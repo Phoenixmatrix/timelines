@@ -103,6 +103,21 @@ function included(text: string, what: string) {
   return { quantity, period: /\bday\b/i.test(before) ? ("day" as const) : ("month" as const) };
 }
 
+const SECONDS: Record<string, number> = { hour: 3600, minute: 60, second: 1 };
+
+/** A per-month allowance written as `25 GiB-hours/month`, in the price's seconds. */
+function includedSeconds(text: string, resource: RegExp, what: string) {
+  const before = text.split("+")[0]!;
+  const match = /(\d[\d,.]*)\s*([A-Za-z]+)-(hour|minute|second)s?\b/.exec(before);
+  if (!match || !resource.test(match[2]!))
+    throw new PriceParseError(`${what}: no included amount in "${oneLine(text)}"`);
+  if (!/\bmonth\b/i.test(before))
+    throw new PriceParseError(`${what}: the allowance isn't per month in "${oneLine(text)}"`);
+  const quantity = amount(match[1]!);
+  if (quantity === null) throw new PriceParseError(`${what}: no included amount`);
+  return { quantity: quantity * SECONDS[match[3]!]!, period: "month" as const };
+}
+
 const oneLine = (text: string) => text.replace(/\n/g, " ").slice(0, 120);
 
 /** The date a sentence on the page says billing starts, if it says so. */
@@ -416,6 +431,41 @@ export const PRICING_PAGES: readonly PricingPage[] = [
         }
       }
       return rows;
+    },
+  },
+  {
+    product: "containers",
+    label: "Containers",
+    url: "https://developers.cloudflare.com/containers/platform/pricing/",
+    read(ctx) {
+      const t = findTable(
+        ctx,
+        { heading: /^vCPU, Memory and Disk$/i, header: /^CPU$/ },
+        "vCPU, memory and disk",
+      );
+      const row = /^Workers Paid$/i;
+      // Billed per second; the allowances are written in hours or minutes.
+      const resource = (
+        metric: string,
+        column: RegExp,
+        unit: PriceUnit,
+        priceUnit: RegExp,
+        allowance: RegExp,
+      ): Row => {
+        const what = `Containers ${metric}`;
+        const text = cell(t, row, column, what);
+        return {
+          metric,
+          unit,
+          written: price(text, priceUnit, what),
+          included: includedSeconds(text, allowance, what),
+        };
+      };
+      return [
+        resource("vcpu", /^CPU$/, "vCPU-second", /^vCPU-seconds?$/, /vCPU/),
+        resource("memory", /^Memory$/, "GiB-second", /^GiB-seconds?$/, /GiB/),
+        resource("disk", /^Disk$/, "GB-second", /^GB-seconds?$/, /GB/),
+      ];
     },
   },
 ];

@@ -92,10 +92,18 @@ const RULES: Partial<Record<UsageConstruct, Record<string, Rule>>> = {
       approximation: "only a total was reported; priced as input tokens",
     },
   },
-};
-
-const UNPRICED: Partial<Record<UsageConstruct, string>> = {
-  ci: "Sandbox container time isn't in the price catalog yet.",
+  // CI sandboxes: each job's wall time × its instance type's size (collect.ts).
+  ci: {
+    vcpu_seconds: {
+      product: "containers",
+      metric: fixed("vcpu"),
+      convert: same,
+      approximation:
+        "the instance's vCPUs for the job's whole run; Cloudflare bills only active CPU, so this is an upper bound",
+    },
+    memory_gib_seconds: { product: "containers", metric: fixed("memory"), convert: same },
+    disk_gb_seconds: { product: "containers", metric: fixed("disk"), convert: same },
+  },
 };
 
 /** Figures whose quantities feed a cost (the site's per-account totals read only these). */
@@ -217,7 +225,6 @@ function line(
 ): UsageLine {
   const costs = figures.flatMap((f) => cost(pricing, construct, item, kind, f) ?? []);
   const notes: string[] = [];
-  if (UNPRICED[construct]) notes.push(UNPRICED[construct]);
   for (const f of figures) {
     const rule = RULES[construct]?.[f.metric];
     if (rule?.approximation && costs.some((c) => c.figure === f.metric))

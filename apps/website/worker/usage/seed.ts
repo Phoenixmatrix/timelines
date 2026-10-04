@@ -6,6 +6,9 @@
 // budgets take their model prices from here (knowledge/budget.ts), so there is
 // one source of truth.
 //
+// Containers (CI sandboxes) joined the catalog later the same day (CORE-210),
+// as a second seed change.
+//
 // Artifacts are billed from 2026-10-14 and AI Search from 2026-11-01: those
 // prices take effect then.
 
@@ -131,6 +134,12 @@ export const SEED_PRICES: readonly PublishedPrice[] = [
     ],
     ["@cf/black-forest-labs/flux-1-schnell:tile", "tile", 1, 0.0000528, null, null, "2026-10-04"],
     ["@cf/black-forest-labs/flux-1-schnell:step", "step", 1, 0.0001056, null, null, "2026-10-04"],
+  ]),
+  // Added by CORE-210 (migration 20261004071417_containers_prices), read the same day.
+  ...page("containers", "2026-08-28", [
+    ["vcpu", "vCPU-second", 1, 0.00002, 22500, "month", "2026-10-04"],
+    ["memory", "GiB-second", 1, 0.0000025, 90000, "month", "2026-10-04"],
+    ["disk", "GB-second", 1, 0.00000007, 720000, "month", "2026-10-04"],
   ]),
 ];
 

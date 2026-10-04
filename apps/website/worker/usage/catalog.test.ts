@@ -33,6 +33,8 @@ import {
   refreshCatalog,
   type Fetcher,
 } from "./prices.ts";
+import { INSTANCE_TYPES } from "./containers.ts";
+import { markdownTables } from "./markdown.ts";
 import { SEED_DATE, SEED_PRICES } from "./seed.ts";
 
 const FIXTURES = fileURLToPath(new URL("./fixtures/", import.meta.url).href);
@@ -111,6 +113,78 @@ describe("parsing the saved pricing pages", () => {
     });
   });
 
+  test("reads Containers' per-second prices and converts their allowances to seconds", () => {
+    const containers = SEED_PRICES.filter((p) => p.product === "containers");
+    expect(containers).toEqual([
+      expect.objectContaining({
+        metric: "vcpu",
+        unit: "vCPU-second",
+        unitQuantity: 1,
+        unitPriceUsd: 0.00002,
+        // 375 vCPU-minutes/month.
+        includedQuantity: 22_500,
+        includedPeriod: "month",
+        sourceUpdated: "2026-08-28",
+      }),
+      // 25 GiB-hours/month.
+      expect.objectContaining({
+        metric: "memory",
+        unit: "GiB-second",
+        unitPriceUsd: 0.0000025,
+        includedQuantity: 90_000,
+      }),
+      // 200 GB-hours/month.
+      expect.objectContaining({
+        metric: "disk",
+        unit: "GB-second",
+        unitPriceUsd: 0.00000007,
+        includedQuantity: 720_000,
+      }),
+    ]);
+    const page = pricingPage("containers");
+    const parse = (text: string) => () => parsePricingPage(page, text, SEED_DATE);
+    // A unit changed, an allowance no longer per month, a column or table gone.
+    expect(
+      parse(fixture("containers").replace("per additional GiB-second", "per additional GiB-hour")),
+    ).toThrow('Containers memory: the price is per "GiB-hour", expected');
+    expect(parse(fixture("containers").replace("200 GB-hours/month", "200 GB-hours/day"))).toThrow(
+      "Containers disk: the allowance isn't per month",
+    );
+    expect(parse(fixture("containers").replace("375 vCPU-minutes/month", "Unlimited"))).toThrow(
+      "Containers vcpu: no included amount",
+    );
+    expect(
+      parse(
+        fixture("containers").replace("+ $0.000020 per additional vCPU-second", "+ contact sales"),
+      ),
+    ).toThrow("Containers vcpu: no price");
+    expect(parse(fixture("containers").replace("## vCPU, Memory and Disk", "## Compute"))).toThrow(
+      "Containers: no vCPU, memory and disk table",
+    );
+  });
+
+  test("CI's instance sizes match the instance types Cloudflare publishes", () => {
+    const table = markdownTables(fixture("containers")).find(
+      (t) => t.headers[0] === "Instance Type",
+    );
+    expect(table).toBeDefined();
+    const fraction = (text: string) => {
+      const [n, d] = text.split("/").map(Number);
+      return d ? n! / d : n!;
+    };
+    const published = Object.fromEntries(
+      table!.rows.map(([name, vcpu, memory, disk]) => [
+        name,
+        {
+          vcpu: fraction(vcpu!),
+          memoryGib: /MiB/.test(memory!) ? parseFloat(memory!) / 1024 : parseFloat(memory!),
+          diskGb: parseFloat(disk!),
+        },
+      ]),
+    );
+    expect(published).toEqual(INSTANCE_TYPES);
+  });
+
   test("prices whose billing starts later take effect then", () => {
     for (const p of SEED_PRICES) {
       const expected =
@@ -172,7 +246,11 @@ describe("the seed", () => {
     const { sqlite } = setup();
     expect(
       rows(sqlite, "SELECT id, kind, status, created_by FROM cloudflare_price_changes"),
-    ).toEqual([{ id: 1, kind: "seed", status: "applied", created_by: null }]);
+    ).toEqual([
+      { id: 1, kind: "seed", status: "applied", created_by: null },
+      // Containers (CORE-210), its own seed change.
+      { id: 2, kind: "seed", status: "applied", created_by: null },
+    ]);
     const stored = rows(
       sqlite,
       `SELECT product, metric, unit, unit_quantity, unit_price_usd, included_quantity,
@@ -277,7 +355,7 @@ describe("refreshing the catalog", () => {
       kind: "refresh",
       status: "unchanged",
       createdBy: "root",
-      baseVersion: 1,
+      baseVersion: 2,
       diff: [],
     });
     expect(change.pages.map((p) => [p.product, p.error])).toEqual(
@@ -373,6 +451,7 @@ describe("refreshing the catalog", () => {
         r2: fixture("r2").replace("| Storage | $0.015 / GB-month", "| Storage | $0.015 / GB"),
         vectorize: 503,
         queues: fixture("queues").replace("$0.40/million", "$0.45/million"),
+        containers: fixture("containers").replace("$0.000020 per", "$0.0020 per"),
       }),
       now: new Date("2026-10-20T09:00:00Z"),
     });
@@ -382,11 +461,14 @@ describe("refreshing the catalog", () => {
     );
     expect(errors.r2).toContain('R2 standard_storage: the price is per "GB"');
     expect(errors.vectorize).toBe("Vectorize: the page answered HTTP 503");
+    expect(errors.containers).toBe(
+      "Containers: vCPU time: the price moved from $0.00002 per 1 vCPU-second to $0.002 per 1 vCPU-second, more than 10x",
+    );
     expect(errors.workers_ai).toBeNull();
     // Only the valid page's change is proposed.
     expect(change.status).toBe("pending");
     expect(change.diff.map((e) => `${e.product}/${e.metric}`)).toEqual(["queues/operations"]);
-    expect(change.note).toBe("3 of 9 pages rejected");
+    expect(change.note).toBe("4 of 10 pages rejected");
   });
 
   test("a stored unit that no longer matches the page rejects the page", async () => {
@@ -452,6 +534,7 @@ describe("refreshing the catalog", () => {
     expect((await listChanges(DB)).map((c) => [c.id, c.status])).toEqual([
       [second.id, "pending"],
       [first.id, "superseded"],
+      [2, "applied"],
       [1, "applied"],
     ]);
     expect((await applyChange(DB, first.id, "acc_root", now)).status).toBe("not_pending");

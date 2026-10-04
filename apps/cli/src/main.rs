@@ -50,6 +50,8 @@ fn build_command(agent: bool) -> clap::Command {
                             extra.push_str("Tracker changes are not reversed by `gm undo`; use an explicit versioned edit.\n");
                         } else if m.path.starts_with("timeline ") {
                             extra.push_str("`gm undo` reverses only the local part (working copy, merges), not timeline records on the server or this checkout's binding.\n");
+                        } else if m.path.starts_with("retention ") {
+                            extra.push_str("Retention settings and cleanup runs are not reversed by `gm undo`; deleted data is gone. Preview runs with --dry-run.\n");
                         } else if m.path.starts_with("settings ") {
                             extra.push_str("Account settings are not reversed by `gm undo`; set the previous values explicitly.\n");
                         } else if m.path.starts_with("worktree ") {
@@ -179,6 +181,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         }
         Command::Auth(c) => out(f, server::auth(ctx, &c)),
         Command::Settings(c) => out(f, commands::settings::run(ctx, &c)),
+        Command::Retention(c) => out(f, commands::retention::run(ctx, &c)),
         Command::Repo(c) => out(f, server::repo(ctx, &c)),
         Command::Semantic(c) => out(f, commands::semantic::run(ctx, &c)),
         Command::Release(c) => out(f, commands::release::run(ctx, &c)),

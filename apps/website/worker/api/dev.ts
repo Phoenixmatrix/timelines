@@ -18,7 +18,7 @@ import { findAccountBySlug } from "../db.ts";
 import { probeDurableObjects } from "../durable/probe.ts";
 import { durableAgent, instanceStorage } from "../durable/registry.ts";
 import { collectUsage } from "../usage/collect.ts";
-import { advanceRun, createRun, getRun } from "../retention/runs.ts";
+import { advanceRun, createRun, getRun, retentionCron } from "../retention/runs.ts";
 import { SYSTEM_ACTOR } from "../../registry/core/auth/system.ts";
 import { Services } from "../../registry/core/context.ts";
 import { collectGarbage } from "../../registry/jobs/gc.ts";
@@ -90,6 +90,7 @@ dev.use("*", async (c, next) => {
       "/durable",
       "/usage",
       "/retention",
+      "/retention-cron",
       "/ci-age",
       "/repo-inventory",
       "/repo-purge",
@@ -137,6 +138,30 @@ dev.post("/usage", async (c) => {
 // (CORE-203), so E2E can age what it just made: run to the end, synchronously.
 // With `account`, that account's categories; without, the site's. With `gc`,
 // the registry's garbage collection then runs at the same moment (CORE-205).
+// The hourly retention cron in the real runtime (CORE-210): which scheduled
+// runs it starts, and with which categories, so E2E can show a disabled
+// category is never scheduled.
+dev.post("/retention-cron", async (c) => {
+  const result = await retentionCron(c.env);
+  const runs = await Promise.all(
+    result.scheduled.map((id) =>
+      c.env.DB.prepare(
+        `SELECT r.id, a.slug AS account, json_group_array(c.category) AS categories
+         FROM cleanup_runs r LEFT JOIN accounts a ON a.id = r.account_id
+         JOIN cleanup_run_categories c ON c.run_id = r.id WHERE r.id = ? GROUP BY r.id`,
+      )
+        .bind(id)
+        .first<{ id: number; account: string | null; categories: string }>(),
+    ),
+  );
+  return c.json({
+    scheduled: runs.flatMap((r) =>
+      r ? [{ id: r.id, account: r.account, categories: JSON.parse(r.categories) as string[] }] : [],
+    ),
+    restarted: result.restarted,
+  });
+});
+
 dev.post("/retention", async (c) => {
   const { account, categories, daysAhead, dryRun, gc } = await readJson<{
     account?: string;

@@ -811,7 +811,7 @@ export async function runProviderE2E(
           const composer = page.getByRole("textbox", { name: "Message the assistant" });
           const title = `Approval continuity ${randomBytes(4).toString("hex")}`;
           await composer.fill(
-            `Use create_issue to create exactly one task in owner ${persona}, team ${teamKey}, titled "${title}". Request my approval before creating it, then open the new issue.`,
+            `Call create_issue now to propose exactly one task in owner ${persona}, team ${teamKey}, titled "${title}". The tool's built-in approval card must obtain my approval before the write executes; do not ask for a separate conversational confirmation. After I approve that card, open the new issue.`,
           );
           await page.getByRole("button", { name: "Send", exact: true }).click();
           await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
@@ -1752,6 +1752,7 @@ export async function runProviderE2E(
       let orphan: Inventory | undefined;
       await waitFor("repository-orphan-purged", 15 * 60_000, async () => {
         orphan = await inventoryOf(planted.repoId);
+        // The latest observation is evidence even when the deadline passes.
         deletionEvidence.orphan = orphan;
         return (
           orphan.deletion?.phase === "done" && orphan.vectors === 0 && orphan.searchItems === 0

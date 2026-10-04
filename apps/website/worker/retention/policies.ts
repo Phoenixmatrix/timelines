@@ -102,6 +102,7 @@ function resolve(
   return {
     ...c,
     never: [...c.never],
+    overlaps: [...(c.overlaps ?? [])],
     thresholds: c.thresholds.map((t) => ({ ...t })),
     enabled,
     enabledFrom,

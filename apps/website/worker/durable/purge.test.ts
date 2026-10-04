@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import { FakeR2Bucket } from "@gitmatrix/testing";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { fakeContainer, fakeDurableState } from "../testing/durable-state.ts";
+import { DURABLE_CLASSES } from "./classes.ts";
 import { isEmpty, storageReport, type Purgeable } from "./contract.ts";
 import { Tracker } from "../tracker/object.ts";
 import { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
@@ -93,6 +94,12 @@ const CASES: Record<string, () => Promise<Built>> = {
 };
 
 describe("purge(reason)", () => {
+  test("every registered class has a case here (the Assistant, an Agents SDK agent, in workerd: E2E)", () => {
+    expect([...Object.keys(CASES), "Assistant"].sort()).toEqual(
+      Object.keys(DURABLE_CLASSES).sort(),
+    );
+  });
+
   for (const [name, build] of Object.entries(CASES)) {
     test(`${name}: leaves no storage and no alarm, twice`, async () => {
       const { object, ctx } = await build();

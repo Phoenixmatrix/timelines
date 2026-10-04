@@ -1,6 +1,7 @@
 import {
   CaretDownIcon,
   ChartBarIcon,
+  ClockCounterClockwiseIcon,
   EnvelopeSimpleIcon,
   FingerprintIcon,
   GearSixIcon,
@@ -51,6 +52,11 @@ export function SettingsPage({
         },
         { label: "AI settings", to: `/settings/ai${accountQuery}`, icon: GearSixIcon },
         { label: "Usage & costs", to: `/settings/usage${accountQuery}`, icon: ChartBarIcon },
+        {
+          label: "Data retention",
+          to: `/settings/retention${accountQuery}`,
+          icon: ClockCounterClockwiseIcon,
+        },
       ],
     },
     {
@@ -83,6 +89,11 @@ export function SettingsPage({
                 label: "Site usage & costs",
                 to: `/settings/site-usage${accountQuery}`,
                 icon: ChartBarIcon,
+              },
+              {
+                label: "Site data retention",
+                to: `/settings/site-retention${accountQuery}`,
+                icon: ClockCounterClockwiseIcon,
               },
             ],
           },

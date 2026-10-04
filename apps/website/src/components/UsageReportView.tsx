@@ -13,7 +13,7 @@ import type {
 import { link } from "./ui.tsx";
 import { retentionLink } from "../lib/retention-links.ts";
 
-const usd = (value: number) => {
+export const usd = (value: number) => {
   if (value === 0) return "$0.00";
   if (Math.abs(value) < 0.01) return "<$0.01";
   return new Intl.NumberFormat("en-US", {
@@ -63,6 +63,9 @@ const METRIC_WORDS: Record<string, string> = {
   total_tokens: "tokens (total only)",
   jobs: "jobs",
   minutes: "minutes",
+  vcpu_seconds: "vCPU-seconds",
+  memory_gib_seconds: "GiB-seconds of memory",
+  disk_gb_seconds: "GB-seconds of disk",
 };
 
 export function figure(f: UsageFigure): string {

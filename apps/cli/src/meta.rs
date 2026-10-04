@@ -38,6 +38,10 @@ macro_rules! meta {
 pub const COMMANDS: &[Meta] = &[
     meta!("settings ai show", git: "", kw: "account organization automatic ai settings policy costs pricing models catalog permissions knowledge wiki atlas release notes", mutates: false, out: Out::Other("AiSettingsView {features:{knowledge,wiki,atlas,releaseNotes},models:{classification,fast,task},updatedAt:string|null,updatedBy:string|null,canManage:boolean,catalog:{classification:ModelOption[],fast:ModelOption[],task:ModelOption[]}}; ModelOption {id,name,model,releasedAt,inputUsdPerMillion,outputUsdPerMillion,url}"), ex: ["gm settings ai show", "gm settings ai show --owner orbit"]),
     meta!("settings ai set", git: "", kw: "account organization automatic ai settings enable disable spending policy model classification fast task knowledge wiki atlas release notes", mutates: true, out: Out::Other("AiSettingsView as returned by settings ai show; --dry-run returns {dry_run:true,owner,method:'PATCH',path,request:{features?:{knowledge?,wiki?,atlas?,releaseNotes?},models?:{classification?,fast?,task?}}} without mutation. Requires at least one change. Backend requires a human account/org owner or site admin."), ex: ["gm settings ai set --owner orbit --knowledge off --dry-run", "gm settings ai set --owner orbit --classification clef --fast glm-5.3-flash --task gemma-4-26b-a4b-it"]),
+    meta!("retention show", git: "", kw: "data retention policy policies cleanup categories enabled thresholds defaults delete old logs history storage costs last run site account", mutates: false, out: Out::Other("RetentionSettings {level:'account'|'site',account:string|null,canEdit,categories:[RetentionPolicy {id,scope,control:'policy'|'active'|'fixed',label,description,never:[string],thresholds:[{key,label,unit:'days'|'months'|'count'|'gib',min,max,default}],enabled,enabledFrom,values:{key:number},valuesFrom:{key:'default'|'site'|'account'},runnable,lastRun:{runId,dryRun,trigger,status,items,bytes,error,at}|null,updatedAt,updatedBy}],changes:[{category,actor,before,after,at}]}; a category argument keeps only that category"), ex: ["gm retention show", "gm retention show ci-logs --owner orbit", "gm retention show --site"]),
+    meta!("retention set", git: "", kw: "data retention enable disable turn on off policy threshold days keep latest reset inherit site-wide default category", mutates: true, out: Out::Other("{level,account,category:RetentionPolicy} (see retention show); --dry-run returns {dry_run:true,level,owner,method:'PATCH',path,request:{categories:{<id>:{enabled?:boolean|null,thresholds?:{key:number|null}}}}} without mutation. Account owners (people, not agents) or site administrators."), ex: ["gm retention set ci-logs --enable --owner orbit", "gm retention set ci-runs --threshold days=90 --threshold keepLatest=10", "gm retention set ci-logs --inherit --reset days", "gm retention set auth-hygiene --enable --site"]),
+    meta!("retention run", git: "", kw: "clean up now cleanup delete purge old data dry run preview retention categories run wait progress", mutates: true, out: Out::Other("RetentionRun {id,level,account,trigger,actor,dryRun,status:'queued'|'running'|'succeeded'|'failed',asOf,createdAt,startedAt,finishedAt,items,bytes,error,categories:[{category,label,status,thresholds,items,bytes,batches,error,startedAt,finishedAt}]}; waits for the run unless --no-wait (exit 4 when it fails); --dry-run runs a server-side preview that deletes nothing; a real run requires --yes"), ex: ["gm retention run ci-logs ci-runs --dry-run", "gm retention run ci-logs --threshold ci-logs.days=14 --yes", "gm retention run auth-hygiene --site --dry-run"]),
+    meta!("retention runs", git: "", kw: "cleanup run history audit retention runs list show progress", mutates: false, out: Out::Other("{runs:[RetentionRun],next:number|null} newest first (pass next as --before), or one RetentionRun when an id is given"), ex: ["gm retention runs", "gm retention runs --site --limit 5", "gm retention runs 12 --owner orbit"]),
     meta!("tracker list", git: "", kw: "accounts organizations issue trackers", mutates: false, out: Out::Other("{trackers:[{id,slug,displayName,canAdmin}]}"), ex: ["gm tracker list"]),
     meta!("tracker use", git: "", kw: "select owner initialize offline replica account organization", mutates: true, out: Out::Other("{owner,identity,replica,cursor}"), ex: ["gm tracker use orbit"]),
     meta!("tracker sync", git: "", kw: "offline replica outbox synchronize upload download cursor", mutates: true, out: Out::Other("{dryRun,cursor,pending}; conflicts stop ordered replay without dropping later edits"), ex: ["gm tracker sync"]),
@@ -786,6 +790,20 @@ deterministic projection. Classification accepts only clef; fast and task accept
 glm-5.3-flash|gemma-4-26b-a4b-it. Changes affect future jobs, not running work,
 existing history or cached output, and saving does not trigger a rebuild.
 --dry-run prints the nested PATCH request without changing account policy.
+
+## Data retention
+    gm retention show --owner orbit                 # categories, switches, thresholds, last run
+    gm retention set ci-logs --enable --threshold days=14
+    gm retention run ci-logs ci-runs --dry-run       # preview: what would be deleted
+    gm retention run ci-logs --yes                   # clean up now, wait for the result
+    gm retention runs                                # run history; `gm retention runs 12` for one
+
+Every category is off until enabled; then scheduled cleanups delete what its
+policy selects. Without --owner, gm uses your signed-in personal account;
+--site covers site categories and site-wide defaults (site administrators).
+--inherit and --reset remove this level's value so it inherits again. Runs can
+include any category with a cleanup, enabled or not, with per-run overrides
+(--threshold category.key=value); a real run needs --yes and nothing undoes it.
 
 ## Packages
 CI jobs publish with their own credential: `npm publish`, `docker push

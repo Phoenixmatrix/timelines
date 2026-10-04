@@ -3,6 +3,8 @@
 // in worker/retention/categories.ts; the API sends each definition along with
 // its policy, so clients never keep their own copy.
 
+import type { UsageCost } from "./usage.ts";
+
 /** Whose data a category covers: one account's, or the site's (global caches, auth). */
 export type RetentionScope = "account" | "site";
 
@@ -39,6 +41,13 @@ export interface RetentionCategory {
   /** In plain words, what this category never deletes. */
   never: string[];
   thresholds: RetentionThreshold[];
+  /**
+   * Categories whose selections can include the same records as this one
+   * (closed issues take their activity log entries with them). A dry run of
+   * both counts those records under each, so its total is higher than what a
+   * run removes; a run removes each record once.
+   */
+  overlaps?: string[];
 }
 
 /** Where an effective value comes from. */
@@ -131,6 +140,12 @@ export interface RetentionRunCategory {
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;
+  /**
+   * What `bytes` costs a month at the storage list price in effect on the
+   * run's day (CORE-208's catalog): an estimate of what removing them saves.
+   * Null when the catalog has no price for where the category's data lives.
+   */
+  cost: UsageCost | null;
 }
 
 /** A cleanup run: scheduled or manual, dry or real, with what each category did. */
@@ -153,6 +168,11 @@ export interface RetentionRun {
   bytes: number;
   error: string | null;
   categories: RetentionRunCategory[];
+  /**
+   * Plain statements about the figures, e.g. that a dry run of overlapping
+   * categories counts some records twice. Empty when there is nothing to say.
+   */
+  notes: string[];
 }
 
 /** GET …/runs: newest first; pass `before` = next for the following page. */

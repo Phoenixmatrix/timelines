@@ -52,6 +52,7 @@ export const CATEGORIES = [
     label: "CI logs",
     description: "Log text of CI jobs that finished more than the given days ago.",
     never: ["Logs of pending, queued or running jobs", "The run, job and step records themselves"],
+    overlaps: ["ci-runs"],
     thresholds: [days("days", "Days after the job finished", 30)],
   },
   {
@@ -65,6 +66,7 @@ export const CATEGORIES = [
       "Running or queued runs, and runs with a job still running",
       "Runs a deployment, a landing or a package publish refers to",
     ],
+    overlaps: ["ci-logs"],
     thresholds: [days("days", "Days after the run", 180), keepLatest("Runs kept per ref", 20)],
   },
   {
@@ -133,6 +135,7 @@ export const CATEGORIES = [
     description:
       "Issues closed or canceled more than the given days ago, with their comments, links and events.",
     never: ["Open issues", "Issue keys (never reused)"],
+    overlaps: ["tracker-activity"],
     thresholds: [days("days", "Days after closing", 365)],
   },
   {
@@ -142,6 +145,7 @@ export const CATEGORIES = [
     label: "Tracker activity logs and ended timelines",
     description: "Tracker activity log entries older than the given days, and ended timelines.",
     never: ["Activity that open issues and timelines still show", "Open timelines"],
+    overlaps: ["closed-issues"],
     thresholds: [
       days("eventDays", "Days to keep activity", 365),
       days("endedTimelineDays", "Days after a timeline ended", 180),
@@ -362,6 +366,19 @@ export function defaultValues(c: RetentionCategory): Record<string, number> {
 }
 
 /** Whether a stored value is acceptable for a threshold now (bounds can tighten). */
+/**
+ * Overlapping categories among `ids`, as pairs in registry order: a dry run of
+ * both counts their shared records under each (see RetentionCategory.overlaps).
+ */
+export function overlappingPairs(ids: readonly string[]): [RetentionCategory, RetentionCategory][] {
+  const chosen = CATEGORIES.filter((c) => ids.includes(c.id)) as readonly RetentionCategory[];
+  const pairs: [RetentionCategory, RetentionCategory][] = [];
+  chosen.forEach((a, i) => {
+    for (const b of chosen.slice(i + 1)) if (a.overlaps?.includes(b.id)) pairs.push([a, b]);
+  });
+  return pairs;
+}
+
 export function validThreshold(t: RetentionThreshold, value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= t.min && value <= t.max;
 }

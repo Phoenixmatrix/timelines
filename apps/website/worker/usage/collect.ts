@@ -12,6 +12,7 @@ import { db, nowIso, type UsageConstruct } from "../schema.ts";
 import { DURABLE_CLASS_NAMES } from "../durable/classes.ts";
 import { EMBEDDING_DIMENSIONS } from "../knowledge/models.ts";
 import { measureUnreachable, type Unreachable, type UnreachableRepo } from "../git/unreachable.ts";
+import { instanceSize } from "./containers.ts";
 import { MEASURED_TEXT, TABLE_GROUPS, type Database, type TableGroup } from "./tables.ts";
 
 export const USAGE_LIMITS = {
@@ -523,42 +524,64 @@ const workersAi: Step = {
   },
 };
 
-/** Yesterday's CI: sandbox jobs and their container minutes. */
+/**
+ * Yesterday's CI: sandbox jobs, their container minutes, and what those
+ * minutes provision by each job's instance type (worker/usage/containers.ts),
+ * in the units Cloudflare bills Containers in.
+ */
 const ci: Step = {
   id: "ci",
   async run(ctx) {
-    const row = await ctx.env.DB.prepare(
-      `SELECT COUNT(*) AS jobs,
-              COALESCE(SUM((julianday(j.finished_at) - julianday(j.started_at)) * 1440), 0) AS minutes
+    const { results } = await ctx.env.DB.prepare(
+      `SELECT json_extract(j.spec, '$.instance') AS instance, COUNT(*) AS jobs,
+              COALESCE(SUM((julianday(j.finished_at) - julianday(j.started_at)) * 86400), 0) AS seconds
        FROM ci_jobs j JOIN repos r ON r.id = j.repo_id
        WHERE r.owner_id = ?1 AND j.runner = 'sandbox' AND j.started_at IS NOT NULL
-         AND j.finished_at >= ?2 AND j.finished_at < ?3`,
+         AND j.finished_at >= ?2 AND j.finished_at < ?3
+       GROUP BY 1`,
     )
       .bind(ctx.account, ctx.yesterday, ctx.day)
-      .first<{ jobs: number; minutes: number }>();
-    const jobs = Number(row?.jobs ?? 0);
+      .all<{ instance: string | null; jobs: number; seconds: number }>();
+    const jobs = results.reduce((sum, r) => sum + Number(r.jobs), 0);
     if (jobs === 0) return { rows: [], next: null };
+    let seconds = 0;
+    let vcpu = 0;
+    let memory = 0;
+    let disk = 0;
+    for (const r of results) {
+      const s = Math.max(0, Number(r.seconds));
+      const size = instanceSize(r.instance);
+      seconds += s;
+      vcpu += s * size.vcpu;
+      memory += s * size.memoryGib;
+      disk += s * size.diskGb;
+    }
     const method = "sandbox jobs that finished that day, from their start and finish times";
+    const provisioned =
+      "each job's wall time × its instance type's provisioned size (the container runs a little longer than the job's steps)";
+    const row = (metric: string, quantity: number, how: string, estimated = false) => ({
+      construct: "ci" as const,
+      item: "sandbox",
+      metric,
+      kind: "activity" as const,
+      quantity,
+      method: how,
+      day: ctx.yesterday,
+      estimated,
+    });
+    const round = (n: number) => Math.round(n * 100) / 100;
     return {
       rows: [
-        {
-          construct: "ci",
-          item: "sandbox",
-          metric: "jobs",
-          kind: "activity",
-          quantity: jobs,
-          method,
-          day: ctx.yesterday,
-        },
-        {
-          construct: "ci",
-          item: "sandbox",
-          metric: "minutes",
-          kind: "activity",
-          quantity: Math.round(Number(row?.minutes ?? 0) * 100) / 100,
-          method,
-          day: ctx.yesterday,
-        },
+        row("jobs", jobs, method),
+        row("minutes", round(seconds / 60), method),
+        row(
+          "vcpu_seconds",
+          round(vcpu),
+          `${provisioned}; Cloudflare bills only active CPU, so this is an upper bound`,
+          true,
+        ),
+        row("memory_gib_seconds", round(memory), provisioned, true),
+        row("disk_gb_seconds", round(disk), provisioned, true),
       ],
       next: null,
     };

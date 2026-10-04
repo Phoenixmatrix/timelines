@@ -239,12 +239,12 @@ describe("account retention settings", () => {
     expect(count(t.sqlite, "retention_policy_changes")).toBe(0);
   });
 
-  test("members read, owners change, others don't see it", async () => {
+  test("owners read and change, members are refused, others don't see it", async () => {
     const t = await setup();
     const enable = { categories: { "ci-logs": { enabled: true } } };
-    const member = await t.call(t.tokens.cat, "GET", ORG);
-    expect(member.status).toBe(200);
-    expect((member.json as RetentionSettings).canEdit).toBe(false);
+    expect((await t.call(t.tokens.cat, "GET", ORG)).status).toBe(403);
+    expect(((await t.call(t.tokens.ann, "GET", ORG)).json as RetentionSettings).canEdit).toBe(true);
+    expect(((await t.call(t.tokens.sue, "GET", ORG)).json as RetentionSettings).canEdit).toBe(true);
     expect((await t.call(t.tokens.bob, "GET", ORG)).status).toBe(404);
     expect((await t.call(t.tokens.bob, "PATCH", ORG, enable)).status).toBe(404);
     expect((await t.call(t.tokens.cat, "PATCH", ORG, enable)).status).toBe(403);

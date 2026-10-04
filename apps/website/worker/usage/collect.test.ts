@@ -69,7 +69,8 @@ beforeEach(async () => {
     INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner, started_at, finished_at) VALUES
       ('job_1', 'run_1', 'repo_1', 'a', '{}', 'succeeded', 'sandbox', '${YESTERDAY}T10:00:00.000Z', '${YESTERDAY}T10:30:00.000Z'),
       ('job_2', 'run_1', 'repo_1', 'b', '{}', 'succeeded', 'sandbox', '${YESTERDAY}T23:50:00.000Z', '${TODAY}T00:10:00.000Z'),
-      ('job_3', 'run_1', 'repo_1', 'c', '{}', 'succeeded', 'local', '${YESTERDAY}T10:00:00.000Z', '${YESTERDAY}T11:00:00.000Z');
+      ('job_3', 'run_1', 'repo_1', 'c', '{}', 'succeeded', 'local', '${YESTERDAY}T10:00:00.000Z', '${YESTERDAY}T11:00:00.000Z'),
+      ('job_4', 'run_1', 'repo_1', 'd', '{"instance":"standard-4"}', 'succeeded', 'sandbox', '${YESTERDAY}T12:00:00.000Z', '${YESTERDAY}T12:10:00.000Z');
     INSERT INTO ci_logs (job_id, seq, step, text) VALUES
       ('job_1', 1, 0, '${LOG_A}'), ('job_1', 2, 0, '${LOG_B}'), ('job_2', 1, 0, '${LOG_A}'), ('job_3', 1, 0, 'tiny');
     INSERT INTO kg_nodes (repo_id, id, kind, name, summary, content_hash, changed_in) VALUES
@@ -211,8 +212,15 @@ describe("collectUsage", () => {
     expect(q(`${YESTERDAY} workers_ai/@cf/m/input_tokens`)).toBe(400);
     expect(q(`${YESTERDAY} workers_ai/@cf/m/output_tokens`)).toBe(40);
     expect(o[`${YESTERDAY} workers_ai/@cf/m/calls`]!.kind).toBe("activity");
-    expect(q(`${YESTERDAY} ci/sandbox/jobs`)).toBe(1);
-    expect(q(`${YESTERDAY} ci/sandbox/minutes`)).toBe(30);
+    expect(q(`${YESTERDAY} ci/sandbox/jobs`)).toBe(2);
+    expect(q(`${YESTERDAY} ci/sandbox/minutes`)).toBe(40);
+    // What those minutes provision, by each job's instance type: 30 min on the
+    // default standard-1 (1/2 vCPU, 4 GiB, 8 GB) and 10 on standard-4 (4, 12, 20).
+    expect(q(`${YESTERDAY} ci/sandbox/vcpu_seconds`)).toBe(1800 * 0.5 + 600 * 4);
+    expect(q(`${YESTERDAY} ci/sandbox/memory_gib_seconds`)).toBe(1800 * 4 + 600 * 12);
+    expect(q(`${YESTERDAY} ci/sandbox/disk_gb_seconds`)).toBe(1800 * 8 + 600 * 20);
+    expect(o[`${YESTERDAY} ci/sandbox/vcpu_seconds`]!.estimated).toBe(1);
+    expect(o[`${YESTERDAY} ci/sandbox/minutes`]!.estimated).toBe(0);
 
     // The other account sees only its own.
     const p = figures("acc_p");
