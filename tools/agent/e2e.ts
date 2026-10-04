@@ -21,6 +21,7 @@ import type {
 import type { Deployment, DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Published } from "../../apps/website/shared/packages.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
+import type { Chronicle, LinkedWork } from "../../apps/website/shared/chronicle.ts";
 import type { Landing } from "../../apps/website/shared/timelines.ts";
 import type { UsageReport } from "../../apps/website/shared/usage.ts";
 import type { WhyResponse } from "../../apps/website/shared/why.ts";
@@ -385,6 +386,94 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       /403|404|access|forbidden|not.found|permission/i,
     );
     record({ issue: fixtures.tracker.ready, status: completed.issue.status, evidenceSynced: true });
+  });
+
+  await scenario("chronicle-history-and-linked-work-over-api", async () => {
+    // CORE-250: real gm work on a fresh issue, read back by time from the
+    // Tracker Durable Object in workerd: its states, its work span and markers.
+    const owner = fixtures.tracker.owner;
+    const from = new Date(Date.now() - 5_000).toISOString();
+    const id = randomUUID();
+    const created = await json<{ events: { entity: { key?: string } | null }[] }>(
+      `/api/tracker/${owner}/mutate`,
+      ownerToken,
+      "POST",
+      {
+        operationId: randomUUID(),
+        mutations: [
+          {
+            kind: "issue.create",
+            id,
+            data: { teamId: fixtures.tracker.team, title: "Chronicle fixture" },
+          },
+        ],
+      },
+    );
+    const key = created.events.find((event) => event.entity?.key)?.entity?.key;
+    assert(key, "The new issue has a key");
+    await gm(["tracker", "sync", "--owner", owner]);
+    const claimed = JSON.parse(
+      await gm(["issue", "claim", key, "--owner", owner, "--agent", "chronicle-e2e"]),
+    ) as { results: { leaseToken: string }[] };
+    const lease = claimed.results[0]?.leaseToken;
+    assert(lease, "Claim must return a fencing token");
+    secrets.add(lease);
+    await gm(["issue", "renew", key, "--owner", owner], "marco", work, undefined, {
+      GM_LEASE_TOKEN: lease,
+    });
+    await gm(
+      ["issue", "complete", key, "--owner", owner, "--evidence", "Chronicle verified"],
+      "marco",
+      work,
+      undefined,
+      { GM_LEASE_TOKEN: lease },
+    );
+    const to = new Date(Date.now() + 1_000).toISOString();
+    const range = `from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+    const chronicle = await json<Chronicle>(
+      `/api/tracker/${owner}/chronicle?${range}&q=${encodeURIComponent("chronicle fixture")}`,
+      ownerToken,
+    );
+    const row = chronicle.issues.find((issue) => issue.id === id);
+    assert(row, `${key} is a row of the Chronicle`);
+    assert.equal(row.start.status, null, "It didn't exist at the range's start");
+    assert.deepEqual(
+      row.segments.map((segment) => segment.status),
+      ["todo", "in_progress", "done"],
+    );
+    assert.equal(row.spans.length, 1);
+    const span = row.spans[0]!;
+    assert.equal(span.endedBy, "complete");
+    assert.equal(span.session, "chronicle-e2e");
+    assert.equal(span.renewals.length, 1, "The renewal is on the span");
+    assert.equal(chronicle.actors[span.holder]?.kind, "person");
+    assert.deepEqual(
+      row.markers.map((marker) => marker.kind),
+      ["created", "evidence"],
+    );
+    assert(chronicle.density && chronicle.density.counts.some((n) => n > 0));
+    const linked = await json<LinkedWork>(
+      `/api/tracker/${owner}/issues/${encodeURIComponent(key)}/work`,
+      ownerToken,
+    );
+    assert.equal(linked.issue.key, key);
+    assert.equal(linked.issue.status, "done");
+    // Outside the tracker: no Chronicle, no linked work.
+    await request(
+      `/api/tracker/${owner}/chronicle?${range}`,
+      fixtures.tokens.sam,
+      "GET",
+      undefined,
+      [403],
+    );
+    await request(
+      `/api/tracker/${owner}/issues/${encodeURIComponent(key)}/work`,
+      fixtures.tokens.sam,
+      "GET",
+      undefined,
+      [403],
+    );
+    record({ key, span: { endedBy: span.endedBy, renewals: span.renewals.length } });
   });
 
   await scenario("timeline-fork-bookmark-and-abandon-permissions", async () => {

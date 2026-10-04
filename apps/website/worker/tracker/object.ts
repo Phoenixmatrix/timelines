@@ -8,6 +8,7 @@ import {
   type PushActivity,
 } from "./timelines.ts";
 import type { MutationRequest } from "../../shared/tracker.ts";
+import type { ChronicleOptions } from "./chronicle.ts";
 import type { QueueFailure } from "../../shared/merge-queue.ts";
 import type { SearchQuery } from "../search/query.ts";
 import type { Landing, TimelineStatus } from "../../shared/timelines.ts";
@@ -75,6 +76,14 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   }
   history(access: Access, issueId: string, before: number | null, limit: number) {
     return this.reply(() => this.store.history(access, issueId, before, limit));
+  }
+  /** One page of the Chronicle (CORE-250). */
+  chronicle(access: Access, options: ChronicleOptions) {
+    return this.reply(() => this.store.chronicle(access, options));
+  }
+  /** An issue's timelines, checkpoints and landings, for its linked work (CORE-250). */
+  issueWork(issue: string) {
+    return this.reply(() => this.store.issueWork(issue));
   }
   openRequests() {
     return this.reply(() => this.store.openRequests());

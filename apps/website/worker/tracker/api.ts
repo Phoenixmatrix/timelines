@@ -14,6 +14,8 @@ import { TrackerError, validateRequest, type Access } from "./store.ts";
 import { accessFor } from "./access.ts";
 import type { TrackerReply } from "./object.ts";
 import { trackerObject } from "./stub.ts";
+import { CHRONICLE_PAGE, type LinkedWork } from "../../shared/chronicle.ts";
+import { linkedWork } from "./work.ts";
 import {
   clearPreferences,
   defaultOwner,
@@ -291,6 +293,34 @@ tracker.get("/tracker/:owner/issues/:issue/history", async (c) => {
       Number(limit),
     ),
   );
+});
+/**
+ * The Chronicle (CORE-250): issues matching `q` as of `from`, with what
+ * changed, who worked them and what happened until `to`. Paged by `cursor`.
+ */
+tracker.get("/tracker/:owner/chronicle", async (c) => {
+  const access = await authorize(c);
+  const limit = c.req.query("limit") ?? String(CHRONICLE_PAGE);
+  if (!/^\d+$/.test(limit))
+    throw new TrackerError(400, "invalid_input", "limit must be an integer.");
+  return response(
+    c,
+    await trackerObject(c.env, access.owner.id).chronicle(access, {
+      from: c.req.query("from") ?? "",
+      to: c.req.query("to") ?? new Date().toISOString(),
+      query: c.req.query("q") ?? "",
+      cursor: c.req.query("cursor") || null,
+      limit: Number(limit),
+      quiet: c.req.query("quiet") === "1",
+    }),
+  );
+});
+/** What an issue's work produced (CORE-250): commits, work contexts, runs, previews, packages, timelines, release notes. */
+tracker.get("/tracker/:owner/issues/:issue/work", async (c) => {
+  const access = await authorize(c, false);
+  const work = await trackerObject(c.env, access.owner.id).issueWork(c.req.param("issue"));
+  if (!work.ok) return response(c, work);
+  return c.json<LinkedWork>(await linkedWork(c.env, c.get("actor")!, access.owner, work.value));
 });
 tracker.post("/tracker/:owner/mutate", async (c) => {
   const access = await authorize(c);

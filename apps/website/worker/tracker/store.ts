@@ -42,11 +42,19 @@ import { auditActor, initializeAudit, indexAuditEvent, issueHistory } from "./au
 import { matchRank, matches, type MatchColumns, type SearchQuery } from "../search/query.ts";
 import {
   TIMELINE_POLICIES,
+  type CheckpointState,
+  type Landing,
   type Timeline,
   type TimelineEvent,
   type TimelineIssue,
 } from "../../shared/timelines.ts";
 import { TimelineStore } from "./timelines.ts";
+import { buildChronicle, type ChronicleOptions } from "./chronicle.ts";
+import {
+  CHRONICLE_MAX_PAGE,
+  CHRONICLE_MAX_RANGE_MS,
+  type Chronicle,
+} from "../../shared/chronicle.ts";
 import { feedFloor, RETENTION_TABLES, removedMessage, tombstone } from "./retention.ts";
 import {
   findTimeline,
@@ -188,6 +196,15 @@ function retained(claim: IssueClaim, timeline: Timeline): IssueClaim {
   const { parkedAt: _parked, ...rest } = claim;
   return { ...rest, retainedIn: { id: timeline.id, slug: timeline.slug } };
 }
+
+/** What the tracker knows of an issue's work: its timelines, checkpoints and landings. */
+export interface IssueWork {
+  issue: Pick<Issue, "id" | "key" | "title" | "status">;
+  timelines: { timeline: Timeline; checkpoints: CheckpointState[]; landings: Landing[] }[];
+}
+const WORK_TIMELINES = 20;
+const WORK_CHECKPOINTS = 20;
+const WORK_LANDINGS = 10;
 
 /** After its last request is answered, a parked lease's holder has this long to resume. */
 export const RESUME_WINDOW_SECONDS = 3600;
@@ -868,6 +885,119 @@ export class TrackerStore {
       fail("not_found", `Issue ${issueId} not found.`, 404);
     }
     return issueHistory(this.sql, access, this.anyIssue(made.id), before, limit);
+  }
+  /**
+   * One page of the Chronicle (CORE-250, worker/tracker/chronicle.ts): the
+   * issues matching `query`, each as of `from` with what changed, who worked
+   * it and what happened to it until `to`. Main's view.
+   */
+  chronicle(access: Access, options: ChronicleOptions): Chronicle {
+    const from = Date.parse(options.from);
+    const to = Date.parse(options.to);
+    if (Number.isNaN(from) || Number.isNaN(to))
+      fail("invalid_input", "from and to must be ISO timestamps.");
+    if (to <= from) fail("invalid_input", "to must be after from.");
+    if (to - from > CHRONICLE_MAX_RANGE_MS)
+      fail("invalid_input", "A range covers at most 3 years.");
+    if (
+      !Number.isSafeInteger(options.limit) ||
+      options.limit < 1 ||
+      options.limit > CHRONICLE_MAX_PAGE
+    )
+      fail("invalid_input", `limit must be 1–${CHRONICLE_MAX_PAGE}.`);
+    if (options.query.length > 500) fail("invalid_input", "The query is at most 500 characters.");
+    if (options.cursor !== null && (options.cursor.length > 100 || !options.cursor))
+      fail("invalid_input", "cursor must be an issue key from a previous page.");
+    const snapshot = {
+      owner: access.owner,
+      canAdmin: access.canAdmin,
+      members: access.members,
+      agents: access.agents,
+      teams: this.all<Team>("team"),
+      workspaces: this.all<Workspace>("workspace"),
+      issues: this.all<Issue>("issue"),
+      links: this.all<Link>("link"),
+      comments: [],
+      requests: [],
+      subscriptions: [],
+      cursor: 0,
+      serverTime: new Date(this.clock()).toISOString(),
+    } satisfies Snapshot;
+    return buildChronicle(
+      this.sql,
+      { viewerId: access.actorId, snapshot, known: (id) => auditActor(access, id) },
+      {
+        ...options,
+        from: new Date(from).toISOString(),
+        to: new Date(to).toISOString(),
+      },
+      this.clock(),
+    );
+  }
+  /**
+   * What the tracker knows of an issue's work (CORE-250): the timelines it was
+   * worked in (made in, done in, retained by, or changed in), with their
+   * checkpoints and landings. The Worker adds what D1 and the registry know.
+   */
+  issueWork(issueRef: string): IssueWork {
+    const ref = text(issueRef, "issue", 200);
+    const row =
+      first(this.sql, tracker.selectFrom("issues").select("data").where("id", "=", ref)) ??
+      first(
+        this.sql,
+        tracker
+          .selectFrom("issues")
+          .select("data")
+          .where(json("data", "$.key"), "=", ref.toUpperCase()),
+      );
+    if (!row) {
+      const stone = tombstone(this.sql, "issue", ref);
+      if (stone) fail("removed_by_retention", removedMessage(stone), 404);
+      fail("not_found", `Issue ${ref} not found.`, 404);
+    }
+    const issue = JSON.parse(row.data) as Issue;
+    const ids = new Set<string>();
+    for (const id of [issue.timelineId, issue.doneIn?.id, issue.claim?.retainedIn?.id])
+      if (id) ids.add(id);
+    for (const event of all(
+      this.sql,
+      tracker
+        .selectFrom("issue_events as i")
+        .innerJoin("events as e", "e.cursor", "i.cursor")
+        .select(json<string | null>("e.data", "$.timelineId").as("timelineId"))
+        .distinct()
+        .where("i.issue_id", "=", issue.id)
+        .where(json("e.data", "$.timelineId"), "is not", null),
+    ))
+      if (event.timelineId) ids.add(event.timelineId);
+    const timelines = ids.size
+      ? all(
+          this.sql,
+          tracker
+            .selectFrom("timelines")
+            .select("data")
+            .where("id", "in", [...ids]),
+        )
+          .map((r) => JSON.parse(r.data) as Timeline)
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          .slice(0, WORK_TIMELINES)
+      : [];
+    return {
+      issue: { id: issue.id, key: issue.key, title: issue.title, status: issue.status },
+      timelines: timelines.map((timeline) => ({
+        timeline,
+        checkpoints: this.timelines.checkpoints(timeline.slug).slice(-WORK_CHECKPOINTS),
+        landings: all(
+          this.sql,
+          tracker
+            .selectFrom("timeline_landings")
+            .select("data")
+            .where("timeline_id", "=", timeline.id)
+            .orderBy("created_at", "desc")
+            .limit(WORK_LANDINGS),
+        ).map((r) => JSON.parse(r.data) as Landing),
+      })),
+    };
   }
   mutate(access: Access, input: unknown): MutationResult {
     const request = validateRequest(input);

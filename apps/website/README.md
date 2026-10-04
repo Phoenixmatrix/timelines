@@ -986,6 +986,44 @@ own schema. Generate the new binding with `cf workers types`.
 These primitives support durable agent handoffs. An autonomous hours/days-long
 execution loop is not included.
 
+### Chronicle: history by time and linked work
+
+The Chronicle (CORE-42) is the tracker on a time axis. Two read-only routes
+serve it; the shapes and the pure readers (`stateAt`, `summarize`) are in
+`shared/chronicle.ts`, the replay in `worker/tracker/chronicle.ts` and the
+linked work in `worker/tracker/work.ts`.
+
+| Route                                                                          | Contract                                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/tracker/:owner/chronicle?from&to[&q][&cursor][&limit=100][&quiet=1]` | Issues matching tracker query `q`, each as of `from` with every state change, work span and marker until `to`; paged by issue key (`next`), at most 200 issues and ~20,000 events read per page; the first page adds the event density over the whole history |
+| `GET /api/tracker/:owner/issues/:issue/work`                                   | The issue's commits, agent work contexts (steps), CI runs, deployments, published packages, timelines with checkpoints and landings, and release-note entries, each with the `href` the web app opens                                                         |
+
+- **As of.** An issue's state at a time is the state after its last event at
+  or before it. A change made in a timeline reads as the timeline saw it,
+  except that main's `done_in_timeline` stands until the timeline lands.
+  `q` uses the tracker's query language (`shared/tracker-query.ts`) against
+  the issues as they are now; issues closed before the range and untouched in
+  it are left out (counted in `quiet`) unless `quiet=1`.
+- **Work spans** run from a claim through renewals (and parking, while the
+  issue waits on a person) to a release, completion, revoke, takeover,
+  handoff, or the landing or abandoning of the timeline that retained the
+  lease. Expiry records no event, so a lapsed span ends at its lease's expiry.
+  Each span names its holder (person or agent, with the accountable human).
+- **Markers**: creation, comments, checkpoints and evidence, requests asked,
+  answered or withdrawn, links added and removed, landings, and the
+  checkpoints and landings of the timelines the issue was worked in.
+- **Retention.** When `tracker-activity` pruned the log, `history.pruned`
+  says before when events may be missing, and an affected row's
+  `historyFrom` says where its own history begins; `history.removedIssues`
+  counts issues `closed-issues` removed.
+- **Linked work** searches the repositories the tracker covers (the owner's,
+  those subscribed to it, and those its timelines touch) and returns only
+  what the viewer can read: unreadable repositories' items are omitted
+  without a count. Steps are found by issue key (index
+  `step_contexts_issue`), release-note entries by tracker and key
+  (`release_note_entries_issue`); runs, deployments and packages by the
+  commits found. Each list holds at most 50 items (`truncated`).
+
 ### Timelines
 
 A timeline (`TIMELINES-RESEARCH.md`) is an account-wide line of work with a
