@@ -94,7 +94,7 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
       { command: "vp test run search", exit: 0, summary: "12 passed", origin: "local" },
       { command: "cargo test", exit: 0, summary: "ok", origin: "local" },
     ],
-    coverage: { instructions: "hook", steering: "hook" },
+    coverage: { instructions: "hook:claude-code", steering: "hook:claude-code" },
     harness: "claude-code",
     model: null,
     ...over,
@@ -166,7 +166,9 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
   await app.waitForUrl((url) => url.searchParams.get("step") === merge);
   await expect
     .element(context.getByRole("note"))
-    .toMatchTextContent(/No claude-code hook recorded this step's prompts and steering/);
+    .toMatchTextContent(
+      /Steering recorded by the agent; a harness hook isn.t set up, so some context may be missing\. Run `gm agent setup`/,
+    );
   await expect.element(step.getByRole("button", { name: /Next/ })).toBeDisabled();
 
   // Amended: the earlier version, with its own context and diff.

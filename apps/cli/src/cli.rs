@@ -122,6 +122,12 @@ pub enum Command {
     Step(StepArgs),
     /// A timeline's steps in this repository; --follow streams new ones live
     Steps(crate::commands::steps::StepsArgs),
+    /// Harness hooks (installed by `gm agent setup`); not for direct use
+    #[command(hide = true)]
+    Hook {
+        /// The harness: claude-code.
+        harness: String,
+    },
     /// Sign in to a Gitmatrix server
     #[command(subcommand)]
     Auth(AuthCommand),

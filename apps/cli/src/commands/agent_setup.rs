@@ -281,6 +281,17 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
             false,
         ));
     }
+    // Claude Code: its prompts reach the step journal through the hook (CORE-241).
+    if harness.as_deref() == Some("claude-code") {
+        let path = ".claude/settings.json";
+        let current = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+        files.push(plan(
+            &root,
+            path,
+            super::hooks::with_claude_hook(&current),
+            false,
+        ));
+    }
     let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
     if !gitignore.lines().any(|l| l.trim() == profile::LOCAL_FILE) {
         let sep = if gitignore.is_empty() || gitignore.ends_with('\n') {

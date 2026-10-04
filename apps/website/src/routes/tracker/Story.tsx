@@ -321,6 +321,9 @@ export function Story() {
   );
 }
 
+/** Coverage like "hook:claude-code": a harness hook captured it. */
+const byHook = (coverage: string) => coverage === "hook" || coverage.startsWith("hook:");
+
 function testSummary(step: Step | null): { label: string; ok: boolean } | null {
   const tests = step?.context.tests ?? [];
   if (!tests.length) return null;
@@ -334,7 +337,7 @@ function coverageLabel(step: Step | null): string {
   if (!step) return "No context";
   if (step.deleted) return "Context removed";
   const { instructions, steering } = step.context.coverage;
-  return instructions === "hook" && steering === "hook" ? "Full context" : "Partial context";
+  return byHook(instructions) && byHook(steering) ? "Full context" : "Partial context";
 }
 
 function StepRow({ row, active, onOpen }: { row: StoryRow; active: boolean; onOpen: () => void }) {
@@ -507,7 +510,7 @@ function Context({ step }: { step: Step | null }) {
         <p className="m-0 text-body-sm whitespace-pre-wrap [overflow-wrap:anywhere]">{body}</p>
       </>
     );
-  const missing = context.coverage.instructions !== "hook" || context.coverage.steering !== "hook";
+  const missing = !byHook(context.coverage.instructions) || !byHook(context.coverage.steering);
   return (
     <aside aria-label="Context" className="min-w-0 order-first">
       {text("Why", context.why)}
@@ -532,9 +535,11 @@ function Context({ step }: { step: Step | null }) {
       )}
       {missing && (
         <p className="mt-3 mb-0 rounded-md bg-sunken p-2 text-micro text-ink-muted" role="note">
-          {context.harness && context.harness !== "custom"
-            ? `No ${context.harness} hook recorded this step's prompts and steering: the agent wrote them itself, so some may be missing.`
-            : "No harness hook recorded this step's prompts and steering: the agent wrote them itself, so some may be missing."}
+          Steering recorded by the agent; a harness hook isn&rsquo;t set up, so some context may be
+          missing.{" "}
+          {context.harness === "claude-code"
+            ? "Run `gm agent setup` in the agent's checkout to install the Claude Code hook."
+            : "Claude Code has a hook: run `gm agent setup` in its checkout."}
         </p>
       )}
     </aside>

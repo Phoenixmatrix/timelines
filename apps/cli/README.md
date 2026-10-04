@@ -771,6 +771,18 @@ gm context sync                                     # retries uploads a push cou
   It reconnects from the last step it printed; `--count N` stops after N, and
   a feed the reader can't see is an error rather than a retry.
 
+- **Harness hooks** capture what the person tells the agent (CORE-241). For
+  Claude Code, `gm agent setup` adds a `UserPromptSubmit` hook to
+  `.claude/settings.json` (`gm hook claude-code`, run only if gm is
+  installed). In a checkout working in a timeline it appends each prompt,
+  redacted, to the journal's `pending.json`: a session's first prompt as an
+  instruction, later ones as steering. The next `gm commit --context` or
+  `gm step` puts them first in its instructions and steering, marked `hook`,
+  sets coverage to `hook:claude-code` and clears them. The hook never prints
+  (Claude Code would add its output to the conversation) and never fails a
+  prompt. Without a hook, the agent records them itself (`agent`), and the
+  Story notes that some context may be missing.
+
 Reading it back, for an agent picking up the work or a person investigating:
 
 ```bash

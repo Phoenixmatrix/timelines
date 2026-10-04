@@ -234,6 +234,26 @@ another timeline.
 - `gm timeline use main` goes back to main. `gm timeline abandon` ends a
   timeline you started, when a person asks or the attempt is dead.
 
+### Steps: commit at meaningful points, with context
+
+In a timeline, record your work as **steps**: commit and push at each
+meaningful point (a working piece, a decision, a fix), not only at the end.
+People and other agents follow them live and read them later.
+
+- `gm step -m '<what this step does>' --context step.md` runs the repository's
+  fast checks (`gm test`), commits with the context and the test results, and
+  pushes. `gm commit --context step.md` plus `gm push` works too.
+- Write the context as Markdown with `## Why` (why this, this way),
+  `## Challenges` (what got in the way), `## Instructions` and `## Steering`
+  (one bullet each). Always include why. Never put secrets in it.
+- With the Claude Code hook installed (`gm agent setup`), the person's own
+  words reach the step by themselves, marked `hook`. Without a hook, record
+  the instructions you're following and every way the person steered you
+  under `## Instructions` and `## Steering` yourself; they're marked `agent`.
+- Resuming work? `gm log --context` and `gm context show <rev>` give earlier
+  steps' why and challenges; `gm steps --follow` shows other agents' steps as
+  they land.
+
 ## Projects and other agents
 
 - Claiming a parent leases its whole subtree. Delegate a sub-issue to another of

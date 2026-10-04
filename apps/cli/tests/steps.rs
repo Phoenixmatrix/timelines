@@ -644,3 +644,112 @@ fn gm_steps_lists_and_follows_a_timeline_live() {
     assert_ne!(code, 0);
     assert_eq!(value["error"]["code"], json!("not_found"), "{value}");
 }
+
+/// Runs `gm hook claude-code` with a UserPromptSubmit event on stdin.
+fn hook(s: &Sandbox, session: &str, prompt: &str, env: &[(&str, &str)]) -> (i32, String) {
+    use std::io::Write as _;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gm"));
+    command
+        .current_dir(s.work())
+        .args(["hook", "claude-code"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", s.root.join("config"))
+        .env("XDG_DATA_HOME", s.root.join("data"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().unwrap();
+    let event = json!({
+        "session_id": session,
+        "hook_event_name": "UserPromptSubmit",
+        "cwd": s.work(),
+        "prompt": prompt,
+    });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(event.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+    )
+}
+
+#[test]
+fn the_claude_code_hook_puts_the_persons_words_on_the_next_step() {
+    let s = Sandbox::new();
+    let timeline = [("GM_TIMELINE", "search")];
+    // Outside a timeline nothing is kept; the hook never prints or fails.
+    assert_eq!(hook(&s, "s1", "Not a step", &[]), (0, String::new()));
+    // In a timeline: the session's first prompt is an instruction, then steering.
+    hook(&s, "s1", "Rank search results by recency", &timeline);
+    hook(
+        &s,
+        "s1",
+        "Keep score as the tie-breaker; the key is gmx_abcdefghijklmnopqrst",
+        &timeline,
+    );
+    let (code, out) = hook(&s, "s1", "  ", &timeline);
+    assert_eq!((code, out), (0, String::new()));
+
+    git(
+        &s.root.join("seed"),
+        &["push", "-q", "origin", "main:timeline/search"],
+    );
+    s.ok(&["sync"], &timeline);
+    s.edit("rank.rs", "fn rank() {}\n");
+    let file = s.context_file("## Why\nRecency matters.\n\n## Steering\n- Noted the tie-breaker\n");
+    s.ok(
+        &["commit", "-m", "Rank by recency", "--context", &file],
+        &timeline,
+    );
+    s.ok(&["push"], &timeline);
+    eprintln!("DEBUG uploads {:?}", s.api.uploads());
+    eprintln!(
+        "DEBUG journal {:?}",
+        std::fs::read_dir(s.work().join(".git/gm/steps"))
+            .map(|d| d.map(|e| e.unwrap().file_name()).collect::<Vec<_>>())
+    );
+    let up = s.api.uploads()[0].clone();
+    assert_eq!(
+        up["instructions"],
+        json!([{"text": "Rank search results by recency", "source": "hook", "at": up["instructions"][0]["at"]}])
+    );
+    let steering = up["steering"].as_array().unwrap();
+    assert_eq!(steering.len(), 2, "{up}");
+    assert_eq!(steering[0]["source"], json!("hook"));
+    assert!(
+        steering[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Keep score as the tie-breaker")
+    );
+    assert!(
+        !steering[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("gmx_abcdefghijklmnopqrst"),
+        "redacted"
+    );
+    assert_eq!(
+        steering[1],
+        json!({"text": "Noted the tie-breaker", "source": "agent"})
+    );
+    assert_eq!(
+        up["coverage"],
+        json!({"instructions": "hook:claude-code", "steering": "hook:claude-code"})
+    );
+
+    // The step took them: the next one starts empty, still covered by the hook.
+    s.edit("rank.rs", "fn rank() { 1 }\n");
+    s.ok(&["commit", "-m", "Tweak", "--context", &file], &timeline);
+    s.ok(&["push"], &timeline);
+    let next = s.api.uploads()[1].clone();
+    assert!(next.get("instructions").is_none(), "{next}");
+    assert_eq!(next["coverage"]["steering"], json!("hook:claude-code"));
+}

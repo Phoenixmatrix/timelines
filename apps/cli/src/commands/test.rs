@@ -366,8 +366,8 @@ pub fn step(ctx: &Ctx, args: &cli::StepArgs) -> Result<Stepped> {
             t.failed
         ));
     }
-    // With no context file, the step still carries its tests.
-    let context = context.or_else(|| tests.as_ref().map(|_| json!({})));
+    // With no context file, the step still carries its tests and what a hook captured.
+    let context = context.or_else(|| Some(json!({})));
     let commit = local::commit_with(
         ctx,
         &cli::CommitArgs {
