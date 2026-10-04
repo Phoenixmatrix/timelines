@@ -287,6 +287,16 @@ export async function world(action: string, input: unknown): Promise<unknown> {
       const world = worldOf(args.world ?? "");
       return Object.fromEntries((await remoteOf(world, args.repo ?? "")).refs);
     }
+    case "sql": {
+      // Rows only machinery the world lacks would write (CI runs,
+      // deployments, wiki page sets), as that machinery would leave them.
+      const { statement, params = [] } = input as { statement: string; params?: unknown[] };
+      const world = worldOf(args.world ?? "");
+      const { results } = await world.env.DB.prepare(statement)
+        .bind(...params)
+        .all();
+      return results;
+    }
     default:
       throw new Error(`Unknown browser-test world action ${action}`);
   }

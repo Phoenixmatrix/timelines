@@ -27,7 +27,11 @@ export default defineConfig({
     !process.env.VITEST &&
       cloudflare({ persistState: { path: local.stateDir }, inspectorPort: false }),
   ],
-  server: { host: local.host, port: local.port, strictPort: true },
+  // The dev server's own port, strictly. Not under Vitest: the browser project
+  // (`extends: true`) would inherit `strictPort` onto its browser server, which
+  // starts at 63315 (`test.api`), so a second run elsewhere on this machine
+  // failed to start instead of taking the next free port.
+  server: process.env.VITEST ? {} : { host: local.host, port: local.port, strictPort: true },
   // Source highlighting loads late; discover its parsers before navigation,
   // rather than restarting the page when the dependency optimizer finds them.
   optimizeDeps: {

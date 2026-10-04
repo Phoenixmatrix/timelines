@@ -150,6 +150,18 @@ export class TestServer {
     await browserCommands.gmWorld("push", { world: this.#world(), repo, branch, commit });
   }
 
+  /**
+   * Run SQL against the world's database, for rows only machinery the world
+   * lacks would write (CI runs, deployments, wiki page sets), as it would.
+   */
+  async sql<T = Record<string, unknown>>(statement: string, ...params: unknown[]): Promise<T[]> {
+    return (await browserCommands.gmWorld("sql", {
+      world: this.#world(),
+      statement,
+      params,
+    })) as T[];
+  }
+
   #world(): string {
     if (!this.world)
       throw new Error("This test server has no world: start it with { world: true }");

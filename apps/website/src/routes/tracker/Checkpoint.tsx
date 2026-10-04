@@ -109,14 +109,17 @@ export function ReviveButton({
       <button
         type="button"
         className="mk-btn mk-btn--ghost mk-btn--sm"
-        disabled={busy}
+        // Not `disabled`: that would drop keyboard focus while it works.
+        aria-disabled={busy || undefined}
         aria-busy={busy || undefined}
         title={
           live
             ? "A preview is up; reviving rebuilds it from this checkpoint's commits."
             : "Rebuild this checkpoint's preview from its commits (migrations plus seed)."
         }
-        onClick={() => void revive()}
+        onClick={() => {
+          if (!busy) void revive();
+        }}
       >
         {busy ? "Reviving…" : "Revive preview"}
       </button>

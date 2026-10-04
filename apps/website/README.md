@@ -96,6 +96,11 @@ pattern, handler)`, a URLPattern pathname), then, with `{ world: true }`, to
   canned (`cannedFiles()` in `git.ts`). No model, index or CI runner exists
   there; the Knowledge coordinator is idle. `atlasFixtureRepo()` (`atlas.ts`)
   publishes the Atlas fixture the way the non-AI E2E does.
+- `server.sql()` writes the rows only machinery the world lacks would write
+  (CI runs and jobs, deployments, wiki page sets, the push log), as it would.
+  `timelines.ts` builds on it: a timeline across repositories with work on
+  its bookmarks, checkpoints, approval requests, those rows, and a merge
+  run's end that moves a real landing on (`mergeRunEnded`).
 - `press()`, `pressUntil()` and `tap()` (`focus.ts`) drive the keyboard and
   touch; `browserCommands.emulateMedia()` sets reduced motion or a colour
   scheme; `page.viewport(w, h)` resizes.
