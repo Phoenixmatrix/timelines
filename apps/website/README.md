@@ -1984,7 +1984,11 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   gate. No job consumes another's artifacts, and keeping them in one stage avoids
   a scheduler barrier. Real AI verification is an explicit agent command.
   Checkpoints of a timeline get a preview of the app
-  ([Gitmatrix's own previews](#gitmatrixs-own-previews)).
+  ([Gitmatrix's own previews](#gitmatrixs-own-previews)). Each push to a
+  timeline also gets a [step run](#step-runs) of just `step-check` (`vp check`:
+  format, lint, types) and `step-unit` (the website's unit tests related to the
+  step's changes, `vp test run --project unit --changed`), about 25 s locally;
+  `gm test` runs the same two jobs before `gm step` commits.
 - **CI image.** Besides the toolchains, `ci/Dockerfile` bakes Chromium's
   headless shell for the browser-mode tests (CORE-248), with its system
   libraries, at its `PLAYWRIGHT_VERSION`: about 540 MB of the image (260 MB

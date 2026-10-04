@@ -22,10 +22,17 @@
 # (`on: preview`, the preview and preview-teardown jobs below), the reference
 # implementation of the preview contract; apps/website/README.md, "Gitmatrix's
 # own previews". Preview runs run only those two jobs.
+#
+# Steps (CORE-237): every push to a timeline/<slug> bookmark also gets a step
+# run, the light check an agent's step deserves (CORE-235): only the step-*
+# jobs below. Lint and types, and the website's unit tests related to the
+# files the step changed; no E2E, builds or previews. `gm test` runs the same
+# jobs locally (local: true) before `gm step` commits.
 on:
   push:
     coalesce_after: 4
   preview: {}
+  step: {}
 
 # Four independent jobs must not each launch 24 compiler workers on this host.
 # Leave CPU capacity for JavaScript tests and the live server during cold builds.
@@ -33,6 +40,37 @@ env:
   CARGO_BUILD_JOBS: "4"
 
 jobs:
+  step-check:
+    on: step
+    local: true
+    instance: standard-4
+    timeout_minutes: 15
+    steps:
+      # Locally the checkout is already installed and typed.
+      - name: Install
+        run: '[ -n "${GITMATRIX_LOCAL:-}" ] || { pnpm install --frozen-lockfile && vp run website#cf-typegen; }'
+      - name: Format, lint, type check
+        run: vp check
+
+  step-unit:
+    on: step
+    local: true
+    instance: standard-2
+    timeout_minutes: 15
+    steps:
+      - name: Install
+        run: '[ -n "${GITMATRIX_LOCAL:-}" ] || { pnpm install --frozen-lockfile && vp run website#cf-typegen; }'
+      # The step's own changes: locally the working copy against its parent
+      # (git's HEAD in a gm checkout); in a step run the commit against its
+      # parent, or everything when a shallow clone lacks it.
+      - name: Unit tests related to the step's changes
+        run: |
+          cd apps/website
+          if [ -n "${GITMATRIX_LOCAL:-}" ]; then since=HEAD
+          elif git rev-parse -q --verify HEAD~1 >/dev/null; then since=HEAD~1
+          else since=""; fi
+          vp test run --project unit ${since:+--changed=$since} --passWithNoTests
+
   check:
     instance: standard-4
     steps:
