@@ -1,12 +1,20 @@
 import { classHighlighter, highlightTree } from "@lezer/highlight";
+import { parser as yamlParser } from "@lezer/yaml";
+import { parseAllDocuments } from "yaml";
 import { languageAdapters } from "./index.ts";
 import { MAX_SOURCE_BYTES } from "./limits.ts";
 import type { SemanticLanguage, SemanticSource } from "./types.ts";
 
 export type HighlightResult = {
-  language: SemanticLanguage;
+  language: SemanticLanguage | "yaml";
   lines: SemanticSource["tokens"][];
 };
+
+// Syntax-only languages need not implement semantic change extraction.
+const highlightAdapters = [
+  ...languageAdapters,
+  { language: "yaml" as const, extensions: [".yaml", ".yml"], parser: yamlParser },
+];
 
 /** Parse syntax only, with UTF-16 token offsets relative to each original line. */
 export function highlightLines(path: string, text: string): HighlightResult | null {
@@ -14,7 +22,7 @@ export function highlightLines(path: string, text: string): HighlightResult | nu
   const dot = path.lastIndexOf(".");
   if (dot < filenameStart) return null;
   const extension = path.slice(dot).toLowerCase();
-  const adapter = languageAdapters.find((candidate) => candidate.extensions.includes(extension));
+  const adapter = highlightAdapters.find((candidate) => candidate.extensions.includes(extension));
   if (
     !adapter ||
     text.length > MAX_SOURCE_BYTES ||
@@ -25,6 +33,14 @@ export function highlightLines(path: string, text: string): HighlightResult | nu
   }
 
   try {
+    // Lezer recovers even unterminated YAML quotes without error nodes. Validate
+    // the stream first so malformed YAML stays entirely plain text.
+    if (
+      adapter.language === "yaml" &&
+      parseAllDocuments(text).some((document) => document.errors.length > 0)
+    ) {
+      return null;
+    }
     const tree = adapter.parser.parse(text);
     // Match the file viewer's text.replace(/\n$/, "").split("\n") policy without
     // copying source lines. Keep CR characters and omit only the final LF.

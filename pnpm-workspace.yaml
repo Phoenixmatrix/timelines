@@ -75,6 +75,7 @@ catalog:
   agents: ^0.26.0
   ai: ^7.0.127
   workers-ai-provider: ^4.0.0
+  "@lezer/yaml": ^1.0.4
 overrides:
   vite@*: "catalog:"
 peerDependencyRules:

@@ -36,6 +36,69 @@ describe("file syntax highlighting", () => {
     }
   }
 
+  for (const extension of [".yaml", ".yml"]) {
+    it(`highlights ${extension} keys, strings and comments with shared token classes`, () => {
+      const result = highlightLines(
+        `directory.with.dots/FILE${extension.toUpperCase()}`,
+        '# build\nname: "demo"\n',
+      );
+      expect(result?.language).toBe("yaml");
+      expect(result?.lines[0]).toEqual([{ from: 0, to: 7, className: "tok-comment" }]);
+      expect(result?.lines[1]).toContainEqual({
+        from: 0,
+        to: 4,
+        className: expect.stringContaining("tok-propertyName"),
+      });
+      expect(result?.lines[1]).toContainEqual({ from: 6, to: 12, className: "tok-string" });
+    });
+  }
+
+  it.each([
+    "key: [unfinished",
+    'key: "unterminated',
+    "key: 'unterminated",
+    "key:\n  child: ok\n bad: nope\n",
+    "key:\n\tchild: nope\n",
+    "key: 1\nkey: 2\n",
+    '---\nkey: valid\n---\nkey: "unterminated',
+  ])("leaves invalid YAML entirely plain: %j", (text) => {
+    expect(highlightLines("ci.yml", text)).toBeNull();
+  });
+
+  it.each(["a", "界"])("bounds YAML by UTF-8 bytes, including %s", (character) => {
+    const width = new TextEncoder().encode(character).length;
+    const text = `#${character.repeat(Math.floor((MAX_SOURCE_BYTES - 1) / width))}`;
+    expect(new TextEncoder().encode(text).length).toBe(MAX_SOURCE_BYTES);
+    expect(highlightLines("config.yaml", text)?.lines).toEqual([
+      [{ from: 0, to: text.length, className: "tok-comment" }],
+    ]);
+    expect(highlightLines("config.yaml", `${text} `)).toBeNull();
+  });
+
+  it("preserves YAML multiline strings, Unicode, CRLF and blank source rows", () => {
+    const text = 'key: "😀\r\n  界"\r\n\r\n';
+    const originals = text.replace(/\n$/, "").split("\n");
+    const result = highlightLines("config.yaml", text)!;
+    expect(result.lines).toHaveLength(3);
+    expect(
+      result.lines.map((tokens, index) =>
+        tokens
+          .filter((token) => token.className === "tok-string")
+          .map((token) => originals[index]!.slice(token.from, token.to)),
+      ),
+    ).toEqual([['"😀\r'], ['  界"'], []]);
+  });
+
+  it("accepts YAML streams with anchors, aliases, custom tags and block scalars", () => {
+    const result = highlightLines(
+      "config.yaml",
+      'defaults: &base\n  name: "demo"\ncopy: *base\nscript: |\n  echo hello\n---\nvalue: !custom "tagged"\n',
+    );
+    expect(result?.language).toBe("yaml");
+    expect(result?.lines[1]).toContainEqual({ from: 8, to: 14, className: "tok-string" });
+    expect(result?.lines[6]).toContainEqual({ from: 15, to: 23, className: "tok-string" });
+  });
+
   it("falls back for unknown filenames, dotted directories and binary text", () => {
     for (const path of ["README", "file.unknown", "dir.ts/README", "dir.ts\\README", "dir.ts/"]) {
       expect(highlightLines(path, "const value = 1;")).toBeNull();

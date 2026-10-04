@@ -36,6 +36,7 @@
     "@lezer/python": "catalog:",
     "@lezer/rust": "catalog:",
     "@lezer/xml": "catalog:",
+    "@lezer/yaml": "catalog:",
     "@phosphor-icons/react": "catalog:",
     "agents": "catalog:",
     "ai": "catalog:",

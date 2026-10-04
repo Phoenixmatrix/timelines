@@ -447,16 +447,20 @@ Go, Markdown, XML, JSON, HTML and CSS:
   types, cross-file symbol identity, macro expansion, runtime effects or inferred
   author intent. Parent and child changes can both appear.
 
-The repository file view uses those same grammars and the Changes tab's shared
-token renderer in both themes. Source appears immediately as selectable plain
+The repository file view uses those same grammars, plus YAML (`.yaml`/`.yml`) via
+`@lezer/yaml`, and the Changes tab's shared token renderer in both themes.
+Source appears immediately as selectable plain
 text; a dedicated Web Worker applies syntax colors without parsing on the UI
 thread. Source text selection and the knowledge rail remain available.
-Highlighting is limited to 256 KiB of UTF-8 source. Unknown extensions,
-truncated/oversized files and unavailable or failed workers retain plain text;
+Highlighting is limited to 256 KiB of UTF-8 source. Unknown extensions, malformed
+YAML, truncated/oversized files and unavailable or failed workers retain plain text;
 binary files retain the existing not-shown notice. Navigation cancels the worker,
 stale results cannot color another file, and a five-second watchdog terminates
 unfinished worker loading/parsing. The worker uses only the syntax tree, not
 semantic fact extraction.
+YAML streams are validated before coloring, including every document in a
+multi-document file: Lezer's recovery grammar alone accepts some invalid syntax.
+YAML support is syntax-only; it does not add semantic change extraction or filters.
 
 Click a line number to select it; Shift-click another to extend the range in
 either direction. On touch screens, choose **Extend range**, then tap the other

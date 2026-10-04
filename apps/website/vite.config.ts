@@ -37,6 +37,8 @@ export default defineConfig({
       "@lezer/python",
       "@lezer/rust",
       "@lezer/xml",
+      "@lezer/yaml",
+      "yaml",
     ],
   },
   test: {
