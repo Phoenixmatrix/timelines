@@ -18,6 +18,7 @@ import { closedIssues, trackerActivity } from "./tracker.ts";
 import { registryAudit, registryProxyCache } from "./registry.ts";
 import { authHygiene } from "./auth-hygiene.ts";
 import { releaseNotes } from "./release-notes.ts";
+import { pushLog } from "./push-log.ts";
 
 // Items are opaque to the engine: each cleanup gets back what it selected.
 // oxlint-disable-next-line typescript/no-explicit-any
@@ -39,6 +40,7 @@ const CLEANUPS: Partial<Record<CategoryId, CategoryCleanup<any>>> = {
   "assistant-chats": assistantChats,
   "release-notes": releaseNotes,
   "auth-hygiene": authHygiene,
+  "push-log": pushLog,
 };
 
 export function cleanupFor(id: string): CategoryCleanup | undefined {

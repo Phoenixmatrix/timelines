@@ -79,11 +79,12 @@ export async function listRefs(env: Env, artifactsName: string, remote: string):
   return result;
 }
 
-/** HEAD, branches and tags as `ls-refs` lists them: tags unpeeled, with `peeled`. */
+/** HEAD, branches and tags (or the refs under `prefixes`; [] for every ref) as `ls-refs` lists them: tags unpeeled, with `peeled`. */
 export async function lsRefs(
   env: Env,
   artifactsName: string,
   remote: string,
+  prefixes?: readonly string[],
 ): Promise<LsRefsEntry[]> {
   const token = await upstreamToken(env, artifactsName, "read");
   const response = await fetch(`${remote}/git-upload-pack`, {
@@ -94,7 +95,7 @@ export async function lsRefs(
       accept: "application/x-git-upload-pack-result",
       "git-protocol": "version=2",
     },
-    body: lsRefsRequest(),
+    body: lsRefsRequest(prefixes),
   });
   if (!response.ok) throw new Error(`ls-refs failed with HTTP ${response.status}`);
   return parseLsRefs(new Uint8Array(await response.arrayBuffer()));

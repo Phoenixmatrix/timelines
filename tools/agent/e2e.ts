@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { join } from "node:path";
@@ -15,6 +15,7 @@ import type {
   CiRunList,
   CreatedAccessToken,
   HistoryPage,
+  RefUpdateList,
   RepoDetail,
 } from "../../apps/website/shared/api.ts";
 import type { Deployment, DeploymentList } from "../../apps/website/shared/deployments.ts";
@@ -2839,6 +2840,154 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await browser.close();
     }
     record({ written: Object.keys(written), dry: dry.items, removed: removed.items });
+  });
+
+  await scenario("push-log-retention-and-unreachable-git", async () => {
+    // CORE-202 with real Artifacts, in jun's own account (the cleanup is
+    // per account): a deleted branch leaves a commit no ref reaches.
+    // Artifacts keeps it (it still serves it by id) and can't prune it, so
+    // it's measured, not deleted: the usage figure counts its incompressible
+    // blob. Push log retention, a year on, removes exactly the entries its dry
+    // run listed, keeps main's latest, and every reachable ref, commit and
+    // object is identical before and after.
+    const owner = "jun";
+    const token = fixtures.tokens.jun;
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    const name = `agent-unreachable-${randomUUID().slice(0, 8)}`;
+    const remote = `${ctx.origin}/${owner}/${name}.git`;
+    const dir = join(work, name);
+    const run = promisify(execFile);
+    const gitEnv: NodeJS.ProcessEnv = {
+      ...ctx.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: `http.${ctx.origin}/.extraHeader`,
+      GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+    };
+    for (const key of Object.keys(gitEnv))
+      if (/^GIT_CONFIG_(?:KEY|VALUE)_[1-9]/.test(key)) delete gitEnv[key];
+    const git = async (args: string[], cwd = dir) =>
+      (
+        await run("git", args, { cwd, env: gitEnv, timeout: 90_000, maxBuffer: 16 << 20 })
+      ).stdout.trim();
+    await json(`/api/repos`, token, "POST", { owner, name, visibility: "private" }, [201]);
+    await mkdir(dir);
+    await git(["init", "--initial-branch=main"]);
+    await git(["config", "user.name", "Agent Fixture"]);
+    await git(["config", "user.email", "agent@gitmatrix.invalid"]);
+    await writeFile(join(dir, "README.md"), "Reachable history.\n");
+    await git(["add", "."]);
+    await git(["commit", "-m", "Reachable"]);
+    await git(["push", remote, "main"]);
+    await git(["checkout", "-b", "doomed"]);
+    const blobBytes = 96 * 1024;
+    await writeFile(join(dir, "noise.bin"), randomBytes(blobBytes));
+    await git(["add", "."]);
+    await git(["commit", "-m", "Only the deleted branch reaches this"]);
+    const doomed = await git(["rev-parse", "HEAD"]);
+    // The push log records a push after answering it, by comparing the refs
+    // with the last it saw: let it see the branch before it goes.
+    const updates = async () =>
+      (await json<RefUpdateList>(`/api/repos/${owner}/${name}/ref-updates`, token)).updates;
+    await git(["push", remote, "doomed"]);
+    await poll(updates, (list) => list.length === 2, "the push log's branch entry");
+    await git(["push", remote, ":doomed"]);
+
+    /** Every ref, every reachable object, and a full fsck, from a fresh mirror clone. */
+    const reachable = async (label: string) => {
+      const mirror = join(work, `${name}-${label}.git`);
+      await git(["clone", "--mirror", remote, mirror], work);
+      await git(["fsck", "--full", "--strict"], mirror);
+      const refs = await git(["for-each-ref", "--format=%(refname) %(objectname)"], mirror);
+      const objects = (await git(["rev-list", "--all", "--objects"], mirror)).split("\n").sort();
+      const log = await git(["log", "--all", "--format=%H %T %P %an %ae %at %s"], mirror);
+      return {
+        refs,
+        objects: createHash("sha256").update(objects.join("\n")).digest("hex"),
+        count: objects.length,
+        log,
+      };
+    };
+    const before = await reachable("before");
+    assert(!before.refs.includes("doomed"), "The branch is deleted");
+    assert(!before.log.includes(doomed), "Its commit is unreachable");
+
+    // Artifacts still serves the unreachable commit by id: it keeps it.
+    const probe = join(work, `${name}-probe`);
+    await mkdir(probe);
+    await git(["init", "--bare"], probe);
+    await git(["fetch", remote, doomed], probe);
+    assert.equal(await git(["cat-file", "-t", doomed], probe), "commit");
+
+    const logged = await poll(updates, (list) => list.length === 3, "the push log's entries");
+    assert.deepEqual(
+      logged
+        .map((u) => [u.ref, Boolean(u.old), Boolean(u.new)] as const)
+        .toSorted((a, b) => `${a[0]}${a[1]}`.localeCompare(`${b[0]}${b[1]}`)),
+      [
+        ["refs/heads/doomed", false, true],
+        ["refs/heads/doomed", true, false],
+        ["refs/heads/main", false, true],
+      ],
+    );
+    interface Figure {
+      construct: string;
+      item: string;
+      metric: string;
+      quantity: number;
+      estimated: number;
+      method: string;
+    }
+    const unreachable = async () => {
+      const { figures } = await json<{ figures: Figure[] }>("/api/dev/usage", secret, "POST", {
+        account: owner,
+      });
+      const figure = (metric: string) =>
+        figures.find(
+          (f) => f.construct === "artifacts" && f.item === "repositories" && f.metric === metric,
+        );
+      return { bytes: figure("unreachable_bytes"), objects: figure("unreachable_objects") };
+    };
+    const measured = await unreachable();
+    assert(
+      measured.bytes &&
+        measured.bytes.quantity >= blobBytes &&
+        measured.bytes.quantity < blobBytes + 8192,
+      `The incompressible blob only the deleted branch reached is measured: ${JSON.stringify(measured.bytes)}`,
+    );
+    assert.equal(measured.bytes.estimated, 1, "Unreachable bytes are labelled estimated");
+    assert.match(measured.bytes.method, /can't prune/);
+    assert.equal(measured.objects?.quantity, 3, "Its commit, tree and blob");
+
+    const cleanup = async (dryRun: boolean) =>
+      (
+        await json<{ run: { status: string; items: number; bytes: number } }>(
+          "/api/dev/retention",
+          secret,
+          "POST",
+          { account: owner, categories: { "push-log": { days: 365 } }, daysAhead: 400, dryRun },
+        )
+      ).run;
+    const dry = await cleanup(true);
+    assert.equal(dry.status, "succeeded");
+    assert.equal((await updates()).length, 3, "A dry run removes nothing");
+    const real = await cleanup(false);
+    assert.equal(real.status, "succeeded");
+    assert.deepEqual([real.items, real.bytes], [dry.items, dry.bytes], "The run is its dry run");
+    const kept = await updates();
+    assert.deepEqual(
+      kept.map((u) => u.ref),
+      ["refs/heads/main"],
+      "Only main's latest entry, which explains its commit, stays",
+    );
+
+    const after = await reachable("after");
+    assert.deepEqual(after, before, "Reachable history is identical before and after");
+    // What nothing names any more isn't seen: the limitation the figure states.
+    assert.equal((await unreachable()).bytes?.quantity, 0);
+    record({ unreachable: measured, objects: before.count, cleanup: { dry, real } });
   });
 
   await scenario("browser-personas-persisted-product-state", async () => {

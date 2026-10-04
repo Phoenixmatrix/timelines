@@ -103,8 +103,13 @@ export const CATEGORIES = [
     scope: "account",
     control: "policy",
     label: "Push log",
-    description: "Ref update records older than the given days, and change refs nothing uses.",
-    never: ["Commits, refs or any reachable git history"],
+    description:
+      "Push log entries older than the given days, and records of changes on branches or bookmarks that no longer exist, last seen before then.",
+    never: [
+      "Commits, refs or any git history",
+      "The latest push log entry of each branch or tag that exists",
+      "A change's record on a branch or tag that exists, or the push log entry it points to",
+    ],
     thresholds: [days("days", "Days after the push", 365)],
   },
   {
@@ -113,8 +118,11 @@ export const CATEGORIES = [
     control: "policy",
     label: "Unreachable git data",
     description:
-      "Git objects no ref reaches any more (deleted branches, landed or abandoned timeline bookmarks), as far as Artifacts allows.",
-    never: ["Reachable history of any branch, tag or bookmark"],
+      "Git objects no ref reaches any more (deleted branches, landed or abandoned timeline bookmarks). Artifacts can't prune them yet: they are measured in the usage report, never deleted.",
+    never: [
+      "Reachable history of any branch, tag or bookmark",
+      "Anything, until Artifacts can prune",
+    ],
     thresholds: [days("days", "Days after becoming unreachable", 30)],
   },
   {

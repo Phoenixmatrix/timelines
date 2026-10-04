@@ -57,7 +57,10 @@ export function parseLsRefs(bytes: Uint8Array): LsRefsEntry[] {
   return refs;
 }
 
-export function lsRefsRequest(): string {
+/** HEAD, branches and tags; an empty list asks for every ref. */
+export const LISTED_REFS = ["HEAD", "refs/heads/", "refs/tags/"];
+
+export function lsRefsRequest(prefixes: readonly string[] = LISTED_REFS): string {
   return (
     pkt("command=ls-refs\n") +
     pkt("agent=gitmatrix\n") +
@@ -66,9 +69,7 @@ export function lsRefsRequest(): string {
     pkt("peel\n") +
     pkt("symrefs\n") +
     pkt("unborn\n") +
-    pkt("ref-prefix HEAD\n") +
-    pkt("ref-prefix refs/heads/\n") +
-    pkt("ref-prefix refs/tags/\n") +
+    prefixes.map((prefix) => pkt(`ref-prefix ${prefix}\n`)).join("") +
     FLUSH
   );
 }

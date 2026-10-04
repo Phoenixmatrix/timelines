@@ -2509,6 +2509,29 @@ CORE-206, `worker/retention/cleanups/`:
   notes for an older release again (it would pay a model to rebuild them),
   while releases still stored stay current.
 
+### Push log and unreachable git data
+
+- **Push log** (`push-log`, CORE-202, `worker/retention/cleanups/push-log.ts`):
+  `ref_updates` entries older than the policy's days (365 by default), and
+  `change_refs` rows on refs that no longer exist (deleted branches, landed or
+  abandoned timeline bookmarks) last seen before then. It never removes the
+  latest entry of a branch or tag that exists, a change's record on one, or
+  the entry such a record points to (`first_update_id`, which would cascade).
+  Git itself is never touched.
+- **Unreachable git data** (`unreachable-git`): a deleted branch, a force
+  push or an ended timeline's bookmark leaves commits no ref reaches.
+  Artifacts keeps them (it still serves an unreachable commit by id) and has
+  no gc, prune, repack or size API, so this category has no cleanup: it can
+  be configured but never deletes anything. The usage collection measures it
+  instead (`worker/git/unreachable.ts`): per repository whose push log saw a
+  ref leave a commit, one protocol v2 fetch wanting those commits (at most 256,
+  newest first) with every ref tip as a `have` returns exactly the objects only
+  they reach; the pack is counted as it streams (at most 512 MiB or 15 s, else
+  a lower bound) into `artifacts/repositories` `unreachable_bytes` and
+  `unreachable_objects`, both estimated. Commits that left a ref before the
+  push log began (2026-10-03), or whose entries the push log cleanup removed,
+  aren't seen.
+
 ### Usage and costs
 
 **Settings → Usage & costs** (`/settings/usage?owner=<slug>`, an account's
