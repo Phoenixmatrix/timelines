@@ -730,6 +730,23 @@ None: CORE-62 settled the last questions on 2026-10-02. Deferred on purpose:
 pruning landed work, best-of-N, secrets per environment, and CORE-42's time
 axis.
 
+## Timelines as Artifacts forks (CORE-252, CORE-255)
+
+Decided on 2026-10-04: timeline work moves out of the canonical repository into
+a repository of its own per (repository, timeline), and the owner chose
+CORE-255's compact landing over CORE-252's real merge, so CORE-255 carries the
+work and will amend the Decisions table above. CORE-252's research is in
+[TIMELINE-FORKS-RESEARCH.md](TIMELINE-FORKS-RESEARCH.md): the Artifacts fork
+facts, the inventory of everything that reads `timeline/<slug>`, and two owner
+decisions:
+
+- **Git access:** a timeline has its own URL, `/<owner>/<repo>@<slug>.git`,
+  with permissions inherited from the repository; pushing `timeline/*` to the
+  canonical URL is refused with a hint.
+- **Ending:** a timeline's repository becomes read-only when it lands or is
+  abandoned, then is deleted 30 days after landing and 90 after abandoning,
+  configurable in settings.
+
 ## Sources
 
 Sources were consulted on 2026-10-02. Cloudflare's Worker Previews launched ten
