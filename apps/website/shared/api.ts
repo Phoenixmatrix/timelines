@@ -591,6 +591,8 @@ export interface CiJob {
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;
+  /** When retention removed this job's log text; null while it's kept. */
+  logsRemovedAt: string | null;
   steps: CiStep[];
 }
 
@@ -610,6 +612,8 @@ export interface CiLogs {
   /** Pass back as `after` to fetch only newer output. */
   next: number;
   done: boolean;
+  /** When retention removed the log text (no chunks follow); null while it's kept. */
+  removedAt: string | null;
 }
 
 /** Latest run per commit, for status dots in history. */

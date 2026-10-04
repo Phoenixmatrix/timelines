@@ -495,7 +495,8 @@ function useJobLog(owner: string, name: string, job: CiJob) {
   const active = isActive(job.status);
 
   useEffect(() => {
-    if (log.done && !active) return;
+    // Retention removed the text: there's nothing to fetch.
+    if ((log.done && !active) || job.logsRemovedAt) return;
     let stopped = false;
     const timer = setTimeout(
       async () => {
@@ -522,7 +523,7 @@ function useJobLog(owner: string, name: string, job: CiJob) {
       stopped = true;
       clearTimeout(timer);
     };
-  }, [owner, name, job.id, log, active]);
+  }, [owner, name, job.id, job.logsRemovedAt, log, active]);
 
   return log;
 }
@@ -541,6 +542,7 @@ function StepLog({
   time,
   text,
   open,
+  removed,
 }: {
   title: string;
   status: CiJob["steps"][number]["status"];
@@ -548,6 +550,8 @@ function StepLog({
   time: string;
   text: string;
   open: boolean;
+  /** Retention removed the job's log text. */
+  removed: boolean;
 }) {
   const pre = useRef<HTMLPreElement>(null);
   // Follow the tail while the step is running.
@@ -573,7 +577,11 @@ function StepLog({
         </pre>
       ) : (
         <p className="m-0 bg-sunken px-4 py-3 text-body-sm text-ink-faint">
-          {status === "pending" || status === "skipped" ? "Did not run." : "No output."}
+          {status === "pending" || status === "skipped"
+            ? "Did not run."
+            : removed
+              ? "Output removed by retention."
+              : "No output."}
         </p>
       )}
     </details>
@@ -600,6 +608,11 @@ function JobPanel({ job }: { job: CiJob }) {
           {job.error}
         </p>
       )}
+      {job.logsRemovedAt && (
+        <p className="m-0 border-b border-line-soft bg-sunken px-4 py-2.5 text-body-sm text-ink-muted">
+          Logs removed by retention on {fullDate(job.logsRemovedAt)}.
+        </p>
+      )}
       {(setup || job.startedAt) && (
         <StepLog
           title="Set up"
@@ -608,6 +621,7 @@ function JobPanel({ job }: { job: CiJob }) {
           time=""
           text={setup}
           open={false}
+          removed={job.logsRemovedAt !== null}
         />
       )}
       {job.steps.map((step) => (
@@ -619,6 +633,7 @@ function JobPanel({ job }: { job: CiJob }) {
           time={duration(step.startedAt, step.finishedAt)}
           text={log.byStep.get(step.position) ?? ""}
           open={step.status === "running" || step.status === "failed"}
+          removed={job.logsRemovedAt !== null}
         />
       ))}
     </section>

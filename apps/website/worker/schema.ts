@@ -682,6 +682,8 @@ export interface Database {
     finished_at: string | null;
     /** Set when a job in a concurrency group took the group's slot. */
     concurrency_claimed_at: Generated<string | null>;
+    /** When retention removed its log text (CORE-200). */
+    logs_removed_at: Generated<string | null>;
   };
   ci_steps: {
     job_id: string;

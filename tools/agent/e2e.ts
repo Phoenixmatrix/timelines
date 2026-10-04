@@ -1412,6 +1412,111 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
+  await scenario("ci-retention-removes-logs-and-runs", async () => {
+    // CORE-200, in the real runtime: two finished runs on one branch, moved
+    // 40 days back; a manual dry run then run of "ci-logs" removes their log
+    // text (the run page, the logs API and `gm runs` say so), then "ci-runs"
+    // keeping one run per ref removes the older run (its page says it was
+    // removed by retention) and keeps the latest.
+    const branch = `agent-ci-retention-${randomUUID().slice(0, 6)}`;
+    const jobs = { say: { steps: [{ run: "printf 'retention marker\\n'" }] } };
+    const older = await pushPipeline(jobs, branch);
+    await poll(() => runDetail(older), terminal, "older retention run");
+    const newer = (
+      await json<{ number: number }>(`${api}/ci/runs`, ownerToken, "POST", { ref: branch }, [201])
+    ).number;
+    const latest = await poll(() => runDetail(newer), terminal, "newer retention run");
+    assert.equal(latest.status, "succeeded");
+    await json("/api/dev/ci-age", ctx.env.GITMATRIX_AGENT_SECRET ?? "", "POST", {
+      owner: repo.owner,
+      name: repo.name,
+      numbers: [older, newer],
+      days: 40,
+    });
+    const runs = `/api/accounts/${repo.owner}/retention/runs`;
+    interface Run {
+      id: number;
+      status: string;
+      dryRun: boolean;
+      items: number;
+      bytes: number;
+      categories: { category: string; status: string; items: number; error: string | null }[];
+    }
+    const retention = async (dryRun: boolean, category: string, thresholds: object) => {
+      const started = await json<Run>(
+        runs,
+        ownerToken,
+        "POST",
+        { dryRun, categories: [category], thresholds: { [category]: thresholds } },
+        [202],
+      );
+      const done = await poll(
+        () => json<Run>(`${runs}/${started.id}`, ownerToken),
+        (r) => r.status !== "queued" && r.status !== "running",
+        `retention run ${started.id}`,
+      );
+      assert.equal(done.status, "succeeded", JSON.stringify(done));
+      return done;
+    };
+    const dry = await retention(true, "ci-logs", { days: 30 });
+    assert(dry.items >= 2 && dry.bytes > 0, `the dry run lists both jobs' logs: ${dry.items}`);
+    const removed = await retention(false, "ci-logs", { days: 30 });
+    assert.equal(removed.items, dry.items, "the run removes what the dry run listed");
+    assert.equal(removed.bytes, dry.bytes);
+    for (const number of [older, newer]) {
+      const run = await json<CiRunDetail>(`${api}/ci/runs/${number}`, ownerToken);
+      const job = run.jobs[0]!;
+      assert(job.logsRemovedAt, `run #${number}: the job records the removal`);
+      const logs = await json<CiLogs>(`${api}/ci/jobs/${job.id}/logs`, ownerToken);
+      assert.deepEqual([logs.chunks, logs.done, logs.removedAt], [[], true, job.logsRemovedAt]);
+    }
+    const cliLogs = JSON.parse(await gm(["runs", "logs", String(newer), "-R", fullName])) as {
+      jobs: { log: string; logsRemovedAt?: string }[];
+    };
+    assert(cliLogs.jobs[0]?.logsRemovedAt, "gm runs logs reports the removal");
+    assert.equal((await retention(false, "ci-logs", { days: 30 })).items, 0, "idempotent");
+
+    const pruned = await retention(false, "ci-runs", { days: 30, keepLatest: 1 });
+    assert(pruned.items >= 1, "the older run goes");
+    const gone = await request(`${api}/ci/runs/${older}`, ownerToken, "GET", undefined, [404]);
+    assert.match(gone, new RegExp(`Run #${older} was removed by retention`));
+    await gm(
+      ["runs", "show", String(older), "-R", fullName],
+      "marco",
+      work,
+      /removed by retention/,
+    );
+    assert.equal((await json<CiRunDetail>(`${api}/ci/runs/${newer}`, ownerToken)).number, newer);
+    record({ older, newer, dry, removed, pruned });
+
+    const browserTimeout = 15_000;
+    const expect = playwrightExpect.configure({ timeout: browserTimeout });
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ baseURL: ctx.origin });
+    const page = await context.newPage();
+    page.setDefaultTimeout(browserTimeout);
+    try {
+      await page.goto("/signin");
+      await page.getByRole("button", { name: /Continue as marco/i }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      await page.goto(`/${fullName}/ci/${newer}`);
+      await expect(page.getByText(/Logs removed by retention on /)).toBeVisible();
+      await expect(page.getByText("Output removed by retention.").first()).toBeAttached();
+      await page.screenshot({ path: join(ctx.artifacts, "ci-retention-run.png"), fullPage: true });
+      await page.goto(`/${fullName}/ci/${older}`);
+      await expect(page.getByText(`Run #${older} was removed by retention.`)).toBeVisible();
+      record({ browser: { logsRemovedShown: true, removedRunShown: true } });
+    } catch (error) {
+      await page
+        .screenshot({ path: join(ctx.artifacts, "ci-retention-failure.png"), fullPage: true })
+        .catch(() => {});
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+  });
+
   // CORE-77: a timeline lands through the queue. The merge job and the gates
   // run on the local runner `vp dev` starts per job: the merge job fetches
   // its landing credential with its job token, merges the checkpoint into

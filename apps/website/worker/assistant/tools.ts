@@ -461,7 +461,13 @@ export function buildTools(context: ToolContext) {
         for (let page = 0; page < 20; page++) {
           const r = await api("GET", `${repoApi(repo)}/ci/jobs/${enc(job)}/logs?after=${after}`);
           if (!r.ok) return failed(r);
-          const body = r.body as { chunks: { text: string }[]; next: number; done: boolean };
+          const body = r.body as {
+            chunks: { text: string }[];
+            next: number;
+            done: boolean;
+            removedAt?: string | null;
+          };
+          if (body.removedAt) return { removedByRetentionAt: body.removedAt, output: "" };
           text += body.chunks.map((c) => c.text).join("");
           if (!body.chunks.length || body.next === after) break;
           after = body.next;

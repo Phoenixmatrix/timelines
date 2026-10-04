@@ -274,7 +274,8 @@ describe("the cleanup engine with expired preview records", () => {
       dryRun: true,
       categories: [
         { id: "preview-records", thresholds: {} },
-        { id: "ci-logs", thresholds: { days: 30 } },
+        // Atlas snapshots expire in their own sweep: no cleanup here.
+        { id: "atlas-snapshots", thresholds: {} },
         { id: "preview-records-copy", thresholds: {} },
       ],
       now: NOW,
@@ -284,7 +285,7 @@ describe("the cleanup engine with expired preview records", () => {
     expect(result.status).toBe("failed");
     expect(result.categories.map((c) => [c.category, c.status, c.error])).toEqual([
       ["preview-records", "failed", "preview-records needs its days threshold."],
-      ["ci-logs", "failed", "No cleanup for this category."],
+      ["atlas-snapshots", "failed", "No cleanup for this category."],
       ["preview-records-copy", "failed", "No cleanup for this category."],
     ]);
     expect(result.error).toContain("preview-records: preview-records needs its days threshold.");
@@ -321,8 +322,8 @@ describe("scheduled runs", () => {
     t.sqlite.exec(`
       INSERT INTO retention_policies (account_id, category, enabled, thresholds)
         VALUES ('acc_orbit', 'preview-records', 1, '{}');
-      -- Enabled but without a cleanup yet: skipped.
-      INSERT INTO retention_policies (account_id, category, enabled) VALUES ('acc_sam', 'ci-logs', 1);
+      -- Stored as enabled, but not a policy category with a cleanup: skipped.
+      INSERT INTO retention_policies (account_id, category, enabled) VALUES ('acc_sam', 'atlas-snapshots', 1);
     `);
     const dry = await run(t.env, true);
     const first = await retentionCron(t.env, { now: NOW, advance: { now: NOW } });
@@ -344,7 +345,7 @@ describe("scheduled runs", () => {
       runnable: true,
       lastRun: { runId: scheduled.id, dryRun: false, trigger: "schedule", items: 12 },
     });
-    expect(policies.find((p) => p.id === "ci-logs")).toMatchObject({
+    expect(policies.find((p) => p.id === "atlas-snapshots")).toMatchObject({
       runnable: false,
       lastRun: null,
     });

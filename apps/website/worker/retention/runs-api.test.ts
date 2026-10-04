@@ -162,7 +162,6 @@ describe("manual cleanup runs", () => {
     await bad({ dryRun: true, categories: ["preview-records", "preview-records"] }, /each once/);
     await bad({ dryRun: true, categories: ["nope"] }, /Unknown category/);
     await bad({ dryRun: true, categories: ["auth-hygiene"] }, /isn't a category of this level/);
-    await bad({ dryRun: true, categories: ["ci-logs"] }, /has no cleanup yet/);
     await bad({ dryRun: true, categories: ["previews"] }, /has no cleanup yet/);
     await bad(
       {

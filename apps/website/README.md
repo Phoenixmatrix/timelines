@@ -2438,6 +2438,23 @@ thresholds used, counts, estimated bytes, batches, errors and timings.
 
 The settings responses show each category's `runnable` and `lastRun`.
 
+### CI retention
+
+`ci-logs` and `ci-runs` (CORE-200, `worker/retention/cleanups/ci-*.ts`):
+
+- **`ci-logs`** deletes the `ci_logs` chunks of jobs that finished more than
+  `days` ago (any end state; never pending, queued or running jobs) and stamps
+  `ci_jobs.logs_removed_at`. Items are jobs; counts are chunks; bytes are the
+  log text. The run API returns `logsRemovedAt` per job and the logs API
+  `removedAt`; the run page and `gm runs show`/`gm runs logs` say "Logs
+  removed by retention on <date>" instead of an empty log.
+- **`ci-runs`** deletes runs older than `days` (finished, else created) with
+  their jobs, steps and logs, always keeping the latest `keepLatest` runs of
+  each ref, runs that are queued or running or have a job still running,
+  landing runs, runs a deployment records or tore down, and runs a registry
+  publish names as provenance. A removed run's number answers 404 "Run #n was
+  removed by retention." when a later run exists.
+
 ### Usage and costs
 
 **Settings → Usage & costs** (`/settings/usage?owner=<slug>`, an account's

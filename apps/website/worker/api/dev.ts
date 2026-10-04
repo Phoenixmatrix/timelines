@@ -75,9 +75,16 @@ dev.use("*", async (c, next) => {
   const id = Reflect.get(c.env, "AGENT_ID");
   if (
     id &&
-    ["/tokens", "/seed", "/environment", "/atlas", "/durable", "/usage", "/retention"].some(
-      (path) => c.req.path.endsWith(path),
-    )
+    [
+      "/tokens",
+      "/seed",
+      "/environment",
+      "/atlas",
+      "/durable",
+      "/usage",
+      "/retention",
+      "/ci-age",
+    ].some((path) => c.req.path.endsWith(path))
   ) {
     const secret = Reflect.get(c.env, "AGENT_SECRET");
     const supplied = c.req.header("Authorization")?.replace(/^Bearer /, "");
@@ -147,6 +154,48 @@ dev.post("/retention", async (c) => {
   for (let calls = 0; calls < 50; calls++)
     if ((await advanceRun(c.env, id, { now })) !== "more") break;
   return c.json({ run: await getRun(c.env.DB, target, id) });
+});
+
+// CI retention in the real runtime (CORE-200): move runs (with their jobs and
+// steps) back in time so the retention categories see them as old.
+dev.post("/ci-age", async (c) => {
+  const { owner, name, numbers, days } = await readJson<{
+    owner: string;
+    name: string;
+    numbers: number[];
+    days: number;
+  }>(c);
+  const account = owner ? await findAccountBySlug(c.env.DB, owner) : null;
+  const repo = account
+    ? await db(c.env.DB)
+        .selectFrom("repos")
+        .select("id")
+        .where("owner_id", "=", account.id)
+        .where("name", "=", name ?? "")
+        .executeTakeFirst()
+    : undefined;
+  if (!repo) return fail(c, 404, "No such repository.");
+  if (!Array.isArray(numbers) || !Number.isInteger(days))
+    return fail(c, 400, "Send {numbers, days}.");
+  const shift = `-${days} days`;
+  const at = (column: string) =>
+    `${column} = CASE WHEN ${column} IS NULL THEN NULL ELSE strftime('%Y-%m-%dT%H:%M:%fZ', ${column}, '${shift}') END`;
+  const runs = `SELECT id FROM ci_runs WHERE repo_id = ? AND number IN (SELECT value FROM json_each(?))`;
+  const jobs = `SELECT id FROM ci_jobs WHERE run_id IN (${runs})`;
+  const ids = JSON.stringify(numbers);
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE ci_steps SET ${at("started_at")}, ${at("finished_at")} WHERE job_id IN (${jobs})`,
+    ).bind(repo.id, ids),
+    c.env.DB.prepare(
+      `UPDATE ci_jobs SET ${at("started_at")}, ${at("finished_at")} WHERE id IN (${jobs})`,
+    ).bind(repo.id, ids),
+    c.env.DB.prepare(
+      `UPDATE ci_runs SET ${at("created_at")}, ${at("started_at")}, ${at("finished_at")}
+       WHERE id IN (${runs})`,
+    ).bind(repo.id, ids),
+  ]);
+  return c.json({ ok: true });
 });
 
 dev.get("/environment", async (c) => {

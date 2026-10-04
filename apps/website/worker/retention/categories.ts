@@ -51,7 +51,7 @@ export const CATEGORIES = [
     control: "policy",
     label: "CI logs",
     description: "Log text of CI jobs that finished more than the given days ago.",
-    never: ["Logs of running or queued jobs", "The run, job and step records themselves"],
+    never: ["Logs of pending, queued or running jobs", "The run, job and step records themselves"],
     thresholds: [days("days", "Days after the job finished", 30)],
   },
   {
@@ -62,8 +62,8 @@ export const CATEGORIES = [
     description: "CI runs older than the given days, with their jobs, steps and logs.",
     never: [
       "The latest runs of each ref (the count below)",
-      "Running or queued runs",
-      "Runs a deployment or a landing refers to",
+      "Running or queued runs, and runs with a job still running",
+      "Runs a deployment, a landing or a package publish refers to",
     ],
     thresholds: [days("days", "Days after the run", 180), keepLatest("Runs kept per ref", 20)],
   },

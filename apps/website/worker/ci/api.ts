@@ -161,6 +161,7 @@ async function runDetail(
       error: job.error,
       startedAt: job.started_at,
       finishedAt: job.finished_at,
+      logsRemovedAt: job.logs_removed_at,
       steps: stepRows
         .filter((s) => s.job_id === job.id)
         .map((s) => ({
@@ -178,9 +179,27 @@ async function runDetail(
 ci.get("/runs/:number{[0-9]+}", async (c) => {
   const repo = await loadRepo(c);
   if (repo instanceof Response) return repo;
-  const run = await runDetail(c.env.DB, repo.row.id, Number(c.req.param("number")));
-  return run ? c.json<CiRunDetail>(run) : fail(c, 404, "No such run.");
+  const number = Number(c.req.param("number"));
+  const run = await runDetail(c.env.DB, repo.row.id, number);
+  if (run) return c.json<CiRunDetail>(run);
+  return fail(c, 404, await missingRun(c.env.DB, repo.row.id, number));
 });
+
+/**
+ * Why a run number has no run. Numbers are handed out in sequence and only
+ * retention deletes runs ("ci-runs", CORE-200), so a number below a run that
+ * exists was removed by retention.
+ */
+async function missingRun(d1: D1Database, repoId: string, number: number): Promise<string> {
+  const later = await db(d1)
+    .selectFrom("ci_runs")
+    .select("number")
+    .where("repo_id", "=", repoId)
+    .where("number", ">", number)
+    .limit(1)
+    .executeTakeFirst();
+  return later ? `Run #${number} was removed by retention.` : "No such run.";
+}
 
 ci.post("/runs/:number{[0-9]+}/cancel", async (c) => {
   const repo = await loadRepo(c, "write");
@@ -278,12 +297,13 @@ ci.get("/jobs/:job/logs", async (c) => {
     .limit(500);
   const jobQuery = kdb
     .selectFrom("ci_jobs")
-    .select("status")
+    .select(["status", "logs_removed_at"])
     .where("id", "=", c.req.param("job"))
     .where("repo_id", "=", repo.row.id);
   const [chunks, job] = await batch(d1, [chunksQuery, jobQuery]);
-  const status = (job!.results as InferResult<typeof jobQuery>)[0]?.status;
-  if (!status) return fail(c, 404, "No such job.");
+  const found = (job!.results as InferResult<typeof jobQuery>)[0];
+  if (!found) return fail(c, 404, "No such job.");
+  const status = found.status;
   const rows: CiLogs["chunks"] = chunks!.results as InferResult<typeof chunksQuery>;
   const done = !["pending", "queued", "running"].includes(status);
   return c.json<CiLogs>({
@@ -291,6 +311,7 @@ ci.get("/jobs/:job/logs", async (c) => {
     next: rows.at(-1)?.seq ?? after,
     // Done only once the job ended and every chunk has been read.
     done: done && rows.length < 500,
+    removedAt: found.logs_removed_at,
   });
 });
 
