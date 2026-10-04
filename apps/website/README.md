@@ -319,6 +319,29 @@ a push has shown Gitmatrix its commit, at upload (from `change_refs`) or on a
 later push (`worker/ref-log/record.ts`); until then it's "local, unverified".
 Context is the agent's account, shown as such next to what Gitmatrix verifies.
 
+### The live feed
+
+Each repository's steps in a timeline also go out live (CORE-239): a
+`StepFeed` Durable Object per repository and timeline (`<repoId>:<slug>`,
+`worker/steps/feed.ts`, the PRD's fallback ahead of K2) gets a small record
+when a new step is uploaded (`StepFeedRecord`: repository, timeline, change,
+commit, summary, issue, author, test counts, the first line of its why, never
+the context itself). It keeps the newest 100 records for a week.
+
+`GET /api/repos/:o/:n/steps/live?timeline=<slug>` streams them as Server-Sent
+Events (`id: <seq>`, `event: step`, `data: <record>`): what the feed has after
+`Last-Event-ID` (or `?after=`), then each new step as it arrives, with a
+keepalive comment every 25 s. The route checks the reader can read the
+repository, as for every step read; a stream ends after ten minutes and the
+reconnect (with `Last-Event-ID`) is checked again, so lost access closes the
+feed within that time. Records come at least once: readers dedupe by
+(repository, commit).
+
+The timeline page's **Live now** (`src/routes/tracker/LiveNow.tsx`) reads each
+repository's feed with `fetch` (not `EventSource`), and shows each agent's
+latest step, its test result, how many steps since when and its why, linked
+into the story. `gm steps --follow` streams the same feed.
+
 ### The story view
 
 A timeline's **Story** (`/tracker/:owner/timelines/:slug/story`, linked from

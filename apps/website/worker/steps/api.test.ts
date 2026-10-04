@@ -5,9 +5,21 @@ import { STEP_LIMITS } from "../../shared/steps.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
+import { fakeDurableState } from "../testing/durable-state.ts";
+import { StepFeed } from "./feed.ts";
 import { steps } from "./api.ts";
 
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {}, WorkflowEntrypoint: class {} }));
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    ctx: unknown;
+    env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+  WorkflowEntrypoint: class {},
+}));
 
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
 const annsAgent: Actor = { ...ann, agent: { id: "agt_builder", name: "builder" } };
@@ -26,7 +38,18 @@ function setup(visibility: "public" | "private" = "private") {
       VALUES ('repo', 'ann', 'app', '${visibility}', 'a', 'https://a');
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('repo', 'ben', 'write');
   `);
-  const env = { DB: d1(sqlite) } as unknown as Env;
+  // Live feeds (CORE-239), real objects over fake storage, by name.
+  const feeds = new Map<string, StepFeed>();
+  const env = {
+    DB: d1(sqlite),
+    STEP_FEED: {
+      getByName: (name: string) => {
+        if (!feeds.has(name))
+          feeds.set(name, new StepFeed(fakeDurableState().ctx as never, {} as Env));
+        return feeds.get(name)!;
+      },
+    },
+  } as unknown as Env;
   let actor: Actor | null = annsAgent;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
@@ -38,6 +61,7 @@ function setup(visibility: "public" | "private" = "private") {
     app.request(`/api/repos/ann/app/steps${path}`, init, env);
   return {
     sqlite,
+    feeds,
     as: (next: Actor | null) => {
       actor = next;
     },
@@ -65,6 +89,40 @@ const step = (n: number, over: Partial<StepUpload> = {}): StepUpload => ({
 });
 
 describe("step context", () => {
+  test("a new timeline step goes out on its live feed, read by whoever can read the repo (CORE-239)", async () => {
+    const s = setup();
+    await s.upload(step(1));
+    // A retry doesn't go out twice; a step outside a timeline doesn't at all.
+    await s.upload(step(1));
+    await s.upload(step(2, { timeline: undefined }));
+    const feed = s.feeds.get("repo:search")!;
+    const records = await feed.since(0);
+    expect(records.map((r) => [r.seq, r.summary, r.repo, r.timeline])).toEqual([
+      [1, "Step 1", "ann/app", "search"],
+    ]);
+    expect(records[0]).toMatchObject({
+      author: { id: "agt_builder", kind: "agent", name: "builder" },
+      tests: { passed: 1, failed: 0 },
+      why: "Recency matters more than score here.",
+    });
+
+    // Ben can read: the stream has the step.
+    s.as(ben);
+    const live = await s.call("/live?timeline=search");
+    expect(live.status).toBe(200);
+    expect(live.headers.get("content-type")).toContain("text/event-stream");
+    const reader = live.body!.getReader();
+    let text = "";
+    while (!text.includes("Step 1")) text += new TextDecoder().decode((await reader.read()).value);
+    await reader.cancel();
+    expect(text).toContain("id: 1\nevent: step\n");
+    // Cid can't read the private repository: nothing, not even that it exists.
+    s.as(cid);
+    expect((await s.call("/live?timeline=search")).status).toBe(404);
+    s.as(ben);
+    expect((await s.call("/live?timeline=Not%20a%20slug")).status).toBe(400);
+  });
+
   test("a step carries its step runs' artifacts, newest first (CORE-235)", async () => {
     const s = setup();
     await s.upload(step(1));

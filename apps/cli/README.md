@@ -764,6 +764,13 @@ gm context sync                                     # retries uploads a push cou
 - **Missing context warns, never blocks.** An agent's commit in a timeline
   without `--context` succeeds with a warning saying what to add.
 
+- **`gm steps [--timeline <slug>] [-n N]`** lists a timeline's recent steps in
+  this repository (default: the timeline this checkout works in);
+  **`--follow`** streams new ones live as they're pushed (CORE-239): one JSON
+  object per line for agents (`StepFeedRecord`), a line of text at a terminal.
+  It reconnects from the last step it printed; `--count N` stops after N, and
+  a feed the reader can't see is an error rather than a retry.
+
 Reading it back, for an agent picking up the work or a person investigating:
 
 ```bash

@@ -23,6 +23,7 @@ import {
   type StepArtifact,
   type StepAuthor,
   type StepContextBody,
+  type StepFeedRecord,
   type StepPage,
   type StepTest,
   type StepTestSummary,
@@ -32,6 +33,7 @@ import {
 import type { AppEnv } from "../auth.ts";
 import { fail, requireActor } from "../api/http.ts";
 import { loadRepo } from "../api/repos.ts";
+import { durableStub } from "../durable/registry.ts";
 import { avatarUrl } from "../avatars/api.ts";
 import { sqlNow } from "../db.ts";
 import { db, type Database } from "../schema.ts";
@@ -299,7 +301,70 @@ steps.post("/", async (c) => {
     .where("commit_oid", "=", commitOid)
     .executeTakeFirstOrThrow();
   const [step] = await present(c, [row]);
+  // A new step in a timeline goes out on its live feed (CORE-239), after the answer.
+  if (!existing && step!.timeline && Reflect.has(c.env, "STEP_FEED")) {
+    const work = publishStep(c.env, loaded.row, step!).catch((error) =>
+      console.error("Steps: publishing to the live feed failed", error),
+    );
+    try {
+      c.executionCtx.waitUntil(work);
+    } catch {
+      await work;
+    }
+  }
   return c.json(step, existing ? 200 : 201);
+});
+
+/** The live feed of one repository's steps in one timeline. */
+function feed(env: Env, repoId: string, timeline: string) {
+  return durableStub(env, "StepFeed", `${repoId}:${timeline}`, { repo: repoId });
+}
+
+async function publishStep(
+  env: Env,
+  repo: { id: string; owner_slug: string; name: string },
+  step: Step,
+) {
+  const tests = step.context.tests;
+  const record: Omit<StepFeedRecord, "seq" | "at"> = {
+    repo: `${repo.owner_slug}/${repo.name}`,
+    timeline: step.timeline!,
+    changeId: step.changeId,
+    commitOid: step.commitOid,
+    summary: step.summary,
+    issue: step.issue,
+    author: { id: step.author.id, kind: step.author.kind, name: step.author.name },
+    tests: tests.length
+      ? {
+          passed: tests.filter((t) => t.exit === 0).length,
+          failed: tests.filter((t) => t.exit !== 0).length,
+        }
+      : null,
+    why: (step.context.why.split("\n").find((l) => l.trim()) ?? "").trim().slice(0, 200),
+    committedAt: step.committedAt,
+  };
+  await feed(env, repo.id, step.timeline!).publish(record);
+}
+
+/**
+ * GET /live?timeline=<slug>: the timeline's steps in this repository as
+ * Server-Sent Events, for anyone who can read it (CORE-239). Each connection
+ * is checked; a stream ends after ten minutes and reconnects with
+ * Last-Event-ID, checked again.
+ */
+steps.get("/live", async (c) => {
+  const loaded = await loadRepo(c, "read");
+  if (loaded instanceof Response) return loaded;
+  const timeline = c.req.query("timeline") ?? "";
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(timeline))
+    return fail(c, 400, "timeline is a timeline's slug.");
+  const headers = new Headers();
+  const last = c.req.header("last-event-id") ?? c.req.query("after");
+  if (last && /^\d+$/.test(last)) headers.set("last-event-id", last);
+  const response = await feed(c.env, loaded.row.id, timeline).fetch(
+    new Request("https://step-feed/subscribe", { headers }),
+  );
+  return new Response(response.body, response);
 });
 
 /** Opaque paging: the last step's (committedAt, changeId, commitOid). */

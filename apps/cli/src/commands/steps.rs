@@ -499,6 +499,180 @@ pub fn repo_slug(ctx: &Ctx) -> Result<String> {
     super::server::current_repo(ctx)
 }
 
+// ---- gm steps: a timeline's steps, and its live feed (CORE-239) ---------------------
+
+#[derive(clap::Args)]
+pub struct StepsArgs {
+    /// The timeline (default: the one this checkout works in).
+    #[arg(long)]
+    pub timeline: Option<String>,
+    /// Stream new steps as they're pushed: one JSON object per line for agents,
+    /// a line of text at a terminal. Reconnects on its own; Ctrl-C stops.
+    #[arg(short, long)]
+    pub follow: bool,
+    /// With --follow: stop after this many steps.
+    #[arg(long, requires = "follow")]
+    pub count: Option<usize>,
+    /// Without --follow: how many recent steps.
+    #[arg(short = 'n', long, default_value_t = 20)]
+    pub limit: usize,
+}
+
+fn timeline_for(ws: &Workspace, arg: &Option<String>) -> Result<String> {
+    arg.clone().or_else(|| ws.timeline.clone()).ok_or_else(|| {
+        GmError::new(
+            "not_in_timeline",
+            "Which timeline? This checkout isn't working in one.",
+        )
+        .hint("Pass --timeline <slug>, or `gm timeline use <slug>`.")
+        .exit(crate::output::exit::USAGE)
+    })
+}
+
+/// One feed record as a line of text.
+fn record_line(record: &Value) -> String {
+    let tests = match (
+        record["tests"]["passed"].as_u64(),
+        record["tests"]["failed"].as_u64(),
+    ) {
+        (Some(p), Some(0)) => format!("  {}", crate::output::style::good(&format!("✓ {p} passed"))),
+        (Some(_), Some(f)) => format!("  {}", crate::output::style::bad(&format!("✗ {f} failed"))),
+        _ => String::new(),
+    };
+    let time = record["at"]
+        .as_str()
+        .and_then(|t| t.get(11..19))
+        .unwrap_or("");
+    let why = record["why"]
+        .as_str()
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("\n    {}", crate::output::style::dim(&format!("why: {w}"))));
+    format!(
+        "{time}  {}  {}  {}{tests}{}",
+        record["author"]["name"].as_str().unwrap_or("?"),
+        crate::output::style::commit(
+            record["commitOid"]
+                .as_str()
+                .and_then(|c| c.get(..12))
+                .unwrap_or("")
+        ),
+        record["summary"].as_str().unwrap_or(""),
+        why.unwrap_or_default()
+    )
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct StepList {
+    pub repo: String,
+    pub timeline: String,
+    /// Newest first (the steps API's Step).
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub steps: Vec<Value>,
+}
+
+impl crate::output::Render for StepList {
+    fn text(&self) -> String {
+        if self.steps.is_empty() {
+            return format!(
+                "No steps in timeline {} of {} yet.",
+                self.timeline, self.repo
+            );
+        }
+        self.steps
+            .iter()
+            .map(|s| {
+                let why = s["context"]["why"].as_str().unwrap_or("").lines().next().unwrap_or("");
+                record_line(&json!({
+                    "at": s["committedAt"], "author": s["author"], "commitOid": s["commitOid"],
+                    "summary": s["summary"], "why": why,
+                    "tests": {
+                        "passed": s["context"]["tests"].as_array().map(|t| t.iter().filter(|x| x["exit"] == 0).count()),
+                        "failed": s["context"]["tests"].as_array().map(|t| t.iter().filter(|x| x["exit"] != 0).count()),
+                    },
+                }))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// `gm steps`: the timeline's recent steps in this repository.
+pub fn list(ctx: &Ctx, args: &StepsArgs) -> Result<StepList> {
+    let ws = Workspace::open(&ctx.cwd)?;
+    let timeline = timeline_for(&ws, &args.timeline)?;
+    let repo = repo_slug(ctx)?;
+    let page = remote::api(
+        &Config::load(),
+        "GET",
+        &format!(
+            "/repos/{repo}/steps?timeline={timeline}&limit={}",
+            args.limit.clamp(1, 100)
+        ),
+        None,
+    )?;
+    Ok(StepList {
+        repo,
+        timeline,
+        steps: page["steps"].as_array().cloned().unwrap_or_default(),
+    })
+}
+
+/// `gm steps --follow`: print each record of the live feed as it arrives;
+/// reconnects from the last one seen until `--count` records or an error.
+pub fn follow(ctx: &Ctx, args: &StepsArgs) -> Result<()> {
+    let ws = Workspace::open(&ctx.cwd)?;
+    let timeline = timeline_for(&ws, &args.timeline)?;
+    let repo = repo_slug(ctx)?;
+    drop(ws);
+    let config = Config::load();
+    let json = !matches!(ctx.format, crate::output::Format::Text);
+    let mut last: Option<u64> = None;
+    let mut seen = 0usize;
+    let done = |seen: usize| args.count.is_some_and(|n| seen >= n);
+    while !done(seen) {
+        let after = last.map(|l| format!("&after={l}")).unwrap_or_default();
+        let path = format!("/repos/{repo}/steps/live?timeline={timeline}{after}");
+        let (mut id, mut data, mut kind) = (None::<u64>, String::new(), String::new());
+        let result = remote::stream_get(&config, &path, |line| {
+            if line.is_empty() {
+                if kind == "step" && !data.is_empty() && !done(seen) {
+                    let record: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+                    let out = if json {
+                        record.to_string()
+                    } else {
+                        record_line(&record)
+                    };
+                    let mut stdout = std::io::stdout().lock();
+                    let _ = std::io::Write::write_all(&mut stdout, format!("{out}\n").as_bytes());
+                    let _ = std::io::Write::flush(&mut stdout);
+                    last = id.or(last);
+                    seen += 1;
+                }
+                (id, data, kind) = (None, String::new(), String::new());
+                if done(seen) {
+                    return Err(GmError::new("done", ""));
+                }
+            } else if let Some(v) = line.strip_prefix("id: ") {
+                id = v.trim().parse().ok();
+            } else if let Some(v) = line.strip_prefix("event: ") {
+                kind = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("data: ") {
+                data.push_str(v);
+            }
+            Ok(())
+        });
+        match result {
+            Err(e) if e.code == "done" => break,
+            // A dropped connection reconnects; anything the server said stops.
+            Err(e) if e.code != "stream_interrupted" && e.code != "server_unreachable" => {
+                return Err(e);
+            }
+            _ => std::thread::sleep(std::time::Duration::from_secs(2)),
+        }
+    }
+    Ok(())
+}
+
 // ---- reading steps: gm context show, log --context, show --context ---------------
 
 /// A step's context as a read shows it.

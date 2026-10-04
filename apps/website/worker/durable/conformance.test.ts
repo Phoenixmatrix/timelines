@@ -32,7 +32,7 @@ function realTree(): ConformanceInput {
 describe("Durable Object conformance", () => {
   test("every class the config exports is registered and purgeable; no hand-built stubs", () => {
     const input = realTree();
-    // The gate reads what it should: all seven classes and their sources.
+    // The gate reads what it should: all eight classes and their sources.
     expect(Object.keys(input.classes).sort()).toEqual([
       "Assistant",
       "CiSandbox",
@@ -40,6 +40,7 @@ describe("Durable Object conformance", () => {
       "RegistryLogin",
       "RegistryRepo",
       "RegistryUpload",
+      "StepFeed",
       "Tracker",
     ]);
     expect(conformanceProblems(input)).toEqual([]);

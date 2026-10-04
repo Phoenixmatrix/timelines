@@ -120,6 +120,8 @@ pub enum Command {
     Test,
     /// Record a step of a timeline: gm test, commit with context, push
     Step(StepArgs),
+    /// A timeline's steps in this repository; --follow streams new ones live
+    Steps(crate::commands::steps::StepsArgs),
     /// Sign in to a Gitmatrix server
     #[command(subcommand)]
     Auth(AuthCommand),

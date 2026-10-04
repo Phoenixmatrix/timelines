@@ -2108,6 +2108,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       "RegistryLogin",
       "RegistryRepo",
       "RegistryUpload",
+      "StepFeed",
       "Tracker",
     ]);
     for (const result of results) {

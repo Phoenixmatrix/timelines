@@ -177,6 +177,8 @@ export default defineConfig(({ mode, isPreview }) => {
           worker: "gitmatrix",
           exportName: "KnowledgeCoordinator",
         }),
+        // A timeline's live feed of steps in one repository (CORE-239).
+        STEP_FEED: bindings.durableObject({ worker: "gitmatrix", exportName: "StepFeed" }),
         // Workflows are the account's, not a Preview's: a preview binds none.
         ...(preview
           ? {}
@@ -340,6 +342,7 @@ export default defineConfig(({ mode, isPreview }) => {
         Tracker: exports.durableObject({ storage: "sqlite" }),
         Assistant: exports.durableObject({ storage: "sqlite" }),
         KnowledgeCoordinator: exports.durableObject({ storage: "sqlite" }),
+        StepFeed: exports.durableObject({ storage: "sqlite" }),
         // A Workflow's name is the account's: a preview declaring these would
         // redefine production's.
         ...(preview

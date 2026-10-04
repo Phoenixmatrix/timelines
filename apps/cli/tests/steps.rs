@@ -84,9 +84,39 @@ impl Api {
                 drop(reader);
                 let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let is_upload = method == "POST" && path.ends_with("/steps");
-                let is_list = method == "GET" && path.contains("/steps?");
+                let is_list =
+                    method == "GET" && path.contains("/steps?") && !path.contains("/live?");
                 let (code, reply) = if (is_upload || is_list) && fail.load(Ordering::Acquire) {
                     (500, json!({"error": "Something went wrong on our side."}))
+                } else if method == "GET" && path.contains("/steps/live?") {
+                    // A short live feed: two records, then the stream ends.
+                    let after = path
+                        .split("after=")
+                        .nth(1)
+                        .and_then(|v| v.split('&').next())
+                        .unwrap_or("0")
+                        .to_string();
+                    let body = if path.contains("timeline=secret") {
+                        None
+                    } else {
+                        Some((1..=3).filter(|n| n.to_string() > after).map(|n| {
+                            format!("id: {n}\nevent: step\ndata: {}\n\n", json!({"seq": n, "repo": "x/y", "timeline": "search", "summary": format!("Step {n}"), "commitOid": "a".repeat(40), "author": {"name": "builder"}, "tests": {"passed": 1, "failed": 0}, "why": "Because.", "at": "2026-10-04T12:00:00.000Z"}))
+                        }).collect::<String>())
+                    };
+                    let (code, text, kind) = match body {
+                        Some(b) => (200, format!("retry: 5000\n\n{b}"), "text/event-stream"),
+                        None => (
+                            404,
+                            json!({"error": "Not found."}).to_string(),
+                            "application/json",
+                        ),
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {code} Fixture\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                    continue;
                 } else if is_list {
                     // The server's view: uploaded steps for the asked commits, verified.
                     let commits = path
@@ -554,4 +584,63 @@ fn gm_step_works_only_in_a_timeline_and_tests_commits_and_pushes() {
             .contains("has no context"),
         "{quiet}"
     );
+}
+
+#[test]
+fn gm_steps_lists_and_follows_a_timeline_live() {
+    let s = Sandbox::new();
+    let (code, value, _) = s.run(&["steps"], &[]);
+    assert_ne!(code, 0);
+    assert_eq!(value["error"]["code"], json!("not_in_timeline"), "{value}");
+
+    let timeline = [("GM_TIMELINE", "search")];
+    let listed = s.ok(&["steps"], &timeline);
+    assert_eq!(listed["timeline"], json!("search"), "{listed}");
+
+    // --follow: one JSON object per record, stopping after --count.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gm"));
+    command
+        .current_dir(s.work())
+        .args(["steps", "--follow", "--count", "2"])
+        .env("GM_AGENT", "1")
+        .env("GM_TIMELINE", "search")
+        .env("GM_SERVER", format!("http://{}", s.api.address))
+        .env("GM_TOKEN", "test-token")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", s.root.join("config"))
+        .env("XDG_DATA_HOME", s.root.join("data"));
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l["summary"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("Step 1"), json!("Step 2")]
+    );
+
+    // At a terminal: a line of text per step.
+    let (code, text, _) = s.run(
+        &["steps", "--follow", "--count", "1", "-o", "text"],
+        &timeline,
+    );
+    assert_eq!(code, 0);
+    let text = text.as_str().unwrap_or_default().to_string();
+    assert!(
+        text.contains("builder") && text.contains("Step 1") && text.contains("why: Because."),
+        "{text}"
+    );
+
+    // A feed the reader can't see is an error, not an endless retry.
+    let (code, value, _) = s.run(&["steps", "--follow", "--timeline", "secret"], &[]);
+    assert_ne!(code, 0);
+    assert_eq!(value["error"]["code"], json!("not_found"), "{value}");
 }

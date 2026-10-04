@@ -180,6 +180,8 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
             Ok(())
         }
         Command::Step(a) => out(f, commands::test::step(ctx, &a)),
+        Command::Steps(a) if a.follow => commands::steps::follow(ctx, &a),
+        Command::Steps(a) => out(f, commands::steps::list(ctx, &a)),
         Command::Context(commands::steps::ContextCommand::Sync) => {
             out(f, commands::steps::sync(ctx))
         }

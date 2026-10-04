@@ -120,6 +120,7 @@ export default {
 } satisfies ExportedHandler<Env, Job | MirrorJob | ReleaseNotesJob | RetentionJob>;
 export { KnowledgeBuild } from "./knowledge/build.ts";
 export { KnowledgeCoordinator } from "./knowledge/coordinator.ts";
+export { StepFeed } from "./steps/feed.ts";
 export { CiRun } from "./ci/workflow.ts";
 export { RepoPurge } from "./retention/repo-purge.ts";
 export { CiSandbox } from "./ci/sandbox.ts";

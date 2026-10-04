@@ -13,6 +13,7 @@
 
 import type { Assistant } from "../assistant/agent.ts";
 import type { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
+import type { StepFeed } from "../steps/feed.ts";
 import type { CiSandbox } from "../ci/sandbox.ts";
 import type { Tracker } from "../tracker/object.ts";
 import type { RepoDO } from "../../registry/do/repo-do.ts";
@@ -27,6 +28,7 @@ export interface DurableTypes {
   Tracker: Tracker;
   Assistant: Assistant;
   KnowledgeCoordinator: KnowledgeCoordinator;
+  StepFeed: StepFeed;
   CiSandbox: CiSandbox;
   RegistryRepo: RepoDO;
   RegistryUpload: UploadDO;

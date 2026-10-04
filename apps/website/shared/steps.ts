@@ -144,3 +144,27 @@ export const EMPTY_CONTEXT: StepContextBody = {
   harness: null,
   model: null,
 };
+
+/**
+ * One record of a timeline's live feed (CORE-239): small, never the context
+ * itself. `seq` orders a feed; readers may see a record twice and dedupe by
+ * (repo, commitOid).
+ */
+export interface StepFeedRecord {
+  seq: number;
+  /** owner/name */
+  repo: string;
+  timeline: string;
+  changeId: string;
+  commitOid: string;
+  summary: string;
+  issue: string | null;
+  author: { id: string; kind: "agent" | "person"; name: string };
+  /** From the step's own tests: null when it reported none. */
+  tests: { passed: number; failed: number } | null;
+  /** The step's context said why: a first line, at most 200 characters. */
+  why: string;
+  committedAt: string;
+  /** When the feed received it. */
+  at: string;
+}

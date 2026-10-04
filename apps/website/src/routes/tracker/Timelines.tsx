@@ -46,6 +46,7 @@ import { LaneDrawing, ROW_HEIGHT, RowText, eventRepo, graphWidth } from "./Timel
 import { DoneInTimelineIcon, statusLabel } from "./ui.tsx";
 import { PreviewLink, ReviveButton } from "./Checkpoint.tsx";
 import { LandingPanel } from "./Landing.tsx";
+import { LiveNow } from "./LiveNow.tsx";
 
 export async function trackerTimelinesLoader({ request, params }: LoaderFunctionArgs) {
   try {
@@ -686,6 +687,8 @@ function TimelineDetails({
           );
         })}
       </ul>
+
+      <LiveNow owner={data.owner.slug} timeline={timeline} />
 
       <TimelineCheckpoints owner={data.owner.slug} timeline={timeline} />
 

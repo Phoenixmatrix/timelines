@@ -702,6 +702,45 @@ pub fn stream_lines(
     Ok(())
 }
 
+/// GET a streamed API response and hand over every line as it arrives, blank
+/// ones included (Server-Sent Events separate events with them). Returns when
+/// the server ends the stream.
+pub fn stream_get(
+    config: &Config,
+    path: &str,
+    mut on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    use std::io::BufRead;
+    let (token, _) = credential(config)?;
+    let url = format!("{}/api{}", config.server(), path);
+    let mut req = agent(&url, false)?
+        .get(&url)
+        .header("accept", "text/event-stream");
+    if let Some(t) = &token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let mut response = req.call().map_err(|e| {
+        GmError::new(
+            "server_unreachable",
+            format!("Could not reach {}: {e}", config.server()),
+        )
+    })?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        return Err(status_error(status, &value));
+    }
+    let reader = std::io::BufReader::new(response.body_mut().as_reader());
+    for line in reader.lines() {
+        let line = line.map_err(|e| {
+            GmError::new("stream_interrupted", format!("The response stopped: {e}"))
+        })?;
+        on_line(&line)?;
+    }
+    Ok(())
+}
+
 /// A non-2xx API response as an error carrying the server's message.
 fn status_error(status: u16, value: &Value) -> GmError {
     let message = value
