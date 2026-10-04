@@ -21,6 +21,7 @@ import type { AppEnv } from "../auth.ts";
 import { fail, requirePerson } from "../api/http.ts";
 import { findAccountBySlug, findUserById, sqlNow, viewerFor, type Actor } from "../db.ts";
 import { db } from "../schema.ts";
+import { recordAiCall } from "../usage/ai.ts";
 
 export const avatars = new Hono<AppEnv>();
 
@@ -296,6 +297,10 @@ async function generateOptions(c: Context<AppEnv>, target: Target) {
   const keys: string[] = [];
   const generate = async (prompt: string) => {
     const result = (await c.env.AI!.run(AVATAR_MODEL, { prompt, steps: 4 })) as { image?: string };
+    // Metering (CORE-207): an image call, no tokens.
+    c.executionCtx.waitUntil(
+      recordAiCall(c.env, AVATAR_MODEL, {}, { work: { feature: "avatars", account: target.id } }),
+    );
     if (!result.image) throw new Error("No image in the response.");
     return Uint8Array.from(atob(result.image), (char) => char.charCodeAt(0));
   };

@@ -1934,6 +1934,44 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
   });
 
+  await scenario("usage-metering-collects-per-account", async () => {
+    // CORE-207, in the real runtime: the cron's collection, run to the end,
+    // meters what the earlier scenarios stored for the fixture repository's
+    // owner: pushed pack bytes (Artifacts), D1 groups, Durable Objects.
+    interface Figure {
+      day: string;
+      construct: string;
+      item: string;
+      metric: string;
+      kind: string;
+      quantity: number;
+      estimated: number;
+      method: string;
+    }
+    const { figures } = await json<{ runs: number; figures: Figure[] }>(
+      "/api/dev/usage",
+      ctx.env.GITMATRIX_AGENT_SECRET ?? "",
+      "POST",
+      { account: repo.owner },
+    );
+    const find = (construct: string, item: string, metric: string) =>
+      figures.find((f) => f.construct === construct && f.item === item && f.metric === metric);
+    const pushed = find("artifacts", "repositories", "bytes");
+    assert(pushed && pushed.quantity > 0, "Pushes through the proxy count toward Artifacts");
+    assert.equal(pushed.estimated, 1, "Artifacts bytes are labelled estimated");
+    assert((find("d1", "repositories", "rows")?.quantity ?? 0) >= 1, "D1 rows are counted");
+    assert.equal(find("d1", "repositories", "rows")?.estimated, 0);
+    assert((find("d1", "repositories", "bytes")?.quantity ?? 0) > 0, "D1 bytes are sampled");
+    assert.equal(find("d1", "repositories", "bytes")?.estimated, 1);
+    assert(
+      (find("durable_objects", "Tracker", "instances")?.quantity ?? 0) >= 1,
+      "The account's tracker is metered from the instance registry",
+    );
+    for (const figure of figures)
+      assert(figure.method.length > 0, `${figure.construct}/${figure.item} says how it was made`);
+    record({ usage: figures.map((f) => `${f.construct}/${f.item}/${f.metric}=${f.quantity}`) });
+  });
+
   await scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;

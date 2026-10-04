@@ -49,6 +49,7 @@ import { embed } from "./models.ts";
 import { overlayRef, overlayState, setEndReason, timelineEnd } from "./overlay.ts";
 import { commitKey, listSets, overlayEnded, timelinePage } from "./pages.ts";
 import { timelineSlugOf } from "../../shared/timelines.ts";
+import { aiWork } from "../usage/ai.ts";
 
 export const knowledge = new Hono<AppEnv>();
 
@@ -334,7 +335,7 @@ knowledge.get("/search", async (c) => {
   const kinds = c.req.query("kinds")?.split(",").filter(Boolean);
 
   const entities = (async () => {
-    const [vector] = await embed(c.env, [query]);
+    const [vector] = await aiWork({ feature: "search", repo: row.id }, () => embed(c.env, [query]));
     const matches = await c.env.VECTORS.query(vector as number[], {
       topK: 12,
       filter: { repo: row.id, ...(kinds?.length ? { kind: { $in: kinds } } : {}) },

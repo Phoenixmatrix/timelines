@@ -68,6 +68,8 @@ export interface Database {
     imported_from: string | null;
     created_at: Generated<string>;
     pushed_at: string | null;
+    /** Pack bytes pushed through the proxy since CORE-207 (Artifacts' size estimate). */
+    pushed_bytes: Generated<number>;
   };
   repo_collaborators: {
     repo_id: string;
@@ -128,6 +130,30 @@ export interface Database {
     retiring_at: string | null;
     purged_at: string | null;
     purge_reason: string | null;
+  };
+  /** Daily usage per account and construct (CORE-207, worker/usage/collect.ts). */
+  usage_snapshots: {
+    day: string;
+    account_id: string;
+    construct: UsageConstruct;
+    item: string;
+    metric: string;
+    kind: "storage" | "activity";
+    quantity: number;
+    estimated: number;
+    method: string;
+    collected_at: string;
+  };
+  /** Workers AI calls and tokens per day, account, feature and model (worker/usage/ai.ts). */
+  ai_usage: {
+    day: string;
+    account_id: string;
+    feature: string;
+    model: string;
+    calls: Generated<number>;
+    input_tokens: Generated<number>;
+    output_tokens: Generated<number>;
+    total_tokens: Generated<number>;
   };
   /** Where a bounded, resumable cron pass left off. */
   job_cursors: {
@@ -227,6 +253,8 @@ export interface Database {
     key: string;
     item_id: string;
     version: string;
+    /** Uploaded size; null for items uploaded before CORE-207. */
+    bytes: number | null;
   };
   kg_concept_pairs: {
     repo_id: string;
@@ -777,6 +805,16 @@ export interface Database {
     finished_at: Generated<string | null>;
   };
 }
+
+export type UsageConstruct =
+  | "d1"
+  | "durable_objects"
+  | "r2"
+  | "artifacts"
+  | "vectorize"
+  | "ai_search"
+  | "workers_ai"
+  | "ci";
 
 export type DB = Kysely<Database>;
 

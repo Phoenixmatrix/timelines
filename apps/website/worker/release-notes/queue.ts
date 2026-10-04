@@ -16,6 +16,7 @@ import { Timing } from "../timing.ts";
 import { generateReleaseNotes, type GeneratorSource } from "./generate.ts";
 import { landedTimelines, ownerTimelines } from "./timelines.ts";
 import { affectedRepos, issuesFrom, subscribedOwners } from "./trackers.ts";
+import { aiWork } from "../usage/ai.ts";
 
 export interface ReleaseNotesJob {
   type: "release-notes";
@@ -152,7 +153,18 @@ async function source(
 }
 
 /** Queue consumer for one repository. */
-export async function runReleaseNotesJob(
+export function runReleaseNotesJob(
+  env: Env,
+  message: Message<ReleaseNotesJob>,
+  waitUntil: (work: Promise<unknown>) => void,
+): Promise<void> {
+  // Metering (CORE-207): the model calls are the repository owner's.
+  return aiWork({ feature: "release_notes", repo: message.body.repoId }, () =>
+    releaseNotesJob(env, message, waitUntil),
+  );
+}
+
+async function releaseNotesJob(
   env: Env,
   message: Message<ReleaseNotesJob>,
   waitUntil: (work: Promise<unknown>) => void,

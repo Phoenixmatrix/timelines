@@ -6,6 +6,8 @@
 //             cosmetic?", "is this page out of date?")
 //   embed     vectors for graph nodes (Vectorize)
 
+import { recordAiCall, tokensOf } from "../usage/ai.ts";
+
 export const MODELS = {
   fast: "@cf/zai-org/glm-5.3-flash",
   reason: "@cf/qwen/qwen3.8-27b",
@@ -71,15 +73,21 @@ const ai = (env: Env): LooseAi => ({
   },
 });
 
-function once(env: Env, model: string, inputs: unknown): Promise<unknown> {
+async function once(env: Env, model: string, inputs: unknown): Promise<unknown> {
   const ms = TIMEOUT_MS[model] ?? 120_000;
   let timer: ReturnType<typeof setTimeout> | null = null;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(`${model} timed out after ${ms / 1000}s`)), ms);
   });
-  return Promise.race([(env.AI as unknown as LooseAi).run(model, inputs), deadline]).finally(() => {
+  const result = await Promise.race([
+    (env.AI as unknown as LooseAi).run(model, inputs),
+    deadline,
+  ]).finally(() => {
     if (timer) clearTimeout(timer);
   });
+  // Metering (CORE-207): the call's tokens, for the account whose work this is.
+  await recordAiCall(env, model, tokensOf(result));
+  return result;
 }
 
 // Provider-specific reasoning controls: GLM and Qwen cannot use the old

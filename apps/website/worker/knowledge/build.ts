@@ -79,6 +79,7 @@ import { computeOverlay, overlayFailed, planOverlay, toAnalyze } from "./overlay
 import { runPageSet } from "./pages.ts";
 import { chunk } from "./util.ts";
 import { planWiki, updatePages, type WikiSource, type WikiStats } from "./wiki.ts";
+import { aiWork } from "../usage/ai.ts";
 
 export interface BuildParams {
   repoId: string;
@@ -230,7 +231,17 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     return { repoId: row.id, commit: head, reader, graph, syntheses, files, analyses, readme };
   }
 
-  async run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
+  run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
+    // Metering (CORE-207): every model call below is the repository owner's.
+    const feature = event.payload.overlay
+      ? "knowledge_overlay"
+      : event.payload.pages
+        ? "wiki"
+        : "knowledge";
+    return aiWork({ feature, repo: event.payload.repoId }, () => this.#run(event, step));
+  }
+
+  async #run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
     const policy = event.payload.policy ?? LEGACY_KNOWLEDGE_POLICY;
     const models = policy.ai.models;
     if (event.payload.overlay) return this.#overlay(event.payload, step);

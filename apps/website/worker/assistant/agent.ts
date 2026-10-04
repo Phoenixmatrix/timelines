@@ -39,6 +39,7 @@ import { clefState, planFrom, questions, type TurnPlan } from "./plan.ts";
 import { sentenceCase } from "./titles.ts";
 import { builtinSkills, preloaded, repositorySkills, SkillRegistry } from "./skills.ts";
 import { buildTools } from "./tools.ts";
+import { aiWork, recordAiCall, type AiTokens, type AiWork } from "../usage/ai.ts";
 
 /** Models by job. All Workers AI; see the CORE-25 notes for why each. */
 export const ASSISTANT_MODELS = {
@@ -113,11 +114,23 @@ ${where}
 ${options.skills}`.trim();
 }
 
+/** The AI SDK's usage, as metering records it. */
+function usageTokens(
+  usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined,
+): AiTokens {
+  return { input: usage?.inputTokens, output: usage?.outputTokens, total: usage?.totalTokens };
+}
+
 export class Assistant extends AIChatAgent<Env> implements Purgeable {
   maxPersistedMessages = 500;
   private credential: AssistantCredential | null = null;
   /** Set while a `gm ask` turn runs (programmatic turns carry no request body). */
   private cli: CliTurn | null = null;
+
+  /** Whose model calls these are (CORE-207 metering). */
+  #aiWork(): AiWork {
+    return { feature: "assistant", account: this.owner.userId };
+  }
 
   /** "<userId>:<chatId>", fixed by api/assistant.ts. */
   private get owner() {
@@ -143,7 +156,9 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     const started = Date.now();
     try {
       const answers = await Promise.race([
-        decide(this.env, clefState(input), questions(), { flash: true }),
+        aiWork(this.#aiWork(), () =>
+          decide(this.env, clefState(input), questions(), { flash: true }),
+        ),
         new Promise<null>((resolve) => setTimeout(() => resolve(null), PLAN_DEADLINE_MS)),
       ]);
       if (!answers)
@@ -298,7 +313,17 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
                   });
               }
             : undefined,
-          onFinish: onFinish as never,
+          // Metering (CORE-207): the turn's model steps and tokens.
+          onFinish: (async (event: {
+            steps?: unknown[];
+            totalUsage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+          }) => {
+            await recordAiCall(this.env, model, usageTokens(event.totalUsage), {
+              calls: event.steps?.length || 1,
+              work: this.#aiWork(),
+            });
+            return (onFinish as unknown as (event: unknown) => unknown)(event);
+          }) as never,
         });
         writer.merge(result.toUIMessageStream({ sendReasoning: false, onError }));
       },
@@ -320,12 +345,15 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     const first = text(this.messages.find((m) => m.role === "user"));
     if (!first) return;
     try {
-      const { text: title } = await generateText({
+      const { text: title, usage } = await generateText({
         model: createWorkersAI({ binding: this.env.AI })(ASSISTANT_MODELS.title),
         instructions:
           "Name this conversation in 2 to 6 words, sentence case, no quotes or trailing punctuation.",
         prompt: first.slice(0, 1500),
         maxOutputTokens: 20,
+      });
+      await recordAiCall(this.env, ASSISTANT_MODELS.title, usageTokens(usage), {
+        work: this.#aiWork(),
       });
       const clean = sentenceCase(title.replace(/["“”.]/g, "").trim()).slice(0, 80);
       await db(this.env.DB)

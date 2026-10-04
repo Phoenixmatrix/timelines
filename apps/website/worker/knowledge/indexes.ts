@@ -101,14 +101,20 @@ async function upload(
   });
   await db(env.DB)
     .insertInto("kg_search_items")
-    .values({ repo_id: repoId, key, item_id: info.id, version })
+    .values({ repo_id: repoId, key, item_id: info.id, version, bytes: utf8Bytes(body) })
     .onConflict((oc) =>
       oc.columns(["repo_id", "key"]).doUpdateSet((eb) => ({
         item_id: eb.ref("excluded.item_id"),
         version: eb.ref("excluded.version"),
+        bytes: eb.ref("excluded.bytes"),
       })),
     )
     .execute();
+}
+
+/** What an item weighs uploaded (metering, CORE-207). */
+function utf8Bytes(body: string): number {
+  return new TextEncoder().encode(body).byteLength;
 }
 
 async function forget(env: Env, repoId: string, row: SearchItemRow) {

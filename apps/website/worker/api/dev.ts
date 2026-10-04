@@ -16,6 +16,7 @@ import {
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { findAccountBySlug } from "../db.ts";
 import { probeDurableObjects } from "../durable/probe.ts";
+import { collectUsage } from "../usage/collect.ts";
 import type { DurableClass } from "../durable/classes.ts";
 import { batch, db } from "../schema.ts";
 import { fail, readJson } from "./http.ts";
@@ -72,7 +73,7 @@ dev.use("*", async (c, next) => {
   const id = Reflect.get(c.env, "AGENT_ID");
   if (
     id &&
-    ["/tokens", "/seed", "/environment", "/atlas", "/durable"].some((path) =>
+    ["/tokens", "/seed", "/environment", "/atlas", "/durable", "/usage"].some((path) =>
       c.req.path.endsWith(path),
     )
   ) {
@@ -92,6 +93,23 @@ dev.use("*", async (c, next) => {
 dev.post("/durable", async (c) => {
   const { classes } = await readJson<{ classes?: DurableClass[] }>(c);
   return c.json({ results: await probeDurableObjects(c.env, "acc_jun", classes) });
+});
+
+// Usage metering in the real runtime (CORE-207): run today's collection
+// from the start to the end, then return one account's figures.
+dev.post("/usage", async (c) => {
+  const { account } = await readJson<{ account: string }>(c);
+  const found = account ? await findAccountBySlug(c.env.DB, account) : null;
+  if (!found) return fail(c, 404, "No such account.");
+  await c.env.DB.prepare("DELETE FROM job_cursors WHERE name = 'usage:collect'").run();
+  let runs = 0;
+  for (let done = false; !done && runs < 50; runs++) done = (await collectUsage(c.env)).done;
+  const { results } = await c.env.DB.prepare(
+    "SELECT day, construct, item, metric, kind, quantity, estimated, method FROM usage_snapshots WHERE account_id = ? ORDER BY day, construct, item, metric",
+  )
+    .bind(found.id)
+    .all();
+  return c.json({ runs, figures: results });
 });
 
 dev.get("/environment", async (c) => {

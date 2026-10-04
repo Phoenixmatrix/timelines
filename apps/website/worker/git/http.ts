@@ -81,7 +81,13 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     return c.text("This token is read-only. Create a token with write scope to push.\n", 403);
   }
 
-  const upstream = await forward(c, repo, service, endpoint, c.req.raw.body);
+  // A push's pack, counted on its way through: Artifacts reports no
+  // repository sizes, so metering estimates them from this (CORE-207).
+  const pack =
+    service === "git-receive-pack" && c.req.method === "POST" && c.req.raw.body
+      ? meterPack(c.req.raw.body, c.req.header("content-length"))
+      : null;
+  const upstream = await forward(c, repo, service, endpoint, pack?.body ?? c.req.raw.body);
   if (upstream instanceof Response) {
     if (credential.kind === "token") {
       c.executionCtx.waitUntil(
@@ -92,8 +98,10 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
           .execute(),
       );
     }
-    if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok)
+    if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok) {
       afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
+      if (pack) c.executionCtx.waitUntil(recordPushedBytes(c.env, repo.id, pack.done));
+    }
   }
   return respond(upstream);
 }
@@ -224,4 +232,49 @@ function respond(upstream: Response | { refused: Response }) {
     if (value) responseHeaders.set(header, value);
   }
   return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
+}
+
+/**
+ * A push body and its size: one of known length goes on untouched (and is
+ * that long); a chunked one is counted as it streams through.
+ */
+function meterPack(body: ReadableStream<Uint8Array>, contentLength: string | undefined) {
+  const length = Number(contentLength ?? Number.NaN);
+  if (Number.isSafeInteger(length) && length >= 0) return { body, done: Promise.resolve(length) };
+  return countBytes(body);
+}
+
+/** The stream, passed through unchanged, and its byte count once it ends. */
+function countBytes(body: ReadableStream<Uint8Array>) {
+  let bytes = 0;
+  const { promise: done, resolve } = Promise.withResolvers<number>();
+  const counter = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      bytes += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+    flush() {
+      resolve(bytes);
+    },
+  });
+  return { body: body.pipeThrough(counter), done };
+}
+
+/** Add a push's pack bytes to its repository (never fails the push). */
+async function recordPushedBytes(env: Env, repoId: string, done: Promise<number>) {
+  try {
+    // A pack the client abandoned never ends; don't wait on it for long.
+    const bytes = await Promise.race([
+      done,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 30_000)),
+    ]);
+    if (!bytes) return;
+    await db(env.DB)
+      .updateTable("repos")
+      .set((eb) => ({ pushed_bytes: eb("pushed_bytes", "+", bytes) }))
+      .where("id", "=", repoId)
+      .execute();
+  } catch (error) {
+    console.warn("Usage: recording pushed bytes failed", error);
+  }
 }

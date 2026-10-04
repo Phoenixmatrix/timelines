@@ -4,6 +4,7 @@ import { isPreview } from "./preview.ts";
 import { previewFetch } from "./preview-gate.ts";
 import { sweepPreviews } from "./deployments/sweep.ts";
 import { sweepDurableInstances } from "./durable/sweep.ts";
+import { collectUsage } from "./usage/collect.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
 import { retentionCron, runRetentionJob, type RetentionJob } from "./retention/runs.ts";
@@ -75,6 +76,10 @@ export default {
     // and restarting stalled runs; with nothing enabled it writes nothing.
     ctx.waitUntil(
       retentionCron(env).catch((error) => console.error("Retention: the cron failed", error)),
+    );
+    // Per-account usage snapshots, a bounded slice per run (CORE-207).
+    ctx.waitUntil(
+      collectUsage(env).catch((error) => console.error("Usage: the collection failed", error)),
     );
     // Landings a CI run's end didn't move on (CORE-77).
     ctx.waitUntil(
