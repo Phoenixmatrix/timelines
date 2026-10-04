@@ -84,8 +84,45 @@ impl Api {
                 drop(reader);
                 let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let is_upload = method == "POST" && path.ends_with("/steps");
-                let (code, reply) = if is_upload && fail.load(Ordering::Acquire) {
+                let is_list = method == "GET" && path.contains("/steps?");
+                let (code, reply) = if (is_upload || is_list) && fail.load(Ordering::Acquire) {
                     (500, json!({"error": "Something went wrong on our side."}))
+                } else if is_list {
+                    // The server's view: uploaded steps for the asked commits, verified.
+                    let commits = path
+                        .split("commits=")
+                        .nth(1)
+                        .unwrap_or("")
+                        .split('&')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let steps: Vec<Value> = seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(_, up)| up)
+                        .filter(|up| commits.split(',').any(|c| up["commitOid"] == json!(c)))
+                        .map(|up| {
+                            let mut context = up.clone();
+                            for key in ["changeId", "commitOid", "summary", "committedAt", "timeline", "issue"] {
+                                context.as_object_mut().unwrap().remove(key);
+                            }
+                            json!({
+                                "changeId": up["changeId"],
+                                "commitOid": up["commitOid"],
+                                "summary": up["summary"],
+                                "timeline": up["timeline"],
+                                "issue": null,
+                                "verified": true,
+                                "deleted": false,
+                                "committedAt": up["committedAt"],
+                                "author": {"kind": "agent", "name": "claude-code", "accountable": {"displayName": "Pat"}},
+                                "context": context,
+                            })
+                        })
+                        .collect();
+                    (200, json!({"steps": steps, "cursor": null}))
                 } else if is_upload {
                     seen.lock().unwrap().push((path.clone(), body.clone()));
                     (201, json!({"changeId": body["changeId"]}))
@@ -330,4 +367,75 @@ fn an_agent_step_in_a_timeline_without_context_warns_but_commits() {
     s.edit("b.txt", "b\n");
     let plain = s.ok(&["commit", "-m", "Plain"], &[]);
     assert!(plain.get("warnings").is_none(), "{plain}");
+}
+
+#[test]
+fn reads_show_local_steps_as_unverified_and_pushed_ones_from_the_server() {
+    let s = Sandbox::new();
+    s.edit("a.txt", "a\n");
+    let file = s.context_file(CONTEXT);
+    s.ok(
+        &["commit", "-m", "Rank by recency", "--context", &file],
+        &[],
+    );
+
+    // Local only: from the journal, not verified.
+    let shown = s.ok(&["context", "show"], &[]);
+    assert_eq!(shown["step"]["origin"], json!("local"), "{shown}");
+    assert_eq!(shown["step"]["verified"], json!(false));
+    assert_eq!(
+        shown["step"]["context"]["why"],
+        json!("Recency matters more than score.")
+    );
+    assert!(shown["step"]["context"].get("commitOid").is_none());
+    let change = shown["change_id"].as_str().unwrap().to_string();
+
+    let log = s.ok(&["log", "--context"], &[]);
+    let short = &change[..8];
+    assert_eq!(log["steps"][short]["origin"], json!("local"), "{log}");
+    assert!(s.ok(&["log"], &[]).get("steps").is_none());
+
+    let show = s.ok(&["show", "@-", "--context"], &[]);
+    assert_eq!(
+        show["step"]["context"]["steering"][0]["text"],
+        json!("Keep the old order as a fallback")
+    );
+    let none = s.ok(&["show", "@", "--context"], &[]);
+    assert_eq!(none["step"], Value::Null, "{none}");
+    assert!(s.ok(&["show", "@"], &[]).get("step").is_none());
+
+    // Pushed: the server's verified copy, with its author.
+    s.ok(&["push"], &[]);
+    let shown = s.ok(&["context", "show", "trunk"], &[]);
+    assert_eq!(shown["step"]["origin"], json!("server"), "{shown}");
+    assert_eq!(shown["step"]["verified"], json!(true));
+    assert_eq!(shown["step"]["author"]["name"], json!("claude-code"));
+
+    // Text for people: the why on the log line, the whole context in show.
+    let (_, text, _) = s.run(&["log", "--context", "-r", "trunk", "-o", "text"], &[]);
+    assert!(
+        text.as_str()
+            .unwrap_or_default()
+            .contains("why: Recency matters more than score."),
+        "{text}"
+    );
+    let (_, text, _) = s.run(&["context", "show", "trunk", "-o", "text"], &[]);
+    let text = text.as_str().unwrap_or_default().to_string();
+    assert!(text.contains("claude-code (for Pat) · verified"), "{text}");
+    assert!(
+        text.contains("  - Rank results by recency (agent)"),
+        "{text}"
+    );
+
+    // The server unreachable: a note, and the journal's copy.
+    s.api.failing.store(true, Ordering::Release);
+    let shown = s.ok(&["context", "show", "trunk"], &[]);
+    assert_eq!(shown["step"]["origin"], json!("local"));
+    assert!(
+        shown["note"]
+            .as_str()
+            .unwrap()
+            .contains("Couldn't read step context"),
+        "{shown}"
+    );
 }

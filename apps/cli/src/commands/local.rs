@@ -1,6 +1,6 @@
 //! Commands that only touch the local repository.
 
-use super::{Ctx, Outcome, message, mutate, report, short};
+use super::{Ctx, Outcome, message, mutate, report, short, steps};
 use crate::cli;
 use crate::model::{Change, ConflictReport, Diff, FileChange, Log, OpResult, Status, TrunkInfo};
 use crate::output::{GmError, Render, Result, exit};
@@ -237,10 +237,26 @@ pub fn log(ctx: &Ctx, args: &cli::LogArgs) -> Result<Log> {
         truncated = true;
     }
     let changes = oids
-        .into_iter()
-        .map(|o| Change::load(&ws, o))
+        .iter()
+        .map(|o| Change::load(&ws, *o))
         .collect::<Result<Vec<_>>>()?;
-    Ok(Log { changes, truncated })
+    let (steps, note) = if args.context {
+        let (found, note) = steps::lookup(ctx, &ws, &oids);
+        let by_change = oids
+            .iter()
+            .zip(&changes)
+            .filter_map(|(oid, c)| Some((c.change_id.clone(), found.get(oid)?.clone())))
+            .collect();
+        (Some(by_change), note)
+    } else {
+        (None, None)
+    };
+    Ok(Log {
+        changes,
+        truncated,
+        steps,
+        note,
+    })
 }
 
 pub fn show(ctx: &Ctx, args: &cli::ShowArgs) -> Result<Diff> {
@@ -253,10 +269,14 @@ pub fn show(ctx: &Ctx, args: &cli::ShowArgs) -> Result<Diff> {
         &[],
         !args.stat,
     )?;
+    let step = args
+        .context
+        .then(|| steps::lookup(ctx, &ws, &[oid]).0.remove(&oid));
     Ok(Diff {
         change: Some(Change::load(&ws, oid)?),
         files,
         patch,
+        step,
     })
 }
 
@@ -282,6 +302,7 @@ pub fn diff(ctx: &Ctx, args: &cli::DiffArgs) -> Result<Diff> {
         change,
         files,
         patch,
+        step: None,
     })
 }
 
@@ -401,9 +422,7 @@ pub fn merge(ctx: &Ctx, args: &cli::MergeArgs) -> Result<OpResult> {
 pub fn commit(ctx: &Ctx, args: &cli::CommitArgs) -> Result<OpResult> {
     // Read and check the step context first: a bad file fails before anything changes.
     let context = match &args.context {
-        Some(arg) => Some(super::steps::parse_context(
-            &super::steps::read_context_arg(arg)?,
-        )?),
+        Some(arg) => Some(steps::parse_context(&steps::read_context_arg(arg)?)?),
         None => None,
     };
     let mut timeline = None;
@@ -433,7 +452,7 @@ pub fn commit(ctx: &Ctx, args: &cli::CommitArgs) -> Result<OpResult> {
         if let Some(context) = context.clone()
             && !ctx.dry_run
         {
-            super::steps::record(ws, described, context)?;
+            steps::record(ws, described, context)?;
         }
         let next = ws.new_commit(&[described], full, "")?;
         // Anything built on the old @ now builds on the full contents in the new @.

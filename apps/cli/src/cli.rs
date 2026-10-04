@@ -199,6 +199,9 @@ pub struct LogArgs {
     /// Maximum number of changes.
     #[arg(short = 'n', long, default_value_t = 50)]
     pub limit: usize,
+    /// Add each step's why (from `gm commit --context`), from the server or this checkout.
+    #[arg(long)]
+    pub context: bool,
 }
 
 #[derive(Args)]
@@ -209,6 +212,9 @@ pub struct ShowArgs {
     /// Only list files and line counts.
     #[arg(long)]
     pub stat: bool,
+    /// Add the step's context: why, instructions, steering, challenges, tests.
+    #[arg(long)]
+    pub context: bool,
 }
 
 #[derive(Args)]

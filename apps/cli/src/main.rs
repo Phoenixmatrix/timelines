@@ -174,6 +174,9 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Context(commands::steps::ContextCommand::Sync) => {
             out(f, commands::steps::sync(ctx))
         }
+        Command::Context(commands::steps::ContextCommand::Show { revision }) => {
+            out(f, commands::steps::show(ctx, &revision))
+        }
         Command::Auth(cli::AuthCommand::GitCredential { operation }) => {
             // Git reads this helper's stdout in its own key=value format.
             server::git_credential(&operation);

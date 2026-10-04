@@ -747,6 +747,20 @@ gm context sync                                     # retries uploads a push cou
 - **Missing context warns, never blocks.** An agent's commit in a timeline
   without `--context` succeeds with a warning saying what to add.
 
+Reading it back, for an agent picking up the work or a person investigating:
+
+```bash
+gm context show [<rev>]     # one step's context (default @-): JSON for agents, text at a terminal
+gm log --context            # each step's why beside it (`steps`, keyed by change ID, in JSON)
+gm show <rev> --context     # the change, its context, then its diff
+```
+
+Reads ask the server for the shown commits in one call and fall back to this
+checkout's journal. A step's `origin` says which: `server` (with its author,
+and `verified` once a push showed the commit) or `local` (not pushed, never
+verified). When the server can't be reached, `note` says so and the local
+context is shown. A step without context reads as `step: null`.
+
 ## Automatic AI settings
 
 ```bash

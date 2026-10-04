@@ -14,6 +14,7 @@ use crate::remote::{self, Config};
 use crate::repo::Workspace;
 use git2::Oid;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -369,6 +370,11 @@ fn entries_all(ws: &Workspace) -> Vec<(PathBuf, Value)> {
 /// The journal entry for `oid`, or one inherited from the newest entry of its
 /// change ID (a commit amend or rebase replaced), written as its own entry.
 fn entry_for(ws: &Workspace, oid: Oid) -> Result<Option<(PathBuf, Value)>> {
+    entry_lookup(ws, oid, true)
+}
+
+/// `entry_for`, optionally without writing the inherited entry (for reads).
+fn entry_lookup(ws: &Workspace, oid: Oid, persist: bool) -> Result<Option<(PathBuf, Value)>> {
     let path = entry_path(ws, oid);
     if let Some(entry) = read_entry(&path) {
         return Ok(Some((path, entry)));
@@ -384,8 +390,10 @@ fn entry_for(ws: &Workspace, oid: Oid) -> Result<Option<(PathBuf, Value)>> {
     entry["upload"]["summary"] = json!(summary_of(ws, oid)?);
     entry["upload"]["committedAt"] = json!(commit_time(ws, oid)?);
     entry["uploaded"] = json!(false);
-    fs::write(&path, serde_json::to_vec_pretty(&entry).unwrap_or_default())
-        .map_err(|e| GmError::new("io", format!("Couldn't write {}: {e}", path.display())))?;
+    if persist {
+        fs::write(&path, serde_json::to_vec_pretty(&entry).unwrap_or_default())
+            .map_err(|e| GmError::new("io", format!("Couldn't write {}: {e}", path.display())))?;
+    }
     Ok(Some((path, entry)))
 }
 
@@ -458,12 +466,279 @@ pub fn repo_slug(ctx: &Ctx) -> Result<String> {
     super::server::current_repo(ctx)
 }
 
-// ---- gm context sync -------------------------------------------------------------
+// ---- reading steps: gm context show, log --context, show --context ---------------
+
+/// A step's context as a read shows it.
+#[derive(Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct StepView {
+    /// The full change ID.
+    pub change_id: String,
+    pub commit_oid: String,
+    /// `server` (uploaded) or `local` (only in this repository's journal).
+    pub origin: String,
+    /// A push showed the commit as this change. Local-only steps aren't verified.
+    pub verified: bool,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<String>,
+    /// Who uploaded it (an agent and its accountable person); null when local.
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub author: Option<Value>,
+    /// instructions, steering, why, challenges, tests, coverage, harness, model.
+    #[schemars(with = "serde_json::Value")]
+    pub context: Value,
+}
+
+impl StepView {
+    /// The step's why, on one line.
+    pub fn why(&self) -> Option<String> {
+        let why = self.context["why"]
+            .as_str()?
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        (!why.is_empty()).then(|| why.join(" "))
+    }
+
+    /// The step as text: who, then each part it has.
+    pub fn text(&self) -> String {
+        let mut out = vec![];
+        let who = self
+            .author
+            .as_ref()
+            .and_then(|a| {
+                let name = a["name"].as_str()?;
+                Some(match a["accountable"]["displayName"].as_str() {
+                    Some(person) => format!("{name} (for {person})"),
+                    None => name.to_string(),
+                })
+            })
+            .unwrap_or_else(|| "this checkout".into());
+        let state = match (self.origin.as_str(), self.verified) {
+            ("local", _) => "local, not pushed",
+            (_, true) => "verified",
+            (_, false) => "uploaded, not yet pushed",
+        };
+        out.push(crate::output::style::dim(&format!(
+            "Step context from {who} · {state}"
+        )));
+        let list = |key: &str| -> Vec<String> {
+            self.context[key]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|e| {
+                            let text = e["text"].as_str()?;
+                            let source = e["source"].as_str().unwrap_or("agent");
+                            Some(format!("  - {text} ({source})"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for (title, key) in [("Instructions", "instructions"), ("Steering", "steering")] {
+            let items = list(key);
+            if !items.is_empty() {
+                out.push(format!("{title}:"));
+                out.extend(items);
+            }
+        }
+        for (title, key) in [("Why", "why"), ("Challenges", "challenges")] {
+            if let Some(text) = self.context[key].as_str().filter(|t| !t.trim().is_empty()) {
+                out.push(format!("{title}:"));
+                out.extend(text.trim().lines().map(|l| format!("  {l}")));
+            }
+        }
+        if let Some(tests) = self.context["tests"].as_array().filter(|t| !t.is_empty()) {
+            out.push("Tests:".into());
+            for t in tests {
+                out.push(format!(
+                    "  {} {} → exit {}{}",
+                    if t["exit"].as_i64() == Some(0) {
+                        "✓"
+                    } else {
+                        "✗"
+                    },
+                    t["command"].as_str().unwrap_or("?"),
+                    t["exit"],
+                    t["summary"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!(" ({s})"))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+        let coverage = &self.context["coverage"];
+        if coverage["instructions"] == "none" || coverage["steering"] == "none" {
+            out.push(crate::output::style::dim(
+                "No harness hook recorded this step's prompts or steering; some context may be missing.",
+            ));
+        }
+        out.join("\n")
+    }
+}
+
+/// Upload fields that describe the step rather than its context.
+const META: [&str; 6] = [
+    "changeId",
+    "commitOid",
+    "summary",
+    "committedAt",
+    "timeline",
+    "issue",
+];
+
+fn local_view(entry: &Value) -> StepView {
+    let upload = &entry["upload"];
+    let context: Map<String, Value> = upload
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter(|(k, _)| !META.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = |k: &str| upload[k].as_str().map(str::to_string);
+    StepView {
+        change_id: text("changeId").unwrap_or_default(),
+        commit_oid: text("commitOid").unwrap_or_default(),
+        origin: "local".into(),
+        verified: false,
+        summary: text("summary").unwrap_or_default(),
+        timeline: text("timeline"),
+        issue: text("issue"),
+        author: None,
+        context: Value::Object(context),
+    }
+}
+
+fn server_view(step: &Value) -> StepView {
+    let text = |k: &str| step[k].as_str().map(str::to_string);
+    StepView {
+        change_id: text("changeId").unwrap_or_default(),
+        commit_oid: text("commitOid").unwrap_or_default(),
+        origin: "server".into(),
+        verified: step["verified"].as_bool().unwrap_or(false),
+        summary: text("summary").unwrap_or_default(),
+        timeline: text("timeline"),
+        issue: text("issue"),
+        author: Some(step["author"].clone()),
+        context: step["context"].clone(),
+    }
+}
+
+/// The context of these commits: what the server has, else this repository's
+/// journal (local, unverified). A server that can't be reached leaves a note
+/// and the local context.
+pub fn lookup(ctx: &Ctx, ws: &Workspace, oids: &[Oid]) -> (HashMap<Oid, StepView>, Option<String>) {
+    let mut found = HashMap::new();
+    for oid in oids {
+        if let Ok(Some((_, entry))) = entry_lookup(ws, *oid, false) {
+            found.insert(*oid, local_view(&entry));
+        }
+    }
+    let Ok(repo) = repo_slug(ctx) else {
+        return (found, None);
+    };
+    let config = Config::load();
+    for chunk in oids.chunks(100) {
+        let list = chunk
+            .iter()
+            .map(Oid::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let path = format!("/repos/{repo}/steps?commits={list}&limit=100");
+        match remote::api(&config, "GET", &path, None) {
+            Ok(page) => {
+                for step in page["steps"].as_array().into_iter().flatten() {
+                    let Some(oid) = step["commitOid"]
+                        .as_str()
+                        .and_then(|s| Oid::from_str(s).ok())
+                    else {
+                        continue;
+                    };
+                    // The newest version wins when an author re-uploaded.
+                    found
+                        .entry(oid)
+                        .and_modify(|v: &mut StepView| {
+                            if v.origin == "local" {
+                                *v = server_view(step);
+                            }
+                        })
+                        .or_insert_with(|| server_view(step));
+                }
+            }
+            Err(e) => {
+                return (
+                    found,
+                    Some(format!(
+                        "Couldn't read step context from the server ({}); showing this checkout's.",
+                        e.message
+                    )),
+                );
+            }
+        }
+    }
+    (found, None)
+}
 
 #[derive(clap::Subcommand)]
 pub enum ContextCommand {
     /// Upload step context the server doesn't have yet (after an offline push or a crash)
     Sync,
+    /// The context of one step: why, instructions, steering, challenges, tests
+    Show {
+        /// Revision to show.
+        #[arg(default_value = "@-")]
+        revision: String,
+    },
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct Shown {
+    pub change_id: String,
+    pub commit_oid: String,
+    /// Null when nothing recorded context for this step.
+    pub step: Option<StepView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl crate::output::Render for Shown {
+    fn text(&self) -> String {
+        let mut out = match &self.step {
+            Some(step) => format!(
+                "{}  {}\n{}",
+                crate::output::style::change(&self.change_id[..8.min(self.change_id.len())]),
+                step.summary,
+                step.text()
+            ),
+            None => format!(
+                "No context was recorded for {}. Agents attach it with `gm commit --context`.",
+                &self.change_id[..8.min(self.change_id.len())]
+            ),
+        };
+        if let Some(note) = &self.note {
+            out.push_str(&format!("\n{}", crate::output::style::dim(note)));
+        }
+        out
+    }
+}
+
+pub fn show(ctx: &Ctx, revision: &str) -> Result<Shown> {
+    let ws = Workspace::open(&ctx.cwd)?;
+    let oid = crate::repo::revset::resolve(&ws, revision)?;
+    let (mut found, note) = lookup(ctx, &ws, &[oid]);
+    Ok(Shown {
+        change_id: ws.change_id(&ws.commit(oid)?),
+        commit_oid: oid.to_string(),
+        step: found.remove(&oid),
+        note,
+    })
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]

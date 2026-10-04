@@ -296,6 +296,12 @@ pub struct Log {
     pub changes: Vec<Change>,
     /// More commits exist beyond --limit.
     pub truncated: bool,
+    /// With --context: each step's context, keyed by change ID as shown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps: Option<std::collections::BTreeMap<String, crate::commands::steps::StepView>>,
+    /// With --context: why some context may be missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl Render for Log {
@@ -307,7 +313,22 @@ impl Render for Log {
                 id: &c.change_id,
                 parents: &c.parents,
                 glyph: c.marker(),
-                text: c.label(),
+                text: match self
+                    .steps
+                    .as_ref()
+                    .and_then(|s| s.get(&c.change_id))
+                    .and_then(|s| s.why())
+                {
+                    Some(why) => {
+                        let why: String = if why.chars().count() > 80 {
+                            why.chars().take(79).collect::<String>() + "…"
+                        } else {
+                            why
+                        };
+                        format!("{}  {}", c.label(), style::dim(&format!("why: {why}")))
+                    }
+                    None => c.label(),
+                },
             })
             .collect();
         let mut lines = graph::draw(&nodes);
@@ -325,6 +346,9 @@ impl Render for Log {
                 _ => lines.push(format!("~  {hint}")),
             }
         }
+        if let Some(note) = &self.note {
+            lines.push(style::dim(note));
+        }
         lines.join("\n")
     }
 }
@@ -337,6 +361,9 @@ pub struct Diff {
     /// Unified diff; omitted with --stat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patch: Option<String>,
+    /// With `gm show --context`: the step's context, or null when none was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<Option<crate::commands::steps::StepView>>,
 }
 
 impl Render for Diff {
@@ -345,6 +372,17 @@ impl Render for Diff {
         if let Some(change) = &self.change {
             out.push_str(&change.text());
             out.push_str("\n\n");
+        }
+        match &self.step {
+            Some(Some(step)) => {
+                out.push_str(&step.text());
+                out.push_str("\n\n");
+            }
+            Some(None) => {
+                out.push_str(&style::dim("No context was recorded for this step."));
+                out.push_str("\n\n");
+            }
+            None => {}
         }
         match &self.patch {
             Some(patch) => {

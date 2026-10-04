@@ -296,12 +296,12 @@ instructions and human steering (each entry marked `hook`, `agent` or
 keyed by gm's change ID, so amend and rebase add versions instead of
 overwriting, and capped at 256 KiB per step.
 
-| Route                                                        | Does                                                                                    |
-| ------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
-| `POST /api/repos/:o/:n/steps`                                | Upload one step (write access); retries replace the author's own record, others get 409 |
-| `GET /api/repos/:o/:n/steps?timeline=&issue=&cursor=&limit=` | Newest first, paged (1–100, default 50)                                                 |
-| `GET /api/repos/:o/:n/steps/:changeId`                       | Every version of a change, newest first                                                 |
-| `DELETE /api/repos/:o/:n/steps/:changeId/:commitOid`         | Delete or redact (admins): the text goes, a tombstone stays                             |
+| Route                                                                 | Does                                                                                      |
+| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `POST /api/repos/:o/:n/steps`                                         | Upload one step (write access); retries replace the author's own record, others get 409   |
+| `GET /api/repos/:o/:n/steps?timeline=&issue=&commits=&cursor=&limit=` | Newest first, paged (1–100, default 50); `commits` takes up to 100 comma-separated hashes |
+| `GET /api/repos/:o/:n/steps/:changeId`                                | Every version of a change, newest first                                                   |
+| `DELETE /api/repos/:o/:n/steps/:changeId/:commitOid`                  | Delete or redact (admins): the text goes, a tombstone stays                               |
 
 Anyone who can read the repository reads its steps. A step is **verified** once
 a push has shown Gitmatrix its commit, at upload (from `change_refs`) or on a

@@ -160,7 +160,7 @@ describe("step context", () => {
     expect((await open.call("")).status).toBe(200);
   });
 
-  test("lists newest first, filters by timeline and issue, and pages without repeats", async () => {
+  test("lists newest first, filters by timeline, issue and commits, and pages without repeats", async () => {
     const s = setup();
     for (let n = 1; n <= 7; n++)
       await s.upload(step(n, n > 5 ? { timeline: "other", issue: "CORE-8" } : {}));
@@ -184,6 +184,11 @@ describe("step context", () => {
     ]);
     const issue = (await (await s.call("?issue=CORE-8")).json()) as StepPage;
     expect(issue.steps).toHaveLength(2);
+    const commits = (await (
+      await s.call(`?commits=${oid(2)},${oid(6)},${oid(99)}`)
+    ).json()) as StepPage;
+    expect(commits.steps.map((x) => x.summary)).toEqual(["Step 6", "Step 2"]);
+    expect((await s.call("?commits=abc")).status).toBe(400);
     expect((await s.call("?cursor=junk")).status).toBe(400);
     expect((await s.call("?limit=500")).status).toBe(400);
   });

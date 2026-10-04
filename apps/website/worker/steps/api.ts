@@ -3,7 +3,7 @@
 // the repository.
 //
 //   POST   /api/repos/:owner/:name/steps                       gm uploads one step (write access)
-//   GET    /api/repos/:owner/:name/steps?timeline=&issue=&cursor=&limit=   newest first
+//   GET    /api/repos/:owner/:name/steps?timeline=&issue=&commits=&cursor=&limit=   newest first
 //   GET    /api/repos/:owner/:name/steps/:changeId             every version of a change
 //   DELETE /api/repos/:owner/:name/steps/:changeId/:commitOid  delete or redact (admins)
 //
@@ -285,6 +285,14 @@ steps.get("/", async (c) => {
   if (timeline) query = query.where("timeline", "=", timeline);
   const issue = c.req.query("issue");
   if (issue) query = query.where("issue_key", "=", issue);
+  // `gm log --context` asks for the steps of the commits it shows, in one call.
+  const commitsParam = c.req.query("commits");
+  if (commitsParam) {
+    const commits = commitsParam.split(",").filter(Boolean);
+    if (commits.length > 100 || commits.some((oid) => !/^[0-9a-f]{40}$/.test(oid)))
+      return fail(c, 400, "commits is up to 100 comma-separated 40-character commit hashes.");
+    if (commits.length > 0) query = query.where("commit_oid", "in", commits);
+  }
   const cursor = c.req.query("cursor");
   if (cursor) {
     const after = decodeCursor(cursor);
