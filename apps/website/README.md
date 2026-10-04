@@ -887,12 +887,16 @@ wire types.
   `landing` meanwhile. Per repository:
   1. The Worker points `refs/heads/gitmatrix/landing/<slug>` at the
      checkpoint's commit and starts a merge run there: one Gitmatrix job
-     (`land`, `worker/ci/landing.ts`), not the repository's ci.yml. It asks
-     `POST /api/repos/:o/:n/landing/credential` with its job credential for
-     the landing credential (a short-lived Artifacts write token for that
-     repository, given only to a running landing merge job), fetches main,
-     merges the checkpoint with `--no-ff` into the main commit the landing
-     pinned, and force-pushes the merge to the landing branch. A conflict
+     (`land`, `worker/ci/landing.ts`), not the repository's ci.yml. It
+     fetches and pushes through Gitmatrix's git proxy with its own job
+     credential (`gmj_…`, CORE-157). The proxy (`worker/git/http.ts`) takes a
+     job credential only from a running landing merge job, for its own
+     repository, and reads each push's commands before forwarding any of it:
+     one update of `refs/heads/gitmatrix/landing/<slug>` (or git's empty
+     probe), anything else a 403. No Artifacts token reaches the sandbox. The
+     job fetches main, merges the checkpoint with `--no-ff` into the main
+     commit the landing pinned, and force-pushes the merge to the landing
+     branch. A conflict
      exits 42 and lists the files.
   2. The Worker checks the merge's parents (main's pinned commit, then the
      checkpoint's), then runs the repository's pipeline on it: jobs see
@@ -2265,7 +2269,9 @@ and a rejected request stores nothing.
 
 ## Layout
 
-- `worker/git/http.ts`: smart HTTP proxy (info/refs, upload-pack, receive-pack)
+- `worker/git/http.ts`: smart HTTP proxy (info/refs, upload-pack, receive-pack);
+  a landing merge job's credential pushes only to its landing branch
+  (`worker/git/receive-pack.ts` reads the commands)
 - `worker/ssh.ts`, `worker/api/ssh.ts`: SSH public keys, SSHSIG verification, key sign-in
 - `worker/git/pktline.ts`: pkt-line codec and the `ls-refs` client used to list branches
 - `worker/api/*`: JSON API (`dev.ts` mints persona tokens and seeds sample data)

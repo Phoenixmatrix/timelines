@@ -1,84 +1,86 @@
-// A landing's merge job (CORE-77): who gets the landing credential, and the
-// merge step itself, run with real git against a local remote.
+// A landing's merge job (CORE-77): which job credential is a landing's, and
+// the merge step itself, run with real git through Gitmatrix's git proxy
+// (CORE-157), in front of `git http-backend` standing in for Artifacts.
 
-import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { AppEnv } from "../auth.ts";
-import { jobRoute } from "../deployments/job.ts";
+import { gitHttp } from "../git/http.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
-import { CONFLICT_EXIT, landingCredential, MERGE_SCRIPT } from "./landing.ts";
+import { gitBackend, run, serve } from "../testing/git-http.ts";
+import { CONFLICT_EXIT, landingJob, MERGE_SCRIPT } from "./landing.ts";
 import { mintJobToken } from "./registry.ts";
 
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
-describe("the landing credential", () => {
-  async function setup() {
-    const sqlite = migratedDatabase();
-    const landing = JSON.stringify({ steps: [], landing: { slug: "search" } });
-    sqlite.exec(`
-      INSERT INTO accounts (id, kind, slug, display_name) VALUES ('orbit', 'org', 'orbit', 'Orbit');
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
-        ('app', 'orbit', 'app', 'private', 'r-app', 'https://app'),
-        ('lib', 'orbit', 'lib', 'private', 'r-lib', 'https://lib');
-      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES
-        ('merge', 'app', 1, '${oid(1)}', 'gitmatrix/landing/search', 'manual', 'running'),
-        ('push', 'app', 2, '${oid(2)}', 'gitmatrix/landing/search', 'manual', 'running'),
-        ('old', 'app', 3, '${oid(3)}', 'gitmatrix/landing/search', 'manual', 'succeeded');
-      INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner) VALUES
-        ('land', 'merge', 'app', 'land', '${landing}', 'running', 'sandbox'),
-        ('mimic', 'push', 'app', 'land', '{"steps":[]}', 'running', 'sandbox'),
-        ('done', 'old', 'app', 'land', '${landing}', 'succeeded', 'sandbox');
-    `);
-    const env = {
-      DB: d1(sqlite),
-      ARTIFACTS: {
-        get: async (name: string) => ({
-          createToken: async (scope: string) => ({
-            id: "t",
-            plaintext: `${scope}-${name}`,
-            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-          }),
-          [Symbol.dispose]() {},
-        }),
-      },
-    } as unknown as Env;
-    const app = new Hono<AppEnv>();
-    app.use("*", async (c, next) => {
-      if (!jobRoute(c)) return c.json({ error: "not a job route" }, 401);
-      return next();
-    });
-    app.route("/api/repos/:owner/:name/landing", landingCredential);
-    const ask = async (job: string, repo = "app") => {
-      const token = await mintJobToken(env.DB, job, 30);
-      const response = await app.request(
-        `/api/repos/orbit/${repo}/landing/credential`,
-        { method: "POST", headers: { authorization: `Bearer ${token}` } },
-        env,
-      );
-      return { status: response.status, text: await response.text() };
-    };
-    return { ask };
-  }
+/** Repositories app and lib, and landing-shaped jobs in app. */
+function database(commit = oid(1)) {
+  const sqlite = migratedDatabase();
+  const landing = JSON.stringify({ steps: [], landing: { slug: "search" } });
+  sqlite.exec(`
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('orbit', 'org', 'orbit', 'Orbit');
+    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+      ('app', 'orbit', 'app', 'private', 'r-app', 'https://artifacts.test/app.git'),
+      ('lib', 'orbit', 'lib', 'private', 'r-lib', 'https://artifacts.test/lib.git');
+    INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES
+      ('merge', 'app', 1, '${commit}', 'gitmatrix/landing/search', 'manual', 'running'),
+      ('push', 'app', 2, '${commit}', 'gitmatrix/landing/search', 'manual', 'running'),
+      ('other', 'app', 4, '${commit}', 'gitmatrix/landing/search', 'manual', 'running'),
+      ('old', 'app', 3, '${commit}', 'gitmatrix/landing/search', 'manual', 'succeeded');
+    INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner) VALUES
+      ('land', 'merge', 'app', 'land', '${landing}', 'running', 'sandbox'),
+      ('mimic', 'push', 'app', 'land', '{"steps":[]}', 'running', 'sandbox'),
+      ('odd', 'other', 'app', 'land', '{"steps":[],"landing":{"slug":"../main"}}', 'running', 'sandbox'),
+      ('done', 'old', 'app', 'land', '${landing}', 'succeeded', 'sandbox');
+  `);
+  return sqlite;
+}
 
-  test("only a landing's running merge job gets it, for its own repository", async () => {
-    const t = await setup();
-    expect(await t.ask("land")).toEqual({ status: 200, text: "https://app\nwrite-r-app\n" });
-    // A repository's own job named like it, another repository, a finished job: no.
-    expect((await t.ask("mimic")).status).toBe(403);
-    expect((await t.ask("land", "lib")).status).toBe(403);
-    expect((await t.ask("done")).status).toBe(401);
+describe("a landing's merge job", () => {
+  test("is a landing's running merge job, in its own repository", async () => {
+    const db = d1(database());
+    const check = async (job: string, repo = "app") =>
+      landingJob(db, await mintJobToken(db, job, 30), "orbit", repo);
+    expect(await check("land")).toEqual({
+      ok: true,
+      slug: "search",
+      repo: {
+        id: "app",
+        artifacts_name: "r-app",
+        artifacts_remote: "https://artifacts.test/app.git",
+      },
+    });
+    // A repository's own job named like it, a slug that isn't one, another
+    // repository: forbidden. A finished job's credential is no credential.
+    expect(await check("mimic")).toMatchObject({ ok: false, status: 403 });
+    expect(await check("odd")).toMatchObject({ ok: false, status: 403 });
+    expect(await check("land", "lib")).toMatchObject({ ok: false, status: 403 });
+    expect(await check("done")).toMatchObject({ ok: false, status: 401 });
+    expect(await landingJob(db, "gmj_nope", "orbit", "app")).toMatchObject({
+      ok: false,
+      status: 401,
+    });
+  });
+
+  test("gets no Artifacts credential: it uses the git proxy with its own", () => {
+    expect(MERGE_SCRIPT).not.toMatch(/curl|landing\/credential/);
+    expect(MERGE_SCRIPT).toContain('remote="$GITMATRIX_URL/$GITMATRIX_REPOSITORY.git"');
+    expect(MERGE_SCRIPT).toContain('"Authorization: Bearer $GITMATRIX_TOKEN"');
   });
 });
 
 describe("the merge step", () => {
   const dirs: string[] = [];
-  afterEach(() => {
+  const closers: (() => Promise<void>)[] = [];
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    for (const close of closers.splice(0)) await close();
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
@@ -99,12 +101,14 @@ describe("the merge step", () => {
   /**
    * A remote where the timeline and main each changed `file` (different
    * lines); with `clash`, main also added the `new` file the timeline adds.
-   * Then a checkout as CI makes one, and the step to run in it.
+   * Then a checkout as CI makes one, Gitmatrix's git proxy in front of the
+   * remote (as Artifacts), and the step to run in the checkout with the merge
+   * job's credential.
    */
-  function setup(clash = false) {
+  async function setup(clash = false) {
     const root = mkdtempSync(join(tmpdir(), "landing-"));
     dirs.push(root);
-    const remote = join(root, "remote.git");
+    const remote = join(root, "app.git");
     const work = join(root, "work");
     git(root, "init", "--quiet", "--bare", "-b", "main", remote);
     git(root, "clone", "--quiet", remote, work);
@@ -140,20 +144,34 @@ describe("the merge step", () => {
       `file://${remote}`,
       checkout,
     );
-    // curl answers with the landing credential: the remote, and a token.
-    const bin = join(root, "bin");
-    mkdirSync(bin);
-    writeFileSync(join(bin, "curl"), `#!/bin/sh\nprintf 'file://${remote}\\ntoken\\n'\n`);
-    chmodSync(join(bin, "curl"), 0o755);
-    const run = () =>
-      spawnSync("bash", ["-eo", "pipefail", "-c", MERGE_SCRIPT], {
+    // The proxy, with the landing's merge job in the database.
+    const env = {
+      DB: d1(database(commit)),
+      ARTIFACTS: {
+        get: async (name: string) => ({
+          createToken: async (scope: string) => ({
+            id: "t",
+            plaintext: `${scope}-${name}`,
+            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+          }),
+          [Symbol.dispose]() {},
+        }),
+      },
+    } as unknown as Env;
+    const backend = gitBackend(root);
+    vi.stubGlobal("fetch", backend.fetch);
+    const server = await serve(new Hono<AppEnv>().route("/", gitHttp), env);
+    closers.push(server.close);
+    const token = await mintJobToken(env.DB, "land", 30);
+    const step = () =>
+      run("bash", ["-eo", "pipefail", "-c", MERGE_SCRIPT], {
         cwd: checkout,
-        encoding: "utf8",
         env: {
           ...process.env,
-          PATH: `${bin}:${process.env.PATH}`,
-          GITMATRIX_TOKEN: "gmj_x",
-          GITMATRIX_URL: "https://gitmatrix.test",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GITMATRIX_TOKEN: token,
+          GITMATRIX_URL: server.url,
           GITMATRIX_REPOSITORY: "orbit/app",
           GITMATRIX_COMMIT: commit,
           GITMATRIX_LANDING_BRANCH: "gitmatrix/landing/search",
@@ -164,12 +182,12 @@ describe("the merge step", () => {
           GITMATRIX_LANDING_EMAIL: "landing@gitmatrix.invalid",
         },
       });
-    return { remote, base, commit, run };
+    return { remote, base, commit, step, backend };
   }
 
-  test("merges the checkpoint into main's pinned commit and pushes it to the landing branch", () => {
-    const t = setup();
-    const result = t.run();
+  test("merges the checkpoint into main's pinned commit and pushes it to the landing branch", async () => {
+    const t = await setup();
+    const result = await t.step();
     expect(result.status, result.stdout + result.stderr).toBe(0);
     const merge = git(t.remote, "rev-parse", "refs/heads/gitmatrix/landing/search");
     expect(git(t.remote, "rev-parse", `${merge}^1`)).toBe(t.base);
@@ -180,11 +198,18 @@ describe("the merge step", () => {
     );
     // Main itself is the Worker's to move.
     expect(git(t.remote, "rev-parse", "refs/heads/main")).toBe(t.base);
+    // All of it through the proxy, which used its own tokens for Artifacts.
+    expect(t.backend.requests.map((r) => [new URL(r.url).pathname, r.authorization])).toEqual(
+      expect.arrayContaining([
+        ["/app.git/git-upload-pack", "Bearer read-r-app"],
+        ["/app.git/git-receive-pack", "Bearer write-r-app"],
+      ]),
+    );
   });
 
-  test("a conflict exits with its own code, listing the files, and pushes nothing", () => {
-    const t = setup(true);
-    const result = t.run();
+  test("a conflict exits with its own code, listing the files, and pushes nothing", async () => {
+    const t = await setup(true);
+    const result = await t.step();
     expect(result.status, result.stdout + result.stderr).toBe(CONFLICT_EXIT);
     expect(result.stdout).toMatch(/conflicts in:\n {2}new/);
     expect(git(t.remote, "rev-parse", "refs/heads/gitmatrix/landing/search")).toBe(t.commit);

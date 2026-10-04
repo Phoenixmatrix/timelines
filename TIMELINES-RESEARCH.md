@@ -444,6 +444,9 @@ returns:
   `trigger == "landing"`; landings run in parallel and serialize at each
   main's compare-and-swap, so one that lost the race merges onto the new main
   and is tested again. `apps/website/README.md` ("Landing") has the details.
+  The job's landing credential is its own CI job credential, which
+  Gitmatrix's git proxy accepts only for reads and for pushes to that one
+  landing branch (CORE-157).
 
 ### Tracker
 

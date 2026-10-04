@@ -6,22 +6,22 @@
 // back to the landing branch, where the repository's own pipeline then tests
 // it before main moves (timelines/landing.ts).
 //
-// The landing credential: the job asks for it with its own job credential
-// (gmj_…), and gets a short-lived Artifacts write token for this repository
-// only, and only while it runs. Every timeline repository belongs to the
-// tracker's own account. The commands are these, never the repository's, and
-// the Worker checks the merge's parents before testing it and moves main
-// itself, with a compare-and-swap.
+// The landing credential is the job's own (gmj_…, for as long as the job
+// runs). The job fetches and pushes through Gitmatrix's git proxy
+// (git/http.ts), which takes that credential from a landing's merge job only,
+// for its own repository, and lets it push to nothing but its landing branch
+// (CORE-157): no Artifacts token reaches the sandbox. Every timeline
+// repository belongs to the tracker's own account. The commands are these,
+// never the repository's, and the Worker checks the merge's parents before
+// testing it and moves main itself, with a compare-and-swap.
 
-import { Hono } from "hono";
 import { sql } from "kysely";
-import type { AppEnv } from "../auth.ts";
-import { upstreamToken } from "../artifacts.ts";
-import { jobCaller, jobSecret } from "../deployments/job.ts";
+import { jobCaller } from "../deployments/job.ts";
 import { PreviewModeError, productionOnly } from "../preview.ts";
 import { batch, db } from "../schema.ts";
 import type { StoredJob } from "./jobs.ts";
 import { startWorkflow } from "./trigger.ts";
+import { landingBranch, landingSlugOf } from "../../shared/timelines.ts";
 
 /** The exit code the merge step ends with when the merge conflicts. */
 export const CONFLICT_EXIT = 42;
@@ -34,13 +34,11 @@ export interface LandingJobSpec extends StoredJob {
 }
 
 /** The merge step: POSIX shell under `bash -eo pipefail`, like every step. */
-export const MERGE_SCRIPT = String.raw`# The landing credential: write access to this repository, for this job only.
-credential=$(curl -fsS -X POST -H "authorization: Bearer $GITMATRIX_TOKEN" "$GITMATRIX_URL/api/repos/$GITMATRIX_REPOSITORY/landing/credential")
-remote=$(printf '%s\n' "$credential" | sed -n 1p)
+export const MERGE_SCRIPT = String.raw`# Through Gitmatrix's git proxy, with the job's own credential: it reads this
+# repository and pushes only to this landing's branch.
+remote="$GITMATRIX_URL/$GITMATRIX_REPOSITORY.git"
 export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
-GIT_CONFIG_VALUE_0="Authorization: Bearer $(printf '%s\n' "$credential" | sed -n 2p)"
-export GIT_CONFIG_VALUE_0
-unset credential
+export GIT_CONFIG_VALUE_0="Authorization: Bearer $GITMATRIX_TOKEN"
 deepen=""
 if [ -f "$(git rev-parse --git-dir)/shallow" ]; then deepen=--unshallow; fi
 git fetch --quiet $deepen "$remote" "+refs/heads/$GITMATRIX_LANDING_MAIN:refs/remotes/landing/main"
@@ -220,30 +218,69 @@ export async function runOutcome(
   };
 }
 
-/** POST /api/repos/:owner/:name/landing/credential, with a landing merge job's own credential. */
-export const landingCredential = new Hono<AppEnv>();
+export type LandingJobAccess =
+  | {
+      ok: true;
+      slug: string;
+      repo: { id: string; artifacts_name: string; artifacts_remote: string };
+    }
+  | { ok: false; status: 401 | 403; error: string };
 
-landingCredential.post("/credential", async (c) => {
-  const secret = jobSecret(c.req.header("authorization"));
-  const job = secret ? await jobCaller(c.env.DB, secret) : null;
-  if (!job) return c.json({ error: "A running CI job's credential is required." }, 401);
-  const row = await db(c.env.DB)
+/**
+ * What a job credential (gmj_…) may do in `owner/name`'s git: only a
+ * landing's own merge job, while it runs, in its own repository, gets its
+ * landing's slug, and with it a push to that landing's branch (git/http.ts).
+ */
+export async function landingJob(
+  d1: D1Database,
+  secret: string,
+  owner: string,
+  name: string,
+): Promise<LandingJobAccess> {
+  const job = await jobCaller(d1, secret);
+  if (!job)
+    return {
+      ok: false,
+      status: 401,
+      error: "This isn't a running CI job's credential (has the job ended?).",
+    };
+  const row = await db(d1)
     .selectFrom("ci_jobs as j")
     .innerJoin("repos as p", "p.id", "j.repo_id")
     .innerJoin("accounts as o", "o.id", "p.owner_id")
-    .select(["j.spec", "p.name", "o.slug as owner", "p.artifacts_name", "p.artifacts_remote"])
+    .select([
+      "j.spec",
+      "p.id",
+      "p.name",
+      "o.slug as owner",
+      "p.artifacts_name",
+      "p.artifacts_remote",
+    ])
     .where("j.id", "=", job.jobId)
     .executeTakeFirst();
   const spec = row ? (JSON.parse(row.spec) as Partial<LandingJobSpec>) : null;
-  // Only a landing's own merge job, for its own repository.
+  const slug = spec?.landing?.slug;
   if (
     !row ||
-    !spec?.landing ||
+    !slug ||
+    landingSlugOf(landingBranch(slug)) !== slug ||
     job.jobName !== LANDING_JOB ||
-    row.owner !== c.req.param("owner") ||
-    row.name !== c.req.param("name")
+    row.owner !== owner ||
+    row.name !== name
   )
-    return c.json({ error: "Only a landing's merge job gets a landing credential." }, 403);
-  const token = await upstreamToken(c.env, row.artifacts_name, "write");
-  return c.text(`${row.artifacts_remote}\n${token}\n`);
-});
+    return {
+      ok: false,
+      status: 403,
+      error:
+        "A CI job's credential reaches git only as a landing's merge job, in its own repository.",
+    };
+  return {
+    ok: true,
+    slug,
+    repo: {
+      id: row.id,
+      artifacts_name: row.artifacts_name,
+      artifacts_remote: row.artifacts_remote,
+    },
+  };
+}
