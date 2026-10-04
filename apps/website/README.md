@@ -51,6 +51,62 @@ from this directory, `vp run db:migrate`, `vp run db:seed` and `vp dev` use port
 against it. **Load samples** creates four small empty named repositories;
 the agent harness fills them through real `gm` commits, without GitHub imports.
 
+## Testing
+
+Three kinds of test, each where it's cheapest to say what it checks. `vp test`
+here runs the first two (projects `unit` and `browser` in `vite.config.ts`);
+CI's test job runs them on every push. E2E runs only in `vp run ready` and
+`vp run agent test`.
+
+| Kind                       | Files                               | What belongs there                                                                                                                                                                                           |
+| -------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Node unit tests            | `**/*.test.ts`                      | Pure logic: parsers, reducers, URL and state helpers, and Worker routes over `worker/testing/` fakes (D1 over node:sqlite, Durable Object storage, git remotes).                                             |
+| Browser-mode tests         | `src/**/*.browser.test.tsx`         | What a person sees and does: rendering, interaction, keyboard and focus, touch, reduced motion, themes and responsive layout, the address and Back/Forward, against mocked or in-memory APIs.                |
+| End-to-end (`tools/agent`) | `e2e.ts`, `atlas-e2e.ts`, providers | Only what needs the real stack: sign-in and sessions, the Worker under `vp dev`, D1, git over HTTP and `gm`, CI runners, mirrors, deployments. A few journeys, asserting integration rather than UI details. |
+
+When a UI behaviour can be checked against a canned or in-memory API, it's a
+browser-mode test, not an E2E step.
+
+### Browser-mode tests
+
+Vitest's browser mode runs these in headless Chromium (Playwright's headless
+shell, which `vp run agent setup` installs; elsewhere run
+`vp exec playwright install --only-shell chromium` in this package). Run one file with
+`vp test --project browser src/palette/Palette.browser.test.tsx`; add
+`--project unit` for the Node tests alone. The helpers are in `src/testing/`:
+
+- `renderApp(path)` (`render.tsx`) mounts the whole app, as `main.tsx` does,
+  at an address: the real routes, loaders, shell and styles, with a browser
+  router (the timeline scope's middleware reads `window.location`). It returns
+  the router, `url()`, `waitForUrl()`, `navigate()`, `back()` and `forward()`;
+  `unmount()` and a fresh `renderApp(url)` is a cold load of a copied link.
+- `TestServer.start()` (`server.ts`) replaces `fetch` for the test. Each /api
+  request goes to the newest matching canned handler (`server.on(method,
+pattern, handler)`, a URLPattern pathname), then, with `{ world: true }`, to
+  the **in-memory API**: the Worker's own routes (accounts, repositories,
+  tracker and timelines, Knowledge, Atlas, search, `/api/dev/atlas`) over the
+  migrated schema and development seed, in Vitest's Node process
+  (`worker/testing/browser-api.ts`, reached through the commands in
+  `vite/browser-commands.ts`). Requests act as the world's persona (marco by
+  default; `server.as()` switches, and `server.call(..., as)` acts as someone
+  else once). `server.requests` records every request, for "it read only
+  this" assertions.
+- A world's repositories (`server.repo()`) have refs (`server.push()`) and
+  accept ref-only pushes, but no git objects: file listings and history are
+  canned (`cannedFiles()` in `git.ts`). No model, index or CI runner exists
+  there; the Knowledge coordinator is idle. `atlasFixtureRepo()` (`atlas.ts`)
+  publishes the Atlas fixture the way the non-AI E2E does.
+- `press()`, `pressUntil()` and `tap()` (`focus.ts`) drive the keyboard and
+  touch; `browserCommands.emulateMedia()` sets reduced motion or a colour
+  scheme; `page.viewport(w, h)` resizes.
+
+Write assertions with `expect.element(locator)`. `toHaveTextContent` and
+`toHaveAttribute` compare exactly; use `toMatchTextContent` for "contains"
+and `expect.poll(() => el.getAttribute(...)).toMatch(...)` for patterns.
+Pass a timeout to `expect.element(locator, { timeout })`, not the matcher.
+Locator text with an apostrophe is safer as a RegExp. Restore what a test
+changes in the page (viewport, theme, emulated media) in a `finally`.
+
 ## File history
 
 The repository file list shows each entry's most recent change, author,

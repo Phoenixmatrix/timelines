@@ -68,6 +68,11 @@ export function forgetRepoData(owner: string, name: string) {
   }
 }
 
+/** Drop everything cached for every repository (a new session, or a test's new world). */
+export function forgetAllRepoData() {
+  cache.clear();
+}
+
 /** In loaders: turn API failures into route errors for the error boundary. */
 export async function routeData<T>(promise: Promise<T>): Promise<T> {
   try {

@@ -2,6 +2,8 @@ import { cloudflare } from "@cloudflare/vite-plugin";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite-plus";
+import { playwright } from "vite-plus/test/browser-playwright";
+import { browserCommands } from "./vite/browser-commands.ts";
 import { ciRunners } from "./vite/ci-runners.ts";
 import { developmentEnvironment } from "./vite/environment.ts";
 
@@ -41,14 +43,46 @@ export default defineConfig({
       "yaml",
     ],
   },
+  // Two projects (see "Testing" in README.md): Node unit tests of pure logic,
+  // and browser-mode tests that render the app in headless Chromium against
+  // mocked and in-memory APIs.
   test: {
     maxWorkers: 2,
-    include: [
-      "worker/**/*.test.ts",
-      "registry/**/*.test.ts",
-      "src/**/*.test.ts",
-      "shared/**/*.test.ts",
-      "vite/**/*.test.ts",
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: "unit",
+          include: [
+            "worker/**/*.test.ts",
+            "registry/**/*.test.ts",
+            "src/**/*.test.ts",
+            "shared/**/*.test.ts",
+            "vite/**/*.test.ts",
+          ],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "browser",
+          include: ["src/**/*.browser.test.tsx"],
+          // Pages settle in well under a second; a missing element fails in 5s.
+          expect: { poll: { timeout: 5_000 } },
+          testTimeout: 30_000,
+          browser: {
+            enabled: true,
+            // Chromium's headless shell, which `vp run agent setup` and CI install.
+            headless: true,
+            // Touch on, so tests can tap as well as click.
+            provider: playwright({ contextOptions: { hasTouch: true } }),
+            instances: [{ browser: "chromium" }],
+            viewport: { width: 1280, height: 900 },
+            screenshotFailures: false,
+            commands: browserCommands,
+          },
+        },
+      },
     ],
   },
 });

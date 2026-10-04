@@ -51,6 +51,10 @@ release. Add a tool name to select part of the graph. For example, run
   every agent on this machine: follow
   `.agents/skills/gitmatrix-gm-install/SKILL.md`. Never install a feature
   build of gm machine-wide.
+- Put each test where it's cheapest (apps/website/README.md, "Testing"): pure
+  logic in Node unit tests, UI behaviour (rendering, keyboard, focus, touch,
+  motion, themes, layout) in browser-mode tests (`*.browser.test.tsx`, in
+  `vp test` and CI), and only real-stack journeys in E2E.
 - Keep the E2E artifacts and inspect failures before changing assertions.
   Sandbox/deployment changes (`apps/website/ci/`, `worker/ci/sandbox.ts`,
   `cloudflare.config.ts`) need their own deployment-boundary check: push and

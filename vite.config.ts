@@ -1,7 +1,12 @@
 import { defineConfig } from "vite-plus";
+import { configDefaults } from "vite-plus/test/config";
 
 export default defineConfig({
-  test: { maxWorkers: 2 },
+  test: {
+    maxWorkers: 2,
+    // Browser-mode tests need apps/website's browser project (its `vp test`).
+    exclude: [...configDefaults.exclude, "**/*.browser.test.tsx"],
+  },
   staged: {
     "*": "vp check --fix",
   },
