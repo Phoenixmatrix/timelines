@@ -3,6 +3,7 @@ import { sweepAtlasRetention } from "./atlas/retention.ts";
 import { isPreview } from "./preview.ts";
 import { previewFetch } from "./preview-gate.ts";
 import { sweepPreviews } from "./deployments/sweep.ts";
+import { sweepDurableInstances } from "./durable/sweep.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
 import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
@@ -57,6 +58,12 @@ export default {
     ctx.waitUntil(
       sweepAtlasRetention(env.DB).catch((error) =>
         console.error("Atlas: the retention sweep failed", error),
+      ),
+    );
+    // The Durable Object registry: backfill, owners and sizes (CORE-197).
+    ctx.waitUntil(
+      sweepDurableInstances(env).catch((error) =>
+        console.error("Durable: the registry sweep failed", error),
       ),
     );
     // Landings a CI run's end didn't move on (CORE-77).

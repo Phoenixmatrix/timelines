@@ -115,6 +115,26 @@ export interface Database {
     created_at: Generated<string>;
     updated_at: Generated<string>;
   };
+  /** The Durable Object instance registry (CORE-197, worker/durable/). */
+  do_instances: {
+    class: string;
+    name: string;
+    account_id: string | null;
+    repo_id: string | null;
+    created_at: Generated<string>;
+    last_active_at: Generated<string>;
+    storage_bytes: number | null;
+    sized_at: string | null;
+    retiring_at: string | null;
+    purged_at: string | null;
+    purge_reason: string | null;
+  };
+  /** Where a bounded, resumable cron pass left off. */
+  job_cursors: {
+    name: string;
+    cursor: string;
+    updated_at: Generated<string>;
+  };
   ssh_keys: {
     id: string;
     user_id: string;

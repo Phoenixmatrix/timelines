@@ -10,6 +10,16 @@ import {
 import type { MutationRequest } from "../../shared/tracker.ts";
 import type { SearchQuery } from "../search/query.ts";
 import type { Landing, TimelineStatus } from "../../shared/timelines.ts";
+import {
+  clearStorage,
+  pendingRetirement,
+  resetSoon,
+  scheduleRetirement,
+  settleRetirement,
+  storageReport,
+  type Purgeable,
+  type PurgeReport,
+} from "../durable/contract.ts";
 
 export type TrackerReply<T> =
   | { ok: true; value: T }
@@ -20,7 +30,7 @@ export type TrackerReply<T> =
       code: string;
       details: TrackerError["details"];
     };
-export class Tracker extends DurableObject<Env> {
+export class Tracker extends DurableObject<Env> implements Purgeable {
   private store: TrackerStore;
   private timelines: TimelineStore;
   private transaction: <T>(fn: () => T) => T;
@@ -185,5 +195,31 @@ export class Tracker extends DurableObject<Env> {
         );
       }),
     );
+  }
+
+  // The purge contract (worker/durable/contract.ts, CORE-197). The tracker
+  // holds nothing outside its own storage.
+  async purge(reason: string): Promise<PurgeReport> {
+    const report = await clearStorage(this.ctx.storage, reason);
+    resetSoon(this.ctx);
+    return report;
+  }
+  retire(reason: string, name: string): Promise<void> {
+    return scheduleRetirement(this.ctx.storage, reason, name);
+  }
+  storageReport() {
+    return storageReport(this.ctx.storage);
+  }
+  override async alarm(): Promise<void> {
+    const retirement = await pendingRetirement(this.ctx.storage);
+    if (!retirement) return;
+    await settleRetirement({
+      storage: this.ctx.storage,
+      env: this.env,
+      className: "Tracker",
+      retirement,
+      busy: false,
+      purge: (reason) => clearStorage(this.ctx.storage, reason),
+    });
   }
 }

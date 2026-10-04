@@ -10,6 +10,17 @@ import { upstreamToken } from "../artifacts.ts";
 import { batch, db, nowIso } from "../schema.ts";
 import { jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
 import { mintJobToken, withConfigDir } from "./registry.ts";
+import {
+  clearStorage,
+  pendingRetirement,
+  resetSoon,
+  scheduleRetirement,
+  settleRetirement,
+  storageReport,
+  type Purgeable,
+  type PurgeReport,
+} from "../durable/contract.ts";
+import { durableStub } from "../durable/registry.ts";
 
 const WORKDIR = "/workspace/repo";
 /** Package tools' configuration (npmrc, docker/config.json…), outside the checkout. */
@@ -35,7 +46,7 @@ class Cancelled extends Error {}
 
 const FINISHED = new Set(["succeeded", "failed", "cancelled", "skipped"]);
 
-export class CiSandbox extends DurableObject<Env> {
+export class CiSandbox extends DurableObject<Env> implements Purgeable {
   #running: Promise<void> | null = null;
 
   /**
@@ -48,6 +59,42 @@ export class CiSandbox extends DurableObject<Env> {
       this.#running = null;
     });
     return this.#running;
+  }
+
+  // The purge contract (worker/durable/contract.ts, CORE-197): the container
+  // is the external resource; the object keeps no storage of its own.
+  async purge(reason: string): Promise<PurgeReport> {
+    const report = await this.#clear(reason);
+    resetSoon(this.ctx);
+    return report;
+  }
+
+  async #clear(reason: string): Promise<PurgeReport> {
+    const container = this.ctx.container;
+    if (container?.running) await container.destroy().catch(() => {});
+    return clearStorage(this.ctx.storage, reason);
+  }
+
+  /** Purge once the job in progress (if any) has ended. */
+  retire(reason: string, name: string): Promise<void> {
+    return scheduleRetirement(this.ctx.storage, reason, name);
+  }
+
+  storageReport() {
+    return storageReport(this.ctx.storage);
+  }
+
+  override async alarm(): Promise<void> {
+    const retirement = await pendingRetirement(this.ctx.storage);
+    if (!retirement) return;
+    await settleRetirement({
+      storage: this.ctx.storage,
+      env: this.env,
+      className: "CiSandbox",
+      retirement,
+      busy: this.#running !== null,
+      purge: (reason) => this.#clear(reason),
+    });
   }
 
   async #run(jobId: string): Promise<void> {
@@ -301,6 +348,5 @@ export class CiSandbox extends DurableObject<Env> {
 
 /** The sandbox for one job. */
 export function sandbox(env: Env, jobId: string): DurableObjectStub<CiSandbox> {
-  // The config names the class by string, so its binding type can't infer it.
-  return (env.CI_SANDBOX as unknown as DurableObjectNamespace<CiSandbox>).getByName(jobId);
+  return durableStub(env, "CiSandbox", jobId);
 }

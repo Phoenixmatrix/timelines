@@ -1,4 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
+import {
+  clearStorage,
+  pendingRetirement,
+  resetSoon,
+  scheduleRetirement,
+  settleRetirement,
+  storageReport,
+  type Purgeable,
+  type PurgeReport,
+} from "../../worker/durable/contract.ts";
 
 /**
  * One per pending CLI web login (npm login --auth-type=web). The browser side
@@ -15,7 +25,7 @@ export interface LoginState {
   repo: string;
 }
 
-export class LoginDO extends DurableObject<Env> {
+export class LoginDO extends DurableObject<Env> implements Purgeable {
   async start(state: LoginState): Promise<void> {
     await this.ctx.storage.put("state", state);
     await this.ctx.storage.setAlarm(state.expiresAt);
@@ -45,7 +55,35 @@ export class LoginDO extends DurableObject<Env> {
     return { status: "done", token: state.token };
   }
 
+  // The purge contract (worker/durable/contract.ts, CORE-197). A login
+  // cleans itself up when it expires; purge and retire only do it sooner.
+  async purge(reason: string): Promise<PurgeReport> {
+    const report = await clearStorage(this.ctx.storage, reason);
+    resetSoon(this.ctx);
+    return report;
+  }
+
+  retire(reason: string, name: string): Promise<void> {
+    return scheduleRetirement(this.ctx.storage, reason, name);
+  }
+
+  storageReport() {
+    return storageReport(this.ctx.storage);
+  }
+
   override async alarm(): Promise<void> {
+    const retirement = await pendingRetirement(this.ctx.storage);
+    if (retirement) {
+      await settleRetirement({
+        storage: this.ctx.storage,
+        env: this.env,
+        className: "RegistryLogin",
+        retirement,
+        busy: false,
+        purge: (reason) => clearStorage(this.ctx.storage, reason),
+      });
+      return;
+    }
     await this.ctx.storage.deleteAll();
   }
 }

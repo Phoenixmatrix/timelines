@@ -15,6 +15,8 @@ import {
 } from "../atlas/fixture.ts";
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { findAccountBySlug } from "../db.ts";
+import { probeDurableObjects } from "../durable/probe.ts";
+import type { DurableClass } from "../durable/classes.ts";
 import { batch, db } from "../schema.ts";
 import { fail, readJson } from "./http.ts";
 import { issueToken } from "./tokens.ts";
@@ -70,7 +72,9 @@ dev.use("*", async (c, next) => {
   const id = Reflect.get(c.env, "AGENT_ID");
   if (
     id &&
-    ["/tokens", "/seed", "/environment", "/atlas"].some((path) => c.req.path.endsWith(path))
+    ["/tokens", "/seed", "/environment", "/atlas", "/durable"].some((path) =>
+      c.req.path.endsWith(path),
+    )
   ) {
     const secret = Reflect.get(c.env, "AGENT_SECRET");
     const supplied = c.req.header("Authorization")?.replace(/^Bearer /, "");
@@ -81,6 +85,13 @@ dev.use("*", async (c, next) => {
       return fail(c, 401, "Unauthorized.");
   }
   await next();
+});
+
+// The Durable Object purge contract in the real runtime (CORE-197): every
+// class, a fresh instance each, registered, given storage, purged.
+dev.post("/durable", async (c) => {
+  const { classes } = await readJson<{ classes?: DurableClass[] }>(c);
+  return c.json({ results: await probeDurableObjects(c.env, "acc_jun", classes) });
 });
 
 dev.get("/environment", async (c) => {

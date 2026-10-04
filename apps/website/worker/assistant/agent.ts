@@ -26,6 +26,13 @@ import { toolLabel, type AskEvent, type PageContext } from "../../shared/assista
 import { app } from "../app.ts";
 import { decide } from "../knowledge/models.ts";
 import { db, nowIso } from "../schema.ts";
+import {
+  confirmPurged,
+  storageReport,
+  type Purgeable,
+  type PurgeReport,
+} from "../durable/contract.ts";
+import { recordPurge } from "../durable/record.ts";
 import { credential, type AssistantCredential } from "./identity.ts";
 import { apiClient } from "./internal.ts";
 import { clefState, planFrom, questions, type TurnPlan } from "./plan.ts";
@@ -106,7 +113,7 @@ ${where}
 ${options.skills}`.trim();
 }
 
-export class Assistant extends AIChatAgent<Env> {
+export class Assistant extends AIChatAgent<Env> implements Purgeable {
   maxPersistedMessages = 500;
   private credential: AssistantCredential | null = null;
   /** Set while a `gm ask` turn runs (programmatic turns carry no request body). */
@@ -372,6 +379,37 @@ export class Assistant extends AIChatAgent<Env> {
       })(),
     );
     return readable;
+  }
+
+  // The purge contract (worker/durable/contract.ts, CORE-197), on the Agents
+  // SDK's destroy(): it stops the agent's own alarms and connections, deletes
+  // all storage and resets the instance on the next tick.
+  async purge(reason: string): Promise<PurgeReport> {
+    await this.destroy();
+    return confirmPurged(this.ctx.storage, reason);
+  }
+
+  /** Purge from the agent's own scheduler (its alarm), after the turn in progress. */
+  async retire(reason: string, name: string): Promise<void> {
+    await this.schedule(1, "retireNow", { reason, name });
+  }
+
+  /** The scheduled half of retire(). */
+  async retireNow({ reason, name }: { reason: string; name: string }): Promise<void> {
+    // Recorded first: destroy() resets the instance right after it returns.
+    await recordPurge(this.env, "Assistant", name, {
+      reason,
+      purgedAt: nowIso(),
+      bytes: 0,
+      tables: [],
+      keys: 0,
+      alarm: null,
+    }).catch((error) => console.error("Durable: recording a retirement failed", error));
+    await this.destroy();
+  }
+
+  storageReport() {
+    return storageReport(this.ctx.storage);
   }
 
   /** The transcript as plain text turns, for `gm assistant show`. */

@@ -2,11 +2,10 @@
 // Durable Object instance is "<userId>:<chatId>", chosen here from the signed-
 // in actor, so nobody can reach someone else's conversation by naming it.
 
-import { getAgentByName } from "agents";
 import { Hono } from "hono";
 import type { AskRequest, AssistantChat } from "../../shared/assistant.ts";
-import type { Assistant } from "../assistant/agent.ts";
 import type { AppEnv } from "../auth.ts";
+import { durableAgent, purgeInstance } from "../durable/registry.ts";
 import { db } from "../schema.ts";
 import { fail, readJson, requireActor } from "./http.ts";
 
@@ -22,10 +21,7 @@ function passThrough(response: Response): Response {
 }
 
 function stub(env: Env, userId: string, chatId: string) {
-  return getAgentByName(
-    env.ASSISTANT as unknown as DurableObjectNamespace<Assistant>,
-    `${userId}:${chatId}`,
-  );
+  return durableAgent(env, "Assistant", `${userId}:${chatId}`);
 }
 
 assistant.get("/chats", async (c) => {
@@ -74,7 +70,7 @@ assistant.delete("/chats/:id", async (c) => {
     .where("user_id", "=", actor.id)
     .executeTakeFirst();
   if (!numDeletedRows) return fail(c, 404, "No such chat.");
-  await (await stub(c.env, actor.id, id)).destroy();
+  await purgeInstance(c.env, "Assistant", `${actor.id}:${id}`, "chat deleted");
   return c.body(null, 204);
 });
 

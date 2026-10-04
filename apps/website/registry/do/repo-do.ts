@@ -3,11 +3,21 @@ import { DurableObject } from "cloudflare:workers";
 import type { Actor } from "../core/auth/actor.ts";
 import { RepoLogic } from "./repo-logic.ts";
 import { cacheNpmArchive } from "../manage/archive.ts";
+import {
+  clearStorage,
+  pendingRetirement,
+  resetSoon,
+  scheduleRetirement,
+  settleRetirement,
+  storageReport,
+  type Purgeable,
+  type PurgeReport,
+} from "../../worker/durable/contract.ts";
 
 const REBUILD_DELAY_MS = 2_000;
 
 /** One per repository (named by repository id). */
-export class RepoDO extends DurableObject<Env> {
+export class RepoDO extends DurableObject<Env> implements Purgeable {
   private readonly logic: RepoLogic;
   private readonly archives = new Map<string, Promise<string>>();
 
@@ -60,7 +70,35 @@ export class RepoDO extends DurableObject<Env> {
     this.logic.release(key);
   }
 
+  // The purge contract (worker/durable/contract.ts, CORE-197). Leases and
+  // the rebuild debounce live in storage; the catalog lives in REGISTRY_DB.
+  async purge(reason: string): Promise<PurgeReport> {
+    const report = await clearStorage(this.ctx.storage, reason);
+    resetSoon(this.ctx);
+    return report;
+  }
+
+  retire(reason: string, name: string): Promise<void> {
+    return scheduleRetirement(this.ctx.storage, reason, name);
+  }
+
+  storageReport() {
+    return storageReport(this.ctx.storage);
+  }
+
   override async alarm(): Promise<void> {
+    const retirement = await pendingRetirement(this.ctx.storage);
+    if (retirement) {
+      await settleRetirement({
+        storage: this.ctx.storage,
+        env: this.env,
+        className: "RegistryRepo",
+        retirement,
+        busy: this.archives.size > 0,
+        purge: (reason) => clearStorage(this.ctx.storage, reason),
+      });
+      return;
+    }
     const repoId = await this.ctx.storage.get<string>("repoId");
     if (!repoId) return;
     await this.ctx.storage.put("lastRebuildAt", Date.now());

@@ -53,6 +53,18 @@ import type { Checkpoint } from "../../shared/timelines.ts";
 import { watchdog } from "./watchdog.ts";
 import { repoAiSnapshot } from "../settings/ai.ts";
 import { knowledgePolicy, LEGACY_KNOWLEDGE_POLICY, type KnowledgePolicy } from "./policy.ts";
+import {
+  clearStorage,
+  pendingRetirement,
+  resetSoon,
+  scheduleRetirement,
+  settleRetirement,
+  storageReport,
+  type Purgeable,
+  type PurgeReport,
+  type Retirement,
+} from "../durable/contract.ts";
+import { durableStub } from "../durable/registry.ts";
 
 /** Quiet period after the last push before building. */
 const DEBOUNCE_MS = 1_500;
@@ -135,7 +147,7 @@ const INITIAL: State = {
   pagesDue: false,
 };
 
-export class KnowledgeCoordinator extends DurableObject<Env> {
+export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeable {
   async #state(): Promise<State> {
     return { ...INITIAL, ...(await this.ctx.storage.get<State>("state")) };
   }
@@ -179,6 +191,8 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
   }
 
   async #alarm(): Promise<void> {
+    const retirement = await pendingRetirement(this.ctx.storage);
+    if (retirement) return this.#retire(retirement);
     const state = await this.#state();
     if (!state.repoId) return;
     if (state.running) await this.#watchBuild(state);
@@ -254,6 +268,46 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     if (state.pagesDue) await this.#startPages(state);
     await this.#save(state);
     if (this.#busy(state)) await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+  }
+
+  /**
+   * Retiring (CORE-197): start nothing new, keep watching what runs, and
+   * purge once it has all ended.
+   */
+  async #retire(retirement: Retirement): Promise<void> {
+    const state = await this.#state();
+    if (state.running) await this.#watchBuild(state);
+    await this.#watchOverlays(state);
+    await this.#watchPages(state);
+    await this.#save(state);
+    await settleRetirement(
+      {
+        storage: this.ctx.storage,
+        env: this.env,
+        className: "KnowledgeCoordinator",
+        retirement,
+        busy: this.#busy(state),
+        purge: (reason) => clearStorage(this.ctx.storage, reason),
+      },
+      WATCHDOG_MS,
+    );
+  }
+
+  // The purge contract (worker/durable/contract.ts). Builds, overlays and
+  // page sets run in Workflows that report back by id; purge forgets them
+  // (their reports find no state and start nothing), retire waits for them.
+  async purge(reason: string): Promise<PurgeReport> {
+    const report = await clearStorage(this.ctx.storage, reason);
+    resetSoon(this.ctx);
+    return report;
+  }
+
+  retire(reason: string, name: string): Promise<void> {
+    return scheduleRetirement(this.ctx.storage, reason, name);
+  }
+
+  storageReport() {
+    return storageReport(this.ctx.storage);
   }
 
   #busy(state: State) {
@@ -505,6 +559,9 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
     await this.#save(state);
     // Pushes that arrived during the build: build again now, for the latest HEAD.
     if (state.seq > state.builtSeq || state.scan) await this.ctx.storage.setAlarm(Date.now() + 250);
+    // A retiring coordinator's alarm purges it once this was the last work.
+    else if (await pendingRetirement(this.ctx.storage))
+      await this.ctx.storage.setAlarm(Date.now() + 250);
     else if (!this.#busy(state)) await this.ctx.storage.deleteAlarm();
   }
 
@@ -558,10 +615,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> {
 
 /** The coordinator for one repository. */
 export function coordinator(env: Env, repoId: string): DurableObjectStub<KnowledgeCoordinator> {
-  // The config names the class by string, so its binding type can't infer it.
-  const namespace =
-    env.KNOWLEDGE_COORDINATOR as unknown as DurableObjectNamespace<KnowledgeCoordinator>;
-  return namespace.getByName(repoId);
+  return durableStub(env, "KnowledgeCoordinator", repoId);
 }
 
 /** Tell a repository's coordinator that something changed. */

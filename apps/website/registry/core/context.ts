@@ -9,6 +9,7 @@ import { createDb, type DB } from "./db.ts";
 import type { LoginDO } from "../do/login-do.ts";
 import type { RepoDO } from "../do/repo-do.ts";
 import type { Repository } from "./repos.ts";
+import { durableStub } from "../../worker/durable/registry.ts";
 
 /**
  * Everything a handler needs for one request. Authentication is lazy: public
@@ -74,13 +75,11 @@ export class Services {
 
 /** Typed stubs: the config names the classes by string, so bindings can't infer them. */
 export function repoObject(env: Env, repoId: string): DurableObjectStub<RepoDO> {
-  const ns = env.REGISTRY_REPO as unknown as DurableObjectNamespace<RepoDO>;
-  return ns.get(ns.idFromName(repoId));
+  return durableStub(env, "RegistryRepo", repoId);
 }
 
 export function loginObject(env: Env, name: string): DurableObjectStub<LoginDO> {
-  const ns = env.REGISTRY_LOGIN as unknown as DurableObjectNamespace<LoginDO>;
-  return ns.get(ns.idFromName(name));
+  return durableStub(env, "RegistryLogin", name);
 }
 
 /**

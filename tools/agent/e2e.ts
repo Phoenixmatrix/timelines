@@ -1884,6 +1884,56 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     record({ avatar: url, removed: true, orgIcon: icon });
   });
 
+  await scenario("durable-objects-register-and-purge", async () => {
+    // CORE-197, in the real runtime: every Durable Object class, a fresh
+    // instance each, recorded in the registry on use, given storage and an
+    // alarm (retire()), then purged: no table, key or alarm left, and the
+    // registry row records the purge.
+    interface Report {
+      bytes: number;
+      tables: string[];
+      keys: number;
+      alarm: number | null;
+    }
+    const { results } = await json<{
+      results: {
+        class: string;
+        name: string;
+        registered: boolean;
+        before: Report;
+        purged: Report & { reason: string };
+        row: { purged_at: string | null; purge_reason: string | null } | null;
+      }[];
+    }>("/api/dev/durable", ctx.env.GITMATRIX_AGENT_SECRET ?? "", "POST", {});
+    assert.deepEqual(results.map((r) => r.class).sort(), [
+      "Assistant",
+      "CiSandbox",
+      "KnowledgeCoordinator",
+      "RegistryLogin",
+      "RegistryRepo",
+      "RegistryUpload",
+      "Tracker",
+    ]);
+    for (const result of results) {
+      const label = `${result.class} ${result.name}`;
+      assert(result.registered, `${label}: recorded in do_instances on first use`);
+      assert(
+        result.before.keys + result.before.tables.length > 0 && result.before.alarm !== null,
+        `${label}: held storage and an alarm before the purge: ${JSON.stringify(result.before)}`,
+      );
+      assert.deepEqual(
+        { tables: result.purged.tables, keys: result.purged.keys, alarm: result.purged.alarm },
+        { tables: [], keys: 0, alarm: null },
+        `${label}: purge leaves no storage and no alarm`,
+      );
+      assert(result.row?.purged_at, `${label}: the registry row records the purge`);
+      assert.equal(result.row?.purge_reason, "probe");
+    }
+    record({
+      durable: results.map((r) => ({ class: r.class, before: r.before, after: r.purged.bytes })),
+    });
+  });
+
   await scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;

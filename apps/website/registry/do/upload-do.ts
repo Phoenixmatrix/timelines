@@ -1,7 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
+import {
+  clearStorage,
+  pendingRetirement,
+  resetSoon,
+  scheduleRetirement,
+  settleRetirement,
+  storageReport,
+  type Purgeable,
+  type PurgeReport,
+} from "../../worker/durable/contract.ts";
 
 /** One per OCI blob upload session; holds resumable state between PATCHes. */
-export class UploadDO extends DurableObject<Env> {
+export class UploadDO extends DurableObject<Env> implements Purgeable {
   async getState<T>(): Promise<T | null> {
     return (await this.ctx.storage.get<T>("state")) ?? null;
   }
@@ -26,7 +36,46 @@ export class UploadDO extends DurableObject<Env> {
     await this.ctx.storage.deleteAlarm();
   }
 
+  // The purge contract (worker/durable/contract.ts, CORE-197). An upload
+  // cleans itself up when it expires; purge and retire only do it sooner.
+  async purge(reason: string): Promise<PurgeReport> {
+    const report = await this.#clear(reason);
+    resetSoon(this.ctx);
+    return report;
+  }
+
+  async #clear(reason: string): Promise<PurgeReport> {
+    await this.#release();
+    return clearStorage(this.ctx.storage, reason);
+  }
+
+  retire(reason: string, name: string): Promise<void> {
+    return scheduleRetirement(this.ctx.storage, reason, name);
+  }
+
+  storageReport() {
+    return storageReport(this.ctx.storage);
+  }
+
   override async alarm(): Promise<void> {
+    const retirement = await pendingRetirement(this.ctx.storage);
+    if (retirement) {
+      await settleRetirement({
+        storage: this.ctx.storage,
+        env: this.env,
+        className: "RegistryUpload",
+        retirement,
+        busy: false,
+        purge: (reason) => this.#clear(reason),
+      });
+      return;
+    }
+    await this.#release();
+    await this.ctx.storage.deleteAll();
+  }
+
+  /** The upload's R2 leftovers: its multipart upload and any tails. */
+  async #release(): Promise<void> {
     // Shape: UploadState in formats/oci/uploads.ts.
     const state = await this.ctx.storage.get<{
       r2Key?: string;
@@ -46,6 +95,5 @@ export class UploadDO extends DurableObject<Env> {
         );
       }
     }
-    await this.ctx.storage.deleteAll();
   }
 }

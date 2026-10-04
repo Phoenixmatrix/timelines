@@ -56,6 +56,9 @@ class FakeNamespace<T> {
   idFromName(name: string): string {
     return name;
   }
+  getByName(name: string): T {
+    return this.get(this.idFromName(name));
+  }
   get(id: string): T {
     let instance = this.instances.get(id);
     if (!instance) {

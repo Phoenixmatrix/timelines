@@ -3,6 +3,7 @@ import { createHasher, resumeHasher, toHex, type HasherState } from "@gitmatrix/
 import { commitBlob, newBlobKey, PART_SIZE, type StoredBlob } from "../../core/blobs.ts";
 import type { Services } from "../../core/context.ts";
 import { OciError } from "./errors.ts";
+import { durableStub } from "../../../worker/durable/registry.ts";
 
 /**
  * Chunked blob uploads. The Worker streams bytes straight to an R2 multipart
@@ -43,8 +44,7 @@ interface UploadStub {
 }
 
 export function uploadStub(svc: Services, uuid: string): UploadStub {
-  const ns = svc.env.REGISTRY_UPLOAD;
-  return ns.get(ns.idFromName(uuid)) as unknown as UploadStub;
+  return durableStub(svc.env, "RegistryUpload", uuid) as unknown as UploadStub;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
