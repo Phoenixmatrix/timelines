@@ -177,10 +177,17 @@ export function Story() {
   const open = (row: StoryRow | undefined) => row && set({ step: row.commit.oid });
 
   // j/k and the arrow keys step through; Escape closes the step. The handler
-  // reads the latest position, so keys pressed faster than a render still
-  // step one at a time.
-  const position = useRef({ shown, index, current, open, set });
-  position.current = { shown, index, current, open, set };
+  // reads the latest position, and remembers the step it asked for until the
+  // URL shows it: a render in between (a diff loading) must not send the next
+  // key from the old step.
+  const position = useRef({ shown, open, set, selected, heading: null as string | null });
+  position.current = {
+    shown,
+    open,
+    set,
+    selected,
+    heading: position.current.heading === selected ? null : position.current.heading,
+  };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
@@ -191,18 +198,21 @@ export function Story() {
         )
       )
         return;
-      const { shown, index, current, open, set } = position.current;
+      const { shown, open, set, selected, heading } = position.current;
+      const at = heading ?? selected;
+      const index = shown.findIndex((row) => row.commit.oid === at);
       // Newest first: "next" is the step after this one in time, one row up.
       const go = (row: StoryRow | undefined) => {
         if (!row) return;
-        position.current.index = shown.indexOf(row);
-        position.current.current = row;
+        position.current.heading = row.commit.oid;
         open(row);
       };
       if (event.key === "j" || event.key === "ArrowLeft") go(shown[index < 0 ? 0 : index + 1]);
       else if (event.key === "k" || event.key === "ArrowRight") go(shown[index - 1]);
-      else if (event.key === "Escape" && current) set({ step: null });
-      else return;
+      else if (event.key === "Escape" && at) {
+        position.current.heading = null;
+        set({ step: null });
+      } else return;
       event.preventDefault();
     };
     document.addEventListener("keydown", onKey);
