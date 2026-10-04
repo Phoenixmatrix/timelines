@@ -157,17 +157,7 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
   await expect.element(diff).toMatchTextContent(/src\/rank\.ts/);
   await expect.element(diff.getByText("+byRecency()")).toBeVisible();
 
-  // Amended: the earlier version, with its own context and diff.
-  const version = step.getByRole("combobox", { name: "Version" });
-  await userEvent.click(version);
-  await userEvent.click(page.getByRole("option", { name: new RegExp(rankOld.slice(0, 7)) }));
-  await expect.element(context).toMatchTextContent(/First take: rank by date\./);
-  await expect.element(diff.getByText("+byDate()")).toBeVisible();
-
-  // The keyboard (outside the version picker): j goes back in time, k forward.
-  await expect.element(page.getByRole("listbox")).not.toBeInTheDocument();
-  await userEvent.click(step.getByRole("heading", { level: 2 }));
-  await expect.poll(() => document.activeElement?.closest("[role=combobox]")).toBeNull();
+  // The keyboard: j goes back in time, k forward, even pressed quickly.
   await userEvent.keyboard("j");
   await app.waitForUrl((url) => url.searchParams.get("step") === plain);
   await expect.element(context).toMatchTextContent(/No context was recorded for this commit/);
@@ -178,6 +168,15 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
     .element(context.getByRole("note"))
     .toMatchTextContent(/No claude-code hook recorded this step's prompts and steering/);
   await expect.element(step.getByRole("button", { name: /Next/ })).toBeDisabled();
+
+  // Amended: the earlier version, with its own context and diff.
+  await userEvent.keyboard("j");
+  await app.waitForUrl((url) => url.searchParams.get("step") === rank);
+  const version = step.getByRole("combobox", { name: "Version" });
+  await userEvent.click(version);
+  await userEvent.click(page.getByRole("option", { name: new RegExp(rankOld.slice(0, 7)) }));
+  await expect.element(context).toMatchTextContent(/First take: rank by date\./);
+  await expect.element(diff.getByText("+byDate()")).toBeVisible();
 
   // Filters: by issue, then by agent.
   await userEvent.click(page.getByRole("combobox", { name: "Issue" }));
