@@ -5,7 +5,7 @@ import { EnvelopeSimpleIcon } from "@phosphor-icons/react";
 import { useEffect, useRef } from "react";
 import { Form, redirect, useActionData, useLoaderData, useNavigation } from "react-router";
 import type { Invite } from "../../shared/api.ts";
-import { Page } from "../components/AppShell.tsx";
+import { SettingsPage } from "../components/SettingsPage.tsx";
 import { Card, FormError, TextField } from "../components/ui.tsx";
 import { api, attempt, field, load } from "../lib/api.ts";
 import { fullDate, timeAgo } from "../lib/format.ts";
@@ -40,7 +40,7 @@ export function Invites() {
   }, [result]);
 
   return (
-    <Page>
+    <SettingsPage>
       <h1 className="m-0 text-headline">Invitations</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         Gitmatrix is invite only. Someone you invite signs in with an emailed code, and their
@@ -95,6 +95,6 @@ export function Invites() {
           )}
         </section>
       </div>
-    </Page>
+    </SettingsPage>
   );
 }

@@ -3,7 +3,7 @@
 import { Form, Link, useActionData, useNavigation, useRevalidator } from "react-router";
 import { useEffect } from "react";
 import type { SessionResponse } from "../../shared/api.ts";
-import { Page } from "../components/AppShell.tsx";
+import { SettingsPage } from "../components/SettingsPage.tsx";
 import { Card, FormError, TextField, link } from "../components/ui.tsx";
 import { api, attempt, field } from "../lib/api.ts";
 import { requireViewer, useViewer } from "../lib/session.ts";
@@ -39,7 +39,7 @@ export function Profile() {
 
   if (!viewer) return null;
   return (
-    <Page>
+    <SettingsPage>
       <h1 className="m-0 text-headline">Profile</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         Manage your picture, display name and username. These identify you across Gitmatrix. See{" "}
@@ -90,6 +90,6 @@ export function Profile() {
           </Form>
         </Card>
       </div>
-    </Page>
+    </SettingsPage>
   );
 }

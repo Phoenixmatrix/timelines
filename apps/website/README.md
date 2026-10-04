@@ -728,11 +728,16 @@ read as `agent_decides`.
 - **Keyboard shortcuts:** enable them in **Account menu → Preferences**. This
   opt-in applies only to the current browser: `c`/`n` captures an issue, `/`
   filters, `j`/`k` moves between issues, and Escape closes the issue.
-- **Tracker administration:** the **Settings** gear at the bottom of the
-  navigation rail opens **Teams and workspaces** for the current tracker, or
-  your default tracker when outside a tracker. Manage teams, workspaces and
-  repository subscriptions there; existing permissions still apply. **Back
-  to issues** returns to the current filters and layout.
+- **Settings:** the gear at the bottom of the navigation rail opens a shared
+  settings area, starting with **Teams and workspaces** for the current tracker,
+  or your default tracker when outside a tracker. A left-hand section navigation
+  brings together **AI settings**, profile, preferences, access tokens, SSH keys,
+  agents, and invitations for site admins. On smaller screens it becomes a
+  collapsible section menu. Account context follows section links; personal
+  settings still belong to the signed-in person. Existing permissions apply.
+  Tracker administration includes teams, workspaces, and repository subscriptions;
+  changing its account stays in Settings. **Back to issues** retains the current
+  filters and layout.
 - **Default team in one click:** the star next to each team in the facet
   column makes it your default; the filled star marks the current one, and
   clicking it clears the default. Under the query bar a note names the default
@@ -1136,9 +1141,9 @@ model budget is exhausted, and stale-subject pruning within D1 binding limits.
 ## Automatic AI settings
 
 `/settings/ai?owner=<account>` controls automatic work across repositories owned
-by that personal or organization account. The account menu and Preferences link
-to this page. Account members can read; only the human account owner, organization
-owners, and site admins can save. Agent credentials cannot change spending policy.
+by that personal or organization account. Open **Settings → AI settings** in the
+shared section navigation. Account members can read; only the human account owner,
+organization owners, and site admins can save. Agent credentials cannot change spending policy.
 Agent chat and interactive search, including query embeddings and reranking, are
 unchanged.
 

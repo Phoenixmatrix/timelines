@@ -2,7 +2,7 @@ import { KeyIcon } from "@phosphor-icons/react";
 import { useEffect, useRef } from "react";
 import { Form, Link, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
 import type { AccessToken, CreatedAccessToken } from "../../shared/api.ts";
-import { Page } from "../components/AppShell.tsx";
+import { SettingsPage } from "../components/SettingsPage.tsx";
 import { Segmented } from "../components/Choice.tsx";
 import { Card, ConfirmDialog, CopyField, FormError, TextField, link } from "../components/ui.tsx";
 import { api, attempt, field, load } from "../lib/api.ts";
@@ -40,7 +40,7 @@ export function Tokens() {
   }, [fresh]);
 
   return (
-    <Page>
+    <SettingsPage>
       <h1 className="m-0 text-headline">Access tokens</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         Git asks for a username and password over HTTPS. Use your username and a token as the
@@ -123,7 +123,7 @@ export function Tokens() {
           )}
         </Card>
       </div>
-    </Page>
+    </SettingsPage>
   );
 }
 

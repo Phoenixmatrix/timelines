@@ -4,7 +4,7 @@ import { KeyIcon, RobotIcon } from "@phosphor-icons/react";
 import { useEffect, useRef } from "react";
 import { Form, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
 import type { Agent, AgentCapabilities, CreatedAccessToken } from "../../shared/api.ts";
-import { Page } from "../components/AppShell.tsx";
+import { SettingsPage } from "../components/SettingsPage.tsx";
 import { Card, ConfirmDialog, CopyField, FormError, TextField } from "../components/ui.tsx";
 import { api, attempt, field, load } from "../lib/api.ts";
 import { fullDate, timeAgo } from "../lib/format.ts";
@@ -60,7 +60,7 @@ export function Agents() {
   }, [result]);
 
   return (
-    <Page>
+    <SettingsPage>
       <h1 className="m-0 text-headline">Agents</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         An agent works on its own: it claims tracker work, comments and checkpoints as itself, and
@@ -147,7 +147,7 @@ export function Agents() {
           )}
         </Card>
       </div>
-    </Page>
+    </SettingsPage>
   );
 }
 

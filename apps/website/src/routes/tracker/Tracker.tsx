@@ -50,6 +50,7 @@ import {
   type TrackerView,
 } from "../../../shared/tracker.ts";
 import { ActivityStrip } from "../../components/ActivityStrip.tsx";
+import { SettingsPage } from "../../components/SettingsPage.tsx";
 import { FormError, SelectField, Tip, useToast } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { useViewer } from "../../lib/session.ts";
@@ -698,14 +699,20 @@ function Workbench({ data }: { data: TrackerView }) {
     </div>
   ) : null;
 
-  return (
+  const content = (
     <div
-      className="flex min-h-dvh flex-col gap-3 px-4 py-3 lg:h-[calc(100dvh-var(--scope-banner))] lg:min-h-0 lg:overflow-hidden"
+      className={
+        admin
+          ? "flex min-w-0 flex-col gap-6"
+          : "flex min-h-dvh flex-col gap-3 px-4 py-3 lg:h-[calc(100dvh-var(--scope-banner))] lg:min-h-0 lg:overflow-hidden"
+      }
       aria-busy={navigation.state !== "idle"}
       data-shortcuts={shortcuts}
     >
       <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <h1 className="m-0 text-title-lg">{admin ? "Teams and workspaces" : "Issues"}</h1>
+        <h1 className={`m-0 ${admin ? "text-headline" : "text-title-lg"}`}>
+          {admin ? "Teams and workspaces" : "Issues"}
+        </h1>
         <SelectField
           ariaLabel="Tracker owner"
           value={owner}
@@ -714,7 +721,9 @@ function Workbench({ data }: { data: TrackerView }) {
             value: tracker.slug,
             label: tracker.displayName,
           }))}
-          onChange={(value) => navigate(`/tracker/${value}`)}
+          onChange={(value) =>
+            navigate(`/tracker/${encodeURIComponent(value)}${admin ? "?manage=true" : ""}`)
+          }
         />
         {!admin && hasTeam && (
           <div className="order-last flex min-w-0 basis-full md:order-none md:basis-0 md:flex-1">
@@ -763,7 +772,7 @@ function Workbench({ data }: { data: TrackerView }) {
           }}
         />
       )}
-      {shortcuts && (
+      {shortcuts && !admin && (
         <p className="m-0 -mt-1 text-micro text-ink-faint">
           Shortcuts: c captures, / filters, j and k move, Escape closes the issue.
         </p>
@@ -1026,6 +1035,13 @@ function Workbench({ data }: { data: TrackerView }) {
         </div>
       )}
     </div>
+  );
+  return admin ? (
+    <SettingsPage owner={owner} tracker>
+      {content}
+    </SettingsPage>
+  ) : (
+    content
   );
 }
 

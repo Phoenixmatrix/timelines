@@ -15,7 +15,7 @@ import type {
   AiSettingsPatch,
   AiSettingsView,
 } from "../../shared/ai.ts";
-import { Page } from "../components/AppShell.tsx";
+import { SettingsPage } from "../components/SettingsPage.tsx";
 import { FormError, SelectField, link } from "../components/ui.tsx";
 import { api, ApiError } from "../lib/api.ts";
 import { requireViewer } from "../lib/session.ts";
@@ -102,7 +102,7 @@ export function AiSettings() {
   const revalidator = useRevalidator();
   const switching = navigation.state !== "idle";
   return (
-    <Page>
+    <SettingsPage owner={data.owner}>
       <div className="max-w-3xl">
         <h1 className="m-0 text-headline">AI settings</h1>
         <p className="mt-1.5 mb-0 max-w-[65ch] text-ink-muted">
@@ -151,7 +151,7 @@ export function AiSettings() {
           </div>
         )}
       </div>
-    </Page>
+    </SettingsPage>
   );
 }
 

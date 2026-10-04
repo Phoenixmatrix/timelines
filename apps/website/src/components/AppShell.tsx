@@ -135,14 +135,6 @@ function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
             <Menu.LinkItem
               closeOnClick
               className="mk-menu-item"
-              render={<Link to={`/settings/ai?owner=${encodeURIComponent(viewer.slug)}`} />}
-            >
-              <GearSixIcon className="size-4" aria-hidden />
-              AI settings
-            </Menu.LinkItem>
-            <Menu.LinkItem
-              closeOnClick
-              className="mk-menu-item"
               render={<Link to={`/${viewer.slug}`} />}
             >
               <GitBranchIcon className="size-4" aria-hidden />
@@ -239,7 +231,11 @@ export function AppShell() {
   const onReleaseNotes = trackerPage === "releases" || location.pathname === "/release-notes";
   const owner =
     tracker?.params.owner ??
-    (location.pathname === "/settings/preferences" ? params.get("tracker") : null);
+    (location.pathname === "/settings/preferences"
+      ? params.get("tracker")
+      : location.pathname.startsWith("/settings/")
+        ? params.get("owner")
+        : null);
   const settingsParams = tracker ? new URLSearchParams(location.search) : new URLSearchParams();
   settingsParams.set("manage", "true");
   const settingsPath = `${owner ? `/tracker/${encodeURIComponent(owner)}` : "/tracker"}?${settingsParams}`;
@@ -318,11 +314,6 @@ export function AppShell() {
                 )}
               </Place>
             )}
-            {viewer && (
-              <Place to="/settings/tokens" label="Access tokens">
-                {(active) => <KeyIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />}
-              </Place>
-            )}
             {places.length > 0 && <span className="mk-rail-rule max-sm:hidden" />}
             {places.map((org) => (
               <Tip key={org.id} label={org.displayName} side="right">
@@ -349,7 +340,11 @@ export function AppShell() {
             <div className="flex-1" />
             {viewer && <AskButton />}
             {viewer && (
-              <Place to={settingsPath} label="Settings" active={managingTracker}>
+              <Place
+                to={settingsPath}
+                label="Settings"
+                active={managingTracker || location.pathname.startsWith("/settings/")}
+              >
                 {(active) => (
                   <GearSixIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
                 )}

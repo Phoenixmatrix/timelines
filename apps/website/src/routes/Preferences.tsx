@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link, useLoaderData, useSearchParams, type LoaderFunctionArgs } from "react-router";
 import type { TrackerList, TrackerView } from "../../shared/tracker.ts";
-import { Page } from "../components/AppShell.tsx";
+import { SettingsPage } from "../components/SettingsPage.tsx";
 import { FormError, SelectField, useToast } from "../components/ui.tsx";
 import { api } from "../lib/api.ts";
 import { requireViewer, useViewer } from "../lib/session.ts";
@@ -34,17 +34,10 @@ export function Preferences() {
   const [shortcutsError, setShortcutsError] = useState("");
 
   return (
-    <Page>
+    <SettingsPage owner={data?.snapshot.owner.slug}>
       <h1 className="m-0 text-headline">Preferences</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         Choose how the issue tracker opens and how you move through it.
-      </p>
-      <p className="mt-4 mb-0 text-body-sm">
-        Automatic repository work is managed separately in{" "}
-        <Link to="/settings/ai" className="text-signal underline underline-offset-4">
-          account AI settings
-        </Link>
-        .
       </p>
       <div className="mt-8 flex flex-col gap-8">
         {data ? (
@@ -109,7 +102,7 @@ export function Preferences() {
           <FormError message={shortcutsError} />
         </section>
       </div>
-    </Page>
+    </SettingsPage>
   );
 }
 

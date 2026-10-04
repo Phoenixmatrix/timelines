@@ -2,7 +2,7 @@ import { FingerprintIcon } from "@phosphor-icons/react";
 import { useEffect, useId, useRef } from "react";
 import { Form, Link, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
 import type { SshKey } from "../../shared/api.ts";
-import { Page } from "../components/AppShell.tsx";
+import { SettingsPage } from "../components/SettingsPage.tsx";
 import { Segmented } from "../components/Choice.tsx";
 import { Card, ConfirmDialog, CopyField, FormError, TextField, link } from "../components/ui.tsx";
 import { api, attempt, field, load } from "../lib/api.ts";
@@ -41,7 +41,7 @@ export function SshKeys() {
   }, [added]);
 
   return (
-    <Page>
+    <SettingsPage>
       <h1 className="m-0 text-headline">SSH keys</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         Sign in to <code className="mk-mono">gm</code> with the SSH keys you already use, from your
@@ -151,7 +151,7 @@ export function SshKeys() {
           )}
         </Card>
       </div>
-    </Page>
+    </SettingsPage>
   );
 }
 
