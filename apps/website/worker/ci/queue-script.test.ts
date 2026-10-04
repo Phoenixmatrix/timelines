@@ -236,10 +236,12 @@ describe("trusted queue merge program", { timeout: 30_000 }, () => {
   });
 
   test("fails closed without replaying a paid resolution after its end-to-end deadline", async () => {
+    // The deadline covers starting Node and the merge before the request, so
+    // leave room for those on a slower host (CORE-257); the answer comes later.
     const t = await setup({
-      script: queueMergeScript(100),
+      script: queueMergeScript(1_500),
       resolve: async (files) => {
-        await delay(250);
+        await delay(2_500);
         return Response.json({ resolution: approved(files) });
       },
     });

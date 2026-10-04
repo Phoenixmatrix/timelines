@@ -142,12 +142,15 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     let stdout = "",
       stderr = "",
       timedOut = false;
+    // A command that waits with its own --timeout gets that long, and a minute more.
+    const asked = Number(args[args.indexOf("--timeout") + 1]);
+    const limit = Math.max(180, args.includes("--timeout") && asked > 0 ? asked + 60 : 0);
     const timer = setTimeout(() => {
       timedOut = true;
       try {
         process.kill(-child.pid!, "SIGKILL");
       } catch {}
-    }, 180_000);
+    }, limit * 1000);
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
@@ -160,7 +163,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (timedOut) reject(new Error(`gm ${args[0]} exceeded 180 seconds`));
+      if (timedOut) reject(new Error(`gm ${args[0]} exceeded ${limit} seconds`));
       else resolve({ code, stdout, stderr });
     });
     const result = await promise;

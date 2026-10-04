@@ -129,6 +129,11 @@ a feature worktree's `gm` over the shared binary.
 - Linux (including WSL2) with a running **user systemd** manager and `flock`.
 - Vite+, Node 24+, the Rust toolchain, Git and curl. `vp install` selects pinned
   pnpm 12.8.1; each worktree installs its own links into the shared global store.
+- A **system Node** (18+, in `/usr/bin` or `/usr/local/bin`; on Debian,
+  `sudo apt-get install nodejs`). The merge queue's trusted merge program runs
+  with the merge credential and only system tools, never `node_modules/.bin` or
+  version-manager shims, so a local runner needs one (CORE-257). Keep vp's Node
+  first on `PATH` for everything else; `vp env doctor` checks it.
 - `cf` installed outside the worktree, authenticated with `cf auth login`.
   Automatic non-AI E2E needs Artifacts access. Interactive setup and explicit AI
   verification also need Vectorize, AI Search, Workers AI and AI Gateway access.
