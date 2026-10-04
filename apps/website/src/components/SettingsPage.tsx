@@ -63,7 +63,7 @@ export function SettingsPage({
       {sections.map((group) => (
         <div key={group.label}>
           <div className="mb-2 flex flex-wrap items-baseline gap-x-2 px-3 text-body-sm text-ink-muted">
-            <span className="font-semibold">{group.label}</span>
+            <span className="text-label tracking-wider uppercase">{group.label}</span>
             {group.context && <span className="min-w-0 break-all">{group.context}</span>}
           </div>
           <ul className="m-0 flex list-none flex-col gap-1 p-0">
