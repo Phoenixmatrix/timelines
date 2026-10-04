@@ -26,7 +26,10 @@ export interface Environment {
   expires: number;
   secret: string;
   dispatchSecret: string;
-  resources: Record<Resource, "pending" | "created" | "deleted">;
+  resources: Record<Resource, "pending" | "created" | "deleted"> & {
+    // Missing in pre-Gateway v1 journals: no gateway is owned or eligible for deletion.
+    gateway?: "pending" | "created" | "deleted";
+  };
   status: "provisioning" | "ready" | "deleting" | "deleted";
   server?: { pid: number; start: string };
 }
@@ -61,6 +64,21 @@ export function validateEnvironment(value: Environment): void {
   for (const key of ["artifacts", "vectors", "search"] as const)
     if (!["pending", "created", "deleted"].includes(value.resources[key]))
       throw new Error("Invalid resource ownership journal.");
+  if (
+    Object.hasOwn(value.resources, "gateway") &&
+    !["pending", "created", "deleted"].includes(value.resources.gateway as string)
+  )
+    throw new Error("Invalid resource ownership journal.");
+}
+
+function requireGateway(env: Environment): void {
+  if (
+    (env.resources.vectors !== "deleted" || env.resources.search !== "deleted") &&
+    env.resources.gateway !== "created"
+  )
+    throw new Error(
+      "AI environment has no owned AI Gateway; run destroy then setup to recreate it.",
+    );
 }
 
 export function redact(text: string): string {
@@ -181,7 +199,7 @@ async function persist(env: Environment): Promise<void> {
   const previous = await recordAt(join(registry, "environments", `${env.id}.json`));
   if (previous?.status === "deleted" || previous?.status === "deleting") {
     if (env.status === "ready") env.status = previous.status;
-    for (const resource of ["artifacts", "vectors", "search"] as const)
+    for (const resource of ["artifacts", "vectors", "search", "gateway"] as const)
       if (previous.resources[resource] === "deleted") env.resources[resource] = "deleted";
   }
   // Central journal survives worktree removal and is committed before local state.
@@ -218,6 +236,7 @@ export async function loadEnvironment(root: string): Promise<Environment> {
     throw new Error("Environment belongs to a different worktree; run setup here.");
   if (value.status !== "ready" || value.expires <= Date.now())
     throw new Error("Environment is expired or incomplete; run destroy then setup.");
+  requireGateway(value);
   return value;
 }
 
@@ -295,7 +314,7 @@ async function cfJson<T>(env: Environment, args: string[]): Promise<T> {
 }
 function absent(error: unknown): boolean {
   // Only explicit resource absence is idempotent, never permission/network failures.
-  return /\b404\b|resource not found|namespace not found|index not found|instance not found/i.test(
+  return /\b404\b|resource not found|namespace not found|index not found|instance not found|gateway not found/i.test(
     String(error),
   );
 }
@@ -335,8 +354,8 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
   await persist(env);
   const failures: string[] = [];
   // Continue independent deletions even if one provider is unavailable.
-  for (const resource of ["search", "vectors", "artifacts"] as const) {
-    if (env.resources[resource] === "deleted") continue;
+  for (const resource of ["search", "gateway", "vectors", "artifacts"] as const) {
+    if (env.resources[resource] === undefined || env.resources[resource] === "deleted") continue;
     try {
       if (resource === "search") {
         // Parent owns the namespace, including every instance created inside it.
@@ -367,6 +386,8 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
             ]);
         }
         await deleteIfPresent(env, ["ai-search", "namespace", "delete", env.id, "--force"]);
+      } else if (resource === "gateway") {
+        await deleteIfPresent(env, ["ai-gateway", "gateways", "delete", env.id, "--force"]);
       } else if (resource === "vectors") {
         await deleteIfPresent(env, ["vectorize", "delete", env.id, "--force"]);
       } else {
@@ -493,6 +514,7 @@ export async function createEnvironment(
       if (current) {
         if (current.status !== "ready")
           throw new Error("Partial environment exists; run destroy before setup.");
+        requireGateway(current);
         return current;
       }
     }
@@ -538,6 +560,7 @@ export async function createEnvironment(
         artifacts: "pending",
         vectors: ai ? "pending" : "deleted",
         search: ai ? "pending" : "deleted",
+        gateway: ai ? "pending" : "deleted",
       },
       status: "provisioning",
     };
@@ -547,6 +570,24 @@ export async function createEnvironment(
       env.resources.artifacts = "created";
       await persist(env);
       if (ai) {
+        await cf(env, [
+          "ai-gateway",
+          "gateways",
+          "create",
+          "--body",
+          JSON.stringify({
+            id,
+            authentication: true,
+            collect_logs: true,
+            cache_ttl: 0,
+            cache_invalidate_on_update: false,
+            rate_limiting_interval: 0,
+            rate_limiting_limit: 0,
+            workers_ai_billing_mode: "postpaid",
+          }),
+        ]);
+        env.resources.gateway = "created";
+        await persist(env);
         await cf(env, [
           "vectorize",
           "create",
@@ -590,6 +631,7 @@ export async function createEnvironment(
           "--body",
           JSON.stringify({
             id: "knowledge",
+            ai_gateway_id: id,
             embedding_model: "@cf/qwen/qwen3-embedding-0.6b",
             indexing_options: { keyword_tokenizer: "trigram" },
             custom_metadata: ["repo", "kind", "path", "commit", "lang"].map((field_name) => ({
@@ -626,6 +668,7 @@ export async function createEnvironment(
 
 export async function context(env: Environment): Promise<HarnessContext> {
   validateEnvironment(env);
+  requireGateway(env);
   await safeLocalDirectory(env);
   const vars: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(vars))
@@ -661,6 +704,7 @@ export async function context(env: Environment): Promise<HarnessContext> {
     GITMATRIX_AGENT_AI: env.resources.vectors === "deleted" ? "disabled" : "enabled",
     GITMATRIX_VECTORIZE_INDEX: env.id,
     GITMATRIX_SEARCH_NAMESPACE: env.id,
+    GITMATRIX_AI_GATEWAY: env.id,
     GITMATRIX_GM: gm,
     GITMATRIX_CI_RUNNER: "local",
     GITMATRIX_CI_RUNNERS: "2",

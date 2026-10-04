@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { command, validateEnvironment, redact } from "./environment.ts";
+import { command, validateEnvironment, redact, context, loadEnvironment } from "./environment.ts";
 import type { Environment } from "./environment.ts";
 import { developmentEnvironment } from "../../apps/website/vite/environment.ts";
 
@@ -40,6 +40,7 @@ function runtime(env: Environment): Record<string, string> {
     GITMATRIX_ARTIFACTS_NAMESPACE: env.id,
     GITMATRIX_VECTORIZE_INDEX: env.id,
     GITMATRIX_SEARCH_NAMESPACE: env.id,
+    GITMATRIX_AI_GATEWAY: env.id,
     GITMATRIX_AGENT_SECRET: env.secret,
     GITMATRIX_CI_DISPATCH_SECRET: env.dispatchSecret,
     GITMATRIX_CI_RUNNER: "local",
@@ -65,6 +66,12 @@ await test("ownership rejects canonical, foreign and non-expiring environments",
     () => validateEnvironment({ ...env, expires: env.created + 86_400_001 }),
     /lifetime/,
   );
+  for (const gateway of [null, undefined, "gitmatrix", "unknown"])
+    assert.throws(
+      () =>
+        validateEnvironment({ ...env, resources: { ...env.resources, gateway } } as Environment),
+      /journal/,
+    );
 });
 
 await test("runtime rejects cross-environment stores and credentials while accepting an owned ephemeral run", () => {
@@ -72,6 +79,11 @@ await test("runtime rejects cross-environment stores and credentials while accep
   env.dir = `${env.dir}/runs/${env.id}`;
   validateEnvironment(env);
   assert.equal(developmentEnvironment(runtime(env)).stateDir, `${env.dir}/state`);
+  for (const gateway of ["gitmatrix", "gitmatrix-dev", "gma-mga00000-111111abcdef", undefined])
+    assert.throws(
+      () => developmentEnvironment({ ...runtime(env), GITMATRIX_AI_GATEWAY: gateway }),
+      /gateway/i,
+    );
   assert.throws(
     () =>
       developmentEnvironment({
@@ -144,62 +156,70 @@ await test("diagnostic redaction removes personal and CI bearer credentials", ()
   assert.equal(message, "[REDACTED] [REDACTED] Authorization: Bearer [REDACTED]");
 });
 
-await test("cleanup retries incomplete deletions before expiry without repeating completed providers", async () => {
-  const home = await mkdtemp(join(tmpdir(), "gitmatrix-cleanup-"));
-  try {
-    const root = join(home, "worktree");
-    const directory = join(home, ".local/state/gitmatrix-agent/environments");
-    const bin = join(home, "bin");
-    await mkdir(directory, { recursive: true });
-    await mkdir(root, { recursive: true });
-    await mkdir(bin);
-    const env = owned(root);
-    env.created -= 172_800_000;
-    env.expires -= 172_800_000;
-    const journal = join(directory, `${env.id}.json`);
-    await writeFile(journal, JSON.stringify(env));
-    const calls = join(home, "calls");
-    const failure = join(home, "provider-unavailable");
-    await writeFile(failure, "yes");
-    await writeFile(
-      join(bin, "cf"),
-      `#!${process.execPath}\nconst fs=require('node:fs'); const args=process.argv.slice(2); fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n'); if(args[0]==='vectorize' && fs.existsSync(${JSON.stringify(failure)})){console.error('provider unavailable');process.exit(1)} console.log('[]');\n`,
-      { mode: 0o700 },
-    );
-    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
-    const invocation = [
-      "--input-type=module",
-      "-e",
-      `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`,
-    ];
-    const childEnv = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` };
-    await assert.rejects(
-      command(process.execPath, invocation, { env: childEnv }),
-      /Cleanup incomplete/,
-    );
-    const partial = JSON.parse(await readFile(journal, "utf8")) as Environment;
-    assert.equal(partial.status, "deleting");
-    assert.deepEqual(partial.resources, {
-      artifacts: "deleted",
-      search: "deleted",
-      vectors: "created",
-    });
-    partial.created = Date.now();
-    partial.expires = partial.created + 86_400_000;
-    await writeFile(journal, JSON.stringify(partial));
-    await rm(failure);
-    await writeFile(calls, "");
-    await command(process.execPath, invocation, { env: childEnv });
-    assert.equal((JSON.parse(await readFile(journal, "utf8")) as Environment).status, "deleted");
-    const retried = (await readFile(calls, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as string[]);
-    assert.deepEqual(retried, [["vectorize", "delete", env.id, "--force"]]);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
+for (const gateway of [undefined, "pending", "created"] as const)
+  await test(`cleanup retries incomplete ${gateway ? `${gateway} Gateway` : "legacy vector"} deletions without repeating completed providers`, async () => {
+    const home = await mkdtemp(join(tmpdir(), "gitmatrix-cleanup-"));
+    try {
+      const root = join(home, "worktree");
+      const directory = join(home, ".local/state/gitmatrix-agent/environments");
+      const bin = join(home, "bin");
+      await mkdir(directory, { recursive: true });
+      await mkdir(root, { recursive: true });
+      await mkdir(bin);
+      const env = owned(root);
+      if (gateway) env.resources.gateway = gateway;
+      env.created -= 172_800_000;
+      env.expires -= 172_800_000;
+      const journal = join(directory, `${env.id}.json`);
+      await writeFile(journal, JSON.stringify(env));
+      const calls = join(home, "calls");
+      const failure = join(home, "provider-unavailable");
+      await writeFile(failure, "yes");
+      await writeFile(
+        join(bin, "cf"),
+        `#!${process.execPath}\nconst fs=require('node:fs'); const args=process.argv.slice(2); fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n'); if(args[0]===${JSON.stringify(gateway ? "ai-gateway" : "vectorize")} && fs.existsSync(${JSON.stringify(failure)})){console.error('provider unavailable');process.exit(1)} console.log('[]');\n`,
+        { mode: 0o700 },
+      );
+      const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+      const invocation = [
+        "--input-type=module",
+        "-e",
+        `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`,
+      ];
+      const childEnv = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` };
+      await assert.rejects(
+        command(process.execPath, invocation, { env: childEnv }),
+        /Cleanup incomplete/,
+      );
+      const partial = JSON.parse(await readFile(journal, "utf8")) as Environment;
+      assert.equal(partial.status, "deleting");
+      assert.deepEqual(partial.resources, {
+        artifacts: "deleted",
+        search: "deleted",
+        vectors: gateway ? "deleted" : "created",
+        ...(gateway ? { gateway } : {}),
+      });
+      partial.created = Date.now();
+      partial.expires = partial.created + 86_400_000;
+      await writeFile(journal, JSON.stringify(partial));
+      await rm(failure);
+      await writeFile(calls, "");
+      await command(process.execPath, invocation, { env: childEnv });
+      assert.equal((JSON.parse(await readFile(journal, "utf8")) as Environment).status, "deleted");
+      const retried = (await readFile(calls, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      assert.deepEqual(
+        retried,
+        gateway
+          ? [["ai-gateway", "gateways", "delete", env.id, "--force"]]
+          : [["vectorize", "delete", env.id, "--force"]],
+      );
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 
 await test("a crashed lock owner does not prevent the next cleanup", async () => {
   const home = await mkdtemp(join(tmpdir(), "gitmatrix-lock-"));
@@ -326,5 +346,22 @@ await test("failed local cleanup stays retryable after remote resources have bee
     await assert.rejects(readFile(credential), { code: "ENOENT" });
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("legacy AI journals require recreation for use but remain valid for cleanup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "gitmatrix-legacy-ai-"));
+  try {
+    const env = owned(root);
+    await mkdir(env.dir);
+    await writeFile(join(env.dir, "environment.json"), JSON.stringify(env));
+    await assert.rejects(loadEnvironment(root), /destroy then setup/);
+    await assert.rejects(context(env), /destroy then setup/);
+    env.resources.vectors = "deleted";
+    env.resources.search = "deleted";
+    await writeFile(join(env.dir, "environment.json"), JSON.stringify(env));
+    assert.deepEqual(await loadEnvironment(root), env);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

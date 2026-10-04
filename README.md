@@ -54,6 +54,39 @@ grouped, what it uses and what uses it, and jump to its source. Labels appear
 as you zoom in; a name is drawn whole or not at all. The account page's
 Knowledge link opens the same view across the repositories you pick.
 
+### AI usage in Cloudflare AI Gateway
+
+Open Cloudflare **AI Gateway → `gitmatrix`** for production usage; normal local
+development uses `gitmatrix-dev`. Application inference, including knowledge/wiki
+generation, graph embeddings, routing, assistant streams/titles and avatars, goes
+through the configured Gateway. Filter logs by `metadata.component`: `knowledge`,
+`assistant`, `assistant-title` or `avatars`. Application calls disable raw
+prompt/response payload storage while retaining model, status, tokens, cost and
+latency metadata.
+
+The Worker reads the `AI_GATEWAY` text binding. Agent environments override it
+with their owned `GITMATRIX_AI_GATEWAY`; they never fall back to a shared Gateway.
+Gateways require authentication, enable logging, use postpaid Workers AI billing,
+and leave caching and rate limiting disabled. Existing model choices and
+application retry behavior are unchanged.
+
+Managed AI Search's `knowledge` instance is also connected to the matching Gateway.
+**Exception:** Cloudflare includes built-in Workers AI embedding/reranking in
+AI Search usage, not Gateway logs or analytics. Those models remain unchanged;
+consult AI Search usage for that portion. Query rewriting/generation and
+external-provider model calls use its connected Gateway
+([Cloudflare's coverage](https://developers.cloudflare.com/ai-search/configuration/models/ai-gateway/)).
+Application payload-suppression headers do not configure managed Search logging.
+
+For a new deployment, create the Gateway before deploying the Worker, then connect
+the existing Search instance (use `gitmatrix-dev` and namespace `gitmatrix` for
+normal development):
+
+```bash
+cf ai-gateway gateways create --id gitmatrix --authentication true --collect-logs true --cache-ttl 0 --cache-invalidate-on-update false --rate-limiting-interval 0 --rate-limiting-limit 0 --workers-ai-billing-mode postpaid
+cf ai-search update knowledge --name gitmatrix-prod --ai-gateway-id gitmatrix
+```
+
 ## Release note evidence
 
 On repository and account release-note pages, select an item's **last commit**
@@ -77,7 +110,7 @@ a feature worktree's `gm` over the shared binary.
   pnpm 12.8.1; each worktree installs its own links into the shared global store.
 - `cf` installed outside the worktree, authenticated with `cf auth login`.
   Automatic non-AI E2E needs Artifacts access. Interactive setup and explicit AI
-  verification also need Vectorize, AI Search and Workers AI.
+  verification also need Vectorize, AI Search, Workers AI and AI Gateway access.
   If login exposes multiple accounts, set `CLOUDFLARE_ACCOUNT_ID` explicitly.
 - Chromium's OS dependencies. Setup installs only the pinned Playwright version's
   Chromium **headless shell** (`playwright install --only-shell chromium`) and checks
@@ -230,9 +263,13 @@ release notes, follow the
 pushed commit, named graph relationships, generated wiki provenance/content, and
 matching Vectorize entities plus AI Search source passages. It also verifies
 daily release-note rollover by UTC committer date, retained commit provenance,
-optional named tags and non-duplicated daily tracker feeds. Assertions check
-source facts, not exact generated wording. Missing providers or an expired
-visibility deadline fail honestly. Normal interactive `agent setup` remains AI-enabled.
+optional named tags and non-duplicated daily tracker feeds. It exercises real avatar
+generation and checks Gateway attempts within its ten-call budget, with successes matching the
+returned images (the API permits partial generation). It also checks successful
+Gateway records for knowledge, embeddings and assistant streaming/titles, including
+empty payloads and usage metadata. `ai-e2e.json` retains sanitized Gateway evidence. Assertions check source
+facts, not exact generated wording. Missing providers or an expired visibility
+deadline fail honestly. Normal interactive `agent setup` remains AI-enabled.
 
 Build completion acknowledges uploads, not search visibility. The AI gate observes
 the fixture item’s own AI Search indexing status before making at most six
@@ -289,9 +326,11 @@ vp run agent maintenance status
   resource journal live outside worktrees in `~/.local/state/gitmatrix-agent`, so
   deleting a worktree does not lose the cleanup inventory.
 - Remote resource names must match an ownership-checked `gma-...` journal entry.
-  Cleanup deletes AI Search instances/namespace, Vectorize index, and Artifacts
-  repositories/namespace independently. Failed deletions stay journaled and are
+  Cleanup deletes AI Search instances/namespace, the AI Gateway, Vectorize index,
+  and Artifacts repositories/namespace independently. Failed deletions stay journaled and are
   retried; unrelated resources are never discovered and deleted by prefix alone.
+  AI environments created before Gateway ownership was introduced must be destroyed
+  and recreated with `setup`; their legacy journals remain valid for cleanup.
 - Foreground apps stop at expiry. Process-group shutdown is PID-start-time fenced;
   kernel-backed locks release after crashes. A removed or redirected worktree
   cannot prevent remote resource deletion. Local credentials, state, disposable

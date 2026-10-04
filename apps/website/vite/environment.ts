@@ -72,6 +72,8 @@ export function developmentEnvironment(env: Environment) {
       if (required(key) !== agentId)
         throw new Error(`${key} must match the owned environment resource namespace`);
     }
+    if (env.GITMATRIX_AGENT_AI !== "disabled" && required("GITMATRIX_AI_GATEWAY") !== agentId)
+      throw new Error("GITMATRIX_AI_GATEWAY must match the owned environment resource namespace");
     required("GITMATRIX_AGENT_SECRET");
     required("GITMATRIX_CI_DISPATCH_SECRET");
     if (env.GITMATRIX_CI_RUNNER !== "local")

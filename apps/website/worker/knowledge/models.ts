@@ -6,6 +6,7 @@
 //             cosmetic?", "is this page out of date?")
 //   embed     vectors for graph nodes (Vectorize)
 
+import { aiGatewayOptions } from "../ai-gateway.ts";
 import { recordAiCall, tokensOf } from "../usage/ai.ts";
 
 export const MODELS = {
@@ -40,7 +41,9 @@ interface ChatResult {
 // The binding's model list is typed per model; these are OpenAI-shaped chat
 // models, so call through a narrow untyped view. Every call has a deadline: a
 // hung call must fail (and its workflow step retry) rather than stall a build.
-type LooseAi = { run(model: string, inputs: unknown): Promise<unknown> };
+type LooseAi = {
+  run(model: string, inputs: unknown, options?: AiOptions): Promise<unknown>;
+};
 const TIMEOUT_MS: Record<string, number> = {
   [MODELS.fast]: 90_000,
   [MODELS.reason]: 180_000,
@@ -80,7 +83,7 @@ async function once(env: Env, model: string, inputs: unknown): Promise<unknown> 
     timer = setTimeout(() => reject(new Error(`${model} timed out after ${ms / 1000}s`)), ms);
   });
   const result = await Promise.race([
-    (env.AI as unknown as LooseAi).run(model, inputs),
+    (env.AI as unknown as LooseAi).run(model, inputs, aiGatewayOptions(env, "knowledge")),
     deadline,
   ]).finally(() => {
     if (timer) clearTimeout(timer);

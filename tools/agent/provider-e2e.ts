@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -16,6 +16,100 @@ import type {
 import { waitForIndexVisibility, type VisibilityReport } from "./index-visibility.ts";
 import { searchItemStatus } from "./search-item-status.ts";
 import { runAtlasProviderE2E } from "./atlas-provider-e2e.ts";
+import { command, validateEnvironment, type Environment } from "./environment.ts";
+
+interface GatewayLog {
+  id: string;
+  created_at: string;
+  model: string;
+  provider: string;
+  success: boolean;
+  cached: boolean;
+  metadata?: { component?: string };
+  request: string;
+  response: string;
+  response_content_type: string;
+  tokens_in: number;
+  tokens_out: number;
+  cost?: number;
+}
+
+// List metadata only: never fetch request/response bodies or persist raw cf output.
+async function gatewayLogs(owned: Environment, since: string, component: string, model?: string) {
+  let output: string;
+  try {
+    output = await command(
+      "cf",
+      [
+        "ai-gateway",
+        "logs",
+        "list",
+        "--gateway-id",
+        owned.id,
+        "--start-date",
+        since,
+        "--per-page",
+        "50",
+        "--order-by",
+        "created_at",
+        "--order-by-direction",
+        "asc",
+        "--filters",
+        JSON.stringify([
+          { key: "metadata.key", operator: "eq", value: ["component"] },
+          { key: "metadata.value", operator: "eq", value: [component] },
+          ...(model ? [{ key: "model", operator: "eq", value: [model] }] : []),
+        ]),
+        ...(owned.profile ? ["--profile", owned.profile] : []),
+      ],
+      { env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: owned.account }, timeout: 30_000 },
+    );
+  } catch {
+    throw new Error(`Gateway metadata lookup failed for ${component}`);
+  }
+  let logs: GatewayLog[];
+  try {
+    logs = JSON.parse(output);
+  } catch {
+    throw new Error("Gateway metadata lookup returned invalid JSON");
+  }
+  assert(Array.isArray(logs), "Gateway metadata lookup must return a list");
+  return logs.flatMap((log) => {
+    assert(
+      typeof log.id === "string" &&
+        typeof log.model === "string" &&
+        typeof log.provider === "string" &&
+        typeof log.success === "boolean" &&
+        Number.isFinite(Date.parse(log.created_at)),
+      "Gateway log has invalid identity or outcome",
+    );
+    if (
+      log.metadata?.component !== component ||
+      Date.parse(log.created_at) < Date.parse(since) ||
+      (model && log.model !== model)
+    )
+      return [];
+    assert(
+      log.request === "" && log.response === "",
+      "Application Gateway logs must not retain prompt or response payloads",
+    );
+    return [
+      {
+        id: log.id,
+        createdAt: log.created_at,
+        component,
+        model: log.model,
+        provider: log.provider,
+        success: log.success,
+        cached: log.cached,
+        responseContentType: log.response_content_type,
+        tokensIn: log.tokens_in,
+        tokensOut: log.tokens_out,
+        cost: log.cost,
+      },
+    ];
+  });
+}
 
 // Real git http-backend provides the target; all state belongs to this invocation.
 interface MirrorTarget {
@@ -172,6 +266,7 @@ export async function runProviderE2E(
     stageStarted = Date.now();
   };
   let target: MirrorTarget | undefined;
+  let generatedAvatarCount = 0;
   // Use the owning organization's member for AI scenarios; site administration
   // does not grant access to another account's tracker.
   const persona = mode === "ai" ? "marco" : "priya";
@@ -885,6 +980,41 @@ export async function runProviderE2E(
             retryRecovered: true,
             redirectSkippedWrite: true,
           };
+          enter("avatar-generation");
+          // A real person's cookie session is required: agent bearer tokens cannot
+          // spend their one-time image generation allowance.
+          const before = await context.request.get("/api/account/avatar/options");
+          assert.equal(before.status(), 200);
+          assert.equal((await before.json()).status, "none");
+          const generated = await context.request.post("/api/account/avatar/options", {
+            timeout: 240_000,
+          });
+          assert.equal(generated.status(), 201, "Real avatar generation must succeed");
+          const options = (await generated.json()) as { status: string; options: string[] };
+          assert.equal(options.status, "ready");
+          // The API retains partial success when a provider refuses one style.
+          generatedAvatarCount = options.options.length;
+          assert(generatedAvatarCount >= 1 && generatedAvatarCount <= 4);
+          const images = [];
+          for (const path of options.options) {
+            assert.match(path, /^\/api\/account\/avatar\/options\/[0-3]$/);
+            const image = await context.request.get(path);
+            assert.equal(image.status(), 200);
+            assert.match(image.headers()["content-type"] ?? "", /^image\/(jpeg|png|webp)$/);
+            const bytes = await image.body();
+            const dimensions = await page.evaluate(
+              async ({ bytes, type }) => {
+                const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type }));
+                const result = { width: bitmap.width, height: bitmap.height };
+                bitmap.close();
+                return result;
+              },
+              { bytes: [...bytes], type: image.headers()["content-type"]! },
+            );
+            assert(dimensions.width > 0 && dimensions.height > 0, "Avatar must decode as an image");
+            images.push({ path, bytes: bytes.length, ...dimensions });
+          }
+          evidence.avatars = { status: options.status, images };
         } finally {
           await page
             .screenshot({ path: join(ctx.artifacts, "assistant-approval.png"), fullPage: true })
@@ -1400,6 +1530,78 @@ export async function runProviderE2E(
         mainBefore,
         "Writing a timeline's pages changed main's graph, wiki or builds",
       );
+      enter("gateway-evidence");
+      const owned = JSON.parse(
+        await readFile(join(ctx.dir, "environment.json"), "utf8"),
+      ) as Environment;
+      validateEnvironment(owned);
+      assert(
+        owned.root === ctx.root &&
+          owned.dir === ctx.dir &&
+          owned.status === "ready" &&
+          owned.id === ctx.env.GITMATRIX_AGENT_ID &&
+          owned.id === ctx.env.GITMATRIX_AI_GATEWAY,
+        "Gateway evidence must target this invocation's owned gateway",
+      );
+      const requirements = [
+        { key: "knowledge", component: "knowledge", model: capturedAi.models.task, minimum: 1 },
+        {
+          key: "embedding",
+          component: "knowledge",
+          model: "@cf/qwen/qwen3-embedding-0.6b",
+          minimum: 1,
+        },
+        { key: "assistant", component: "assistant", minimum: 1 },
+        { key: "assistant-title", component: "assistant-title", minimum: 1 },
+        {
+          key: "avatars",
+          component: "avatars",
+          model: "@cf/black-forest-labs/flux-1-schnell",
+          minimum: generatedAvatarCount,
+        },
+      ];
+      const gatewayEvidence: Record<string, unknown> = {
+        id: owned.id,
+        since: evidence.startedAt,
+        // Cloudflare's built-in AI Search embedding/reranking are not Gateway logged.
+        excluded: ["AI Search built-in embedding", "AI Search built-in reranking"],
+      };
+      evidence.gateway = gatewayEvidence;
+      for (const requirement of requirements) {
+        await waitFor(`gateway-${requirement.key}`, 120_000, async () => {
+          const logs = await gatewayLogs(
+            owned,
+            String(evidence.startedAt),
+            requirement.component,
+            requirement.model,
+          );
+          const successful = logs.filter(
+            (log) =>
+              log.success &&
+              !log.cached &&
+              (requirement.component !== "assistant" ||
+                log.responseContentType === "text/event-stream"),
+          );
+          gatewayEvidence[requirement.key] = {
+            observedCount: logs.length,
+            successfulUncachedCount: successful.length,
+            tokensIn: logs.reduce((sum, log) => sum + (log.tokensIn ?? 0), 0),
+            tokensOut: logs.reduce((sum, log) => sum + (log.tokensOut ?? 0), 0),
+            cost: logs.reduce((sum, log) => sum + (log.cost ?? 0), 0),
+            logs,
+          };
+          if (requirement.key === "avatars") {
+            if (logs.length < 4 || successful.length < generatedAvatarCount) return false;
+            assert(logs.length <= 10, "Avatar inference must stay within its ten-call budget");
+            assert.equal(
+              successful.length,
+              generatedAvatarCount,
+              "Successful Gateway calls must match the returned avatar images",
+            );
+          }
+          return successful.length >= requirement.minimum;
+        });
+      }
     }
     evidence.outcome = "passed";
   } catch (error) {

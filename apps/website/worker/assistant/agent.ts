@@ -23,6 +23,7 @@ import {
 } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { toolLabel, type AskEvent, type PageContext } from "../../shared/assistant.ts";
+import { aiGatewayOptions } from "../ai-gateway.ts";
 import { app } from "../app.ts";
 import { decide } from "../knowledge/models.ts";
 import { db, nowIso } from "../schema.ts";
@@ -283,6 +284,7 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
         const workersai = createWorkersAI({ binding: this.env.AI });
         const result = streamText({
           model: workersai(model, {
+            ...aiGatewayOptions(this.env, "assistant"),
             reasoning_effort: plan.reasoning,
             sessionAffinity: this.name,
           }),
@@ -346,7 +348,10 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     if (!first) return;
     try {
       const { text: title, usage } = await generateText({
-        model: createWorkersAI({ binding: this.env.AI })(ASSISTANT_MODELS.title),
+        model: createWorkersAI({ binding: this.env.AI })(
+          ASSISTANT_MODELS.title,
+          aiGatewayOptions(this.env, "assistant-title"),
+        ),
         instructions:
           "Name this conversation in 2 to 6 words, sentence case, no quotes or trailing punctuation.",
         prompt: first.slice(0, 1500),

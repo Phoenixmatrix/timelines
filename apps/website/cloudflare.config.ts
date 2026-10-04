@@ -25,6 +25,7 @@ const PRODUCTION = {
   artifacts: "gitmatrix",
   vectors: "gitmatrix-knowledge-prod",
   search: "gitmatrix-prod",
+  gateway: "gitmatrix",
   db: "3ed3e1ec-bd11-4f8e-bfee-d7c0bcb89e77",
   registryDb: "caea2f3d-d4d3-43cd-aaf9-f14a3d84621d",
 };
@@ -155,6 +156,9 @@ export default defineConfig(({ mode, isPreview }) => {
         ...(ai
           ? {
               AI: bindings.ai(remote),
+              AI_GATEWAY: bindings.text(
+                dev ? (env.GITMATRIX_AI_GATEWAY ?? "gitmatrix-dev") : PRODUCTION.gateway,
+              ),
               VECTORS: bindings.vectorize({
                 name: dev
                   ? (env.GITMATRIX_VECTORIZE_INDEX ?? "gitmatrix-knowledge")
