@@ -1,4 +1,16 @@
-import { CaretDownIcon } from "@phosphor-icons/react";
+import {
+  CaretDownIcon,
+  EnvelopeSimpleIcon,
+  FingerprintIcon,
+  GearSixIcon,
+  KeyIcon,
+  RobotIcon,
+  SlidersHorizontalIcon,
+  UserCircleIcon,
+  UsersThreeIcon,
+  type Icon,
+} from "@phosphor-icons/react";
+import { useId } from "react";
 import { Link, useLocation } from "react-router";
 import { useViewer } from "../lib/session.ts";
 import { Page } from "./AppShell.tsx";
@@ -15,29 +27,43 @@ export function SettingsPage({
 }) {
   const viewer = useViewer();
   const location = useLocation();
+  const id = useId();
   const params = new URLSearchParams(location.search);
   const account = owner ?? params.get("owner") ?? params.get("tracker") ?? viewer?.slug;
   const accountQuery = account ? `?owner=${encodeURIComponent(account)}` : "";
   const trackerQuery = account ? `?tracker=${encodeURIComponent(account)}` : "";
   const trackerPath = account ? `/tracker/${encodeURIComponent(account)}` : "/tracker";
-  const groups = [
+  const groups: {
+    label: string;
+    context: string | null;
+    links: { label: string; to: string; icon: Icon; active?: boolean }[];
+  }[] = [
     {
       label: "Account",
       context: account ? `@${account}` : null,
       links: [
-        { label: "Teams and workspaces", to: `${trackerPath}?manage=true`, active: tracker },
-        { label: "AI settings", to: `/settings/ai${accountQuery}` },
+        {
+          label: "Teams and workspaces",
+          to: `${trackerPath}?manage=true`,
+          icon: UsersThreeIcon,
+          active: tracker,
+        },
+        { label: "AI settings", to: `/settings/ai${accountQuery}`, icon: GearSixIcon },
       ],
     },
     {
       label: "Personal",
       context: null,
       links: [
-        { label: "Profile", to: `/settings/profile${accountQuery}` },
-        { label: "Preferences", to: `/settings/preferences${trackerQuery}` },
-        { label: "Access tokens", to: `/settings/tokens${accountQuery}` },
-        { label: "SSH keys", to: `/settings/ssh-keys${accountQuery}` },
-        { label: "Agents", to: `/settings/agents${accountQuery}` },
+        { label: "Profile", to: `/settings/profile${accountQuery}`, icon: UserCircleIcon },
+        {
+          label: "Preferences",
+          to: `/settings/preferences${trackerQuery}`,
+          icon: SlidersHorizontalIcon,
+        },
+        { label: "Access tokens", to: `/settings/tokens${accountQuery}`, icon: KeyIcon },
+        { label: "SSH keys", to: `/settings/ssh-keys${accountQuery}`, icon: FingerprintIcon },
+        { label: "Agents", to: `/settings/agents${accountQuery}`, icon: RobotIcon },
       ],
     },
     ...(viewer?.isSiteAdmin
@@ -45,7 +71,13 @@ export function SettingsPage({
           {
             label: "Administration",
             context: null,
-            links: [{ label: "Invitations", to: `/settings/invites${accountQuery}` }],
+            links: [
+              {
+                label: "Invitations",
+                to: `/settings/invites${accountQuery}`,
+                icon: EnvelopeSimpleIcon,
+              },
+            ],
           },
         ]
       : []),
@@ -54,33 +86,56 @@ export function SettingsPage({
     ...group,
     links: group.links.map((item) => ({
       ...item,
-      active: "active" in item ? item.active : location.pathname === item.to.split("?")[0],
+      active: item.active ?? location.pathname === item.to.split("?")[0],
     })),
   }));
   const current = sections.flatMap((group) => group.links).find((item) => item.active)?.label;
-  const navigation = (
-    <nav aria-label="Settings sections" className="flex flex-col gap-6">
-      {sections.map((group) => (
-        <div key={group.label}>
-          <div className="mb-2 flex flex-wrap items-baseline gap-x-2 px-3 text-body-sm text-ink-muted">
-            <span className="text-label tracking-wider uppercase">{group.label}</span>
-            {group.context && <span className="min-w-0 break-all">{group.context}</span>}
+  // Group labels sit on the page surface; links sit inside a pane with an icon each, so the two
+  // differ by container, tone and shape rather than by capitalization alone.
+  const navigation = (prefix: string) => (
+    <nav aria-label="Settings sections" className="flex flex-col gap-5">
+      {sections.map((group, index) => {
+        const labelId = `${id}-${prefix}-${index}`;
+        return (
+          <div key={group.label} className="flex flex-col gap-2">
+            <p
+              id={labelId}
+              className="m-0 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-2 text-label text-ink-faint"
+            >
+              {group.label}
+              {group.context && (
+                <span className="mk-chip mk-chip--tag mk-mono max-w-full min-w-0 truncate">
+                  {group.context}
+                </span>
+              )}
+            </p>
+            <ul
+              aria-labelledby={labelId}
+              className="m-0 flex list-none flex-col gap-0.5 rounded-pane bg-pane p-1"
+            >
+              {group.links.map((item) => {
+                const ItemIcon = item.icon;
+                return (
+                  <li key={item.to}>
+                    <Link
+                      to={item.to}
+                      aria-current={item.active ? "page" : undefined}
+                      className={`flex min-h-11 items-center gap-2.5 rounded-control px-3 py-2 text-body-sm no-underline transition-colors ${item.active ? "bg-signal-wash font-semibold text-ink" : "text-ink-muted hover:bg-raised hover:text-ink"}`}
+                    >
+                      <ItemIcon
+                        className={`size-4.5 shrink-0 ${item.active ? "text-ink" : "text-ink-faint"}`}
+                        weight={item.active ? "fill" : "regular"}
+                        aria-hidden
+                      />
+                      <span className="min-w-0">{item.label}</span>
+                    </Link>
+                  </li>
+                );
+              })}
+            </ul>
           </div>
-          <ul className="m-0 flex list-none flex-col gap-1 p-0">
-            {group.links.map((item) => (
-              <li key={item.to}>
-                <Link
-                  to={item.to}
-                  aria-current={item.active ? "page" : undefined}
-                  className={`flex min-h-11 items-center rounded-control px-3 py-2 text-body-sm no-underline transition-colors ${item.active ? "bg-signal-wash font-semibold text-ink" : "text-ink-muted hover:bg-raised hover:text-ink"}`}
-                >
-                  {item.label}
-                </Link>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ))}
+        );
+      })}
     </nav>
   );
 
@@ -88,8 +143,8 @@ export function SettingsPage({
     <Page wide>
       <div className="flex min-w-0 flex-col gap-6 md:flex-row md:gap-8">
         <aside className="hidden w-52 shrink-0 self-start md:sticky md:top-7 md:block">
-          <p className="mt-0 mb-6 px-3 text-title">Settings</p>
-          {navigation}
+          <p className="mt-0 mb-5 px-2 text-title">Settings</p>
+          {navigation("side")}
         </aside>
         <details
           key={`${location.pathname}${location.search}`}
@@ -105,7 +160,7 @@ export function SettingsPage({
               aria-hidden
             />
           </summary>
-          <div className="pt-4 pb-2">{navigation}</div>
+          <div className="pt-4 pb-2">{navigation("menu")}</div>
         </details>
         <div className="min-w-0 flex-1">{children}</div>
       </div>
