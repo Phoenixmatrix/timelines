@@ -23,6 +23,7 @@ import {
 import type { Environment } from "./environment.ts";
 import type { HarnessContext } from "./types.ts";
 import { installMaintenance, maintenanceStatus, uninstallMaintenance } from "./maintenance.ts";
+import { pruneBrowsers } from "./browsers.ts";
 import { seed } from "./seed.ts";
 import { runE2E } from "./e2e.ts";
 import { runProviderE2E } from "./provider-e2e.ts";
@@ -33,7 +34,7 @@ const args = process.argv.slice(2);
 const operation = args.shift() ?? "help";
 const website = join(root, "apps", "website");
 const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
-  vp run agent setup              Build gm, install Chromium, provision/migrate/seed isolated dev environment
+  vp run agent setup              Build gm, install Chromium's headless shell, provision/migrate/seed isolated dev environment
   vp run agent up                 Run the scoped app and CI dispatcher in the foreground
   vp run agent status             List owned environments (no secrets)
   vp run agent seed               Reconcile deterministic fixtures against the live environment
@@ -48,6 +49,8 @@ const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
   vp run agent destroy            Delete owned remote resources and local credentials/state
   vp run agent cleanup --expired  Sweep all expired owned environments, including removed worktrees
   vp run agent maintenance install|status|uninstall
+  vp run agent prune-browsers [--dry-run] [--include-other-installs]
+                                  Delete Playwright browser revisions no worktree or other live install uses
 24-hour hard lifetime; four live environments per user. Setup installs hourly user-systemd cleanup.
 Canonical source publication uses ordinary gm outside 'agent gm'. Never point test commands at port 5180.
 `;
@@ -79,13 +82,33 @@ async function prepare(): Promise<void> {
     }
   }
   await command("cf", ["workers", "types"], { cwd: website });
-  await command("vp", ["exec", "playwright", "install", "chromium"], {
+  // Every scenario launches headless, which Playwright serves from the headless
+  // shell; full Chromium (~400 MB a revision) is only for headed or channel launches.
+  await command("vp", ["exec", "playwright", "install", "--only-shell", "chromium"], {
     cwd: join(root, "tools/agent"),
     timeout: 300_000,
   });
-  // Fail before provisioning if Chromium system dependencies are unavailable.
+  // Fail before provisioning if the shell or its system dependencies are unavailable,
+  // exercising the emulation the browser scenarios rely on.
   const browser = await chromium.launch({ headless: true });
-  await browser.close();
+  try {
+    const context = await browser.newContext({
+      isMobile: true,
+      hasTouch: true,
+      reducedMotion: "reduce",
+    });
+    const page = await context.newPage();
+    await page.setContent("<button>ok</button>");
+    await page.getByRole("button").tap();
+    const media = await page.evaluate(() => [
+      matchMedia("(prefers-reduced-motion: reduce)").matches,
+      matchMedia("(pointer: coarse)").matches,
+    ]);
+    if (!media.every(Boolean)) throw new Error("Headless shell ignored touch/motion emulation.");
+    await page.screenshot();
+  } finally {
+    await browser.close();
+  }
 }
 
 async function migrate(env: Environment): Promise<void> {
@@ -436,6 +459,17 @@ try {
     else if (args[0] === "uninstall") await uninstallMaintenance();
     else if (args[0] === "status") console.log(await maintenanceStatus());
     else throw new Error("Use maintenance install|status|uninstall.");
+  } else if (operation === "prune-browsers") {
+    const flags = new Set(args);
+    for (const flag of flags)
+      if (flag !== "--dry-run" && flag !== "--include-other-installs")
+        throw new Error("Use prune-browsers [--dry-run] [--include-other-installs].");
+    const report = await pruneBrowsers({
+      root,
+      dryRun: flags.has("--dry-run"),
+      includeOtherInstalls: flags.has("--include-other-installs"),
+    });
+    console.log(JSON.stringify({ event: "browsers.prune", ...report }, null, 2));
   } else if (operation === "destroy") await destroyCurrent();
   else if (operation === "reset") {
     await destroyCurrent();
