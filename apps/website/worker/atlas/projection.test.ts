@@ -319,7 +319,7 @@ describe("Atlas projections", () => {
     const page = await childrenAt(db, scope, seq, "component:big", null, 100);
     expect(page.entities).toHaveLength(100);
     expect(page.next).not.toBeNull();
-  });
+  }, 30_000); // Thousands of rows: seconds on a loaded 4-core host (CORE-247).
 
   test("deleting the repository deletes its projections", async () => {
     const { sqlite, db } = setup();

@@ -408,7 +408,7 @@ describe("Atlas read API", () => {
     const bytes = new TextEncoder().encode(json).length;
     expect(bytes).toBeLessThan(ATLAS_OVERVIEW_MAX_BYTES / 2);
     expect(gzipSync(json).length).toBeLessThan(ATLAS_OVERVIEW_MAX_BYTES / 8);
-  });
+  }, 30_000); // A large projection: seconds on a loaded 4-core host (CORE-247).
 
   test("forged and replayed cursors are rejected, recoverably", async () => {
     const s = setup();

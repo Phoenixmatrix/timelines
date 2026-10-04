@@ -160,6 +160,9 @@ test("a timeline in capabilities, across repositories, ended and expired", async
   // 4b. Across repositories (CORE-186): the workspace Atlas reads the same
   // timeline in each selected repository, each part on its own; engine has no
   // such timeline and says so. Its capabilities are marked there too.
+  // Going back re-reads the repository's Atlas; let that finish first, so
+  // everything after the mark is the workspace page's own (CORE-247).
+  await settled(server);
   mark = server.requests.length;
   await app.navigate(`/orbit/-/atlas?repos=${repo.name},engine&tl=${slug}`);
   const workspace = page.getByRole("region", { name: `Timeline ${slug}` });
