@@ -2226,6 +2226,43 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
   protocol: the pack streams from Artifacts to the target without buffering.
 - The token (push access on the target) is sealed with `REGISTRY_KEK`.
 
+## Data retention
+
+Everything Gitmatrix keeps costs storage, so data past its useful life can be
+cleaned up by **retention categories** (PRD CORE-195). Every new category is
+**disabled until an administrator enables it**: a fresh or upgraded deployment
+deletes nothing it didn't delete before.
+
+- **Categories** are defined once in `worker/retention/categories.ts`: id
+  (kebab-case, stored, never renamed), scope (`account` or `site`), label,
+  description, `never` (what it never deletes, in plain words) and thresholds
+  (whole numbers with `min`, `max` and the PRD `default`). `control` is
+  `policy` (off until enabled), `active` (preview teardown: always runs, its
+  numbers are the `account_settings` preview columns, the same ones
+  `/settings/previews` changes) or `fixed` (Atlas snapshot retention,
+  `ATLAS_RETENTION`, shown read-only). Shapes for clients are in
+  `shared/retention.ts`.
+- **Policies** (`worker/retention/policies.ts`) store only what was changed:
+  `retention_policies` per account, `retention_site_policies` for site
+  categories and site-wide defaults of account categories. Each value
+  resolves account, then site-wide default, then category default; `enabled`
+  ends at false. Enabling a category without values applies its defaults. A
+  stored value outside today's bounds is ignored. `enabledTargets(d1)` lists
+  what scheduled cleanup covers (empty with nothing enabled).
+- **Audit:** every change records who changed which category from what to
+  what in `retention_policy_changes`; the settings responses include the
+  latest 20.
+
+| Route                                          | Contract                                                                                                                          |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/accounts/:slug/settings/retention`   | The account's categories with effective `enabled`, `values` and where each comes from (members; others 404)                       |
+| `PATCH /api/accounts/:slug/settings/retention` | `{categories: {<id>: {enabled?, thresholds?}}}`; `null` resets to inherit (org owners, the user, site admins; people, not agents) |
+| `GET`, `PATCH /api/admin/retention`            | Site categories and site-wide defaults for account `policy` categories (site administrators; others 403)                          |
+
+Unknown categories or thresholds, fractional or out-of-bounds values, site
+categories at account level and read-only categories are rejected with 400,
+and a rejected request stores nothing.
+
 ## Layout
 
 - `worker/git/http.ts`: smart HTTP proxy (info/refs, upload-pack, receive-pack)
@@ -2238,6 +2275,7 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
 - `registry/`: package registries (formats, catalog, ACL, provenance, Durable Objects,
   jobs); `registry/manage/`: the packages API behind the console, feeds and gm
 - `packages/formats` (repo root): IO-free protocol libraries for every package format
+- `worker/retention/*`, `shared/retention.ts`: retention categories, policies and cleanup
 - `worker/tracker/*`: account-level authority, transactional graph store and sync API
 - `worker/search/*`, `shared/search.ts`: global search providers, ranking and `/api/search`
 - `shared/tracker.ts`: shared tracker entities, mutations and readiness semantics

@@ -35,7 +35,7 @@ export async function previewSettings(d1: D1Database, accountId: string): Promis
 }
 
 /** The viewer's standing in an account: none, a member, or one who may change its settings. */
-async function standing(
+export async function standing(
   d1: D1Database,
   account: AccountRow,
   actor: Actor,
@@ -52,7 +52,8 @@ async function standing(
   return membership.role === "owner" ? "admin" : "member";
 }
 
-async function load(c: Context<AppEnv>, actor: Actor) {
+/** The route's account (`:slug`) and the viewer's standing; null when they aren't a member. */
+export async function load(c: Context<AppEnv>, actor: Actor) {
   const account = await findAccountBySlug(c.env.DB, c.req.param("slug") ?? "");
   const role = account ? await standing(c.env.DB, account, actor) : "none";
   return account && role !== "none" ? { account, role } : null;

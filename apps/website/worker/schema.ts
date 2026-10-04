@@ -713,6 +713,34 @@ export interface Database {
     ai_updated_by: Generated<string | null>;
     ai_updated_at: Generated<string | null>;
   };
+  /** Retention policies (CORE-196): what an account changed; absent inherits. */
+  retention_policies: {
+    account_id: string;
+    category: string;
+    enabled: number | null;
+    /** JSON {key: number} of threshold overrides. */
+    thresholds: Generated<string>;
+    updated_by: string | null;
+    updated_at: Generated<string>;
+  };
+  /** Site-scope categories, and site-wide defaults for account ones. */
+  retention_site_policies: {
+    category: string;
+    enabled: number | null;
+    thresholds: Generated<string>;
+    updated_by: string | null;
+    updated_at: Generated<string>;
+  };
+  /** Who changed which retention policy; account_id null at site level. */
+  retention_policy_changes: {
+    id: Generated<number>;
+    account_id: string | null;
+    category: string;
+    actor_id: string | null;
+    before: string;
+    after: string;
+    created_at: Generated<string>;
+  };
 }
 
 export type DB = Kysely<Database>;

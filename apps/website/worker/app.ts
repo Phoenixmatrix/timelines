@@ -37,6 +37,7 @@ import { deployments } from "./deployments/api.ts";
 import { jobRoute } from "./deployments/job.ts";
 import { previewSettingsApi } from "./deployments/settings.ts";
 import { aiSettingsApi } from "./settings/ai.ts";
+import { accountRetentionApi, siteRetentionApi } from "./retention/api.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -91,6 +92,8 @@ api.use(async (c, next) => {
 });
 api.route("/accounts/:slug/settings/previews", previewSettingsApi);
 api.route("/accounts/:slug/settings/ai", aiSettingsApi);
+api.route("/accounts/:slug/settings/retention", accountRetentionApi);
+api.route("/admin/retention", siteRetentionApi);
 api.route("/accounts/:owner/atlas", workspaceAtlas);
 api.route("/", accounts);
 api.route("/tracker/:owner/release-notes", trackerReleaseNotes);
