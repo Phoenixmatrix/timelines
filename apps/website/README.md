@@ -2062,6 +2062,33 @@ jobs:
   first (`StepArtifact`, `shared/steps.ts`). The schema allows `screenshot` and
   `document` artifacts with a stored object later.
 
+#### Heavy work waits for a quiet period
+
+Step runs are per step; a timeline's heavy work isn't (CORE-238). Its full CI
+(the push run) and its knowledge overlay run for the timeline's latest head
+once its pushes pause for the **quiet period**, ten minutes
+(`worker/timelines/quiet.ts`), or at once when a checkpoint is made:
+
+- **Full CI.** A push run on `timeline/<slug>` is stored with `quiet_until`
+  and its Workflow starts right away, then waits (`waitForEvent`
+  `quiet-release`, timing out at `quiet_until`). A newer push to the timeline
+  covers it (`cancelled`, `covered_by` the new run) and waits in its place; a
+  checkpoint (`POST …/timelines/:slug/checkpoints`) sends the event, so the
+  checkpoint's commit is tested now. A checkpoint can beat its push's run (runs
+  start after the push answers), so it also notes the commit on the branch's
+  `ci_refs` row (`quiet_released`) and a run of exactly that commit doesn't wait. Main and other branches never wait, and
+  step runs never do.
+- **Knowledge overlays.** The repository's coordinator remembers when it
+  first saw each timeline tip and starts the overlay once the tip has stood
+  for the quiet period (`scanOverlays`); a moved main still rebuilds overlays
+  at once. A checkpoint asks for its timelines' overlays now (`overlayNow`),
+  within the automatic-AI settings (CORE-190) like every overlay.
+- **Previews** already follow checkpoints only.
+
+Development environments may shorten it with `GITMATRIX_TIMELINE_QUIET_SECONDS`
+(agent environments use 3 s, so E2E exercises the wait); deployed Workers
+always wait ten minutes.
+
 ### Deployments and previews
 
 Gitmatrix deploys nothing (`TIMELINES-RESEARCH.md`, "Previews: primitives, not

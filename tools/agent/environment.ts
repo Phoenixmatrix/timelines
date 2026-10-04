@@ -708,6 +708,9 @@ export async function context(env: Environment): Promise<HarnessContext> {
     GITMATRIX_GM: gm,
     GITMATRIX_CI_RUNNER: "local",
     GITMATRIX_CI_RUNNERS: "2",
+    // A timeline's full CI and overlays wait for its pushes to pause (CORE-238):
+    // seconds here, so scenarios exercise the wait without spending minutes on it.
+    GITMATRIX_TIMELINE_QUIET_SECONDS: "3",
     HOME: join(env.dir, "home"),
     TMPDIR: temporary,
     XDG_CONFIG_HOME: join(env.dir, "config"),

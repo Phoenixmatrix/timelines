@@ -5,7 +5,8 @@ import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { jobPayload, loadJob } from "./jobs.ts";
 import { recordStepRun } from "../steps/runs.ts";
-import { onPush, startRun, startWorkflow } from "./trigger.ts";
+import { timelineQuietMs } from "../timelines/quiet.ts";
+import { onPush, releaseQuiet, startRun, startWorkflow } from "./trigger.ts";
 
 const files = vi.hoisted(() => ({ ciYml: "" }));
 const refs = vi.hoisted(() => ({
@@ -422,5 +423,88 @@ jobs:
         { name: "unit", status: "failed", exitCode: 1, durationMs: 1000 },
       ],
     });
+  });
+});
+
+describe("a timeline's quiet period (CORE-238)", () => {
+  const PIPE =
+    "on:\n  push: {}\n  step: {}\njobs:\n  lint:\n    on: step\n    steps: [x]\n  test:\n    steps: [y]\n";
+  const runs = (t: ReturnType<typeof setup>) =>
+    t.sqlite
+      .prepare(
+        "SELECT id, number, ref, step, status, quiet_until, covered_by FROM ci_runs ORDER BY number",
+      )
+      .all() as {
+      id: string;
+      number: number;
+      ref: string;
+      step: number;
+      status: string;
+      quiet_until: string | null;
+      covered_by: number | null;
+    }[];
+
+  test("a timeline's push run waits; its step run and main's runs don't", async () => {
+    files.ciYml = PIPE;
+    const t = setup();
+    const before = Date.now();
+    await t.start({ trigger: "push", preview: undefined });
+    await t.start({ trigger: "step", preview: undefined });
+    await t.start({ trigger: "push", preview: undefined, branch: "main", commit: oid(8) });
+    const [push, step, main] = runs(t);
+    const waits = Date.parse(push!.quiet_until!) - before;
+    expect(waits).toBeGreaterThanOrEqual(600_000);
+    expect(waits).toBeLessThan(610_000);
+    expect(step!.quiet_until).toBeNull();
+    expect(main!.quiet_until).toBeNull();
+    // The Workflow starts at once and does the waiting.
+    expect(t.created).toHaveLength(3);
+  });
+
+  test("a newer push covers the run still waiting; a checkpoint releases the newest", async () => {
+    files.ciYml = PIPE;
+    const t = setup();
+    const events: { id: string; type: string }[] = [];
+    Object.assign(t.env, {
+      CI_RUN: {
+        create: async ({ id }: { id: string }) => void t.created.push(id),
+        get: async (id: string) => ({
+          sendEvent: async ({ type }: { type: string }) => void events.push({ id, type }),
+        }),
+      },
+    });
+    await t.start({ trigger: "push", preview: undefined, commit: oid(1) });
+    await t.start({ trigger: "push", preview: undefined, commit: oid(2) });
+    const [first, second] = runs(t);
+    expect(first).toMatchObject({ status: "cancelled", covered_by: second!.number });
+    expect(second).toMatchObject({ status: "queued", covered_by: null });
+
+    expect(await releaseQuiet(t.env, "repo", "timeline/search", oid(2))).toBe(1);
+    expect(events).toEqual([{ id: second!.id, type: "quiet-release" }]);
+    // Nothing waits on another branch.
+    expect(await releaseQuiet(t.env, "repo", "timeline/other", oid(2))).toBe(0);
+  });
+
+  test("a checkpoint that beats its push's run still releases it", async () => {
+    files.ciYml = PIPE;
+    const t = setup();
+    // The bookmark CI already follows; the checkpoint of oid(3) comes first.
+    t.sqlite.exec(
+      `INSERT INTO ci_refs (repo_id, ref, oid) VALUES ('repo', 'timeline/search', '${oid(2)}')`,
+    );
+    expect(await releaseQuiet(t.env, "repo", "timeline/search", oid(3))).toBe(0);
+    await t.start({ trigger: "push", preview: undefined, commit: oid(3) });
+    await t.start({ trigger: "push", preview: undefined, commit: oid(4) });
+    const [released, later] = runs(t);
+    expect(released!.quiet_until).toBeNull();
+    // Only that commit: the next push waits again.
+    expect(later!.quiet_until).not.toBeNull();
+  });
+
+  test("the quiet period comes from the environment in development", () => {
+    expect(timelineQuietMs({} as Env)).toBe(600_000);
+    expect(timelineQuietMs({ TIMELINE_QUIET_SECONDS: "3" } as unknown as Env)).toBe(3_000);
+    expect(timelineQuietMs({ TIMELINE_QUIET_SECONDS: "0" } as unknown as Env)).toBe(0);
+    expect(timelineQuietMs({ TIMELINE_QUIET_SECONDS: "soon" } as unknown as Env)).toBe(600_000);
   });
 });

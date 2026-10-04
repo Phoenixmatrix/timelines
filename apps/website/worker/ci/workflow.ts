@@ -11,6 +11,7 @@
 // Either way the job's state lives in D1, so the Workflow reads the outcome
 // from there.
 
+import { QUIET_RELEASE } from "./workflow-events.ts";
 import { recordStepRun } from "../steps/runs.ts";
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type { CiJobStatus } from "../../shared/api.ts";
@@ -68,6 +69,39 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
   async run(event: Readonly<WorkflowEvent<RunParams>>, step: WorkflowStep) {
     const { runId } = event.payload;
     const kdb = db(this.env.DB);
+
+    // A timeline's push run waits out its quiet period (CORE-238): a newer
+    // push covers it meanwhile, a checkpoint releases it at once.
+    const quietUntil = await step.do("quiet period", DB_STEP, async () => {
+      const row = await kdb
+        .selectFrom("ci_runs")
+        .select("quiet_until")
+        .where("id", "=", runId)
+        .executeTakeFirst();
+      return row?.quiet_until ?? null;
+    });
+    if (quietUntil) {
+      const seconds = Math.ceil((Date.parse(quietUntil) - event.timestamp.getTime()) / 1000);
+      if (seconds > 0) {
+        try {
+          await step.waitForEvent("quiet", {
+            type: QUIET_RELEASE,
+            timeout: `${seconds} seconds` as WorkflowSleepDuration,
+          });
+        } catch {
+          // The quiet period passed with no newer push: run.
+        }
+      }
+      const still = await step.do("after the quiet period", DB_STEP, async () => {
+        const row = await kdb
+          .selectFrom("ci_runs")
+          .select("status")
+          .where("id", "=", runId)
+          .executeTakeFirst();
+        return row?.status === "queued";
+      });
+      if (!still) return;
+    }
 
     const jobs = await step.do("plan", DB_STEP, async () => {
       await kdb

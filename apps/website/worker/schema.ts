@@ -684,6 +684,8 @@ export interface Database {
     repo_id: string;
     ref: string;
     oid: string;
+    /** The commit a checkpoint released from the quiet period, maybe before its run existed (CORE-238). */
+    quiet_released: Generated<string | null>;
   };
   repo_refs: {
     repo_id: string;
@@ -752,6 +754,8 @@ export interface Database {
     queue_id: Generated<string | null>;
     /** 1 for a step run (CORE-235): the light run for a timeline push, never full CI. */
     step: Generated<number>;
+    /** A timeline push run waits until then for its quiet period (CORE-238); null starts now. */
+    quiet_until: Generated<string | null>;
   };
   ci_jobs: {
     id: string;

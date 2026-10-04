@@ -227,6 +227,11 @@ export default defineConfig(({ mode, isPreview }) => {
         // (worker/knowledge/budget.ts `atlasSettings`). `agent test-ai` runs its
         // disabled, refused and exhausted providers through it; deployed
         // Workers always use the built-in defaults.
+        // Development only: the quiet period before a timeline's heavy work
+        // (worker/timelines/quiet.ts); agent environments shorten it.
+        ...(dev && env.GITMATRIX_TIMELINE_QUIET_SECONDS
+          ? { TIMELINE_QUIET_SECONDS: bindings.text(env.GITMATRIX_TIMELINE_QUIET_SECONDS) }
+          : {}),
         ...(dev && env.GITMATRIX_ATLAS_CONFIG
           ? { ATLAS_CONFIG: bindings.text(env.GITMATRIX_ATLAS_CONFIG) }
           : {}),

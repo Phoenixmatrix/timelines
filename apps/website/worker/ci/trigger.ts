@@ -23,6 +23,8 @@ import {
 import { activeRun, anyHeld, inFlight, lastPassed, releaseHeld, UNCHANGED } from "./coalesce.ts";
 import type { StoredJob } from "./jobs.ts";
 import { landingSlugOf, timelineSlugOf } from "../../shared/timelines.ts";
+import { timelineQuietMs } from "../timelines/quiet.ts";
+import { QUIET_RELEASE } from "./workflow-events.ts";
 import { isQueueSourceBranch } from "../../shared/merge-queue.ts";
 
 export interface CiRepo {
@@ -186,6 +188,21 @@ export async function startRun(
     }
 
     const runId = options.runId ?? crypto.randomUUID().replaceAll("-", "");
+    // A timeline's full CI waits for its pushes to pause (CORE-238).
+    const quietMs =
+      options.trigger === "push" && isTimeline(options.branch) ? timelineQuietMs(env) : 0;
+    const released =
+      quietMs > 0 &&
+      (
+        await db(env.DB)
+          .selectFrom("ci_refs")
+          .select("quiet_released")
+          .where("repo_id", "=", repo.id)
+          .where("ref", "=", options.branch)
+          .executeTakeFirst()
+      )?.quiet_released === options.commit;
+    const quietUntil =
+      quietMs > 0 && !released ? new Date(Date.now() + quietMs).toISOString() : null;
     const stored =
       options.trigger === "preview" || options.trigger === "landing" || step
         ? "manual"
@@ -229,6 +246,7 @@ export async function startRun(
           "landing_id",
           "queue_id",
           "step",
+          "quiet_until",
         ])
         .expression((eb) =>
           eb
@@ -257,6 +275,7 @@ export async function startRun(
                 .as("landing_id"),
               eb.val(options.queueId ?? null).as("queue_id"),
               eb.val(step ? 1 : 0).as("step"),
+              eb.val(error ? null : quietUntil).as("quiet_until"),
             ])
             .where("repo_id", "=", repo.id)
             .having((eb) =>
@@ -340,7 +359,9 @@ export async function startRun(
     // Under load, a push waits in a held run: when a run on its branch finishes,
     // the newest held run starts and covers the older ones.
     const limit = pipeline?.coalesceAfter;
-    if (!error && limit && options.trigger === "push") {
+    // A newer push covers the timeline's runs still waiting out their quiet period.
+    if (!error && quietUntil) await coverQuiet(env.DB, repo.id, options.branch, runId);
+    if (!error && limit && options.trigger === "push" && !quietUntil) {
       const busy = await inFlight(env.DB, repo.id, options.branch, runId);
       if (busy >= limit || (await anyHeld(env.DB, repo.id, options.branch, runId))) {
         await kdb
@@ -391,6 +412,68 @@ export async function startRun(
  * After a push: start a run for every branch that moved. The upsert is
  * conditional, so concurrent pushes (or retries) never start the same run twice.
  */
+const isTimeline = (branch: string) => timelineSlugOf(`refs/heads/${branch}`) !== null;
+
+/** Runs on `ref` waiting out their quiet period, other than `except`, are covered by it. */
+async function coverQuiet(d1: D1Database, repoId: string, ref: string, except: string) {
+  const kdb = db(d1);
+  const newest = await kdb
+    .selectFrom("ci_runs")
+    .select("number")
+    .where("id", "=", except)
+    .executeTakeFirst();
+  if (!newest) return;
+  await kdb
+    .updateTable("ci_runs")
+    .set({
+      status: "cancelled",
+      covered_by: newest.number,
+      finished_at: nowIso(),
+    })
+    .where("repo_id", "=", repoId)
+    .where("ref", "=", ref)
+    .where("id", "<>", except)
+    .where("quiet_until", "is not", null)
+    .where("status", "=", "queued")
+    .execute();
+}
+
+/**
+ * A checkpoint wants the timeline's heavy work now (CORE-238): release the
+ * push run waiting out its quiet period on this bookmark, if any, and note
+ * the commit so a run of it that doesn't exist yet won't wait either.
+ */
+export async function releaseQuiet(
+  env: Env,
+  repoId: string,
+  ref: string,
+  commit: string,
+): Promise<number> {
+  // Only a row onPush already keeps: inserting one would hide the push from it.
+  await db(env.DB)
+    .updateTable("ci_refs")
+    .set({ quiet_released: commit })
+    .where("repo_id", "=", repoId)
+    .where("ref", "=", ref)
+    .execute();
+  const waiting = await db(env.DB)
+    .selectFrom("ci_runs")
+    .select("id")
+    .where("repo_id", "=", repoId)
+    .where("ref", "=", ref)
+    .where("quiet_until", "is not", null)
+    .where("status", "=", "queued")
+    .execute();
+  for (const run of waiting) {
+    try {
+      await (await env.CI_RUN.get(run.id)).sendEvent({ type: QUIET_RELEASE, payload: {} });
+    } catch (error) {
+      console.error("CI: could not release a quiet run", { runId: run.id, error });
+    }
+  }
+  return waiting.length;
+}
+
 export async function onPush(
   env: Env,
   repo: CiRepo,

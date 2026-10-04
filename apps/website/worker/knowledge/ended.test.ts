@@ -75,6 +75,8 @@ async function setup() {
   const env = {
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
+    // Overlays start at once here; the quiet period has its own tests (CORE-238).
+    TIMELINE_QUIET_SECONDS: "0",
     KNOWLEDGE_BUILD: {
       create: builds,
       get: async () => ({ status: async () => ({ status: "running" }), terminate: async () => {} }),

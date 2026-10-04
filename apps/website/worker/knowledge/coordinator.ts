@@ -24,6 +24,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { timelineSlugOf } from "../../shared/timelines.ts";
+import { timelineQuietMs } from "../timelines/quiet.ts";
 import { listRefs, type RepoRefs } from "../artifacts.ts";
 import { productionOnly } from "../preview.ts";
 import { db, nowIso } from "../schema.ts";
@@ -118,6 +119,8 @@ interface State {
   lastFinishedAt: number | null;
   /** Timeline bookmarks need comparing with their overlays. */
   scan: boolean;
+  /** Bookmarks a checkpoint wants an overlay for now, past the quiet period (CORE-238). */
+  overlaysNow?: string[];
   overlays: Record<
     string,
     OverlayState & {
@@ -169,6 +172,18 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     await this.#save(state);
     // Even while a build runs: timeline overlays don't wait for main's build.
     const due = Math.min(now + DEBOUNCE_MS, state.burstStartedAt + MAX_WAIT_MS);
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+  }
+
+  /** A checkpoint wants these bookmarks' overlays now, quiet period or not (CORE-238). */
+  async overlayNow(repoId: string, refs: string[]): Promise<void> {
+    const state = await this.#state();
+    state.repoId = repoId;
+    state.scan = true;
+    state.overlaysNow = [...new Set([...(state.overlaysNow ?? []), ...refs])];
+    await this.#save(state);
+    const due = Date.now() + 250;
     const alarm = await this.ctx.storage.getAlarm();
     if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
   }
@@ -264,11 +279,18 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     // Main's next build waits for its own run to end (finished() schedules it).
     state.burstStartedAt = null;
     // Without a ref listing the scan waits for the next ping.
-    if (state.scan && refs && ownerId) await this.#scanOverlays(state, refs, indexed, ownerId);
+    let quietWake: number | null = null;
+    if (state.scan && refs && ownerId)
+      quietWake = await this.#scanOverlays(state, refs, indexed, ownerId);
     await this.#watchPages(state);
     if (state.pagesDue) await this.#startPages(state);
     await this.#save(state);
     if (this.#busy(state)) await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+    // A timeline still in its quiet period is looked at again when it's due.
+    if (quietWake !== null) {
+      const alarm = await this.ctx.storage.getAlarm();
+      if (alarm === null || alarm > quietWake) await this.ctx.storage.setAlarm(quietWake);
+    }
   }
 
   /**
@@ -480,7 +502,13 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
    * Start overlays for bookmarks whose tip or base moved; end the overlays of
    * bookmarks that are gone, keeping them read-only.
    */
-  async #scanOverlays(state: State, refs: RepoRefs, indexed: string | null, ownerId: string) {
+  /** Starts what's due; returns when a timeline still in its quiet period is due, if any. */
+  async #scanOverlays(
+    state: State,
+    refs: RepoRefs,
+    indexed: string | null,
+    ownerId: string,
+  ): Promise<number | null> {
     const repoId = state.repoId!;
     const tips = new Map(
       refs.branches.filter((b) => timelineSlugOf(b.name)).map((b) => [b.name, b.oid]),
@@ -502,15 +530,27 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
         tips.delete(ref);
       }
     }
-    const scan = scanOverlays(state.overlays, tips, indexed);
+    const now = Date.now();
+    const scan = scanOverlays(state.overlays, tips, indexed, undefined, {
+      now,
+      ms: timelineQuietMs(this.env),
+      now_refs: new Set(state.overlaysNow ?? []),
+    });
+    state.overlaysNow = [];
+    for (const [ref, commit] of scan.seen)
+      state.overlays[ref] = {
+        ...(state.overlays[ref] ?? { running: null, done: null, retries: 0, lastError: null }),
+        seen: { commit, at: now },
+      };
     const reasons = new Map<string, KnowledgeOverlayEndReason>();
     for (const ref of scan.gone) {
       delete state.overlays[ref];
       reasons.set(ref, (await timelineEnd(this.env, ownerId, ref)) ?? "ended");
     }
     await endOverlays(this.env.DB, repoId, reasons);
-    // Over the limit: picked up when one of those in flight ends.
-    state.scan = scan.deferred;
+    // Over the limit: picked up when one of those in flight ends. In the quiet
+    // period: picked up when it's due.
+    state.scan = scan.deferred || scan.wakeAt !== null;
     for (const [ref, commit] of scan.start) {
       const previous = state.overlays[ref];
       const retry = previous?.retry;
@@ -540,6 +580,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
         },
       });
     }
+    return scan.wakeAt;
   }
 
   /** Called by the Workflow when a build ends. */
@@ -626,6 +667,17 @@ export async function notifyKnowledge(env: Env, repoId: string, options: { force
   if (!env.AI || !productionOnly(env, "workflow", "a knowledge build")) return false;
   if (!(await repoAiSnapshot(env.DB, repoId)).features.knowledge) return false;
   await coordinator(env, repoId).notify(repoId, options);
+  return true;
+}
+
+/**
+ * A checkpoint: compute these timeline bookmarks' overlays now, without
+ * waiting for the quiet period (CORE-238). Respects the automatic-AI settings.
+ */
+export async function overlayNow(env: Env, repoId: string, refs: string[]) {
+  if (!env.AI || !productionOnly(env, "workflow", "a knowledge overlay")) return false;
+  if (!(await repoAiSnapshot(env.DB, repoId)).features.knowledge) return false;
+  await coordinator(env, repoId).overlayNow(repoId, refs);
   return true;
 }
 

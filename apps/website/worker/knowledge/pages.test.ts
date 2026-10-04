@@ -201,6 +201,8 @@ async function setup() {
   const env = {
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
+    // Overlays start at once here; the quiet period has its own tests (CORE-238).
+    TIMELINE_QUIET_SECONDS: "0",
     AI,
     KNOWLEDGE_BUILD: {
       create: async ({ id, params }: { id: string; params: unknown }) =>
@@ -324,7 +326,10 @@ async function setup() {
   /** Wake the coordinator, then run every page set it started to the end. */
   const drain = async () => {
     await coordinator.alarm();
-    const started = [...builds].filter(([, b]) => b.status === "running");
+    // Page sets only: a checkpoint's overlay build (CORE-238) isn't drained here.
+    const started = [...builds].filter(
+      ([, b]) => b.status === "running" && !(b.params as { overlay?: unknown }).overlay,
+    );
     const results = [];
     for (const [, build] of started) {
       const params = build.params as Parameters<typeof runPageSet>[1];
@@ -374,6 +379,15 @@ async function setup() {
 
 type Setup = Awaited<ReturnType<typeof setup>>;
 
+/**
+ * Builds other than the checkpoint's own overlay. A checkpoint also asks for
+ * its timeline's overlay at once (CORE-238); this fresh coordinator doesn't
+ * know it's already built, so it starts one.
+ */
+function pageAndMainBuilds(t: Setup) {
+  return [...t.builds.values()].filter((b) => !(b.params as { overlay?: unknown }).overlay);
+}
+
 async function makeCheckpoint(t: Setup, summary = "Refunds") {
   const made = await t.timeline("bot", "POST", "/search/checkpoints", { summary });
   expect(made.status).toBe(201);
@@ -389,7 +403,7 @@ describe("timeline wiki pages", () => {
       .run("orbit", 0);
     await t.coordinator.notify("app", { force: true });
     await t.coordinator.alarm();
-    expect([...t.builds.values()]).toEqual([]);
+    expect(pageAndMainBuilds(t)).toEqual([]);
     expect(t.ai.calls).toEqual([]);
     expect(t.sets()).toEqual([
       { set_key: made.checkpoint.id, status: "queued", commit_oid: TIP, checkpoint_number: 1 },
@@ -416,7 +430,7 @@ describe("timeline wiki pages", () => {
         .prepare(`UPDATE account_settings SET ai_${feature} = 1 WHERE account_id = ?`)
         .run("orbit");
       await t.coordinator.alarm();
-      expect([...t.builds.values()]).toEqual([]);
+      expect(pageAndMainBuilds(t)).toEqual([]);
       const requested = await t.kn("ben", "POST", path);
       expect(requested.status).toBe(202);
       expect(requested.body.state).toBe("queued");
@@ -436,7 +450,7 @@ describe("timeline wiki pages", () => {
       .prepare("INSERT INTO account_settings (account_id, ai_wiki) VALUES (?, ?)")
       .run("orbit", 0);
     await t.coordinator.alarm();
-    expect([...t.builds.values()]).toEqual([]);
+    expect(pageAndMainBuilds(t)).toEqual([]);
     expect(t.ai.calls).toEqual([]);
     expect((await t.kn("ben", "POST", "/overlay/pages?ref=timeline/search")).status).toBe(409);
 
@@ -446,7 +460,7 @@ describe("timeline wiki pages", () => {
     // Saving policy does not wake a stopped queue. Re-requesting the same
     // checkpoint must wake it even though its set already exists.
     await t.coordinator.alarm();
-    expect([...t.builds.values()]).toEqual([]);
+    expect(pageAndMainBuilds(t)).toEqual([]);
     expect(
       (
         await t.kn(
@@ -457,7 +471,7 @@ describe("timeline wiki pages", () => {
       ).status,
     ).toBe(202);
     await t.coordinator.alarm();
-    const build = [...t.builds.values()][0]!;
+    const build = pageAndMainBuilds(t)[0]!;
     const params = build.params as Parameters<typeof runPageSet>[1];
     const snapshot = t.sqlite
       .prepare("SELECT ai_snapshot FROM kg_page_sets WHERE set_key = ?")
@@ -523,8 +537,8 @@ describe("timeline wiki pages", () => {
 
     // The coordinator starts it; meanwhile the checkpoint shows it pending.
     await t.coordinator.alarm();
-    expect(t.builds.size).toBe(1);
-    const build = [...t.builds.values()][0];
+    expect(pageAndMainBuilds(t)).toHaveLength(1);
+    const build = pageAndMainBuilds(t)[0];
     expect(build!.params).toMatchObject({
       repoId: "app",
       pages: { ref: REF, key: made.checkpoint.id },
