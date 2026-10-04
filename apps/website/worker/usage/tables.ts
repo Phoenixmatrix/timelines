@@ -223,6 +223,13 @@ export const TABLE_GROUPS: TableGroup[] = [
     tables: { job_cursors: null, retention_site_policies: null },
   },
   {
+    id: "price-catalog",
+    database: "db",
+    scope: "site",
+    label: "Cloudflare price catalog and its changes",
+    tables: { cloudflare_prices: null, cloudflare_price_changes: null },
+  },
+  {
     id: "packages",
     database: "registry",
     scope: "account",

@@ -10,6 +10,7 @@ import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.
 import { retentionCron, runRetentionJob, type RetentionJob } from "./retention/runs.ts";
 import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
 import { settled, sweepLandings } from "./timelines/landing.ts";
+import { checkCatalogDaily } from "./usage/prices.ts";
 
 export default {
   // A timeline preview answers only through its access gate (worker/preview-gate.ts).
@@ -50,7 +51,8 @@ export default {
   },
   /**
    * Hourly: package sweeps, tearing down expired timeline previews (CORE-79),
-   * Atlas projection retention (CORE-159) and data retention runs (CORE-198).
+   * Atlas projection retention (CORE-159), data retention runs (CORE-198),
+   * usage snapshots (CORE-207) and the daily price check (CORE-208).
    */
   async scheduled(_controller, env, ctx) {
     if (isPreview(env)) return;
@@ -80,6 +82,12 @@ export default {
     // Per-account usage snapshots, a bounded slice per run (CORE-207).
     ctx.waitUntil(
       collectUsage(env).catch((error) => console.error("Usage: the collection failed", error)),
+    );
+    // Once a day: does every Cloudflare pricing page still parse, and did a price change? (CORE-208)
+    ctx.waitUntil(
+      checkCatalogDaily(env.DB).catch((error) =>
+        console.error("Prices: the daily check failed", error),
+      ),
     );
     // Landings a CI run's end didn't move on (CORE-77).
     ctx.waitUntil(

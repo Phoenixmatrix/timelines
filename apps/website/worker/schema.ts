@@ -331,6 +331,44 @@ export interface Database {
     exhausted_at: string;
     resets_at: string | null;
   };
+  /** The Cloudflare price catalog's changes and checks, the audit trail (worker/usage/prices.ts). */
+  cloudflare_price_changes: {
+    id: Generated<number>;
+    kind: "seed" | "refresh" | "check" | "manual";
+    status: "pending" | "applied" | "discarded" | "rejected" | "unchanged" | "superseded";
+    created_at: Generated<string>;
+    created_by: string | null;
+    base_version: number | null;
+    /** JSON PricePageResult[]. */
+    pages: Generated<string>;
+    /** JSON PriceDiffEntry[]. */
+    diff: Generated<string>;
+    note: string | null;
+    decided_at: string | null;
+    decided_by: string | null;
+  };
+  /** Versions of Cloudflare's published prices (worker/usage/prices.ts). */
+  cloudflare_prices: {
+    id: Generated<number>;
+    change_id: number;
+    product: string;
+    metric: string;
+    unit: string;
+    unit_quantity: number;
+    unit_price_usd: number;
+    included_quantity: number | null;
+    included_period: "month" | "day" | null;
+    effective_from: string;
+    source_url: string;
+    source_updated: string | null;
+    fetched_at: string | null;
+    provenance: "seed" | "refresh" | "manual";
+    recorded_at: Generated<string>;
+    recorded_by: string | null;
+    note: string | null;
+    superseded_at: string | null;
+    superseded_by: number | null;
+  };
   kg_overlay_changes: {
     repo_id: string;
     overlay_id: string;

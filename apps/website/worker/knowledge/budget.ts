@@ -40,6 +40,8 @@
 import type { Insertable } from "kysely";
 import { AI_MODEL_CATALOG } from "../../shared/ai.ts";
 import { MODELS } from "./models.ts";
+import { modelMetric } from "../usage/pages.ts";
+import { seedPrice } from "../usage/seed.ts";
 import { db, nowIso, type Database } from "../schema.ts";
 
 export interface RunLimits {
@@ -70,20 +72,30 @@ export interface ModelPrice {
 }
 export type PriceTable = Readonly<Record<string, ModelPrice>>;
 
+/** A Workers AI model's USD per million input and output tokens, from the price catalog's seed. */
+function modelPrice(model: string): ModelPrice {
+  const perMillion = (metric: "input" | "output") => {
+    const price = seedPrice("workers_ai", modelMetric(model, metric));
+    if (price.unit !== "token") throw new Error(`${model} ${metric} isn't priced per token`);
+    return price.unitQuantity === 1_000_000
+      ? price.unitPriceUsd
+      : (price.unitPriceUsd * 1_000_000) / price.unitQuantity;
+  };
+  return { input: perMillion("input"), output: perMillion("output") };
+}
+
 /**
- * Provider prices Atlas may spend at, per model id. Configurable task prices
- * share the account settings catalog; legacy Qwen remains priced for already
- * running jobs. A model missing here cannot be used for Atlas paid synthesis
- * (reservations return `disabled`).
+ * Provider prices Atlas may spend at, per model id: Workers AI's published
+ * prices from the Cloudflare price catalog's seed (worker/usage/seed.ts, the
+ * one place they are written down), for every configurable task model, and
+ * legacy Qwen for already running jobs. A model missing here cannot be used
+ * for Atlas paid synthesis (reservations return `disabled`).
  */
 export const ATLAS_PRICES: PriceTable = {
   ...Object.fromEntries(
-    AI_MODEL_CATALOG.task.map((option) => [
-      option.model,
-      { input: option.inputUsdPerMillion, output: option.outputUsdPerMillion },
-    ]),
+    AI_MODEL_CATALOG.task.map((option) => [option.model, modelPrice(option.model)]),
   ),
-  [MODELS.reason]: { input: 0.45, output: 3.2 },
+  [MODELS.reason]: modelPrice(MODELS.reason),
 };
 
 export type AtlasScope =
