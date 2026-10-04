@@ -187,22 +187,89 @@ async function deleteNamespace(cloudflare: Cloudflare, name: string): Promise<vo
   await ignoringAbsent(cloudflare.cf(["artifacts", "namespaces", "delete", name, "--force"]));
 }
 
+function ok(status: number): boolean {
+  return status >= 200 && status < 300;
+}
+
+/** A Cloudflare API error code (10007: no such Worker), or null. */
+function errorCode(body: unknown): number | null {
+  const errors = (body as { errors?: { code?: unknown }[] } | null)?.errors;
+  const code = Array.isArray(errors) ? errors[0]?.code : undefined;
+  return typeof code === "number" ? code : null;
+}
+
+/** The Worker's id, or null when there is no such Worker (so it has no Previews). */
+async function workerId(cloudflare: Cloudflare, account: string): Promise<string | null> {
+  const { status, body } = await cloudflare.api(
+    "GET",
+    `/accounts/${account}/workers/workers/${WORKER}`,
+  );
+  if (status === 404 && errorCode(body) === 10007) return null;
+  const id = (body as { result?: { id?: unknown } } | null)?.result?.id;
+  if (!ok(status) || typeof id !== "string")
+    throw new Error(`Looking up Worker ${WORKER} returned HTTP ${status}: ${JSON.stringify(body)}`);
+  return id;
+}
+
+interface Preview {
+  id: string;
+  name: string;
+}
+
+/** Every Preview of the Worker, page by page. */
+async function listPreviews(
+  cloudflare: Cloudflare,
+  account: string,
+  worker: string,
+): Promise<Preview[]> {
+  const all: Preview[] = [];
+  for (let page = 1; ; page++) {
+    const { status, body } = await cloudflare.api(
+      "GET",
+      `/accounts/${account}/workers/workers/${worker}/previews?per_page=100&page=${page}`,
+    );
+    const listed = body as {
+      result?: Preview[] | null;
+      result_info?: { total_count?: number };
+    } | null;
+    if (!ok(status) || !Array.isArray(listed?.result))
+      throw new Error(
+        `Listing ${WORKER}'s Previews returned HTTP ${status}: ${JSON.stringify(body)}`,
+      );
+    all.push(...listed.result);
+    const total = listed.result_info?.total_count ?? 0;
+    if (!listed.result.length || all.length >= total) return all;
+  }
+}
+
 /**
  * Delete the Worker Preview and its deployments. `cf previews` can only
- * deploy, so this is the API call cf's own (unexposed) delete makes.
+ * deploy, so this calls the API (as cf's own unexposed delete does): find the
+ * Preview by name in the Worker's list, delete it by id, and confirm it's gone.
+ * Only the list says a Preview is absent; a 404 from the delete itself is an
+ * error unless a fresh list agrees.
  */
 export async function deletePreview(
   cloudflare: Cloudflare,
   account: string,
   name: string,
 ): Promise<void> {
+  const worker = await workerId(cloudflare, account);
+  if (!worker) return;
+  const find = async () =>
+    (await listPreviews(cloudflare, account, worker)).find((preview) => preview.name === name);
+  const preview = await find();
+  if (!preview) return;
   const { status, body } = await cloudflare.api(
     "DELETE",
-    `/accounts/${account}/workers/workers/${WORKER}/previews/${encodeURIComponent(name)}`,
+    `/accounts/${account}/workers/workers/${worker}/previews/${encodeURIComponent(preview.id)}`,
   );
-  if (status === 404 || (status >= 200 && status < 300)) return;
-  if (absent(JSON.stringify(body))) return;
-  throw new Error(`Deleting Preview ${name} returned HTTP ${status}: ${JSON.stringify(body)}`);
+  if (!ok(status) && status !== 404)
+    throw new Error(`Deleting Preview ${name} returned HTTP ${status}: ${JSON.stringify(body)}`);
+  if (await find())
+    throw new Error(
+      `Preview ${name} (${preview.id}) is still listed after its delete returned HTTP ${status}: ${JSON.stringify(body)}`,
+    );
 }
 
 /** Delete the data resources a create made (all of them, whether or not they exist). */

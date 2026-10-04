@@ -9,6 +9,7 @@ import {
   accessLink,
   bounded,
   create,
+  deletePreview,
   installGm,
   hide,
   jobFrom,
@@ -20,6 +21,8 @@ import {
   type Cloudflare,
 } from "./preview.ts";
 
+const WORKER_ID = "826276d4ee384ccd9e1f6635ab45011a";
+
 /** A Cloudflare account in memory: D1s, buckets, namespaces and Previews. */
 function fakeCloudflare(state: {
   databases?: { uuid: string; name: string }[];
@@ -30,7 +33,9 @@ function fakeCloudflare(state: {
   const databases = state.databases ?? [];
   const buckets = state.buckets ?? {};
   const namespaces = state.namespaces ?? {};
-  const previews = new Set(state.previews ?? []);
+  const previews = new Map(
+    (state.previews ?? []).map((name, i) => [name, { id: `pv${i + 1}`, name, slug: name }]),
+  );
   const calls: string[] = [];
   let next = 0;
   const flag = (args: string[], name: string) => args[args.indexOf(name) + 1]!;
@@ -94,7 +99,7 @@ function fakeCloudflare(state: {
       }
       if (command.startsWith("previews deploy")) {
         assert.ok(env, "previews deploy gets the preview's resources");
-        previews.add(args[2]!);
+        previews.set(args[2]!, { id: `pv${++next}`, name: args[2]!, slug: args[2]! });
         calls.push(`env ${JSON.stringify(env)}`);
         return `${JSON.stringify(
           {
@@ -112,10 +117,43 @@ function fakeCloudflare(state: {
     },
     async api(method, path) {
       calls.push(`${method} ${path}`);
-      const name = decodeURIComponent(path.split("/").pop()!);
-      if (!previews.delete(name))
-        return { status: 404, body: { errors: [{ code: 10025, message: "Preview not found" }] } };
-      return { status: 200, body: { success: true } };
+      const base = "/accounts/acct/workers/workers/";
+      if (method === "GET" && path === `${base}gitmatrix`)
+        return {
+          status: 200,
+          body: { success: true, result: { id: WORKER_ID, name: "gitmatrix" } },
+        };
+      const listing =
+        /^GET \/accounts\/acct\/workers\/workers\/(\w+)\/previews\?per_page=(\d+)&page=(\d+)$/.exec(
+          `${method} ${path}`,
+        );
+      if (listing) {
+        assert.equal(listing[1], WORKER_ID, "Previews are listed by Worker id");
+        // Pages of two, whatever was asked, so tests cover paging.
+        const all = [...previews.values()];
+        const page = Number(listing[3]);
+        return {
+          status: 200,
+          body: {
+            success: true,
+            result: all.slice((page - 1) * 2, page * 2),
+            result_info: { page, per_page: 2, total_count: all.length },
+          },
+        };
+      }
+      const deleting = /^DELETE \/accounts\/acct\/workers\/workers\/(\w+)\/previews\/([^/]+)$/.exec(
+        `${method} ${path}`,
+      );
+      if (deleting && deleting[1] === WORKER_ID) {
+        // This fake addresses Previews by id only, so a delete by name would 404.
+        const id = decodeURIComponent(deleting[2]!);
+        const found = [...previews.entries()].find(([, preview]) => preview.id === id);
+        if (!found)
+          return { status: 404, body: { errors: [{ code: 10025, message: "Preview not found" }] } };
+        previews.delete(found[0]);
+        return { status: 200, body: { success: true } };
+      }
+      throw new Error(`unexpected API ${method} ${path}`);
     },
   };
   return { cloudflare, calls, databases, buckets, namespaces, previews };
@@ -175,11 +213,15 @@ await test("create tears down, provisions fresh data, deploys in preview mode, s
     { slug: "faster-search", account: "acct", env: {} },
   );
   assert.equal(url, "https://timeline-faster-search-gitmatrix.example.workers.dev");
-  // The old Preview went first, then the old data; the other timeline's survived.
-  assert.equal(
-    fake.calls[0],
-    "DELETE /accounts/acct/workers/workers/gitmatrix/previews/timeline-faster-search",
-  );
+  // The old Preview went first (found by name, deleted by id), then the old
+  // data; the other timeline's survived.
+  assert.deepEqual(fake.calls.slice(0, 4), [
+    "GET /accounts/acct/workers/workers/gitmatrix",
+    `GET /accounts/acct/workers/workers/${WORKER_ID}/previews?per_page=100&page=1`,
+    `DELETE /accounts/acct/workers/workers/${WORKER_ID}/previews/pv1`,
+    `GET /accounts/acct/workers/workers/${WORKER_ID}/previews?per_page=100&page=1`,
+  ]);
+  assert.deepEqual([...fake.previews.keys()], ["timeline-faster-search"]);
   assert.deepEqual(
     fake.databases.map((d) => d.uuid),
     ["other", "db-1", "db-2"],
@@ -246,6 +288,88 @@ await test("teardown fails on errors other than absence", async () => {
     api: async () => ({ status: 403, body: { errors: [{ code: 10000 }] } }),
   };
   await assert.rejects(teardown(forbidden, "acct", "faster-search"), /HTTP 403/);
+});
+
+await test("teardown finds the Preview by name among the Worker's and deletes it by id", async () => {
+  const fake = fakeCloudflare({
+    // Three pages of two: this timeline's Preview is on the last.
+    previews: [
+      "timeline-a",
+      "timeline-b",
+      "timeline-faster-search-2",
+      "timeline-c",
+      "timeline-faster-search",
+    ],
+  });
+  await deletePreview(fake.cloudflare, "acct", "timeline-faster-search");
+  assert.deepEqual(
+    [...fake.previews.keys()],
+    ["timeline-a", "timeline-b", "timeline-faster-search-2", "timeline-c"],
+  );
+  assert.deepEqual(
+    fake.calls.filter((call) => call.startsWith("DELETE")),
+    [`DELETE /accounts/acct/workers/workers/${WORKER_ID}/previews/pv5`],
+  );
+  assert.ok(
+    fake.calls.includes(
+      `GET /accounts/acct/workers/workers/${WORKER_ID}/previews?per_page=100&page=3`,
+    ),
+  );
+});
+
+await test("a Preview the list doesn't show is already deleted; no Worker means no Previews", async () => {
+  const fake = fakeCloudflare({ previews: ["timeline-other"] });
+  await deletePreview(fake.cloudflare, "acct", "timeline-faster-search");
+  assert.equal(fake.calls.filter((call) => call.startsWith("DELETE")).length, 0);
+  assert.deepEqual([...fake.previews.keys()], ["timeline-other"]);
+  const noWorker: Cloudflare = {
+    ...fake.cloudflare,
+    api: async () => ({
+      status: 404,
+      body: { errors: [{ code: 10007, message: "Worker not found" }] },
+    }),
+  };
+  await deletePreview(noWorker, "acct", "timeline-faster-search");
+});
+
+await test("a delete that 404s or fails while the Preview is still listed is an error", async () => {
+  const listed = fakeCloudflare({ previews: ["timeline-faster-search"] });
+  // The delete 404s, yet the Preview is still listed: never treated as done.
+  const misaddressed: Cloudflare = {
+    ...listed.cloudflare,
+    api: async (method, path) =>
+      method === "DELETE"
+        ? { status: 404, body: { errors: [{ code: 10025, message: "Preview not found" }] } }
+        : listed.cloudflare.api(method, path),
+  };
+  await assert.rejects(
+    deletePreview(misaddressed, "acct", "timeline-faster-search"),
+    /still listed after its delete returned HTTP 404/,
+  );
+  // A 404 that a fresh list agrees with (a concurrent teardown won) is done.
+  const raced: Cloudflare = {
+    ...listed.cloudflare,
+    api: async (method, path) => {
+      if (method !== "DELETE") return listed.cloudflare.api(method, path);
+      listed.previews.clear();
+      return { status: 404, body: { errors: [{ code: 10025, message: "Preview not found" }] } };
+    },
+  };
+  await deletePreview(raced, "acct", "timeline-faster-search");
+  const failing = fakeCloudflare({ previews: ["timeline-faster-search"] });
+  const serverError: Cloudflare = {
+    ...failing.cloudflare,
+    api: async (method, path) =>
+      method === "DELETE"
+        ? { status: 500, body: { errors: [{ code: 10013, message: "internal" }] } }
+        : failing.cloudflare.api(method, path),
+  };
+  await assert.rejects(
+    deletePreview(serverError, "acct", "timeline-faster-search"),
+    /Deleting Preview timeline-faster-search returned HTTP 500/,
+  );
+  // A failed Preview delete still leaves the data to a later teardown, and says why.
+  await assert.rejects(teardown(serverError, "acct", "faster-search"), /HTTP 500/);
 });
 
 await test("previewUrl reads cf's result", () => {
