@@ -68,10 +68,13 @@ import {
   formatLabel,
   installCommand,
   packageApi,
+  packagePath,
   packagesPath,
   plural,
 } from "../../lib/packages.ts";
-import { repoPath, treeUrl } from "../../lib/refs.ts";
+import { useRememberPlace } from "../../lib/recentPlaces.ts";
+import { commitPanelUrl } from "../../lib/commitPanel.ts";
+import { repoPath } from "../../lib/refs.ts";
 import { load } from "../../lib/api.ts";
 import type { FormatId } from "@gitmatrix/formats/info";
 import { PackageVersionContents, versionContentsSearch } from "./PackageVersionContents.tsx";
@@ -664,9 +667,9 @@ function VersionRow({
       <span role="cell" className={CELLS.commit}>
         {row.commit && repoOwner && repoName && (
           <Link
-            to={treeUrl(repoOwner, repoName, row.commit)}
+            to={commitPanelUrl(repoOwner, repoName, row.commit)}
             className="mk-chip mk-chip--tag mk-mono no-underline"
-            title={`Browse ${row.repo} at ${row.commit}`}
+            title={`Open commit ${shortOid(row.commit)} in ${row.repo}`}
           >
             <GitCommitIcon aria-hidden />
             {shortOid(row.commit)}
@@ -1190,6 +1193,12 @@ export function PackageConsole() {
   const [busy, setBusy] = useState(false);
   const anchor = useRef<string | null>(null);
   const pkg = detail.package;
+  useRememberPlace({
+    kind: "package",
+    title: pkg.name,
+    detail: `${formatLabel(pkg.format)} · ${detail.owner.slug}`,
+    to: packagePath(detail.owner.slug, pkg.format, pkg.name),
+  });
   const selectable = detail.actions.length > 0;
   // A query that doesn't parse keeps the last results on screen, dimmed.
   const lastPage = useRef(page);

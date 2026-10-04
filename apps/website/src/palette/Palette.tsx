@@ -14,9 +14,12 @@ import {
   FileCodeIcon,
   FolderSimpleIcon,
   GitBranchIcon,
+  GitCommitIcon,
+  GitForkIcon,
   LightningIcon,
   MagnifyingGlassIcon,
   PackageIcon,
+  PlayCircleIcon,
   PlusCircleIcon,
   TreeStructureIcon,
   UserCircleIcon,
@@ -37,18 +40,32 @@ import { useLocation, useNavigate, useRouteLoaderData } from "react-router";
 import type { RepoDetail } from "../../shared/api.ts";
 import {
   SEARCH_LIMITS,
+  MATCH_RANK,
+  matchFields,
   type SearchCategory,
   type SearchResponse,
   type SearchResult,
 } from "../../shared/search.ts";
+import type { TimelineList } from "../../shared/timelines.ts";
 import type { TrackerList } from "../../shared/tracker.ts";
 import { useAssistant } from "../assistant/state.tsx";
 import { dialogMotion, fadeMotion, Tip } from "../components/ui.tsx";
 import { api } from "../lib/api.ts";
+import { readRecent, type PlaceKind, type RecentPlace } from "../lib/recentPlaces.ts";
+import {
+  parseRef,
+  resolveJump,
+  timelineJump,
+  type Jump,
+  type JumpContext,
+  type ParsedRef,
+} from "../lib/resolveRefs.ts";
 import { useViewer } from "../lib/session.ts";
+import { refContextFromPath } from "../refs/context.ts";
 import {
   COMMAND_SOURCES,
   destinations,
+  contextTracker,
   matchCommands,
   type Command,
   type CommandGroup,
@@ -64,7 +81,7 @@ import {
   type KnowledgeState,
   type ScopedRepo,
 } from "./knowledge.ts";
-import { remoteSearch, type RemoteState } from "./remote.ts";
+import { DEBOUNCE_MS, remoteSearch, type RemoteState } from "./remote.ts";
 import { edge, FRESH, move, reconcile, type Selection } from "./selection.ts";
 
 /**
@@ -357,6 +374,57 @@ function scopeIcon(scope: PaletteScope) {
   return <FileCodeIcon className={className} aria-hidden />;
 }
 
+/** One icon per kind of place, for jumps and recent places alike. */
+const PLACE_ICON: Record<PlaceKind, ReactNode> = {
+  repo: <GitBranchIcon className={iconClass} aria-hidden />,
+  issue: <CircleDashedIcon className={iconClass} aria-hidden />,
+  run: <PlayCircleIcon className={iconClass} aria-hidden />,
+  package: <PackageIcon className={iconClass} aria-hidden />,
+  timeline: <GitForkIcon className={iconClass} aria-hidden />,
+  commit: <GitCommitIcon className={iconClass} aria-hidden />,
+};
+
+const PLACE_LABEL: Record<PlaceKind, string> = {
+  repo: "Repository",
+  issue: "Issue",
+  run: "CI run",
+  package: "Package",
+  timeline: "Timeline",
+  commit: "Commit",
+};
+
+function jumpOption(jump: Jump): Option {
+  return {
+    id: jump.id,
+    title: jump.title,
+    detail: jump.detail,
+    icon: PLACE_ICON[jump.kind],
+    activate: (env) => env.navigate(jump.to, jump.state),
+  };
+}
+
+function recentOption(place: RecentPlace): Option {
+  return {
+    id: `recent:${place.to}`,
+    title: place.title,
+    detail: place.detail || PLACE_LABEL[place.kind],
+    icon: PLACE_ICON[place.kind],
+    activate: (env) => env.navigate(place.to),
+  };
+}
+
+/**
+ * What typed text jumps to, if anything: a reference (CORE-22), or in a
+ * repository a bare run number, or a timeline's exact slug.
+ */
+function jumpRef(typed: string, inRepo: boolean, timelines: { slug: string }[]): ParsedRef | null {
+  const ref = parseRef(typed);
+  if (ref) return ref;
+  if (inRepo && /^\d{1,6}$/.test(typed)) return { kind: "run", number: Number(typed) };
+  const slug = typed.toLowerCase();
+  return timelines.some((timeline) => timeline.slug === slug) ? { kind: "timeline", slug } : null;
+}
+
 /** What screen readers hear after each change: counts, then what's still loading or failed. */
 function announce(count: number, query: string, remote: RemoteState): string {
   const parts = [query ? `${count} result${count === 1 ? "" : "s"}` : ""];
@@ -397,7 +465,8 @@ function Palette({
   onOpenChange: (open: boolean) => void;
 }) {
   const viewer = useViewer();
-  const { pathname } = useLocation();
+  const location = useLocation();
+  const { pathname } = location;
   const repo = (useRouteLoaderData("repo") as RepoDetail | undefined) ?? null;
   const navigate = useNavigate();
   const assistant = useAssistant();
@@ -484,6 +553,91 @@ function Palette({
     defaultTrackerId: trackers?.defaultOwnerId ?? null,
     query,
   };
+  // Read on the render that opens it, so a previous opening's list never shows.
+  const viewerId = viewer?.id ?? null;
+  const recents = useMemo<RecentPlace[]>(
+    () => (open ? readRecent(viewerId) : []),
+    [open, viewerId],
+  );
+
+  // The timelines of the tracker in view (else the one /tracker opens), once per opening.
+  const timelineOwner =
+    contextTracker(context)?.slug ??
+    trackers?.trackers.find((tracker) => tracker.id === trackers.defaultOwnerId)?.slug ??
+    null;
+  const [timelines, setTimelines] = useState<JumpContext["timelines"]>([]);
+  useEffect(() => {
+    setTimelines([]);
+    if (!open || !viewer || !timelineOwner) return;
+    const controller = new AbortController();
+    api<TimelineList>(`/tracker/${encodeURIComponent(timelineOwner)}/timelines`, {
+      signal: controller.signal,
+    }).then(
+      (list) =>
+        setTimelines(
+          list.timelines.map((t) => ({ slug: t.slug, name: t.name, owner: timelineOwner })),
+        ),
+      () => {},
+    );
+    return () => controller.abort();
+  }, [open, viewer, timelineOwner]);
+
+  // Direct jumps: what a reference names, through the one resolver.
+  const typed = query.trim().replace(/\s+/g, " ");
+  const ref = scope ? null : jumpRef(typed, !!repo, timelines);
+  const refKey = ref ? JSON.stringify(ref) : null;
+  const jumpContext: JumpContext = {
+    here: { pathname, search: location.search, state: location.state as unknown },
+    repo,
+    tracker: contextTracker(context)?.slug ?? repo?.owner.slug ?? null,
+    owner: refContextFromPath(pathname).owner ?? null,
+    recentRepos: recents
+      .filter((place) => place.kind === "repo")
+      .map((place) => {
+        const [owner = "", name = ""] = place.title.split("/");
+        return { owner, name };
+      }),
+    timelines,
+  };
+  const jumpContextRef = useRef(jumpContext);
+  jumpContextRef.current = jumpContext;
+  const [jumpState, setJumpState] = useState<{
+    key: string;
+    status: "loading" | "done" | "failed";
+    jumps: Jump[];
+    error?: string;
+  } | null>(null);
+  const contextKey = `${pathname}${location.search}|${repo?.id ?? ""}|${timelines.length}|${recents.length}`;
+  useEffect(() => {
+    if (!open || !refKey) return;
+    const parsed = JSON.parse(refKey) as ParsedRef;
+    // Issues and packages are found through search, which is for signed-in viewers.
+    if (!viewer && (parsed.kind === "issue" || parsed.kind === "package")) return;
+    const controller = new AbortController();
+    setJumpState({ key: refKey, status: "loading", jumps: [] });
+    const timer = setTimeout(() => {
+      resolveJump(parsed, jumpContextRef.current, controller.signal).then(
+        (jumps) => {
+          if (!controller.signal.aborted) setJumpState({ key: refKey, status: "done", jumps });
+        },
+        (error: unknown) => {
+          if (controller.signal.aborted) return;
+          setJumpState({
+            key: refKey,
+            status: "failed",
+            jumps: [],
+            error: error instanceof Error ? error.message : "Couldn't look that up.",
+          });
+        },
+      );
+    }, DEBOUNCE_MS);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [open, refKey, viewer, contextKey]);
+  const jumping = jumpState && jumpState.key === refKey ? jumpState : null;
+
   const going = scope?.kind === "go";
   const commands = going
     ? destinations(context)
@@ -497,6 +651,18 @@ function Palette({
   );
   const blank = !query.trim();
   const sections: Section[] = [];
+  if (jumping?.jumps.length)
+    sections.push({ key: "jumps", label: "Jump to", options: jumping.jumps.map(jumpOption) });
+  // Before anything is typed: where the viewer has been, newest first,
+  // right under Go to… (which stays first and selected).
+  const here = `${pathname}${location.search}`;
+  const recentShown = !scope && !typed ? recents.filter((place) => place.to !== here) : [];
+  let recentsShown = false;
+  const pushRecents = () => {
+    if (recentsShown || !recentShown.length) return;
+    recentsShown = true;
+    sections.push({ key: "recent", label: "Recent", options: recentShown.map(recentOption) });
+  };
   // Commands that act on the query itself ("Create issue “…”") are fallbacks:
   // listed last and never selected by default, so Enter on a search opens a
   // result rather than a form.
@@ -517,9 +683,32 @@ function Palette({
         label: groupLabel(group, context, scope, blank),
         options: matched.map(({ command }) => commandOption(command)),
       });
+    if (group === order[0]) pushRecents();
   }
+  pushRecents();
+  // Timelines in view, matched here: the list is already loaded.
+  if (typed && !scope) {
+    const jumped = new Set(jumping?.jumps.map((jump) => jump.id));
+    const matched = timelines
+      .map((timeline) => ({
+        timeline,
+        match: matchFields(typed, {
+          identifiers: [timeline.slug, `timeline/${timeline.slug}`, timeline.name],
+          names: [timeline.name, timeline.slug],
+          searched: [],
+        }),
+      }))
+      .filter((m) => m.match !== null)
+      .sort((a, b) => MATCH_RANK[a.match!] - MATCH_RANK[b.match!])
+      .map((m) => timelineJump(m.timeline))
+      .filter((jump) => !jumped.has(jump.id))
+      .slice(0, 5);
+    if (matched.length)
+      sections.push({ key: "timelines", label: "Timelines", options: matched.map(jumpOption) });
+  }
+
   // Remote groups only ever show the answer to the current query.
-  const normalized = query.trim().replace(/\s+/g, " ");
+  const normalized = typed;
   const current = remote.status === "done" && remote.query === normalized;
   if (current)
     for (const group of remote.response.groups)
@@ -658,7 +847,10 @@ function Palette({
 
   const text = scopeText(scope, !!viewer);
   // A finished answer to an older query is still waiting on the newer one.
-  const loading = remote.status === "loading" || (remote.status === "done" && !current);
+  const loading =
+    remote.status === "loading" ||
+    (remote.status === "done" && !current) ||
+    jumping?.status === "loading";
   const unavailable =
     current && remote.status === "done"
       ? remote.response.groups.flatMap((group) => (group.status === "unavailable" ? [group] : []))
@@ -800,6 +992,11 @@ function Palette({
                 </p>
               )}
               {loading && <p className="m-0 px-2.5 py-2 text-body-sm text-ink-faint">Searching…</p>}
+              {jumping?.status === "failed" && (
+                <p className="m-0 px-2.5 py-2 text-body-sm text-danger-text">
+                  Couldn't look up “{typed}”: {jumping.error}
+                </p>
+              )}
               {remote.status === "failed" && remote.query === normalized && (
                 <p className="m-0 px-2.5 py-2 text-body-sm text-danger-text">
                   Search failed: {remote.error}

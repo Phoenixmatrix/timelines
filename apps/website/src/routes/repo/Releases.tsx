@@ -14,6 +14,7 @@ import {
   type ReleaseNotesIndex,
   type ReleaseNotesRelease,
 } from "../../../shared/release-notes.ts";
+import { CommitLink } from "../../components/CommitLink.tsx";
 import { RailSection, railClass } from "../../components/Rail.tsx";
 import {
   RELEASE_NOTE_DETAILS_ID,
@@ -22,7 +23,7 @@ import {
 import { LinkedText } from "../../refs/RefLink.tsx";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { shortOid, timeAgo } from "../../lib/format.ts";
-import { commitsUrl, repoPath } from "../../lib/refs.ts";
+import { repoPath } from "../../lib/refs.ts";
 import { scopeOf } from "../../lib/timelineScope.ts";
 import { useRepo } from "./RepoLayout.tsx";
 import { useEffect, useState } from "react";
@@ -320,9 +321,14 @@ export function Releases() {
           {release.release.kind === "tag" && (
             <RailSection title="Range">
               <p className="m-0 text-body-sm text-ink-muted">
-                <Link className="mk-mono" to={commitsUrl(owner, repo.name, release.release.toOid)}>
+                <CommitLink
+                  className="mk-mono"
+                  owner={owner}
+                  name={repo.name}
+                  sha={release.release.toOid}
+                >
                   {shortOid(release.release.toOid)}
-                </Link>
+                </CommitLink>
                 {release.release.fromOid ? (
                   <>
                     {" "}

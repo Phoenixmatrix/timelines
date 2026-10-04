@@ -3,6 +3,7 @@
 
 import { redirect, type RouteObject } from "react-router";
 import { AppShell } from "./components/AppShell.tsx";
+import { keepPageUnderPanel } from "./lib/commitPanel.ts";
 import { rootLoader } from "./lib/session.ts";
 import { scopeOf, timelineScopeMiddleware } from "./lib/timelineScope.ts";
 import { Account, accountLoader } from "./routes/Account.tsx";
@@ -202,42 +203,45 @@ export const routes: RouteObject[] = [
             loader: repoLoader,
             shouldRevalidate: repoShouldRevalidate,
             Component: RepoLayout,
-            children: [
-              { index: true, loader: codeLoader, Component: Code },
-              { path: "tree/*", loader: codeLoader, Component: Code },
-              { path: "blob/*", loader: blobLoader, Component: Blob },
-              { path: "commits/*", loader: commitsLoader, Component: Commits },
-              { path: "changes", Component: SemanticChanges },
-              { path: "wiki/*", loader: wikiLoader, Component: Wiki },
-              { path: "releases/*", loader: releasesLoader, Component: Releases },
-              // Knowledge is the Semantic Code Atlas (CORE-174): bounded regions, never the whole graph.
-              {
-                path: "knowledge",
-                loader: atlasLoader,
-                shouldRevalidate: atlasShouldRevalidate,
-                Component: Atlas,
-              },
-              // Links from before the cutover keep their view.
-              {
-                path: "atlas",
-                loader: ({ request }) => {
-                  const url = new URL(request.url);
-                  return redirect(
-                    `${url.pathname.replace(/\/atlas\/?$/, "/knowledge")}${url.search}`,
-                  );
+            // ?commit= opens the commit panel over any of these (CORE-22) without reloading it.
+            children: (
+              [
+                { index: true, loader: codeLoader, Component: Code },
+                { path: "tree/*", loader: codeLoader, Component: Code },
+                { path: "blob/*", loader: blobLoader, Component: Blob },
+                { path: "commits/*", loader: commitsLoader, Component: Commits },
+                { path: "changes", Component: SemanticChanges },
+                { path: "wiki/*", loader: wikiLoader, Component: Wiki },
+                { path: "releases/*", loader: releasesLoader, Component: Releases },
+                // Knowledge is the Semantic Code Atlas (CORE-174): bounded regions, never the whole graph.
+                {
+                  path: "knowledge",
+                  loader: atlasLoader,
+                  shouldRevalidate: atlasShouldRevalidate,
+                  Component: Atlas,
                 },
-              },
-              { path: "tracker", loader: repoTrackerLoader, Component: RepoTracker },
-              { path: "ci", loader: ciLoader, action: ciAction, Component: CiRuns },
-              { path: "ci/:number", loader: ciRunLoader, Component: CiRun },
-              { path: "packages", loader: repoPackagesLoader, Component: RepoPackages },
-              {
-                path: "settings",
-                loader: settingsLoader,
-                action: settingsAction,
-                Component: Settings,
-              },
-            ],
+                // Links from before the cutover keep their view.
+                {
+                  path: "atlas",
+                  loader: ({ request }) => {
+                    const url = new URL(request.url);
+                    return redirect(
+                      `${url.pathname.replace(/\/atlas\/?$/, "/knowledge")}${url.search}`,
+                    );
+                  },
+                },
+                { path: "tracker", loader: repoTrackerLoader, Component: RepoTracker },
+                { path: "ci", loader: ciLoader, action: ciAction, Component: CiRuns },
+                { path: "ci/:number", loader: ciRunLoader, Component: CiRun },
+                { path: "packages", loader: repoPackagesLoader, Component: RepoPackages },
+                {
+                  path: "settings",
+                  loader: settingsLoader,
+                  action: settingsAction,
+                  Component: Settings,
+                },
+              ] satisfies RouteObject[]
+            ).map(keepPageUnderPanel),
           },
         ],
       },

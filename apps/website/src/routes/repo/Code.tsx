@@ -13,6 +13,7 @@ import { CopyField, link } from "../../components/ui.tsx";
 import { coAuthors } from "../../lib/commitAttribution.ts";
 import { firstLine, fullDate, timeAgo } from "../../lib/format.ts";
 import { blobUrl, commitsUrl, treeUrl } from "../../lib/refs.ts";
+import { CommitLink } from "../../components/CommitLink.tsx";
 import { repoData, routeData } from "../../lib/repoData.ts";
 import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
@@ -143,13 +144,15 @@ function EntryRow({
           <LinkedText
             text={subject}
             plain={(text) => (
-              <Link
-                to={treeUrl(repo.owner.slug, repo.name, change.latest.oid)}
+              <CommitLink
+                owner={repo.owner.slug}
+                name={repo.name}
+                sha={change.latest.oid}
                 className="text-ink-muted no-underline hover:text-ink hover:underline"
                 title={`${subject} · ${change.latest.authorName}`}
               >
                 {text}
-              </Link>
+              </CommitLink>
             )}
           />
         ) : (

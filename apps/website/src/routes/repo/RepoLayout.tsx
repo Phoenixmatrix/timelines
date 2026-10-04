@@ -18,7 +18,9 @@ import { CopyField, RoleChip, VisibilityChip, link, popMotion } from "../../comp
 import { forgetRepoData, repoData, routeData } from "../../lib/repoData.ts";
 import { repoPath } from "../../lib/refs.ts";
 import { repoSections } from "../../lib/repoSections.ts";
+import { useRememberPlace } from "../../lib/recentPlaces.ts";
 import { useViewer } from "../../lib/session.ts";
+import { CommitPanel } from "./CommitPanel.tsx";
 
 export async function repoLoader({ params }: LoaderFunctionArgs) {
   return routeData(repoData.detail(params.owner ?? "", params.repo ?? ""));
@@ -118,6 +120,12 @@ export function RepoLayout() {
   const repo = useLoaderData<typeof repoLoader>();
   const revalidator = useRevalidator();
   const base = repoPath(repo.owner.slug, repo.name);
+  useRememberPlace({
+    kind: "repo",
+    title: `${repo.owner.slug}/${repo.name}`,
+    detail: repo.description,
+    to: base,
+  });
   // Every repository tab uses the same full-width column, so the header and
   // tabs never shift; pages that read better narrow constrain their own content.
   return (
@@ -189,6 +197,8 @@ export function RepoLayout() {
           </div>
         </>
       )}
+      {/* Any repository page with ?commit=<sha> opens the commit over it (CORE-22). */}
+      <CommitPanel repo={repo} />
     </Page>
   );
 }

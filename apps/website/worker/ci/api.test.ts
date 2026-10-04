@@ -74,6 +74,15 @@ describe("CI runs list", () => {
     const full = await get("/api/repos/ann/app/ci?ref=refs/heads/timeline/fast-search&before=4");
     expect(full.json.runs.map((run) => run.number)).toEqual([2]);
   });
+
+  test("?commit= lists one commit's runs, for the commit panel; a short hash is refused", async () => {
+    const get = await setup();
+    get.sqlite.exec(`INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status)
+      VALUES ('run7', 'repo', 7, '${oid(3)}', 'topic', 'manual', 'failed')`);
+    const runs = await get(`/api/repos/ann/app/ci?commit=${oid(3).toUpperCase()}`);
+    expect(runs.json.runs.map((run) => run.number)).toEqual([7, 3]);
+    expect((await get(`/api/repos/ann/app/ci?commit=${oid(3).slice(0, 7)}`)).status).toBe(400);
+  });
 });
 
 describe("after retention (CORE-200)", () => {

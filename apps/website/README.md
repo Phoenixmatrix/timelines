@@ -119,6 +119,28 @@ Pass a timeout to `expect.element(locator, { timeout })`, not the matcher.
 Locator text with an apostrophe is safer as a RegExp. Restore what a test
 changes in the page (viewport, theme, emulated media) in a `finally`.
 
+## Commit panel
+
+There is no commit page (CORE-22): any repository page with `?commit=<sha>`
+opens the commit as a side panel over it (`src/routes/repo/CommitPanel.tsx`,
+mounted in the repository layout), and `/<owner>/<repo>?commit=<sha>` opens
+it over the Code page from anywhere else. A short hash is resolved first.
+Closing it (Escape, ×) returns to the page: Back, when a link on the page
+opened it (parents opened from the panel are Back steps too); otherwise it
+drops the parameter. The page under it never reloads for the parameter
+(`keepPageUnderPanel` in `src/lib/commitPanel.ts`). Use `CommitLink` (or
+`commitPanelUrl` off repository pages) for SHA links.
+
+It reads, each independently, so one failing source doesn't hide the others:
+the commit and its changed files with stats (`/commits/:oid/diff`; the log
+for one too large to diff), CI runs (`/ci?commit=`), packages published
+(`/api/packages/-/published?commit=`), deployments (`/deployments?commit=`),
+who made it (the step's author, `/steps?commits=`), and the why chain
+(`/why?commit=`: change id, refs reached and who pushed, timelines, landing).
+Issue keys in the message link only when the resolver confirms an issue the
+viewer can open; others stay text. People link to their profiles; agents are
+named as text. "Browse files at this commit" opens the tree.
+
 ## File history
 
 The repository file list shows each entry's most recent change, author,
@@ -549,9 +571,25 @@ still reaches every place directly. Signed out, the few places are listed as
 they are. Each second step (Go to, Find, code and wiki) shows above the input;
 × or Backspace on an empty query goes back.
 
+- **Jump to** (CORE-22): a reference goes straight to its place, first and
+  selected: an issue key (`CORE-22`), a commit hash (7–40 hex: the commit
+  panel, over the page in its repository; outside one, in the repositories
+  visited recently), `#12` or `run 12` (a bare number in a repository) for
+  that CI run, `pkg@1.2.0` for that version in its package's console, and a
+  timeline's slug (or `timeline/<slug>`). `src/lib/resolveRefs.ts` is the one
+  place references resolve: issue keys, hashes (in this repository, or each
+  recently visited one) and packages (the page owner's) through
+  `POST /api/refs/resolve`, runs through the CI API, timelines from the
+  tracker's list;
+- **Recent**: with nothing typed, right under **Go to…** (which stays
+  selected), the last eight distinct places you opened (repositories, issues,
+  CI runs, packages, timelines, commits), newest first, kept per viewer in this browser's `localStorage`
+  (`src/lib/recentPlaces.ts`; nothing when storage is unavailable);
+- **Timelines**: the tracker in view's timelines, matched by name and slug;
 - **Or**: fallbacks that act on what you typed, such as **Create issue “…”**,
   which proposes the text as a title in the current tracker (else the one
-  `/tracker` opens, else your own; the hint names it). Fallbacks come last and
+  `/tracker` opens, else your own; the hint names it), but never a reference
+  (a hash, an issue key, `#12`, `pkg@1.0`). Fallbacks come last and
   are never selected by default, so Enter on a search opens a result. **Ask
   Gitmatrix “…”** (CORE-96) submits the text to the assistant in a new
   conversation and opens it; it's the only palette action that reaches a model,

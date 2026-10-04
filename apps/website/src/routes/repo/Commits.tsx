@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
 import type { CiCommitStatuses, HistoryPage, RepoDetail } from "../../../shared/api.ts";
 import { CiStatusIcon, ciLabel } from "../../components/CiStatus.tsx";
+import { CommitLink } from "../../components/CommitLink.tsx";
 import { DeploymentMark, useCommitDeployments } from "../../components/Deployments.tsx";
 import { Monogram } from "../../components/Monogram.tsx";
 import { repoData, routeData } from "../../lib/repoData.ts";
@@ -9,7 +10,7 @@ import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { shortOid } from "../../lib/format.ts";
 import { api } from "../../lib/api.ts";
-import { commitsUrl, repoPath, treeUrl } from "../../lib/refs.ts";
+import { commitsUrl, repoPath } from "../../lib/refs.ts";
 import { CommitInfo, HistoryProgress, countLabel, useHistory } from "./History.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
@@ -99,13 +100,15 @@ function History({ repo, initial }: { repo: RepoDetail; initial: HistoryPage }) 
               </PrefetchLink>
             )}
             {deployed[commit.oid] && <DeploymentMark deployment={deployed[commit.oid]!} />}
-            <PrefetchLink
-              to={treeUrl(repo.owner.slug, repo.name, commit.oid)}
+            <CommitLink
+              owner={repo.owner.slug}
+              name={repo.name}
+              sha={commit.oid}
               className="mk-chip mk-chip--tag mk-mono hidden h-6 no-underline sm:inline-flex"
-              title="Browse files at this commit"
+              title={`Open commit ${shortOid(commit.oid)}`}
             >
               {shortOid(commit.oid)}
-            </PrefetchLink>
+            </CommitLink>
           </li>
         ))}
       </ol>

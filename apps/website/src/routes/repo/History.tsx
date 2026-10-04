@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import type { CommitSummary, HistoryPage, RepoDetail, TreeEntry } from "../../../shared/api.ts";
+import { CommitLink } from "../../components/CommitLink.tsx";
 import { coAuthors } from "../../lib/commitAttribution.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
-import { commitsUrl, treeUrl } from "../../lib/refs.ts";
+import { commitsUrl } from "../../lib/refs.ts";
 import { repoData } from "../../lib/repoData.ts";
 import { LinkedText } from "../../refs/RefLink.tsx";
 
@@ -111,17 +112,19 @@ export function Attribution({ commit }: { commit: CommitSummary }) {
 export function CommitInfo({ commit, repo }: { commit: CommitSummary; repo: RepoDetail }) {
   return (
     <div className="min-w-0 flex-1">
-      {/* Refs in the title link to what they name; the rest opens the commit (CORE-22). */}
+      {/* Refs in the title link to what they name; the rest opens the commit panel (CORE-22). */}
       <span className="block truncate font-semibold" title={firstLine(commit.message)}>
         <LinkedText
           text={firstLine(commit.message)}
           plain={(text) => (
-            <Link
+            <CommitLink
               className="text-ink no-underline hover:underline"
-              to={treeUrl(repo.owner.slug, repo.name, commit.oid)}
+              owner={repo.owner.slug}
+              name={repo.name}
+              sha={commit.oid}
             >
               {text}
-            </Link>
+            </CommitLink>
           )}
         />
       </span>

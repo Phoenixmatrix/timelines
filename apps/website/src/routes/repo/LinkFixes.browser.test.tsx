@@ -255,7 +255,7 @@ test("release-note commits link under the entry's own repository", async () => {
   await page.getByRole("button", { name: /Show release note details for Faster search/ }).click();
   await expect
     .element(page.getByRole("link", { name: oid }))
-    .toHaveAttribute("href", `/orbit/web/commits/${oid}`);
+    .toHaveAttribute("href", `/orbit/web?commit=${oid}`);
 });
 
 test("wiki Markdown keeps app-absolute links; repository paths still open the code", async () => {

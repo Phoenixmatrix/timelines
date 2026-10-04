@@ -242,6 +242,15 @@ describe("create issue", () => {
       "new issue ann",
     ])
       expect(creates({ query }).map((c) => c.id)).not.toContain("create-titled:ann");
+    // A reference is somewhere to go (the palette jumps to it), never a title (CORE-22).
+    for (const query of [
+      "3f9a2c1",
+      "3f9a2c1d0e4b5a6978877665544332211aabbccd",
+      "CORE-22",
+      "#12",
+      "kit@1.2.0",
+    ])
+      expect(creates({ query }).map((c) => c.id)).not.toContain("create-titled:ann");
     // It's offered for any text, ahead of other actions.
     const matched = matchCommands(commands({ trackers, query: "qqq zzz" }), "qqq zzz");
     expect(matched.get("actions")?.[0]?.command.id).toBe("create-titled:ann");

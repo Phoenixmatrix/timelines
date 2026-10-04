@@ -30,10 +30,12 @@ import { bytes, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { formatLabel, packagePath } from "../../lib/packages.ts";
 import { STATUS_LABEL } from "../packages/PackageConsole.tsx";
 import type { Published } from "../../../shared/packages.ts";
-import { commitsUrl, repoPath, treeUrl } from "../../lib/refs.ts";
+import { commitsUrl, repoPath } from "../../lib/refs.ts";
 import { PersonLink } from "../../components/PersonLink.tsx";
 import { repoData, routeData } from "../../lib/repoData.ts";
 import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
+import { useRememberPlace } from "../../lib/recentPlaces.ts";
+import { CommitLink } from "../../components/CommitLink.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 import type { RefKind } from "../../../shared/refs.ts";
 import { LinkedText } from "../../refs/RefLink.tsx";
@@ -677,6 +679,12 @@ export function CiRun() {
   const canRun = repo.viewerRole === "write" || repo.viewerRole === "admin";
   const active = isActive(run.status);
   usePolling(active);
+  useRememberPlace({
+    kind: "run",
+    title: `#${run.number} ${run.title}`,
+    detail: `CI run in ${repo.owner.slug}/${repo.name}`,
+    to: repoPath(repo.owner.slug, repo.name, "ci", String(run.number)),
+  });
 
   const chosen =
     run.jobs.find((j) => j.name === params.get("job")) ??
@@ -793,13 +801,15 @@ export function CiRun() {
               <GitBranchIcon weight="bold" aria-hidden />
               {run.ref}
             </Link>
-            <PrefetchLink
-              to={treeUrl(repo.owner.slug, repo.name, run.commit)}
+            <CommitLink
+              owner={repo.owner.slug}
+              name={repo.name}
+              sha={run.commit}
               className="mk-chip mk-chip--tag mk-mono h-6 no-underline"
-              title="Browse files at this commit"
+              title={`Open commit ${shortOid(run.commit)}`}
             >
               {shortOid(run.commit)}
-            </PrefetchLink>
+            </CommitLink>
           </div>
         </div>
         {canRun && (active || !run.queueId) && (

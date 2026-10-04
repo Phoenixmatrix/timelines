@@ -19,6 +19,7 @@ import type { TimelineDetail, TimelineRepo } from "../../../shared/timelines.ts"
 import { SelectField, link } from "../../components/ui.tsx";
 import { PersonLink } from "../../components/PersonLink.tsx";
 import { api, ApiError } from "../../lib/api.ts";
+import { commitPanelUrl } from "../../lib/commitPanel.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 
 /** The filters' "no filter" value. */
@@ -463,7 +464,13 @@ function StepDetail({
         <time dateTime={at} title={fullDate(at)}>
           {timeAgo(at)}
         </time>
-        <span className="mk-mono">{shortOid(version)}</span>
+        <Link
+          className={`${link} mk-mono`}
+          to={commitPanelUrl(repo.owner, repo.name, version)}
+          title={`Open commit ${shortOid(version)} in ${repo.owner}/${repo.name}`}
+        >
+          {shortOid(version)}
+        </Link>
         {step?.issue && <span className="mk-chip mk-chip--tag">{step.issue}</span>}
         {step && !step.verified && (
           <span className="mk-chip mk-chip--tag">Not verified by a push</span>

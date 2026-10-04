@@ -132,19 +132,17 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
     const row = repoRow(repo.name);
     await expect
       .element(row.getByRole("link", { name: short(repo.tip), exact: true }))
-      .toHaveAttribute("href", `/orbit/${repo.name}/tree/${repo.tip}`);
+      .toHaveAttribute("href", `/orbit/${repo.name}?commit=${repo.tip}`);
     await expect.element(row).toMatchTextContent(`onto main ${short(repo.main)}`);
     await expect
       .element(row.getByRole("link", { name: short(repo.main), exact: true }))
-      .toHaveAttribute("href", `/orbit/${repo.name}/tree/${repo.main}`);
+      .toHaveAttribute("href", `/orbit/${repo.name}?commit=${repo.main}`);
     await expect
       .element(row.getByRole("link", { name: "Knowledge diff" }))
       .toHaveAttribute("href", `/orbit/${repo.name}/knowledge?timeline=search`);
   }
   const engineChanges = repoRow("engine").getByRole("link", { name: "3 changes" });
-  await expect
-    .element(engineChanges)
-    .toHaveAttribute("href", `/orbit/engine/commits/${engine.tip}`);
+  await expect.element(engineChanges).toHaveAttribute("href", `/orbit/engine?commit=${engine.tip}`);
   await expect.element(engineChanges).toHaveAttribute("title", "wxyzabcd\nlmnopqrs\nkxqrstuv");
   await expect.element(repoRow("web").getByRole("link", { name: "1 change" })).toBeVisible();
   await expect.element(repoRow("docs").getByRole("link", { name: "0 changes" })).toBeVisible();

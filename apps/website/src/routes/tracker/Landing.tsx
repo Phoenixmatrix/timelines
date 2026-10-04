@@ -9,7 +9,8 @@ import type { Landing, LandingRepo, LandResult, Timeline } from "../../../shared
 import { link } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { shortOid } from "../../lib/format.ts";
-import { repoPath, treeUrl } from "../../lib/refs.ts";
+import { repoPath } from "../../lib/refs.ts";
+import { commitPanelUrl } from "../../lib/commitPanel.ts";
 
 const STATE: Record<Landing["state"], string> = {
   merging: "Merging into main",
@@ -128,7 +129,7 @@ export function LandingPanel({
                 </span>
                 <span>{REPO_STATE[repo.state]}</span>
                 {repo.merge && (
-                  <Link className={link} to={treeUrl(repo.owner, repo.name, repo.merge)}>
+                  <Link className={link} to={commitPanelUrl(repo.owner, repo.name, repo.merge)}>
                     merge <span className="mk-mono">{shortOid(repo.merge)}</span>
                   </Link>
                 )}

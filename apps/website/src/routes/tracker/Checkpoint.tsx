@@ -17,7 +17,8 @@ import { CiStatusIcon, ciLabel } from "../../components/CiStatus.tsx";
 import { PageSetSummary, pagesPending, useRefreshWhile } from "../../components/TimelinePages.tsx";
 import { api } from "../../lib/api.ts";
 import { fullDate, shortOid } from "../../lib/format.ts";
-import { commitsUrl, repoPath, treeUrl } from "../../lib/refs.ts";
+import { commitPanelUrl } from "../../lib/commitPanel.ts";
+import { repoPath } from "../../lib/refs.ts";
 import { MarkdownText } from "./ui.tsx";
 
 /** Just the reference, where the checkpoint's details aren't loaded (an issue's requests). */
@@ -198,9 +199,9 @@ export function CheckpointPanel({
                 {repo.owner}/{repo.name}
               </span>
               <Link
-                to={treeUrl(repo.owner, repo.name, repo.commit)}
+                to={commitPanelUrl(repo.owner, repo.name, repo.commit)}
                 className="mk-chip mk-chip--tag mk-mono no-underline"
-                title="Browse files at this commit"
+                title={`Open commit ${shortOid(repo.commit)}`}
               >
                 {shortOid(repo.commit)}
               </Link>
@@ -208,7 +209,7 @@ export function CheckpointPanel({
                 <span className="text-ink-muted">
                   onto main{" "}
                   <Link
-                    to={treeUrl(repo.owner, repo.name, repo.base)}
+                    to={commitPanelUrl(repo.owner, repo.name, repo.base)}
                     className="mk-mono"
                     title="Main when the checkpoint was made"
                   >
@@ -217,7 +218,7 @@ export function CheckpointPanel({
                 </span>
               )}
               <Link
-                to={commitsUrl(repo.owner, repo.name, repo.commit)}
+                to={commitPanelUrl(repo.owner, repo.name, repo.commit)}
                 className="text-ink-muted"
                 title={repo.changes.map((c) => c.changeId).join("\n")}
               >

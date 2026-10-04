@@ -245,7 +245,11 @@ export async function chronicleScenario(t: ChronicleE2E): Promise<void> {
           .filter({ hasText: run.commit.slice(0, 7) })
           .first()
           .click();
-        await page.waitForURL((url) => url.pathname.startsWith(`/${repo}/commits/${run.commit}`));
+        // A commit opens the commit panel over the repository (CORE-22).
+        await page.waitForURL(
+          (url) => url.pathname === `/${repo}` && url.searchParams.get("commit") === run.commit,
+        );
+        await expect(page.getByRole("button", { name: "Close commit" })).toBeVisible();
         await page.goBack();
         await page.waitForURL(spanUrl);
         await linked.locator('[data-linked-work="Release notes"] a').first().click();

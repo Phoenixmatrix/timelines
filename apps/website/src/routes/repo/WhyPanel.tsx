@@ -8,6 +8,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import type { RepoDetail } from "../../../shared/api.ts";
 import type { WhyChain, WhyResponse } from "../../../shared/why.ts";
+import { CommitLink } from "../../components/CommitLink.tsx";
 import { link } from "../../components/ui.tsx";
 import { PersonLink } from "../../components/PersonLink.tsx";
 import { api } from "../../lib/api.ts";
@@ -114,7 +115,7 @@ export function WhyPanel({
                 Couldn't follow the history: {current.error}
               </p>
             ) : (
-              <WhyResult result={current.result!} path={path} />
+              <WhyResult result={current.result!} path={path} onLeave={() => onOpenChange(false)} />
             )}
           </div>
         </Dialog.Popup>
@@ -123,7 +124,16 @@ export function WhyPanel({
   );
 }
 
-function WhyResult({ result, path }: { result: WhyResponse; path: string }) {
+function WhyResult({
+  result,
+  path,
+  onLeave,
+}: {
+  result: WhyResponse;
+  path: string;
+  /** Closes this panel as a link opens the commit panel in its place. */
+  onLeave: () => void;
+}) {
   return (
     <div className="flex flex-col gap-6">
       {!result.tracker.readable && (
@@ -139,7 +149,7 @@ function WhyResult({ result, path }: { result: WhyResponse; path: string }) {
         </p>
       )}
       {result.chains.map((chain) => (
-        <Chain key={chain.oid} chain={chain} result={result} path={path} />
+        <Chain key={chain.oid} chain={chain} result={result} path={path} onLeave={onLeave} />
       ))}
     </div>
   );
@@ -160,7 +170,17 @@ function Step({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; path: string }) {
+function Chain({
+  chain,
+  result,
+  path,
+  onLeave,
+}: {
+  chain: WhyChain;
+  result: WhyResponse;
+  path: string;
+  onLeave: () => void;
+}) {
   const { owner, name, defaultBranch } = result.repo;
   const tracker = result.tracker.owner;
   const timelineUrl = (slug: string) =>
@@ -193,7 +213,17 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
                 <time title={fullDate(commit.authoredAt * 1000)}>
                   {timeAgo(commit.authoredAt * 1000)}
                 </time>{" "}
-                · <code className="mk-mono">{shortOid(commit.oid)}</code>
+                ·{" "}
+                <CommitLink
+                  className={`${link} mk-mono`}
+                  owner={owner}
+                  name={name}
+                  sha={commit.oid}
+                  onClick={onLeave}
+                  title={`Open commit ${shortOid(commit.oid)}`}
+                >
+                  {shortOid(commit.oid)}
+                </CommitLink>
               </span>
               <span className="flex flex-wrap gap-x-3">
                 <Link className={link} to={blobUrl(owner, name, commit.oid, path)}>

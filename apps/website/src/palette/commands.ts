@@ -13,6 +13,7 @@ import type { TrackerOwner } from "../../shared/tracker.ts";
 import { createIntent } from "./intents.ts";
 import type { ScopedRepo } from "./knowledge.ts";
 import { packagesPath } from "../lib/packages.ts";
+import { parseRef } from "../lib/resolveRefs.ts";
 import { repoSections } from "../lib/repoSections.ts";
 
 /**
@@ -285,7 +286,9 @@ const createIssue: CommandSource = (context) => {
       searched: command.keywords ?? [],
     }),
   );
-  if (!proposed || !target || naming) return commands;
+  // A reference (a SHA, an issue key, #12, pkg@1.0) is somewhere to go, not
+  // an issue's title: the palette jumps to it instead (CORE-22).
+  if (!proposed || !target || naming || parseRef(proposed)) return commands;
   return [
     {
       id: `create-titled:${target.id}`,

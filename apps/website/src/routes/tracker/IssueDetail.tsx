@@ -46,6 +46,7 @@ import { DoneInTimelineCallout, LockedStatusHint, lockedIn } from "./DoneInTimel
 import { useViewer } from "../../lib/session.ts";
 import { Actor } from "./Actor.tsx";
 import { repoPath } from "../../lib/refs.ts";
+import { useRememberPlace } from "../../lib/recentPlaces.ts";
 import { AuditHistory, AuditIdentity } from "./AuditHistory.tsx";
 import { LabelPicker } from "./Labels.tsx";
 import { LinkedWorkPanel } from "./LinkedWork.tsx";
@@ -138,6 +139,12 @@ export function IssueDetail({
   initialEditing?: boolean;
 }) {
   const storageKey = `gitmatrix:issue-draft:${snapshot.owner.id}:${issue.id}`;
+  useRememberPlace({
+    kind: "issue",
+    title: issue.key,
+    detail: issue.title,
+    to: `/tracker/${encodeURIComponent(snapshot.owner.slug)}/issues/${encodeURIComponent(issue.id)}`,
+  });
   const initial: Draft = {
     version: issue.version,
     fields: fieldsOf(issue),

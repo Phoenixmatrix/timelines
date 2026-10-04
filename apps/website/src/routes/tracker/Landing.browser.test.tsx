@@ -257,7 +257,7 @@ describe("the later states, with the runs that merged and tested them", () => {
     await expect.element(repoRow("web")).toMatchTextContent("orbit/webpassed");
     await expect
       .element(repoRow("engine").getByRole("link", { name: `merge ${short(merge.engine)}` }))
-      .toHaveAttribute("href", `/orbit/engine/tree/${merge.engine}?tl=search`);
+      .toHaveAttribute("href", `/orbit/engine?commit=${merge.engine}&tl=search`);
     await expect
       .element(repoRow("engine").getByRole("link", { name: "Merge #3" }))
       .toHaveAttribute("href", "/orbit/engine/ci/3?tl=search");
@@ -309,7 +309,7 @@ describe("the later states, with the runs that merged and tested them", () => {
     await expect.element(repoRow("web")).toMatchTextContent("orbit/webmain advanced");
     await expect
       .element(repoRow("web").getByRole("link", { name: `merge ${short(merge.web)}` }))
-      .toHaveAttribute("href", `/orbit/web/tree/${merge.web}?tl=search`);
+      .toHaveAttribute("href", `/orbit/web?commit=${merge.web}&tl=search`);
     expect(landButton().elements()).toHaveLength(0);
   });
 

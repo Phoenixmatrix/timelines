@@ -2,11 +2,12 @@ import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { CiLogs, CiRunDetail, CommitSummary, HistoryPage } from "../../shared/api.ts";
 import type { Mutation } from "../../shared/tracker.ts";
-import { treeUrl } from "../lib/refs.ts";
 import { renderApp } from "../testing/render.tsx";
 import { reply, TestServer, type Persona } from "../testing/server.ts";
 
 const HEAD = "3f2a9c1b".padEnd(40, "0");
+/** Where the rest of a commit title goes: that commit's panel over the history page (CORE-22). */
+const panelOver = (sha: string) => `/orbit/engine/commits/main?commit=${sha}`;
 
 /** Apply tracker mutations to `owner`'s tracker as `as` (the world's persona by default). */
 async function mutate(server: TestServer, owner: string, mutations: Mutation[], as?: Persona) {
@@ -82,10 +83,10 @@ test("commit titles link what resolves; the rest stays the commit's own link", a
   await expect.element(issue).toHaveAttribute("title", "ENG-1 · Fix the login");
   const title = issue.element().parentElement!;
   expect(anchors(title)).toEqual([
-    ["Fix ", treeUrl("orbit", "engine", HEAD)],
+    ["Fix ", panelOver(HEAD)],
     ["ENG-1", "/tracker/orbit/issues/login"],
     // Keys no tracker of yours has stay inside the commit's link, as written.
-    [", not JIRA-9 or ENG-77, see ", treeUrl("orbit", "engine", HEAD)],
+    [", not JIRA-9 or ENG-77, see ", panelOver(HEAD)],
     ["orbit/engine", "/orbit/engine"],
   ]);
 
@@ -93,9 +94,9 @@ test("commit titles link what resolves; the rest stays the commit's own link", a
   const sha = page.getByRole("link", { name: "3f2a9c1b", exact: true });
   await expect.element(sha).toHaveAttribute("href", `/orbit/engine/commits/main?commit=${HEAD}`);
   expect(anchors(sha.element().parentElement!)).toEqual([
-    ["Revert ", treeUrl("orbit", "engine", "b".repeat(40))],
+    ["Revert ", panelOver("b".repeat(40))],
     ["3f2a9c1b", `/orbit/engine/commits/main?commit=${HEAD}`],
-    [" and abc1234f", treeUrl("orbit", "engine", "b".repeat(40))],
+    [" and abc1234f", panelOver("b".repeat(40))],
   ]);
 
   // One batch for the whole list.
@@ -118,7 +119,7 @@ test("titles render as plain text until the answer arrives, and stay so when it 
   const app = renderApp("/orbit/engine/commits/main");
 
   const whole = page.getByRole("link", { name: "Fix ENG-1 now", exact: true });
-  await expect.element(whole).toHaveAttribute("href", treeUrl("orbit", "engine", HEAD));
+  await expect.element(whole).toHaveAttribute("href", panelOver(HEAD));
   const height = whole.element().getBoundingClientRect().height;
   release();
   await expect
@@ -140,7 +141,7 @@ test("titles render as plain text until the answer arrives, and stay so when it 
     .toBe(true);
   await expect
     .element(page.getByRole("link", { name: "Fix ENG-1 now", exact: true }))
-    .toHaveAttribute("href", treeUrl("orbit", "engine", HEAD));
+    .toHaveAttribute("href", panelOver(HEAD));
 });
 
 test("a CI run's title links refs; its log links hashes alone", async () => {

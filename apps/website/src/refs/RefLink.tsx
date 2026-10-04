@@ -14,6 +14,7 @@ import {
   type ScanOptions,
 } from "../../shared/refs.ts";
 import { link, popMotion } from "../components/ui.tsx";
+import { commitHref } from "../lib/commitPanel.ts";
 import { refHref, useRefContext } from "./context.ts";
 import { useRefResolution, useRefResolutions } from "./resolver.ts";
 
@@ -23,6 +24,19 @@ const KIND_LABEL: Record<RefTarget["kind"], string> = {
   repo: "Repository",
   package: "Package",
 };
+
+/**
+ * Where a target opens, and the router state to go with it: a commit opens
+ * the panel (src/lib/commitPanel.ts), one Back step above the page it's over.
+ */
+function hrefOf(
+  target: RefTarget,
+  location: ReturnType<typeof useLocation>,
+): { to: string; state?: unknown } {
+  return target.kind === "commit"
+    ? commitHref(location, target.owner, target.repo, target.sha)
+    : { to: refHref(target, location) };
+}
 
 /** A link to a resolved target, named by the text it replaces. */
 export function RefAnchor({
@@ -37,7 +51,7 @@ export function RefAnchor({
   const location = useLocation();
   return (
     <Link
-      to={refHref(target, location)}
+      {...hrefOf(target, location)}
       className={className}
       title={target.label}
       data-ref-kind={target.kind}
@@ -76,7 +90,7 @@ export function RefChooser({
               {candidates.map((target) => (
                 <li key={target.path}>
                   <Link
-                    to={refHref(target, location)}
+                    {...hrefOf(target, location)}
                     className="flex min-h-9 flex-col justify-center rounded-plate px-2.5 py-1.5 text-body-sm text-ink no-underline hover:bg-raised focus-visible:bg-raised max-sm:min-h-11"
                   >
                     <span className="truncate">{target.label}</span>

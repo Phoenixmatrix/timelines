@@ -29,6 +29,7 @@ import { SelectField, Tip, link } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { commitsUrl, treeUrl } from "../../lib/refs.ts";
+import { commitPanelUrl } from "../../lib/commitPanel.ts";
 import { withScope } from "../../lib/timelineScope.ts";
 import {
   DEFAULT_FILTERS,
@@ -46,6 +47,7 @@ import { LaneDrawing, ROW_HEIGHT, RowText, eventRepo, graphWidth } from "./Timel
 import { DoneInTimelineIcon, statusLabel } from "./ui.tsx";
 import { PreviewLink, ReviveButton } from "./Checkpoint.tsx";
 import { LandingPanel } from "./Landing.tsx";
+import { useRememberPlace } from "../../lib/recentPlaces.ts";
 import { LiveNow } from "./LiveNow.tsx";
 import { PersonLink } from "../../components/PersonLink.tsx";
 
@@ -110,6 +112,16 @@ export function TrackerTimelines() {
   const slug = params.get("tl");
   const selected = slug ? (data.timelines.find((t) => t.slug === slug) ?? null) : null;
   const byId = useMemo(() => new Map(data.timelines.map((t) => [t.id, t])), [data.timelines]);
+  useRememberPlace(
+    selected
+      ? {
+          kind: "timeline",
+          title: selected.name,
+          detail: `timeline/${selected.slug} · ${owner}`,
+          to: `${base}?tl=${encodeURIComponent(selected.slug)}`,
+        }
+      : null,
+  );
 
   // Stalled: open, and no push for the account's idle period. The data's time
   // stands in for now, so a refresh moves it on.
@@ -176,7 +188,7 @@ export function TrackerTimelines() {
       merge && repo ? (
         <Link
           className="mk-mono text-micro text-ink-faint no-underline hover:underline max-sm:hidden"
-          to={commitsUrl(repo.owner, repo.name, merge.commit)}
+          to={commitPanelUrl(repo.owner, repo.name, merge.commit)}
           title={`${repo.owner}/${repo.name} at ${merge.commit}`}
           onClick={(event) => event.stopPropagation()}
         >
@@ -679,7 +691,7 @@ function TimelineDetails({
               </span>
               {gone ? (
                 last ? (
-                  <Link className={link} to={treeUrl(repo.owner, repo.name, last)}>
+                  <Link className={link} to={commitPanelUrl(repo.owner, repo.name, last)}>
                     last commit <span className="mk-mono">{shortOid(last)}</span>
                   </Link>
                 ) : (
@@ -733,7 +745,7 @@ function TimelineDetails({
                       {" "}
                       <Link
                         className="mk-mono text-micro text-ink-faint no-underline hover:underline"
-                        to={commitsUrl(repo.owner, repo.name, event.commit)}
+                        to={commitPanelUrl(repo.owner, repo.name, event.commit)}
                       >
                         {shortOid(event.commit)}
                       </Link>
