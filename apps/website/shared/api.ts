@@ -396,7 +396,15 @@ export interface KnowledgeOverlaySummary {
    * Set once the timeline's bookmark is gone (CORE-139): the last overlay is
    * kept read-only and never computed again. Null while the bookmark exists.
    */
-  ended: { reason: KnowledgeOverlayEndReason; at: string } | null;
+  ended: {
+    reason: KnowledgeOverlayEndReason;
+    at: string;
+    /**
+     * When retention removed the ended overlay's changes, regrouping and page
+     * sets (CORE-201, "ended-timeline-data"); null while they're kept.
+     */
+    removedAt: string | null;
+  } | null;
 }
 
 export interface KnowledgeOverlay extends KnowledgeOverlaySummary {

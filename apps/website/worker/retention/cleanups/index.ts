@@ -7,6 +7,10 @@ import type { CategoryId } from "../categories.ts";
 import type { CategoryCleanup } from "../engine.ts";
 import { ciLogs } from "./ci-logs.ts";
 import { ciRuns } from "./ci-runs.ts";
+import { aiSpend } from "./ai-spend.ts";
+import { analysisCaches } from "./analysis-caches.ts";
+import { endedTimelineData } from "./ended-timeline-data.ts";
+import { knowledgeBuilds } from "./knowledge-builds.ts";
 import { previewRecords } from "./preview-records.ts";
 import { closedIssues, trackerActivity } from "./tracker.ts";
 import { registryAudit, registryProxyCache } from "./registry.ts";
@@ -21,6 +25,10 @@ const CLEANUPS: Partial<Record<CategoryId, CategoryCleanup<any>>> = {
   "tracker-activity": trackerActivity,
   "registry-proxy-cache": registryProxyCache,
   "registry-audit": registryAudit,
+  "knowledge-builds": knowledgeBuilds,
+  "ended-timeline-data": endedTimelineData,
+  "analysis-caches": analysisCaches,
+  "ai-spend": aiSpend,
 };
 
 export function cleanupFor(id: string): CategoryCleanup | undefined {

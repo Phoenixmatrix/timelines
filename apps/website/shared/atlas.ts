@@ -921,7 +921,12 @@ export interface AtlasTimelineRepo {
   mergeBaseState: "found" | "none" | "truncated" | "unknown";
   updatedAt: string | null;
   error: string | null;
-  ended: { reason: "landed" | "abandoned" | "ended"; at: string } | null;
+  /** `removedAt`: when retention removed the ended overlay's data (CORE-201). */
+  ended: {
+    reason: "landed" | "abandoned" | "ended";
+    at: string;
+    removedAt: string | null;
+  } | null;
   /** This repository's commit in the snapshot on screen. */
   projectionCommit: string | null;
   /** Where `baseCommit` sits relative to that snapshot. */

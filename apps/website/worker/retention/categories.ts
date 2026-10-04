@@ -12,15 +12,15 @@
 // Two categories describe cleanup that already ran before policies existed and
 // keeps running exactly as before: preview teardown ("active"; its two numbers
 // are the account_settings preview columns, also served by
-// /settings/previews) and Atlas snapshot retention ("fixed"; ATLAS_RETENTION,
-// shown read-only).
+// /settings/previews) and Atlas snapshot retention ("active"; ATLAS_RETENTION,
+// which an account can tighten within ATLAS_RETENTION_BOUNDS; CORE-201).
 //
 // Adding a category: append an entry (a new kebab-case id; ids are stored, so
 // never rename one), then implement its cleanup against the engine contract
 // (worker/retention/engine.ts) in the ticket that owns it.
 
 import type { RetentionCategory, RetentionThreshold } from "../../shared/retention.ts";
-import { ATLAS_RETENTION } from "../atlas/retention.ts";
+import { ATLAS_RETENTION, ATLAS_RETENTION_BOUNDS } from "../atlas/retention.ts";
 import { DEFAULT_PREVIEW_SETTINGS } from "../../shared/deployments.ts";
 
 const TEN_YEARS = 3650;
@@ -197,34 +197,31 @@ export const CATEGORIES = [
   {
     id: "atlas-snapshots",
     scope: "account",
-    control: "fixed",
+    control: "active",
     label: "Atlas snapshots",
     description:
-      "Each repository keeps its current Atlas snapshot and recent prior ones; older priors expire and their rows are reclaimed.",
+      "Each repository keeps its current Atlas snapshot and recent prior ones; older priors expire and their rows are reclaimed. An account can keep fewer, never more.",
     never: ["The current snapshot"],
     thresholds: [
       {
         key: "maxPrior",
         label: "Prior snapshots kept",
         unit: "count",
-        min: ATLAS_RETENTION.maxPrior,
-        max: ATLAS_RETENTION.maxPrior,
+        ...ATLAS_RETENTION_BOUNDS.maxPrior,
         default: ATLAS_RETENTION.maxPrior,
       },
       {
         key: "priorDays",
         label: "Days a prior snapshot is kept",
         unit: "days",
-        min: ATLAS_RETENTION.priorTtlMs / 86_400_000,
-        max: ATLAS_RETENTION.priorTtlMs / 86_400_000,
+        ...ATLAS_RETENTION_BOUNDS.priorDays,
         default: ATLAS_RETENTION.priorTtlMs / 86_400_000,
       },
       {
         key: "capGib",
         label: "Storage per repository",
         unit: "gib",
-        min: ATLAS_RETENTION.repoCapBytes / 1024 ** 3,
-        max: ATLAS_RETENTION.repoCapBytes / 1024 ** 3,
+        ...ATLAS_RETENTION_BOUNDS.capGib,
         default: ATLAS_RETENTION.repoCapBytes / 1024 ** 3,
       },
     ],
@@ -284,8 +281,9 @@ export const CATEGORIES = [
     control: "policy",
     label: "AI spend records",
     description: "Per-call AI spend records older than the given days, rolled up to daily totals.",
-    never: ["Totals budgets are enforced against"],
-    thresholds: [days("days", "Days of per-call detail", 90)],
+    never: ["Totals budgets are enforced against", "Reservations still in flight"],
+    // At least a week: a run's own caps read its per-call rows.
+    thresholds: [days("days", "Days of per-call detail", 90, 7)],
   },
 ] as const satisfies readonly RetentionCategory[];
 

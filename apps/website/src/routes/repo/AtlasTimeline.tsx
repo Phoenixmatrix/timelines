@@ -33,7 +33,7 @@ import {
   type AtlasRepo,
   type AtlasWorkspace,
 } from "../../lib/atlas.ts";
-import { timeAgo } from "../../lib/format.ts";
+import { fullDate, timeAgo } from "../../lib/format.ts";
 import { blobUrl, commitsUrl, repoPath } from "../../lib/refs.ts";
 import { withScope } from "../../lib/timelineScope.ts";
 import {
@@ -308,14 +308,24 @@ export function AtlasTimeline({
                 className="m-0 rounded-plate border border-line-soft bg-raised px-2 py-1.5 text-body-sm text-ink-muted"
               >
                 {many && `${p.name}: `}
-                {ENDED[p.ended!.reason]} {timeAgo(p.ended!.at)}. This is its last overlay
-                {p.commit && (
+                {ENDED[p.ended!.reason]} {timeAgo(p.ended!.at)}.{" "}
+                {p.ended!.removedAt ? (
                   <>
-                    {" "}
-                    at <span className="font-mono">{short(p.commit)}</span>
+                    Its overlay and wiki pages were removed by retention on{" "}
+                    {fullDate(p.ended!.removedAt)}.
+                  </>
+                ) : (
+                  <>
+                    This is its last overlay
+                    {p.commit && (
+                      <>
+                        {" "}
+                        at <span className="font-mono">{short(p.commit)}</span>
+                      </>
+                    )}
+                    , kept read-only: nothing here computes it again.
                   </>
                 )}
-                , kept read-only: nothing here computes it again.
               </p>
             ))}
 
@@ -368,11 +378,13 @@ export function AtlasTimeline({
                   ? "This timeline changes no file here."
                   : parts.length === 0
                     ? "None of the selected repositories has this timeline."
-                    : part.ended
-                      ? "This timeline changed no file."
-                      : part.commit
-                        ? "This timeline changes no file yet."
-                        : "No overlay yet. It is computed after the next push."}
+                    : part.ended?.removedAt
+                      ? "Removed by retention."
+                      : part.ended
+                        ? "This timeline changed no file."
+                        : part.commit
+                          ? "This timeline changes no file yet."
+                          : "No overlay yet. It is computed after the next push."}
               </p>
             ) : (
               <ul className="m-0 flex list-none flex-col gap-2 p-0">
@@ -453,6 +465,7 @@ export function AtlasTimeline({
                   repo={{ owner: p.owner, name: p.name }}
                   ref={ref}
                   ended={Boolean(p.ended)}
+                  removedAt={p.ended?.removedAt ?? null}
                   canAsk={p.head !== null && p.state !== "waiting" && p.state !== "unavailable"}
                   note={
                     head.wiki[p.repoId]

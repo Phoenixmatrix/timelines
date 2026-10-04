@@ -142,7 +142,11 @@ export const TABLE_GROUPS: TableGroup[] = [
     database: "db",
     scope: "account",
     label: "Atlas model spend records",
-    tables: { atlas_spend: "account_id = ?1", atlas_budget_exhaustions: "account_id = ?1" },
+    tables: {
+      atlas_spend: "account_id = ?1",
+      atlas_spend_daily: "account_id = ?1",
+      atlas_budget_exhaustions: "account_id = ?1",
+    },
   },
   {
     id: "release-notes",

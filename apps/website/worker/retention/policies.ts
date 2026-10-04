@@ -6,10 +6,12 @@
 // - account categories: the account's stored value, else the site-wide
 //   default, else the category's default; `enabled` likewise, ending at false.
 // - site categories: the site's stored value, else the category's default.
-// - "active" categories (previews) always run; their thresholds live in
+// - "active" categories always run, per account. Previews' thresholds live in
 //   account_settings (the columns the preview sweep reads), so changing them
-//   here or through /settings/previews is the same change.
-// - "fixed" categories (Atlas) always run with their defaults.
+//   here or through /settings/previews is the same change; Atlas snapshots'
+//   in retention_policies (enabled null), which every Atlas retention pass
+//   reads (worker/atlas/retention.ts `scopePolicy`).
+// - "fixed" categories always run with their defaults (none today).
 // A stored value that no longer fits its threshold's bounds is ignored.
 //
 // Nothing here deletes anything. The cleanup engine (runs.ts) asks
@@ -26,6 +28,7 @@ import type {
   StoredPolicy,
 } from "../../shared/retention.ts";
 import { DEFAULT_PREVIEW_SETTINGS } from "../../shared/deployments.ts";
+import { ATLAS_CATEGORY } from "../atlas/retention.ts";
 import { batch, db, nowIso } from "../schema.ts";
 import { CATEGORIES, category, validThreshold } from "./categories.ts";
 import { cleanupFor } from "./cleanups/index.ts";
@@ -165,8 +168,10 @@ export async function accountPolicies(
     lastRuns(d1, { scope: "account", accountId }),
   ]);
   return CATEGORIES.filter((c) => c.scope === "account").map((c) => {
-    if (c.control === "fixed") return resolve(c, []);
-    if (c.control === "active") return resolve(c, [{ from: "account", row: preview }]);
+    // Active (and any fixed) categories: the account's own values only (a
+    // fixed one never has stored values: validatePatch refuses them).
+    if (c.control !== "policy")
+      return resolve(c, [{ from: "account", row: c.id === "previews" ? preview : own.get(c.id) }]);
     return resolve(
       c,
       [
@@ -391,10 +396,11 @@ export async function applyPatch(
   const at = nowIso();
   const queries: Parameters<typeof batch>[1] = [];
   for (const [c, change] of changes) {
-    const before = stored(c.control === "active" ? preview : rows.get(c.id));
+    const previews = c.id === "previews";
+    const before = stored(previews ? preview : rows.get(c.id));
     let after = merge(before, change);
     // Previews store both numbers (account_settings columns), defaults where reset.
-    if (c.control === "active")
+    if (previews)
       after = {
         thresholds: {
           endedDays: after.thresholds?.endedDays ?? DEFAULT_PREVIEW_SETTINGS.endedDays,
@@ -412,7 +418,20 @@ export async function applyPatch(
         created_at: at,
       }),
     );
-    if (c.control === "active" && accountId !== null) {
+    // Atlas retention reads the policy on every pass; flag the account's
+    // repositories so the hourly sweep applies a tighter one without waiting
+    // for their next build.
+    if (c.id === ATLAS_CATEGORY && accountId !== null)
+      queries.push(
+        kdb
+          .updateTable("atlas_scopes")
+          .set({ retention_pending: 1 })
+          .where("kind", "=", "repo")
+          .where("repo_id", "in", (eb) =>
+            eb.selectFrom("repos").select("id").where("owner_id", "=", accountId),
+          ),
+      );
+    if (previews && accountId !== null) {
       const values = {
         preview_ended_days: after.thresholds!.endedDays!,
         preview_idle_days: after.thresholds!.idleDays!,

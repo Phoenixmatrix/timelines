@@ -657,7 +657,19 @@ export async function setEndReason(
 export async function reopenOverlay(d1: D1Database, repoId: string, ref: string) {
   await db(d1)
     .updateTable("kg_overlays")
-    .set({ ended_at: null, ended_reason: null })
+    // Live again. If retention removed its changes (CORE-201), forget the
+    // commit they described so the overlay is computed afresh.
+    .set((eb) => ({
+      ended_at: null,
+      ended_reason: null,
+      removed_at: null,
+      head_commit: eb
+        .case()
+        .when("removed_at", "is not", null)
+        .then(null)
+        .else(eb.ref("head_commit"))
+        .end(),
+    }))
     .where("repo_id", "=", repoId)
     .where("ref", "=", ref)
     .where("ended_reason", "=", "ended")

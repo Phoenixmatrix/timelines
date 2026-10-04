@@ -7,7 +7,8 @@
 // timeline's commit that Back returns from; the workspace Atlas reads the same
 // timeline per repository. Then it ends: read-only, nothing asks for a
 // computation. Then the map's snapshot expires: the link explains and keeps
-// the route to the overlay.
+// the route to the overlay. Then retention removes the ended overlay's data
+// (CORE-201) and the panel says so.
 
 import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
@@ -233,4 +234,24 @@ test("a timeline in capabilities, across repositories, ended and expired", async
   );
   await expect.element(panel).toMatchTextContent("This timeline landed");
   await expect.poll(() => files.getByRole("listitem").elements().length).toBe(4);
+
+  // 7. CORE-201: 100 days on, retention ("ended-timeline-data", 90 days)
+  // removes the ended overlay's changes and pages; the panel says so.
+  const { run } = await server.call<{ run: { status: string; items: number } }>(
+    "POST",
+    "/api/dev/retention",
+    { account: "orbit", categories: { "ended-timeline-data": { days: 90 } }, daysAhead: 100 },
+  );
+  expect(run.status).toBe("succeeded");
+  expect(run.items, "The overlay's changes go").toBeGreaterThanOrEqual(4);
+  cold.unmount();
+  renderApp(`${repo.base}?tl=${slug}`);
+  await expect.element(panel).toMatchTextContent("This timeline landed");
+  await expect
+    .element(panel)
+    .toMatchTextContent("Its overlay and wiki pages were removed by retention on");
+  await expect.element(files).toMatchTextContent("Removed by retention.");
+  await expect
+    .element(panel.getByRole("region", { name: "Timeline wiki pages" }))
+    .toMatchTextContent("Removed by retention on");
 });

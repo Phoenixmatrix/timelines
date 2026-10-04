@@ -561,7 +561,11 @@ async function overlaySummaries(
         updatedAt: stored?.updated_at ?? null,
         error: stored?.status === "failed" ? stored.error : null,
         ended: stored?.ended_at
-          ? { reason: stored.ended_reason ?? "ended", at: stored.ended_at }
+          ? {
+              reason: stored.ended_reason ?? "ended",
+              at: stored.ended_at,
+              removedAt: stored.removed_at,
+            }
           : null,
       },
     };

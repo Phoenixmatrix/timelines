@@ -2374,10 +2374,11 @@ deletes nothing it didn't delete before.
   (kebab-case, stored, never renamed), scope (`account` or `site`), label,
   description, `never` (what it never deletes, in plain words) and thresholds
   (whole numbers with `min`, `max` and the PRD `default`). `control` is
-  `policy` (off until enabled), `active` (preview teardown: always runs, its
+  `policy` (off until enabled), `active` (always runs: preview teardown, whose
   numbers are the `account_settings` preview columns, the same ones
-  `/settings/previews` changes) or `fixed` (Atlas snapshot retention,
-  `ATLAS_RETENTION`, shown read-only). Shapes for clients are in
+  `/settings/previews` changes, and Atlas snapshot retention, which an account
+  can tighten within `ATLAS_RETENTION_BOUNDS` but never loosen) or `fixed`
+  (shown read-only; none today). Shapes for clients are in
   `shared/retention.ts`.
 - **Policies** (`worker/retention/policies.ts`) store only what was changed:
   `retention_policies` per account, `retention_site_policies` for site
@@ -2454,6 +2455,41 @@ The settings responses show each category's `runnable` and `lastRun`.
   landing runs, runs a deployment records or tore down, and runs a registry
   publish names as provenance. A removed run's number answers 404 "Run #n was
   removed by retention." when a later run exists.
+
+### Knowledge retention
+
+CORE-201, `worker/retention/cleanups/`:
+
+- **`knowledge-builds`** deletes `kg_builds` older than `days` (finished, else
+  started) with their `kg_changes`, keeping the latest `keepLatest` builds of
+  each repository, running builds, the build behind the current graph and
+  wiki (`kg_state.last_build_id`) and any build a kept Atlas snapshot's vector
+  names. Graph, wiki and Atlas rows are never touched.
+- **`ended-timeline-data`** empties overlays whose timeline ended more than
+  `days` ago: their `kg_overlay_changes`, `atlas_timeline_regroupings`,
+  `kg_page_sets` and `kg_page_set_pages`. The `kg_overlays` row stays with
+  `removed_at`, which the overlay APIs return as `ended.removedAt`; the
+  Knowledge tab's timeline panel says the overlay and wiki pages were removed
+  by retention. A bookmark that comes back reopens the overlay and computes it
+  afresh.
+- **`analysis-caches`** (site) deletes `kg_blob_analysis` and `kg_synthesis`
+  entries no build has used for `days`. Builds record use cheaply in
+  `used_at` (`worker/knowledge/cache-use.ts`: at most once a day per entry;
+  null counts as 2026-10-04, when the column came). Never: an analysis of a
+  file in any current or running build (`kg_files`, current analyzer), or a
+  synthesis used since the oldest current or running build started (less a
+  day); with a graph whose build record is gone, no synthesis goes. A later
+  build re-analyzes only what was removed.
+- **`ai-spend`** (site; at least 7 days) rolls `atlas_spend` rows of whole
+  UTC days older than `days` (not in-flight reservations) into
+  `atlas_spend_daily` per account and day, deleting them in the same
+  transaction. Daily budget checks add that table, so they answer exactly as
+  before; a rolled-up run no longer shows its per-call detail.
+- **`atlas-snapshots`** is `active`: `PATCH …/settings/retention` stores an
+  account's `maxPrior` (0–20), `priorDays` (1–7) and `capGib` (1–2) in
+  `retention_policies`, every Atlas retention pass reads them
+  (`scopePolicy`), a shorter period brings stamped priors' expiry forward, and
+  a change flags the account's scopes so the hourly sweep applies it.
 
 ### Usage and costs
 

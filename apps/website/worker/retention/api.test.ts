@@ -3,6 +3,7 @@ import { describe, expect, test } from "vite-plus/test";
 import type { PreviewSettings } from "../../shared/deployments.ts";
 import type { RetentionPolicy, RetentionSettings } from "../../shared/retention.ts";
 import { issueToken } from "../api/tokens.ts";
+import { scopePolicy } from "../atlas/retention.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { previewSettingsApi } from "../deployments/settings.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
@@ -136,7 +137,7 @@ describe("account retention settings", () => {
       values: { endedDays: 2, idleDays: 7 },
     });
     expect(policy(settings, "atlas-snapshots")).toMatchObject({
-      control: "fixed",
+      control: "active",
       enabled: true,
       values: { maxPrior: 20, priorDays: 7, capGib: 2 },
     });
@@ -216,9 +217,15 @@ describe("account retention settings", () => {
     expect(await bad({ categories: { "auth-hygiene": { enabled: true } } })).toMatch(
       /site category/,
     );
+    // Atlas snapshots: an account can keep less, never more.
     expect(
-      await bad({ categories: { "atlas-snapshots": { thresholds: { maxPrior: 20 } } } }),
-    ).toMatch(/read-only/);
+      await bad({ categories: { "atlas-snapshots": { thresholds: { maxPrior: 21 } } } }),
+    ).toMatch(/whole number from 0 to 20/);
+    await bad({ categories: { "atlas-snapshots": { thresholds: { priorDays: 8 } } } });
+    await bad({ categories: { "atlas-snapshots": { thresholds: { capGib: 3 } } } });
+    expect(await bad({ categories: { "atlas-snapshots": { enabled: false } } })).toMatch(
+      /always runs/,
+    );
     expect(await bad({ categories: { previews: { enabled: false } } })).toMatch(/always runs/);
     await bad({ categories: { previews: { thresholds: { idleDays: 0 } } } });
     await bad({ categories: [] });
@@ -300,6 +307,52 @@ describe("account retention settings", () => {
     const settings = (await t.call(t.tokens.ann, "GET", ORG)).json as RetentionSettings;
     expect(policy(settings, "ci-logs")).toMatchObject({ enabled: true, values: { days: 30 } });
     expect(policy(settings, "push-log")).toMatchObject({ enabled: false, values: { days: 365 } });
+  });
+
+  test("Atlas snapshots: an account keeps less, which every Atlas retention pass reads", async () => {
+    const t = await setup();
+    t.sqlite.exec(`
+      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+        ('r_org', 'acc_org', 'engine', 'private', 'a', ''),
+        ('r_ann', 'acc_ann', 'notes', 'private', 'b', '');
+      INSERT INTO atlas_scopes (scope, kind, repo_id) VALUES
+        ('repo:r_org', 'repo', 'r_org'), ('repo:r_ann', 'repo', 'r_ann');
+    `);
+    expect(await scopePolicy(t.env.DB, ["repo:r_org"])).toEqual({});
+    const patched = await t.call(t.tokens.ann, "PATCH", ORG, {
+      categories: { "atlas-snapshots": { thresholds: { maxPrior: 3, priorDays: 2 } } },
+    });
+    expect(patched.status).toBe(200);
+    expect(policy(patched.json as RetentionSettings, "atlas-snapshots")).toMatchObject({
+      control: "active",
+      enabled: true,
+      values: { maxPrior: 3, priorDays: 2, capGib: 2 },
+      valuesFrom: { maxPrior: "account", priorDays: "account", capGib: "default" },
+      updatedBy: "ann",
+    });
+    expect(
+      t.sqlite
+        .prepare("SELECT enabled, thresholds FROM retention_policies WHERE category = ?")
+        .all("atlas-snapshots"),
+    ).toEqual([{ enabled: null, thresholds: '{"maxPrior":3,"priorDays":2}' }]);
+    // The hourly sweep applies it to the account's repositories, not others'.
+    expect(
+      t.sqlite.prepare("SELECT scope, retention_pending FROM atlas_scopes ORDER BY scope").all(),
+    ).toEqual([
+      { scope: "repo:r_ann", retention_pending: 0 },
+      { scope: "repo:r_org", retention_pending: 1 },
+    ]);
+    expect(await scopePolicy(t.env.DB, ["repo:r_org"])).toEqual({
+      maxPrior: 3,
+      priorTtlMs: 2 * 86_400_000,
+    });
+    expect(await scopePolicy(t.env.DB, ["repo:r_ann"])).toEqual({});
+    // Reset: back to ATLAS_RETENTION.
+    await t.call(t.tokens.ann, "PATCH", ORG, {
+      categories: { "atlas-snapshots": { thresholds: { maxPrior: null, priorDays: null } } },
+    });
+    expect(count(t.sqlite, "retention_policies")).toBe(0);
+    expect(await scopePolicy(t.env.DB, ["repo:r_org"])).toEqual({});
   });
 });
 

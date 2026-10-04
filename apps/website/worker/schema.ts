@@ -186,6 +186,8 @@ export interface Database {
     model: string | null;
     tokens: Generated<number>;
     created_at: Generated<string>;
+    /** When a build last used it (at most daily; CORE-201). */
+    used_at: Generated<string | null>;
   };
   kg_synthesis: {
     key: string;
@@ -193,6 +195,8 @@ export interface Database {
     model: string | null;
     tokens: Generated<number>;
     created_at: Generated<string>;
+    /** When a build last used it (at most daily; CORE-201). */
+    used_at: Generated<string | null>;
   };
   kg_nodes: {
     repo_id: string;
@@ -300,6 +304,18 @@ export interface Database {
     /** Set when the bookmark disappeared (CORE-139): the overlay is kept read-only. */
     ended_at: string | null;
     ended_reason: "landed" | "abandoned" | "ended" | null;
+    /** Set when retention removed an ended overlay's changes and pages (CORE-201). */
+    removed_at: Generated<string | null>;
+  };
+  /** Atlas spend rolled up per account and day (CORE-201, "ai-spend"). */
+  atlas_spend_daily: {
+    account_id: string;
+    day: string;
+    calls: number;
+    input_tokens: number;
+    output_tokens: number;
+    cost_micro_usd: number;
+    rolled_up_at: string;
   };
   /** Atlas paid-synthesis calls, reserved then reconciled (worker/knowledge/budget.ts). */
   atlas_spend: {

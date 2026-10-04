@@ -723,7 +723,9 @@ function factsOf(
           : "unknown",
     updatedAt: row?.updated_at ?? null,
     error: row?.status === "failed" ? row.error : null,
-    ended: row?.ended_at ? { reason: row.ended_reason ?? "ended", at: row.ended_at } : null,
+    ended: row?.ended_at
+      ? { reason: row.ended_reason ?? "ended", at: row.ended_at, removedAt: row.removed_at }
+      : null,
     projectionCommit: read.projectionCommit,
     base: read.base,
     changes: { total, stored: stats.stored ?? read.stored },

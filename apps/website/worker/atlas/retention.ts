@@ -19,6 +19,11 @@
 //   never evicted: a snapshot that doesn't fit even with every prior gone fails
 //   with `failure = 'capacity'` (`admitProjection`) and the previous snapshot
 //   stays current, stale; `capacityFailure` reports it for the UI.
+// - An account may tighten these for its repositories, never loosen them
+//   (retention category "atlas-snapshots", CORE-201: fewer priors, fewer
+//   days, a smaller cap, within ATLAS_RETENTION_BOUNDS). Every pass reads the
+//   owner's choice (`scopePolicy`); a shorter period also brings forward the
+//   expiry of priors stamped before it changed.
 // - Reclaiming: a row is kept while any retained snapshot (published or
 //   building) sees it (from_seq <= seq < to_seq, or open). Expiry is always
 //   oldest-first, so retained published snapshots are a suffix of the scope's
@@ -70,6 +75,65 @@ export const ATLAS_RETENTION = {
   /** How long an expired or failed snapshot's record outlives its rows. */
   recordTtlMs: 30 * DAY,
 } as const;
+
+/**
+ * What an account may choose for its repositories (retention category
+ * "atlas-snapshots", CORE-201): anything up to ATLAS_RETENTION, never more.
+ * Stored in retention_policies; `scopePolicy` reads it for every pass.
+ */
+export const ATLAS_RETENTION_BOUNDS = {
+  maxPrior: { min: 0, max: ATLAS_RETENTION.maxPrior },
+  priorDays: { min: 1, max: ATLAS_RETENTION.priorTtlMs / DAY },
+  capGib: { min: 1, max: ATLAS_RETENTION.repoCapBytes / GIB },
+} as const;
+
+/** The retention category whose stored thresholds tighten a repository's policy. */
+export const ATLAS_CATEGORY = "atlas-snapshots";
+
+/**
+ * A repository scope's policy as its owning account chose it (category
+ * "atlas-snapshots"), over REPO_RETENTION; nothing for other pools or when
+ * the account chose nothing. A stored value outside ATLAS_RETENTION_BOUNDS is
+ * ignored, like any retention threshold.
+ */
+export async function scopePolicy(
+  d1: D1Database,
+  scopes: string[],
+): Promise<Partial<RetentionPolicy>> {
+  const [scope] = scopes;
+  if (scopes.length !== 1 || !scope?.startsWith("repo:")) return {};
+  const row = await d1
+    .prepare(
+      `SELECT p.thresholds FROM retention_policies p JOIN repos r ON r.owner_id = p.account_id
+       WHERE r.id = ? AND p.category = ?`,
+    )
+    .bind(scope.slice("repo:".length), ATLAS_CATEGORY)
+    .first<{ thresholds: string }>();
+  if (!row) return {};
+  let stored: Record<string, unknown> = {};
+  try {
+    const value = JSON.parse(row.thresholds) as unknown;
+    if (value && typeof value === "object" && !Array.isArray(value))
+      stored = value as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+  const valid = (key: keyof typeof ATLAS_RETENTION_BOUNDS): number | undefined => {
+    const value = stored[key];
+    const { min, max } = ATLAS_RETENTION_BOUNDS[key];
+    return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max
+      ? value
+      : undefined;
+  };
+  const policy: Partial<RetentionPolicy> = {};
+  const maxPrior = valid("maxPrior");
+  const priorDays = valid("priorDays");
+  const capGib = valid("capGib");
+  if (maxPrior !== undefined) policy.maxPrior = maxPrior;
+  if (priorDays !== undefined) policy.priorTtlMs = priorDays * DAY;
+  if (capGib !== undefined) policy.capBytes = capGib * GIB;
+  return policy;
+}
 
 /** Cursors expire 30 minutes after issue, or at their snapshot's expiry if sooner. */
 export const CURSOR_TTL_MS = 30 * MINUTE;
@@ -245,24 +309,29 @@ export async function enforceRetention(
   scopes: string[],
   options: { now?: Date; policy?: Partial<RetentionPolicy> } = {},
 ): Promise<RetentionResult> {
-  const policy = { ...REPO_RETENTION, ...options.policy };
+  const policy = { ...REPO_RETENTION, ...(await scopePolicy(d1, scopes)), ...options.policy };
   const now = options.now ?? new Date();
   const nowIso = now.toISOString();
   const expired: RetentionResult["expired"] = [];
   let rows = await retainedSnapshots(d1, scopes);
 
-  // A prior's 7 days start when the next snapshot was published.
+  // A prior's 7 days start when the next snapshot was published. An account
+  // that shortened the period since a prior was stamped brings it forward.
   const stamps: Statement[] = [];
   for (const row of rows) {
-    if (row.status !== "published" || row.current || row.expires_at) continue;
+    if (row.status !== "published" || row.current) continue;
     const next = rows.find(
       (r) => r.scope === row.scope && r.status === "published" && r.seq > row.seq,
     );
+    if (row.expires_at && !next?.published_at) continue;
     const from = Date.parse(next?.published_at ?? nowIso);
-    row.expires_at = new Date(from + policy.priorTtlMs).toISOString();
+    const due = new Date(from + policy.priorTtlMs).toISOString();
+    if (row.expires_at && row.expires_at <= due) continue;
+    row.expires_at = due;
     stamps.push(
       raw(
-        "UPDATE atlas_snapshots SET expires_at = ? WHERE id = ? AND expires_at IS NULL",
+        `UPDATE atlas_snapshots SET expires_at = ?1
+         WHERE id = ?2 AND (expires_at IS NULL OR expires_at > ?1)`,
         row.expires_at,
         row.id,
       ),
@@ -387,7 +456,11 @@ export async function admitProjection(
   snapshotId: string,
   options: { scopes?: string[]; policy?: Partial<RetentionPolicy> } = {},
 ): Promise<Admission> {
-  const policy = { ...REPO_RETENTION, ...options.policy };
+  const policy = {
+    ...REPO_RETENTION,
+    ...(await scopePolicy(d1, options.scopes ?? [scope])),
+    ...options.policy,
+  };
   const capBytes = policy.capBytes;
   const snapshot = await db(d1)
     .selectFrom("atlas_snapshots")
