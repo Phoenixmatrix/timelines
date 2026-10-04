@@ -14,9 +14,6 @@ export interface ScopedRepo {
   defaultBranch: string;
 }
 
-/** Choosing a repository first, or searching one's code and wiki. */
-export type PaletteScope = { kind: "pick" } | ({ kind: "repo" } & ScopedRepo);
-
 export type KnowledgeState =
   | { status: "idle" }
   | { status: "loading"; repo: string; query: string }

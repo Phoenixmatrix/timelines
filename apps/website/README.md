@@ -534,6 +534,18 @@ you were. It lists, in labelled groups:
   **Conversations**: from `/api/search` as you type (debounced; signed-in
   only). Issues show their key, status and tracker; packages their format and
   owner; choosing a conversation reopens it in the assistant.
+- **Find**: **Find a repository…**, **an issue…**, **a person or
+  organization…**, **a package…**, **a conversation…** narrow search to that one
+  category, with up to 20 results instead of 5.
+
+Before anything is typed (CORE-152), the places don't fill the list: it opens
+on **Go to…** (selected, so Enter opens it), then this repository's code
+search, the likeliest **Create issue**, the assistant and the Find entries.
+**Go to…** is a second step, like Raycast's: it lists every place, this
+repository's sections first, and filters them as you type. Typing at the top
+still reaches every place directly. Signed out, the few places are listed as
+they are. Each second step (Go to, Find, code and wiki) shows above the input;
+× or Backspace on an empty query goes back.
 
 - **Or**: fallbacks that act on what you typed, such as **Create issue “…”**,
   which proposes the text as a title in the current tracker (else the one

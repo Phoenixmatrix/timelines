@@ -3,7 +3,8 @@
 // search, tracker and repository routes in memory: the Search button and
 // Ctrl+K open it with focus in the query and Escape gives focus back; an
 // exact identifier comes first and Enter opens it; what the viewer can't read
-// never appears; issues and packages open their pages; Create issue hands a
+// never appears; before anything's typed one Go to leads, and Go to and Find
+// are second steps; issues and packages open their pages; Create issue hands a
 // proposed title to the tracker's own creator once, never in the address;
 // signed out it only navigates, and never searches.
 
@@ -60,6 +61,71 @@ test("open, search, choose: each by keyboard, with focus where it belongs", asyn
     .toBeVisible();
   await press("Escape");
   expect(server.requests.some((r) => r.url.pathname === "/api/search")).toBe(true);
+});
+
+test("before anything's typed, one Go to leads; Go to and Find are second steps", async () => {
+  const server = await setup();
+  await server.call("POST", "/api/tracker/orbit/mutate", {
+    operationId: "palette-go-fixtures",
+    mutations: [
+      {
+        kind: "team.create",
+        id: "palette-team",
+        data: { key: "PAL", name: "Palette", memberIds: ["acc_marco"] },
+      },
+      {
+        kind: "issue.create",
+        id: "palette-ready",
+        data: { teamId: "palette-team", title: "Agent ready fixture", status: "todo" },
+      },
+    ],
+  });
+  const app = renderApp("/orbit/engine");
+  await expect.element(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
+
+  // Every page waits behind Go to, selected so Enter opens it; things to do follow.
+  await press("Control+k");
+  await expect.element(page.getByRole("option", { selected: true })).toMatchTextContent("Go to…");
+  await expect.element(dialog().getByRole("option", { name: /^Find an issue…/ })).toBeVisible();
+  expect(
+    dialog()
+      .getByRole("option", { name: /^Access tokens/ })
+      .elements(),
+  ).toHaveLength(0);
+  await press("Enter");
+  const goTo = page.getByRole("combobox", { name: "Go to a page" });
+  await expect.element(goTo).toHaveFocus();
+  await expect.element(dialog().getByRole("option", { name: /^Access tokens/ })).toBeVisible();
+
+  // Backspace on the empty query steps back out; Enter goes in again.
+  await press("Backspace");
+  await expect.element(query()).toHaveFocus();
+  await press("Enter");
+  await expect.element(goTo).toHaveFocus();
+  // The repository's sections come first, and typing filters every place.
+  await userEvent.keyboard("CI");
+  await expect.element(page.getByRole("option", { selected: true })).toMatchTextContent("CI");
+  await press("Enter");
+  await expect.element(dialog()).not.toBeInTheDocument();
+  await app.waitForUrl((url) => url.pathname === "/orbit/engine/ci");
+  const searched = server.requests.filter((r) => r.url.pathname === "/api/search").length;
+  expect(searched, "Go to only filters the app's own places").toBe(0);
+
+  // Find narrows search to one kind of result, with more of them.
+  await press("Control+k");
+  await userEvent.keyboard("find an issue");
+  await press("Enter");
+  const findIssues = page.getByRole("combobox", { name: "Find issues" });
+  await expect.element(findIssues).toHaveFocus();
+  await expect.element(dialog().getByText("Type to find issues.")).toBeVisible();
+  await userEvent.keyboard("Agent ready");
+  await expect
+    .element(page.getByRole("group", { name: "Issues" }).getByRole("option").first())
+    .toMatchTextContent("Agent ready fixture");
+  const search = server.requests.findLast((r) => r.url.pathname === "/api/search")!;
+  expect(search.url.searchParams.get("categories")).toBe("issues");
+  expect(search.url.searchParams.get("limit")).toBe("20");
+  expect(page.getByRole("group", { name: "Repositories" }).elements()).toHaveLength(0);
 });
 
 test("issues and packages open their own pages", async () => {

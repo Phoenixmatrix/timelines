@@ -10,6 +10,7 @@ import {
   ChatCenteredDotsIcon,
   CheckCircleIcon,
   CircleDashedIcon,
+  CompassIcon,
   FileCodeIcon,
   FolderSimpleIcon,
   GitBranchIcon,
@@ -34,7 +35,12 @@ import {
 } from "react";
 import { useLocation, useNavigate, useRouteLoaderData } from "react-router";
 import type { RepoDetail } from "../../shared/api.ts";
-import type { SearchCategory, SearchResponse, SearchResult } from "../../shared/search.ts";
+import {
+  SEARCH_LIMITS,
+  type SearchCategory,
+  type SearchResponse,
+  type SearchResult,
+} from "../../shared/search.ts";
 import type { TrackerList } from "../../shared/tracker.ts";
 import { useAssistant } from "../assistant/state.tsx";
 import { dialogMotion, fadeMotion, Tip } from "../components/ui.tsx";
@@ -42,11 +48,13 @@ import { api } from "../lib/api.ts";
 import { useViewer } from "../lib/session.ts";
 import {
   COMMAND_SOURCES,
+  destinations,
   matchCommands,
   type Command,
   type CommandGroup,
   type PaletteContext,
   type PaletteEnv,
+  type PaletteScope,
 } from "./commands.ts";
 import {
   knowledgeResults,
@@ -54,7 +62,6 @@ import {
   repoKey,
   type AtlasHandoff,
   type KnowledgeState,
-  type PaletteScope,
   type ScopedRepo,
 } from "./knowledge.ts";
 import { remoteSearch, type RemoteState } from "./remote.ts";
@@ -177,25 +184,47 @@ interface Section {
 
 const iconClass = "size-4 shrink-0 text-ink-muted";
 
+const CATEGORY_ICON: Record<SearchCategory, ReactNode> = {
+  repositories: <GitBranchIcon className={iconClass} aria-hidden />,
+  issues: <CircleDashedIcon className={iconClass} aria-hidden />,
+  packages: <PackageIcon className={iconClass} aria-hidden />,
+  accounts: <UserCircleIcon className={iconClass} aria-hidden />,
+  conversations: <ChatCenteredDotsIcon className={iconClass} aria-hidden />,
+};
+
+/** What one kind of result is called in a sentence: "Find issues". */
+const CATEGORY_NOUN: Record<SearchCategory, string> = {
+  repositories: "repositories",
+  issues: "issues",
+  packages: "packages",
+  accounts: "people and organizations",
+  conversations: "conversations",
+};
+
 function commandOption(command: Command): Option {
   const run = command.run;
   return {
     id: command.id,
     title: command.title,
     detail: command.hint ?? "",
-    icon: command.id.startsWith("knowledge") ? (
-      <FileCodeIcon className={iconClass} aria-hidden />
-    ) : command.id.startsWith("create") ? (
-      <PlusCircleIcon className={iconClass} aria-hidden />
-    ) : command.id === "ask" ? (
-      <ChatCenteredDotsIcon className={iconClass} aria-hidden />
-    ) : command.group === "actions" ? (
-      <LightningIcon className={iconClass} aria-hidden />
-    ) : command.group === "repository" ? (
-      <FolderSimpleIcon className={iconClass} aria-hidden />
-    ) : (
-      <ArrowRightIcon className={iconClass} aria-hidden />
-    ),
+    icon:
+      command.id === "go" ? (
+        <CompassIcon className={iconClass} aria-hidden />
+      ) : run.kind === "scope" && run.scope.kind === "find" ? (
+        CATEGORY_ICON[run.scope.category]
+      ) : command.id.startsWith("knowledge") ? (
+        <FileCodeIcon className={iconClass} aria-hidden />
+      ) : command.id.startsWith("create") ? (
+        <PlusCircleIcon className={iconClass} aria-hidden />
+      ) : command.id === "ask" ? (
+        <ChatCenteredDotsIcon className={iconClass} aria-hidden />
+      ) : command.group === "actions" ? (
+        <LightningIcon className={iconClass} aria-hidden />
+      ) : command.group === "repository" ? (
+        <FolderSimpleIcon className={iconClass} aria-hidden />
+      ) : (
+        <ArrowRightIcon className={iconClass} aria-hidden />
+      ),
     activate: (env) =>
       run.kind === "navigate"
         ? env.navigate(run.to, run.state)
@@ -256,10 +285,76 @@ function resultOption(result: SearchResult): Option {
   };
 }
 
-function groupLabel(group: CommandGroup, context: PaletteContext) {
-  if (group === "repository" && context.repo)
-    return `In ${context.repo.owner.slug}/${context.repo.name}`;
-  return group === "actions" ? "Actions" : "Go to";
+function groupLabel(
+  group: CommandGroup,
+  context: PaletteContext,
+  scope: PaletteScope | null,
+  blank: boolean,
+) {
+  const going = scope?.kind === "go";
+  if (group === "repository" && context.repo) {
+    const name = `${context.repo.owner.slug}/${context.repo.name}`;
+    return going ? name : `In ${name}`;
+  }
+  if (group === "actions") return "Actions";
+  if (group === "find") return "Find";
+  return going ? "Pages" : blank && context.viewer ? "Navigate" : "Go to";
+}
+
+/** The second step's banner, the input's name and its placeholder. */
+function scopeText(scope: PaletteScope | null, signedIn: boolean) {
+  if (!scope) {
+    const label = signedIn ? "Search or go to" : "Go to";
+    return { label, placeholder: `${label}…` };
+  }
+  switch (scope.kind) {
+    case "go":
+      return {
+        label: "Go to a page",
+        placeholder: "Filter pages and settings…",
+        banner: <span className="font-semibold text-ink">Go to</span>,
+        leave: "Leave Go to",
+      };
+    case "find": {
+      const noun = CATEGORY_NOUN[scope.category];
+      return {
+        label: `Find ${noun}`,
+        placeholder: `Find ${noun}…`,
+        banner: (
+          <>
+            Find <span className="font-semibold text-ink">{noun}</span>
+          </>
+        ),
+        leave: `Leave ${noun} search`,
+      };
+    }
+    case "pick":
+      return {
+        label: "Choose a repository",
+        placeholder: "Find a repository…",
+        banner: "Code and wiki search: choose a repository",
+        leave: "Leave code and wiki search",
+      };
+    case "repo":
+      return {
+        label: `Search code and wiki in ${repoKey(scope)}`,
+        placeholder: "A name, or describe the behavior, then Enter",
+        banner: (
+          <>
+            Code and wiki in <span className="font-semibold text-ink">{repoKey(scope)}</span>
+            <span className="text-ink-faint"> · searches when you press Enter</span>
+          </>
+        ),
+        leave: "Leave code and wiki search",
+      };
+  }
+}
+
+function scopeIcon(scope: PaletteScope) {
+  const className = "size-4 shrink-0 text-ink-muted";
+  if (scope.kind === "go") return <CompassIcon className={className} aria-hidden />;
+  if (scope.kind === "find") return CATEGORY_ICON[scope.category];
+  return <FileCodeIcon className={className} aria-hidden />;
 }
 
 /** What screen readers hear after each change: counts, then what's still loading or failed. */
@@ -275,9 +370,14 @@ function announce(count: number, query: string, remote: RemoteState): string {
   return parts.filter(Boolean).join(". ");
 }
 
-function fetchSearch(query: string, signal: AbortSignal, categories?: SearchCategory[]) {
+function fetchSearch(query: string, signal: AbortSignal, scope: PaletteScope | null) {
   const params = new URLSearchParams({ q: query });
-  if (categories) params.set("categories", categories.join(","));
+  if (scope?.kind === "pick") params.set("categories", "repositories");
+  // Narrowed to one kind, it's worth seeing more of it than instant search shows.
+  if (scope?.kind === "find") {
+    params.set("categories", scope.category);
+    params.set("limit", String(SEARCH_LIMITS.maxLimit));
+  }
   return api<SearchResponse>(`/search?${params.toString()}`, { signal });
 }
 
@@ -320,15 +420,7 @@ function Palette({
   const client = useMemo(
     () =>
       viewer
-        ? remoteSearch(
-            (q, signal) =>
-              fetchSearch(
-                q,
-                signal,
-                scopeRef.current?.kind === "pick" ? ["repositories"] : undefined,
-              ),
-            setRemote,
-          )
+        ? remoteSearch((q, signal) => fetchSearch(q, signal, scopeRef.current), setRemote)
         : null,
     [viewer],
   );
@@ -336,7 +428,8 @@ function Palette({
   useEffect(() => {
     if (!open) return;
     // Code and wiki search waits for Enter; nothing goes out while typing.
-    client?.search(scope?.kind === "repo" ? "" : query);
+    // Go to only filters the app's own places.
+    client?.search(scope?.kind === "repo" || scope?.kind === "go" ? "" : query);
   }, [client, open, query, scope]);
   useEffect(() => {
     if (open) return;
@@ -391,14 +484,29 @@ function Palette({
     defaultTrackerId: trackers?.defaultOwnerId ?? null,
     query,
   };
-  const commands = scope ? [] : COMMAND_SOURCES.flatMap((source) => source(context));
-  const local = matchCommands(commands, query);
+  const going = scope?.kind === "go";
+  const commands = going
+    ? destinations(context)
+    : scope
+      ? []
+      : COMMAND_SOURCES.flatMap((source) => source(context));
+  const local = matchCommands(
+    commands,
+    query,
+    going ? { perGroup: Infinity, everything: true } : undefined,
+  );
+  const blank = !query.trim();
   const sections: Section[] = [];
   // Commands that act on the query itself ("Create issue “…”") are fallbacks:
   // listed last and never selected by default, so Enter on a search opens a
   // result rather than a form.
   const fallbacks: Command[] = [];
-  for (const group of ["repository", "pages", "actions"] as const) {
+  // Before anything's typed, Go to leads and what you can do follows it.
+  const order: CommandGroup[] =
+    blank && !scope
+      ? ["pages", "repository", "actions", "find"]
+      : ["repository", "pages", "actions", "find"];
+  for (const group of order) {
     const matched = (local.get(group) ?? []).filter(({ command }) => {
       if (command.always) fallbacks.push(command);
       return !command.always;
@@ -406,7 +514,7 @@ function Palette({
     if (matched.length)
       sections.push({
         key: group,
-        label: groupLabel(group, context),
+        label: groupLabel(group, context, scope, blank),
         options: matched.map(({ command }) => commandOption(command)),
       });
   }
@@ -548,6 +656,7 @@ function Palette({
     }
   };
 
+  const text = scopeText(scope, !!viewer);
   // A finished answer to an older query is still waiting on the newer one.
   const loading = remote.status === "loading" || (remote.status === "done" && !current);
   const unavailable =
@@ -577,22 +686,12 @@ function Palette({
             <Dialog.Title className="sr-only">Search</Dialog.Title>
             {scope && (
               <div className="flex items-center gap-2 border-b border-line-soft px-4 py-2 text-body-sm">
-                <FileCodeIcon className="size-4 shrink-0 text-ink-muted" aria-hidden />
-                <span className="min-w-0 flex-1 truncate text-ink-muted">
-                  {scope.kind === "pick" ? (
-                    "Code and wiki search: choose a repository"
-                  ) : (
-                    <>
-                      Code and wiki in{" "}
-                      <span className="font-semibold text-ink">{repoKey(scope)}</span>
-                      <span className="text-ink-faint"> · searches when you press Enter</span>
-                    </>
-                  )}
-                </span>
+                {scopeIcon(scope)}
+                <span className="min-w-0 flex-1 truncate text-ink-muted">{text.banner}</span>
                 <button
                   type="button"
                   className="mk-btn mk-btn--ghost mk-btn--sm"
-                  aria-label="Leave code and wiki search"
+                  aria-label={text.leave}
                   onClick={() => setScope(null)}
                 >
                   <XIcon className="size-3.5" aria-hidden />
@@ -613,24 +712,8 @@ function Palette({
                 aria-autocomplete="list"
                 aria-activedescendant={activeIndex >= 0 ? optionId(activeIndex) : undefined}
                 aria-describedby={helpId}
-                aria-label={
-                  scope?.kind === "repo"
-                    ? `Search code and wiki in ${repoKey(scope)}`
-                    : scope?.kind === "pick"
-                      ? "Choose a repository"
-                      : viewer
-                        ? "Search or go to"
-                        : "Go to"
-                }
-                placeholder={
-                  scope?.kind === "repo"
-                    ? "A name, or describe the behavior, then Enter"
-                    : scope?.kind === "pick"
-                      ? "Find a repository…"
-                      : viewer
-                        ? "Search or go to…"
-                        : "Go to…"
-                }
+                aria-label={text.label}
+                placeholder={text.placeholder}
                 value={query}
                 autoComplete="off"
                 autoCorrect="off"
@@ -706,6 +789,11 @@ function Palette({
                   Press Enter to search {repoKey(scopedRepo)}.
                 </p>
               )}
+              {scope?.kind === "find" && !normalized && (
+                <p className="m-0 px-2.5 py-6 text-center text-body-sm text-ink-muted">
+                  Type to find {CATEGORY_NOUN[scope.category]}.
+                </p>
+              )}
               {!scopedRepo && normalized && !found && !loading && (
                 <p className="m-0 px-2.5 py-6 text-center text-body-sm text-ink-muted">
                   Nothing matches “{normalized}”.
@@ -738,6 +826,11 @@ function Palette({
               <span>
                 <kbd className="mk-kbd">Enter</kbd> to open
               </span>
+              {scope && (
+                <span>
+                  <kbd className="mk-kbd">⌫</kbd> to go back
+                </span>
+              )}
               <span>
                 <kbd className="mk-kbd">Esc</kbd> to close
               </span>

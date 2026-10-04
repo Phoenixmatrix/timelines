@@ -3,12 +3,28 @@
 // new action (create an issue, ask the assistant) adds a source.
 
 import type { RepoDetail, Viewer } from "../../shared/api.ts";
-import { MATCH_RANK, matchFields, type SearchMatch } from "../../shared/search.ts";
+import {
+  MATCH_RANK,
+  matchFields,
+  type SearchCategory,
+  type SearchMatch,
+} from "../../shared/search.ts";
 import type { TrackerOwner } from "../../shared/tracker.ts";
 import { createIntent } from "./intents.ts";
-import type { PaletteScope } from "./knowledge.ts";
+import type { ScopedRepo } from "./knowledge.ts";
 import { packagesPath } from "../lib/packages.ts";
 import { repoSections } from "../lib/repoSections.ts";
+
+/**
+ * A second step the palette narrows to, keeping it open: every place to go,
+ * one kind of search result, choosing a repository for code and wiki search,
+ * or one repository's code and wiki.
+ */
+export type PaletteScope =
+  | { kind: "go" }
+  | { kind: "find"; category: SearchCategory }
+  | { kind: "pick" }
+  | ({ kind: "repo" } & ScopedRepo);
 
 /** Where the palette was opened. */
 export interface PaletteContext {
@@ -33,7 +49,7 @@ export interface PaletteEnv {
   scope(next: PaletteScope): void;
 }
 
-export type CommandGroup = "pages" | "repository" | "actions";
+export type CommandGroup = "pages" | "repository" | "actions" | "find";
 
 export interface Command {
   /** Stable across renders and queries: selection follows it. */
@@ -45,6 +61,11 @@ export interface Command {
   keywords?: string[];
   /** Offered whatever is typed, because it acts on the query itself. */
   always?: boolean;
+  /**
+   * Listed before anything is typed. The rest (every page and section) wait
+   * for a query or for Go to, so they don't crowd out everything else.
+   */
+  home?: boolean;
   run:
     | { kind: "navigate"; to: string; state?: unknown }
     | { kind: "action"; perform(env: PaletteEnv): void }
@@ -63,12 +84,35 @@ const page = (id: string, title: string, to: string, keywords: string[] = []): C
   run: { kind: "navigate", to },
 });
 
+/**
+ * One entry for every place to go, which opens them as a second step, so the
+ * places themselves needn't fill the list before anything is typed. Signed
+ * out there are only a few, listed directly.
+ */
+const navigate: CommandSource = ({ viewer, repo }) =>
+  viewer
+    ? [
+        {
+          id: "go",
+          group: "pages",
+          title: "Go to…",
+          hint: repo ? `Pages, settings and ${repo.owner.slug}/${repo.name}` : "Pages and settings",
+          keywords: ["navigate", "pages", "open", "jump"],
+          home: true,
+          run: { kind: "scope", scope: { kind: "go" } },
+        },
+      ]
+    : [];
+
 /** The app's own places, as the rail and account menu offer them. */
 const pages: CommandSource = ({ viewer, pathname }) => {
   if (!viewer)
     return [
-      page("home", "Home", "/"),
-      page("signin", "Sign in", `/signin?next=${encodeURIComponent(pathname)}`, ["log in"]),
+      { ...page("home", "Home", "/"), home: true },
+      {
+        ...page("signin", "Sign in", `/signin?next=${encodeURIComponent(pathname)}`, ["log in"]),
+        home: true,
+      },
     ];
   return [
     page("home", "Home", "/", ["dashboard"]),
@@ -115,7 +159,7 @@ const pages: CommandSource = ({ viewer, pathname }) => {
 };
 
 /** The current repository's sections, from the same list as its tabs. */
-const repository: CommandSource = ({ repo }) =>
+const repository: CommandSource = ({ viewer, repo }) =>
   repo
     ? repoSections(repo).map((section) => ({
         id: `repo:${section.id}`,
@@ -123,9 +167,13 @@ const repository: CommandSource = ({ repo }) =>
         title: section.label,
         hint: `${repo.owner.slug}/${repo.name}`,
         keywords: section.keywords,
+        home: !viewer,
         run: { kind: "navigate" as const, to: section.to },
       }))
     : [];
+
+/** Where Go to leads: the current repository's sections, then the app's pages. */
+export const destinations: CommandSource = (context) => [...repository(context), ...pages(context)];
 
 const actions: CommandSource = ({ viewer, query }) => {
   if (!viewer) return [];
@@ -154,10 +202,36 @@ const actions: CommandSource = ({ viewer, query }) => {
       title: "Open the assistant",
       hint: "⌘J",
       keywords: ["ask", "chat", "help"],
+      home: true,
       run: { kind: "action", perform: (env) => env.assistant.show() },
     },
   ];
 };
+
+const FINDS: { category: SearchCategory; title: string; keywords: string[] }[] = [
+  { category: "repositories", title: "Find a repository…", keywords: ["repos", "projects"] },
+  { category: "issues", title: "Find an issue…", keywords: ["tickets", "tasks", "tracker"] },
+  {
+    category: "accounts",
+    title: "Find a person or organization…",
+    keywords: ["people", "users", "orgs", "teams", "members"],
+  },
+  { category: "packages", title: "Find a package…", keywords: ["registry"] },
+  { category: "conversations", title: "Find a conversation…", keywords: ["chats", "assistant"] },
+];
+
+/** Search one kind of thing, with more results than instant search shows for each. */
+const find: CommandSource = ({ viewer }) =>
+  viewer
+    ? FINDS.map(({ category, title, keywords }) => ({
+        id: `find:${category}`,
+        group: "find" as const,
+        title,
+        keywords: ["search", ...keywords],
+        home: true,
+        run: { kind: "scope" as const, scope: { kind: "find" as const, category } },
+      }))
+    : [];
 
 /** The tracker the viewer is in: the one being viewed, or the repository owner's. */
 export function contextTracker({ pathname, repo, trackers }: PaletteContext) {
@@ -186,12 +260,19 @@ const createIssue: CommandSource = (context) => {
     to: `/tracker/${encodeURIComponent(tracker.slug)}`,
     state: createIntent(title),
   });
+  const target =
+    here ??
+    trackers.find((tracker) => tracker.id === context.defaultTrackerId) ??
+    trackers.find((tracker) => tracker.id === viewer.id) ??
+    null;
+  // Before anything's typed, only the likeliest tracker; typing finds the rest.
   const commands: Command[] = ordered.map((tracker) => ({
     id: `create:${tracker.id}`,
     group: "actions",
     title: `Create issue in ${tracker.displayName}`,
     hint: tracker.slug,
     keywords: ["new issue", "ticket", "task", tracker.slug],
+    home: tracker.id === (target ?? ordered[0])?.id,
     run: open(tracker, ""),
   }));
   // Text that finds one of those commands ("create issue", "new issue in
@@ -204,11 +285,6 @@ const createIssue: CommandSource = (context) => {
       searched: command.keywords ?? [],
     }),
   );
-  const target =
-    here ??
-    trackers.find((tracker) => tracker.id === context.defaultTrackerId) ??
-    trackers.find((tracker) => tracker.id === viewer.id) ??
-    null;
   if (!proposed || !target || naming) return commands;
   return [
     {
@@ -239,6 +315,7 @@ const knowledge: CommandSource = ({ viewer, repo }) => {
           title: "Search code and wiki",
           hint: `${repo.owner.slug}/${repo.name}`,
           keywords,
+          home: true,
           run: {
             kind: "scope",
             scope: {
@@ -253,20 +330,23 @@ const knowledge: CommandSource = ({ viewer, repo }) => {
     : [
         {
           id: "knowledge:pick",
-          group: "actions",
+          group: "find",
           title: "Search code and wiki in a repository…",
           keywords,
+          home: true,
           run: { kind: "scope", scope: { kind: "pick" } },
         },
       ];
 };
 
 export const COMMAND_SOURCES: readonly CommandSource[] = [
+  navigate,
   pages,
   repository,
   knowledge,
   createIssue,
   actions,
+  find,
 ];
 
 export interface MatchedCommand {
@@ -274,16 +354,20 @@ export interface MatchedCommand {
   match: SearchMatch;
 }
 
-/** Commands matching `query`, strongest first within each group; all of them for an empty query. */
+/**
+ * Commands matching `query`, strongest first within each group. For an empty
+ * query, the `home` ones, or every one when `everything` (inside Go to).
+ */
 export function matchCommands(
   commands: Command[],
   query: string,
-  perGroup = 6,
+  { perGroup = 6, everything = false }: { perGroup?: number; everything?: boolean } = {},
 ): Map<CommandGroup, MatchedCommand[]> {
   const groups = new Map<CommandGroup, MatchedCommand[]>();
   const blank = !query.trim();
   commands.forEach((command) => {
     if (command.always && blank) return;
+    if (blank && !everything && !command.home) return;
     const match: SearchMatch | null = blank
       ? "contains"
       : command.always
