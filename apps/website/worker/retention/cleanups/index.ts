@@ -11,6 +11,7 @@ import { aiSpend } from "./ai-spend.ts";
 import { analysisCaches } from "./analysis-caches.ts";
 import { endedTimelineData } from "./ended-timeline-data.ts";
 import { knowledgeBuilds } from "./knowledge-builds.ts";
+import { assistantChats } from "./assistant-chats.ts";
 import { previewRecords } from "./preview-records.ts";
 import { aiUsage, durableRegistry, usageHistory } from "./usage.ts";
 import { closedIssues, trackerActivity } from "./tracker.ts";
@@ -33,6 +34,7 @@ const CLEANUPS: Partial<Record<CategoryId, CategoryCleanup<any>>> = {
   "ended-timeline-data": endedTimelineData,
   "analysis-caches": analysisCaches,
   "ai-spend": aiSpend,
+  "assistant-chats": assistantChats,
 };
 
 export function cleanupFor(id: string): CategoryCleanup | undefined {

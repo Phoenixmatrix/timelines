@@ -185,6 +185,35 @@ function background(work: Promise<unknown>): void {
 }
 
 /**
+ * A purge call's report. The Agents SDK's destroy() deletes the assistant's
+ * storage, then aborts the instance on the next tick, which can beat the
+ * RPC's reply: that abort means the purge happened, with nothing left.
+ */
+async function settled<T extends PurgeReport | null>(
+  cls: DurableClass,
+  reason: string,
+  call: () => Promise<T>,
+): Promise<T | PurgeReport> {
+  try {
+    return await call();
+  } catch (error) {
+    const reset =
+      (error as { durableObjectReset?: boolean } | null)?.durableObjectReset === true &&
+      error instanceof Error &&
+      error.message === "destroyed";
+    if (cls !== "Assistant" || !reset) throw error;
+    return {
+      reason,
+      purgedAt: new Date().toISOString(),
+      bytes: 0,
+      tables: [],
+      keys: 0,
+      alarm: null,
+    };
+  }
+}
+
+/**
  * Purge an instance now (its purge(): alarm cancelled, external resources
  * released, storage deleted) and record it. Idempotent.
  */
@@ -195,9 +224,26 @@ export async function purgeInstance(
   reason: string,
 ): Promise<PurgeReport> {
   const stub = await contractStub(env, cls, name);
-  const report = await stub.purge(reason);
+  const report = (await settled(cls, reason, () => stub.purge(reason)))!;
   recorded.delete(key(cls, name));
   await recordPurge(env, cls, name, report);
+  return report;
+}
+
+/**
+ * Purge an assistant chat unless it's being written to (retention, CORE-204),
+ * and record it. Null when a turn is in progress: nothing changed.
+ */
+export async function purgeIdleChat(
+  env: Env,
+  name: string,
+  reason: string,
+): Promise<PurgeReport | null> {
+  const stub = await agentStub(env, name);
+  const report = await settled("Assistant", reason, () => stub.purgeIfIdle(reason));
+  if (!report) return null;
+  recorded.delete(key("Assistant", name));
+  await recordPurge(env, "Assistant", name, report);
   return report;
 }
 

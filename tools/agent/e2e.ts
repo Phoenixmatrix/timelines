@@ -2655,6 +2655,131 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
+  await scenario("assistant-chats-expire", async () => {
+    // CORE-204, in the real runtime: jun turns on assistant chat expiration;
+    // the chat list says when each chat expires; a run 100 days ahead (a dry
+    // run first) purges the chat nobody used (its Durable Object through the
+    // registry, which records it) and keeps the one used since. The browser's
+    // list shows the expiry, then no longer shows the purged chat.
+    const owner = "jun";
+    const token = fixtures.tokens.jun;
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    const tag = randomUUID().replaceAll("-", "").slice(0, 10);
+    const stale = { id: `e2e-stale-${tag}`, title: `Stale chat ${tag}` };
+    const used = { id: `e2e-used-${tag}`, title: `Used chat ${tag}` };
+    const settings = `/api/accounts/${owner}/settings/retention`;
+    type Chat = { id: string; title: string; expiresAt: string | null };
+    const list = async () =>
+      (await json<{ chats: Chat[] }>("/api/assistant/chats", token)).chats.filter((chat) =>
+        chat.id.endsWith(tag),
+      );
+    await json("/api/dev/assistant-chat", secret, "POST", { account: owner, ...stale });
+    // Used again "later": still active when the run's moment comes.
+    await json("/api/dev/assistant-chat", secret, "POST", {
+      account: owner,
+      ...used,
+      updatedAt: new Date(Date.now() + 95 * 86_400_000).toISOString(),
+    });
+    assert.deepEqual(
+      (await list()).map((chat) => chat.expiresAt),
+      [null, null],
+      "No expiry while the policy is off",
+    );
+    await json(settings, token, "PATCH", { categories: { "assistant-chats": { enabled: true } } });
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ baseURL: ctx.origin });
+    const page = await context.newPage();
+    try {
+      const expiring = await list();
+      const staleExpiry = expiring.find((chat) => chat.id === stale.id)?.expiresAt;
+      assert(staleExpiry, "The chat list says when the stale chat expires");
+      const days = Math.round((Date.parse(staleExpiry) - Date.now()) / 86_400_000);
+      assert.equal(days, 90, "Ninety days after its last use (the default)");
+
+      const expect = playwrightExpect.configure({ timeout: 15_000 });
+      // The dock remembers being open across page loads: open it only if it's closed.
+      const conversations = async () => {
+        await page.goto("/");
+        const toggle = page.getByRole("button", { name: "Assistant", exact: true });
+        await expect(toggle).toBeVisible();
+        if ((await toggle.getAttribute("aria-pressed")) !== "true") await toggle.click();
+        const dock = page.getByRole("complementary", { name: "Assistant" });
+        await dock.getByRole("button", { name: "Conversations", exact: true }).click();
+      };
+      await page.goto("/signin");
+      await page.getByRole("button", { name: /Continue as jun/i }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      await conversations();
+      const row = page.getByRole("button", { name: new RegExp(`^${stale.title}`) });
+      await expect(row).toBeVisible();
+      await expect(row).toContainText(/expires in (89|90) days/);
+      await page.screenshot({ path: join(ctx.artifacts, "browser-assistant-chat-expiry.png") });
+
+      type Run = { run: { status: string; items: number; bytes: number } };
+      const runs: Run["run"][] = [];
+      for (const dryRun of [true, false])
+        runs.push(
+          (
+            await json<Run>("/api/dev/retention", secret, "POST", {
+              account: owner,
+              categories: { "assistant-chats": { days: 90, maxPerUser: 0 } },
+              daysAhead: 100,
+              dryRun,
+            })
+          ).run,
+        );
+      const [dry, real] = runs as [Run["run"], Run["run"]];
+      assert.equal(real.status, "succeeded");
+      assert(dry.items >= 1, "The dry run lists the stale chat");
+      assert.equal(real.items, dry.items, "The run purges what the dry run listed");
+      assert.equal(real.bytes, dry.bytes);
+
+      assert.deepEqual(
+        (await list()).map((chat) => chat.id),
+        [used.id],
+        "The stale chat is gone, the used one stays",
+      );
+      const purged = await json<{
+        instance: { purged_at: string | null; purge_reason: string | null } | null;
+        listed: boolean;
+      }>("/api/dev/assistant-chat", secret, "POST", { account: owner, id: stale.id });
+      assert.equal(purged.listed, false);
+      assert(purged.instance?.purged_at, "The registry records the purge");
+      assert.match(purged.instance?.purge_reason ?? "", /^retention: /);
+      const kept = await json<{ instance: { purged_at: string | null } | null }>(
+        "/api/dev/assistant-chat",
+        secret,
+        "POST",
+        { account: owner, id: used.id },
+      );
+      assert.equal(kept.instance?.purged_at, null, "The used chat's object stays");
+
+      await conversations();
+      await expect(page.getByRole("button", { name: new RegExp(`^${used.title}`) })).toBeVisible();
+      await expect(page.getByRole("button", { name: new RegExp(`^${stale.title}`) })).toHaveCount(
+        0,
+      );
+      record({ purged: stale.id, kept: used.id, items: real.items, bytes: real.bytes });
+    } catch (error) {
+      await page
+        .screenshot({
+          path: join(ctx.artifacts, "browser-assistant-chat-failure.png"),
+          fullPage: true,
+        })
+        .catch(() => {});
+      throw error;
+    } finally {
+      await context.close();
+      await browser.close();
+      await request(settings, token, "PATCH", {
+        categories: { "assistant-chats": { enabled: null } },
+      }).catch(() => {});
+      await request(`/api/assistant/chats/${used.id}`, token, "DELETE", undefined, [204]).catch(
+        () => {},
+      );
+    }
+  });
+
   await scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;

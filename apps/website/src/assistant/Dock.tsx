@@ -8,7 +8,7 @@ import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import type { AssistantChat } from "../../shared/assistant.ts";
 import { popMotion, Tip } from "../components/ui.tsx";
 import { api } from "../lib/api.ts";
-import { timeAgo } from "../lib/format.ts";
+import { fullDate, timeAgo } from "../lib/format.ts";
 import { usePageContext } from "./page.ts";
 import { useAssistant } from "./state.tsx";
 
@@ -150,6 +150,13 @@ export function AssistantDock() {
   );
 }
 
+/** When retention deletes an unused chat (CORE-204), as the list says it. */
+export function expiry(expiresAt: string, now = Date.now()): string {
+  const days = Math.ceil((Date.parse(expiresAt) - now) / 86_400_000);
+  if (days <= 0) return "expires at the next cleanup";
+  return days === 1 ? "expires in 1 day" : `expires in ${days} days`;
+}
+
 function History({
   chats,
   current,
@@ -201,6 +208,11 @@ function History({
                       <span className="text-micro text-ink-faint">
                         {timeAgo(chat.updatedAt)}
                         {chat.source === "cli" && " · gm ask"}
+                        {chat.expiresAt && (
+                          <span title={`Retention deletes it ${fullDate(chat.expiresAt)}`}>
+                            {` · ${expiry(chat.expiresAt)}`}
+                          </span>
+                        )}
                       </span>
                     </button>
                     <button

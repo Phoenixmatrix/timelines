@@ -145,7 +145,11 @@ export const CATEGORIES = [
     control: "policy",
     label: "Assistant chats",
     description: "Assistant chats nobody has used for the given days.",
-    never: ["Chats used within the period"],
+    never: [
+      "Chats used within the period (unless over the per-person limit)",
+      "A chat with a turn in progress",
+      "The newest chats up to the per-person limit",
+    ],
     thresholds: [
       days("days", "Days without activity", 90),
       {

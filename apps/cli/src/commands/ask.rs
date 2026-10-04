@@ -168,7 +168,7 @@ pub fn assistant(ctx: &Ctx, command: &AssistantCommand) -> Result<Shown> {
                     .iter()
                     .map(|c| {
                         format!(
-                            "{}  {}  {}{}",
+                            "{}  {}  {}{}{}",
                             c["id"].as_str().unwrap_or(""),
                             c["updatedAt"].as_str().unwrap_or(""),
                             c["title"]
@@ -179,7 +179,12 @@ pub fn assistant(ctx: &Ctx, command: &AssistantCommand) -> Result<Shown> {
                                 "  · gm ask"
                             } else {
                                 ""
-                            }
+                            },
+                            // Retention (CORE-204): when an unused chat is deleted.
+                            c["expiresAt"]
+                                .as_str()
+                                .map(|at| format!("  · expires {at}"))
+                                .unwrap_or_default()
                         )
                     })
                     .collect::<Vec<_>>()

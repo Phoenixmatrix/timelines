@@ -16,6 +16,7 @@ import {
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { findAccountBySlug } from "../db.ts";
 import { probeDurableObjects } from "../durable/probe.ts";
+import { durableAgent, instanceStorage } from "../durable/registry.ts";
 import { collectUsage } from "../usage/collect.ts";
 import { advanceRun, createRun, getRun } from "../retention/runs.ts";
 import { SYSTEM_ACTOR } from "../../registry/core/auth/system.ts";
@@ -93,6 +94,7 @@ dev.use("*", async (c, next) => {
       "/repo-inventory",
       "/repo-purge",
       "/repo-orphans",
+      "/assistant-chat",
     ].some((path) => c.req.path.endsWith(path))
   ) {
     const secret = Reflect.get(c.env, "AGENT_SECRET");
@@ -276,6 +278,48 @@ dev.post("/repo-orphans", async (c) => {
     return c.json(state);
   }
   return fail(c, 400, "action is plant or sweep.");
+});
+
+// An assistant chat without a model call (CORE-204): its directory row (last
+// used `updatedAt`) and its Durable Object, woken through the registry so it
+// holds storage and is recorded. Without `title`, only reports on it.
+dev.post("/assistant-chat", async (c) => {
+  const { account, id, title, updatedAt } = await readJson<{
+    account?: string;
+    id?: string;
+    title?: string;
+    updatedAt?: string;
+  }>(c);
+  const found = account ? await findAccountBySlug(c.env.DB, account) : null;
+  if (!found || !id || !/^[A-Za-z0-9_-]{8,64}$/.test(id))
+    return fail(c, 400, "account and a chat id are required.");
+  const name = `${found.id}:${id}`;
+  const instance = () =>
+    c.env.DB.prepare(
+      "SELECT purged_at, purge_reason FROM do_instances WHERE class = 'Assistant' AND name = ?",
+    )
+      .bind(name)
+      .first<{ purged_at: string | null; purge_reason: string | null }>();
+  if (title) {
+    const at = updatedAt ?? new Date().toISOString();
+    await c.env.DB.prepare(
+      `INSERT INTO assistant_chats (id, user_id, title, source, updated_at) VALUES (?, ?, ?, 'web', ?)
+       ON CONFLICT (id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at`,
+    )
+      .bind(id, found.id, title, at)
+      .run();
+    await (await durableAgent(c.env, "Assistant", name)).transcript();
+    for (let i = 0; i < 40 && !(await instance()); i++)
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    return c.json({
+      instance: await instance(),
+      storage: await instanceStorage(c.env, "Assistant", name),
+    });
+  }
+  const row = await c.env.DB.prepare("SELECT id FROM assistant_chats WHERE id = ?")
+    .bind(id)
+    .first();
+  return c.json({ instance: await instance(), listed: row !== null });
 });
 
 dev.get("/environment", async (c) => {
