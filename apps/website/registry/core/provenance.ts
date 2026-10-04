@@ -84,6 +84,7 @@ async function repoNames(gitmatrix: GitmatrixDB, ids: string[]): Promise<Map<str
     .innerJoin("accounts as o", "o.id", "r.owner_id")
     .select(["r.id", "r.name", "o.slug"])
     .where("r.id", "in", ids)
+    .where("r.deleted_at", "is", null)
     .execute();
   return new Map(results.map((r) => [r.id, `${r.slug}/${r.name}`]));
 }
@@ -118,6 +119,7 @@ async function writesAny(
         .as("collaborator_role"),
     ])
     .where("r.id", "in", repoIds)
+    .where("r.deleted_at", "is", null)
     .execute();
   return results.some((row) =>
     atLeast(

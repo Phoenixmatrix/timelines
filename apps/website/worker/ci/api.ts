@@ -37,6 +37,7 @@ import { findRepo, roleFor } from "../db.ts";
 import { RepoReader } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 import { batch, db, nowIso, type DB } from "../schema.ts";
+import { cancelRun } from "./cancel.ts";
 import { claim, jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
 import { mintJobToken } from "./registry.ts";
 import { startRun } from "./trigger.ts";
@@ -204,9 +205,7 @@ async function missingRun(d1: D1Database, repoId: string, number: number): Promi
 ci.post("/runs/:number{[0-9]+}/cancel", async (c) => {
   const repo = await loadRepo(c, "write");
   if (repo instanceof Response) return repo;
-  const d1 = c.env.DB;
-  const kdb = db(d1);
-  const run = await kdb
+  const run = await db(c.env.DB)
     .selectFrom("ci_runs")
     .select(["id", "status"])
     .where("repo_id", "=", repo.row.id)
@@ -216,26 +215,7 @@ ci.post("/runs/:number{[0-9]+}/cancel", async (c) => {
   if (run.status !== "queued" && run.status !== "running") {
     return fail(c, 409, `The run already ${run.status}.`);
   }
-  // Runners notice on their next report and stop; the Workflow stops now.
-  const now = nowIso();
-  await batch(d1, [
-    kdb
-      .updateTable("ci_runs")
-      .set({ status: "cancelled", finished_at: now })
-      .where("id", "=", run.id),
-    kdb
-      .updateTable("ci_jobs")
-      .set({ status: "cancelled", finished_at: now })
-      .where("run_id", "=", run.id)
-      .where("status", "in", ["pending", "queued", "running"]),
-    kdb
-      .updateTable("ci_steps")
-      .set({ status: "cancelled", finished_at: now })
-      .where("job_id", "in", kdb.selectFrom("ci_jobs").select("id").where("run_id", "=", run.id))
-      .where("status", "in", ["pending", "running"]),
-  ]);
-  const instance = await c.env.CI_RUN.get(run.id).catch(() => null);
-  await instance?.terminate().catch(() => {});
+  await cancelRun(c.env, run.id);
   return c.json({ ok: true });
 });
 
@@ -384,14 +364,18 @@ ci.delete("/secrets/:secret", async (c) => {
 
 export const runner = new Hono<AppEnv>();
 
-/** Whether the actor may run (and see the secrets of) jobs for a repo. */
+/**
+ * Whether the actor may run (and see the secrets of) jobs for a repo. A
+ * repository being deleted still runs its previews' teardown (CORE-199); its
+ * other runs were cancelled when the deletion started.
+ */
 async function mayRun(
   d1: D1Database,
   actor: NonNullable<AppEnv["Variables"]["actor"]>,
   repo: string,
 ) {
   const [owner, name] = repo.split("/");
-  const row = await findRepo(d1, actor, owner ?? "", name ?? "");
+  const row = await findRepo(d1, actor, owner ?? "", name ?? "", { deleting: true });
   return row !== null && atLeast(roleFor(row, actor), "write");
 }
 

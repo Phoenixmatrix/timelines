@@ -99,6 +99,7 @@ async function source(
     .innerJoin("accounts as a", "a.id", "r.owner_id")
     .select(["r.id", "r.owner_id", "r.name", "r.artifacts_name", "r.artifacts_remote", "a.slug"])
     .where("r.id", "=", repoId)
+    .where("r.deleted_at", "is", null)
     .executeTakeFirst();
   if (!row) return null;
   const reader = new RepoReader(

@@ -208,6 +208,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
           .selectFrom("repos")
           .select(["artifacts_name", "artifacts_remote", "owner_id"])
           .where("id", "=", state.repoId)
+          .where("deleted_at", "is", null)
           .executeTakeFirst(),
         db(this.env.DB)
           .selectFrom("kg_state")

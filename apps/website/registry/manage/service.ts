@@ -96,6 +96,7 @@ export function directory(services: Services, owner: { slug: string }): Director
         .select("r.id")
         .where("o.slug", "=", ownerSlug ?? "")
         .where("r.name", "=", name ?? "")
+        .where("r.deleted_at", "is", null)
         .execute();
       return results.map((r) => r.id);
     },
@@ -108,6 +109,7 @@ export function directory(services: Services, owner: { slug: string }): Director
           .innerJoin("accounts as o", "o.id", "r.owner_id")
           .select(["r.id", "r.name", "o.slug"])
           .where("r.id", "in", chunk)
+          .where("r.deleted_at", "is", null)
           .execute();
         for (const row of results) names.set(row.id, `${row.slug}/${row.name}`);
       }

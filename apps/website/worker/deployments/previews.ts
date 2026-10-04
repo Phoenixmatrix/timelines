@@ -96,6 +96,8 @@ async function ciRepos(d1: D1Database, ids: string[]): Promise<Map<string, Previ
     .selectFrom("repos")
     .select(["id", "artifacts_name", "artifacts_remote", "default_branch"])
     .where("id", "in", ids)
+    // A repository being deleted tears its previews down instead (CORE-199).
+    .where("deleted_at", "is", null)
     .execute();
   return new Map(rows.map((row) => [row.id, row]));
 }

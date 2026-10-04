@@ -2530,6 +2530,54 @@ with the price catalog (CORE-208, `cloudflare_prices`). The report
 | `GET /api/accounts/:slug/usage` | `UsageReport`; `?format=csv` for one row per figure with its price and monthly cost (administrators; members 403, others 404) |
 | `GET /api/admin/usage`          | The site's `UsageReport` with `accounts`; `?format=csv` (site administrators)                                                 |
 
+### Repository deletion
+
+Deleting a repository (CORE-199, `worker/retention/repo-deletion.ts`) removes
+everything it owned, everywhere, in two steps:
+
+- **Tombstone.** `DELETE /api/repos/:owner/:name` sets `repos.deleted_at` and
+  records the deletion in `repo_deletions`, in one transaction. From then on
+  the repository is missing to every reader (`selectRepos`/`findRepo` and the
+  other repository lookups skip it; pass `{deleting: true}` only where a
+  deletion's own preview teardown needs it: the local runner claiming,
+  checking out and reporting its job). The name stays taken (409 "being
+  deleted") until the purge ends.
+- **Purge.** The `RepoPurge` Workflow (`repo-purge.ts`) runs the phases in
+  order, each step bounded and idempotent, recording the phase and its counts
+  in `repo_deletions.progress`: `stop` (purge the KnowledgeCoordinator,
+  terminate its builds, cancel CI runs), `previews` (expire live timeline
+  previews and start the project's own teardown run per timeline, as the
+  preview sweep does, then wait for them up to 2 hours), `vectors` (Vectorize
+  ids from `kg_nodes`, then the `repo` metadata filter until nothing is
+  found), `search` (AI Search items from `kg_search_items`, then by metadata and
+  key prefix), `durable` (every registered instance it owns), `links`
+  (earlier days' `atlas_spend` go, today's stay detached for the account's
+  ceiling; registry `package_sources` go, `publishes` keep the package history
+  without the repository), `artifacts`, and `rows` (large children in batches,
+  then the repository row and its cascade). The hourly cron
+  (`resumeDeletions`) starts a new instance for a deletion whose Workflow
+  died; it resumes from the recorded phase. A timeline preview has no
+  Workflow: the purge runs on the request's `waitUntil`.
+- **Orphans** (`repo-orphans.ts`): what deletions before this left behind is
+  swept once by production's cron: AI Search items and `atlas_spend`,
+  `do_instances` and registry links naming unknown repository ids become
+  `repo_deletions` rows (`source = 'orphan-sweep'`) purged through the phases
+  that need no row; Artifacts repositories no row names and older than a day
+  are deleted. Vectorize can't be listed from a Worker, so vectors only a
+  deleted repository's id names are found through the metadata filter of ids
+  found elsewhere; the sweep records the index's vector count beside the
+  count live graphs account for.
+
+`GET /api/dev/repo-inventory?repo=<id|owner/name>` lists what a repository
+holds in every store (D1 tables, registry, Durable Objects, Artifacts,
+Vectorize, AI Search, previews) and its deletion's progress;
+`POST /api/dev/repo-purge {repo, action: "terminate"|"resume"}` kills or
+restarts a purge and `POST /api/dev/repo-orphans {action: "plant"|"sweep"}`
+plants and sweeps orphans (isolated agent environments only). E2E:
+`repository-deletion-purges-everything-and-resumes` (ready: Artifacts, a live
+preview's teardown, a killed purge resumed, the name reused) and the
+`repository-deletion` stage of `agent test-ai` (Vectorize, AI Search).
+
 ## Layout
 
 - `worker/git/http.ts`: smart HTTP proxy (info/refs, upload-pack, receive-pack);

@@ -54,3 +54,14 @@ export function migratedDatabase(): DatabaseSync {
     sqlite.exec(readFileSync(join(dir, file), "utf8"));
   return sqlite;
 }
+
+/** A fresh in-memory registry database (REGISTRY_DB) with registry/migrations applied. */
+export function migratedRegistryDatabase(): DatabaseSync {
+  const sqlite = new DatabaseSync(":memory:");
+  const dir = fileURLToPath(new URL("../../registry/migrations/", import.meta.url).href);
+  for (const file of readdirSync(dir)
+    .filter((f) => f.endsWith(".sql"))
+    .sort())
+    sqlite.exec(readFileSync(join(dir, file), "utf8"));
+  return sqlite;
+}

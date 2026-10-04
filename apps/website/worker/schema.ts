@@ -70,6 +70,25 @@ export interface Database {
     pushed_at: string | null;
     /** Pack bytes pushed through the proxy since CORE-207 (Artifacts' size estimate). */
     pushed_bytes: Generated<number>;
+    /** Set when deletion starts (CORE-199): missing to readers until the purge removes the row. */
+    deleted_at: Generated<string | null>;
+  };
+  /** Repository deletions and what their purge did (CORE-199, worker/retention/repo-purge.ts). */
+  repo_deletions: {
+    repo_id: string;
+    owner_id: string;
+    full_name: string;
+    artifacts_name: string | null;
+    source: Generated<"delete" | "orphan-sweep">;
+    requested_by: string | null;
+    requested_at: string;
+    phase: string;
+    progress: Generated<string>;
+    workflow_id: string | null;
+    attempts: Generated<number>;
+    updated_at: string;
+    finished_at: string | null;
+    error: string | null;
   };
   repo_collaborators: {
     repo_id: string;

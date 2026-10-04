@@ -122,6 +122,8 @@ async function repoRow(d1: D1Database, repoId: string): Promise<RepoRow | null> 
     .innerJoin("accounts as o", "o.id", "r.owner_id")
     .select(["r.id", "r.artifacts_name", "r.artifacts_remote", "o.slug", "r.name"])
     .where("r.id", "=", repoId)
+    // A repository being deleted builds nothing more (CORE-199).
+    .where("r.deleted_at", "is", null)
     .executeTakeFirst();
   if (!row) return null;
   return {

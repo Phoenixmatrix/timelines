@@ -35,6 +35,7 @@ export const TABLE_GROUPS: TableGroup[] = [
     label: "Repositories, collaborators, mirrors and refs",
     tables: {
       repos: "owner_id = ?1",
+      repo_deletions: "owner_id = ?1",
       repo_collaborators: REPO,
       repo_mirrors: REPO,
       repo_refs: REPO,

@@ -50,7 +50,9 @@ import {
 import { app as server } from "../app.ts";
 import { issueToken } from "../api/tokens.ts";
 import { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { fakeDurableState } from "../testing/durable-state.ts";
+import { runPurge } from "../retention/repo-deletion.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { clearCompositionCache } from "./compose.ts";
 import { publishAtlasFixture, writeAtlasFixtureGraph } from "./fixture.ts";
@@ -89,22 +91,6 @@ const OTHER = "Marrowind"; // ann/other, private to ann
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 const enc = encodeURIComponent;
-
-/** A Durable Object's state, in memory. */
-function objectState() {
-  const values = new Map<string, unknown>();
-  let alarm: number | null = null;
-  return {
-    storage: {
-      get: async (key: string) => structuredClone(values.get(key)),
-      put: async (key: string, value: unknown) => void values.set(key, structuredClone(value)),
-      getAlarm: async () => alarm,
-      setAlarm: async (at: number) => void (alarm = at),
-      deleteAlarm: async () => void (alarm = null),
-    },
-    blockConcurrencyWhile: <T>(fn: () => Promise<T>) => fn(),
-  } as unknown as DurableObjectState;
-}
 
 /** A binding any touch of which fails the request, and is recorded. */
 function forbidden(name: string, touched: string[]) {
@@ -218,11 +204,13 @@ async function world() {
       SEARCH: forbidden("SEARCH", touched),
       KNOWLEDGE_BUILD: forbidden("KNOWLEDGE_BUILD", touched),
       KNOWLEDGE_QUEUE: forbidden("KNOWLEDGE_QUEUE", touched),
+      // Deleting a repository starts its purge (CORE-199); the test runs it.
+      REPO_PURGE: { create: async () => ({}) },
       KNOWLEDGE_COORDINATOR: {
         getByName: (id: string) => {
           let found = coordinators.get(id);
           if (!found) {
-            found = new KnowledgeCoordinator(objectState(), env);
+            found = new KnowledgeCoordinator(fakeDurableState({ name: id }).ctx, env);
             coordinators.set(id, found);
           }
           return found;
@@ -278,6 +266,7 @@ async function world() {
   return {
     sqlite,
     db: DB,
+    env: warmEnv,
     touched,
     queries,
     /** Route the browser client's fetches (src/lib/atlas.ts) into the app, as `who`. */
@@ -742,6 +731,20 @@ describe("Atlas authorization, revocation and privacy", () => {
 
     const deleted = await w.call("ann", "/api/repos/ann/vault", { method: "DELETE" });
     expect(deleted.status).toBeLessThan(300);
+    // The purge (CORE-199), without the providers this world forbids.
+    const purged = await runPurge(
+      {
+        ...w.env,
+        VECTORS: undefined,
+        SEARCH: undefined,
+        KNOWLEDGE_BUILD: undefined,
+        REGISTRY_DB: d1(migratedRegistryDatabase()),
+      } as unknown as Env,
+      "r_vault",
+      { do: (_name, _config, work) => work(), sleep: async () => {} },
+      { waitUntil: () => {} },
+    );
+    expect(purged).toBe("done");
     expect(rows().filter(([, n]) => n > 0)).toEqual([]);
     for (const table of ["atlas_feed", "kg_nodes", "kg_edges", "wiki_pages", "kg_overlays"])
       expect(

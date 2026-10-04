@@ -310,6 +310,7 @@ timelines.post("/:slug/abandon", async (c) => {
       "r.artifacts_remote",
     ])
     .where("r.id", "in", ids)
+    .where("r.deleted_at", "is", null)
     .execute();
   // Each bookmark's last commit goes into the abandon event before it's deleted.
   const tips = new Map<string, { row: BookmarkRepo; ref: string; tip: string | null }>();

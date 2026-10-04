@@ -13,7 +13,8 @@ import type {
   Visibility,
 } from "../../shared/api.ts";
 import type { AppEnv } from "../auth.ts";
-import { forgetUpstreamTokens, isArtifactsError, newArtifactsName } from "../artifacts.ts";
+import { isArtifactsError, newArtifactsName } from "../artifacts.ts";
+import { launchPurge, requestDeletion } from "../retention/repo-deletion.ts";
 import {
   accountSummary,
   canCreateIn,
@@ -103,8 +104,16 @@ repos.post("/", async (c) => {
   if (!(await canCreateIn(c.env.DB, actor, owner))) {
     return fail(c, 403, `You can't create repositories in ${owner.slug}.`);
   }
-  if (await findRepo(c.env.DB, null, owner.slug, name)) {
-    return fail(c, 409, `${owner.slug}/${name} already exists.`);
+  const existing = await findRepo(c.env.DB, null, owner.slug, name, { deleting: true });
+  if (existing) {
+    // A deleted repository keeps its name until its purge ends (CORE-199).
+    return fail(
+      c,
+      409,
+      existing.deleted_at
+        ? `${owner.slug}/${name} is being deleted. Its name is free again once that finishes.`
+        : `${owner.slug}/${name} already exists.`,
+    );
   }
 
   let importUrl: string | null = null;
@@ -440,16 +449,15 @@ repos.delete("/:owner/:name", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
-  // Remove the record first: a failed storage delete leaves an unreachable
-  // orphan rather than a listed repository with no contents.
-  await db(c.env.DB).deleteFrom("repos").where("id", "=", row.id).execute();
-  forgetUpstreamTokens(row.artifacts_name);
-  c.executionCtx.waitUntil(
-    c.env.ARTIFACTS.delete(row.artifacts_name).then(
-      () => undefined,
-      (error: unknown) => console.error("Artifacts delete failed", row.artifacts_name, error),
-    ),
-  );
+  // Tombstoned now, so it's missing to every reader at once; the purge
+  // Workflow then removes what it owned everywhere and, last, the row
+  // (CORE-199, worker/retention/repo-deletion.ts). The cron restarts a purge
+  // that fails to start or dies.
+  const waitUntil = (work: Promise<unknown>) => c.executionCtx.waitUntil(work);
+  if (await requestDeletion(c.env, row, c.get("actor")?.id ?? null))
+    await launchPurge(c.env, row.id, waitUntil).catch((error: unknown) =>
+      console.error("Repository deletion: starting the purge failed", { repo: row.id, error }),
+    );
   return c.body(null, 204);
 });
 

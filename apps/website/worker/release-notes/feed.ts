@@ -197,6 +197,7 @@ export async function releaseFeed(
     .innerJoin("accounts as a", "a.id", "r.owner_id")
     .innerJoin("release_note_state as s", "s.repo_id", "e.repo_id")
     .where("s.format_version", "=", 1)
+    .where("r.deleted_at", "is", null)
     .innerJoin("release_notes as n", (join) =>
       join.onRef("n.repo_id", "=", "e.repo_id").onRef("n.release", "=", "e.release"),
     )

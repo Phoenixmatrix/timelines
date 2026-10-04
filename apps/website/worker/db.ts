@@ -47,6 +47,8 @@ export interface RepoRow {
   imported_from: string | null;
   created_at: string;
   pushed_at: string | null;
+  /** Set while the repository is being deleted (only `deleting` lookups return one). */
+  deleted_at: string | null;
   owner_slug: string;
   owner_kind: "user" | "org";
   owner_display_name: string;
@@ -60,9 +62,16 @@ export interface RepoRow {
 export const sqlNow = sql<string>`strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`;
 
 // The viewer's account id is "" when signed out, so the per-viewer columns
-// come back null for anonymous requests.
-export function selectRepos(d1: D1Database, viewerId: string) {
-  return db(d1)
+// come back null for anonymous requests. A repository being deleted
+// (deleted_at, CORE-199) is missing to every reader; only the paths a
+// deletion's own preview teardown needs (a local runner claiming and
+// reporting its job) ask for it with `deleting`.
+export function selectRepos(
+  d1: D1Database,
+  viewerId: string,
+  options: { deleting?: boolean } = {},
+) {
+  const query = db(d1)
     .selectFrom("repos as r")
     .innerJoin("accounts as o", "o.id", "r.owner_id")
     .selectAll("r")
@@ -85,6 +94,7 @@ export function selectRepos(d1: D1Database, viewerId: string) {
         .where("c.user_id", "=", viewerId)
         .as("collaborator_role"),
     ]);
+  return options.deleting ? query : query.where("r.deleted_at", "is", null);
 }
 
 export function accountSummary(row: AccountRow): AccountSummary {
@@ -182,8 +192,9 @@ export async function findRepo(
   actor: Actor | null,
   owner: string,
   name: string,
+  options: { deleting?: boolean } = {},
 ): Promise<RepoRow | null> {
-  const row = await selectRepos(d1, actor?.id ?? "")
+  const row = await selectRepos(d1, actor?.id ?? "", options)
     .where("o.slug", "=", owner)
     .where("r.name", "=", name)
     .executeTakeFirst();

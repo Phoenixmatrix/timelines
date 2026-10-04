@@ -126,11 +126,13 @@ async function writer(c: Context<AppEnv>): Promise<Writer | Response> {
   if (secret) {
     const job = await jobCaller(c.env.DB, secret);
     if (!job) return fail(c, 401, "The CI job's credential is invalid, or the job has ended.");
+    // A deletion's preview teardown job still reports (CORE-199).
     const repo = await findRepo(
       c.env.DB,
       null,
       c.req.param("owner") ?? "",
       c.req.param("name") ?? "",
+      { deleting: true },
     );
     if (!repo || repo.id !== job.repoId)
       return fail(c, 403, "A CI job records deployments for its own repository only.");

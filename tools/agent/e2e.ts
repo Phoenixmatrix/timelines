@@ -2440,6 +2440,221 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     record({ removed: counts, installed: ["1.0.0", "2.0.0"] });
   });
 
+  await scenario("repository-deletion-purges-everything-and-resumes", async () => {
+    // CORE-199, in the real runtime with real Artifacts: a repository with a
+    // live timeline preview, a registry grant and pushed history is deleted.
+    // It's missing at once; the purge Workflow tears the preview down with the
+    // project's own teardown job (which still checks the repository out), is
+    // killed mid-purge and resumed, and leaves nothing behind; then the name
+    // is free again.
+    interface Inventory {
+      repo: { name: string; deletedAt: string | null } | null;
+      d1: Record<string, number>;
+      registry: { packageSources: number; publishes: number };
+      durable: { class: string; name: string; purgedAt: string | null }[];
+      artifacts: { name: string | null; exists: boolean | null };
+      vectors: number | null;
+      searchItems: number | null;
+      previews: { live: number; teardownsOpen: number };
+      deletion: {
+        phase: string;
+        workflowId: string | null;
+        attempts: number;
+        finishedAt: string | null;
+        progress: {
+          previews?: {
+            groups: { timeline: string; run: { number: number } | null }[];
+            timedOut?: number;
+          };
+          artifacts?: { deleted: boolean };
+          links?: { sources: number };
+          rows?: Record<string, number>;
+        };
+      } | null;
+    }
+    const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+    const name = `agent-delete-${randomUUID().slice(0, 8)}`;
+    const doomed = `${repo.owner}/${name}`;
+    const timeline = `delete-${randomUUID().slice(0, 8)}`;
+    // The local runtime's D1 sometimes fails a query under load: retry a read.
+    const inventory = async (): Promise<Inventory> => {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await json<Inventory>(
+            `/api/dev/repo-inventory?repo=${encodeURIComponent(doomed)}`,
+            secret,
+          );
+        } catch (error) {
+          if (attempt === 3) throw error;
+          await delay(1000);
+        }
+      }
+    };
+    const capability = randomUUID();
+    let tornDown: string | undefined;
+    let gate: ServerResponse | undefined;
+    const collector = createServer((req, res) => {
+      if (req.method === "GET" && req.url === `/${capability}/wait`) {
+        gate = res;
+        res.setTimeout(170_000, () => res.writeHead(504).end());
+        return;
+      }
+      if (req.method !== "POST" || req.url !== `/${capability}`) {
+        res.writeHead(404).end();
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk: Buffer) => {
+        body += chunk.toString();
+        if (body.length > 256) req.destroy();
+      });
+      req.on("end", () => {
+        tornDown = body;
+        res.writeHead(204).end();
+      });
+    });
+    const listening = Promise.withResolvers<void>();
+    collector.once("error", listening.reject);
+    collector.listen(0, "127.0.0.1", listening.resolve);
+    await listening.promise;
+    try {
+      const address = collector.address();
+      assert(address && typeof address !== "string");
+      await gm(["repo", "create", name, "--owner", repo.owner]);
+      const clone = join(work, name);
+      await gm(["clone", doomed, clone]);
+      await writeFile(join(clone, "marker.txt"), "checked out by the teardown\n");
+      await mkdir(join(clone, ".gitmatrix"), { recursive: true });
+      // The teardown proves its checkout, reports, then holds until released.
+      const teardown = [
+        "test -f marker.txt",
+        `curl --fail --silent --show-error --max-time 20 --data "$GITMATRIX_TIMELINE" http://127.0.0.1:${address.port}/${capability}`,
+        `curl --fail --silent --show-error --max-time 180 http://127.0.0.1:${address.port}/${capability}/wait`,
+      ].join("\n");
+      await writeFile(
+        join(clone, ".gitmatrix", "ci.yml"),
+        JSON.stringify({
+          on: { push: { branches: ["never-agent-auto"] }, preview: {} },
+          jobs: {
+            teardown: {
+              if: 'trigger == "preview" && action == "teardown"',
+              steps: [{ run: teardown }],
+            },
+          },
+        }),
+      );
+      await gm(["commit", "-m", "Agent deletion fixture"], "marco", clone);
+      await gm(["push", "--bookmark", "main"], "marco", clone);
+      const detail = await json<RepoDetail>(`/api/repos/${doomed}`, ownerToken);
+      const commit = detail.branches.find((b) => b.shortName === "main")?.oid;
+      assert(commit, "The fixture's main was pushed");
+      await gm([
+        "deploy",
+        "record",
+        "--url",
+        "https://agent-e2e.example.com/deleted-preview",
+        "--timeline",
+        timeline,
+        "--commit",
+        commit,
+        "-R",
+        doomed,
+      ]);
+      // A package the repository may publish: a registry grant that names it.
+      const granted = `${name}-pkg`;
+      const artifact = join(work, `${name}.txt`);
+      await writeFile(artifact, "published before the repository was deleted\n");
+      await gm(["pkg", "upload", artifact, `${granted}/1.0.0/artifact.txt`, "--owner", repo.owner]);
+      await gm(["pkg", "grant", `generic/${granted}`, doomed, "--owner", repo.owner]);
+
+      const before = await inventory();
+      assert.equal(before.repo?.deletedAt, null);
+      assert.equal(before.artifacts.exists, true, "Its Artifacts repository exists");
+      assert.deepEqual(before.previews, { live: 1, teardownsOpen: 0 });
+      assert.equal(before.registry.packageSources, 1, "The registry grant names it");
+      assert((before.d1.ref_updates ?? 0) >= 1, "The push log names it");
+      record({ before });
+
+      await request(`/api/repos/${doomed}`, ownerToken, "DELETE", undefined, [204]);
+      // Missing to every reader at once; the name stays taken until the purge ends.
+      await request(`/api/repos/${doomed}`, ownerToken, "GET", undefined, [404]);
+      await gm(["clone", doomed, join(work, `${name}-again`)], "marco", work, /not found|404/i);
+      const taken = await request(
+        "/api/repos",
+        ownerToken,
+        "POST",
+        { owner: repo.owner, name, visibility: "private" },
+        [409],
+      );
+      assert.match(taken, /being deleted/);
+
+      // The teardown run checked the deleted repository out and is held: the
+      // purge waits in its previews phase. Kill it there, then resume it.
+      await poll(async () => tornDown, Boolean, "the preview's teardown job");
+      assert.equal(tornDown, timeline, "The teardown ran for the preview's timeline");
+      await poll(async () => gate, Boolean, "the teardown's hold");
+      const waiting = await poll(
+        inventory,
+        (value) => value.deletion?.phase === "previews" && Boolean(value.deletion.workflowId),
+        "the purge waiting for its teardown",
+      );
+      assert.equal(waiting.deletion?.attempts, 1);
+      assert.equal(waiting.previews.teardownsOpen, 1);
+      const killed = await json<{ terminated: string; status: { status: string } }>(
+        "/api/dev/repo-purge",
+        secret,
+        "POST",
+        { repo: doomed, action: "terminate" },
+      );
+      assert.equal(killed.terminated, waiting.deletion?.workflowId);
+      const resumed = await json<{ started: string[]; deletion: Inventory["deletion"] }>(
+        "/api/dev/repo-purge",
+        secret,
+        "POST",
+        { repo: doomed, action: "resume" },
+      );
+      assert.equal(resumed.started.length, 1, "The resume started a new purge");
+      assert.equal(resumed.deletion?.attempts, 2);
+      assert.notEqual(resumed.deletion?.workflowId, waiting.deletion?.workflowId);
+      gate!.writeHead(204).end();
+
+      const after = await poll(
+        inventory,
+        (value) => value.deletion?.phase === "done",
+        "the resumed purge to finish",
+        300_000,
+      );
+      assert.equal(after.repo, null, "The repository row is gone");
+      assert.deepEqual(after.d1, {}, "No D1 row names it");
+      assert.deepEqual(after.registry, { packageSources: 0, publishes: 0 });
+      assert.equal(after.artifacts.exists, false, "Its Artifacts repository is deleted");
+      assert.deepEqual(after.previews, { live: 0, teardownsOpen: 0 });
+      for (const instance of after.durable)
+        assert(instance.purgedAt, `${instance.class} ${instance.name} was purged`);
+      assert(!after.vectors && !after.searchItems, "No vector or search item is left");
+      const progress = after.deletion!.progress;
+      assert.equal(progress.previews?.groups.length, 1);
+      assert.equal(progress.previews?.groups[0]?.timeline, timeline);
+      assert(progress.previews?.groups[0]?.run, "One teardown run was started");
+      assert.equal(progress.previews?.timedOut, undefined, "The teardown finished in time");
+      assert.equal(progress.artifacts?.deleted, true);
+      assert.equal(progress.links?.sources, 1);
+      record({ after });
+
+      // Purged, the name is free again.
+      await gm(["repo", "create", name, "--owner", repo.owner]);
+      await request(`/api/repos/${doomed}`, ownerToken, "DELETE", undefined, [204]);
+      await poll(
+        inventory,
+        (value) => value.deletion?.phase === "done" && value.repo === null,
+        "the reused name's purge",
+      );
+    } finally {
+      if (gate && !gate.writableEnded) gate.writeHead(204).end();
+      collector.close();
+    }
+  });
+
   await scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;

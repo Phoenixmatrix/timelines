@@ -248,6 +248,8 @@ export async function syncMirror(env: Env, repoId: string): Promise<MirrorResult
         "r.default_branch",
       ])
       .where("m.repo_id", "=", repoId)
+      // A repository being deleted mirrors nothing more (CORE-199).
+      .where("r.deleted_at", "is", null)
       .executeTakeFirstOrThrow();
     if (!row.token_sealed) throw new MirrorError("The mirror has no token.");
     const token = await unseal(env, row.token_sealed);

@@ -69,6 +69,19 @@ export function durableStub<C extends Exclude<DurableClass, "Assistant">>(
 }
 
 /**
+ * A typed stub that isn't a use: for looking at an instance before purging it
+ * (repository deletion reads a coordinator's running builds), so it neither
+ * records the instance nor revives a purged registry row.
+ */
+export function peekStub<C extends Exclude<DurableClass, "Assistant">>(
+  env: Env,
+  cls: C,
+  name: string,
+): DurableObjectStub<DurableTypes[C]> {
+  return durableNamespace(env, cls).getByName(name);
+}
+
+/**
  * The assistant, an Agents SDK agent, through getAgentByName (it sets the
  * agent's name before the first call), recorded like the others.
  */

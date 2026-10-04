@@ -1,4 +1,5 @@
 import { Hono, type Context } from "hono";
+import { sql } from "kysely";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { forgetUpstreamTokens, upstreamToken } from "../artifacts.ts";
 import { landingJob } from "../ci/landing.ts";
@@ -65,7 +66,11 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     return challenge("Invalid credentials. Use a personal access token as the password.\n");
   }
   const actor = credential.kind === "token" ? credential.actor : null;
-  const repo = await findRepo(c.env.DB, actor, owner, name);
+  const repo =
+    (await findRepo(c.env.DB, actor, owner, name)) ??
+    (service === "git-upload-pack" && actor
+      ? await teardownCheckout(c.env.DB, actor, owner, name)
+      : null);
   const role = repo ? roleFor(repo, actor) : "none";
 
   if (!repo || !atLeast(role, "read")) {
@@ -104,6 +109,33 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     }
   }
   return respond(upstream);
+}
+
+/**
+ * A repository being deleted is missing to everyone (CORE-199) except a local
+ * runner checking out its preview teardown: the purge waits for that run
+ * before the repository goes. Only the runner's person, holding write access,
+ * while one of their runners has such a job running, and only to read.
+ */
+async function teardownCheckout(
+  d1: D1Database,
+  actor: NonNullable<Parameters<typeof findRepo>[1]>,
+  owner: string,
+  name: string,
+) {
+  const repo = await findRepo(d1, actor, owner, name, { deleting: true });
+  if (!repo?.deleted_at || !atLeast(roleFor(repo, actor), "write")) return null;
+  const running = await db(d1)
+    .selectFrom("ci_jobs as j")
+    .innerJoin("ci_runs as r", "r.id", "j.run_id")
+    .select("j.id")
+    .where("j.repo_id", "=", repo.id)
+    .where("j.runner", "=", "local")
+    .where("j.status", "=", "running")
+    .where(sql<string>`substr(j.claimed_by, 1, ${actor.slug.length + 1})`, "=", `${actor.slug}/`)
+    .where("r.preview_action", "=", "teardown")
+    .executeTakeFirst();
+  return running ? repo : null;
 }
 
 /**

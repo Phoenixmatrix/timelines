@@ -22,6 +22,9 @@ import { SYSTEM_ACTOR } from "../../registry/core/auth/system.ts";
 import { Services } from "../../registry/core/context.ts";
 import { collectGarbage } from "../../registry/jobs/gc.ts";
 import type { RetentionTarget } from "../retention/policies.ts";
+import { deletionStatus, resumeDeletions } from "../retention/repo-deletion.ts";
+import { repoInventory } from "../retention/repo-inventory.ts";
+import { plantOrphans, resetOrphanSweep, sweepRepoOrphans } from "../retention/repo-orphans.ts";
 import type { DurableClass } from "../durable/classes.ts";
 import { batch, db } from "../schema.ts";
 import { fail, readJson } from "./http.ts";
@@ -87,6 +90,9 @@ dev.use("*", async (c, next) => {
       "/usage",
       "/retention",
       "/ci-age",
+      "/repo-inventory",
+      "/repo-purge",
+      "/repo-orphans",
     ].some((path) => c.req.path.endsWith(path))
   ) {
     const secret = Reflect.get(c.env, "AGENT_SECRET");
@@ -211,6 +217,65 @@ dev.post("/ci-age", async (c) => {
     ).bind(repo.id, ids),
   ]);
   return c.json({ ok: true });
+});
+
+// Repository deletion in the real runtime (CORE-199). The inventory of what
+// a repository (by id, or owner/name while it exists or its deletion is
+// recorded) holds in every store; nothing is changed.
+dev.get("/repo-inventory", async (c) => {
+  const id = await devRepoId(c.env, c.req.query("repo") ?? "");
+  if (!id) return fail(c, 404, "No such repository or deletion.");
+  return c.json(await repoInventory(c.env, id));
+});
+
+// `terminate` stands for a crash: the purge's Workflow instance dies where it
+// is. `resume` is the cron's restart, without waiting for staleness.
+dev.post("/repo-purge", async (c) => {
+  const body = await readJson<{ repo: string; action: "terminate" | "resume" }>(c);
+  const id = await devRepoId(c.env, body.repo ?? "");
+  const deletion = id ? await deletionStatus(c.env, id) : null;
+  if (!id || !deletion) return fail(c, 404, "No such deletion.");
+  if (body.action === "terminate") {
+    if (!deletion.workflowId) return fail(c, 409, "The purge has no Workflow instance.");
+    const instance = await c.env.REPO_PURGE.get(deletion.workflowId);
+    await instance.terminate();
+    return c.json({ terminated: deletion.workflowId, status: await instance.status() });
+  }
+  if (body.action === "resume") {
+    const started = await resumeDeletions(c.env, {
+      staleMs: 0,
+      waitUntil: (work) => c.executionCtx.waitUntil(work),
+    });
+    return c.json({ started, deletion: await deletionStatus(c.env, id) });
+  }
+  return fail(c, 400, "action is terminate or resume.");
+});
+
+// The orphan sweep, only in an isolated agent environment (its provider
+// namespaces are its own). `plant` makes an orphan in each store as a
+// repository deleted before the purge existed would have left it: an AI
+// Search item and a vector naming an unknown repository id, and an Artifacts
+// repository no row names. `sweep` runs the sweep from the start to the end,
+// treating every Artifacts repository as old enough.
+dev.post("/repo-orphans", async (c) => {
+  if (!Reflect.get(c.env, "AGENT_ID"))
+    return fail(c, 403, "Only an isolated agent environment sweeps orphans.");
+  const body = await readJson<{ action: "plant" | "sweep" }>(c);
+  if (body.action === "plant") return c.json(await plantOrphans(c.env));
+  if (body.action === "sweep") {
+    await resetOrphanSweep(c.env);
+    let state = await sweepRepoOrphans(c.env, {
+      waitUntil: (work) => c.executionCtx.waitUntil(work),
+      limits: { minAgeMs: 0 },
+    });
+    for (let calls = 1; state.stage !== "done" && calls < 50; calls++)
+      state = await sweepRepoOrphans(c.env, {
+        waitUntil: (work) => c.executionCtx.waitUntil(work),
+        limits: { minAgeMs: 0 },
+      });
+    return c.json(state);
+  }
+  return fail(c, 400, "action is plant or sweep.");
 });
 
 dev.get("/environment", async (c) => {
@@ -387,3 +452,23 @@ dev.post("/atlas", async (c) => {
   if (body.land) await landAtlasFixtureBuild(c.env.DB, repo.id, body.commit);
   return c.json(published, 201);
 });
+
+/** A repository's id from its id or owner/name, live, being deleted or deleted. */
+async function devRepoId(env: Env, repo: string): Promise<string | null> {
+  if (!repo) return null;
+  if (!repo.includes("/")) return repo;
+  const [owner, name] = repo.split("/");
+  const live = await env.DB.prepare(
+    "SELECT r.id FROM repos r JOIN accounts o ON o.id = r.owner_id WHERE o.slug = ? AND r.name = ?",
+  )
+    .bind(owner, name)
+    .first<string>("id");
+  if (live) return live;
+  return (
+    (await env.DB.prepare(
+      "SELECT repo_id FROM repo_deletions WHERE full_name = ? ORDER BY requested_at DESC LIMIT 1",
+    )
+      .bind(repo)
+      .first<string>("repo_id")) ?? null
+  );
+}

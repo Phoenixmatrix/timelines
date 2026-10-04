@@ -1602,6 +1602,158 @@ export async function runProviderE2E(
           return successful.length >= requirement.minimum;
         });
       }
+      enter("repository-deletion");
+      // CORE-199 against the real providers: the fixture repository, with its
+      // vectors, AI Search items, coordinator and Artifacts repository, is
+      // deleted; its purge is killed mid-way and resumed; nothing of it is
+      // left in any store. Then the one-off orphan sweep finds what a
+      // repository deleted before the purge existed left in each store. The
+      // Atlas fixtures create repositories, so the sweep waits for them.
+      const deletionEvidence: Record<string, unknown> = {};
+      evidence.repositoryDeletion = deletionEvidence;
+      const secret = ctx.env.GITMATRIX_AGENT_SECRET ?? "";
+      const dev = async <T>(path: string, method = "GET", body?: unknown): Promise<T> => {
+        const response = await fetch(`${ctx.origin}/api/dev${path}`, {
+          method,
+          headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          signal: AbortSignal.timeout(120_000),
+        });
+        events.push({ stage, method, path: `/dev${path}`, status: response.status });
+        assert.equal(
+          response.status,
+          200,
+          `${stage}: ${method} /dev${path} HTTP ${response.status}`,
+        );
+        return (await response.json()) as T;
+      };
+      interface Inventory {
+        repo: unknown;
+        d1: Record<string, number>;
+        registry: { packageSources: number; publishes: number };
+        durable: {
+          class: string;
+          purgedAt: string | null;
+          storage: { tables: string[]; keys: number; alarm: number | null } | null;
+        }[];
+        artifacts: { exists: boolean | null };
+        vectors: number | null;
+        searchItems: number | null;
+        deletion: { phase: string; workflowId: string | null; attempts: number } | null;
+      }
+      // The local runtime's D1 sometimes fails a query under load: retry a read.
+      const inventoryOf = async (repo: string): Promise<Inventory> => {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            return await dev<Inventory>(`/repo-inventory?repo=${encodeURIComponent(repo)}`);
+          } catch (error) {
+            if (attempt === 3) throw error;
+            await delay(1000);
+          }
+        }
+      };
+      const fixture = `${owner}/${name}`;
+      const before = await inventoryOf(fixture);
+      deletionEvidence.before = before;
+      assert((before.vectors ?? 0) > 0, "The fixture has vectors before its deletion");
+      assert((before.searchItems ?? 0) > 0, "The fixture has AI Search items before its deletion");
+      assert.equal(before.artifacts.exists, true);
+      assert(
+        before.durable.some((d) => d.class === "KnowledgeCoordinator" && !d.purgedAt),
+        "The fixture's coordinator is registered",
+      );
+      const deleted = await fetch(`${ctx.origin}/api${base}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${fixtures.tokens[persona]}` },
+        signal: AbortSignal.timeout(60_000),
+      });
+      events.push({ stage, method: "DELETE", path: base, status: deleted.status });
+      assert.equal(deleted.status, 204, "Deleting the fixture repository");
+      const hidden = await fetch(`${ctx.origin}/api${base}`, {
+        headers: { authorization: `Bearer ${fixtures.tokens[persona]}` },
+        signal: AbortSignal.timeout(60_000),
+      });
+      assert.equal(hidden.status, 404, "A deleted repository is missing at once");
+      // Kill the purge once it deletes from the providers (vectors, search
+      // items, or a later phase short of done), then resume it as the cron would.
+      let killedAt: string | undefined;
+      await waitFor("repository-deletion-running", 300_000, async () => {
+        const now = await inventoryOf(fixture);
+        const phase = now.deletion?.phase;
+        assert(phase && phase !== "done", "The purge must be killed before it ends");
+        if (!now.deletion?.workflowId || ["stop", "previews"].includes(phase)) return false;
+        await dev("/repo-purge", "POST", { repo: fixture, action: "terminate" });
+        killedAt = phase;
+        return true;
+      });
+      const resumed = await dev<{ started: string[]; deletion: Inventory["deletion"] }>(
+        "/repo-purge",
+        "POST",
+        { repo: fixture, action: "resume" },
+      );
+      assert(resumed.started.length >= 1, "The resume starts a new purge");
+      assert.equal(resumed.deletion?.attempts, 2);
+      deletionEvidence.killedAt = killedAt;
+      let after: Inventory | undefined;
+      await waitFor("repository-deletion-done", 15 * 60_000, async () => {
+        after = await inventoryOf(fixture);
+        return after.deletion?.phase === "done" && after.vectors === 0 && after.searchItems === 0;
+      });
+      deletionEvidence.after = after;
+      assert.equal(after!.repo, null);
+      assert.deepEqual(after!.d1, {}, "No D1 row names the deleted repository");
+      assert.deepEqual(after!.registry, { packageSources: 0, publishes: 0 });
+      assert.equal(after!.artifacts.exists, false, "Its Artifacts repository is deleted");
+      for (const instance of after!.durable) {
+        assert(instance.purgedAt, `${instance.class} was purged`);
+        if (instance.storage)
+          assert.deepEqual(
+            {
+              tables: instance.storage.tables,
+              keys: instance.storage.keys,
+              alarm: instance.storage.alarm,
+            },
+            { tables: [], keys: 0, alarm: null },
+            `${instance.class} holds nothing`,
+          );
+      }
+
+      enter("repository-orphan-sweep");
+      await atlas;
+      const planted = await dev<{
+        repoId: string;
+        artifactsName: string;
+        itemId: string | null;
+        vectorId: string | null;
+      }>("/repo-orphans", "POST", { action: "plant" });
+      assert(planted.itemId && planted.vectorId, "An orphan was planted in each provider");
+      // Vectorize applies upserts asynchronously: the orphan must be findable first.
+      await waitFor("repository-orphan-planted", 300_000, async () => {
+        const seen = await inventoryOf(planted.repoId).catch(() => null);
+        return Boolean(seen && seen.vectors === 1 && seen.searchItems === 1);
+      });
+      const sweep = await dev<{
+        stage: string;
+        orphans: number;
+        artifacts: number;
+        deletedArtifacts?: string[];
+        vectors?: { indexed: number; expected: number };
+      }>("/repo-orphans", "POST", { action: "sweep" });
+      deletionEvidence.sweep = sweep;
+      assert.equal(sweep.stage, "done");
+      assert(sweep.orphans >= 1, "The sweep found the orphaned repository id");
+      assert(
+        sweep.deletedArtifacts?.includes(planted.artifactsName),
+        "The sweep deleted the Artifacts repository no row names",
+      );
+      let orphan: Inventory | undefined;
+      await waitFor("repository-orphan-purged", 15 * 60_000, async () => {
+        orphan = await inventoryOf(planted.repoId);
+        return (
+          orphan.deletion?.phase === "done" && orphan.vectors === 0 && orphan.searchItems === 0
+        );
+      });
+      deletionEvidence.orphan = orphan;
     }
     evidence.outcome = "passed";
   } catch (error) {
