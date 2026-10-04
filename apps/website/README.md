@@ -71,7 +71,8 @@ browser-mode test, not an E2E step.
 
 Vitest's browser mode runs these in headless Chromium (Playwright's headless
 shell, which `vp run agent setup` installs; elsewhere run
-`vp exec playwright install --only-shell chromium` in this package). Run one file with
+`vp exec playwright install --only-shell chromium` in this package). In CI the
+image already has it (see "CI image" under [CI/CD](#cicd)). Run one file with
 `vp test --project browser src/palette/Palette.browser.test.tsx`; add
 `--project unit` for the Node tests alone. The helpers are in `src/testing/`:
 
@@ -174,6 +175,7 @@ never shares data with `vp dev`. mail.fward.dev is enabled for Email Sending.
 - A Sandbox has no Docker, so CI reuses the deployed CI image
   (`GITMATRIX_CI_IMAGE`). A change under `ci/` fails the job after the rest has
   shipped: run `vp run deploy` here, which builds the image and tags the commit.
+  Jobs that start after cf's container rollout run in the new image.
 
 The job's `CLOUDFLARE_API_TOKEN` is a repository CI secret (`gm secret set`).
 
@@ -1903,7 +1905,8 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
 ```
 
 - **Runners.** Deployed, jobs run in Cloudflare Sandbox containers (image
-  `ci/Dockerfile`: Node 24, pnpm, Vite+, Rust, git). Under `vp dev` they run on
+  `ci/Dockerfile`: Node 24, pnpm, Vite+, Rust, git, and Chromium's headless
+  shell; see "CI image" below). Under `vp dev` they run on
   this machine instead, so development doesn't start paid containers, and
   they come and go the same way: when the CI Workflow queues a job it pings
   the dev server (`CI_DISPATCH_URL`), whose `vite/ci-runners.ts` plugin starts
@@ -1929,6 +1932,22 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   a scheduler barrier. Real AI verification is an explicit agent command.
   Checkpoints of a timeline get a preview of the app
   ([Gitmatrix's own previews](#gitmatrixs-own-previews)).
+- **CI image.** Besides the toolchains, `ci/Dockerfile` bakes Chromium's
+  headless shell for the browser-mode tests (CORE-248), with its system
+  libraries, at its `PLAYWRIGHT_VERSION`: about 540 MB of the image (260 MB
+  browser, the rest libraries and fonts). Browsers live in
+  `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, and `/root/.cache/ms-playwright`
+  links there for processes that don't inherit the variable;
+  `/usr/local/share/playwright-deps/<version>` marks the version whose libraries
+  are installed. The test job's "Chromium for browser-mode tests" step then
+  takes under a second: it skips `playwright install-deps` when the marker
+  matches the lockfile's Playwright, and `playwright install --only-shell`
+  finds the revision present. On an older image (a Playwright upgrade that
+  hasn't been deployed yet) the same step installs the libraries and fetches
+  the browser, about 20 s. A local runner isn't root, never installs
+  libraries, and uses the user's cache. `tools/agent/ci-image.test.ts` fails
+  when the ARG and `pnpm-lock.yaml` disagree, so a Playwright upgrade bumps
+  both and then needs `vp run deploy` from a machine with Docker.
 - **Both runners report the same way** (`worker/ci/jobs.ts`): batched log
   chunks, step transitions, the end. Secret values are masked server-side; a
   cancelled job is told so in the reply to its next report and kills its

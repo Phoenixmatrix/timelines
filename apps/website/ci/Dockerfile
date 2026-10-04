@@ -21,5 +21,22 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-to
 # must also find its toolchains at the default ~/.rustup.
 RUN ln -s $RUSTUP_HOME /root/.rustup && ln -s $CARGO_HOME /root/.cargo
 
+# Chromium's headless shell for apps/website's browser-mode tests, with its
+# system libraries, at the repository's Playwright version
+# (tools/agent/ci-image.test.ts keeps this ARG equal to the lockfile's). The
+# test job's Chromium step then finds both and does nothing; after a Playwright
+# upgrade it fetches the new revision until this image is redeployed. Browsers
+# live at a fixed path, not under $HOME; ~/.cache/ms-playwright points there
+# for processes that don't get the variable. The marker file names the version
+# whose system libraries are installed.
+ARG PLAYWRIGHT_VERSION=1.63.0
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN pnpm dlx playwright@$PLAYWRIGHT_VERSION install --with-deps --only-shell chromium \
+  && mkdir -p /usr/local/share/playwright-deps /root/.cache \
+  && touch /usr/local/share/playwright-deps/$PLAYWRIGHT_VERSION \
+  && ln -s $PLAYWRIGHT_BROWSERS_PATH /root/.cache/ms-playwright \
+  && rm -rf /var/lib/apt/lists/* /root/.cache/pnpm \
+  && pnpm store prune
+
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
