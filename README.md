@@ -79,8 +79,10 @@ a feature worktree's `gm` over the shared binary.
   Automatic non-AI E2E needs Artifacts access. Interactive setup and explicit AI
   verification also need Vectorize, AI Search and Workers AI.
   If login exposes multiple accounts, set `CLOUDFLARE_ACCOUNT_ID` explicitly.
-- Chromium's OS dependencies. Setup installs the pinned Playwright browser and
-  checks that it launches; missing host libraries are a setup error, not a skipped test.
+- Chromium's OS dependencies. Setup installs only the pinned Playwright version's
+  Chromium **headless shell** (`playwright install --only-shell chromium`) and checks
+  that it launches with touch and reduced-motion emulation; missing host libraries are
+  a setup error, not a skipped test. See [browser cache](#browser-cache).
 
 Cloudflare operations use **`cf`, never Wrangler**. Remote services incur charges;
 see [cleanup and cost bounds](#cleanup-and-cost-bounds) before provisioning.
@@ -311,6 +313,53 @@ profile, no token) so a worktree's work keeps its agent. Never copy
 `node_modules`. Checkouts share immutable package contents, not mutable application
 state; the shared store and local runners assume mutually trusted agents, not
 hostile-code sandboxing.
+
+### Browser cache
+
+Every browser check launches `chromium.launch({ headless: true })` without a
+`channel`, which Playwright serves from `chromium_headless_shell-<revision>`.
+Setup therefore skips full Chromium (Chrome for Testing): per revision about
+266 MB on disk instead of 658 MB, and a 117 MiB download instead of 303 MiB.
+Browser tests in other tools share this install only if they also launch
+headless with no channel. Vitest browser mode defaults `browser.headless` to
+`process.env.CI`, so set `headless: true` explicitly. A headed run, a
+`channel: "chromium"` launch or a debugger needs full Chromium; install it
+yourself with `vp exec playwright install chromium`.
+
+Browsers live in `~/.cache/ms-playwright` (or `PLAYWRIGHT_BROWSERS_PATH`),
+shared by every worktree and every other Playwright project on the machine.
+Playwright's own cleanup during install keeps any revision that a still-present
+package registered, and pnpm's global store keeps old packages present, so old
+revisions accumulate. Prune them explicitly:
+
+```bash
+vp run agent prune-browsers --dry-run   # report what would go, with sizes and reasons
+vp run agent prune-browsers             # delete it
+vp run agent prune-browsers --dry-run --include-other-installs   # also other projects' browsers
+```
+
+- **Kept:** every revision that any `playwright-core` version in any worktree's
+  lockfiles (from `git worktree list`) names in its installed `browsers.json`.
+  That includes full Chromium, which other agent tools on the host launch directly
+  from this cache. The command refuses to run when a linked version isn't
+  installed, rather than guess which revisions it needs.
+- **Also kept:** any revision that a running process executes, maps or uses as its
+  working directory (from `/proc`). Each revision is renamed aside and checked
+  again before it is deleted.
+- **Also kept by default:** every revision another live Playwright install
+  registered in `.links` (`npx playwright`, `pnpm dlx`, other repositories), as
+  long as its package still exists. The report lists them under
+  `heldByOtherInstalls` with their sizes and owners: what `--include-other-installs`
+  would also delete. Those projects download their browsers again on their next
+  `playwright install`, so pass the flag only when you know they are unused.
+- **Deleted:** every other revision, such as one whose registering package is gone.
+  An old Playwright version that pnpm's global store still holds counts as a live
+  install, so its revisions stay until the store is pruned or you pass the flag.
+- Only Playwright revision directories are candidates; `.links`, profiles and
+  unknown entries are never touched.
+- The command holds Playwright's install lock (`__dirlock`) and refuses if an
+  install holds it.
+- Pruning is manual, not part of the hourly cleanup.
 
 ## Toolchain notes
 
