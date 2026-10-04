@@ -23,7 +23,7 @@ let loaded: Promise<BrowserApiModule> | undefined;
 function browserApi(): Promise<BrowserApiModule> {
   if (!loaded) {
     const stub = [
-      "export class DurableObject {}",
+      "export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }",
       "export class WorkflowEntrypoint {}",
       "export class WorkerEntrypoint {}",
       "export class RpcTarget {}",

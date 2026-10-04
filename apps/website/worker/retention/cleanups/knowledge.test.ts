@@ -169,6 +169,31 @@ describe("knowledge-builds", () => {
 });
 
 describe("ended-timeline-data", () => {
+  test("page-only archived sources release their consumer root without removing canonical pages", async () => {
+    const t = seeded();
+    t.sqlite.exec(`INSERT INTO timeline_work_sources
+      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,state,allocation_operation_id,
+       fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
+      VALUES ('work_pages','r_app','page-timeline','pages','acc_orbit','owned-pages','ready','page-allocation',
+        'canonical','base','tree','refs/heads/main','canonical','head','head-tree','refs/heads/main','${ago(200)}','${ago(200)}');
+      INSERT INTO kg_page_sets(repo_id,source_id,ref,set_key,commit_oid,status,stats)
+        VALUES ('r_app','work_pages','refs/heads/timeline/pages','key','head','succeeded','{}'),
+               ('r_app','canonical','refs/heads/timeline/pages','key','canonical-head','succeeded','{}');
+      INSERT INTO timeline_source_roots(repo_id,source_id,consumer_kind,consumer_id,commit_oid,created_at)
+        VALUES ('r_app','work_pages','knowledge-pages','r_app:work_pages:refs/heads/timeline/pages:key','head','${ago(200)}');
+      UPDATE timeline_work_sources SET state='archived',archived_at='${ago(200)}' WHERE source_id='work_pages';`);
+    const dry = await run(t.env, ORBIT, "ended-timeline-data", { days: 90 }, true);
+    expect(dry.items).toBe(1);
+    const removed = await run(t.env, ORBIT, "ended-timeline-data", { days: 90 }, false);
+    expect(removed.items).toBe(1);
+    expect(t.sqlite.prepare("SELECT source_id,commit_oid FROM kg_page_sets").all()).toEqual([
+      { source_id: "canonical", commit_oid: "canonical-head" },
+    ]);
+    expect(t.sqlite.prepare("SELECT source_id FROM timeline_source_roots").all()).toEqual([]);
+    expect((await run(t.env, ORBIT, "ended-timeline-data", { days: 90 }, false)).items).toBe(0);
+    t.sqlite.close();
+  });
+
   function overlaysSeed() {
     const t = seeded();
     const overlay = t.sqlite.prepare(`
@@ -185,7 +210,7 @@ describe("ended-timeline-data", () => {
       VALUES (?, ?, 1, 1, 'ready', '{"groups":[]}', ?)`);
     const set = t.sqlite.prepare(`
       INSERT INTO kg_page_sets (repo_id, ref, set_key, commit_oid, status, stats)
-      VALUES (?, ?, 'k1', 'tip', 'succeeded', '{}')`);
+      VALUES (?, ?, 'k1', 'tip', 'writing', '{}')`);
     const page = t.sqlite.prepare(`
       INSERT INTO kg_page_set_pages (repo_id, ref, set_key, slug, title, section, position, kind,
                                      change, outcome, body, inputs_hash)
@@ -205,6 +230,9 @@ describe("ended-timeline-data", () => {
       regrouping.run(repo, id, ago(200));
       set.run(repo, ref);
       for (const s of ["one", "two"]) page.run(repo, ref, s);
+      t.sqlite
+        .prepare("UPDATE kg_page_sets SET status='succeeded' WHERE repo_id=? AND ref=?")
+        .run(repo, ref);
     };
     add("r_app", "old", 100);
     add("r_lib", "older", 300);

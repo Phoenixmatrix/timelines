@@ -32,6 +32,34 @@ function setup() {
   return { sqlite, db: d1(sqlite), run, job, runRow };
 }
 
+test("identical branch and commit in different sources never share gates or held coverage", async () => {
+  const c = setup();
+  c.run(1, "running");
+  c.run(2, "queued", { held: true });
+  c.run(3, "queued", { held: true });
+  c.sqlite.exec("UPDATE ci_runs SET source_id='work_a', commit_oid='c1' WHERE number IN (2,3)");
+  expect(await activeRun(c.db, "repo", "main", "c1", null, "work_b")).toBeNull();
+  expect(await activeRun(c.db, "repo", "main", "c1", null, "work_a")).toMatchObject({ number: 3 });
+  expect(await inFlight(c.db, "repo", "main", "none", "work_a")).toBe(0);
+  expect(await releaseHeld(c.db, "repo", "main", async () => {})).toBeNull();
+  const started: string[] = [];
+  expect(
+    await releaseHeld(
+      c.db,
+      "repo",
+      "main",
+      async (id) => {
+        started.push(id);
+      },
+      "work_a",
+    ),
+  ).toBe(3);
+  expect(started).toEqual(["run-3"]);
+  expect(c.runRow(2)).toMatchObject({ covered_by: 3 });
+  expect(c.runRow(1)).toMatchObject({ status: "running", covered_by: null });
+  c.sqlite.close();
+});
+
 describe("dedupe and load", () => {
   test("a commit in flight on its branch is found; finished runs and other branches aren't", async () => {
     const c = setup();

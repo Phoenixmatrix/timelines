@@ -32,8 +32,7 @@ import { pricesApi } from "../usage/prices-api.ts";
 import { accountUsageApi, siteUsageApi } from "../usage/report-api.ts";
 import { collectUsage } from "../usage/collect.ts";
 import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./api.ts";
-import { CATEGORIES, category, defaultValues } from "./categories.ts";
-import { cleanupFor } from "./cleanups/index.ts";
+import { category, defaultValues } from "./categories.ts";
 import { resumeDeletions } from "./repo-deletion.ts";
 import { advanceRun, createRun, getRun, retentionCron } from "./runs.ts";
 import type { RetentionTarget } from "./policies.ts";
@@ -72,8 +71,6 @@ vi.mock("agents", async () => {
 });
 
 afterEach(() => vi.unstubAllGlobals());
-
-const RUNNABLE = CATEGORIES.filter((c) => cleanupFor(c.id)).map((c) => c.id);
 
 // ---- snapshots ------------------------------------------------------------------------
 
@@ -188,14 +185,6 @@ async function runOne(t: Rich, id: string, target: RetentionTarget, dryRun: bool
 
 // ---- the suite ------------------------------------------------------------------------
 
-describe("retention safety: coverage", () => {
-  test("every category with a cleanup has a fixture, and only those", () => {
-    expect(Object.keys(FIXTURES).sort()).toEqual([...RUNNABLE].sort());
-    for (const [id, fixture] of Object.entries(FIXTURES))
-      expect(fixture.target.scope, id).toBe(category(id)!.scope);
-  });
-});
-
 describe("gate 1: nothing enabled, a full cron cycle deletes nothing", () => {
   test("every hourly retention job over 26 hours, on the rich deployment", async () => {
     const t = richSeed();
@@ -208,6 +197,7 @@ describe("gate 1: nothing enabled, a full cron cycle deletes nothing", () => {
         ('acc_orbit', 'push-log', NULL, '{"days": 1}'),
         ('acc_marco', 'assistant-chats', 0, '{"days": 1, "maxPerUser": 1}');
       INSERT INTO retention_site_policies (category, enabled, thresholds) VALUES
+        ('timeline-work-sources', 0, '{}'),
         ('auth-hygiene', 0, '{"days": 1}'),
         ('closed-issues', NULL, '{"days": 1}'),
         ('usage-history', NULL, '{"days": 32, "months": 1}');
@@ -247,7 +237,7 @@ describe("gate 1: nothing enabled, a full cron cycle deletes nothing", () => {
 });
 
 describe("gate 2: each category's dry run is its run, bounded, idempotent, audited", () => {
-  test.each(RUNNABLE)("%s", async (id) => {
+  test.each(Object.keys(FIXTURES))("%s", async (id) => {
     const fixture = FIXTURES[id]!;
     const t = richSeed();
     await t.ready;

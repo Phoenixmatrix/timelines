@@ -35,7 +35,7 @@ const operation = args.shift() ?? "help";
 const website = join(root, "apps", "website");
 const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
   vp run agent setup              Build gm, install Chromium's headless shell, provision/migrate/seed isolated dev environment
-  vp run agent up                 Run the scoped app and CI dispatcher in the foreground
+  vp run agent up [--sandbox]     Run the scoped app; --sandbox exercises local Docker CI instead of host runners
   vp run agent status             List owned environments (no secrets)
   vp run agent seed               Reconcile deterministic fixtures against the live environment
   vp run agent gm -- <args>       Use this worktree's binary, server, credentials and replica
@@ -481,6 +481,11 @@ try {
     const env = await loadEnvironment(root);
     const ctx = await context(env);
     if (operation === "up") {
+      if (args.length) {
+        if (args.length !== 1 || args[0] !== "--sandbox") throw new Error("Use up [--sandbox].");
+        await command("docker", ["info"], { cwd: root });
+        ctx.env.GITMATRIX_CI_RUNNER = "sandbox";
+      }
       const handle = await start(env, ctx);
       if (!handle.owned) throw new Error("Environment already running; use status for its origin.");
       const supervisor = superviseEnvironment(env);

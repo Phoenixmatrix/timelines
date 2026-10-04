@@ -313,6 +313,7 @@ describe("capability names and summaries", () => {
     expect(inferred.sources).toEqual([
       {
         repoId: "r1",
+        sourceId: "canonical",
         commit: "commit-b1",
         path: anchor,
         blob: `${anchor}@1`,
@@ -539,7 +540,7 @@ describe("capability names and summaries", () => {
       // exact input hash, both in the cache key and immutable inference record.
       for (const call of ai.calls) {
         const identity = `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:`;
-        const key = await sha256(`${identity}r1:${call.user}`);
+        const key = await sha256(`${identity}r1:canonical:${call.user}`);
         const legacyKey = await sha256(`${identity}${original}:r1:${call.user}`);
         sqlite
           .prepare(
@@ -620,7 +621,12 @@ describe("capability names and summaries", () => {
     });
     // The stale prose names the source version it was written from.
     const inferred = provenanceOf(ops).inferred as AtlasInference;
-    expect(inferred.basis).toEqual({ repoId: "r1", commit: "commit-b1", buildId: "b1" });
+    expect(inferred.basis).toEqual({
+      repoId: "r1",
+      sourceId: "canonical",
+      commit: "commit-b1",
+      buildId: "b1",
+    });
     expect(inferred.sources[0]?.commit).toBe("commit-b1");
 
     // Still stale a build later, still with the original basis.

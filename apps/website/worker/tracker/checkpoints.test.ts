@@ -7,6 +7,7 @@ import type { HumanRequest, Mutation } from "../../shared/tracker.ts";
 import type { CheckpointRepo } from "../../shared/timelines.ts";
 import { durableStorage } from "../testing/durable.ts";
 import { TrackerStore, type Access } from "./store.ts";
+import { ownedTimeline, ownedCheckpointRepo } from "../testing/timeline-source.ts";
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
@@ -52,31 +53,41 @@ function setup() {
     data: { key: "ENG", name: "Engineering" },
   });
   mutate(ben, { kind: "issue.create", id: "issue", data: { teamId: "team", title: "Search" } });
-  timelines.create(bot, {
+  const timeline = ownedTimeline(timelines, bot, {
     slug: "search",
     parent: null,
     repos: [{ id: "app", owner: "org", name: "app" }],
     commits: { app: oid(1) },
   });
-  const repo = (commit: number, base = 1): CheckpointRepo => ({
-    id: "app",
-    owner: "org",
-    name: "app",
-    commit: oid(commit),
-    base: oid(base),
-    changes: [{ changeId: `change${commit}`, commit: oid(commit) }],
-  });
+  const repo = (commit: number, base = 1): CheckpointRepo =>
+    ownedCheckpointRepo(timelines, "search", {
+      id: "app",
+      owner: "org",
+      name: "app",
+      commit: oid(commit),
+      base: oid(base),
+      changes: [{ changeId: `change${commit}`, commit: oid(commit) }],
+    });
   const checkpoint = (commit: number, summary = `work up to ${commit}`) =>
     timelines.createCheckpoint(bot, "search", { summary, repos: [repo(commit)] });
-  const push = (commit: number | null) =>
-    timelines.recordPush({
-      repo: { id: "app", owner: "org", name: "app" },
+  let tip = oid(1);
+  const admit = (commit: number) => {
+    const operationId = `push-${++operation}`;
+    timelines.beginSourcePush({
+      operationId,
+      timelineId: timeline.id,
+      repoId: "app",
+      sourceId: timeline.repos[0]!.source!.sourceId,
+      commands: [{ ref: "refs/heads/work", old: tip, new: oid(commit) }],
       actorId: "agt_bot",
       accountableId: "ben",
-      pushed: commit === null ? [] : ["search"],
-      heads: [{ slug: "search", commit: commit === null ? null : oid(commit) }],
-      merges: [],
     });
+    return operationId;
+  };
+  const push = (commit: number) => {
+    timelines.finishSourcePush(admit(commit), "accepted");
+    tip = oid(commit);
+  };
   const ask = (checkpointId: string, access = bot, leaseToken?: string) => {
     const id = `req-${++operation}`;
     mutate(access, {
@@ -105,6 +116,7 @@ function setup() {
   const request = (id: string) =>
     tracker.snapshot(ben).requests.find((r) => r.id === id) as HumanRequest;
   return {
+    sql,
     tracker,
     timelines,
     as,
@@ -113,6 +125,7 @@ function setup() {
     repo,
     checkpoint,
     push,
+    admit,
     ask,
     answer,
     request,
@@ -140,7 +153,6 @@ describe("checkpoints", () => {
       approved: false,
     });
     expect(first.checkpoint.id).toMatch(/^cp_/);
-    expect(() => t.checkpoint(2)).toThrow(/already pins these commits/);
     t.push(3);
     const second = t.checkpoint(3);
     expect(second.checkpoint.number).toBe(2);
@@ -165,6 +177,40 @@ describe("checkpoints", () => {
     ]);
   });
 
+  test("a migrated source needs a fresh checkpoint even when its commit is unchanged", () => {
+    const t = setup();
+    t.push(2);
+    const first = t.checkpoint(2).checkpoint;
+    const legacy = {
+      ...first,
+      repos: first.repos.map((repo) => ({
+        ...repo,
+        source: {
+          ...repo.source!,
+          sourceId: "canonical",
+          kind: "canonical",
+          timelineId: null,
+          ref: "refs/heads/timeline/search",
+        },
+      })),
+    };
+    // Persisted pre-cutover checkpoint; the active timeline now owns its work source.
+    t.sql.exec(
+      "UPDATE timeline_checkpoints SET data = ? WHERE id = ?",
+      JSON.stringify(legacy),
+      first.id,
+    );
+    const renewed = t.checkpoint(2);
+    expect(renewed.checkpoint.id).not.toBe(first.id);
+    expect(renewed.checkpoint.number).toBe(2);
+    expect(renewed.checkpoint.repos[0]?.source).toEqual(first.repos[0]?.source);
+    expect(renewed.current).toBe(true);
+    expect(t.timelines.checkpoint("search", first.id).checkpoint).toEqual(legacy);
+    expect(() => t.checkpoint(2)).toThrow(
+      expect.objectContaining({ code: "unchanged", status: 409 }),
+    );
+  });
+
   test("cover exactly the timeline's repositories, and not an ended timeline", () => {
     const t = setup();
     t.push(2);
@@ -172,12 +218,16 @@ describe("checkpoints", () => {
       t.timelines.createCheckpoint(t.bot, "search", {
         repos: [t.repo(2), { ...t.repo(2), id: "lib" }],
       }),
-    ).toThrow(/repositories changed/);
+    ).toThrow(expect.objectContaining({ code: "timeline_changed", status: 409 }));
     expect(() =>
-      t.timelines.createCheckpoint(t.bot, "search", { repos: [{ ...t.repo(2), commit: "abc" }] }),
-    ).toThrow(/full commit ids/);
+      t.timelines.createCheckpoint(t.bot, "search", {
+        repos: [{ ...t.repo(2), commit: "abc", source: { ...t.repo(2).source!, commit: "abc" } }],
+      }),
+    ).toThrow(expect.objectContaining({ code: "invalid_input" }));
     t.timelines.abandon(t.ben, "search", { app: oid(2) });
-    expect(() => t.checkpoint(2)).toThrow(/abandoned/);
+    expect(() => t.checkpoint(2)).toThrow(
+      expect.objectContaining({ code: "timeline_ended", status: 409 }),
+    );
   });
 });
 
@@ -249,6 +299,63 @@ describe("approvals pinned to a checkpoint", () => {
     expect(t.timelines.checkpoint("search", "2").approved).toBe(true);
   });
 
+  test.each(["logicalBase", "dependencies"] as const)(
+    "renewing %s at the same work OID requires a fresh review",
+    (field) => {
+      const t = setup();
+      t.push(2);
+      const original = t.checkpoint(2).checkpoint;
+      const requestId = t.ask(original.id);
+      if (field === "logicalBase") t.answer(t.ben, requestId, true);
+      const measured = t.repo(2);
+      const foreign = {
+        ...measured.logicalBase!,
+        kind: "timeline-work" as const,
+        sourceId: "work_parent",
+        timelineId: "parent",
+        ref: "refs/heads/work",
+        commit: oid(10),
+        tree: oid(11),
+      };
+      if (field === "logicalBase") measured.logicalBase = foreign;
+      else measured.dependencies = [{ source: foreign, base: measured.logicalBase! }];
+      const renewed = t.timelines.createCheckpoint(t.bot, "search", {
+        summary: "Review the new dependency proof",
+        repos: [measured],
+      });
+      expect(renewed).toMatchObject({ current: true, approved: false });
+      expect(renewed.checkpoint.number).toBe(original.number + 1);
+      expect(renewed.checkpoint.repos[0]?.commit).toBe(original.repos[0]?.commit);
+      expect(t.timelines.checkpoint("search", original.id)).toMatchObject({
+        current: false,
+        approved: false,
+      });
+      expect(t.request(requestId).status).toBe(field === "logicalBase" ? "answered" : "canceled");
+      expect(() =>
+        t.timelines.createCheckpoint(t.bot, "search", {
+          summary: "Same proof again",
+          repos: [measured],
+        }),
+      ).toThrow(expect.objectContaining({ code: "unchanged" }));
+    },
+  );
+
+  test("an admitted source write fences approval before provider completion", () => {
+    const t = setup();
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const requestId = t.ask(checkpoint.id);
+    const operation = t.admit(3);
+    expect(t.timelines.checkpoint("search", checkpoint.id).current).toBe(false);
+    expect(t.request(requestId).status).toBe("canceled");
+    expect(() => t.answer(t.ben, requestId, true)).toThrow();
+    t.timelines.finishSourcePush(operation, "rejected");
+    expect(t.timelines.checkpoint("search", checkpoint.id)).toMatchObject({
+      current: true,
+      approved: false,
+    });
+  });
+
   test("a push past the checkpoint withdraws its open request and unparks the lease", () => {
     const t = setup();
     t.push(2);
@@ -261,7 +368,6 @@ describe("approvals pinned to a checkpoint", () => {
     t.push(3);
     expect(t.request(id)).toMatchObject({
       status: "canceled",
-      answer: "Superseded by new commits on timeline/search; make a new checkpoint and ask again.",
     });
     expect(t.issue()).toMatchObject({ waiting: 0 });
     expect(t.issue().claim?.parkedAt).toBeUndefined();

@@ -226,6 +226,13 @@ async function pin<K>(
 ): Promise<Pinned<K> | Response> {
   const loaded = await loadRepo(c, "read");
   if (loaded instanceof Response) return loaded;
+  if (route !== "timeline" && c.req.query("source") && c.req.query("source") !== "canonical")
+    return failWith(
+      c,
+      400,
+      "bad_request",
+      "Atlas projections describe canonical sources; use the timeline view for work sources.",
+    );
   const d1 = c.env.DB;
   const scope = repoScope(loaded.row.id);
   const secret = await cursorSecret(c.env);
@@ -598,6 +605,7 @@ atlas.get("/evidence", async (c) => {
       entityId: file.id,
       kind: "file",
       repoId: ctx.repoId,
+      sourceId: "canonical",
       commit,
       path: file.path ?? "",
       blob: typeof file.data.blob === "string" ? file.data.blob : null,
@@ -670,6 +678,8 @@ atlas.get("/catalogue", async (c) => {
 atlas.get("/snapshots", async (c) => {
   const loaded = await loadRepo(c, "read");
   if (loaded instanceof Response) return loaded;
+  if (c.req.query("source") && c.req.query("source") !== "canonical")
+    return failWith(c, 400, "bad_request", "Atlas snapshots describe canonical sources.");
   const limit = limitOf(c);
   if (limit instanceof Response) return limit;
   const d1 = c.env.DB;
@@ -869,7 +879,8 @@ atlas.get("/compare", async (c) => {
 atlas.get("/timeline", async (c) => {
   const raw = c.req.query("ref") ?? "";
   const within = c.req.query("within") || null;
-  const ctx = await pin<[string, string]>(c, "timeline", { ref: raw, within });
+  const sourceId = c.req.query("source") || null;
+  const ctx = await pin<[string, string]>(c, "timeline", { ref: raw, within, source: sourceId });
   if (ctx instanceof Response) return ctx;
   const ref = raw.length <= 512 ? overlayRef(raw) : null;
   if (!ref) return failWith(c, 400, "bad_request", "Pass ref=timeline/<slug>.");
@@ -894,6 +905,13 @@ atlas.get("/timeline", async (c) => {
       404,
       "timeline_unknown",
       "This repository has no such timeline bookmark, and keeps no overlay of one.",
+    );
+  if (sourceId && state.sourceId !== sourceId)
+    return failWith(
+      c,
+      409,
+      "timeline_changed",
+      "The requested source does not belong to this timeline.",
     );
   const view = await timelineView(d1, ctx.scope, ctx.snapshot, ctx.repo, state, Boolean(c.env.AI));
   const after = ctx.cursor?.after ?? null;

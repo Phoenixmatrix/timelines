@@ -1,4 +1,5 @@
 // Shapes the Worker's JSON API returns, shared with the React app.
+import type { CodeSource, SourceSnapshot } from "./code-source.ts";
 
 export type RepoRole = "none" | "read" | "write" | "admin";
 export type Visibility = "public" | "private";
@@ -99,6 +100,8 @@ export interface GitRef {
 }
 
 export interface RepoDetail extends RepoSummary {
+  source?: CodeSource;
+  sourceState?: "ready" | "archived" | "expired";
   /** "importing" while Artifacts is still copying an imported repository. */
   state: "ready" | "importing";
   cloneUrl: string;
@@ -125,6 +128,7 @@ export interface TreeEntry {
 }
 
 export interface TreeResponse {
+  source?: CodeSource;
   ref: string;
   path: string;
   commit: CommitSummary;
@@ -133,6 +137,7 @@ export interface TreeResponse {
 }
 
 export interface BlobResponse {
+  source?: CodeSource;
   ref: string;
   /** The exact commit used to read this blob, even if its branch moves afterward. */
   commitOid: string;
@@ -146,6 +151,7 @@ export interface BlobResponse {
 }
 
 export interface CommitsResponse {
+  source?: CodeSource;
   ref: string;
   commits: CommitSummary[];
   hasMore: boolean;
@@ -153,6 +159,7 @@ export interface CommitsResponse {
 
 /** One bounded page of first-parent history, pinned to an immutable head. */
 export interface HistoryPage {
+  source?: CodeSource;
   ref: string;
   /** Null for an empty repository. */
   head: string | null;
@@ -376,6 +383,7 @@ export type KnowledgeOverlayEndReason = "landed" | "abandoned" | "ended";
 
 /** A timeline's knowledge graph diff against main, kept current on every push. */
 export interface KnowledgeOverlaySummary {
+  sourceId: string;
   /** The bookmark, as `timeline/<slug>`. */
   ref: string;
   timeline: string;
@@ -445,6 +453,7 @@ export interface KnowledgeTimelinePageSummary {
  * changes in components and concepts.
  */
 export interface KnowledgePageSet {
+  sourceId: string;
   /** The bookmark, as `timeline/<slug>`. */
   ref: string;
   timeline: string;
@@ -477,6 +486,9 @@ export interface KnowledgePageSets {
 
 /** GET /knowledge/overlay/page: one timeline page in full. */
 export interface KnowledgeTimelinePage extends WikiPage {
+  sourceId: string;
+  /** Exact per-file snapshots, including unchanged files inherited from the canonical base. */
+  sourceLocations?: { path: string; sourceId: string; commit: string }[];
   timeline: string;
   /** The set it belongs to. */
   set: Omit<KnowledgePageSet, "pages" | "counts">;
@@ -500,6 +512,7 @@ export type CiStepStatus = "pending" | "running" | "succeeded" | "failed" | "ski
 export type CiRunner = "local" | "sandbox";
 
 export interface CiRunSummary {
+  sourceId?: string;
   id: string;
   number: number;
   commit: string;
@@ -541,6 +554,7 @@ export interface CiRunList {
 
 /** One ref update a push made, from the push log. */
 export interface RefUpdate {
+  sourceId?: string;
   id: number;
   /** Full name: refs/heads/main, refs/tags/v1. */
   ref: string;
@@ -576,6 +590,7 @@ export interface ChangeRef {
 }
 
 export interface ChangeHistory {
+  sourceId: string;
   changeId: string;
   /** Oldest first. */
   refs: ChangeRef[];
@@ -643,6 +658,11 @@ export interface CiSecretSummary {
  * own and substitutes that directory's path.
  */
 export interface CiClaimedJob {
+  sourceId: string;
+  /** Address of the persisted owned source; immutable sourceId remains the authority. */
+  timelineSlug: string | null;
+  /** Authorized Gitmatrix checkout endpoint; never an upstream provider URL. */
+  gitUrl: string;
   id: string;
   runId: string;
   runNumber: number;
@@ -693,4 +713,18 @@ export interface UpdateMirrorRequest {
   token?: string;
   enabled?: boolean;
   prune?: boolean;
+}
+
+/** Exact membership in an admitted compact landing; never inferred from change IDs. */
+export interface SourceLineage {
+  status: "integrated" | "pending" | "ambiguous" | "expired" | "unknown";
+  source: CodeSource;
+  commit: string;
+  integration: {
+    source: SourceSnapshot;
+    canonical: SourceSnapshot;
+    logicalBase: SourceSnapshot;
+  } | null;
+  canonical: SourceSnapshot | null;
+  members: string[];
 }

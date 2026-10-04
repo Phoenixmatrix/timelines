@@ -1,217 +1,198 @@
-// A landing's merge job (CORE-77): which job credential is a landing's, and
-// the merge step itself, run with real git through Gitmatrix's git proxy
-// (CORE-157), in front of `git http-backend` standing in for Artifacts.
-
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Hono } from "hono";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
-import type { AppEnv } from "../auth.ts";
-import { gitHttp } from "../git/http.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
-import { gitBackend, run, serve } from "../testing/git-http.ts";
-import { CONFLICT_EXIT, landingJob, MERGE_SCRIPT } from "./landing.ts";
+import { landingJob } from "./landing.ts";
+import { COMPACT_SCRIPT } from "./compact-script.ts";
 import { mintJobToken } from "./registry.ts";
 
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
-
-const oid = (n: number) => n.toString(16).padStart(40, "0");
-
-/** Repositories app and lib, and landing-shaped jobs in app. */
-function database(commit = oid(1)) {
-  const sqlite = migratedDatabase();
-  const landing = JSON.stringify({ steps: [], landing: { slug: "search" } });
-  sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('orbit', 'org', 'orbit', 'Orbit');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
-      ('app', 'orbit', 'app', 'private', 'r-app', 'https://artifacts.test/app.git'),
-      ('lib', 'orbit', 'lib', 'private', 'r-lib', 'https://artifacts.test/lib.git');
-    INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES
-      ('merge', 'app', 1, '${commit}', 'gitmatrix/landing/search', 'manual', 'running'),
-      ('push', 'app', 2, '${commit}', 'gitmatrix/landing/search', 'manual', 'running'),
-      ('other', 'app', 4, '${commit}', 'gitmatrix/landing/search', 'manual', 'running'),
-      ('old', 'app', 3, '${commit}', 'gitmatrix/landing/search', 'manual', 'succeeded');
-    INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner) VALUES
-      ('land', 'merge', 'app', 'land', '${landing}', 'running', 'sandbox'),
-      ('mimic', 'push', 'app', 'land', '{"steps":[]}', 'running', 'sandbox'),
-      ('odd', 'other', 'app', 'land', '{"steps":[],"landing":{"slug":"../main"}}', 'running', 'sandbox'),
-      ('done', 'old', 'app', 'land', '${landing}', 'succeeded', 'sandbox');
-  `);
-  return sqlite;
+const dirs: string[] = [];
+afterEach(() => {
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+const identity = {
+  ...process.env,
+  GIT_AUTHOR_NAME: "test",
+  GIT_AUTHOR_EMAIL: "test@example.invalid",
+  GIT_COMMITTER_NAME: "test",
+  GIT_COMMITTER_EMAIL: "test@example.invalid",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+};
+function git(cwd: string, ...args: string[]) {
+  return execFileSync("git", args, { cwd, env: identity, encoding: "utf8" }).trim();
 }
-
-describe("a landing's merge job", () => {
-  test("is a landing's running merge job, in its own repository", async () => {
-    const db = d1(database());
-    const check = async (job: string, repo = "app") =>
-      landingJob(db, await mintJobToken(db, job, 30), "orbit", repo);
-    expect(await check("land")).toEqual({
-      ok: true,
-      slug: "search",
-      repo: {
-        id: "app",
-        artifacts_name: "r-app",
-        artifacts_remote: "https://artifacts.test/app.git",
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), "compact-landing-"));
+  dirs.push(root);
+  const canonical = join(root, "repo.git");
+  const source = join(root, "repo@search.git");
+  const local = join(root, "local");
+  git(root, "init", "--quiet", "--bare", "-b", "main", canonical);
+  git(root, "clone", "--quiet", canonical, local);
+  writeFileSync(join(local, "base"), "baseline\n");
+  git(local, "add", ".");
+  git(local, "commit", "--quiet", "-m", "baseline");
+  const base = git(local, "rev-parse", "HEAD");
+  git(local, "push", "--quiet", "origin", "HEAD:main");
+  git(root, "clone", "--quiet", "--bare", canonical, source);
+  const commit = (file: string, value: string) => {
+    writeFileSync(join(local, file), value);
+    git(local, "add", ".");
+    git(local, "commit", "--quiet", "-m", file);
+    return git(local, "rev-parse", "HEAD");
+  };
+  const prepare = (snapshot: string, logical: string, main: string) => {
+    git(local, "push", "--quiet", "--force", source, `${snapshot}:refs/heads/work`);
+    const current = spawnSync("git", ["rev-parse", "refs/heads/gitmatrix/landing/test"], {
+      cwd: canonical,
+      encoding: "utf8",
+    });
+    return spawnSync("bash", ["-c", COMPACT_SCRIPT], {
+      cwd: local,
+      encoding: "utf8",
+      env: {
+        ...identity,
+        GITMATRIX_URL: `file://${root}`,
+        GITMATRIX_REPOSITORY: "repo",
+        GITMATRIX_TOKEN: "local-test",
+        GITMATRIX_COMMIT: snapshot,
+        GITMATRIX_LANDING_SOURCE: "work_test",
+        GITMATRIX_LANDING_TIMELINE: "search",
+        GITMATRIX_LANDING_SOURCE_TREE: git(local, "rev-parse", `${snapshot}^{tree}`),
+        GITMATRIX_LANDING_LOGICAL_COMMIT: logical,
+        GITMATRIX_LANDING_LOGICAL_TREE: git(local, "rev-parse", `${logical}^{tree}`),
+        GITMATRIX_LANDING_BASE: main,
+        GITMATRIX_LANDING_BRANCH: "gitmatrix/landing/test",
+        GITMATRIX_LANDING_OLD: current.status === 0 ? current.stdout.trim() : "",
+        GITMATRIX_LANDING_NAME: "Gitmatrix",
+        GITMATRIX_LANDING_EMAIL: "landing@gitmatrix.invalid",
+        GITMATRIX_LANDING_DATE: "2000-01-01T00:00:00Z",
+        GITMATRIX_LANDING_MESSAGE: "Compact checkpoint",
       },
     });
-    // A repository's own job named like it, a slug that isn't one, another
-    // repository: forbidden. A finished job's credential is no credential.
-    expect(await check("mimic")).toMatchObject({ ok: false, status: 403 });
-    expect(await check("odd")).toMatchObject({ ok: false, status: 403 });
-    expect(await check("land", "lib")).toMatchObject({ ok: false, status: 403 });
-    expect(await check("done")).toMatchObject({ ok: false, status: 401 });
-    expect(await landingJob(db, "gmj_nope", "orbit", "app")).toMatchObject({
-      ok: false,
-      status: 401,
-    });
-  });
+  };
+  return { root, canonical, source, local, base, commit, prepare };
+}
 
-  test("gets no Artifacts credential: it uses the git proxy with its own", () => {
-    expect(MERGE_SCRIPT).not.toMatch(/curl|landing\/credential/);
-    expect(MERGE_SCRIPT).toContain('remote="$GITMATRIX_URL/$GITMATRIX_REPOSITORY.git"');
-    expect(MERGE_SCRIPT).toContain('"Authorization: Bearer $GITMATRIX_TOKEN"');
+describe("compact publication", () => {
+  test("publishes one canonical-only parent and never uploads WIP objects, including staging", () => {
+    const f = fixture();
+    const w1 = f.commit("work", "one\n"),
+      w2 = f.commit("work", "two\n"),
+      w3 = f.commit("work", "three\n");
+    git(f.local, "checkout", "--quiet", "--detach", f.base);
+    const main = f.commit("independent", "canonical\n");
+    git(f.local, "push", "--quiet", "origin", "HEAD:main");
+    const result = f.prepare(w3, f.base, main);
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    const candidate = git(f.canonical, "rev-parse", "refs/heads/gitmatrix/landing/test");
+    expect(git(f.canonical, "rev-list", "--parents", "-n", "1", candidate)).toBe(
+      `${candidate} ${main}`,
+    );
+    expect(git(f.canonical, "rev-list", "--count", `${main}..${candidate}`)).toBe("1");
+    expect(git(f.canonical, "show", `${candidate}:work`)).toBe("three");
+    expect(git(f.canonical, "show", `${candidate}:independent`)).toBe("canonical");
+    for (const oid of [w1, w2, w3])
+      expect(spawnSync("git", ["cat-file", "-e", oid], { cwd: f.canonical }).status).not.toBe(0);
+    expect(git(f.canonical, "rev-parse", "main")).toBe(main);
+  });
+  test("uses P0 rather than compact parent's tree and preserves a canonical parent revert", () => {
+    const f = fixture();
+    const p0 = f.commit("parent", "parent contribution\n");
+    const child = f.commit("child", "child contribution\n");
+    git(f.local, "checkout", "--quiet", "--detach", f.base);
+    const main = f.commit("unrelated", "main kept this\n");
+    git(f.local, "push", "--quiet", "origin", "HEAD:main");
+    const result = f.prepare(child, p0, main);
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    const candidate = git(f.canonical, "rev-parse", "refs/heads/gitmatrix/landing/test");
+    expect(git(f.canonical, "ls-tree", "--name-only", candidate).split("\n")).toEqual([
+      "base",
+      "child",
+      "unrelated",
+    ]);
+    expect(git(f.canonical, "show", `${candidate}:child`)).toBe("child contribution");
+  });
+  test("no-op publishes the pinned canonical commit, not an empty commit", () => {
+    const f = fixture();
+    const result = f.prepare(f.base, f.base, f.base);
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    expect(git(f.canonical, "rev-parse", "refs/heads/gitmatrix/landing/test")).toBe(f.base);
+  });
+  test("honest content conflicts publish nothing", () => {
+    const f = fixture();
+    const work = f.commit("base", "work\n");
+    git(f.local, "checkout", "--quiet", "--detach", f.base);
+    const main = f.commit("base", "main\n");
+    git(f.local, "push", "--quiet", "origin", "HEAD:main");
+    expect(f.prepare(work, f.base, main).status).toBe(42);
+    expect(
+      spawnSync("git", ["rev-parse", "--verify", "refs/heads/gitmatrix/landing/test"], {
+        cwd: f.canonical,
+      }).status,
+    ).not.toBe(0);
   });
 });
 
-describe("the merge step", () => {
-  const dirs: string[] = [];
-  const closers: (() => Promise<void>)[] = [];
-  afterEach(async () => {
-    vi.unstubAllGlobals();
-    for (const close of closers.splice(0)) await close();
-    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+test("a source merge never introduces either WIP parent into canonical objects", () => {
+  const f = fixture(),
+    left = f.commit("left", "left\n");
+  git(f.local, "checkout", "--quiet", "--detach", f.base);
+  const right = f.commit("right", "right\n");
+  git(f.local, "merge", "--quiet", "--no-ff", "-m", "source merge", left);
+  const merged = git(f.local, "rev-parse", "HEAD");
+  const result = f.prepare(merged, f.base, f.base);
+  expect(result.status, result.stdout + result.stderr).toBe(0);
+  const candidate = git(f.canonical, "rev-parse", "refs/heads/gitmatrix/landing/test");
+  expect(git(f.canonical, "rev-list", "--parents", "-n", "1", candidate)).toBe(
+    `${candidate} ${f.base}`,
+  );
+  expect(git(f.canonical, "ls-tree", "--name-only", candidate).split("\n")).toEqual([
+    "base",
+    "left",
+    "right",
+  ]);
+  for (const oid of [left, right, merged])
+    expect(spawnSync("git", ["cat-file", "-e", oid], { cwd: f.canonical }).status).not.toBe(0);
+});
+
+test("only the running trusted job owns its source and canonical landing authority", async () => {
+  const sqlite = migratedDatabase();
+  sqlite.exec(`INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner');
+    INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote) VALUES('r','owner','repo','private','r','https://r');
+    INSERT INTO timeline_work_sources
+      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,
+       allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
+       initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
+      VALUES ('work_test','r','timeline','test','owner','work-r','https://work-r','ready',
+       'allocation','canonical','${"a".repeat(40)}','${"b".repeat(40)}','refs/heads/main',
+       'canonical','${"a".repeat(40)}','${"b".repeat(40)}','refs/heads/main',datetime('now'),datetime('now'));
+    INSERT INTO ci_runs(id,repo_id,number,commit_oid,ref,trigger,status,source_id) VALUES('run','r',1,'${"a".repeat(40)}','gitmatrix/landing/test','manual','running','work_test');
+    INSERT INTO ci_jobs(id,run_id,repo_id,name,spec,status,runner,source_id) VALUES('job','run','r','land','{"landing":{"slug":"test","sourceId":"work_test"},"steps":[]}','running','local','work_test');`);
+  const db = d1(sqlite),
+    token = await mintJobToken(db, "job", 30);
+  expect(await landingJob(db, token, "owner", "repo")).toMatchObject({
+    ok: true,
+    sourceId: "work_test",
+    slug: "test",
   });
-
-  function git(cwd: string, ...args: string[]) {
-    return execFileSync("git", args, {
-      cwd,
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        GIT_AUTHOR_NAME: "t",
-        GIT_AUTHOR_EMAIL: "t@t",
-        GIT_COMMITTER_NAME: "t",
-        GIT_COMMITTER_EMAIL: "t@t",
-      },
-    }).trim();
-  }
-
-  /**
-   * A remote where the timeline and main each changed `file` (different
-   * lines); with `clash`, main also added the `new` file the timeline adds.
-   * Then a checkout as CI makes one, Gitmatrix's git proxy in front of the
-   * remote (as Artifacts), and the step to run in the checkout with the merge
-   * job's credential.
-   */
-  async function setup(clash = false) {
-    const root = mkdtempSync(join(tmpdir(), "landing-"));
-    dirs.push(root);
-    const remote = join(root, "app.git");
-    const work = join(root, "work");
-    git(root, "init", "--quiet", "--bare", "-b", "main", remote);
-    git(root, "clone", "--quiet", remote, work);
-    writeFileSync(join(work, "file"), "one\ntwo\nthree\n");
-    git(work, "add", "file");
-    git(work, "commit", "--quiet", "-m", "start");
-    git(work, "push", "--quiet", "origin", "HEAD:refs/heads/main");
-    git(work, "checkout", "--quiet", "-b", "timeline");
-    writeFileSync(join(work, "file"), "ONE\ntwo\nthree\n");
-    writeFileSync(join(work, "new"), "timeline\n");
-    git(work, "add", "file", "new");
-    git(work, "commit", "--quiet", "-m", "timeline work");
-    const commit = git(work, "rev-parse", "HEAD");
-    git(work, "push", "--quiet", "origin", "HEAD:refs/heads/gitmatrix/landing/search");
-    git(work, "checkout", "--quiet", "main");
-    writeFileSync(join(work, "file"), "one\ntwo\nTHREE\n");
-    if (clash) writeFileSync(join(work, "new"), "main's own\n");
-    git(work, "add", "file", ...(clash ? ["new"] : []));
-    git(work, "commit", "--quiet", "-m", "main moved");
-    git(work, "push", "--quiet", "origin", "HEAD:refs/heads/main");
-    const base = git(work, "rev-parse", "HEAD");
-    // CI's checkout: the landing branch, shallow.
-    const checkout = join(root, "ci");
-    git(
-      root,
-      "clone",
-      "--quiet",
-      "--depth",
-      "1",
-      "--single-branch",
-      "--branch",
-      "gitmatrix/landing/search",
-      `file://${remote}`,
-      checkout,
-    );
-    // The proxy, with the landing's merge job in the database.
-    const env = {
-      DB: d1(database(commit)),
-      ARTIFACTS: {
-        get: async (name: string) => ({
-          createToken: async (scope: string) => ({
-            id: "t",
-            plaintext: `${scope}-${name}`,
-            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-          }),
-          [Symbol.dispose]() {},
-        }),
-      },
-    } as unknown as Env;
-    const backend = gitBackend(root);
-    vi.stubGlobal("fetch", backend.fetch);
-    const server = await serve(new Hono<AppEnv>().route("/", gitHttp), env);
-    closers.push(server.close);
-    const token = await mintJobToken(env.DB, "land", 30);
-    const step = () =>
-      run("bash", ["-eo", "pipefail", "-c", MERGE_SCRIPT], {
-        cwd: checkout,
-        env: {
-          ...process.env,
-          GIT_CONFIG_NOSYSTEM: "1",
-          GIT_CONFIG_GLOBAL: "/dev/null",
-          GITMATRIX_TOKEN: token,
-          GITMATRIX_URL: server.url,
-          GITMATRIX_REPOSITORY: "orbit/app",
-          GITMATRIX_COMMIT: commit,
-          GITMATRIX_LANDING_BRANCH: "gitmatrix/landing/search",
-          GITMATRIX_LANDING_MAIN: "main",
-          GITMATRIX_LANDING_BASE: base,
-          GITMATRIX_LANDING_MESSAGE: "Land timeline search (checkpoint #1)",
-          GITMATRIX_LANDING_NAME: "Gitmatrix",
-          GITMATRIX_LANDING_EMAIL: "landing@gitmatrix.invalid",
-        },
-      });
-    return { remote, base, commit, step, backend };
-  }
-
-  test("merges the checkpoint into main's pinned commit and pushes it to the landing branch", async () => {
-    const t = await setup();
-    const result = await t.step();
-    expect(result.status, result.stdout + result.stderr).toBe(0);
-    const merge = git(t.remote, "rev-parse", "refs/heads/gitmatrix/landing/search");
-    expect(git(t.remote, "rev-parse", `${merge}^1`)).toBe(t.base);
-    expect(git(t.remote, "rev-parse", `${merge}^2`)).toBe(t.commit);
-    expect(git(t.remote, "show", `${merge}:file`)).toBe("ONE\ntwo\nTHREE");
-    expect(git(t.remote, "log", "-1", "--format=%s %an", merge)).toBe(
-      "Land timeline search (checkpoint #1) Gitmatrix",
-    );
-    // Main itself is the Worker's to move.
-    expect(git(t.remote, "rev-parse", "refs/heads/main")).toBe(t.base);
-    // All of it through the proxy, which used its own tokens for Artifacts.
-    expect(t.backend.requests.map((r) => [new URL(r.url).pathname, r.authorization])).toEqual(
-      expect.arrayContaining([
-        ["/app.git/git-upload-pack", "Bearer read-r-app"],
-        ["/app.git/git-receive-pack", "Bearer write-r-app"],
-      ]),
-    );
-  });
-
-  test("a conflict exits with its own code, listing the files, and pushes nothing", async () => {
-    const t = await setup(true);
-    const result = await t.step();
-    expect(result.status, result.stdout + result.stderr).toBe(CONFLICT_EXIT);
-    expect(result.stdout).toMatch(/conflicts in:\n {2}new/);
-    expect(git(t.remote, "rev-parse", "refs/heads/gitmatrix/landing/search")).toBe(t.commit);
-  });
+  expect(await landingJob(db, token, "owner", "other")).toMatchObject({ ok: false });
+  sqlite.exec(
+    'UPDATE ci_jobs SET spec=\'{"landing":{"slug":"test","sourceId":"work_other"}}\' WHERE id=\'job\'',
+  );
+  expect(await landingJob(db, token, "owner", "repo")).toMatchObject({ ok: false });
+  sqlite.exec(
+    'UPDATE ci_jobs SET spec=\'{"landing":{"slug":"test","sourceId":"work_test"}}\' WHERE id=\'job\'',
+  );
+  sqlite.exec("UPDATE ci_runs SET ref='gitmatrix/landing/other' WHERE id='run'");
+  expect(await landingJob(db, token, "owner", "repo")).toMatchObject({ ok: false });
+  sqlite.exec("UPDATE ci_runs SET ref='gitmatrix/landing/test',status='succeeded' WHERE id='run'");
+  expect(await landingJob(db, token, "owner", "repo")).toMatchObject({ ok: false });
+  sqlite.exec("UPDATE ci_runs SET status='running' WHERE id='run'");
+  sqlite.exec("UPDATE ci_jobs SET status='succeeded' WHERE id='job'");
+  expect(await landingJob(db, token, "owner", "repo")).toMatchObject({ ok: false });
 });

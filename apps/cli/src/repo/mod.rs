@@ -269,7 +269,7 @@ impl Workspace {
         let main = self.find_main()?;
         if let Some(slug) = &self.timeline {
             let name = format!("timeline/{slug}");
-            let refname = format!("refs/remotes/origin/{name}");
+            let refname = format!("refs/remotes/gm-work/{name}");
             if let Ok(reference) = self.repo.find_reference(&refname)
                 && let Ok(commit) = reference.peel_to_commit()
             {

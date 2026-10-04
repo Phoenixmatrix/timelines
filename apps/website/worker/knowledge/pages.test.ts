@@ -157,6 +157,7 @@ interface AiCall {
 
 async function setup() {
   const sqlite = migratedDatabase();
+  const artifactsName = `r-pages-${crypto.randomUUID()}`;
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name, member_repo_role) VALUES
       ('ann', 'user', 'ann', 'Ann', NULL), ('ben', 'user', 'ben', 'Ben', NULL),
@@ -165,12 +166,12 @@ async function setup() {
       ('orbit', 'ann', 'owner'), ('orbit', 'ben', 'member'), ('orbit', 'cat', 'member');
     INSERT INTO agents (id, name, accountable_id) VALUES ('agt_bot', 'bot', 'ben');
     INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
-      ('app', 'orbit', 'app', 'private', 'r-pages-${crypto.randomUUID()}', 'https://app');
+      ('app', 'orbit', 'app', 'private', '${artifactsName}', 'https://app');
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('app', 'ben', 'write');
     INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('app', '${MAIN}');
   `);
   const git = fakeRemotes();
-  const app = git.add("https://app", { "refs/heads/main": MAIN });
+  git.add("https://app", { "refs/heads/main": MAIN }, "refs/heads/main", artifactsName);
   vi.stubGlobal("fetch", git.fetch);
 
   // The models: clef answers how stale a page is; the writer echoes the page.
@@ -198,7 +199,7 @@ async function setup() {
 
   const builds = new Map<string, { params: unknown; status: string }>();
   const trackers = new Map<string, Tracker>();
-  const env = {
+  const env: Env = {
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
     AI,
@@ -216,7 +217,7 @@ async function setup() {
         if (!trackers.has(id)) {
           const { sql, transactionSync } = durableStorage();
           const ctx = { storage: { sql, transactionSync } } as unknown as DurableObjectState;
-          trackers.set(id, new Tracker(ctx, {} as Env));
+          trackers.set(id, new Tracker(ctx, env));
         }
         return trackers.get(id);
       },
@@ -309,9 +310,22 @@ async function setup() {
   const kn = (who: keyof typeof tokens, method: string, path: string) =>
     raw(who, method, `/repos/orbit/app/knowledge${path}`);
 
-  // A timeline in orbit/app whose bookmark moved to TIP.
-  await timeline("bot", "POST", "", { slug: "search", repos: ["orbit/app"] });
-  app.refs.set(REF, TIP);
+  // A tracked timeline resolves its own physical work repository, never a canonical bookmark.
+  const created = await timeline("bot", "POST", "", { slug: "search", repos: ["orbit/app"] });
+  expect(created.status).toBe(201);
+  const owned = sqlite
+    .prepare("SELECT source_id, artifacts_name FROM timeline_work_sources WHERE repo_id = 'app'")
+    .get() as {
+    source_id: string;
+    artifacts_name: string;
+  };
+  const app = git.getByName(owned.artifacts_name);
+  app.refs.set("refs/heads/work", TIP);
+  app.commits.add(TIP);
+  app.parents.set(TIP, [MAIN]);
+  sqlite
+    .prepare("UPDATE timeline_work_sources SET fork_tree = 't-main' WHERE source_id = ?")
+    .run(owned.source_id);
 
   const step = (names: string[]) =>
     ({
@@ -332,6 +346,11 @@ async function setup() {
         await runPageSet(env, params, step([]), {
           repo: async (repoId) => ({ id: repoId, full_name: "orbit/app" }),
           withReader: (_row, work) => work(reader),
+          pinBase: async (repoId, base, snapshot) => {
+            expect(base).toBe(MAIN);
+            await saveSnapshot(env.DB, repoId, snapshot, MAIN_FILES);
+            return MAIN_FILES;
+          },
           finished: (buildId) => coordinator.pagesFinished(buildId),
         }),
       );
@@ -355,6 +374,7 @@ async function setup() {
 
   return {
     sqlite,
+    sourceId: owned.source_id,
     env,
     app,
     ai,
@@ -485,7 +505,7 @@ describe("timeline wiki pages", () => {
   test("main watchdog retries retain admission policy while a successor captures changed settings", async () => {
     const t = await setup();
     // Keep this scenario on main rather than starting an independent overlay.
-    t.app.refs.delete(REF);
+    t.app.refs.delete("refs/heads/work");
     await t.coordinator.notify("app", { force: true });
     await t.coordinator.alarm();
     const [firstId, first] = [...t.builds.entries()][0]!;
@@ -623,6 +643,7 @@ describe("timeline wiki pages", () => {
     expect(
       await queueSet(t.env.DB, {
         repoId: "app",
+        sourceId: t.sourceId,
         ref: REF,
         key: made.checkpoint.id,
         commit: TIP,
@@ -632,7 +653,12 @@ describe("timeline wiki pages", () => {
     ).toEqual({ status: "succeeded", queued: false });
     expect((await t.drain()).started).toEqual([]);
     // Settling the set's pages again changes nothing and asks no model.
-    const set: PageSetRef = { repoId: "app", ref: REF, key: made.checkpoint.id };
+    const set: PageSetRef = {
+      repoId: "app",
+      sourceId: t.sourceId,
+      ref: REF,
+      key: made.checkpoint.id,
+    };
     const changes = await timelineChanges(t);
     const again = await writeSetPages(
       t.env,
@@ -692,6 +718,13 @@ describe("timeline wiki pages", () => {
       set: { key: made.checkpoint.id, checkpoint: { number: 1 } },
     });
     expect(page.body).toContain("Written about src/web.");
+    expect(page.sourceId).toBe(t.sourceId);
+    expect(page.sourceLocations).toEqual(
+      expect.arrayContaining([
+        { path: "src/web/f0.ts", sourceId: t.sourceId, commit: TIP },
+        { path: "src/web/f1.ts", sourceId: "canonical", commit: MAIN },
+      ]),
+    );
     expect(
       (await t.kn("cat", "GET", "/overlay/page?ref=timeline/search&slug=overview")).status,
     ).toBe(404);
@@ -744,13 +777,13 @@ describe("timeline wiki pages", () => {
     const written = t.pages(made.checkpoint.id);
 
     // A second checkpoint's set is queued and started, then the timeline ends.
-    t.app.refs.set(REF, TIP);
+    t.app.refs.set("refs/heads/work", TIP);
     const second = await requestSecond(t, made);
     await t.coordinator.alarm();
     t.sqlite.exec(`
-      INSERT INTO kg_overlays (repo_id, ref, overlay_id, head_commit, base_commit, status,
+      INSERT INTO kg_overlays (repo_id, source_id, ref, overlay_id, head_commit, base_commit, status,
           attempted_commit, ended_at, ended_reason)
-        VALUES ('app', '${REF}', 'o1', '${TIP}', '${MAIN}', 'succeeded', '${TIP}',
+        VALUES ('app', '${t.sourceId}', '${REF}', 'o1', '${TIP}', '${MAIN}', 'succeeded', '${TIP}',
           '2026-10-03T00:00:00.000Z', 'landed');
     `);
     const calls = t.ai.calls.length;
@@ -767,6 +800,7 @@ describe("timeline wiki pages", () => {
     expect(
       await queueSet(t.env.DB, {
         repoId: "app",
+        sourceId: t.sourceId,
         ref: REF,
         key: "cp-later",
         commit: TIP,
@@ -779,6 +813,47 @@ describe("timeline wiki pages", () => {
       .body as KnowledgePageSets;
     expect(listed.ended).toBe(true);
     expect(t.pages(made.checkpoint.id)).toEqual(written);
+  });
+
+  test("published pages outlive work Git while retained source ownership remains enforced", async () => {
+    const t = await setup();
+    try {
+      const made = await makeCheckpoint(t);
+      await t.drain();
+      const query = `ref=timeline/search&source=${t.sourceId}`;
+      const pagePath = `/overlay/page?${query}&slug=components/src-web&set=${made.checkpoint.id}`;
+      const before = await t.kn("cat", "GET", pagePath);
+      expect(before.status).toBe(200);
+      expect(before.body).toMatchObject({ sourceId: t.sourceId, generatedIn: TIP });
+      t.sqlite
+        .prepare(
+          "UPDATE timeline_work_sources SET state='purged', artifacts_remote=NULL WHERE source_id=?",
+        )
+        .run(t.sourceId);
+      expect(await t.kn("cat", "GET", pagePath)).toEqual(before);
+      const listed = await t.kn("cat", "GET", `/overlay/pages?${query}`);
+      expect(listed.status).toBe(200);
+      expect(listed.body.sets.map((set: KnowledgePageSet) => set.key)).toEqual([
+        made.checkpoint.id,
+      ]);
+      expect(
+        (await t.kn("cat", "GET", pagePath.replace("timeline/search", "timeline/other"))).status,
+      ).toBe(404);
+      t.sqlite.exec(`
+        INSERT INTO repos (id,owner_id,name,visibility,artifacts_name,artifacts_remote)
+          VALUES ('other','orbit','other','private','other','https://other');
+      `);
+      expect((await t.raw("cat", "GET", `/repos/orbit/other/knowledge${pagePath}`)).status).toBe(
+        404,
+      );
+      t.sqlite.exec("DELETE FROM org_members WHERE org_id='orbit' AND user_id='cat'");
+      expect((await t.kn("cat", "GET", pagePath)).status).toBe(404);
+      expect((await t.kn("ann", "GET", pagePath)).status).toBe(200);
+      t.sqlite.exec("UPDATE repos SET deleted_at='2026-10-04' WHERE id='app'");
+      expect((await t.kn("ann", "GET", pagePath)).status).toBe(404);
+    } finally {
+      t.sqlite.close();
+    }
   });
 });
 

@@ -3,7 +3,6 @@ import { createMemoryRouter } from "react-router";
 import {
   bookmarkIn,
   carryScope,
-  scopeHint,
   scopeLinks,
   scopeOf,
   scopeOwner,
@@ -105,34 +104,38 @@ describe("the timeline scope", () => {
     );
   });
 
+  test("switching work sources preserves the file path but replaces source identity; leaving clears it", () => {
+    const source = {
+      sourceId: "work_parent",
+      repoId: "repo",
+      kind: "timeline-work" as const,
+      timelineId: "parent",
+      ref: "refs/heads/work",
+    };
+    const targetSource = { ...source, sourceId: "work_child", timelineId: "child" };
+    const location = {
+      pathname: "/orbit/engine/blob/work/src/a.ts",
+      search: "?tl=parent&source=work_parent",
+      hash: "#L4",
+    };
+    expect(
+      switchScope(location, "child", {
+        defaultBranch: "main",
+        branches: ["work"],
+        source,
+        targetSource,
+      }),
+    ).toBe("/orbit/engine/blob/work/src/a.ts?tl=child&source=work_child#L4");
+    expect(switchScope(location, null, { defaultBranch: "main", branches: ["work"], source })).toBe(
+      "/orbit/engine/blob/main/src/a.ts?tl=main#L4",
+    );
+  });
+
   test("a repository opens on the bookmark only when the timeline touches it", () => {
     const repo = { branches: [{ shortName: "main" }, { shortName: "timeline/search" }] };
     expect(bookmarkIn(repo, "search")).toBe("timeline/search");
     expect(bookmarkIn(repo, "ranking")).toBeNull();
     expect(bookmarkIn(repo, null)).toBeNull();
-  });
-
-  test("the banner says what the scope means where you are", () => {
-    expect(scopeHint("/tracker/orbit", "search")).toMatch(/stays in it until it lands/);
-    expect(scopeHint("/orbit/engine/ci", "search", true)).toBe("Runs on timeline/search.");
-    expect(scopeHint("/orbit/engine/ci", "search", false)).toMatch(/isn't part of the timeline/);
-    expect(scopeHint("/orbit/engine", "search", true)).toMatch(/^Code on timeline\/search/);
-    expect(scopeHint("/orbit/-/packages/npm/web", "search")).toBe(
-      "Versions built from timeline/search.",
-    );
-    expect(scopeHint("/orbit/engine/knowledge", "search")).toMatch(/adds, changes and removes/);
-    expect(scopeHint("/needs-you", "search")).toBe("Main plus this timeline's work.");
-    // An ended timeline's view is read-only everywhere (CORE-74).
-    expect(scopeHint("/tracker/orbit", "search", undefined, "abandoned")).toMatch(
-      /^read-only, its issues as it left them/,
-    );
-    expect(scopeHint("/tracker/orbit/issues/ENG-1", "search", undefined, "abandoned")).toMatch(
-      /back to do/,
-    );
-    expect(scopeHint("/orbit/engine/ci", "search", false, "abandoned")).toMatch(/^read-only;/);
-    expect(scopeHint("/orbit/engine", "search", true, "landed")).toBe(
-      "read-only; its work is on main.",
-    );
   });
 });
 

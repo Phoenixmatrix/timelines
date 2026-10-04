@@ -8,8 +8,11 @@ import { setTimeout as delay } from "node:timers/promises";
 import { chromium, expect as playwrightExpect } from "@playwright/test";
 import type { HarnessContext, SeedManifest } from "./types.ts";
 import type { AiSettingsView, AiSnapshot } from "../../apps/website/shared/ai.ts";
+import type { CodeSource, SourceSnapshot } from "../../apps/website/shared/code-source.ts";
+import type { Landing } from "../../apps/website/shared/timelines.ts";
 import type {
   ReleaseFeed,
+  ReleaseNoteEntry,
   ReleaseNotesIndex,
   ReleaseNotesRelease,
 } from "../../apps/website/shared/release-notes.ts";
@@ -414,104 +417,340 @@ export async function runProviderE2E(
     let final: string;
     if (mode === "mirror") {
       assert(target);
-      enter("mirror-configure");
-      await api(`${base}/mirror`, "PUT", {
-        url: target.url,
-        username: "agent",
-        token,
-        enabled: true,
-        prune: true,
-      });
-      enter("mirror-initial-queue");
-      await git(["push", "origin", "main"], work, true);
-      const initial = await git(["rev-parse", "HEAD"]);
-      const refs = async () => {
-        const result = new Map<string, string>(
-          (
-            await git([
-              "--git-dir",
-              join(root, "target.git"),
-              "for-each-ref",
-              "--format=%(refname) %(objectname)",
-            ])
-          )
-            .split("\n")
-            .filter(Boolean)
-            .map((line) => {
-              const [ref, oid] = line.split(" ");
-              return [ref!, oid!];
-            }),
+      const dev = async (path: string, body?: unknown) => {
+        assert(ctx.env.GITMATRIX_AGENT_SECRET, "Mirror fixtures require the agent secret");
+        const response = await fetch(`${ctx.origin}/api/dev/${path}`, {
+          method: body === undefined ? "GET" : "POST",
+          headers: {
+            authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET}`,
+            "content-type": "application/json",
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          signal: AbortSignal.timeout(180_000),
+        });
+        assert.equal(response.status, 200, `Owned mirror ${path} control failed`);
+        return response.json();
+      };
+      let mirrorRepoId: string | undefined;
+      try {
+        enter("mirror-configure");
+        await api(`${base}/mirror`, "PUT", {
+          url: target.url,
+          username: "agent",
+          token,
+          enabled: true,
+          prune: true,
+        });
+        enter("mirror-initial-queue");
+        await git(["push", "origin", "main"], work, true);
+        const initial = await git(["rev-parse", "HEAD"]);
+        mirrorRepoId = (await api(base)).id;
+        assert(mirrorRepoId, "Mirror cleanup needs the canonical repository identity");
+        const refs = async () => {
+          const result = new Map<string, string>(
+            (
+              await git([
+                "--git-dir",
+                join(root, "target.git"),
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+              ])
+            )
+              .split("\n")
+              .filter(Boolean)
+              .map((line) => {
+                const [ref, oid] = line.split(" ");
+                return [ref!, oid!];
+              }),
+          );
+          evidence.observedMirrorRefs = Object.fromEntries(result);
+          return result;
+        };
+        await waitFor(
+          stage,
+          120_000,
+          async () => (await refs()).get("refs/heads/main") === initial,
         );
-        evidence.observedMirrorRefs = Object.fromEntries(result);
-        return result;
-      };
-      await waitFor(stage, 120_000, async () => (await refs()).get("refs/heads/main") === initial);
-      // Pruning covers only what is mirrored: the stale tag goes, the stale
-      // branch (not the default) stays.
-      for (const ref of ["refs/heads/stale-fixture", "refs/tags/stale-fixture"]) {
-        await git(["--git-dir", join(root, "target.git"), "update-ref", ref, initial]);
+        // Pruning covers only what is mirrored: the stale tag goes, the stale
+        // branch (not the default) stays.
+        for (const ref of ["refs/heads/stale-fixture", "refs/tags/stale-fixture"]) {
+          await git(["--git-dir", join(root, "target.git"), "update-ref", ref, initial]);
+        }
+        enter("mirror-update-tag-prune");
+        await git([
+          "-c",
+          "core.hooksPath=/dev/null",
+          "commit",
+          "--allow-empty",
+          "-m",
+          "Verify mirror update",
+        ]);
+        await git(["tag", "-a", "provider-v1", "-m", "Provider fixture tag"]);
+        final = await git(["rev-parse", "HEAD"]);
+        let tag = await git(["rev-parse", "refs/tags/provider-v1"]);
+        // Only the default branch and tags are mirrored; the timeline stays here.
+        await git(
+          ["push", "origin", "main", "refs/tags/provider-v1", "HEAD:refs/heads/timeline-fixture"],
+          work,
+          true,
+        );
+        const mirrored = (actual: Map<string, string>) =>
+          actual.size === 3 &&
+          actual.get("refs/heads/main") === final &&
+          actual.get("refs/tags/provider-v1") === tag &&
+          actual.get("refs/heads/stale-fixture") === initial;
+        await waitFor(stage, 120_000, async () => mirrored(await refs()));
+        evidence.mirrorRefs = { main: final, tag };
+        enter("mirror-owned-work");
+        const slug = `mirror-work-${name.slice("provider-".length)}`;
+        const timelinePath = `/tracker/${owner}/timelines/${slug}`;
+        const forked = await api(
+          `/tracker/${owner}/timelines`,
+          "POST",
+          { slug, policy: "auto", repos: [{ repo: `${owner}/${name}`, commit: final }] },
+          201,
+        );
+        assert.equal(forked.timeline.repos.length, 1);
+        const entry = forked.timeline.repos[0] as {
+          source: CodeSource;
+          logicalBase: SourceSnapshot;
+          bookmark: string;
+        };
+        assert.equal(entry.source.kind, "timeline-work");
+        assert.match(entry.source.sourceId, /^work_/);
+        assert.equal(entry.source.repoId, mirrorRepoId);
+        assert.equal(entry.source.timelineId, forked.timeline.id);
+        assert.equal(entry.source.ref, "refs/heads/work");
+        assert.equal(entry.bookmark, "work");
+        assert.equal(entry.logicalBase.sourceId, "canonical");
+        assert.equal(entry.logicalBase.commit, final);
+        const remote = `${ctx.origin}/${owner}/${name}@${slug}.git`;
+        const workCommits: string[] = [];
+        const excludedObjects: string[] = [];
+        const observations: unknown[] = [];
+        evidence.ownedMirror = {
+          actor: persona,
+          timeline: slug,
+          source: entry.source,
+          logicalBase: entry.logicalBase,
+          workCommits,
+          excludedObjects,
+          observations,
+        };
+        // A fresh private source is not readable merely by knowing its opaque ID.
+        const denied = await fetch(`${remote}/info/refs?service=git-upload-pack`, {
+          signal: AbortSignal.timeout(30_000),
+        });
+        assert([401, 403, 404].includes(denied.status), "Anonymous work transport was authorized");
+        await denied.arrayBuffer();
+        const outsider = await fetch(`${remote}/info/refs?service=git-upload-pack`, {
+          headers: { authorization: `Bearer ${fixtures.tokens.sam}` },
+          signal: AbortSignal.timeout(30_000),
+        });
+        assert([403, 404].includes(outsider.status), "An unrelated person read private work");
+        await outsider.arrayBuffer();
+        const assertIsolated = async (label: string) => {
+          const { mirror } = await api(`${base}/mirror/sync`, "POST");
+          assert.equal(mirror.status, "ok");
+          assert.equal(mirror.lastSyncedCommit, final);
+          const actual = await refs();
+          assert(mirrored(actual), `${label}: canonical filtering or stale-ref controls changed`);
+          // Enumerate all stored objects, including unreachable ones: absence from
+          // refs alone would miss WIP objects leaked inside an otherwise valid pack.
+          const objects = new Set(
+            (
+              await git([
+                "--git-dir",
+                join(root, "target.git"),
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+              ])
+            )
+              .split("\n")
+              .filter(Boolean),
+          );
+          for (const oid of excludedObjects)
+            assert(!objects.has(oid), `${label}: mirror object database contains WIP ${oid}`);
+          observations.push({
+            label,
+            sourceId: entry.source.sourceId,
+            canonical: final,
+            refs: Object.fromEntries(actual),
+            excludedObjects: [...excludedObjects],
+            objectCount: objects.size,
+          });
+        };
+        await git(["fetch", remote, "refs/heads/work"], work, true);
+        assert.equal(await git(["rev-parse", "FETCH_HEAD"]), final);
+        await git(["checkout", "--detach", "FETCH_HEAD"]);
+        for (const revision of [1, 2]) {
+          await writeFile(
+            join(work, "mirror-work.txt"),
+            `Owned mirror work revision ${revision}\n`,
+          );
+          await git(["add", "mirror-work.txt"]);
+          await git(["-c", "core.hooksPath=/dev/null", "commit", "-m", `Mirror WIP ${revision}`]);
+          const oid = await git(["rev-parse", "HEAD"]);
+          workCommits.push(oid);
+          excludedObjects.push(oid);
+          if (revision === 1)
+            excludedObjects.push(await git(["rev-parse", "HEAD:mirror-work.txt"]));
+          await git(["push", remote, "HEAD:refs/heads/work"], work, true);
+          assert.equal(
+            await git(["ls-remote", remote, "refs/heads/work"], work, true),
+            `${oid}\trefs/heads/work`,
+          );
+          const sourceHistory = await api(
+            `${base}/commits?source=${entry.source.sourceId}&ref=${oid}`,
+          );
+          assert.equal(sourceHistory.source.sourceId, entry.source.sourceId);
+          await api(`${base}/commits?ref=${oid}`, "GET", undefined, 404);
+          await assertIsolated(`work-push-${revision}`);
+        }
+        assert.notEqual(workCommits[0], workCommits[1]);
+        assert.equal(await git(["show", "-s", "--format=%P", workCommits[1]!]), workCommits[0]);
+        const approvedTree = await git(["rev-parse", "HEAD^{tree}"]);
+        const canonicalParent = final;
+        enter("mirror-compact-landing");
+        const checkpoint = await api(
+          `${timelinePath}/checkpoints`,
+          "POST",
+          { summary: "Mirror only the compact canonical result, never owned WIP history." },
+          201,
+        );
+        assert.equal(checkpoint.checkpoint.repos[0].source.sourceId, entry.source.sourceId);
+        assert.equal(checkpoint.checkpoint.repos[0].source.commit, workCommits[1]);
+        let landing: Landing | null = null;
+        await waitFor(stage, 12 * 60_000, async () => {
+          landing = (await api(`${timelinePath}/landing`)).landing;
+          if (
+            landing &&
+            ["failed", "conflict", "partly_landed", "blocked_dependency"].includes(landing.state)
+          )
+            throw new Error(`Mirror compact landing ${landing.state}`);
+          return landing?.state === "landed";
+        });
+        await git(["fetch", "origin", "main"], work, true);
+        final = await git(["rev-parse", "FETCH_HEAD"]);
+        assert.equal(await git(["show", "-s", "--format=%P", final]), canonicalParent);
+        assert.equal(await git(["rev-list", "--count", `${canonicalParent}..${final}`]), "1");
+        assert.equal(await git(["rev-parse", `${final}^{tree}`]), approvedTree);
+        assert(!workCommits.includes(final), "Landing reused a WIP commit");
+        // Move the existing annotated tag to the canonical result, keeping the
+        // original exact three-ref assertion and stale-tag/nondefault controls.
+        await git(["tag", "-f", "-a", "provider-v1", final, "-m", "Compact provider fixture"]);
+        tag = await git(["rev-parse", "refs/tags/provider-v1"]);
+        await git(["push", "--force", "origin", "refs/tags/provider-v1"], work, true);
+        await waitFor("mirror-compact-convergence", 120_000, async () => mirrored(await refs()));
+        const archived = await api(timelinePath);
+        assert.equal(archived.timeline.status, "landed");
+        const archivedSource = await api(`${base}?source=${entry.source.sourceId}`);
+        assert.equal(archivedSource.source.sourceId, entry.source.sourceId);
+        assert.equal(archivedSource.sourceState, "archived");
+        assert.equal(
+          await git(["ls-remote", remote, "refs/heads/work"], work, true),
+          `${workCommits[1]}\trefs/heads/work`,
+        );
+        await assertIsolated("compact-landed-archive");
+        assert.equal(
+          await git(["--git-dir", join(root, "target.git"), "show", "-s", "--format=%P", final]),
+          canonicalParent,
+        );
+        assert.equal(
+          await git([
+            "--git-dir",
+            join(root, "target.git"),
+            "rev-parse",
+            "refs/tags/provider-v1^{}",
+          ]),
+          final,
+        );
+        enter("mirror-owned-source-expiry");
+        const expiry = await dev("source-retention", {
+          action: "expire",
+          repo: `${owner}/${name}`,
+          timeline: slug,
+          sourceId: entry.source.sourceId,
+        });
+        assert.equal(expiry.sourceId, entry.source.sourceId);
+        assert.equal(expiry.state, "purged");
+        await api(
+          `${base}/commits?source=${entry.source.sourceId}&ref=${workCommits[1]}`,
+          "GET",
+          undefined,
+          410,
+        );
+        await assertIsolated("owned-source-deleted");
+        Object.assign(evidence.ownedMirror as Record<string, unknown>, {
+          anonymousStatus: denied.status,
+          outsider: "sam",
+          outsiderStatus: outsider.status,
+          checkpoint: checkpoint.checkpoint.id,
+          canonicalParent,
+          compact: final,
+          approvedTree,
+          landing,
+          archivedSourceState: archivedSource.sourceState,
+          expiry,
+        });
+        evidence.mirrorRefs = { main: final, tag };
+        // Observe the persisted queue result before attempting synchronous auth checks.
+        await waitFor("mirror-queue-settled", 30_000, async () => {
+          const { mirror } = await api(`${base}/mirror`);
+          return mirror.status === "ok" && mirror.lastSyncedCommit === final;
+        });
+        enter("mirror-auth-rejection");
+        await api(`${base}/mirror`, "PUT", { token: randomBytes(24).toString("hex") });
+        await api(`${base}/mirror/sync`, "POST", undefined, 502);
+        const { mirror: failed } = await api(`${base}/mirror`);
+        assert.equal(failed.status, "failed");
+        assert.match(failed.lastError, /401|token/i);
+        assert(target.counts.rejected > 0, "Real HTTP target did not reject invalid credentials");
+        enter("mirror-auth-recovery");
+        await api(`${base}/mirror`, "PUT", { token });
+        const { mirror: recovered } = await api(`${base}/mirror/sync`, "POST");
+        assert.equal(recovered.status, "ok");
+        assert.equal(recovered.lastSyncedCommit, final);
+        assert.equal(recovered.lastError, null);
+        assert(mirrored(await refs()), "A sync mirrored a non-default branch or pruned too much");
+        evidence.mirrorRequests = target.counts;
+        enter("non-ai-boundary");
+        const status = await api(`${base}/knowledge/status`);
+        assert.equal(status.current, null, "Automatic fixture push launched knowledge work");
+        assert.deepEqual(status.recent, [], "Automatic fixture push created knowledge builds");
+        assert.equal(status.indexedCommit, null);
+        await api(`${base}/knowledge/rebuild`, "POST", undefined, 503);
+        await api(`${base}/knowledge/search?q=checksum`, "GET", undefined, 503);
+        await delay(2_000); // Past the coordinator debounce: status reads must not start a build either.
+        const afterRead = await api(`${base}/knowledge/status`);
+        assert.equal(afterRead.current, null, "Status read launched knowledge work");
+        assert.deepEqual(afterRead.recent, [], "Status read created knowledge builds");
+        evidence.knowledge = {
+          current: status.current,
+          recent: status.recent,
+          indexedCommit: status.indexedCommit,
+        };
+      } finally {
+        const deleted = await fetch(`${ctx.origin}/api${base}`, {
+          method: "DELETE",
+          headers: { authorization: `Bearer ${fixtures.tokens[persona]}` },
+          signal: AbortSignal.timeout(60_000),
+        });
+        assert.equal(deleted.status, 204, "Delete only this owned mirror repository");
+        if (mirrorRepoId) {
+          await dev("repo-purge", { repo: mirrorRepoId, action: "resume" });
+          await waitFor("mirror-owned-cleanup", 15 * 60_000, async () => {
+            const inventory = await dev(`repo-inventory?repo=${encodeURIComponent(mirrorRepoId!)}`);
+            if (inventory.deletion?.phase !== "done") return false;
+            assert.equal(inventory.repo, null);
+            assert.deepEqual(inventory.d1, {});
+            assert.equal(inventory.artifacts.exists, false);
+            evidence.mirrorCleanup = { repoId: mirrorRepoId, phase: "done", providerExists: false };
+            return true;
+          });
+        }
       }
-      enter("mirror-update-tag-prune");
-      await git([
-        "-c",
-        "core.hooksPath=/dev/null",
-        "commit",
-        "--allow-empty",
-        "-m",
-        "Verify mirror update",
-      ]);
-      await git(["tag", "-a", "provider-v1", "-m", "Provider fixture tag"]);
-      final = await git(["rev-parse", "HEAD"]);
-      const tag = await git(["rev-parse", "refs/tags/provider-v1"]);
-      // Only the default branch and tags are mirrored; the timeline stays here.
-      await git(
-        ["push", "origin", "main", "refs/tags/provider-v1", "HEAD:refs/heads/timeline-fixture"],
-        work,
-        true,
-      );
-      const mirrored = (actual: Map<string, string>) =>
-        actual.size === 3 &&
-        actual.get("refs/heads/main") === final &&
-        actual.get("refs/tags/provider-v1") === tag &&
-        actual.get("refs/heads/stale-fixture") === initial;
-      await waitFor(stage, 120_000, async () => mirrored(await refs()));
-      evidence.mirrorRefs = { main: final, tag };
-      // Observe the persisted queue result before attempting synchronous auth checks.
-      await waitFor("mirror-queue-settled", 30_000, async () => {
-        const { mirror } = await api(`${base}/mirror`);
-        return mirror.status === "ok" && mirror.lastSyncedCommit === final;
-      });
-      enter("mirror-auth-rejection");
-      await api(`${base}/mirror`, "PUT", { token: randomBytes(24).toString("hex") });
-      await api(`${base}/mirror/sync`, "POST", undefined, 502);
-      const { mirror: failed } = await api(`${base}/mirror`);
-      assert.equal(failed.status, "failed");
-      assert.match(failed.lastError, /401|token/i);
-      assert(target.counts.rejected > 0, "Real HTTP target did not reject invalid credentials");
-      enter("mirror-auth-recovery");
-      await api(`${base}/mirror`, "PUT", { token });
-      const { mirror: recovered } = await api(`${base}/mirror/sync`, "POST");
-      assert.equal(recovered.status, "ok");
-      assert.equal(recovered.lastSyncedCommit, final);
-      assert.equal(recovered.lastError, null);
-      assert(mirrored(await refs()), "A sync mirrored a non-default branch or pruned too much");
-      evidence.mirrorRequests = target.counts;
-      enter("non-ai-boundary");
-      const status = await api(`${base}/knowledge/status`);
-      assert.equal(status.current, null, "Automatic fixture push launched knowledge work");
-      assert.deepEqual(status.recent, [], "Automatic fixture push created knowledge builds");
-      assert.equal(status.indexedCommit, null);
-      await api(`${base}/knowledge/rebuild`, "POST", undefined, 503);
-      await api(`${base}/knowledge/search?q=checksum`, "GET", undefined, 503);
-      await delay(2_000); // Past the coordinator debounce: status reads must not start a build either.
-      const afterRead = await api(`${base}/knowledge/status`);
-      assert.equal(afterRead.current, null, "Status read launched knowledge work");
-      assert.deepEqual(afterRead.recent, [], "Status read created knowledge builds");
-      evidence.knowledge = {
-        current: status.current,
-        recent: status.recent,
-        indexedCommit: status.indexedCommit,
-      };
     } else {
       await git(["push", "origin", "main"], work, true);
       final = await git(["rev-parse", "HEAD"]);
@@ -1026,7 +1265,7 @@ export async function runProviderE2E(
           await browser.close();
         }
       }
-      const waitForNotes = async (names: string[]) => {
+      const waitForNotes = async (names: string[], exact = true) => {
         await waitFor(stage, 5 * 60_000, async () => {
           const index: ReleaseNotesIndex = await api(`${base}/release-notes`);
           evidence.releaseIndex = index;
@@ -1034,8 +1273,10 @@ export async function runProviderE2E(
             throw new Error("Release-note generation failed; see provider evidence");
           return (
             index.status.state === "ready" &&
-            JSON.stringify(index.releases.map((release) => release.name).sort()) ===
-              JSON.stringify([...names].sort())
+            (exact
+              ? JSON.stringify(index.releases.map((release) => release.name).sort()) ===
+                JSON.stringify([...names].sort())
+              : names.every((name) => index.releases.some((release) => release.name === name)))
           );
         });
       };
@@ -1309,8 +1550,7 @@ export async function runProviderE2E(
         "The team's release feed must include the shipped issue",
       );
       enter("knowledge-timeline-overlay");
-      // CORE-83: a push to a timeline bookmark updates that timeline's graph
-      // diff against main, and leaves main's graph and wiki as they were.
+      // Owned work pushes update only their source's graph diff and wiki.
       await waitFor("knowledge-main-before-overlay", 12 * 60_000, async () => {
         const status = await api(`${base}/knowledge/status`);
         if (status.state === "failed")
@@ -1338,9 +1578,38 @@ export async function runProviderE2E(
         };
       };
       const mainBefore = await mainView();
+      const canonicalRefsBefore = await git(["ls-remote", "origin"], work, true);
+      const forkWork = async (slug: string, commit: string) => {
+        const forked = await api(
+          `/tracker/${owner}/timelines`,
+          "POST",
+          { slug, repos: [{ repo: `${owner}/${name}`, commit }] },
+          201,
+        );
+        const entry = forked.timeline.repos[0] as {
+          source: CodeSource;
+          logicalBase: SourceSnapshot;
+          bookmark: string;
+        };
+        assert.equal(forked.timeline.repos.length, 1);
+        assert.equal(entry.source.kind, "timeline-work");
+        assert.match(entry.source.sourceId, /^work_/);
+        assert.equal(entry.source.timelineId, forked.timeline.id);
+        assert.equal(entry.source.ref, "refs/heads/work");
+        assert.equal(entry.bookmark, "work");
+        assert.equal(entry.logicalBase.sourceId, "canonical");
+        assert.equal(entry.logicalBase.repoId, entry.source.repoId);
+        assert.equal(entry.logicalBase.commit, commit);
+        assert.match(entry.logicalBase.tree, /^[0-9a-f]{40}$/);
+        return {
+          ...entry,
+          remote: `${ctx.origin}/${owner}/${name}@${slug}.git`,
+        };
+      };
       // Forked before verify-all.ts landed on main: the overlay must count
       // changes from the merge base, not report main's later file as removed.
       const timelineRef = "timeline/copper-limits";
+      const limitsWork = await forkWork("copper-limits", edited);
       await git(["checkout", "-q", "-b", timelineRef, edited]);
       await writeFile(
         join(work, "limits.ts"),
@@ -1348,9 +1617,10 @@ export async function runProviderE2E(
       );
       await git(["add", "limits.ts"]);
       await git(["-c", "core.hooksPath=/dev/null", "commit", "-m", "Limit Copper Finch batches"]);
-      await git(["push", "origin", `HEAD:refs/heads/${timelineRef}`], work, true);
+      await git(["push", limitsWork.remote, "HEAD:refs/heads/work"], work, true);
       const timelineHead = await git(["rev-parse", "HEAD"]);
       type Overlay = {
+        sourceId: string;
         state: string;
         commit: string | null;
         baseCommit: string | null;
@@ -1361,18 +1631,19 @@ export async function runProviderE2E(
         let overlay: Overlay | undefined;
         await waitFor("knowledge-overlay", 10 * 60_000, async () => {
           overlay = await api(
-            `${base}/knowledge/overlay?ref=${encodeURIComponent(timelineRef)}&limit=2000`,
+            `${base}/knowledge/overlay?ref=${encodeURIComponent(timelineRef)}&source=${limitsWork.source.sourceId}&limit=2000`,
           );
           if (overlay!.state === "failed")
             throw new Error("Timeline overlay failed; see provider evidence");
           return overlay!.state === "up-to-date" && overlay!.commit === commit;
         });
+        assert.equal(overlay!.sourceId, limitsWork.source.sourceId);
         return overlay!;
       };
       const has = (o: Overlay, change: string, id: string) =>
         o.changes.some((c) => c.change === change && c.id === id);
       const first = await overlayAt(timelineHead);
-      evidence.overlay = { first };
+      evidence.overlay = { source: limitsWork.source, logicalBase: limitsWork.logicalBase, first };
       assert.equal(first.baseCommit, cited, "The overlay must be measured against main's graph");
       assert.equal(first.mergeBase, edited, "The overlay must count from the fork point");
       assert(has(first, "added", "file:limits.ts"), "Overlay lacks the timeline's new file");
@@ -1396,19 +1667,47 @@ export async function runProviderE2E(
         "-am",
         "Check Copper Finch batch size",
       ]);
-      await git(["push", "origin", `HEAD:refs/heads/${timelineRef}`], work, true);
+      await git(["push", limitsWork.remote, "HEAD:refs/heads/work"], work, true);
       const timelineNext = await git(["rev-parse", "HEAD"]);
       const second = await overlayAt(timelineNext);
-      evidence.overlay = { first, second };
+      evidence.overlay = {
+        source: limitsWork.source,
+        logicalBase: limitsWork.logicalBase,
+        first,
+        second,
+      };
+      assert.equal(second.baseCommit, cited);
+      assert.equal(second.mergeBase, edited);
+      assert(has(second, "added", "file:limits.ts"));
+      assert(has(second, "added", "sym:limits.ts#copperFinchBatchLimit"));
+      assert(
+        !second.changes.some((c) => c.id === "file:verify-all.ts" || c.id === "file:checksum.ts"),
+        "The second work push must still exclude canonical-only changes",
+      );
+      assert.equal(
+        await git(["ls-remote", limitsWork.remote, "refs/heads/work"], work, true),
+        `${timelineNext}\trefs/heads/work`,
+        "Owned transport must expose the exact acknowledged work head",
+      );
+      const timelineAtlas = await api(
+        `${base}/atlas/timeline?ref=${encodeURIComponent(timelineRef)}&source=${limitsWork.source.sourceId}`,
+      );
+      assert.equal(timelineAtlas.repos[0].sourceId, limitsWork.source.sourceId);
+      assert.equal(timelineAtlas.repos[0].commit, timelineNext);
+      assert(timelineAtlas.items.some((item: { path: string }) => item.path === "limits.ts"));
+      assert(!timelineAtlas.items.some((item: { path: string }) => item.path === "verify-all.ts"));
+      (evidence.overlay as Record<string, unknown>).atlas = timelineAtlas;
       assert(
         has(second, "added", "sym:limits.ts#copperFinchFitsBatch"),
         "The overlay did not follow the timeline's second push",
       );
-      const listed = await api(`${base}/knowledge/overlays`);
+      const listed = await api(`${base}/knowledge/overlays?source=${limitsWork.source.sourceId}`);
       assert(
         listed.overlays.some(
-          (o: { ref: string; commit: string }) =>
-            o.ref === timelineRef && o.commit === timelineNext,
+          (o: { ref: string; commit: string; sourceId: string }) =>
+            o.ref === timelineRef &&
+            o.commit === timelineNext &&
+            o.sourceId === limitsWork.source.sourceId,
         ),
         "The overlay list must show the timeline at its head",
       );
@@ -1425,16 +1724,8 @@ export async function runProviderE2E(
       // apart from main's wiki. A tracked timeline forked from main's tip.
       const pagesSlug = "copper-pages";
       const pagesRef = `timeline/${pagesSlug}`;
-      const forked = await api(
-        `/tracker/${owner}/timelines`,
-        "POST",
-        { slug: pagesSlug, repos: [`${owner}/${name}`] },
-        201,
-      );
-      assert(
-        (forked.bookmarks as { ok: boolean }[]).every((b) => b.ok),
-        "Forking the pages timeline did not create its bookmark",
-      );
+      const pagesWork = await forkWork(pagesSlug, cited);
+      assert.notEqual(pagesWork.source.sourceId, limitsWork.source.sourceId);
       await git(["checkout", "-q", "-b", pagesRef, cited]);
       await writeFile(
         join(work, "receipts.ts"),
@@ -1448,7 +1739,20 @@ export async function runProviderE2E(
         "-m",
         "Receipts for Copper Finch batches",
       ]);
-      await git(["push", "origin", `HEAD:refs/heads/${pagesRef}`], work, true);
+      const pagesFirst = await git(["rev-parse", "HEAD"]);
+      await writeFile(
+        join(work, "receipt-valid.ts"),
+        'import type { CopperFinchReceipt } from "./receipts.ts";\n/** A delivered batch must have a signer and at least one parcel. */\nexport function copperFinchReceiptValid(receipt: CopperFinchReceipt): boolean {\n  return receipt.signedBy.length > 0 && receipt.parcels > 0;\n}\n',
+      );
+      await git(["add", "receipt-valid.ts"]);
+      await git([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-m",
+        "Validate signed Copper Finch receipts",
+      ]);
+      await git(["push", pagesWork.remote, "HEAD:refs/heads/work"], work, true);
       const pagesHead = await git(["rev-parse", "HEAD"]);
       const made = await api(
         `/tracker/${owner}/timelines/${pagesSlug}/checkpoints`,
@@ -1457,7 +1761,16 @@ export async function runProviderE2E(
         201,
       );
       const checkpointId = made.checkpoint.id as string;
+      const checkpointRepo = made.checkpoint.repos[0] as {
+        source: SourceSnapshot;
+        logicalBase: SourceSnapshot;
+      };
+      assert.deepEqual(checkpointRepo.logicalBase, pagesWork.logicalBase);
+      assert.equal(checkpointRepo.source.sourceId, pagesWork.source.sourceId);
+      assert.equal(checkpointRepo.source.commit, pagesHead);
+      assert.equal(checkpointRepo.source.tree, await git(["rev-parse", "HEAD^{tree}"]));
       type PageSet = {
+        sourceId: string;
         key: string;
         state: string;
         commit: string;
@@ -1470,7 +1783,7 @@ export async function runProviderE2E(
       // Queued after the checkpoint's response; one model-written page or so.
       await waitFor("knowledge-timeline-pages", 12 * 60_000, async () => {
         const listed = await api(
-          `${base}/knowledge/overlay/pages?ref=${encodeURIComponent(pagesRef)}&checkpoint=${encodeURIComponent(checkpointId)}`,
+          `${base}/knowledge/overlay/pages?ref=${encodeURIComponent(pagesRef)}&source=${pagesWork.source.sourceId}&checkpoint=${encodeURIComponent(checkpointId)}`,
         );
         set = (listed.sets as PageSet[])[0];
         if (set?.state === "failed" || set?.state === "ended")
@@ -1479,6 +1792,8 @@ export async function runProviderE2E(
       });
       const pages = set!;
       evidence.timelinePages = {
+        source: pagesWork.source,
+        logicalBase: pagesWork.logicalBase,
         key: pages.key,
         commit: pages.commit,
         baseCommit: pages.baseCommit,
@@ -1486,8 +1801,21 @@ export async function runProviderE2E(
         pages: pages.pages,
       };
       assert.equal(pages.key, checkpointId, "The page set must belong to the checkpoint");
+      assert.equal(pages.sourceId, pagesWork.source.sourceId);
       assert.equal(pages.commit, pagesHead, "The pages must describe the checkpoint's commit");
       assert.equal(pages.baseCommit, cited, "The pages must be measured against main's graph");
+      const completedPagesOverlay: Overlay = await api(
+        `${base}/knowledge/overlay?ref=${encodeURIComponent(pagesRef)}&source=${pagesWork.source.sourceId}&limit=2000`,
+      );
+      assert.equal(completedPagesOverlay.sourceId, pagesWork.source.sourceId);
+      assert.equal(completedPagesOverlay.commit, pagesHead);
+      assert(has(completedPagesOverlay, "added", "file:receipts.ts"));
+      assert(has(completedPagesOverlay, "added", "sym:receipts.ts#copperFinchReceipt"));
+      assert(
+        !completedPagesOverlay.changes.some((c) => c.id.includes("limits.ts")),
+        "Two owned sources using the same physical work ref must not share graph changes",
+      );
+      (evidence.timelinePages as Record<string, unknown>).overlay = completedPagesOverlay;
       assert((pages.counts.file?.added ?? 0) >= 1, "The pages' diff lacks the timeline's new file");
       const written = pages.pages.filter(
         (p) =>
@@ -1495,15 +1823,15 @@ export async function runProviderE2E(
       );
       assert(written.length > 0, "The checkpoint wrote no component or glossary page");
       const shown = written.find((p) => p.slug.startsWith("components/")) ?? written[0]!;
-      const timelinePage = await api(
-        `${base}/knowledge/overlay/page?ref=${encodeURIComponent(pagesRef)}&slug=${encodeURIComponent(shown.slug)}&set=${encodeURIComponent(checkpointId)}`,
-      );
+      const timelinePagePath = `${base}/knowledge/overlay/page?ref=${encodeURIComponent(pagesRef)}&source=${pagesWork.source.sourceId}&slug=${encodeURIComponent(shown.slug)}&set=${encodeURIComponent(checkpointId)}`;
+      const timelinePage = await api(timelinePagePath);
       (evidence.timelinePages as Record<string, unknown>).page = {
         slug: timelinePage.slug,
         model: timelinePage.model,
         generatedIn: timelinePage.generatedIn,
         body: String(timelinePage.body).slice(0, 1200),
       };
+      assert.equal(timelinePage.sourceId, pagesWork.source.sourceId);
       assert.equal(
         timelinePage.generatedIn,
         pagesHead,
@@ -1516,7 +1844,8 @@ export async function runProviderE2E(
           /receipt/i,
           "The timeline's component page must describe its new receipts",
         );
-      } else assert(String(timelinePage.body).trim(), "The timeline's glossary must not be empty");
+      } else
+        assert.match(String(timelinePage.body), /receipt/i, "The glossary must describe receipts");
       // The approval card shows them: the checkpoint view carries the set.
       const view = await api(`/tracker/${owner}/timelines/${pagesSlug}/checkpoints/1`);
       assert(
@@ -1531,6 +1860,296 @@ export async function runProviderE2E(
         mainBefore,
         "Writing a timeline's pages changed main's graph, wiki or builds",
       );
+      assert.deepEqual(
+        await overlayAt(timelineNext),
+        second,
+        "A different source's checkpoint changed the first source's overlay",
+      );
+      assert.equal(
+        await git(["ls-remote", "origin"], work, true),
+        canonicalRefsBefore,
+        "Owned timeline work must not create or move any canonical Git ref",
+      );
+      const devFixture = async (path: string, body: Record<string, unknown>) => {
+        assert(ctx.env.GITMATRIX_AGENT_SECRET, "Owned AI fixtures require the agent secret");
+        const response = await fetch(`${ctx.origin}/api/dev/${path}`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ repo: `${owner}/${name}`, ...body }),
+          signal: AbortSignal.timeout(180_000),
+        });
+        events.push({ stage, method: "POST", path: `/dev/${path}`, status: response.status });
+        assert.equal(response.status, 200, `Owned ${path} control failed`);
+        return response.json();
+      };
+      type KnowledgeObservation = {
+        barrier: { build_id: string | null; released: number } | null;
+        workflow: string | null;
+        outcome: string | null;
+        commit: string | null;
+        roots: string[];
+        vectors: { id: string; metadata: Record<string, unknown> }[];
+      };
+      const knowledgeFixture = (
+        action: string,
+        sourceId = limitsWork.source.sourceId,
+        extra = {},
+      ) => devFixture("knowledge-fixtures", { action, sourceId, ...extra });
+      enter("knowledge-ended-publication-fence");
+      const vectorsBefore = (await knowledgeFixture("inspect")).vectors;
+      assert.equal(
+        vectorsBefore.length,
+        1,
+        "Only the canonical checksum, not work limits, may have a vector",
+      );
+      assert.equal(vectorsBefore[0].metadata.sourceId, "canonical");
+      assert.equal(vectorsBefore[0].metadata.node, "sym:checksum.ts#copperFinchChecksum");
+      await knowledgeFixture("arm");
+      try {
+        await git(["checkout", timelineRef]);
+        await writeFile(
+          join(work, "late-only.ts"),
+          "/** This unpublished limit must never replace an ended timeline snapshot. */\nexport function copperFinchLateLimit(): number { return 128; }\n",
+        );
+        await git(["add", "late-only.ts"]);
+        await git(["-c", "core.hooksPath=/dev/null", "commit", "-m", "Late Copper Finch limit"]);
+        await git(["push", limitsWork.remote, "HEAD:refs/heads/work"], work, true);
+        const lateHead = await git(["rev-parse", "HEAD"]);
+        let paused: KnowledgeObservation | undefined;
+        await waitFor("knowledge-publication-paused", 12 * 60_000, async () => {
+          const observed: KnowledgeObservation = await knowledgeFixture("inspect");
+          paused = observed;
+          if (observed.workflow === "errored") throw new Error("Late real knowledge build failed");
+          return Boolean(observed.barrier?.build_id);
+        });
+        await api(`/tracker/${owner}/timelines/copper-limits/abandon`, "POST", {});
+        const endedPath = `${base}/knowledge/overlay?ref=${encodeURIComponent(timelineRef)}&source=${limitsWork.source.sourceId}&limit=2000`;
+        const ended = await api(endedPath);
+        assert.equal(ended.state, "ended");
+        assert.equal(ended.commit, timelineNext);
+        const atlasEnded = await api(
+          `${base}/atlas/timeline?ref=${encodeURIComponent(timelineRef)}&source=${limitsWork.source.sourceId}`,
+        );
+        await knowledgeFixture("release");
+        let finished: KnowledgeObservation | undefined;
+        await waitFor("knowledge-late-build-finished", 12 * 60_000, async () => {
+          const observed: KnowledgeObservation = await knowledgeFixture("inspect");
+          finished = observed;
+          if (observed.workflow === "errored") throw new Error("Late real knowledge build failed");
+          return observed.workflow === "complete";
+        });
+        assert(finished);
+        assert.equal(
+          finished.outcome,
+          "succeeded",
+          "Late workflow must reach the real publication fence",
+        );
+        assert.equal(finished.commit, lateHead);
+        assert.deepEqual(finished.roots, [], "Ended late workflow must release its source claim");
+        assert.deepEqual(await api(endedPath), ended, "Late build overwrote the ended overlay");
+        assert.deepEqual(
+          await api(
+            `${base}/atlas/timeline?ref=${encodeURIComponent(timelineRef)}&source=${limitsWork.source.sourceId}`,
+          ),
+          atlasEnded,
+          "Late build replaced the ended Atlas snapshot",
+        );
+        assert.deepEqual(
+          finished.vectors,
+          vectorsBefore,
+          "Work source contaminated canonical vectors",
+        );
+        assert.deepEqual(await mainView(), mainBefore, "Late work changed canonical graph/pages");
+        evidence.endedKnowledge = { lateHead, paused, finished, ended, atlas: atlasEnded };
+      } finally {
+        await knowledgeFixture("delete");
+      }
+
+      enter("release-compact-landing");
+      await api(`/tracker/${owner}/mutate`, "POST", {
+        operationId: operation(),
+        mutations: [
+          {
+            kind: "issue.create",
+            id: "copper-receipt-issue",
+            data: { teamId: "copper-team", title: "Ship signed batch receipts" },
+          },
+          {
+            kind: "request.open",
+            id: "copper-receipt-approval",
+            data: {
+              issueId: "copper-receipt-issue",
+              kind: "approval",
+              prompt: "Land the exact signed receipt checkpoint.",
+              checkpoint: checkpointId,
+            },
+          },
+        ],
+      });
+      const approvalBrowser = await chromium.launch({ headless: true });
+      try {
+        const context = await approvalBrowser.newContext({ baseURL: ctx.origin });
+        const page = await context.newPage();
+        await page.goto("/signin");
+        await page.getByRole("button", { name: /Continue as marco/i }).click();
+        await page.waitForURL((url) => url.pathname !== "/signin");
+        const approved = await context.request.post(`/api/tracker/${owner}/mutate`, {
+          headers: { origin: ctx.origin },
+          data: {
+            operationId: operation(),
+            mutations: [
+              { kind: "request.answer", id: "copper-receipt-approval", data: { approved: true } },
+            ],
+          },
+        });
+        assert.equal(approved.status(), 200, "A real person must approve the exact checkpoint");
+      } finally {
+        await approvalBrowser.close();
+      }
+      let compactLanding: Landing | null = null;
+      await waitFor("compact-landing", 12 * 60_000, async () => {
+        compactLanding = (await api(`/tracker/${owner}/timelines/${pagesSlug}/landing`)).landing;
+        if (
+          compactLanding &&
+          ["failed", "conflict", "partly_landed", "blocked_dependency"].includes(
+            compactLanding.state,
+          )
+        )
+          throw new Error(`Compact AI fixture landing ${compactLanding.state}`);
+        return compactLanding?.state === "landed";
+      });
+      await git(["fetch", "origin", "main"], work, true);
+      const compactOid = await git(["rev-parse", "FETCH_HEAD"]);
+      assert.equal(await git(["show", "-s", "--format=%P", compactOid]), cited);
+      assert.equal(await git(["rev-list", "--count", `${cited}..${compactOid}`]), "1");
+      await git(["tag", "provider-compact", compactOid]);
+      await git(["push", "origin", "refs/tags/provider-compact"], work, true);
+      await waitForNotes(["provider-compact"], false);
+      const compactNotes = await notesFor("provider-compact");
+      const compactEntry = compactNotes.entries.find((entry) => entry.commits.includes(compactOid));
+      assert(compactEntry?.model, "Compact landing must generate real model-written notes");
+      assert.equal(compactEntry.kind, "landing");
+      assert.equal(compactEntry.timeline?.kind, "compact");
+      assert.deepEqual(compactEntry.commits, [compactOid]);
+      assert.deepEqual(
+        compactEntry.provenance?.[0]?.commits.slice().sort(),
+        [pagesFirst, pagesHead].sort(),
+      );
+      assert.equal(compactEntry.provenance?.[0]?.source.sourceId, pagesWork.source.sourceId);
+      assert.equal(compactEntry.provenance?.[0]?.source.commit, pagesHead);
+      assert.match(`${compactEntry.title} ${compactEntry.summary}`, /receipt/i);
+      for (const oid of [pagesFirst, pagesHead]) {
+        await api(`${base}/commits?source=${pagesWork.source.sourceId}&ref=${oid}`);
+        await api(`${base}/commits?ref=${oid}`, "GET", undefined, 404);
+      }
+      const compactRange = await api(`${base}/release-notes/range?from=${cited}&to=${compactOid}`);
+      enter("release-source-purge-regeneration");
+      const purge = await devFixture("source-retention", {
+        action: "expire",
+        timeline: pagesSlug,
+      });
+      await api(
+        `${base}/commits?source=${pagesWork.source.sourceId}&ref=${pagesHead}`,
+        "GET",
+        undefined,
+        410,
+      );
+      const retainedPage = await api(timelinePagePath);
+      assert.equal(retainedPage.sourceId, pagesWork.source.sourceId);
+      assert.equal(retainedPage.generatedIn, pagesHead);
+      assert.equal(
+        retainedPage.body,
+        timelinePage.body,
+        "Source expiry removed independently retained wiki output",
+      );
+      assert.deepEqual(
+        await api(`${base}/release-notes/range?from=${cited}&to=${compactOid}`),
+        compactRange,
+        "Source purge lost retained compact grouping",
+      );
+      const regeneration = await knowledgeFixture("regenerate", pagesWork.source.sourceId, {
+        landing: compactOid,
+      });
+      await waitForNotes(["provider-compact"], false);
+      let regenerated: ReleaseNoteEntry | undefined;
+      await waitFor("compact-notes-regenerated", 12 * 60_000, async () => {
+        regenerated = (await notesFor("provider-compact")).entries.find((entry) =>
+          entry.commits.includes(compactOid),
+        );
+        return Boolean(regenerated?.model && regenerated.id !== compactEntry.id);
+      });
+      assert(regenerated);
+      assert.equal(regenerated.kind, compactEntry.kind);
+      assert.deepEqual(regenerated.commits, compactEntry.commits);
+      assert.deepEqual(regenerated.provenance, compactEntry.provenance);
+      assert.deepEqual(regenerated.timeline, compactEntry.timeline);
+      assert.match(`${regenerated.title} ${regenerated.summary}`, /receipt/i);
+      evidence.compactRelease = {
+        landing: compactLanding,
+        compactOid,
+        workCommits: [pagesFirst, pagesHead],
+        before: compactEntry,
+        after: regenerated,
+        range: compactRange,
+        retainedPage: {
+          sourceId: retainedPage.sourceId,
+          generatedIn: retainedPage.generatedIn,
+          body: retainedPage.body,
+        },
+        purge,
+        regeneration,
+      };
+      enter("release-historical-merge-grouping");
+      // Import a real two-parent history shape; compact landing must not reinterpret it.
+      env.GIT_COMMITTER_DATE = new Date().toISOString();
+      await git(["checkout", "-q", "-b", "historical-receipts", compactOid]);
+      await writeFile(
+        join(work, "receipt-label.ts"),
+        "/** Render a signed delivery receipt label. */\nexport function copperFinchReceiptLabel(batch: string): string { return `Receipt: ${batch}`; }\n",
+      );
+      await git(["add", "receipt-label.ts"]);
+      await git(["-c", "core.hooksPath=/dev/null", "commit", "-m", "Label delivery receipts"]);
+      const historicalWork = await git(["rev-parse", "HEAD"]);
+      await git(["checkout", "-q", "-B", "main", compactOid]);
+      await git([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "merge",
+        "--no-ff",
+        "historical-receipts",
+        "-m",
+        "Merge branch 'historical-receipts'",
+      ]);
+      const historicalMerge = await git(["rev-parse", "HEAD"]);
+      assert.equal(
+        await git(["show", "-s", "--format=%P", historicalMerge]),
+        `${compactOid} ${historicalWork}`,
+      );
+      await git(["push", "origin", "main"], work, true);
+      await git(["tag", "provider-historical"]);
+      await git(["push", "origin", "refs/tags/provider-historical"], work, true);
+      await waitForNotes(["provider-historical"], false);
+      const historical = await notesFor("provider-historical");
+      const historicalEntry = historical.entries.find((entry) =>
+        entry.commits.includes(historicalWork),
+      );
+      assert(historicalEntry?.model, "Historical real merges must still generate notes");
+      assert.equal(historicalEntry.kind, "landing");
+      assert.equal(historicalEntry.timeline?.landing, historicalMerge);
+      assert.notEqual(historicalEntry.timeline?.kind, "compact");
+      assert.equal(historicalEntry.provenance?.length ?? 0, 0);
+      assert.match(`${historicalEntry.title} ${historicalEntry.summary}`, /receipt|label/i);
+      const retainedCompact = (await notesFor("provider-compact")).entries.find((entry) =>
+        entry.commits.includes(compactOid),
+      );
+      assert(retainedCompact);
+      assert.deepEqual(retainedCompact.commits, regenerated.commits);
+      assert.deepEqual(retainedCompact.provenance, regenerated.provenance);
+      assert.deepEqual(retainedCompact.timeline, regenerated.timeline);
+      evidence.historicalMergeRelease = { historicalWork, historicalMerge, entry: historicalEntry };
       enter("gateway-evidence");
       const owned = JSON.parse(
         await readFile(join(ctx.dir, "environment.json"), "utf8"),

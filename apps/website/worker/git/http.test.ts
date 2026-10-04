@@ -87,21 +87,28 @@ async function setup(queue = false, changeId?: string) {
   const merge = git(work, "rev-parse", "HEAD");
 
   const sqlite = migratedDatabase();
-  const landing = JSON.stringify({ steps: [], landing: { slug: "search" } });
+  const landing = JSON.stringify({ steps: [], landing: { slug: "search", sourceId: "work_test" } });
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('orbit', 'org', 'orbit', 'Orbit');
     INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('app', 'orbit', 'app', 'private', 'r-app', 'https://artifacts.test/app.git'),
       ('lib', 'orbit', 'lib', 'private', 'r-lib', 'https://artifacts.test/lib.git');
-    INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES
-      ('merge', 'app', 1, '${main}', 'gitmatrix/landing/search', 'manual', 'running'),
-      ('push', 'app', 2, '${main}', 'main', 'push', 'running'),
-      ('old', 'app', 3, '${main}', 'gitmatrix/landing/search', 'manual', 'succeeded');
-    INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner) VALUES
-      ('land', 'merge', 'app', 'land', '${landing}', 'running', 'sandbox'),
-      ('mimic', 'push', 'app', 'land', '{"steps":[]}', 'running', 'sandbox'),
-      ('build', 'push', 'app', 'build', '${landing}', 'running', 'sandbox'),
-      ('done', 'old', 'app', 'land', '${landing}', 'succeeded', 'sandbox');
+    INSERT INTO timeline_work_sources
+      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,
+       allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
+       initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
+      VALUES ('work_test','app','timeline','search','orbit','work-app','https://artifacts.test/work-app.git','ready',
+       'allocation','canonical','${main}','${git(work, "rev-parse", `${main}^{tree}`)}','refs/heads/main',
+       'canonical','${main}','${git(work, "rev-parse", `${main}^{tree}`)}','refs/heads/main',datetime('now'),datetime('now'));
+    INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, source_id) VALUES
+      ('merge', 'app', 1, '${main}', 'gitmatrix/landing/search', 'manual', 'running', '${queue ? "canonical" : "work_test"}'),
+      ('push', 'app', 2, '${main}', 'main', 'push', 'running', 'canonical'),
+      ('old', 'app', 3, '${main}', 'gitmatrix/landing/search', 'manual', 'succeeded', 'work_test');
+    INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner, source_id) VALUES
+      ('land', 'merge', 'app', 'land', '${landing}', 'running', 'sandbox', '${queue ? "canonical" : "work_test"}'),
+      ('mimic', 'push', 'app', 'land', '{"steps":[]}', 'running', 'sandbox', 'canonical'),
+      ('build', 'push', 'app', 'build', '${landing}', 'running', 'sandbox', 'canonical'),
+      ('done', 'old', 'app', 'land', '${landing}', 'succeeded', 'sandbox', 'work_test');
   `);
   const candidate = queueCandidateBranch(main, 1);
   if (queue) {
@@ -193,6 +200,8 @@ async function setup(queue = false, changeId?: string) {
     );
 
   return {
+    root,
+    work,
     env,
     sqlite,
     backend,
@@ -207,6 +216,65 @@ async function setup(queue = false, changeId?: string) {
     infoRefs,
   };
 }
+
+test.each([
+  { repo: "app", source: "missing", state: "ready", status: 404 },
+  { repo: "lib", source: "search", state: "ready", status: 404 },
+  { repo: "app", source: "search", state: "purged", status: 410 },
+])("native source admission preserves lifecycle status: $repo/$source/$state", async (input) => {
+  const t = await setup();
+  t.sqlite.exec("UPDATE repos SET visibility='public'");
+  t.sqlite.prepare("UPDATE timeline_work_sources SET state=?").run(input.state);
+  const response = await new Hono<AppEnv>()
+    .route("/", gitHttp)
+    .request(
+      `/orbit/${input.repo}@${input.source}.git/info/refs?service=git-upload-pack`,
+      {},
+      t.env,
+    );
+  expect(response.status).toBe(input.status);
+  expect(t.backend.requests).toEqual([]);
+});
+
+test("job credentials cannot cross source identities or write work refs", async () => {
+  const t = await setup();
+  t.sqlite.exec(
+    "UPDATE ci_runs SET source_id='work_test' WHERE id='push'; UPDATE ci_jobs SET source_id='work_test' WHERE run_id='push'",
+  );
+  const secret = await t.token("build");
+  const app = new Hono<AppEnv>().route("/", gitHttp);
+  for (const [source, service] of [
+    ["other", "git-upload-pack"],
+    ["search", "git-receive-pack"],
+  ]) {
+    const result = await app.request(
+      `/orbit/app@${source}.git/info/refs?service=${service}`,
+      {
+        headers: { authorization: `Bearer ${secret}` },
+      },
+      t.env,
+    );
+    expect(result.status).toBe(403);
+  }
+  expect(t.backend.requests).toEqual([]);
+});
+
+test("unmigrated canonical timeline pushes fail with the native timeline address", async () => {
+  const t = await setup();
+  const secret = "gmx_legacy_timeline_test";
+  t.sqlite.exec("UPDATE accounts SET kind='user' WHERE id='orbit'");
+  t.sqlite
+    .prepare(`INSERT INTO access_tokens
+      (id,user_id,name,scope,token_hash,last_four) VALUES ('legacy-pat','orbit','test','write',?,'test')`)
+    .run(await hashToken(secret));
+  const pushed = await t.receivePack(secret, [
+    `${"0".repeat(40)} ${t.merge} refs/heads/timeline/unmigrated`,
+  ]);
+  expect(pushed.status).toBe(409);
+  expect(pushed.text).toContain("/orbit/app@unmigrated.git");
+  expect(pushed.forwarded).toEqual([]);
+  expect(t.ref("refs/heads/main")).toBe(t.main);
+});
 
 describe("a landing merge job's credential in the git proxy", () => {
   test("pushes to its own landing branch, with real git", async () => {
@@ -410,28 +478,37 @@ describe("a queue merge job's credential", () => {
   });
 
   test.each([
-    "UPDATE repos SET deleted_at=CURRENT_TIMESTAMP",
-    "UPDATE merge_queue SET status='cancelled'",
-    "UPDATE merge_queue SET attempts=2",
-    "UPDATE merge_queue SET merge_run_id='replacement'",
-    "UPDATE ci_runs SET status='cancelled' WHERE id='merge'",
-    "UPDATE ci_jobs SET status='queued' WHERE id='land'",
-    "UPDATE ci_runs SET commit_oid='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE id='merge'",
-    "UPDATE ci_runs SET ref='main' WHERE id='merge'",
-    'UPDATE ci_jobs SET spec=\'{"steps":[],"queue":{"id":"wrong","attempt":1}}\' WHERE id=\'land\'',
-  ])("revokes reads, writes and resolution for stale authority: %s", async (mutation) => {
-    const t = await setup(true);
-    const secret = await t.token();
-    t.sqlite.exec(mutation);
-    expect((await t.infoRefs(secret, "git-upload-pack")).status).toBe(403);
-    const push = await t.receivePack(secret, [`${t.main} ${t.merge} refs/heads/${t.candidate}`]);
-    expect(push.status).toBe(403);
-    expect(await queueMergeJob(t.env.DB, secret, "orbit", "app", t.main)).toMatchObject({
-      ok: false,
-      status: 403,
-    });
-    expect(t.backend.requests).toEqual([]);
-  });
+    ["UPDATE repos SET deleted_at=CURRENT_TIMESTAMP", 403],
+    ["UPDATE merge_queue SET status='cancelled'", 403],
+    ["UPDATE merge_queue SET attempts=2", 403],
+    ["UPDATE merge_queue SET merge_run_id='replacement'", 403],
+    ["UPDATE ci_runs SET status='cancelled' WHERE id='merge'", 401],
+    ["UPDATE ci_jobs SET status='queued' WHERE id='land'", 403],
+    [
+      "UPDATE ci_runs SET commit_oid='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE id='merge'",
+      403,
+    ],
+    ["UPDATE ci_runs SET ref='main' WHERE id='merge'", 403],
+    [
+      'UPDATE ci_jobs SET spec=\'{"steps":[],"queue":{"id":"wrong","attempt":1}}\' WHERE id=\'land\'',
+      403,
+    ],
+  ] as const)(
+    "revokes reads, writes and resolution for stale authority: %s",
+    async (mutation, status) => {
+      const t = await setup(true);
+      const secret = await t.token();
+      t.sqlite.exec(mutation);
+      expect((await t.infoRefs(secret, "git-upload-pack")).status).toBe(status);
+      const push = await t.receivePack(secret, [`${t.main} ${t.merge} refs/heads/${t.candidate}`]);
+      expect(push.status).toBe(status);
+      expect(await queueMergeJob(t.env.DB, secret, "orbit", "app", t.main)).toMatchObject({
+        ok: false,
+        status,
+      });
+      expect(t.backend.requests).toEqual([]);
+    },
+  );
 
   test("pins a combined source and keeps replacement attempts on separate refs", async () => {
     const t = await setup(true);
@@ -544,4 +621,42 @@ describe("ordinary queue source staging", () => {
     expect(t.ref("refs/heads/feature")).toBe(t.merge);
     expect(afterPush).toHaveBeenCalledTimes(1);
   });
+});
+
+test("native clones select current work HEAD and hide inherited canonical branches", async () => {
+  const t = await setup();
+  git(t.work, "push", "--quiet", "origin", "HEAD:refs/heads/work");
+  t.sqlite.exec(`
+    INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
+    VALUES('work_a','app','native-timeline','native','orbit','r-work','https://artifacts.test/app.git','ready','allocate','canonical','${t.main}','tree','refs/heads/main','canonical','${t.main}','tree','refs/heads/main',1,'2026-01-01','2026-01-01');
+    UPDATE ci_runs SET source_id='work_a' WHERE id='push';
+    UPDATE ci_jobs SET source_id='work_a' WHERE run_id='push';
+  `);
+  const token = await t.token("build");
+  const url = t.proxyUrl.replace("/app.git", "/app@native.git");
+  for (const version of ["0", "2"]) {
+    const destination = join(t.root, `native-${version}`);
+    const clone = await t.gitWith(
+      token,
+      "-c",
+      `protocol.version=${version}`,
+      "clone",
+      "--quiet",
+      url,
+      destination,
+    );
+    expect(clone.status, clone.stderr).toBe(0);
+    expect(git(destination, "branch", "--show-current")).toBe("work");
+    expect(git(destination, "rev-parse", "HEAD")).toBe(t.merge);
+    expect(git(destination, "branch", "-r")).not.toContain("origin/main");
+  }
+  writeFileSync(join(t.work, "file"), "later work\n");
+  git(t.work, "commit", "--quiet", "-am", "later");
+  git(t.work, "push", "--quiet", "origin", "HEAD:refs/heads/work");
+  const latest = git(t.work, "rev-parse", "HEAD");
+  const destination = join(t.root, "native-latest");
+  const clone = await t.gitWith(token, "clone", "--quiet", url, destination);
+  expect(clone.status, clone.stderr).toBe(0);
+  expect(git(destination, "rev-parse", "HEAD")).toBe(latest);
+  expect(t.ref("refs/heads/main")).toBe(t.main);
 });

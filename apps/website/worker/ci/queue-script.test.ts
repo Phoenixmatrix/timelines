@@ -236,17 +236,31 @@ describe("trusted queue merge program", { timeout: 30_000 }, () => {
   });
 
   test("fails closed without replaying a paid resolution after its end-to-end deadline", async () => {
+    const requested = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
     const t = await setup({
-      script: queueMergeScript(100),
+      script: queueMergeScript(5_000),
       resolve: async (files) => {
-        await delay(250);
+        requested.resolve();
+        await release.promise;
         return Response.json({ resolution: approved(files) });
       },
     });
-    const result = await t.step();
-    expect(result.status).toBe(1);
-    expect(t.requests).toHaveLength(1);
-    t.unchanged();
+    const step = t.step();
+    try {
+      await Promise.race([
+        requested.promise,
+        step.then(() => {
+          throw new Error("The client exited before the resolution request reached its server");
+        }),
+      ]);
+      const result = await step;
+      expect(result.status).toBe(1);
+      expect(t.requests).toHaveLength(1);
+      t.unchanged();
+    } finally {
+      release.resolve();
+    }
   });
 
   test("sends actual three Git stages and applies only the approved lossless repair", async () => {

@@ -43,11 +43,25 @@ describe("readReceivePackCommands", () => {
     expect(read.commands).toEqual([]);
   });
 
-  test("notes a signed push", async () => {
+  test("extracts only certified commands and replays the end marker and pack across chunks", async () => {
     const request = encoder.encode(
-      pkt("push-cert\0report-status\n") + pkt("certificate version 0.1\n"),
+      pkt("push-cert\0report-status\n") +
+        pkt("certificate version 0.1\n") +
+        pkt("pusher Person <p@example.test> 123 +0000\n") +
+        pkt("\n") +
+        pkt(`${a} ${b} refs/heads/work\n`) +
+        pkt("-----BEGIN PGP SIGNATURE-----\n") +
+        pkt(`${b} ${a} refs/heads/not-a-command\n`) +
+        pkt("-----END PGP SIGNATURE-----\n") +
+        pkt("push-cert-end\n") +
+        "PACK and the rest",
     );
-    expect((await readReceivePackCommands(chunked(request, 5))).pushCert).toBe(true);
+    for (const size of [1, 5, request.length]) {
+      const result = await readReceivePackCommands(chunked(request, size));
+      expect(result.pushCert).toBe(true);
+      expect(result.commands).toEqual([{ old: a, new: b, ref: "refs/heads/work" }]);
+      expect(new Uint8Array(await new Response(result.body).arrayBuffer())).toEqual(request);
+    }
   });
 
   test("refuses what isn't a command list", async () => {
@@ -59,6 +73,9 @@ describe("readReceivePackCommands", () => {
     await reject(pkt(`${a} ${b}\n`) + FLUSH);
     await reject(pkt(`${a} ${b} refs/heads/x\n`) + pkt(`${a} ${b} refs/heads/y\0caps\n`) + FLUSH);
     await reject("zzzz");
+    await reject(pkt("push-cert\0report-status\n") + pkt("certificate version 0.1\n"));
+    await reject(pkt("push-cert\0report-status\n") + pkt("\n") + FLUSH);
+    await reject(pkt("push-cert\0report-status\n") + pkt("\n") + pkt("not a command\n"));
     await reject(pkt(`${a} ${b} refs/heads/x\n`).repeat(2000));
   });
 });

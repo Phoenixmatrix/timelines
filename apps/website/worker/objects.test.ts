@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { RepoReader, splitRefPath } from "./objects.ts";
 import { Timing } from "./timing.ts";
+import { fakeRemotes } from "./testing/remote.ts";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -28,6 +29,51 @@ describe("splitRefPath", () => {
   test("an empty tail means the default branch", () => {
     expect(splitRefPath("", names)).toEqual({ ref: "", path: "" });
   });
+});
+
+test("work HEAD hides inherited refs without changing the shared physical ref cache", async () => {
+  const remote = fakeRemotes();
+  const main = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const progress = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  remote.add(
+    "https://artifacts.test/work-head",
+    {
+      "refs/heads/main": main,
+      "refs/heads/work": progress,
+      "refs/tags/inherited": main,
+    },
+    "refs/heads/main",
+    "work-head",
+  );
+  vi.stubGlobal("fetch", remote.fetch);
+  const env = { ARTIFACTS: remote.artifacts } as unknown as Env;
+  const raw = new RepoReader(
+    env,
+    "work-head",
+    "https://artifacts.test/work-head",
+    new Timing(),
+    () => {},
+  );
+  const work = new RepoReader(
+    env,
+    "work-head",
+    "https://artifacts.test/work-head",
+    new Timing(),
+    () => {},
+    "refs/heads/work",
+  );
+  try {
+    expect(await raw.resolve("HEAD")).toBe(main);
+    expect(await work.resolve("HEAD")).toBe(progress);
+    expect(await work.resolve("main")).toBeNull();
+    expect(await work.resolve("inherited")).toBeNull();
+    expect(await work.refs()).toMatchObject({ headBranch: "work", head: progress, tags: [] });
+    expect((await work.refs()).branches.map((branch) => branch.name)).toEqual(["refs/heads/work"]);
+    expect(await raw.resolve("HEAD")).toBe(main);
+    expect(await raw.resolve("inherited")).toBe(main);
+  } finally {
+    await Promise.all([raw.close(), work.close()]);
+  }
 });
 
 test("a failed request does not poison another reader's concurrent commit load", async () => {
@@ -66,4 +112,62 @@ test("a failed request does not poison another reader's concurrent commit load",
     { status: "rejected", reason: closed },
     { status: "fulfilled", value: commit },
   ]);
+});
+
+test("a missing blob can arrive later without becoming an empty file", async () => {
+  const responses = new Map<string, Response>();
+  vi.stubGlobal("caches", {
+    default: {
+      match: async (key: string) => responses.get(key)?.clone(),
+      put: async (key: string, value: Response) => {
+        responses.set(key, value.clone());
+      },
+    },
+  });
+  let blob: Blob | null = null;
+  const get = vi.fn().mockImplementation(async () => ({
+    readBlob: async () => blob,
+    [Symbol.dispose]() {},
+  }));
+  const env = { ARTIFACTS: { get } } as unknown as Env;
+  const read = async () => {
+    const reader = new RepoReader(env, "late-work-object", "", new Timing(), () => {});
+    try {
+      return await reader.blob("2222222222222222222222222222222222222222");
+    } finally {
+      await reader.close();
+    }
+  };
+  expect(await read()).toBeNull();
+  expect(await read()).toBeNull();
+  blob = new Blob(["retained source content"]);
+  const arrived = await read();
+  expect(new TextDecoder().decode(arrived!.bytes)).toBe("retained source content");
+});
+
+test("legacy empty cache entries cannot stand in for source content or hide empty blobs", async () => {
+  vi.stubGlobal("caches", {
+    default: { match: async () => new Response(""), put: async () => {} },
+  });
+  const get = vi.fn().mockImplementation(async () => ({
+    readBlob: async (oid: string) => new Blob([oid.startsWith("3") ? "canonical base" : ""]),
+    [Symbol.dispose]() {},
+  }));
+  const reader = new RepoReader(
+    { ARTIFACTS: { get } } as unknown as Env,
+    "legacy-blob-cache",
+    "",
+    new Timing(),
+    () => {},
+  );
+  try {
+    const content = await reader.blob("3333333333333333333333333333333333333333");
+    expect(new TextDecoder().decode(content!.bytes)).toBe("canonical base");
+    expect(await reader.blob("4444444444444444444444444444444444444444")).toEqual({
+      size: 0,
+      bytes: new Uint8Array(),
+    });
+  } finally {
+    await reader.close();
+  }
 });

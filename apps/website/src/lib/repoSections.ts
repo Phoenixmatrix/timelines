@@ -1,5 +1,5 @@
 import type { RepoDetail } from "../../shared/api.ts";
-import { commitsUrl, repoPath } from "./refs.ts";
+import { commitsUrl, repoPath, sourceUrl } from "./refs.ts";
 
 /** One of a repository's sections: a tab in its header and a destination in search. */
 export interface RepoSection {
@@ -18,7 +18,7 @@ export function repoSections(repo: RepoDetail): RepoSection[] {
   const section = (id: string, label: string, keywords: string[] = []): RepoSection => ({
     id,
     label,
-    to: `${base}/${id}`,
+    to: sourceUrl(`${base}/${id}`, repo.source?.sourceId),
     sections: [`${base}/${id}`],
     keywords,
   });
@@ -26,7 +26,7 @@ export function repoSections(repo: RepoDetail): RepoSection[] {
     {
       id: "code",
       label: "Code",
-      to: base,
+      to: sourceUrl(base, repo.source?.sourceId),
       sections: ["", `${base}/tree/`, `${base}/blob/`],
       keywords: ["files", "tree", "readme"],
     },
@@ -35,7 +35,15 @@ export function repoSections(repo: RepoDetail): RepoSection[] {
           {
             id: "commits",
             label: "Commits",
-            to: commitsUrl(repo.owner.slug, repo.name, repo.defaultBranch),
+            to: commitsUrl(
+              repo.owner.slug,
+              repo.name,
+              repo.source?.kind === "timeline-work"
+                ? repo.source.ref.replace(/^refs\/heads\//, "")
+                : repo.defaultBranch,
+              "",
+              repo.source?.sourceId,
+            ),
             sections: [`${base}/commits/`],
             keywords: ["history", "log"],
           },

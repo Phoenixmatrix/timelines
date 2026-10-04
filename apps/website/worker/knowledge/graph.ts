@@ -324,7 +324,12 @@ export function buildGraph(
   }
 
   return {
-    nodes: [...nodes.values()],
+    nodes: Array.from(nodes.values(), (node) => {
+      // Topic membership is unordered; another file must not change its serialized order.
+      if (node.kind === "file" && Array.isArray(node.data.topics))
+        node.data.topics.sort((a: string, b: string) => a.localeCompare(b));
+      return node;
+    }),
     edges: [...edges.values()],
     components,
     componentDeps,

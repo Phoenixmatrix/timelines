@@ -400,10 +400,12 @@ pub fn git_credential(operation: &str) {
 pub(crate) fn current_repo(ctx: &Ctx) -> Result<String> {
     let repo = git2::Repository::discover(&ctx.cwd)
         .map_err(|_| GmError::usage("Name a repository: owner/name."))?;
-    let url = repo
-        .find_remote("origin")
-        .ok()
-        .and_then(|r| r.url().ok().map(str::to_string))
+    // Transport rewrites must not replace the canonical repository identity.
+    let config = repo.config()?;
+    let origin = config.get_entry("remote.origin.url").ok();
+    let url = origin
+        .as_ref()
+        .and_then(|entry| entry.value().ok())
         .ok_or_else(|| GmError::usage("This repository has no origin; name one: owner/name."))?;
     let path = url.trim_end_matches('/').trim_end_matches(".git");
     let mut parts = path.rsplit('/');

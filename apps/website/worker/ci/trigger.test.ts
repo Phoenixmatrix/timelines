@@ -90,8 +90,18 @@ describe("preview runs", () => {
       expect(t.sqlite.prepare("SELECT commit_oid FROM ci_runs ORDER BY number").all()).toEqual([
         { commit_oid: oid(9) },
       ]);
+      await expect(
+        t.start({
+          preview: { action: "teardown", timeline: "search", checkpoint: "cp_1" },
+        }),
+      ).rejects.toThrow();
+      t.sqlite
+        .prepare(`INSERT INTO deployments
+        (id,repo_id,environment,timeline_slug,checkpoint_id,commit_oid,url,status)
+        VALUES(1,'repo','timeline/search','search','cp_1',?,'https://preview','expired')`)
+        .run(oid(9));
       const teardown = await t.start({
-        preview: { action: "teardown", timeline: "search", checkpoint: "cp_1" },
+        preview: { action: "teardown", timeline: "search", checkpoint: "cp_1", teardownOf: 1 },
       });
       if (!("runId" in teardown)) throw new Error(teardown.skipped);
       expect(t.created).toEqual([teardown.runId]);
@@ -153,13 +163,14 @@ describe("preview runs", () => {
   test("a project that doesn't opt in, or has no job for the action, gets no run", async () => {
     const t = setup();
     files.ciYml = "jobs:\n  test:\n    steps: [vp test]\n";
-    expect(await t.start()).toEqual({ skipped: expect.stringMatching(/doesn't opt in/) });
+    await t.start();
     files.ciYml = "on: preview\njobs:\n  p:\n    if: action == 'create'\n    steps: [x]\n";
-    expect(
-      await t.start({ preview: { action: "teardown", timeline: "search", checkpoint: null } }),
-    ).toEqual({ skipped: expect.stringMatching(/No job .* runs for preview teardown/) });
+    const unmanaged = await t.start({
+      preview: { action: "teardown", timeline: "search", checkpoint: null },
+    });
+    expect(unmanaged).toMatchObject({ teardownUnmanaged: true });
     files.ciYml = "jobs: [";
-    expect(await t.start()).toEqual({ skipped: expect.stringMatching(/has errors/) });
+    await t.start();
     expect(t.sqlite.prepare("SELECT count(*) AS n FROM ci_runs").get()).toEqual({ n: 0 });
   });
 

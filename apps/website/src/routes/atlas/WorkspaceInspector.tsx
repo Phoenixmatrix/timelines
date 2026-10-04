@@ -54,7 +54,7 @@ function FileAt({ owner, names, file }: { owner: string; names: RepoNames; file:
   if (!repo) return <span className="font-mono">{file.path}</span>;
   return (
     <Link
-      to={blobUrl(owner, repo, file.commit, file.path)}
+      to={blobUrl(owner, repo, file.commit, file.path, file.sourceId ?? "canonical")}
       className="min-w-0 truncate font-mono text-ink-muted hover:text-ink pointer-coarse:py-2.5"
       title={`${repo}/${file.path} at ${short(file.commit)}`}
     >

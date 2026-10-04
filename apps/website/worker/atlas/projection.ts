@@ -64,6 +64,8 @@ const isSynthetic = (id: string) =>
 
 export interface VectorEntry {
   repoId: string;
+  /** Legacy projection requests are canonical; work sources never project here. */
+  sourceId?: string;
   commit: string;
   buildId: string;
 }
@@ -196,6 +198,13 @@ export async function beginRepoProjection(
   vector: VectorEntry[],
   options: { full?: boolean } = {},
 ): Promise<ProjectionStart> {
+  if (
+    vector.some(
+      (entry) => entry.repoId !== repoId || (entry.sourceId ?? "canonical") !== "canonical",
+    )
+  )
+    throw new Error("Atlas repository projections require the canonical source");
+  vector = vector.map((entry) => ({ ...entry, sourceId: "canonical" }));
   const scope = repoScope(repoId);
   await db(d1)
     .insertInto("atlas_scopes")
@@ -1695,7 +1704,10 @@ export function toSnapshot(row: {
     status: row.status as AtlasSnapshot["status"],
     partial: Boolean(row.partial),
     projectionVersion: row.projection_version,
-    vector: JSON.parse(row.vector) as VectorEntry[],
+    vector: (JSON.parse(row.vector) as VectorEntry[]).map((entry) => ({
+      ...entry,
+      sourceId: entry.sourceId ?? "canonical",
+    })),
     entities: Number(row.entities),
     edges: Number(row.edges),
     bytes: Number(row.bytes),

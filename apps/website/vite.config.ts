@@ -69,6 +69,8 @@ export default defineConfig({
         extends: true,
         test: {
           name: "browser",
+          // Concurrent source worktrees must not contend for Vitest's default API port.
+          api: { host: "127.0.0.1", strictPort: false },
           include: ["src/**/*.browser.test.tsx"],
           // Pages settle in well under a second; a missing element fails in 5s.
           expect: { poll: { timeout: 5_000 } },

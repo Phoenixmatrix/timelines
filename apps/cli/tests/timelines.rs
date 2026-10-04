@@ -39,6 +39,8 @@ type Requests = Arc<Mutex<Vec<(String, String, Value)>>>;
 struct Api {
     address: SocketAddr,
     requests: Requests,
+    lineage: Arc<parking_lot::Mutex<Option<Value>>>,
+    legacy: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -81,7 +83,7 @@ fn page_set(key: &str, state: &str) -> Value {
         json!([])
     };
     json!({
-        "repoId": "r1", "ref": "timeline/search", "timeline": "search", "key": key,
+        "repoId": "r1", "sourceId": "work_search", "ref": "timeline/search", "timeline": "search", "key": key,
         "checkpoint": checkpoint, "commit": "a".repeat(40), "baseCommit": "b".repeat(40),
         "state": state, "counts": {"component": {"added": 0, "changed": 1, "removed": 0}},
         "pages": pages, "skipped": 0, "error": null,
@@ -93,7 +95,9 @@ fn record(status: &str) -> Value {
     json!({
         "id": "tl_search", "slug": "search", "name": "Search", "policy": "approval",
         "experimental": false, "parentId": null, "status": status,
-        "repos": [{"id": "r1", "owner": "orbit", "name": "engine", "bookmark": "timeline/search"}],
+        "repos": [{"id": "r1", "owner": "orbit", "name": "engine", "bookmark": "work",
+            "source": {"sourceId": "work_search", "repoId": "r1", "timelineId": "tl_search",
+                "kind": "timeline-work", "ref": "refs/heads/work"}}],
     })
 }
 
@@ -104,6 +108,11 @@ impl Api {
         let requests: Requests = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let (seen, halt) = (Arc::clone(&requests), Arc::clone(&stop));
+        let lineage: Arc<parking_lot::Mutex<Option<Value>>> = Arc::default();
+        let lineage_reply = Arc::clone(&lineage);
+        let legacy = Arc::new(AtomicBool::new(false));
+        let legacy_reply = Arc::clone(&legacy);
+        let work = remote.parent().unwrap().join("source.git");
         let worker = thread::spawn(move || {
             let mut status = "none";
             for stream in listener.incoming() {
@@ -139,10 +148,22 @@ impl Api {
                 seen.lock()
                     .unwrap()
                     .push((method.clone(), path.clone(), body.clone()));
-                let bookmark = "refs/heads/timeline/search";
+                let bookmark = "refs/heads/work";
+                if lineage_reply.lock().is_some() {
+                    status = "landed";
+                }
                 let (code, reply) = match (method.as_str(), path.as_str()) {
+                    ("GET", "/api/repos/orbit/engine?source=work_search") => (
+                        200,
+                        json!({"source": record(status)["repos"][0]["source"],
+                            "cloneUrl": format!("http://{address}/orbit/engine@search.git")}),
+                    ),
+                    ("GET", p) if p.starts_with("/api/repos/orbit/engine/sources/work_search/lineage?") => {
+                        (200, lineage_reply.lock().clone().unwrap_or(json!({"status":"pending"})))
+                    }
                     ("POST", "/api/tracker/orbit/timelines") => {
-                        git(&remote, &["update-ref", bookmark, "refs/heads/main"]);
+                        git(&work, &["fetch", "-q", remote.to_str().unwrap(), "refs/heads/main"]);
+                        git(&work, &["update-ref", bookmark, "FETCH_HEAD"]);
                         status = "active";
                         (
                             201,
@@ -152,12 +173,19 @@ impl Api {
                     ("GET", "/api/tracker/orbit/timelines") => {
                         (200, json!({"timelines": [record(status)]}))
                     }
-                    ("GET", p) if p.starts_with("/api/tracker/orbit/timelines/search?") => (
-                        200,
-                        json!({"timeline": record(status), "events": [
+                    ("GET", p) if p.starts_with("/api/tracker/orbit/timelines/search?") => {
+                        let mut timeline = record(status);
+                        if legacy_reply.load(Ordering::Acquire) {
+                            timeline["repos"][0]["source"] = Value::Null;
+                        }
+                        (200, json!({"timeline": timeline, "events": [
                             {"id": "e1", "seq": 1, "kind": "fork", "timelineId": "tl_search", "parentId": null, "createdAt": "2026-10-02T00:00:00Z"}
-                        ], "next": null}),
-                    ),
+                        ], "next": null}))
+                    }
+                    ("POST", "/api/tracker/orbit/timelines/search/migrate") => {
+                        legacy_reply.store(false, Ordering::Release);
+                        (200, record(status))
+                    }
                     ("POST", "/api/tracker/orbit/timelines/search/checkpoints") => {
                         (201, checkpoint_view(&body["summary"]))
                     }
@@ -170,7 +198,7 @@ impl Api {
                     }
                     (
                         "GET",
-                        "/api/repos/orbit/engine/knowledge/overlay/pages?ref=timeline%2Fsearch",
+                        "/api/repos/orbit/engine/knowledge/overlay/pages?ref=timeline%2Fsearch&source=work_search",
                     ) => (
                         200,
                         json!({"ref": "timeline/search", "timeline": "search", "ended": false,
@@ -178,7 +206,7 @@ impl Api {
                     ),
                     (
                         "POST",
-                        "/api/repos/orbit/engine/knowledge/overlay/pages?ref=timeline%2Fsearch",
+                        "/api/repos/orbit/engine/knowledge/overlay/pages?ref=timeline%2Fsearch&source=work_search",
                     ) => (202, page_set(&format!("commit:{}", "a".repeat(40)), "queued")),
                     ("GET", p)
                         if p.starts_with(
@@ -193,7 +221,7 @@ impl Api {
                         )
                     }
                     ("POST", "/api/tracker/orbit/timelines/search/abandon") => {
-                        git(&remote, &["update-ref", "-d", bookmark]);
+                        // Archived sources remain readable; writes are guarded by status.
                         status = "abandoned";
                         (
                             200,
@@ -216,6 +244,8 @@ impl Api {
         Api {
             address,
             requests,
+            lineage,
+            legacy,
             stop,
             worker: Some(worker),
         }
@@ -261,6 +291,10 @@ impl Sandbox {
         git(&root.join("seed"), &["add", "."]);
         git(&root.join("seed"), &["commit", "-qm", "Initial"]);
         git(&root.join("seed"), &["push", "-q", "origin", "main"]);
+        git(
+            &root,
+            &["clone", "-q", "--bare", "remote.git", "source.git"],
+        );
         git(&root, &["clone", "-q", "remote.git", "work"]);
         git(&root.join("work"), &["config", "user.name", "Agent"]);
         git(
@@ -268,6 +302,28 @@ impl Sandbox {
             &["config", "user.email", "agent@example.com"],
         );
         let api = Api::new(root.join("remote.git"));
+        let canonical = format!("http://{}/orbit/engine.git", api.address);
+        let scoped = format!("http://{}/orbit/engine@search.git", api.address);
+        git(
+            &root.join("work"),
+            &["remote", "set-url", "origin", &canonical],
+        );
+        git(
+            &root.join("work"),
+            &[
+                "config",
+                &format!("url.{}.insteadOf", root.join("remote.git").display()),
+                &canonical,
+            ],
+        );
+        git(
+            &root.join("work"),
+            &[
+                "config",
+                &format!("url.{}.insteadOf", root.join("source.git").display()),
+                &scoped,
+            ],
+        );
         let sandbox = Sandbox {
             _dir: dir,
             root,
@@ -282,7 +338,18 @@ impl Sandbox {
     }
 
     fn remote(&self, args: &[&str]) -> String {
-        git(&self.root.join("remote.git"), args)
+        let scoped = args.iter().any(|arg| arg.contains("timeline/search"));
+        let args: Vec<String> = args
+            .iter()
+            .map(|arg| arg.replace("timeline/search", "work"))
+            .collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        git(
+            &self
+                .root
+                .join(if scoped { "source.git" } else { "remote.git" }),
+            &args,
+        )
     }
 
     fn run_with(&self, args: &[&str], env: &[(&str, &str)]) -> (i32, Value, String) {
@@ -336,6 +403,19 @@ impl Sandbox {
     /// A teammate pushes a commit to `branch` with plain git.
     fn teammate(&self, branch: &str, file: &str) -> String {
         let seed = self.root.join("seed");
+        if branch == "timeline/search" {
+            let source = self.root.join("source.git");
+            git(
+                &seed,
+                &["fetch", "-q", source.to_str().unwrap(), "refs/heads/work"],
+            );
+            git(&seed, &["checkout", "-q", "-B", "work", "FETCH_HEAD"]);
+            fs::write(seed.join(file), "teammate\n").unwrap();
+            git(&seed, &["add", "."]);
+            git(&seed, &["commit", "-qm", "Teammate on work"]);
+            git(&seed, &["push", "-q", source.to_str().unwrap(), "work"]);
+            return git(&seed, &["rev-parse", "HEAD"]);
+        }
         git(&seed, &["fetch", "-q", "origin"]);
         git(
             &seed,
@@ -346,6 +426,45 @@ impl Sandbox {
         git(&seed, &["commit", "-qm", &format!("Teammate on {branch}")]);
         git(&seed, &["push", "-q", "origin", branch]);
         git(&seed, &["rev-parse", "HEAD"])
+    }
+
+    fn compact_land(&self, admitted: &str) -> String {
+        let seed = self.root.join("seed");
+        let base = self.remote(&["rev-parse", "main"]);
+        git(
+            &seed,
+            &[
+                "fetch",
+                "-q",
+                self.root.join("source.git").to_str().unwrap(),
+                "refs/heads/work",
+            ],
+        );
+        let tree = git(&seed, &["rev-parse", &format!("{admitted}^{{tree}}")]);
+        let canonical = git(
+            &seed,
+            &["commit-tree", &tree, "-p", &base, "-m", "Compact landing"],
+        );
+        git(
+            &seed,
+            &[
+                "push",
+                "-q",
+                "origin",
+                &format!("{canonical}:refs/heads/main"),
+            ],
+        );
+        *self.api.lineage.lock() = Some(json!({
+            "status":"integrated", "commit":admitted, "members":[admitted],
+            "source":{"sourceId":"work_search","repoId":"r1","timelineId":"tl_search","kind":"timeline-work","ref":"refs/heads/work"},
+            "integration": {
+                "source":{"sourceId":"work_search","commit":admitted,"tree":tree},
+                "canonical":{"sourceId":"canonical","commit":canonical},
+                "logicalBase":{"sourceId":"canonical","commit":base}
+            },
+            "canonical":{"sourceId":"canonical","commit":canonical}
+        }));
+        canonical
     }
 }
 
@@ -445,7 +564,10 @@ fn a_checkout_in_a_timeline_pushes_to_its_bookmark_and_never_to_main() {
     assert_eq!(pushed["pushed"].as_array().unwrap().len(), 1, "{pushed}");
     let tip = s.remote(&["rev-parse", "timeline/search"]);
     assert_eq!(
-        s.remote(&["rev-parse", &format!("{tip}^2")]),
+        git(
+            &s.root.join("source.git"),
+            &["rev-parse", &format!("{tip}^2")]
+        ),
         teammate,
         "the merge's second parent is main"
     );
@@ -479,7 +601,7 @@ fn a_checkout_in_a_timeline_pushes_to_its_bookmark_and_never_to_main() {
     let wt = s.root.join("wt").to_string_lossy().into_owned();
     let status = s.ok(&["-C", &wt, "status"]);
     assert_eq!(
-        status["trunk"]["name"], "origin/timeline/search",
+        status["trunk"]["name"], "gm-work/timeline/search",
         "{status}"
     );
     s.ok(&["worktree", "remove", "../wt", "--force"]);
@@ -510,11 +632,11 @@ fn a_checkout_in_a_timeline_pushes_to_its_bookmark_and_never_to_main() {
     assert_eq!(code, 4, "{value}");
     assert_eq!(value["error"]["code"], "timeline_bound");
 
-    // Back in, then abandon: the checkout returns to main.
+    // Abandon keeps the ended-source guard until explicitly leaving.
     s.ok(&["timeline", "use", "search", "-O", "orbit"]);
     assert!(s.work().join("feature.txt").exists());
     let dry = s.ok(&["timeline", "abandon", "-O", "orbit", "--dry-run"]);
-    assert_eq!(dry["unbind"], true);
+    assert_eq!(dry["unbind"], false);
     assert_eq!(s.api.requests("POST").len(), 1);
     let abandoned = s.ok(&["timeline", "abandon", "-O", "orbit"]);
     assert_eq!(abandoned["timeline"]["status"], "abandoned");
@@ -522,7 +644,9 @@ fn a_checkout_in_a_timeline_pushes_to_its_bookmark_and_never_to_main() {
         s.api.requests("POST")[1].0,
         "/api/tracker/orbit/timelines/search/abandon"
     );
-    assert_eq!(abandoned["use"]["previous"], "search");
+    assert!(s.binding().contains("timeline: search"));
+    assert_eq!(s.err(&["push"]), "timeline_ended");
+    s.ok(&["timeline", "use", "main"]);
     assert!(!s.binding().contains("timeline"));
     assert_eq!(
         s.err(&["timeline", "use", "search", "-O", "orbit"]),
@@ -541,9 +665,9 @@ fn a_bound_checkout_without_its_bookmark_refuses_to_push_or_sync() {
     .unwrap();
     s.commit("work.txt", "Work");
     let main = s.remote(&["rev-parse", "main"]);
-    assert_eq!(s.err(&["push"]), "timeline_missing");
-    assert_eq!(s.err(&["sync"]), "timeline_missing");
-    assert_eq!(s.err(&["timeline", "merge", "main"]), "timeline_missing");
+    assert_eq!(s.err(&["push"]), "not_found");
+    assert_eq!(s.err(&["sync"]), "not_found");
+    assert_eq!(s.err(&["timeline", "merge", "main"]), "not_found");
     assert_eq!(s.remote(&["rev-parse", "main"]), main);
 }
 
@@ -660,7 +784,7 @@ fn pages_lists_writes_and_shows_a_timelines_wiki_pages() {
     let (path, _) = s.api.requests("POST").pop().unwrap();
     assert_eq!(
         path,
-        "/api/repos/orbit/engine/knowledge/overlay/pages?ref=timeline%2Fsearch"
+        "/api/repos/orbit/engine/knowledge/overlay/pages?ref=timeline%2Fsearch&source=work_search"
     );
 }
 
@@ -844,4 +968,340 @@ fn work_on_another_remote_bookmark_stays_behind_when_a_timeline_starts() {
     );
     assert_eq!(s.remote(&["rev-parse", "timeline/search"]), teammate);
     assert!(!s.work().join("other.txt").exists());
+}
+
+#[test]
+fn compact_sync_replays_only_unlanded_suffix_and_keeps_push_guard() {
+    let s = Sandbox::new();
+    s.ok(&[
+        "timeline",
+        "start",
+        "search",
+        "-O",
+        "orbit",
+        "--repo",
+        "orbit/engine",
+    ]);
+    s.commit("admitted.txt", "Admitted");
+    s.ok(&["push"]);
+    let admitted = s.remote(&["rev-parse", "timeline/search"]);
+    s.commit("suffix.txt", "Local suffix");
+    let canonical = s.compact_land(&admitted);
+    let canonical_repo = git2::Repository::open_bare(s.root.join("remote.git")).unwrap();
+    assert!(
+        canonical_repo
+            .find_commit(git2::Oid::from_str(&admitted).unwrap())
+            .is_err()
+    );
+    s.ok(&["sync"]);
+    assert_eq!(
+        fs::read_to_string(s.work().join("suffix.txt")).unwrap(),
+        "Local suffix\n"
+    );
+    let log = s.ok(&["log"]);
+    let suffix = log["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["description"] == "Local suffix")
+        .unwrap();
+    let revision = git(
+        &s.work(),
+        &["rev-parse", suffix["commit_id"].as_str().unwrap()],
+    );
+    assert_eq!(
+        git(&s.work(), &["rev-parse", &format!("{revision}^")]),
+        canonical
+    );
+    assert_eq!(s.err(&["push"]), "timeline_ended");
+    assert_eq!(s.remote(&["rev-parse", "main"]), canonical);
+    assert!(s.binding().contains("timeline: search"));
+    s.ok(&["sync"]);
+    assert_eq!(
+        fs::read_to_string(s.work().join("suffix.txt")).unwrap(),
+        "Local suffix\n"
+    );
+}
+
+#[test]
+fn compact_sync_preserves_edited_same_change_revision_and_recovery_root() {
+    let s = Sandbox::new();
+    s.ok(&[
+        "timeline",
+        "start",
+        "search",
+        "-O",
+        "orbit",
+        "--repo",
+        "orbit/engine",
+    ]);
+    s.commit("admitted.txt", "Admitted");
+    let log = s.ok(&["log"]);
+    let original = log["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["description"] == "Admitted")
+        .unwrap();
+    let change = original["change_id"].as_str().unwrap().to_string();
+    let admitted = git(
+        &s.work(),
+        &["rev-parse", original["commit_id"].as_str().unwrap()],
+    );
+    // Another checkout publishes exactly this revision; this checkout has not fetched it.
+    git(
+        &s.work(),
+        &[
+            "push",
+            "-q",
+            s.root.join("source.git").to_str().unwrap(),
+            &format!("{admitted}:refs/heads/work"),
+        ],
+    );
+    s.ok(&["edit", &change]);
+    fs::write(s.work().join("extra.txt"), "not approved\n").unwrap();
+    s.ok(&["commit", "-m", "Revised"]);
+    let canonical = s.compact_land(&admitted);
+    s.ok(&["sync"]);
+    assert_eq!(
+        fs::read_to_string(s.work().join("extra.txt")).unwrap(),
+        "not approved\n"
+    );
+    assert_eq!(
+        fs::read_to_string(s.work().join("admitted.txt")).unwrap(),
+        "Admitted\n"
+    );
+    let log = s.ok(&["log"]);
+    let revised = log["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["description"] == "Revised")
+        .unwrap();
+    assert_eq!(revised["change_id"], change);
+    assert_eq!(revised["immutable"], false);
+    let revision = git(
+        &s.work(),
+        &["rev-parse", revised["commit_id"].as_str().unwrap()],
+    );
+    assert_eq!(
+        git(&s.work(), &["rev-parse", &format!("{revision}^")]),
+        canonical
+    );
+    let recovery = git(
+        &s.work(),
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/gm/source-sync/work_search",
+        ],
+    );
+    let recovered = recovery.lines().next().unwrap();
+    assert_eq!(
+        git(&s.work(), &["show", &format!("{recovered}:extra.txt")]),
+        "not approved"
+    );
+    assert_eq!(s.err(&["push"]), "timeline_ended");
+}
+
+#[test]
+fn unresolved_or_expired_lineage_never_discards_local_work() {
+    for status in ["expired", "ambiguous", "unknown"] {
+        let s = Sandbox::new();
+        s.ok(&[
+            "timeline",
+            "start",
+            "search",
+            "-O",
+            "orbit",
+            "--repo",
+            "orbit/engine",
+        ]);
+        s.commit("admitted.txt", "Admitted");
+        s.ok(&["push"]);
+        s.commit("local.txt", "Unlanded");
+        *s.api.lineage.lock() = Some(json!({"status":status}));
+        assert_eq!(
+            s.err(&["sync"]),
+            if status == "expired" {
+                "source_expired"
+            } else {
+                "source_lineage_unresolved"
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(s.work().join("local.txt")).unwrap(),
+            "Unlanded\n"
+        );
+        assert_eq!(s.err(&["push"]), "timeline_ended");
+        assert!(s.binding().contains("timeline: search"));
+    }
+}
+
+#[test]
+fn legacy_metadata_never_falls_back_to_a_canonical_timeline_bookmark() {
+    let s = Sandbox::new();
+    s.ok(&[
+        "timeline",
+        "start",
+        "search",
+        "-O",
+        "orbit",
+        "--repo",
+        "orbit/engine",
+    ]);
+    git(
+        &s.root.join("remote.git"),
+        &["update-ref", "refs/heads/timeline/search", "main"],
+    );
+    s.api.legacy.store(true, Ordering::Release);
+    s.commit("private.txt", "Private work");
+    let before = s.remote(&["show-ref"]);
+    assert_eq!(s.err(&["push"]), "source_migration_required");
+    assert_eq!(s.err(&["sync"]), "source_migration_required");
+    assert_eq!(s.remote(&["show-ref"]), before);
+    assert!(s.binding().contains("timeline: search"));
+    let migrated = s.ok(&["timeline", "migrate", "-O", "orbit"]);
+    assert_eq!(migrated["repos"][0]["source"]["sourceId"], "work_search");
+    s.ok(&["timeline", "use", "search", "-O", "orbit"]);
+}
+
+#[test]
+fn compact_sync_surfaces_conflicts_without_losing_the_local_revision() {
+    let s = Sandbox::new();
+    s.ok(&[
+        "timeline",
+        "start",
+        "search",
+        "-O",
+        "orbit",
+        "--repo",
+        "orbit/engine",
+    ]);
+    fs::write(s.work().join("README.md"), "approved\n").unwrap();
+    s.ok(&["commit", "-m", "Admitted"]);
+    let log = s.ok(&["log"]);
+    let original = log["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["description"] == "Admitted")
+        .unwrap();
+    let change = original["change_id"].as_str().unwrap().to_string();
+    let admitted = git(
+        &s.work(),
+        &["rev-parse", original["commit_id"].as_str().unwrap()],
+    );
+    git(
+        &s.work(),
+        &[
+            "push",
+            "-q",
+            s.root.join("source.git").to_str().unwrap(),
+            &format!("{admitted}:refs/heads/work"),
+        ],
+    );
+    s.ok(&["edit", &change]);
+    fs::write(s.work().join("README.md"), "local revision\n").unwrap();
+    s.ok(&["commit", "-m", "Revised"]);
+    s.compact_land(&admitted);
+    let current_main = s.teammate("main", "README.md");
+    s.api.lineage.lock().as_mut().unwrap()["canonical"]["commit"] = json!(current_main);
+    let synced = s.ok(&["sync"]);
+    assert!(
+        synced["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["paths"].as_array().unwrap().contains(&json!("README.md"))),
+        "{synced}"
+    );
+    let recovery = git(
+        &s.work(),
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/gm/source-sync/work_search",
+        ],
+    );
+    assert_eq!(
+        git(
+            &s.work(),
+            &[
+                "show",
+                &format!("{}:README.md", recovery.lines().next().unwrap())
+            ]
+        ),
+        "local revision"
+    );
+    assert_eq!(s.remote(&["rev-parse", "main"]), current_main);
+    assert_eq!(s.err(&["push"]), "timeline_ended");
+}
+
+#[test]
+fn migration_resolution_requires_explicit_version_and_nonempty_audit_reason() {
+    let s = Sandbox::new();
+    for args in [
+        vec![
+            "timeline",
+            "migrate",
+            "search",
+            "--resolve",
+            "cancel-unadvanced",
+        ],
+        vec![
+            "timeline",
+            "migrate",
+            "search",
+            "--resolve",
+            "accept-partial-and-abandon",
+            "--expected-version",
+            "7",
+        ],
+        vec![
+            "timeline",
+            "migrate",
+            "search",
+            "--resolve",
+            "cancel-unadvanced",
+            "--expected-version",
+            "7",
+            "--note",
+            "   ",
+        ],
+        vec!["timeline", "migrate", "search", "--expected-version", "7"],
+    ] {
+        let (code, _, _) = s.run_with(&args, &[]);
+        assert_ne!(code, 0, "{args:?} must not resolve a landing");
+    }
+    assert!(s.api.requests("POST").is_empty());
+    let before = s.remote(&["show-ref"]);
+    s.ok(&[
+        "timeline",
+        "migrate",
+        "search",
+        "--resolve",
+        "accept-partial-and-abandon",
+        "--expected-version",
+        "7",
+        "--note",
+        "Preserve partial receipts",
+        "--dry-run",
+    ]);
+    assert!(s.api.requests("POST").is_empty());
+    assert_eq!(s.remote(&["show-ref"]), before);
+}
+
+#[test]
+fn bound_checkout_rejects_a_different_persisted_source_before_push() {
+    let s = Sandbox::new();
+    s.ok(&["timeline", "start", "search"]);
+    s.commit("private.txt", "Local source work");
+    let before = s.remote(&["rev-parse", "timeline/search"]);
+    git(
+        &s.work(),
+        &["config", "gitmatrix.source-search", "work_foreign"],
+    );
+    assert_eq!(s.err(&["push"]), "invalid_source");
+    assert_eq!(s.remote(&["rev-parse", "timeline/search"]), before);
 }

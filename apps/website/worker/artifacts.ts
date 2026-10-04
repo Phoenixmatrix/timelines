@@ -101,11 +101,18 @@ export async function lsRefs(
   return parseLsRefs(new Uint8Array(await response.arrayBuffer()));
 }
 
+const MISSING_REMOTE_REPO = /^ArtifactsError: Repository not found: [A-Za-z0-9][A-Za-z0-9._-]*\.$/;
+
 export function isArtifactsError(error: unknown, code: ArtifactsErrorCode): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  if ("code" in error) return error.code === code;
+  // Remote bindings preserve an RPC error's name in its message, not custom fields.
+  // Recognize only the observed missing-repository form; unknown outcomes stay fenced.
   return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code: unknown }).code === code
+    code === "NOT_FOUND" &&
+    error instanceof Error &&
+    "remote" in error &&
+    error.remote === true &&
+    MISSING_REMOTE_REPO.test(error.message)
   );
 }

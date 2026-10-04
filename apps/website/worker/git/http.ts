@@ -14,6 +14,16 @@ import { isQueueSourceBranch } from "../../shared/merge-queue.ts";
 import { afterPush } from "./effects.ts";
 import { recordPush } from "../ref-log/record.ts";
 import { readReceivePackCommands, type ReceiveCommand } from "./receive-pack.ts";
+import { resolveSource, getWorkSource, workGitPath } from "../timelines/sources.ts";
+import { trackerObject } from "../tracker/stub.ts";
+import { retainProgress, reconcileSourcePushes } from "./source-push.ts";
+import { lsRefs } from "../artifacts.ts";
+import { jobCaller } from "../deployments/job.ts";
+import { ciSource } from "../ci/source.ts";
+import type { Actor, RepoRow } from "../db.ts";
+import { uploadCommand, workAdvertisement, protocolBytes } from "./source-protocol.ts";
+import { pkt, FLUSH } from "./pktline.ts";
+import { TrackerError } from "../tracker/store.ts";
 
 // Git smart HTTP: https://git-scm.com/docs/http-protocol
 //   GET  /:owner/:repo.git/info/refs?service=git-upload-pack|git-receive-pack
@@ -31,6 +41,12 @@ const FORWARDED_REQUEST_HEADERS = ["content-type", "content-encoding", "accept",
 const FORWARDED_RESPONSE_HEADERS = ["content-type", "cache-control", "expires", "pragma"];
 
 export const gitHttp = new Hono<AppEnv>();
+gitHttp.onError((error, c) => {
+  if (error instanceof TrackerError) return c.text(`${error.message}\n`, error.status);
+  // Provider exceptions may contain private remotes or credentials.
+  console.error("Git storage request failed.");
+  return c.text("Storage operation failed.\n", 500);
+});
 
 gitHttp.get("/:owner/:repo{[^/]+\\.git}/info/refs", async (c) => {
   const service = c.req.query("service");
@@ -57,12 +73,36 @@ type UpstreamRepo = { artifacts_name: string; artifacts_remote: string };
 
 async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
   const owner = c.req.param("owner") ?? "";
-  const name = (c.req.param("repo") ?? "").replace(/\.git$/, "");
+  const address = (c.req.param("repo") ?? "").replace(/\.git$/, "");
+  const separator = address.indexOf("@");
+  const name = separator < 0 ? address : address.slice(0, separator);
+  const timelineSlug = separator < 0 ? null : address.slice(separator + 1);
+  if (
+    timelineSlug !== null &&
+    (timelineSlug === "main" ||
+      timelineSlug.length > 64 ||
+      !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(timelineSlug))
+  )
+    return c.text("Repository not found.\n", 404);
   const needed = service === "git-receive-pack" ? "write" : "read";
 
   // A CI job's credential: only a landing's merge job, scoped to its landing branch.
   const jobToken = jobSecret(c.req.header("authorization"));
-  if (jobToken) return landingProxy(c, service, endpoint, owner, name, jobToken);
+  if (jobToken) {
+    if (timelineSlug !== null) {
+      const job = await jobCaller(c.env.DB, jobToken);
+      if (!job || job.sourceId === "canonical" || service !== "git-upload-pack")
+        return c.text("This job cannot access this source.\n", 403);
+      const source = await getWorkSource(c.env, job.repoId, job.sourceId);
+      if (!source || source.timeline_slug !== timelineSlug)
+        return c.text("This job cannot access this source.\n", 403);
+      const resolved = await ciSource(c.env, job.repoId, job.sourceId, { runId: job.runId });
+      if (resolved.owner_slug !== owner || resolved.name !== name)
+        return c.text("Repository not found.\n", 404);
+      return workRead(c, resolved, service, endpoint);
+    }
+    return landingProxy(c, service, endpoint, owner, name, jobToken);
+  }
 
   const credential = await tokenCredential(c);
   if (credential.kind === "invalid") {
@@ -88,17 +128,60 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
   if (needed === "write" && credential.kind === "token" && credential.scope !== "write") {
     return c.text("This token is read-only. Create a token with write scope to push.\n", 403);
   }
+  if (timelineSlug !== null) {
+    const source = await db(c.env.DB)
+      .selectFrom("timeline_work_sources")
+      .selectAll()
+      .where("repo_id", "=", repo.id)
+      .where("owner_id", "=", repo.owner_id)
+      .where("timeline_slug", "=", timelineSlug)
+      .executeTakeFirst();
+    if (!source) return c.text("Timeline work source not found; migrate legacy work first.\n", 404);
+    const resolved = await resolveSource(c.env, repo, source.source_id);
+    if (service === "git-upload-pack") return workRead(c, resolved.repo, service, endpoint);
+    if (source.state !== "ready")
+      return c.text("This source is read-only; select a new timeline or main.\n", 409);
+    if (endpoint === "info/refs") return workRead(c, resolved.repo, service, endpoint);
+    return workPush(c, resolved.repo, source.timeline_id, actor!);
+  }
 
   // Inspect only a bounded command prefix while the original body streams upstream.
-  // Unknown/signed pushes retain ordinary effects; a source-only push stages objects.
+  // Signed pushes keep ordinary effects; queue source-only pushes stage objects.
   let body = c.req.raw.body;
   let sourceOnly = Promise.resolve(false);
   if (service === "git-receive-pack" && c.req.method === "POST" && body) {
     const encoding = c.req.header("content-encoding")?.toLowerCase();
+    if (encoding && encoding !== "identity" && encoding !== "gzip")
+      return c.text("Unsupported content encoding.\n", 415);
     if (!encoding || encoding === "identity" || encoding === "gzip") {
       const [forwarded, inspection] = body.tee();
       body = forwarded;
-      sourceOnly = queueSourceOnly(inspection, encoding === "gzip");
+      const inspected =
+        encoding === "gzip"
+          ? inspection.pipeThrough(
+              new DecompressionStream("gzip") as ReadableWritablePair<Uint8Array, Uint8Array>,
+            )
+          : inspection;
+      const request = await readReceivePackCommands(inspected);
+      void request.body.cancel().catch(() => {});
+      for (const command of request.commands) {
+        const match = /^refs\/heads\/timeline\/(.+)$/.exec(command.ref);
+        if (!match) continue;
+        void body.cancel().catch(() => {});
+        return c.text(
+          `Canonical timeline branches are read-only; use ${new URL(c.req.url).origin}${workGitPath(repo, match[1]!)} instead. Legacy timelines must be migrated first.\n`,
+          409,
+        );
+      }
+      sourceOnly = Promise.resolve(
+        !request.pushCert &&
+          request.commands.length > 0 &&
+          request.commands.every(
+            (command) =>
+              command.ref.startsWith("refs/heads/") &&
+              isQueueSourceBranch(command.ref.slice("refs/heads/".length)),
+          ),
+      );
     }
   }
   const pack =
@@ -133,26 +216,138 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
   return respond(upstream);
 }
 
-async function queueSourceOnly(body: ReadableStream<Uint8Array>, gzip: boolean): Promise<boolean> {
-  try {
-    if (gzip)
-      body = body.pipeThrough(
-        new DecompressionStream("gzip") as ReadableWritablePair<Uint8Array, Uint8Array>,
-      );
-    const request = await readReceivePackCommands(body);
-    // Do not wait for tee cancellation: the forwarding branch is still consuming.
+async function workRead(c: Context<AppEnv>, repo: RepoRow, service: Service, endpoint: string) {
+  const ref = `refs/heads/${repo.default_branch}`;
+  if (endpoint === "info/refs") {
+    const response = respond(await forward(c, repo, service, endpoint, null));
+    if (!response.ok) return response;
+    const tip = (await lsRefs(c.env, repo.artifacts_name, repo.artifacts_remote, [ref])).find(
+      (entry) => entry.name === ref,
+    )?.oid;
+    if (!tip) return c.text("Source work ref is unavailable.\n", 409);
+    return new Response(workAdvertisement(await protocolBytes(response), tip, ref), {
+      status: response.status,
+      headers: response.headers,
+    });
+  }
+  if (!c.req.raw.body) return c.text("Git request body is required.\n", 400);
+  const encoding = c.req.header("content-encoding")?.toLowerCase();
+  if (encoding && encoding !== "identity" && encoding !== "gzip")
+    return c.text("Unsupported content encoding.\n", 415);
+  const body =
+    encoding === "gzip"
+      ? c.req.raw.body.pipeThrough(
+          new DecompressionStream("gzip") as ReadableWritablePair<Uint8Array, Uint8Array>,
+        )
+      : c.req.raw.body;
+  const request = await uploadCommand(body);
+  if (request.command === "command=ls-refs") {
     void request.body.cancel().catch(() => {});
-    return (
-      !request.pushCert &&
-      request.commands.length > 0 &&
-      request.commands.every(
-        (command) =>
-          command.ref.startsWith("refs/heads/") &&
-          isQueueSourceBranch(command.ref.slice("refs/heads/".length)),
-      )
+    const tip = (await lsRefs(c.env, repo.artifacts_name, repo.artifacts_remote, [ref])).find(
+      (entry) => entry.name === ref,
+    )?.oid;
+    if (!tip) return c.text("Source work ref is unavailable.\n", 409);
+    return new Response(
+      pkt(`${tip} HEAD symref-target:${ref}\n`) + pkt(`${tip} ${ref}\n`) + FLUSH,
+      {
+        headers: {
+          "content-type": "application/x-git-upload-pack-result",
+          "cache-control": "no-cache",
+        },
+      },
     );
-  } catch {
-    return false;
+  }
+  return respond(await forward(c, repo, service, endpoint, request.body, encoding === "gzip"));
+}
+
+async function workPush(
+  c: Context<AppEnv>,
+  repo: RepoRow & { source_id: string },
+  timelineId: string,
+  actor: Actor,
+) {
+  const encoding = c.req.header("content-encoding")?.toLowerCase();
+  if (encoding && encoding !== "identity" && encoding !== "gzip")
+    return c.text("Unsupported content encoding.\n", 415);
+  let body = c.req.raw.body ?? new Response("").body!;
+  if (encoding === "gzip")
+    body = body.pipeThrough(
+      new DecompressionStream("gzip") as ReadableWritablePair<Uint8Array, Uint8Array>,
+    );
+  const request = await readReceivePackCommands(body);
+  if (
+    request.pushCert ||
+    request.commands.length > 1 ||
+    request.commands.some(
+      (command) => command.ref !== "refs/heads/work" || /^0+$/.test(command.new),
+    )
+  ) {
+    void request.body.cancel();
+    return c.text("Work pushes may only update refs/heads/work.\n", 403);
+  }
+  if (!request.commands.length)
+    return respond(
+      await forward(c, repo, "git-receive-pack", "git-receive-pack", request.body, true),
+    );
+  const operationId = crypto.randomUUID();
+  const tracker = trackerObject(c.env, repo.owner_id);
+  if ((await reconcileSourcePushes(c.env, repo.id, repo.source_id)).length) {
+    await recordPush(c.env, repo, null);
+    afterPush(c.env, repo, null, (work) => c.executionCtx.waitUntil(work));
+  }
+  const commands = request.commands.map((command) => ({
+    ...command,
+    old: /^0+$/.test(command.old) ? null : command.old,
+    new: command.new,
+  }));
+  const admitted = await tracker.beginSourcePush({
+    operationId,
+    timelineId,
+    repoId: repo.id,
+    sourceId: repo.source_id,
+    commands,
+    actorId: actor.agent?.id ?? actor.id,
+    accountableId: actor.id,
+  });
+  if (!admitted.ok) {
+    void request.body.cancel();
+    return c.text(`${admitted.error}\n`, admitted.status);
+  }
+  try {
+    for (const command of commands)
+      if (command.old) await retainProgress(c.env, repo, operationId, command.old);
+    const upstream = await forward(
+      c,
+      repo,
+      "git-receive-pack",
+      "git-receive-pack",
+      request.body,
+      true,
+    );
+    // Consume the response before checking durable state. A 200 is not a Git acknowledgement.
+    const response = respond(upstream);
+    const bytes = await protocolBytes(response);
+    const refs = await lsRefs(c.env, repo.artifacts_name, repo.artifacts_remote, [
+      "refs/heads/work",
+    ]);
+    const tip = refs.find((ref) => ref.name === "refs/heads/work")?.oid;
+    const accepted = commands.every((command) => command.new === tip);
+    const rejected = commands.every((command) => command.old === (tip ?? null));
+    if (!accepted && !rejected) throw new Error("Ambiguous source push outcome.");
+    if (accepted) {
+      for (const command of commands) await retainProgress(c.env, repo, operationId, command.new);
+      await recordPush(c.env, repo, actor);
+    }
+    const finished = await tracker.finishSourcePush(
+      operationId,
+      accepted ? "accepted" : "rejected",
+    );
+    if (!finished.ok) throw new Error(finished.error);
+    if (accepted) afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
+    return new Response(bytes, { status: response.status, headers: response.headers });
+  } catch (error) {
+    await tracker.finishSourcePush(operationId, "ambiguous");
+    throw error;
   }
 }
 
@@ -321,7 +516,6 @@ async function forward(
   }
   if (upstream.status === 401 || upstream.status === 403) {
     console.error("Artifacts rejected the proxy's token", {
-      repo: repo.artifacts_name,
       status: upstream.status,
     });
     return { refused: c.text("The storage backend refused this request.\n", 502) };

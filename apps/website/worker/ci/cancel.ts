@@ -4,7 +4,7 @@
 
 import { batch, db, nowIso } from "../schema.ts";
 
-/** Cancel a queued or running run, its unfinished jobs and steps. Idempotent. */
+/** Cancel undispatched work; running children acknowledge cancellation in report(). */
 export async function cancelRun(env: Env, runId: string): Promise<void> {
   const kdb = db(env.DB);
   const now = nowIso();
@@ -18,7 +18,7 @@ export async function cancelRun(env: Env, runId: string): Promise<void> {
       .updateTable("ci_jobs")
       .set({ status: "cancelled", finished_at: now })
       .where("run_id", "=", runId)
-      .where("status", "in", ["pending", "queued", "running"]),
+      .where("status", "in", ["pending", "queued"]),
     kdb
       .updateTable("ci_steps")
       .set({ status: "cancelled", finished_at: now })

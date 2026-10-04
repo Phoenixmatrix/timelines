@@ -813,6 +813,7 @@ workspaceAtlas.get("/evidence", async (c) => {
       entityId: qualify(target.id, file.id),
       kind: "file",
       repoId: target.id,
+      sourceId: "canonical",
       commit,
       path: file.path ?? "",
       blob: typeof file.data.blob === "string" ? file.data.blob : null,
@@ -1049,9 +1050,15 @@ async function dependencyEvidence(
       },
       importers: {
         total: d.files,
-        files: files.map((f) => ({ repoId: source.id, commit, path: f.path, blob: f.blob })),
+        files: files.map((f) => ({
+          repoId: source.id,
+          sourceId: "canonical",
+          commit,
+          path: f.path,
+          blob: f.blob,
+        })),
       },
-      manifest: manifest ? { repoId: source.id, commit, ...manifest } : null,
+      manifest: manifest ? { repoId: source.id, sourceId: "canonical", commit, ...manifest } : null,
     });
   }
   return out;

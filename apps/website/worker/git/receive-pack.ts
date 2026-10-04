@@ -15,21 +15,21 @@ export interface ReceiveCommand {
 
 export interface ReceivePackRequest {
   commands: ReceiveCommand[];
-  /** A signed push (`push-cert`): its commands sit inside the certificate, not read here. */
+  /** A signed push; commands are extracted for routing, never signature validation. */
   pushCert: boolean;
   /** The whole request again, the bytes already read first, to send on. */
   body: ReadableStream<Uint8Array>;
 }
 
-/** More than any command list a landing sends; a body that keeps going without a flush is refused. */
+/** Bound command/certificate inspection before streaming the remaining pack. */
 const MAX_COMMANDS_BYTES = 64 * 1024;
 const COMMAND = /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) (\S+)$/;
 
 const decoder = new TextDecoder();
 
 /**
- * Read the shallow lines and commands up to the flush that ends them. An
- * empty request (git's `0000` probe before a large push) has no commands.
+ * Read shallow lines and commands through their flush, or a signed certificate
+ * through its push-cert-end marker. An empty `0000` probe has no commands.
  * Throws on anything malformed.
  */
 export async function readReceivePackCommands(
@@ -41,6 +41,7 @@ export async function readReceivePackCommands(
   let ended = false;
   const commands: ReceiveCommand[] = [];
   let pushCert = false;
+  let certificate: "headers" | "commands" | "signature" | null = null;
 
   /** Make sure `n` bytes past `offset` are buffered; false once the body ends first. */
   const want = async (n: number) => {
@@ -68,6 +69,7 @@ export async function readReceivePackCommands(
       if (!/^[0-9a-f]{4}$/i.test(hex)) throw new Error("Bad pkt-line length in the push");
       const length = Number.parseInt(hex, 16);
       if (length === 0) {
+        if (pushCert) throw new Error("The push certificate ended before its end marker");
         offset += 4;
         break;
       }
@@ -75,11 +77,31 @@ export async function readReceivePackCommands(
       if (!(await want(length))) throw new Error("The push ended mid-line");
       let text = decoder.decode(buffer.subarray(offset + 4, offset + length)).replace(/\n$/, "");
       offset += length;
+      if (offset > MAX_COMMANDS_BYTES) throw new Error("The push's command list is too long");
+      if (certificate) {
+        if (text === "push-cert-end") {
+          if (certificate !== "signature") throw new Error("Missing push certificate signature");
+          break;
+        }
+        if (certificate === "headers") {
+          if (text === "") certificate = "commands";
+          continue;
+        }
+        if (certificate === "signature") continue;
+        if (text.startsWith("-----BEGIN ") && text.endsWith(" SIGNATURE-----")) {
+          certificate = "signature";
+          continue;
+        }
+        const match = COMMAND.exec(text);
+        if (!match) throw new Error("Malformed certified command in the push");
+        commands.push({ old: match[1]!, new: match[2]!, ref: match[3]! });
+        continue;
+      }
       if (!commands.length && text.startsWith("shallow ")) continue;
-      if (!commands.length && text.startsWith("push-cert")) {
-        // Its commands are inside the certificate; nothing that takes one reads further.
+      if (!commands.length && text.startsWith("push-cert\0")) {
         pushCert = true;
-        break;
+        certificate = "headers";
+        continue;
       }
       const nul = text.indexOf("\0");
       if (nul !== -1) {
@@ -87,11 +109,13 @@ export async function readReceivePackCommands(
         text = text.slice(0, nul);
       }
       const match = COMMAND.exec(text);
-      if (!match) throw new Error("Malformed command in the push");
+      if (!match) {
+        throw new Error("Malformed command in the push");
+      }
       commands.push({ old: match[1]!, new: match[2]!, ref: match[3]! });
     }
   } catch (error) {
-    await reader.cancel().catch(() => {});
+    void reader.cancel().catch(() => {});
     throw error;
   }
 

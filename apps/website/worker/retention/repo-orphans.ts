@@ -202,15 +202,17 @@ async function artifactsStage(
       (repo) => now - Date.parse(repo.createdAt) > limits.minAgeMs && repo.name,
     );
     // D1 binds at most 100 parameters a statement.
-    for (let i = 0; i < old.length; i += 50) {
-      const names = old.slice(i, i + 50).map((repo) => repo.name);
+    for (let i = 0; i < old.length; i += 30) {
+      const names = old.slice(i, i + 30).map((repo) => repo.name);
       const marks = names.map(() => "?").join(",");
       const { results } = await env.DB.prepare(
         `SELECT artifacts_name AS name FROM repos WHERE artifacts_name IN (${marks})
          UNION SELECT artifacts_name FROM repo_deletions
-          WHERE artifacts_name IN (${marks}) AND finished_at IS NULL`,
+          WHERE artifacts_name IN (${marks}) AND finished_at IS NULL
+         UNION SELECT artifacts_name FROM timeline_work_sources
+          WHERE artifacts_name IN (${marks})`,
       )
-        .bind(...names, ...names)
+        .bind(...names, ...names, ...names)
         .all<{ name: string }>();
       const known = new Set(results.map((r) => r.name));
       for (const name of names)

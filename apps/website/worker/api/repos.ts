@@ -32,6 +32,10 @@ import { db } from "../schema.ts";
 import { readHistory } from "../history/read.ts";
 import { semanticResponse } from "../semantic/api.ts";
 import { fail, readJson, requireActor } from "./http.ts";
+import { getWorkSource, resolveSource, workGitPath } from "../timelines/sources.ts";
+import { TrackerError } from "../tracker/store.ts";
+import { sourceLineage } from "../ref-log/lineage.ts";
+import type { CodeSource } from "../../shared/code-source.ts";
 
 const REPO_NAME = /^(?!\.)[A-Za-z0-9._-]{1,100}$/;
 const MAX_TEXT_BYTES = 1024 * 1024;
@@ -58,6 +62,65 @@ export async function loadRepo(
   if (!atLeast(role, needed)) return fail(c, 403, `This needs ${needed} access to the repository.`);
   return { row, role };
 }
+
+/** Authorize the canonical repository before resolving its physical source. */
+export async function loadSourceRepo(
+  c: Context<AppEnv>,
+  needed: RepoRole = "read",
+  metadataOnly = false,
+) {
+  const loaded = await loadRepo(c, needed);
+  if (loaded instanceof Response) return loaded;
+  try {
+    const resolved = await resolveSource(c.env, loaded.row, c.req.query("source"));
+    return {
+      row: resolved.repo,
+      canonical: loaded.row,
+      source: resolved.source,
+      role: loaded.role,
+      expired: false,
+    };
+  } catch (error) {
+    if (metadataOnly && error instanceof TrackerError && error.code === "source_expired") {
+      const owned = await getWorkSource(c.env, loaded.row.id, c.req.query("source")!);
+      if (owned && owned.owner_id === loaded.row.owner_id) {
+        const source: CodeSource = {
+          sourceId: owned.source_id,
+          repoId: loaded.row.id,
+          kind: "timeline-work",
+          timelineId: owned.timeline_id,
+          ref: owned.work_ref,
+        };
+        return {
+          row: {
+            ...loaded.row,
+            source_id: owned.source_id,
+            artifacts_name: owned.artifacts_name,
+            artifacts_remote: owned.artifacts_remote ?? "",
+            default_branch: owned.work_ref.replace(/^refs\/heads\//, ""),
+          },
+          canonical: loaded.row,
+          source,
+          role: loaded.role,
+          expired: true,
+        };
+      }
+    }
+    if (error instanceof TrackerError)
+      return c.json({ error: error.message, code: error.code }, error.status);
+    throw error;
+  }
+}
+
+repos.get("/:owner/:name/sources/:sourceId/lineage", async (c) => {
+  const loaded = await loadRepo(c);
+  if (loaded instanceof Response) return loaded;
+  const commit = c.req.query("commit") ?? "";
+  if (!isCommitId(commit)) return fail(c, 400, "commit must be a full commit hash.");
+  c.header("cache-control", "private, no-store");
+  const result = await sourceLineage(c.env, loaded.row, c.req.param("sourceId"), commit);
+  return result ? c.json(result) : fail(c, 404, "No such code source.");
+});
 
 function cleanPath(raw: string | undefined): string | null {
   const segments = (raw ?? "").split("/").filter(Boolean);
@@ -180,14 +243,23 @@ repos.post("/", async (c) => {
 });
 
 /** Open a cached object reader for a repo; always closed by the caller. */
-function reader(c: Context<AppEnv>, row: RepoRow): RepoReader {
-  return new RepoReader(c.env, row.artifacts_name, row.artifacts_remote, c.get("timing"), (work) =>
-    c.executionCtx.waitUntil(work),
+function reader(c: Context<AppEnv>, row: RepoRow & { source_id?: string }): RepoReader {
+  return new RepoReader(
+    c.env,
+    row.artifacts_name,
+    row.artifacts_remote,
+    c.get("timing"),
+    (work) => c.executionCtx.waitUntil(work),
+    row.source_id && row.source_id !== "canonical" ? `refs/heads/${row.default_branch}` : undefined,
   );
 }
 
 /** Responses addressed by commit id never change, so browsers may keep them. */
 function cacheIfImmutable(c: Context<AppEnv>, ref: string) {
+  if (c.req.query("source") && c.req.query("source") !== "canonical") {
+    c.header("cache-control", "private, no-store");
+    return;
+  }
   if (isCommitId(ref)) {
     c.header("cache-control", "private, max-age=31536000, immutable");
     c.header("vary", "Cookie, Authorization");
@@ -222,18 +294,29 @@ repos.get("/:owner/:name/semantic", async (c) => {
 });
 
 repos.get("/:owner/:name", async (c) => {
-  const loaded = await loadRepo(c);
+  const loaded = await loadSourceRepo(c, "read", c.req.query("metadata") === "1");
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
+  const owned =
+    loaded.source.sourceId === "canonical"
+      ? null
+      : await getWorkSource(c.env, row.id, loaded.source.sourceId);
+  if (loaded.source.sourceId !== "canonical" && !owned)
+    return fail(c, 404, "Code source not found.");
 
   const detail: RepoDetail = {
-    ...repoSummary(row, c.get("actor")),
+    ...repoSummary(loaded.canonical, c.get("actor")),
+    source: loaded.source,
+    sourceState: loaded.expired ? "expired" : owned?.state === "archived" ? "archived" : "ready",
     state: "ready",
-    cloneUrl: `${new URL(c.req.url).origin}/${row.owner_slug}/${row.name}.git`,
+    cloneUrl: `${new URL(c.req.url).origin}${owned ? workGitPath(loaded.canonical, owned.timeline_slug) : `/${row.owner_slug}/${row.name}.git`}`,
     head: null,
     branches: [],
     tags: [],
   };
+  // The repository shell and retained output need identity after Git expiry,
+  // never a canonical ref list substituted for the unavailable work source.
+  if (loaded.expired) return c.json(detail);
   const objects = reader(c, row);
   try {
     const refs = await objects.refs();
@@ -246,7 +329,11 @@ repos.get("/:owner/:name", async (c) => {
     }
     detail.branches = refs.branches;
     detail.tags = refs.tags;
-    if (refs.headBranch && refs.headBranch !== row.default_branch) {
+    if (
+      loaded.source.sourceId === "canonical" &&
+      refs.headBranch &&
+      refs.headBranch !== row.default_branch
+    ) {
       // Imports keep the source's HEAD (often "master"); git is the source of truth.
       detail.defaultBranch = refs.headBranch;
       c.executionCtx.waitUntil(
@@ -279,7 +366,7 @@ repos.get("/:owner/:name", async (c) => {
 });
 
 repos.get("/:owner/:name/tree", async (c) => {
-  const loaded = await loadRepo(c);
+  const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
   const objects = reader(c, row);
@@ -320,7 +407,14 @@ repos.get("/:owner/:name/tree", async (c) => {
     }
 
     cacheIfImmutable(c, ref);
-    const body: TreeResponse = { ref, path, commit: toCommit(commit), entries, readme };
+    const body: TreeResponse = {
+      source: loaded.source,
+      ref,
+      path,
+      commit: toCommit(commit),
+      entries,
+      readme,
+    };
     return c.json(body);
   } finally {
     await objects.close();
@@ -328,7 +422,7 @@ repos.get("/:owner/:name/tree", async (c) => {
 });
 
 repos.get("/:owner/:name/blob", async (c) => {
-  const loaded = await loadRepo(c);
+  const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
   const objects = reader(c, row);
@@ -348,6 +442,7 @@ repos.get("/:owner/:name/blob", async (c) => {
     const binary = looksBinary(head);
     cacheIfImmutable(c, ref);
     const body: BlobResponse = {
+      source: loaded.source,
       ref,
       commitOid: commit.hash,
       path,
@@ -364,7 +459,7 @@ repos.get("/:owner/:name/blob", async (c) => {
 });
 
 repos.get("/:owner/:name/history", async (c) => {
-  const loaded = await loadRepo(c);
+  const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const cursor = c.req.query("cursor");
   if (cursor && !isCommitId(cursor)) return fail(c, 400, "Invalid history cursor.");
@@ -381,7 +476,16 @@ repos.get("/:owner/:name/history", async (c) => {
       !cursor &&
       !(await objects.refs()).head
     ) {
-      return c.json({ ref, head: null, path, scanned: 0, next: null, commits: [], entries: {} });
+      return c.json({
+        source: loaded.source,
+        ref,
+        head: null,
+        path,
+        scanned: 0,
+        next: null,
+        commits: [],
+        entries: {},
+      });
     }
     if (!head || !(await objects.commit(head)))
       return fail(c, 404, `No branch, tag or commit named ${ref}.`);
@@ -393,14 +497,14 @@ repos.get("/:owner/:name/history", async (c) => {
       cursor,
     );
     cacheIfImmutable(c, ref);
-    return c.json({ ...history, ref });
+    return c.json({ ...history, source: loaded.source, ref });
   } finally {
     await objects.close();
   }
 });
 
 repos.get("/:owner/:name/commits", async (c) => {
-  const loaded = await loadRepo(c);
+  const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
   const page = Math.max(1, Number.parseInt(c.req.query("page") ?? "1", 10) || 1);
@@ -411,11 +515,17 @@ repos.get("/:owner/:name/commits", async (c) => {
     if (target instanceof Response) return target;
     const { ref } = target;
     const oid = await objects.resolve(ref);
+    if (
+      (oid && !(await objects.commit(oid))) ||
+      (!oid && (c.req.query("ref") || c.req.query("at")))
+    )
+      return fail(c, 404, `No branch, tag or commit named ${ref}.`);
     const commits = oid
       ? await objects.log(oid, COMMITS_PER_PAGE + 1, (page - 1) * COMMITS_PER_PAGE)
       : [];
     cacheIfImmutable(c, ref);
     const body: CommitsResponse = {
+      source: loaded.source,
       ref,
       commits: commits.slice(0, COMMITS_PER_PAGE).map(toCommit),
       hasMore: commits.length > COMMITS_PER_PAGE,

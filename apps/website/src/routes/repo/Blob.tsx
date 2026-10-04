@@ -31,20 +31,24 @@ import { bytes } from "../../lib/format.ts";
 import { lineAnchor, parseLineAnchor } from "../../lib/lineAnchors.ts";
 import { findDefinitions } from "../../lib/outline.ts";
 import { blobUrl, repoPath } from "../../lib/refs.ts";
-import { repoData, routeData } from "../../lib/repoData.ts";
+import { repoData, requestSource, routeData } from "../../lib/repoData.ts";
 import { useSourceHighlight } from "../../lib/useSourceHighlight.ts";
 import { FileHistory } from "./History.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 import { WhyPanel } from "./WhyPanel.tsx";
 
-export async function blobLoader({ params }: LoaderFunctionArgs) {
+export async function blobLoader({ params, request }: LoaderFunctionArgs) {
   const owner = params.owner ?? "";
   const name = params.repo ?? "";
-  const blob = await routeData(repoData.blob(owner, name, params["*"] ?? ""));
+  const source = await requestSource(owner, name, request);
+  const blob = await routeData(repoData.blob(owner, name, params["*"] ?? "", source));
   // The graph rail is extra: it streams in beside the code and never holds up
   // the file. No node (404) or no graph yet resolves to null.
-  const knowledge = repoData.graphNode(owner, name, `file:${blob.path}`).catch(() => null);
+  const knowledge =
+    source && source !== "canonical"
+      ? Promise.resolve(null)
+      : repoData.graphNode(owner, name, `file:${blob.path}`).catch(() => null);
   return { blob, knowledge };
 }
 
@@ -62,13 +66,13 @@ export function Blob() {
   const end = selection?.end;
   const toast = useToast();
   const anchor = useRef<{ file: string; hash: string; line: number } | null>(null);
-  const file = `${repo.id}:${blob.ref}:${blob.path}`;
+  const file = `${repo.id}:${repo.source?.sourceId}:${blob.ref}:${blob.path}`;
   const [rangeOrigin, setRangeOrigin] = useState<{ file: string; hash: string } | null>(null);
   const [whyOpen, setWhyOpen] = useState(false);
   const extending = rangeOrigin?.file === file && rangeOrigin.hash === hash;
   const selectedHash = selection ? lineAnchor(selection.start, selection.end) : "";
   const lineLabel = start === end ? `line ${start}` : `lines ${start}–${end}`;
-  const permalink = `${blobUrl(repo.owner.slug, repo.name, blob.commitOid, blob.path)}${selectedHash}`;
+  const permalink = `${blobUrl(repo.owner.slug, repo.name, blob.commitOid, blob.path, repo.source?.sourceId)}${selectedHash}`;
 
   const selectLine = (event: MouseEvent<HTMLAnchorElement>, line: number) => {
     if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -95,7 +99,7 @@ export function Blob() {
   const copyLink = async (pinned: boolean) => {
     const path = pinned
       ? permalink
-      : `${blobUrl(repo.owner.slug, repo.name, blob.ref, blob.path)}${selectedHash}`;
+      : `${blobUrl(repo.owner.slug, repo.name, blob.ref, blob.path, repo.source?.sourceId)}${selectedHash}`;
     const what = selection ? lineLabel : fileName;
     try {
       await navigator.clipboard.writeText(new URL(path, window.location.origin).href);
@@ -166,10 +170,12 @@ export function Blob() {
           path={blob.path}
           view="blob"
           commit={blob.commitOid}
-          onSwitch={(ref) => navigate(blobUrl(repo.owner.slug, repo.name, ref, blob.path))}
+          onSwitch={(ref) =>
+            navigate(blobUrl(repo.owner.slug, repo.name, ref, blob.path, repo.source?.sourceId))
+          }
         />
         <FileHistory
-          key={`${repo.id}:${blob.ref}:${blob.commitOid}:${blob.path}`}
+          key={`${repo.id}:${repo.source?.sourceId}:${blob.ref}:${blob.commitOid}:${blob.path}`}
           repo={repo}
           head={blob.commitOid}
           path={blob.path}
@@ -487,7 +493,7 @@ function FileKnowledge({
               use.node.kind === "file" && use.node.path ? (
                 <FileRow
                   key={use.node.id}
-                  to={blobUrl(owner, repo.name, blob.ref, use.node.path)}
+                  to={blobUrl(owner, repo.name, blob.ref, use.node.path, repo.source?.sourceId)}
                   path={use.node.path}
                 />
               ) : (
@@ -510,7 +516,13 @@ function FileKnowledge({
             {usedBy.map((user) => (
               <FileRow
                 key={user.node.id}
-                to={blobUrl(owner, repo.name, blob.ref, user.node.path ?? "")}
+                to={blobUrl(
+                  owner,
+                  repo.name,
+                  blob.ref,
+                  user.node.path ?? "",
+                  repo.source?.sourceId,
+                )}
                 path={user.node.path ?? ""}
               />
             ))}

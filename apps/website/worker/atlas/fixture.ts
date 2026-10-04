@@ -261,6 +261,7 @@ export async function writeAtlasFixtureOverlay(
   ref: string,
   commit: string,
   base: string,
+  sourceId = "canonical",
 ): Promise<{ overlayId: string; stored: number }> {
   const before = atlasFixtureFiles("base");
   const after = atlasFixtureTimelineFiles();
@@ -298,7 +299,7 @@ export async function writeAtlasFixtureOverlay(
     base,
     { mergeBase: base, historyTruncated: false, changes: files },
     changes,
-    { fixture: true },
+    { fixture: true, sourceId },
   );
   // As computeOverlay does: the timeline's regrouping, kept with the overlay.
   if (kept) await storeTimelineRegrouping(d1, repoId, overlayId, { main, timeline }, changes);

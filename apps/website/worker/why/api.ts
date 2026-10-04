@@ -15,6 +15,7 @@
 import { Hono, type Context } from "hono";
 import type { ChangeRef } from "../../shared/api.ts";
 import type { TimelineEvent, TimelineIssue } from "../../shared/timelines.ts";
+import type { CodeSource } from "../../shared/code-source.ts";
 import {
   WHY_MAX_COMMITS,
   WHY_MAX_LINES,
@@ -24,7 +25,7 @@ import {
   type WhyResponse,
 } from "../../shared/why.ts";
 import { fail } from "../api/http.ts";
-import { loadRepo } from "../api/repos.ts";
+import { loadSourceRepo } from "../api/repos.ts";
 import { upstreamToken } from "../artifacts.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor, RepoRow } from "../db.ts";
@@ -33,6 +34,7 @@ import { commitSummary } from "../history/read.ts";
 import { isCommitId, RepoReader } from "../objects.ts";
 import { selectUpdates, toUpdate } from "../ref-log/api.ts";
 import { readNewCommits } from "../ref-log/record.ts";
+import { sourceLineage } from "../ref-log/lineage.ts";
 import { linkedIssues } from "../release-notes/api.ts";
 import { db } from "../schema.ts";
 import { accessible } from "../tracker/api.ts";
@@ -146,15 +148,19 @@ async function headerChangeId(env: Env, row: RepoRow, oid: string): Promise<stri
 /** The Worker's sources: D1's push log, the repository, and the owner's tracker. */
 export async function workerSources(
   c: Context<AppEnv>,
-  row: RepoRow,
+  row: RepoRow & { source_id?: string },
   objects: RepoReader,
+  source?: CodeSource,
+  expired = false,
 ): Promise<WhySources> {
   const kdb = db(c.env.DB);
   const actor = c.get("actor");
   return shared({
+    source,
     repoId: row.id,
     defaultBranch: row.default_branch,
     commit: async (oid) => {
+      if (expired) return null;
       const commit = await objects.commit(oid).catch(() => null);
       return commit && commitSummary(commit);
     },
@@ -163,6 +169,7 @@ export async function workerSources(
         .selectFrom("change_refs")
         .select("change_id")
         .where("repo_id", "=", row.id)
+        .where("source_id", "=", row.source_id ?? "canonical")
         .where((eb) => eb.or([eb("first_commit_oid", "=", oid), eb("last_commit_oid", "=", oid)]))
         .limit(1)
         .executeTakeFirst();
@@ -185,6 +192,7 @@ export async function workerSources(
           "m.last_seen_at",
         ])
         .where("m.repo_id", "=", row.id)
+        .where("m.source_id", "=", row.source_id ?? "canonical")
         .where("m.change_id", "=", changeId)
         .orderBy("m.first_seen_at")
         .orderBy("u.id")
@@ -233,7 +241,7 @@ export function byCommit(lines: { line: number; commit: string }[]): Map<string,
 }
 
 why.get("/why", async (c) => {
-  const loaded = await loadRepo(c);
+  const loaded = await loadSourceRepo(c, "read", true);
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
   const path = cleanPath(c.req.query("path"));
@@ -241,6 +249,14 @@ why.get("/why", async (c) => {
   const named = c.req.queries("commit") ?? [];
   const lines = parseLines(c.req.query("line"));
   if (!named.length) {
+    if (loaded.expired)
+      return c.json(
+        {
+          error: "This code source has expired; retained provenance is available by commit.",
+          code: "source_expired",
+        },
+        410,
+      );
     if (!path) return fail(c, 400, "Name a file with path, or commits with commit.");
     if (!lines) return fail(c, 400, "Name a line (line=12) or a range (line=12-20).");
     if (lines.end - lines.start + 1 > WHY_MAX_LINES)
@@ -258,9 +274,10 @@ why.get("/why", async (c) => {
     row.artifacts_remote,
     c.get("timing"),
     (work) => c.executionCtx.waitUntil(work),
+    loaded.source.kind === "timeline-work" ? loaded.source.ref : undefined,
   );
   try {
-    const sources = await workerSources(c, row, objects);
+    const sources = await workerSources(c, row, objects, loaded.source, loaded.expired);
     let blame: WhyBlame | null = null;
     let wanted: { oid: string; changeId: string | null; lines: number[] }[];
     if (commits.length) {
@@ -283,8 +300,98 @@ why.get("/why", async (c) => {
       wanted = [...byCommit(result.lines)].map(([oid, lines]) => ({ oid, changeId: null, lines }));
     }
     const chains: WhyChain[] = [];
-    for (const request of wanted) chains.push(await resolveChain(sources, request));
+    for (const request of wanted) {
+      const chain = await resolveChain(sources, request);
+      let origin =
+        loaded.source.kind === "timeline-work"
+          ? { sourceId: loaded.source.sourceId, commit: request.oid }
+          : null;
+      if (!origin) {
+        const receipts = await db(c.env.DB)
+          .selectFrom("source_integration_receipts")
+          .select(["source_id", "source_commit"])
+          .where("repo_id", "=", row.id)
+          .where("canonical_commit", "=", request.oid)
+          .where("status", "=", "complete")
+          .where("noop", "=", 0)
+          .execute();
+        if (receipts.length === 1)
+          origin = { sourceId: receipts[0]!.source_id, commit: receipts[0]!.source_commit };
+        if (receipts.length) chain.landing = null;
+      }
+      if (origin) {
+        const lineage = await sourceLineage(
+          c.env,
+          loaded.canonical,
+          origin.sourceId,
+          origin.commit,
+        );
+        if (lineage) chain.lineage = lineage;
+        if (lineage?.integration && sources.tracker) {
+          const queued = await sources.tracker.landing(lineage.integration.canonical.commit);
+          const pinned = queued?.checkpoint.checkpoint.repos.find(
+            (repo) => repo.id === row.id && repo.source?.sourceId === lineage.source.sourceId,
+          );
+          const landingRepo = queued?.landing.repos.find((repo) => repo.id === row.id);
+          if (
+            queued &&
+            pinned &&
+            landingRepo &&
+            queued.landing.state === "landed" &&
+            pinned.commit === lineage.integration.source.commit &&
+            landingRepo.merge === lineage.integration.canonical.commit
+          ) {
+            const checkpoint = queued.checkpoint;
+            const approval = checkpoint.approval && {
+              requestId: checkpoint.approval.requestId,
+              state: checkpoint.approval.state,
+              by: checkpoint.approval.by,
+              at: checkpoint.approval.at,
+              note: checkpoint.approval.note,
+            };
+            if (!chain.checkpoints.some((item) => item.id === checkpoint.checkpoint.id))
+              chain.checkpoints.push({
+                id: checkpoint.checkpoint.id,
+                timeline: queued.landing.slug,
+                number: checkpoint.checkpoint.number,
+                commit: lineage.integration.source.commit,
+                summary: checkpoint.checkpoint.summary,
+                createdAt: checkpoint.checkpoint.createdAt,
+                actorId: checkpoint.checkpoint.actorId,
+                current: checkpoint.current,
+                approval,
+              });
+            if (approval)
+              chain.approval = {
+                ...approval,
+                checkpointId: checkpoint.checkpoint.id,
+                timeline: queued.landing.slug,
+                number: checkpoint.checkpoint.number,
+              };
+            chain.landing = {
+              ref: lineage.integration.canonical.ref,
+              commit: lineage.integration.canonical.commit,
+              at: queued.landing.updatedAt,
+              update: null,
+              via: "compact",
+              timeline: queued.landing.slug,
+              queue: {
+                id: queued.landing.id,
+                checkpointId: queued.landing.checkpointId,
+                checkpointNumber: queued.landing.checkpointNumber,
+                trigger: queued.landing.trigger,
+                requestedBy: queued.landing.requestedBy,
+                mergeRun: landingRepo.mergeRun,
+                gateRun: landingRepo.gateRun,
+              },
+            };
+          }
+        }
+      }
+      chains.push(chain);
+    }
     return c.json<WhyResponse>({
+      source: loaded.source,
       repo: { owner: row.owner_slug, name: row.name, defaultBranch: row.default_branch },
       tracker: { owner: row.owner_slug, readable: sources.tracker !== null },
       blame,

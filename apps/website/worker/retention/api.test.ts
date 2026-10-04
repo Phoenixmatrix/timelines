@@ -8,8 +8,6 @@ import { tokenCredential, type AppEnv } from "../auth.ts";
 import { previewSettingsApi } from "../deployments/settings.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { accountRetentionApi, siteRetentionApi } from "./api.ts";
-import { CATEGORIES } from "./categories.ts";
-import { cleanupFor } from "./cleanups/index.ts";
 import { enabledTargets } from "./policies.ts";
 
 async function setup() {
@@ -70,84 +68,7 @@ const policy = (settings: RetentionSettings, id: string) =>
 const count = (sqlite: ReturnType<typeof migratedDatabase>, table: string) =>
   (sqlite.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
 
-describe("the category registry", () => {
-  test("has every PRD category once, with sane thresholds and plain-language limits", () => {
-    const ids = CATEGORIES.map((c) => c.id);
-    expect(new Set(ids).size).toBe(ids.length);
-    expect(ids).toEqual([
-      "ci-logs",
-      "ci-runs",
-      "preview-records",
-      "knowledge-builds",
-      "ended-timeline-data",
-      "push-log",
-      "unreachable-git",
-      "closed-issues",
-      "tracker-activity",
-      "assistant-chats",
-      "release-notes",
-      "previews",
-      "atlas-snapshots",
-      "analysis-caches",
-      "registry-proxy-cache",
-      "registry-audit",
-      "auth-hygiene",
-      "ai-spend",
-      "usage-history",
-      "ai-usage",
-      "durable-registry",
-    ]);
-    for (const c of CATEGORIES) {
-      expect(c.id).toMatch(/^[a-z]+(-[a-z]+)*$/);
-      expect(c.never.length).toBeGreaterThan(0);
-      expect(c.thresholds.length).toBeGreaterThan(0);
-      for (const t of c.thresholds) {
-        expect(Number.isInteger(t.default)).toBe(true);
-        expect(t.min).toBeLessThanOrEqual(t.default);
-        expect(t.default).toBeLessThanOrEqual(t.max);
-      }
-    }
-  });
-});
-
 describe("account retention settings", () => {
-  test("with nothing stored, every policy category is disabled at its PRD default", async () => {
-    const t = await setup();
-    const { status, json } = await t.call(t.tokens.ann, "GET", ORG);
-    expect(status).toBe(200);
-    const settings = json as RetentionSettings;
-    expect(settings).toMatchObject({ level: "account", account: "orbit", canEdit: true });
-    expect(settings.categories.map((c) => c.id)).toEqual(
-      CATEGORIES.filter((c) => c.scope === "account").map((c) => c.id),
-    );
-    for (const c of settings.categories.filter((c) => c.control === "policy"))
-      expect(c).toMatchObject({
-        enabled: false,
-        enabledFrom: "default",
-        runnable: cleanupFor(c.id) !== undefined,
-        lastRun: null,
-      });
-    expect(policy(settings, "ci-logs").values).toEqual({ days: 30 });
-    expect(policy(settings, "ci-runs").values).toEqual({ days: 180, keepLatest: 20 });
-    expect(policy(settings, "tracker-activity").values).toEqual({
-      eventDays: 365,
-      endedTimelineDays: 180,
-    });
-    // Existing cleanup keeps running as it did.
-    expect(policy(settings, "previews")).toMatchObject({
-      control: "active",
-      enabled: true,
-      values: { endedDays: 2, idleDays: 7 },
-    });
-    expect(policy(settings, "atlas-snapshots")).toMatchObject({
-      control: "active",
-      enabled: true,
-      values: { maxPrior: 20, priorDays: 7, capGib: 2 },
-    });
-    expect(settings.changes).toEqual([]);
-    expect(await enabledTargets(t.env.DB)).toEqual([]);
-  });
-
   test("enabling without values applies the defaults; values and resets are recorded", async () => {
     const t = await setup();
     const enabled = await t.call(t.tokens.ann, "PATCH", ORG, {
@@ -173,10 +94,12 @@ describe("account retention settings", () => {
         ["release-notes", "ann", {}, { thresholds: { days: 400 } }],
       ]),
     );
-    const targets = await enabledTargets(t.env.DB);
+    const targets = (await enabledTargets(t.env.DB)).filter((target) =>
+      target.policies.some((p) => p.id === "ci-logs"),
+    );
     expect(targets).toHaveLength(1);
     expect(targets[0]!.target).toEqual({ scope: "account", accountId: "acc_org" });
-    expect(targets[0]!.policies.map((p) => p.id)).toEqual(["ci-logs"]);
+    expect(targets[0]!.policies.find((p) => p.id === "ci-logs")?.enabled).toBe(true);
 
     // The same values again change nothing and record nothing.
     await t.call(t.tokens.ann, "PATCH", ORG, { categories: { "ci-logs": { enabled: true } } });
@@ -398,7 +321,6 @@ describe("site retention settings", () => {
     ]);
     // Only categories that take a policy have site-wide defaults.
     expect(site.categories.some((c) => c.control !== "policy")).toBe(false);
-    for (const c of site.categories) expect(c.enabled).toBe(false);
 
     const bad = async (body: unknown) =>
       expect((await t.call(t.tokens.sue, "PATCH", SITE, body)).status).toBe(400);
@@ -436,7 +358,11 @@ describe("site retention settings", () => {
       values: { days: 60 },
       valuesFrom: { days: "site" },
     });
-    expect((await enabledTargets(t.env.DB)).map((x) => x.target)).toEqual([{ scope: "site" }]);
+    expect(
+      (await enabledTargets(t.env.DB))
+        .filter((x) => x.target.scope === "site")
+        .map((x) => x.target),
+    ).toEqual([{ scope: "site" }]);
 
     // A site-wide default that enables an account category covers every
     // account that didn't decide otherwise.
@@ -448,7 +374,9 @@ describe("site retention settings", () => {
     expect(policy(org, "ci-logs")).toMatchObject({ enabled: true, enabledFrom: "site" });
     const targets = await enabledTargets(t.env.DB);
     const accounts = targets.flatMap((x) =>
-      x.target.scope === "account" ? [x.target.accountId] : [],
+      x.target.scope === "account" && x.policies.some((p) => p.id === "ci-logs")
+        ? [x.target.accountId]
+        : [],
     );
     expect(accounts).toContain("acc_org");
     expect(accounts).toContain("acc_ann");

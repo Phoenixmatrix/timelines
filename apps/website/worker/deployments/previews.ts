@@ -29,7 +29,7 @@ type Waiter = (work: Promise<unknown>) => void;
 /** One repository's preview run: started (its number), or why not. */
 export type PreviewRunResult =
   | { repoId: string; number: number; runId: string }
-  | { repoId: string; skipped: string };
+  | { repoId: string; skipped: string; teardownUnmanaged?: boolean };
 
 /** A repository to start a preview run in, with its default branch. */
 export type PreviewRepo = CiRepo & { default_branch: string };
@@ -47,6 +47,7 @@ export interface PreviewTarget {
  * exists, else the default branch (the commit is then fetched by id).
  */
 export async function previewBranch(env: Env, repo: PreviewRepo, slug: string): Promise<string> {
+  if (repo.source_id && repo.source_id !== "canonical") return "work";
   const bookmark = timelineBookmark(slug);
   try {
     const refs = await listRefs(env, repo.artifacts_name, repo.artifacts_remote);
@@ -77,7 +78,11 @@ export async function startPreviewRuns(
           waitUntil,
         });
         return "skipped" in started
-          ? { repoId: repo.id, skipped: started.skipped }
+          ? {
+              repoId: repo.id,
+              skipped: started.skipped,
+              teardownUnmanaged: started.teardownUnmanaged,
+            }
           : { repoId: repo.id, number: started.number, runId: started.runId };
       } catch (error) {
         console.error("Previews: could not start a run", { repo: repo.id, preview, error });
@@ -121,10 +126,11 @@ export async function previewCheckpoint(
       return row
         ? [
             {
-              repo: row,
+              repo: { ...row, source_id: repo.source?.sourceId ?? "canonical" },
               commit: repo.commit,
               // Just measured from it.
-              branch: timelineBookmark(timeline.slug),
+              branch:
+                repo.source?.ref.replace(/^refs\/heads\//, "") ?? timelineBookmark(timeline.slug),
               preview: { action: "create", timeline: timeline.slug, checkpoint: checkpoint.id },
             },
           ]
@@ -147,7 +153,7 @@ export async function checkpointRecords(
   if (!ids.length) return new Map();
   const rows = await db(d1)
     .selectFrom("deployments")
-    .select(["id", "repo_id", "commit_oid", "checkpoint_id"])
+    .select(["id", "repo_id", "source_id", "commit_oid", "checkpoint_id"])
     .where("repo_id", "in", ids)
     .where((eb) =>
       eb.or([
@@ -168,7 +174,12 @@ export async function checkpointRecords(
   const newest = new Map<string, number>();
   for (const row of rows) {
     const repo = checkpoint.repos.find((r) => r.id === row.repo_id);
-    if (!repo || (row.checkpoint_id === null && row.commit_oid !== repo.commit)) continue;
+    if (
+      !repo ||
+      row.source_id !== (repo.source?.sourceId ?? "canonical") ||
+      (row.checkpoint_id === null && row.commit_oid !== repo.commit)
+    )
+      continue;
     if (!newest.has(row.repo_id)) newest.set(row.repo_id, row.id);
   }
   return newest;
@@ -201,7 +212,7 @@ export async function reviveCheckpoint(
       return row
         ? [
             {
-              repo: row,
+              repo: { ...row, source_id: repo.source?.sourceId ?? "canonical" },
               commit: repo.commit,
               preview: {
                 action: "create",

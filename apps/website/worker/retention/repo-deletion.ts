@@ -32,6 +32,7 @@ import { DURABLE_CLASSES, type DurableClass } from "../durable/classes.ts";
 import { vectorId, SEARCH_INSTANCE } from "../knowledge/indexes.ts";
 import { pool } from "../knowledge/util.ts";
 import { db, nowIso } from "../schema.ts";
+import { drainDeletedRepoSources } from "./work-sources.ts";
 
 /** The phases, in order; `done` once the last has run. */
 export const PHASES = [
@@ -257,15 +258,17 @@ const LIVE_INSTANCE = new Set(["queued", "running", "waiting", "paused", "waitin
  */
 export async function resumeDeletions(
   env: Env,
-  options: { waitUntil: Waiter; now?: number; staleMs?: number; limit?: number },
+  options: { waitUntil: Waiter; now?: number; staleMs?: number; limit?: number; repoId?: string },
 ): Promise<string[]> {
   const now = options.now ?? Date.now();
   const before = new Date(now - (options.staleMs ?? 15 * 60_000)).toISOString();
-  const rows = await db(env.DB)
+  let query = db(env.DB)
     .selectFrom("repo_deletions")
     .select(["repo_id", "workflow_id"])
     .where("finished_at", "is", null)
-    .where("updated_at", "<=", before)
+    .where("updated_at", "<=", before);
+  if (options.repoId) query = query.where("repo_id", "=", options.repoId);
+  const rows = await query
     .orderBy("updated_at")
     .limit(options.limit ?? 10)
     .execute();
@@ -426,6 +429,7 @@ async function stopPhase(env: Env, repoId: string, step: PurgeStep, limits: Limi
   // A terminated build or queue CI callback may already have an effect in
   // flight. Let it settle before purging stores; tombstones fence new work.
   if (knowledge.terminated > 0 || cancelled > 0) await step.sleep("stop:settle", "1 minute");
+  await step.do("stop:ci-acknowledged", STEP, () => assertCiDrained(env, repoId, true));
 }
 
 /** Purge the coordinator first (it starts builds), then terminate its builds. */
@@ -495,6 +499,38 @@ async function stopCi(env: Env, repoId: string, limits: Limits) {
   return { cancelled: runs.length, more: runs.length === limits.runsPerStep };
 }
 
+/** A stopped Workflow or elapsed grace period is not runner acknowledgment. */
+async function assertCiDrained(env: Env, repoId: string, allowTeardown: boolean) {
+  let query = db(env.DB)
+    .selectFrom("ci_runs as r")
+    .select("r.id")
+    .where("r.repo_id", "=", repoId)
+    .where((eb) =>
+      eb.or([
+        eb("r.status", "in", ["queued", "running"]),
+        eb.exists(
+          eb
+            .selectFrom("ci_jobs as j")
+            .select("j.id")
+            .whereRef("j.run_id", "=", "r.id")
+            .where((job) =>
+              job.or([
+                job("j.status", "in", ["pending", "queued", "running"]),
+                job("j.source_completion_pending", "=", 1),
+              ]),
+            ),
+        ),
+      ]),
+    );
+  if (allowTeardown)
+    query = query.where((eb) =>
+      eb.or([eb("r.preview_action", "is", null), eb("r.preview_action", "!=", "teardown")]),
+    );
+  const outstanding = await query.executeTakeFirst();
+  if (outstanding)
+    throw new Error(`Repository deletion awaits CI consumer acknowledgment for ${outstanding.id}`);
+}
+
 // previews: the same teardown the hourly sweep starts, then wait for it.
 
 async function previewsPhase(
@@ -541,9 +577,58 @@ async function claimPreviews(
   const row = await loadDeletion(env, repoId);
   const progress = parseProgress(row?.progress ?? "{}");
   const previews = progress.previews ?? { startedAt: nowIso(), groups: [] };
+  // Resume from the recorded deployment identities, never today's routing.
+  // Old unadmitted groups could mix physical sources under one timeline slug.
+  const normalized: PreviewGroup[] = [];
+  for (const group of previews.groups) {
+    const records = group.deployments.length
+      ? await kdb
+          .selectFrom("deployments")
+          .select(["id", "source_id", "timeline_slug", "commit_oid", "checkpoint_id"])
+          .where("repo_id", "=", repoId)
+          .where("id", "in", group.deployments)
+          .orderBy("id")
+          .execute()
+      : [];
+    if (records.length !== group.deployments.length || !records.length)
+      throw new Error("Saved preview cleanup has missing deployment identities.");
+    if (group.run) {
+      const admitted = await kdb
+        .selectFrom("ci_runs")
+        .select(["source_id", "commit_oid"])
+        .where("id", "=", group.run.id)
+        .where("repo_id", "=", repoId)
+        .executeTakeFirst();
+      if (
+        !admitted ||
+        records.some((record) => record.source_id !== admitted.source_id) ||
+        admitted.commit_oid !== group.commit
+      )
+        throw new Error("Saved preview cleanup source identity does not match its admitted run.");
+      normalized.push(group);
+      continue;
+    }
+    const sources = new Map<string, PreviewGroup>();
+    for (const record of records) {
+      if (!record.timeline_slug)
+        throw new Error("Saved preview cleanup lost its timeline identity.");
+      const key = `${record.source_id}\0${record.timeline_slug}`;
+      const split = sources.get(key) ?? {
+        ...group,
+        timeline: record.timeline_slug,
+        deployments: [],
+      };
+      split.deployments.push(record.id);
+      split.commit = record.commit_oid;
+      split.checkpoint = record.checkpoint_id;
+      sources.set(key, split);
+    }
+    normalized.push(...sources.values());
+  }
+  previews.groups = normalized;
   const live = await kdb
     .selectFrom("deployments")
-    .select(["id", "timeline_slug", "commit_oid", "checkpoint_id"])
+    .select(["id", "source_id", "timeline_slug", "commit_oid", "checkpoint_id"])
     .where("repo_id", "=", repoId)
     .where("status", "in", ["active", "sleeping"])
     .where("timeline_slug", "is not", null)
@@ -555,7 +640,8 @@ async function claimPreviews(
   for (const deployment of live) {
     if (known.has(deployment.id)) continue;
     const timeline = deployment.timeline_slug!;
-    const group = fresh.get(timeline) ?? {
+    const key = `${deployment.source_id}\0${timeline}`;
+    const group = fresh.get(key) ?? {
       timeline,
       deployments: [],
       commit: deployment.commit_oid,
@@ -567,7 +653,7 @@ async function claimPreviews(
     // The newest preview's commit and checkpoint, as the sweep does.
     group.commit = deployment.commit_oid;
     group.checkpoint = deployment.checkpoint_id;
-    fresh.set(timeline, group);
+    fresh.set(key, group);
   }
   previews.groups.push(...fresh.values());
   await saveProgress(env, repoId, { previews });
@@ -596,14 +682,27 @@ async function claimPreviews(
       group.skipped = "The repository is gone.";
       continue;
     }
+    const parent = await kdb
+      .selectFrom("deployments")
+      .select(["id", "source_id"])
+      .where("repo_id", "=", repoId)
+      .where("id", "in", group.deployments)
+      .orderBy("id", "desc")
+      .executeTakeFirstOrThrow();
+    const sourceRepo = { ...repo, source_id: parent.source_id };
     const [started] = await startPreviewRuns(
       env,
       [
         {
-          repo,
+          repo: sourceRepo,
           commit: group.commit,
-          branch: await previewBranch(env, repo, group.timeline),
-          preview: { action: "teardown", timeline: group.timeline, checkpoint: group.checkpoint },
+          branch: await previewBranch(env, sourceRepo, group.timeline),
+          preview: {
+            action: "teardown",
+            timeline: group.timeline,
+            checkpoint: group.checkpoint,
+            teardownOf: parent.id,
+          },
         },
       ],
       null,
@@ -617,7 +716,16 @@ async function claimPreviews(
         .set({ teardown_run_id: started.runId })
         .where("id", "in", group.deployments)
         .execute();
-    } else group.skipped = started?.skipped ?? "No run was started.";
+    } else {
+      group.skipped = started?.skipped ?? "No run was started.";
+      if (started?.teardownUnmanaged)
+        await kdb
+          .updateTable("deployments")
+          .set({ teardown_unmanaged_at: nowIso() })
+          .where("id", "in", group.deployments)
+          .where("teardown_run_id", "is", null)
+          .execute();
+    }
     await saveProgress(env, repoId, { previews });
   }
   return { groups: previews.groups.length, runs };
@@ -960,6 +1068,9 @@ async function unlinkPublishes(env: Env, repoId: string, limits: Limits) {
 // artifacts: the git repository.
 
 async function artifactsPhase(env: Env, repoId: string, step: PurgeStep) {
+  // Also cover a resumed purge and teardown consumers admitted after stop.
+  await step.do("artifacts:ci-acknowledged", STEP, () => assertCiDrained(env, repoId, false));
+  await step.do("artifacts:work-sources", STEP, () => drainDeletedRepoSources(env, repoId));
   await step.do("artifacts:delete", STEP, async () => {
     const row = await loadDeletion(env, repoId);
     const name = row?.artifacts_name;
@@ -975,6 +1086,13 @@ async function artifactsPhase(env: Env, repoId: string, step: PurgeStep) {
 
 /** Large child tables, children before parents, with how a row finds the repository (?1). */
 export const CHILD_ROWS: [table: string, where: string][] = [
+  ["timeline_source_roots", "repo_id = ?1"],
+  ["source_integration_members", "repo_id = ?1"],
+  ["source_integration_inputs", "repo_id = ?1"],
+  ["source_integration_receipts", "repo_id = ?1"],
+  ["source_progress_members", "repo_id = ?1"],
+  ["source_operations", "repo_id = ?1"],
+  ["timeline_work_sources", "repo_id = ?1 AND state = 'purged'"],
   ["merge_queue", "repo_id = ?1"],
   ["ci_logs", "job_id IN (SELECT id FROM ci_jobs WHERE repo_id = ?1)"],
   ["ci_steps", "job_id IN (SELECT id FROM ci_jobs WHERE repo_id = ?1)"],

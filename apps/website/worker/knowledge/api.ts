@@ -50,6 +50,8 @@ import { overlayRef, overlayState, setEndReason, timelineEnd } from "./overlay.t
 import { commitKey, listSets, overlayEnded, timelinePage } from "./pages.ts";
 import { timelineSlugOf } from "../../shared/timelines.ts";
 import { aiWork } from "../usage/ai.ts";
+import { liveTimelineSources, timelineKnowledgeSource, knowledgeRepo } from "./sources.ts";
+import { getWorkSource, resolveSource } from "../timelines/sources.ts";
 
 export const knowledge = new Hono<AppEnv>();
 
@@ -161,7 +163,26 @@ async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus
 
 async function repoOrFail(c: Context<AppEnv>, needed: "read" | "write" | "admin" = "read") {
   const loaded = await loadRepo(c, needed);
-  return loaded instanceof Response ? loaded : loaded.row;
+  if (loaded instanceof Response) return loaded;
+  const sourceId = c.req.query("source");
+  if (sourceId && sourceId !== "canonical") {
+    if (!c.req.path.includes("/overlay"))
+      return fail(
+        c,
+        400,
+        "Work-source knowledge is available through its timeline overlay and pages.",
+      );
+    const owned = await getWorkSource(c.env, loaded.row.id, sourceId);
+    if (!owned || owned.owner_id !== loaded.row.owner_id)
+      return fail(c, 404, "No such code source.");
+    // Published knowledge has its own retention. Reading it needs source identity,
+    // not the Git repository that its now-completed producer used.
+    if (needed !== "read") await resolveSource(c.env, loaded.row, sourceId);
+    const ref = overlayRef(c.req.query("ref") ?? "");
+    if (ref && ref !== `refs/heads/timeline/${owned.timeline_slug}`)
+      return fail(c, 404, "Source does not belong to this timeline.");
+  }
+  return loaded.row;
 }
 
 knowledge.get("/status", async (c) => {
@@ -507,17 +528,14 @@ async function overlaySummaries(
   row: RepoRow,
   only?: string,
 ): Promise<{ summary: KnowledgeOverlaySummary; overlayId: string | null; stored: number }[]> {
-  const reader = new RepoReader(
-    c.env,
-    row.artifacts_name,
-    row.artifacts_remote,
-    c.get("timing"),
-    (w) => c.executionCtx.waitUntil(w),
-  );
+  const sources = await liveTimelineSources(c.env, row.id);
   let query = db(c.env.DB).selectFrom("kg_overlays").selectAll().where("repo_id", "=", row.id);
   if (only) query = query.where("ref", "=", only);
-  const [refs, rows, state, coordination] = await Promise.all([
-    reader.refs().catch(() => null),
+  const sourceId =
+    c.req.query("source") ??
+    (only ? (await timelineKnowledgeSource(c.env, row.id, only))?.source_id : undefined);
+  if (sourceId) query = query.where("source_id", "=", sourceId);
+  const [rows, state, coordination] = await Promise.all([
     query.execute(),
     db(c.env.DB)
       .selectFrom("kg_state")
@@ -526,15 +544,23 @@ async function overlaySummaries(
       .executeTakeFirst(),
     c.env.AI ? coordinator(c.env, row.id).status() : null,
   ]);
-  await reader.close();
+  // Ref reads above are resolved from owned work sources, never canonical bookmarks.
   await recheckEnded(c, row, rows);
   const indexed = state?.indexed_commit ?? null;
   const tips = new Map(
-    (refs?.branches ?? [])
-      .filter((b) => timelineSlugOf(b.name) && (!only || b.name === only))
-      .map((b) => [b.name, b.oid]),
+    [...sources]
+      .filter(
+        ([ref, source]) => (!only || ref === only) && (!sourceId || source.sourceId === sourceId),
+      )
+      .map(([ref, source]) => [ref, source.commit]),
   );
   const byRef = new Map(rows.map((r) => [r.ref, r]));
+  // A migrated timeline may retain its historical canonical overlay separately.
+  // The unqualified timeline view chooses its owned source; source=canonical is explicit history.
+  if (!sourceId)
+    for (const stored of rows) {
+      if (stored.source_id !== "canonical") byRef.set(stored.ref, stored);
+    }
   let stale = false;
   const out = [...new Set([...tips.keys(), ...byRef.keys()])].sort().map((ref) => {
     const head = tips.get(ref) ?? null;
@@ -550,6 +576,7 @@ async function overlaySummaries(
       overlayId: stored?.overlay_id ?? null,
       stored: stats.stored ?? 0,
       summary: {
+        sourceId: sources.get(ref)?.sourceId ?? stored?.source_id ?? "canonical",
         ref: ref.replace(/^refs\/heads\//, ""),
         timeline: timelineSlugOf(ref) ?? ref,
         head,
@@ -633,7 +660,7 @@ knowledge.get("/overlay", async (c) => {
     ...found.summary,
     changes: changes.slice(0, limit),
     truncated: changes.length > limit || totalChanges > found.stored,
-    pageSets: await listSets(c.env.DB, row.id, ref, { limit: 5 }),
+    pageSets: await listSets(c.env.DB, row.id, ref, { limit: 5, sourceId: found.summary.sourceId }),
   };
   return c.json(body);
 });
@@ -646,9 +673,11 @@ knowledge.get("/overlay/pages", async (c) => {
   const ref = overlayRef(c.req.query("ref") ?? "");
   if (!ref) return fail(c, 400, "Pass ref=timeline/<slug>.");
   const key = c.req.query("checkpoint") || undefined;
+  const sourceId =
+    c.req.query("source") ?? (await timelineKnowledgeSource(c.env, row.id, ref))?.source_id;
   const [sets, ended] = await Promise.all([
-    listSets(c.env.DB, row.id, ref, { key }),
-    overlayEnded(c.env.DB, row.id, ref),
+    listSets(c.env.DB, row.id, ref, { key, sourceId }),
+    overlayEnded(c.env.DB, row.id, ref, sourceId),
   ]);
   const body: KnowledgePageSets = {
     ref: ref.replace(/^refs\/heads\//, ""),
@@ -669,16 +698,26 @@ knowledge.post("/overlay/pages", async (c) => {
     return fail(c, 409, "Wiki generation is disabled in this account's AI settings.");
   const ref = overlayRef(c.req.query("ref") ?? "");
   if (!ref) return fail(c, 400, "Pass ref=timeline/<slug>.");
-  if (await overlayEnded(c.env.DB, row.id, ref))
-    return fail(c, 409, "This timeline has ended: its pages are kept read-only.");
   const checkpoint = c.req.query("checkpoint");
   let request: Parameters<typeof requestPages>[1];
+  const source = await timelineKnowledgeSource(c.env, row.id, ref);
+  if (!source) return fail(c, 409, "Timeline source migration required.");
+  if (c.req.query("source") && c.req.query("source") !== source.source_id)
+    return fail(c, 409, "Requested source does not match this active timeline.");
+  if (source.state !== "ready") return fail(c, 409, "Timeline source is read-only or unavailable.");
+  if (await overlayEnded(c.env.DB, row.id, ref, source.source_id))
+    return fail(c, 409, "This timeline has ended: its pages are kept read-only.");
   if (checkpoint) {
     // A checkpoint's set is queued when the checkpoint is made; asking again retries a failed one.
-    const [set] = await listSets(c.env.DB, row.id, ref, { key: checkpoint, limit: 1 });
+    const [set] = await listSets(c.env.DB, row.id, ref, {
+      key: checkpoint,
+      limit: 1,
+      sourceId: source.source_id,
+    });
     if (!set) return fail(c, 404, "No pages were asked for at that checkpoint.");
     request = {
       repoId: row.id,
+      sourceId: source.source_id,
       ref,
       key: set.key,
       commit: set.commit,
@@ -686,18 +725,22 @@ knowledge.post("/overlay/pages", async (c) => {
       requestedBy: c.get("actor")?.id ?? null,
     };
   } else {
+    const physical = await knowledgeRepo(c.env, row.id, source.source_id);
+    if (!physical) return fail(c, 404, "Repository not found.");
     const reader = new RepoReader(
       c.env,
-      row.artifacts_name,
-      row.artifacts_remote,
+      physical.artifacts_name,
+      physical.artifacts_remote,
       c.get("timing"),
       (w) => c.executionCtx.waitUntil(w),
+      source.work_ref,
     );
     const refs = await reader.refs().finally(() => reader.close());
-    const tip = refs.branches.find((b) => b.name === ref)?.oid;
+    const tip = refs.branches.find((b) => b.name === source.work_ref)?.oid;
     if (!tip) return fail(c, 404, "No such timeline bookmark.");
     request = {
       repoId: row.id,
+      sourceId: source.source_id,
       ref,
       key: commitKey(tip),
       commit: tip,
@@ -723,11 +766,13 @@ knowledge.get("/overlay/page", async (c) => {
     ref,
     c.req.query("slug") ?? "",
     c.req.query("set") || undefined,
+    c.req.query("source") ?? (await timelineKnowledgeSource(c.env, row.id, ref))?.source_id,
   );
   if (!found) return fail(c, 404, "This timeline has no such page.");
   const { page, set } = found;
   const { pages: _pages, counts: _counts, ...brief } = set;
   const body: KnowledgeTimelinePage = {
+    sourceId: set.sourceId,
     slug: page.slug,
     title: page.title,
     section: page.section,
@@ -737,6 +782,11 @@ knowledge.get("/overlay/page", async (c) => {
     body: page.body,
     diagram: page.diagram,
     sources: JSON.parse(page.sources) as string[],
+    sourceLocations: JSON.parse(page.source_locations) as {
+      path: string;
+      sourceId: string;
+      commit: string;
+    }[],
     generatedIn: set.commit,
     model: page.model,
     timeline: set.timeline,

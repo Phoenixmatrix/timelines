@@ -1,28 +1,8 @@
-// The landing queue (CORE-77, TIMELINES-RESEARCH.md "Landing"): the Worker's
-// half. A landing (shared/timelines.ts) is kept in the tracker with its
-// timeline; this moves it on, each time something it waits for happens: a CI
-// run ends (ci/workflow.ts), a person approves a checkpoint, a checkpoint is
-// made, someone runs `gm timeline land`, or the hourly sweep looks.
-//
-// For each repository the queue merges the checkpoint into the main commit it
-// pins, in a CI job (ci/landing.ts), onto refs/heads/gitmatrix/landing/<slug>;
-// checks the merge's parents; and runs the repository's own pipeline on it
-// (`trigger == "landing"`). Only once every repository's merge passed does any
-// main move, one repository at a time, with a compare-and-swap from the
-// commit its merge was tested on. A main that moved meanwhile is merged and
-// tested again (the timeline shows `partly_landed` once another repository
-// advanced). A conflict stops the landing and asks for a sync: there is no
-// automatic sync with main. Main never advances to a merge that wasn't tested.
-//
-// When every main advanced, the tracker folds the timeline's view into main
-// and records it landed in one transaction (issues done, retained leases
-// released), and only then are its bookmarks deleted, so knowledge overlays
-// end as landed. Each main's move fires what a push to main fires: the push
-// log and timeline activity, CI on main, the mirror, knowledge, release notes.
-//
-// Every step reads what it needs afresh (the landing's version, CI run rows,
-// refs), saves before acting where it can, and acts idempotently, so a step
-// that runs twice, or a hook that never fired, only costs a later look.
+// Compact timeline landing: prepare exact logical-base/work/canonical trees,
+// gate every repository, then publish with durable per-repository CAS receipts.
+// Source writes are fenced by Tracker admission. Retries reconcile recorded
+// candidates on canonical history before preparing anything again; successful
+// partial results are fixed. Ordinary queue real-merge semantics are separate.
 
 import { lsRefs } from "../artifacts.ts";
 import { runOutcome, startMergeRun } from "../ci/landing.ts";
@@ -34,8 +14,6 @@ import {
   LANDING_ACTIVE,
   landingBranch,
   landingSlugOf,
-  timelineBookmark,
-  timelineSlugOf,
   type CheckpointState,
   type Landing,
   type LandingRepo,
@@ -48,6 +26,18 @@ import { TrackerError, type Access } from "../tracker/store.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { logPush } from "./activity.ts";
 import { writeRefs, type RefWrite, type RefWriteResult } from "./bookmarks.ts";
+import { getWorkSource } from "./sources.ts";
+import {
+  completeReceipts,
+  receiptFor,
+  recordIntent,
+  recordIntegrated,
+  revisionClosure,
+  validateDependencies,
+  validateMergeEdges,
+} from "./integration.ts";
+import { notifyReleaseNotes } from "../release-notes/queue.ts";
+import { landingFixtureBarrier } from "./landing-fixture.ts";
 
 /** Merges tried per repository before a main that keeps moving stops the landing. */
 export const MAX_ATTEMPTS = 5;
@@ -151,16 +141,17 @@ async function repoRows(d1: D1Database, ids: string[]): Promise<Map<string, Push
  */
 export async function greenness(
   d1: D1Database,
-  timeline: Pick<Timeline, "slug">,
+  _timeline: Pick<Timeline, "slug">,
   state: CheckpointState,
 ): Promise<{ ok: boolean; why: string | null }> {
-  const branch = timelineBookmark(timeline.slug);
+  const branch = "work";
   for (const repo of state.checkpoint.repos) {
     const run = await db(d1)
       .selectFrom("ci_runs")
       .select(["number", "status"])
       .where("repo_id", "=", repo.id)
       .where("commit_oid", "=", repo.commit)
+      .where("source_id", "=", repo.source?.sourceId ?? "migration-required")
       .where("ref", "=", branch)
       .orderBy("number", "desc")
       .executeTakeFirst();
@@ -184,6 +175,18 @@ interface Context {
   rows: Map<string, PushedRepo>;
 }
 
+function recordCasOutcome(
+  ctx: Context,
+  operationId: string,
+  state: "accepted" | "rejected" | "ambiguous",
+) {
+  return ctx.env.DB.prepare(
+    "UPDATE source_operations SET state=?,updated_at=datetime('now') WHERE id=? AND state='admitted'",
+  )
+    .bind(state, operationId)
+    .run();
+}
+
 function actorOf(landing: Landing): RunActor {
   const { accountableId, agentId } = landing.requestedBy;
   return { id: accountableId, ...(agentId ? { agent: { id: agentId, name: "" } } : {}) };
@@ -199,7 +202,7 @@ function withRepo(landing: Landing, id: string, change: Partial<LandingRepo>): L
 /** Stop the landing, with why; the repository that stopped it says so too. */
 function stopped(
   landing: Landing,
-  state: "conflict" | "failed",
+  state: "conflict" | "failed" | "blocked_dependency",
   reason: string,
   repoId?: string,
 ): Landing {
@@ -259,14 +262,105 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
   const { deps } = ctx;
   const branch = landingBranch(landing.slug);
   const branchRef = `refs/heads/${branch}`;
-  const bookmarkRef = `refs/heads/${timelineBookmark(landing.slug)}`;
   const row = (repo: LandingRepo) => ctx.rows.get(repo.id);
   const where = (repo: LandingRepo) => `${repo.owner}/${repo.name}`;
 
+  if (await landingFixtureBarrier(ctx.env, landing)) return null;
   for (const repo of landing.repos) {
     const r = row(repo);
     if (!r && repo.state !== "advanced")
       return save(ctx, landing, stopped(landing, "failed", `${where(repo)} is gone.`, repo.id));
+    if (repo.state === "advanced") continue;
+    if (!repo.source || !repo.logicalBase || !repo.dependencies)
+      return save(
+        ctx,
+        landing,
+        stopped(
+          landing,
+          "failed",
+          "migration_required: renew the checkpoint with owned work source metadata",
+          repo.id,
+        ),
+      );
+    if (
+      repo.source.kind !== "timeline-work" ||
+      repo.source.repoId !== repo.id ||
+      repo.source.timelineId !== landing.timelineId ||
+      repo.source.commit !== repo.commit ||
+      repo.logicalBase.repoId !== repo.id ||
+      repo.dependencies.some(
+        (dependency) => dependency.source.repoId !== repo.id || dependency.base.repoId !== repo.id,
+      )
+    )
+      return save(
+        ctx,
+        landing,
+        stopped(
+          landing,
+          "failed",
+          "Checkpoint source identity does not match the admitted repository and timeline",
+          repo.id,
+        ),
+      );
+    const source = await getWorkSource(ctx.env, repo.id, repo.source.sourceId);
+    if (
+      !source ||
+      source.state !== "ready" ||
+      source.timeline_id !== landing.timelineId ||
+      source.work_ref !== repo.source.ref
+    )
+      return save(ctx, landing, stopped(landing, "failed", "Work source is not ready", repo.id));
+    const refs = await deps.refs({
+      ...r!,
+      artifacts_name: source.artifacts_name,
+      artifacts_remote: source.artifacts_remote!,
+    });
+    if (refs.get(repo.source.ref) !== repo.commit)
+      return save(
+        ctx,
+        landing,
+        stopped(
+          landing,
+          "failed",
+          "Approved work source moved; renew checkpoint and approval",
+          repo.id,
+        ),
+      );
+    const main = (await deps.refs(r!)).get(`refs/heads/${r!.default_branch}`);
+    if (!main)
+      return save(
+        ctx,
+        landing,
+        stopped(landing, "failed", "Canonical main is unavailable", repo.id),
+      );
+    try {
+      await validateDependencies(
+        ctx.env,
+        repo,
+        await revisionClosure(main, (oid) => deps.parents(r!, oid)),
+      );
+      using work = await ctx.env.ARTIFACTS.get(source.artifacts_name);
+      for (const snapshot of [
+        repo.source,
+        repo.logicalBase,
+        ...repo.dependencies.map((dependency) => dependency.source),
+      ]) {
+        const commit = await work.readCommit(snapshot.commit);
+        if (!commit || commit.treeHash !== snapshot.tree)
+          throw new Error("blocked_dependency: pinned source tree is unavailable or mismatched");
+      }
+      await validateMergeEdges(
+        repo.commit,
+        repo.logicalBase.commit,
+        repo.dependencies.map((dependency) => dependency.source.commit),
+        async (oid) => (await work.readCommit(oid))?.parents ?? null,
+      );
+    } catch (error) {
+      // A transport failure defers progress without invalidating prepared candidates.
+      if (!(error instanceof Error) || !error.message.startsWith("blocked_dependency:"))
+        throw error;
+      return save(ctx, landing, stopped(landing, "blocked_dependency", String(error), repo.id));
+    }
   }
 
   // Merge: each repository merges the checkpoint into its main as it is now.
@@ -347,7 +441,7 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
           stopped(
             { ...withRepo(landing, repo.id, { mergeRun }) },
             "conflict",
-            `Checkpoint #${landing.checkpointNumber} conflicts with ${where(repo)}'s main (CI run #${run.number} lists the files). Landing needs a sync: merge main into ${timelineBookmark(landing.slug)} (gm merge, or ask an agent to), push, make a new checkpoint, and land that.`,
+            `Checkpoint #${landing.checkpointNumber} conflicts with ${where(repo)}'s main (CI run #${run.number} lists the files). Explicitly sync/rebase the owned work source, resolve conflicts, and renew the checkpoint and approval.`,
             repo.id,
           ),
         );
@@ -364,27 +458,16 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
     }
     const r = row(repo)!;
     const merge = (await deps.refs(r)).get(branchRef) ?? null;
-    // The checkpoint was already in main: there's nothing to merge or move.
-    if (merge && merge === repo.base)
-      return save(
-        ctx,
-        landing,
-        withRepo(landing, repo.id, {
-          mergeRun,
-          merge,
-          state: "advanced",
-          reason: `${r.default_branch} already had this work.`,
-        }),
-      );
+    // No-op candidates still pass all-repository gates before their durable receipt.
     const parents = merge ? await deps.parents(r, merge) : null;
-    if (!merge || parents?.length !== 2 || parents[0] !== repo.base || parents[1] !== repo.commit)
+    if (!merge || (merge !== repo.base && (parents?.length !== 1 || parents[0] !== repo.base)))
       return save(
         ctx,
         landing,
         stopped(
           withRepo(landing, repo.id, { mergeRun }),
           "failed",
-          `The merge job left ${branch} in ${where(repo)} at ${short(merge)}, not a merge of checkpoint #${landing.checkpointNumber} into main's ${short(repo.base)}. Land again to retry.`,
+          `The compact job left ${branch} at ${short(merge)}, not a single-parent candidate on pinned canonical ${short(repo.base)}.`,
           repo.id,
         ),
       );
@@ -475,81 +558,198 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
     if (left.some((repo) => repo.state !== "tested")) return null;
     return save(ctx, landing, { ...landing, state: "advancing", reason: null });
   }
+  if (await landingFixtureBarrier(ctx.env, landing, "prepared")) return null;
 
-  // Advance each main in turn, from the commit its merge was tested on.
-  const repo = left[0];
-  if (repo) {
-    const r = row(repo)!;
-    const mainRef = `refs/heads/${r.default_branch}`;
-    const tips = await deps.refs(r);
-    if (tips.get(bookmarkRef) !== repo.commit)
+  // Reconcile every durable intent before considering any reprepare. Read main
+  // before its receipt, and use that same observation for staleness: another
+  // progress request may publish between reads without saving Tracker yet.
+  let stale: LandingRepo | undefined;
+  for (const pending of left) {
+    const r = row(pending)!;
+    const main = (await deps.refs(r)).get(`refs/heads/${r.default_branch}`);
+    if (!main) throw new Error("Canonical main disappeared while reconciling CAS");
+    const intent = await receiptFor(ctx.env, landing.id, pending.id);
+    if (!intent) {
+      if (main !== pending.base) stale ??= pending;
+      continue;
+    }
+    let integrated = (await revisionClosure(main, (oid) => deps.parents(r, oid))).has(
+      intent.canonical_commit,
+    );
+    const operation = integrated
+      ? null
+      : await ctx.env.DB.prepare("SELECT state FROM source_operations WHERE id=?")
+          .bind(`landing:${landing.id}:${pending.id}`)
+          .first<{ state: string }>();
+    if (
+      !integrated &&
+      operation &&
+      operation.state !== "admitted" &&
+      operation.state !== "rejected"
+    ) {
+      // The terminal acknowledgement can arrive after our first main read.
+      // Re-observe its result before declaring a confirmed publication lost.
+      const acknowledgedMain = (await deps.refs(r)).get(`refs/heads/${r.default_branch}`);
+      if (!acknowledgedMain)
+        throw new Error("Canonical main disappeared after CAS acknowledgement");
+      if (acknowledgedMain !== main)
+        integrated = (await revisionClosure(acknowledgedMain, (oid) => deps.parents(r, oid))).has(
+          intent.canonical_commit,
+        );
+    }
+    if (integrated) {
+      if (await landingFixtureBarrier(ctx.env, landing, "after-cas", pending.id)) return null;
+      await recordIntegrated(ctx.env, landing, pending);
+      deps.mainMoved(r, actorOf(landing));
+      await landingFixtureBarrier(ctx.env, landing, "after-receipt", pending.id);
+      return save(ctx, landing, withRepo(landing, pending.id, { state: "advanced", reason: null }));
+    }
+    if (intent.status !== "intent")
       return save(
         ctx,
         landing,
         stopped(
           landing,
           "failed",
-          `${timelineBookmark(landing.slug)} in ${where(repo)} moved past checkpoint #${landing.checkpointNumber}; make a new checkpoint and land that.`,
-          repo.id,
+          "Recorded integration is absent from rewritten canonical history; refusing replay",
+          pending.id,
         ),
       );
-    let advanced = tips.get(mainRef) === repo.merge;
-    if (!advanced) {
-      const [result] = await deps.writeRefs(r, [{ ref: mainRef, old: repo.base, new: repo.merge }]);
-      advanced = !!result?.ok || (await deps.refs(r)).get(mainRef) === repo.merge;
-      if (advanced) deps.mainMoved(r, actorOf(landing));
+    // An admitted RPC may still be running in another progress request. It is
+    // neither permission to issue another CAS nor evidence of failure.
+    if (operation?.state === "admitted") {
+      const reason =
+        "Awaiting an admitted canonical CAS. If it does not settle, reconcile its outcome before any retry.";
+      return pending.reason === reason
+        ? null
+        : save(ctx, landing, withRepo(landing, pending.id, { reason }));
     }
-    if (advanced) {
-      // The landing branch has done its job.
-      const now = await deps.refs(r);
-      const tip = now.get(branchRef);
-      if (tip) await deps.writeRefs(r, [{ ref: branchRef, old: tip, new: null }]).catch(() => []);
-      return save(ctx, landing, withRepo(landing, repo.id, { state: "advanced", reason: null }));
-    }
-    // Main moved since the merge was tested: merge onto it and test again.
-    const moved = (await deps.refs(r)).get(mainRef) ?? null;
+    // A reported ambiguous outcome, or an acknowledged success missing from
+    // rewritten history, cannot be replayed even after a reset exactly to base.
+    if (operation && operation.state !== "rejected")
+      return save(
+        ctx,
+        landing,
+        stopped(
+          landing,
+          "failed",
+          "Canonical CAS outcome is unknown and requires reconciliation; refusing replay",
+          pending.id,
+        ),
+      );
+    if (main !== pending.base) stale ??= pending;
+  }
+  // Every unadvanced main was checked above. Never advance A while B's
+  // candidate is stale, or discard a candidate with an unresolved CAS.
+  if (stale)
     return save(ctx, landing, {
-      ...withRepo(landing, repo.id, {
+      ...withRepo(landing, stale.id, {
         state: "merging",
         base: null,
         merge: null,
         mergeRun: null,
         gateRun: null,
-        reason: `${r.default_branch} moved to ${short(moved)} before it advanced; merging again.`,
+        reason: `${row(stale)!.default_branch} moved; rematerializing and regating the approved tree.`,
       }),
       state: "merging",
     });
+  const repo = left[0];
+  if (repo) {
+    const r = row(repo)!;
+    using artifacts = await ctx.env.ARTIFACTS.get(r.artifacts_name);
+    const candidate = await artifacts.readCommit(repo.merge!);
+    if (!candidate) throw new Error("Tested candidate is unavailable");
+    await recordIntent(ctx.env, landing, repo, candidate.treeHash);
+    if (!repo.casIntent || repo.casIntent.candidate !== repo.merge)
+      return save(
+        ctx,
+        landing,
+        withRepo(landing, repo.id, {
+          casIntent: { base: repo.base!, candidate: repo.merge!, tree: candidate.treeHash },
+        }),
+      );
+    if (await landingFixtureBarrier(ctx.env, landing, "before-cas", repo.id)) return null;
+    // Durable intent and complete revision membership precede the external CAS.
+    const operationId = `landing:${landing.id}:${repo.id}`;
+    const admitted = await ctx.env.DB.prepare(`INSERT INTO source_operations
+      (id,owner_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
+      SELECT ?,?,?,?,?, 'landing','admitted',?,datetime('now'),datetime('now')
+      WHERE EXISTS(SELECT 1 FROM repos WHERE id=? AND deleted_at IS NULL)
+      ON CONFLICT(id) DO UPDATE SET state='admitted',data=excluded.data,updated_at=excluded.updated_at
+      WHERE source_operations.state='rejected'`)
+      .bind(
+        operationId,
+        ctx.ownerId,
+        landing.timelineId,
+        repo.id,
+        repo.source!.sourceId,
+        JSON.stringify(repo.casIntent),
+        repo.id,
+      )
+      .run();
+    if (!admitted.meta.changes) return null;
+    const live = await ctx.env.DB.prepare("SELECT id FROM repos WHERE id=? AND deleted_at IS NULL")
+      .bind(repo.id)
+      .first();
+    if (!live) {
+      await recordCasOutcome(ctx, operationId, "rejected");
+      throw new Error("Canonical repository was tombstoned before CAS.");
+    }
+    let result: RefWriteResult | undefined;
+    try {
+      [result] = await deps.writeRefs(r, [
+        {
+          ref: `refs/heads/${r.default_branch}`,
+          old: repo.base,
+          new: repo.merge,
+        },
+      ]);
+      if (!result) throw new Error("Canonical CAS returned no outcome; reconciliation required");
+    } catch (error) {
+      await recordCasOutcome(ctx, operationId, "ambiguous");
+      throw error;
+    }
+    if (!result.ok) {
+      const current = (await deps.refs(r)).get(`refs/heads/${r.default_branch}`);
+      if (
+        current &&
+        (await revisionClosure(current, (oid) => deps.parents(r, oid))).has(repo.merge!)
+      ) {
+        await recordCasOutcome(ctx, operationId, "accepted");
+        if (await landingFixtureBarrier(ctx.env, landing, "after-cas", repo.id)) return null;
+        await recordIntegrated(ctx.env, landing, repo);
+        deps.mainMoved(r, actorOf(landing));
+        await landingFixtureBarrier(ctx.env, landing, "after-receipt", repo.id);
+        return save(ctx, landing, withRepo(landing, repo.id, { state: "advanced", reason: null }));
+      }
+      const rejected = await recordCasOutcome(ctx, operationId, "rejected");
+      if (!rejected.meta.changes) return null;
+      await ctx.env.DB.prepare(
+        "DELETE FROM source_integration_receipts WHERE landing_id=? AND repo_id=? AND status='intent'",
+      )
+        .bind(landing.id, repo.id)
+        .run();
+      return save(ctx, landing, withRepo(landing, repo.id, { casIntent: undefined }));
+    }
+    await recordCasOutcome(ctx, operationId, "accepted");
+    if (await landingFixtureBarrier(ctx.env, landing, "after-cas", repo.id)) return null;
+    await recordIntegrated(ctx.env, landing, repo);
+    deps.mainMoved(r, actorOf(landing));
+    await landingFixtureBarrier(ctx.env, landing, "after-receipt", repo.id);
+    return save(ctx, landing, withRepo(landing, repo.id, { state: "advanced", reason: null }));
   }
 
   // Every main advanced: the timeline lands.
+  if (await landingFixtureBarrier(ctx.env, landing, "before-finalize")) return null;
   return complete(ctx, landing);
 }
 
-/** Point the landing branch at the checkpoint, then start the merge job on it. */
-/**
- * Point the landing branch at the checkpoint, then start the merge job on it.
- * Idempotent, so two looks at the same landing (the auto queue after a
- * checkpoint, and `gm timeline land`, say) may both do it: a ref someone
- * else already moved is fine, and starting the saved run id again is a no-op.
- */
+/** Start the trusted materializer without ever staging the source commit canonically. */
 async function startMerge(ctx: Context, landing: Landing, repoId: string, tip: string | null) {
   const repo = landing.repos.find((r) => r.id === repoId)!;
   const r = ctx.rows.get(repoId)!;
   const branch = landingBranch(landing.slug);
-  if (tip !== repo.commit) {
-    const [result] = await ctx.deps.writeRefs(r, [
-      { ref: `refs/heads/${branch}`, old: tip, new: repo.commit },
-    ]);
-    if (!result?.ok) {
-      // Moved meanwhile: by another look at this landing, or by its merge job.
-      const now = (await ctx.deps.refs(r)).get(`refs/heads/${branch}`) ?? null;
-      if (await ctx.deps.runOutcome(repo.mergeRun!.id)) return;
-      if (now !== repo.commit)
-        throw new Error(
-          `Couldn't point ${branch} at the checkpoint: ${result?.reason ?? "refused"}`,
-        );
-    }
-  }
+  if (!repo.source || !repo.logicalBase) throw new Error("migration_required");
   await ctx.deps.startMerge(r, {
     runId: repo.mergeRun!.id,
     landingId: landing.id,
@@ -557,12 +757,50 @@ async function startMerge(ctx: Context, landing: Landing, repoId: string, tip: s
     branch,
     commit: repo.commit,
     base: repo.base!,
+    source: repo.source,
+    logicalBase: repo.logicalBase,
+    old: tip,
     mainBranch: r.default_branch,
-    title: `Land ${landing.slug} (checkpoint #${landing.checkpointNumber}): merge into ${r.default_branch}`,
-    message: `Land timeline ${landing.slug} (checkpoint #${landing.checkpointNumber})\n\nMerges ${timelineBookmark(landing.slug)} at ${repo.commit.slice(0, 12)} into ${r.default_branch}.\n\nTimeline: ${landing.slug}\nCheckpoint: ${landing.checkpointId}`,
+    title: `Land ${landing.slug} (checkpoint #${landing.checkpointNumber}): compact into ${r.default_branch}`,
+    message: `Land timeline ${landing.slug} (checkpoint #${landing.checkpointNumber})\n\nSource: ${repo.source.sourceId}\nCheckpoint: ${landing.checkpointId}`,
     author: { name: "Gitmatrix", email: "landing@gitmatrix.invalid" },
     actor: { id: landing.requestedBy.accountableId, agentId: landing.requestedBy.agentId },
   });
+}
+
+/** Finish the durable cross-store outbox after Tracker commits the timeline end. */
+async function publishCompleted(env: Env, ownerId: string, landing: Landing) {
+  for (const repo of landing.repos) {
+    if (!repo.source) continue;
+    const owned = await getWorkSource(env, repo.id, repo.source.sourceId);
+    if (!owned || owned.state !== "ready") continue;
+    const archived = unwrap(
+      await trackerObject(env, ownerId).transitionWorkSource(
+        owned.source_id,
+        owned.version,
+        "archived",
+      ),
+    );
+    await db(env.DB)
+      .updateTable("timeline_work_sources")
+      .set({
+        state: archived.state,
+        version: archived.version,
+        archived_at: archived.archived_at,
+        updated_at: archived.updated_at,
+      })
+      .where("source_id", "=", archived.source_id)
+      .where("version", "<=", archived.version)
+      .where("state", "not in", ["purging", "purged"])
+      .execute();
+  }
+  await completeReceipts(env, landing.id);
+  for (const repo of landing.repos) await notifyReleaseNotes(env, repo.id);
+  await env.DB.prepare(
+    "UPDATE source_integration_receipts SET completed_at=datetime('now') WHERE landing_id=? AND status='complete' AND completed_at IS NULL",
+  )
+    .bind(landing.id)
+    .run();
 }
 
 /** Record the timeline landed (issues and leases with it), then delete its bookmarks. */
@@ -585,8 +823,8 @@ async function complete(ctx: Context, landing: Landing): Promise<Landing | null>
     throw new TrackerError(reply.status, reply.code, reply.error);
   }
   if (reply.value.state !== "landed") return reply.value;
+  await publishCompleted(ctx.env, ctx.ownerId, landing);
   // Landed is recorded first (CORE-139): overlays then end as landed.
-  const bookmark = `refs/heads/${timelineBookmark(landing.slug)}`;
   const branch = `refs/heads/${landingBranch(landing.slug)}`;
   for (const repo of landing.repos) {
     const r = ctx.rows.get(repo.id);
@@ -594,8 +832,6 @@ async function complete(ctx: Context, landing: Landing): Promise<Landing | null>
     try {
       const tips = await ctx.deps.refs(r);
       const writes: RefWrite[] = [];
-      if (tips.get(bookmark) === repo.commit)
-        writes.push({ ref: bookmark, old: repo.commit, new: null });
       const tip = tips.get(branch);
       if (tip) writes.push({ ref: branch, old: tip, new: null });
       if (writes.length) await ctx.deps.writeRefs(r, writes);
@@ -617,6 +853,10 @@ export async function progress(
   ownerId: string,
   landing: Landing,
 ): Promise<Landing> {
+  if (landing.state === "landed") {
+    await publishCompleted(env, ownerId, landing);
+    return landing;
+  }
   const ctx: Context = {
     env,
     deps,
@@ -727,7 +967,7 @@ export async function afterRun(env: Env, deps: LandingDeps, runId: string): Prom
     const run = await db(env.DB)
       .selectFrom("ci_runs as c")
       .innerJoin("repos as r", "r.id", "c.repo_id")
-      .select(["c.ref", "r.owner_id"])
+      .select(["c.ref", "c.repo_id", "c.source_id", "r.owner_id"])
       .where("c.id", "=", runId)
       .executeTakeFirst();
     if (!run) return;
@@ -737,8 +977,11 @@ export async function afterRun(env: Env, deps: LandingDeps, runId: string): Prom
       if (reply.ok && reply.value) await progress(env, deps, run.owner_id, reply.value);
       return;
     }
-    const slug = timelineSlugOf(`refs/heads/${run.ref}`);
-    if (slug) await maybeLand(env, deps, run.owner_id, slug, "auto");
+    if (run.source_id !== "canonical") {
+      const source = await getWorkSource(env, run.repo_id, run.source_id);
+      if (source?.state === "ready")
+        await maybeLand(env, deps, run.owner_id, source.timeline_slug, "auto");
+    }
   } catch (error) {
     console.error("Landing: after a CI run", { runId, error });
   }
@@ -749,6 +992,20 @@ export async function afterRun(env: Env, deps: LandingDeps, runId: string): Prom
  * day, in case a run's end didn't move them on.
  */
 export async function sweepLandings(env: Env, deps: LandingDeps): Promise<void> {
+  // Receipt completion is a cross-store outbox, not dependent on a recent CI
+  // callback. Include old/partially advanced operations without a time cutoff.
+  const pending = await env.DB.prepare(`SELECT DISTINCT r.landing_id,w.owner_id,w.timeline_slug
+    FROM source_integration_receipts r JOIN timeline_work_sources w ON w.source_id=r.source_id
+    WHERE r.status IN ('intent','integrated') OR (r.status='complete' AND r.completed_at IS NULL)`).all<{
+    landing_id: string;
+    owner_id: string;
+    timeline_slug: string;
+  }>();
+  for (const row of pending.results) {
+    const reply = await trackerObject(env, row.owner_id).landing(row.timeline_slug);
+    if (reply.ok && reply.value?.id === row.landing_id)
+      await progress(env, deps, row.owner_id, reply.value);
+  }
   const since = new Date(Date.now() - 24 * 3600_000).toISOString();
   const runs = await db(env.DB)
     .selectFrom("ci_runs")

@@ -14,8 +14,9 @@ import { CopyField, link } from "../../components/ui.tsx";
 import { coAuthors } from "../../lib/commitAttribution.ts";
 import { firstLine, fullDate, timeAgo } from "../../lib/format.ts";
 import { blobUrl, commitsUrl, treeUrl } from "../../lib/refs.ts";
-import { repoData, routeData } from "../../lib/repoData.ts";
+import { repoData, requestSource, routeData } from "../../lib/repoData.ts";
 import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
+import { ApiError } from "../../lib/api.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { railClass } from "../../components/Rail.tsx";
 import { useViewer } from "../../lib/session.ts";
@@ -28,18 +29,27 @@ export async function codeLoader({ request, params }: LoaderFunctionArgs) {
   const owner = params.owner ?? "";
   const name = params.repo ?? "";
   const at = params["*"] ?? "";
+  const source = await requestSource(owner, name, request);
   // In a timeline's scope (?tl=) the repository opens on the timeline's
   // bookmark when it has one; a path that names a branch keeps it.
   const scope = at ? null : scopeOf(new URL(request.url).search);
   // Otherwise the tree and the repo detail load in parallel; the server splits
   // the branch from the path, so neither waits for the other.
   const [repo, tree] = await Promise.all([
-    routeData(repoData.detail(owner, name)),
+    routeData(repoData.detail(owner, name, source)),
     (scope
-      ? repoData.detail(owner, name).then((detail) => bookmarkIn(detail, scope) ?? "")
+      ? repoData.detail(owner, name, source).then((detail) => {
+          const bookmark = bookmarkIn(detail, scope);
+          if (!bookmark && source)
+            throw new ApiError(
+              410,
+              "This timeline's historical Git ref is unavailable. Open a recorded commit or select main explicitly.",
+            );
+          return bookmark ?? "";
+        })
       : Promise.resolve(at)
     )
-      .then((path) => repoData.tree(owner, name, path))
+      .then((path) => repoData.tree(owner, name, path, source))
       .catch((error: unknown) => error),
   ]);
   if (!repo.head || repo.state !== "ready") return { tree: null, about: null };
@@ -49,8 +59,10 @@ export async function codeLoader({ request, params }: LoaderFunctionArgs) {
   // The About rail is extra: it streams in beside the files and never holds
   // them up. Both reads are cached, so moving between folders reuses them.
   const about = Promise.all([
-    repoData.graphNode(owner, name, "repo").catch(() => null),
-    repoData.ciRuns(owner, name).catch(() => null),
+    source && source !== "canonical"
+      ? Promise.resolve(null)
+      : repoData.graphNode(owner, name, "repo").catch(() => null),
+    repoData.ciRuns(owner, name, source).catch(() => null),
   ]).then(([knowledge, ci]) => ({ knowledge, ci }));
   return { tree: tree as TreeResponse, about };
 }
@@ -92,8 +104,8 @@ function EntryRow({
   const Icon = ICONS[entry.type];
   const to =
     entry.type === "tree"
-      ? treeUrl(repo.owner.slug, repo.name, refName, entry.path)
-      : blobUrl(repo.owner.slug, repo.name, refName, entry.path);
+      ? treeUrl(repo.owner.slug, repo.name, refName, entry.path, repo.source?.sourceId)
+      : blobUrl(repo.owner.slug, repo.name, refName, entry.path, repo.source?.sourceId);
   const label = (
     <>
       <Icon
@@ -104,7 +116,13 @@ function EntryRow({
       <span className="truncate">{entry.name}</span>
     </>
   );
-  const history = commitsUrl(repo.owner.slug, repo.name, refName, entry.path);
+  const history = commitsUrl(
+    repo.owner.slug,
+    repo.name,
+    refName,
+    entry.path,
+    repo.source?.sourceId,
+  );
   const subject = change ? firstLine(change.latest.message) : "";
   return (
     <li
@@ -125,7 +143,7 @@ function EntryRow({
       <span className="min-w-0 truncate text-body-sm max-sm:hidden">
         {change ? (
           <Link
-            to={treeUrl(repo.owner.slug, repo.name, change.latest.oid)}
+            to={treeUrl(repo.owner.slug, repo.name, change.latest.oid, "", repo.source?.sourceId)}
             className="text-ink-muted no-underline hover:text-ink hover:underline"
             title={`${subject} · ${change.latest.authorName}`}
           >
@@ -221,7 +239,13 @@ function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
         </button>
         <Link
           className="mk-btn mk-btn--sm no-underline"
-          to={commitsUrl(repo.owner.slug, repo.name, tree.commit.oid, tree.path)}
+          to={commitsUrl(
+            repo.owner.slug,
+            repo.name,
+            tree.commit.oid,
+            tree.path,
+            repo.source?.sourceId,
+          )}
         >
           {history ? countLabel(history.commits.length, !!history.next) : "History"}
         </Link>
@@ -235,6 +259,7 @@ function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
                 repo.name,
                 tree.ref,
                 tree.path.split("/").slice(0, -1).join("/"),
+                repo.source?.sourceId,
               )}
               className="flex min-h-10 items-center gap-3 px-4 text-ink-muted no-underline hover:bg-raised max-sm:min-h-11"
               aria-label="Parent folder"
@@ -317,11 +342,13 @@ export function Code() {
           path={tree.path}
           view="tree"
           commit={tree.commit.oid}
-          onSwitch={(ref) => navigate(treeUrl(repo.owner.slug, repo.name, ref, tree.path))}
+          onSwitch={(ref) =>
+            navigate(treeUrl(repo.owner.slug, repo.name, ref, tree.path, repo.source?.sourceId))
+          }
         />
 
         <FileList
-          key={`${repo.id}:${tree.ref}:${tree.commit.oid}:${tree.path}`}
+          key={`${repo.id}:${repo.source?.sourceId}:${tree.ref}:${tree.commit.oid}:${tree.path}`}
           repo={repo}
           tree={tree}
         />

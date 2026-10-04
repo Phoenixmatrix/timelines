@@ -34,7 +34,7 @@ import {
   type AtlasWorkspace,
 } from "../../lib/atlas.ts";
 import { fullDate, timeAgo } from "../../lib/format.ts";
-import { blobUrl, commitsUrl, repoPath } from "../../lib/refs.ts";
+import { blobUrl, commitsUrl, repoPath, sourceUrl } from "../../lib/refs.ts";
 import { withScope } from "../../lib/timelineScope.ts";
 import {
   coverageText,
@@ -414,26 +414,36 @@ export function AtlasTimeline({
           </section>
 
           {parts.map((p) => {
-            const at = p.ended ? (p.commit ?? ref) : ref;
+            const at = p.ended ? p.commit : (p.head ?? p.commit);
+            const sourceId = p.sourceId;
             return (
               <div key={p.repoId} className="flex flex-col gap-1">
                 <p className="m-0 flex flex-wrap gap-x-3 gap-y-1 text-body-sm">
                   {many && <span className="font-semibold text-ink">{p.name}</span>}
-                  <Link
-                    to={withScope(
-                      `${repoPath(p.owner, p.name, "changes")}?ref=${encodeURIComponent(at)}`,
-                      timeline,
-                    )}
-                    className="text-ink underline"
-                  >
-                    Syntax changes on this timeline
-                  </Link>
-                  <Link
-                    to={withScope(commitsUrl(p.owner, p.name, at), timeline)}
-                    className="text-ink underline"
-                  >
-                    Its commits
-                  </Link>
+                  {at && sourceId ? (
+                    <>
+                      <Link
+                        to={withScope(
+                          sourceUrl(
+                            `${repoPath(p.owner, p.name, "changes")}?ref=${encodeURIComponent(at)}`,
+                            sourceId,
+                          ),
+                          timeline,
+                        )}
+                        className="text-ink underline"
+                      >
+                        Syntax changes on this timeline
+                      </Link>
+                      <Link
+                        to={withScope(commitsUrl(p.owner, p.name, at, "", sourceId), timeline)}
+                        className="text-ink underline"
+                      >
+                        Its commits
+                      </Link>
+                    </>
+                  ) : (
+                    <span className="text-ink-muted">Timeline source unavailable.</span>
+                  )}
                 </p>
                 <ul className="m-0 flex list-none flex-col gap-0.5 p-0 text-micro text-ink-faint">
                   <li>{coverageText(p)}</li>
@@ -670,7 +680,10 @@ function RegionItem({
             <Link
               key={`t:${page.slug}`}
               to={withScope(
-                `${repoPath(repo.owner, repo.name, "wiki", page.slug)}?set=${encodeURIComponent(page.set)}`,
+                sourceUrl(
+                  `${repoPath(repo.owner, repo.name, "wiki", page.slug)}?set=${encodeURIComponent(page.set)}`,
+                  part.sourceId,
+                ),
                 timeline,
               )}
               className="text-ink underline"
@@ -707,9 +720,9 @@ function FileItem({
   timeline: string;
 }) {
   const repo = { owner: part.owner, name: part.name };
-  // An ended timeline's bookmark is gone: its kept commit is the evidence.
-  const at = part.commit;
-  const scoped = (href: string) => withScope(href, timeline);
+  // Keep evidence pinned to its source; never substitute canonical for a missing source.
+  const at = part.sourceId ? part.commit : null;
+  const scoped = (href: string) => withScope(sourceUrl(href, part.sourceId!), timeline);
   return (
     <li className="flex flex-col gap-0.5 border-b border-line-soft pb-2 last:border-b-0">
       <span className="flex flex-wrap items-baseline gap-x-2">
@@ -743,7 +756,10 @@ function FileItem({
         )}
         {file.change !== "added" && part.baseCommit && (
           <Link
-            to={withScope(blobUrl(repo.owner, repo.name, part.baseCommit, file.path), null)}
+            to={sourceUrl(
+              withScope(blobUrl(repo.owner, repo.name, part.baseCommit, file.path), null),
+              "canonical",
+            )}
             className="text-ink underline"
           >
             Main's, at {short(part.baseCommit)}

@@ -6,7 +6,7 @@ import type { CiCommitStatuses, RepoDetail } from "../../../shared/api.ts";
 import { CiStatusIcon, isActive } from "../../components/CiStatus.tsx";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { api } from "../../lib/api.ts";
-import { repoPath } from "../../lib/refs.ts";
+import { repoPath, sourceUrl } from "../../lib/refs.ts";
 
 type Run = CiCommitStatuses[string];
 
@@ -21,19 +21,24 @@ export function refCommit(repo: RepoDetail, refName: string): string | null {
 }
 
 /** The latest run for one commit; checked again while it's still going. */
-export function useCommitRun(owner: string, name: string, oid: string | null): Run | null {
-  const [run, setRun] = useState<{ oid: string; run: Run | null } | null>(null);
+export function useCommitRun(
+  owner: string,
+  name: string,
+  oid: string | null,
+  sourceId?: string,
+): Run | null {
+  const [run, setRun] = useState<{ oid: string; sourceId?: string; run: Run | null } | null>(null);
   const active = run?.run ? isActive(run.run.status) : false;
   useEffect(() => {
     if (!oid) return;
     let current = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const load = () => {
-      api<CiCommitStatuses>(`/repos/${owner}/${name}/ci/status?commits=${oid}`)
-        .then((statuses) => current && setRun({ oid, run: statuses[oid] ?? null }))
+      api<CiCommitStatuses>(sourceUrl(`/repos/${owner}/${name}/ci/status?commits=${oid}`, sourceId))
+        .then((statuses) => current && setRun({ oid, sourceId, run: statuses[oid] ?? null }))
         .catch(() => {});
     };
-    if (run?.oid !== oid) load();
+    if (run?.oid !== oid || run?.sourceId !== sourceId) load();
     else if (active) {
       timer = setTimeout(function poll() {
         if (document.visibilityState === "visible") load();
@@ -44,8 +49,8 @@ export function useCommitRun(owner: string, name: string, oid: string | null): R
       current = false;
       clearTimeout(timer);
     };
-  }, [owner, name, oid, run, active]);
-  return run?.oid === oid ? run.run : null;
+  }, [owner, name, oid, sourceId, run, active]);
+  return run?.oid === oid && run.sourceId === sourceId ? run.run : null;
 }
 
 const SUMMARY: Record<Run["status"], string> = {
@@ -66,7 +71,7 @@ export function CommitCi({
   refName: string;
   oid: string | null;
 }) {
-  const run = useCommitRun(repo.owner.slug, repo.name, oid);
+  const run = useCommitRun(repo.owner.slug, repo.name, oid, repo.source?.sourceId);
   if (!run) return null;
   const summary = run.coveredBy ? `Covered by #${run.coveredBy}` : SUMMARY[run.status];
   const target = run.coveredBy ?? run.number;

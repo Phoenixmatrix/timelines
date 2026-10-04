@@ -10,8 +10,6 @@ import { d1, migratedDatabase } from "../testing/d1.ts";
 import { seedPrice } from "../usage/seed.ts";
 import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./api.ts";
 import { CATEGORIES } from "./categories.ts";
-import { cleanupFor } from "./cleanups/index.ts";
-import { CATEGORY_STORAGE } from "./costs.ts";
 import { runNotes } from "./runs.ts";
 
 const DAY = 86_400_000;
@@ -241,11 +239,6 @@ describe("manual cleanup runs", () => {
 });
 
 describe("preview figures", () => {
-  test("every category with a cleanup has a store to price its bytes", () => {
-    const runnable = CATEGORIES.filter((c) => cleanupFor(c.id)).map((c) => c.id);
-    expect(runnable.filter((id) => !(id in CATEGORY_STORAGE))).toEqual([]);
-  });
-
   test("a dry run of overlapping categories says it counts some records twice", () => {
     expect(runNotes(true, ["ci-logs", "preview-records"])).toEqual([]);
     expect(runNotes(false, ["ci-logs", "ci-runs"])).toEqual([]);

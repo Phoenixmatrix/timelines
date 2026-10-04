@@ -107,6 +107,40 @@ describe("step context", () => {
     ).toBe(false);
   });
 
+  test("retained exact source membership verifies overwritten versions without change-ref endpoints", async () => {
+    const s = setup();
+    const original = step(2);
+    expect(((await (await s.upload(original)).json()) as Step).verified).toBe(false);
+    s.sqlite
+      .prepare(
+        "INSERT INTO source_progress_members(repo_id,source_id,commit_oid,operation_id,created_at) VALUES(?,?,?,?,?)",
+      )
+      .run("repo", "work_retained", original.commitOid, "accepted-push", "2026-10-04T00:00:00Z");
+    const verified = await s.upload({ ...original, why: "Retained original revision" });
+    expect((await verified.json()) as Step).toMatchObject({
+      verified: true,
+      context: { why: "Retained original revision" },
+    });
+    const rewritten = await s.upload({ ...original, commitOid: oid(99), why: "New revision" });
+    expect((await rewritten.json()) as Step).toMatchObject({ verified: false, commitOid: oid(99) });
+    s.as(ben);
+    expect((await s.upload({ ...original, why: "Foreign overwrite" })).status).toBe(409);
+    s.as(ann);
+    expect(
+      (await s.call(`/${original.changeId}/${original.commitOid}`, { method: "DELETE" })).status,
+    ).toBe(204);
+    s.as(annsAgent);
+    expect((await s.upload(original)).status).toBe(410);
+    const versions = (await (await s.call(`/${original.changeId}`)).json()) as StepVersions;
+    expect(
+      versions.versions.find((version) => version.commitOid === original.commitOid),
+    ).toMatchObject({ verified: true, deleted: true, context: { why: "" } });
+    expect(versions.versions.find((version) => version.commitOid === oid(99))).toMatchObject({
+      deleted: false,
+      context: { why: "New revision" },
+    });
+  });
+
   test("retries replace the author's own record; nobody else can overwrite it", async () => {
     const s = setup();
     await s.upload(step(1));

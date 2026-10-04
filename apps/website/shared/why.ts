@@ -2,13 +2,14 @@
 // 'why'"): one chain that agents and people both walk. From a line, through
 // blame, to a commit and its change id; then the timelines the change passed
 // through (the push log and merges), its issues, the checkpoints that pinned
-// it, their approvals, and its landing. Every step after blame goes through
-// the change id, so the chain survives rebases: a rewritten commit is a new
-// commit with the same change.
+// it, their approvals, and its landing. Historical change ids join rewritten
+// context; compact source admission and checkpoints use exact source/OID
+// membership, never equality of change ids.
 //
 // GET /api/repos/:owner/:name/why serves it to the web app and to `gm why`.
 
-import type { RefUpdate } from "./api.ts";
+import type { RefUpdate, SourceLineage } from "./api.ts";
+import type { CodeSource } from "./code-source.ts";
 import type {
   ApprovalOutcome,
   Landing,
@@ -152,13 +153,13 @@ export interface WhyLanding {
   /** The change's commit when it first reached the default branch. */
   commit: string;
   at: string;
-  update: RefUpdate;
+  update: RefUpdate | null;
   /**
    * `queue`: the landing queue recorded this repository advancing to this exact merge.
    * `push`: a ref update without matching queue provenance; not necessarily a direct push.
    * `unknown`: the caller can't read the tracker that records landings.
    */
-  via: "queue" | "push" | "unknown";
+  via: "compact" | "queue" | "push" | "unknown";
   /** Only set by an authoritative queue landing, never inferred from a nearby push. */
   timeline: string | null;
   queue:
@@ -185,6 +186,8 @@ export const NO_DISCUSSIONS: WhyDiscussions = {
 
 /** The chain for one commit that blame named. */
 export interface WhyChain {
+  source?: CodeSource;
+  lineage?: SourceLineage;
   /** Null when the server doesn't have the commit (gm blamed one that isn't pushed). */
   commit: WhyCommit | null;
   /** The commit gm or blame named; equals `commit.oid` when the server has it. */
@@ -207,6 +210,7 @@ export interface WhyChain {
 }
 
 export interface WhyResponse {
+  source?: CodeSource;
   repo: { owner: string; name: string; defaultBranch: string };
   /**
    * The tracker of the repository's owner, which holds its timelines,

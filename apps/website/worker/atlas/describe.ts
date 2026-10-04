@@ -460,7 +460,7 @@ async function prepare(env: Env, ctx: DescribeContext): Promise<Prepared[]> {
       membership,
       input,
       inputsHash: await sha256(
-        `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:${ctx.repoId}:${JSON.stringify(input)}`,
+        `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:${ctx.repoId}:canonical:${JSON.stringify(input)}`,
       ),
     });
   }
@@ -479,6 +479,7 @@ function exportedSymbols(card: FileAnalysis | null) {
 function sourceRef(ctx: DescribeContext, file: MemberFile): AtlasSourceRef {
   return {
     repoId: ctx.repoId,
+    sourceId: "canonical",
     commit: ctx.commit,
     path: file.path,
     blob: file.blob,
@@ -572,7 +573,12 @@ function accept(
       version: DESCRIBE_VERSION,
       model,
       inputsHash: p.inputsHash,
-      basis: { repoId: ctx.repoId, commit: ctx.commit, buildId: ctx.buildId },
+      basis: {
+        repoId: ctx.repoId,
+        sourceId: "canonical",
+        commit: ctx.commit,
+        buildId: ctx.buildId,
+      },
       inferredAt: now.toISOString(),
       derivedFrom: derivations(p),
       sources,
@@ -628,6 +634,7 @@ export async function describeRepoCapabilities(
        WHERE json_extract(data, '$.inference.producer') = 'atlas/describe'
          AND json_extract(data, '$.inference.version') = ?
          AND json_extract(data, '$.inference.basis.repoId') = ?
+         AND coalesce(json_extract(data, '$.inference.basis.sourceId'), 'canonical') = 'canonical'
        ORDER BY model`,
     )
       .bind(DESCRIBE_VERSION, ctx.repoId)
@@ -757,6 +764,16 @@ export async function describeRepoCapabilities(
         stats.unavailable++;
       }
       stats.reasons[outcome.reason] = (stats.reasons[outcome.reason] ?? 0) + 1;
+    }
+    if (inferred) {
+      inferred = {
+        ...inferred,
+        basis: { ...inferred.basis, sourceId: inferred.basis.sourceId ?? "canonical" },
+        sources: inferred.sources.map((source) => ({
+          ...source,
+          sourceId: source.sourceId ?? "canonical",
+        })),
+      };
     }
     const current = description.status === "current";
     const provenance: AtlasProvenance = { structural, inferred, curated: [] };

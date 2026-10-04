@@ -22,12 +22,13 @@ const MAX_PACK_BYTES = 32 * 1024 * 1024;
 /** Updates per push whose commits are read; any more are logged without them. */
 const MAX_READS = 10;
 /** change_refs rows per statement, under D1's 100 bound parameters. */
-const ROWS_PER_INSERT = 16;
+const ROWS_PER_INSERT = 14;
 
 const decoder = new TextDecoder();
 
 export interface PushRepo {
   id: string;
+  source_id?: string;
   artifacts_name: string;
   artifacts_remote: string;
 }
@@ -66,8 +67,13 @@ export async function recordPush(
   for (const ref of await lsRefs(env, repo.artifacts_name, repo.artifacts_remote)) {
     if (ref.oid && isLogged(ref.name)) tips.set(ref.name, ref.oid);
   }
-  return recordRefs(env.DB, repo.id, tips, actor, (want, haves) =>
-    fetchNewCommits(env, repo, want, haves),
+  return recordRefs(
+    env.DB,
+    repo.id,
+    tips,
+    actor,
+    (want, haves) => fetchNewCommits(env, repo, want, haves),
+    repo.source_id ?? "canonical",
   );
 }
 
@@ -83,6 +89,7 @@ export async function recordRefs(
   tips: Map<string, string>,
   actor: Pick<Actor, "id" | "agent"> | null,
   read: CommitReader,
+  sourceId = "canonical",
 ): Promise<LoggedUpdate[]> {
   const kdb = db(d1);
   const known = new Map(
@@ -91,6 +98,7 @@ export async function recordRefs(
         .selectFrom("repo_refs")
         .select(["ref", "oid"])
         .where("repo_id", "=", repoId)
+        .where("source_id", "=", sourceId)
         .execute()
     ).map((r) => [r.ref, r.oid]),
   );
@@ -109,15 +117,26 @@ export async function recordRefs(
       .selectFrom("repo_refs")
       .select("oid")
       .where("repo_id", "=", repoId)
+      .where("source_id", "=", sourceId)
       .where("ref", "=", change.ref);
     const log = kdb
       .insertInto("ref_updates")
-      .columns(["repo_id", "ref", "old_oid", "new_oid", "forced", "actor_id", "agent_id"])
+      .columns([
+        "repo_id",
+        "source_id",
+        "ref",
+        "old_oid",
+        "new_oid",
+        "forced",
+        "actor_id",
+        "agent_id",
+      ])
       .expression((eb) =>
         eb
           .selectFrom("repos")
           .select([
             eb.val(repoId).as("repo_id"),
+            eb.val(sourceId).as("source_id"),
             eb.val(change.ref).as("ref"),
             eb.val(change.old).as("old_oid"),
             eb.val(change.new).as("new_oid"),
@@ -138,18 +157,20 @@ export async function recordRefs(
       change.old === null
         ? kdb
             .insertInto("repo_refs")
-            .values({ repo_id: repoId, ref: change.ref, oid: change.new! })
+            .values({ repo_id: repoId, source_id: sourceId, ref: change.ref, oid: change.new! })
             .onConflict((oc) => oc.doNothing())
         : change.new === null
           ? kdb
               .deleteFrom("repo_refs")
               .where("repo_id", "=", repoId)
+              .where("source_id", "=", sourceId)
               .where("ref", "=", change.ref)
               .where("oid", "=", change.old)
           : kdb
               .updateTable("repo_refs")
               .set({ oid: change.new })
               .where("repo_id", "=", repoId)
+              .where("source_id", "=", sourceId)
               .where("ref", "=", change.ref)
               .where("oid", "=", change.old);
     return [log, move];
@@ -195,6 +216,7 @@ export async function recordRefs(
     }
     const rows = [...reached].map(([changeId, oid]) => ({
       repo_id: repoId,
+      source_id: sourceId,
       change_id: changeId,
       ref: update.ref,
       first_commit_oid: oid,
@@ -219,7 +241,7 @@ export async function recordRefs(
           .insertInto("change_refs")
           .values(rows.slice(start, start + ROWS_PER_INSERT))
           .onConflict((oc) =>
-            oc.columns(["repo_id", "change_id", "ref"]).doUpdateSet((eb) => ({
+            oc.columns(["repo_id", "source_id", "change_id", "ref"]).doUpdateSet((eb) => ({
               last_commit_oid: eb.ref("excluded.last_commit_oid"),
               last_seen_at: nowIso(),
             })),

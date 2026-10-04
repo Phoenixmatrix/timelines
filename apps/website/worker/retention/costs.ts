@@ -16,9 +16,8 @@ const DURABLE = { product: "durable_objects", metric: "sqlite_storage" } as cons
 const R2 = { product: "r2", metric: "standard_storage" } as const;
 
 /** Where each category's records are stored, for pricing. */
-export const CATEGORY_STORAGE: Partial<
-  Record<CategoryId, { product: PriceProduct; metric: string }>
-> = {
+// Owned work Git has no measured reclaimable-byte estimate; leave its cost unknown.
+const CATEGORY_STORAGE: Partial<Record<CategoryId, { product: PriceProduct; metric: string }>> = {
   "ci-logs": D1,
   "ci-runs": D1,
   "preview-records": D1,

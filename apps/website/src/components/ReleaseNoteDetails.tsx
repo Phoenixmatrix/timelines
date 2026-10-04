@@ -121,7 +121,10 @@ export function ReleaseNoteDetails({
                       {entry.commits.map((oid) => (
                         <li key={oid} className="mk-mono text-body-sm">
                           {repo ? (
-                            <Link className={link} to={commitsUrl(repo.owner, repo.name, oid)}>
+                            <Link
+                              className={link}
+                              to={commitsUrl(repo.owner, repo.name, oid, "", "canonical")}
+                            >
                               {oid}
                             </Link>
                           ) : (
@@ -139,7 +142,13 @@ export function ReleaseNoteDetails({
                   {repo ? (
                     <Link
                       className={`${link} mk-mono text-body-sm`}
-                      to={commitsUrl(repo.owner, repo.name, entry.timeline.landing)}
+                      to={commitsUrl(
+                        repo.owner,
+                        repo.name,
+                        entry.timeline.landing,
+                        "",
+                        "canonical",
+                      )}
                     >
                       {timelineLabel(entry.timeline)}
                     </Link>
@@ -150,6 +159,28 @@ export function ReleaseNoteDetails({
                   )}
                 </section>
               )}
+              {entry.provenance?.map((provenance) => (
+                <section key={provenance.receiptId} className="mt-4">
+                  <h4 className="mt-0 mb-2 text-body-sm font-semibold">Source receipt</h4>
+                  <p className="m-0 text-body-sm break-all text-ink-muted">
+                    <code className="mk-mono">{provenance.receiptId}</code>
+                  </p>
+                  {repo && (
+                    <Link
+                      className={`${link} text-body-sm`}
+                      to={commitsUrl(
+                        repo.owner,
+                        repo.name,
+                        provenance.source.commit,
+                        "",
+                        provenance.source.sourceId,
+                      )}
+                    >
+                      Approved progress history ({provenance.commits.length} commits)
+                    </Link>
+                  )}
+                </section>
+              ))}
             </div>
           )}
         </Dialog.Popup>

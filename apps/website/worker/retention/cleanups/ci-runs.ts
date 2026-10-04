@@ -31,11 +31,12 @@ const MATCHES = `r.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)
   AND r.status NOT IN ('queued', 'running')
   AND coalesce(r.finished_at, r.created_at) < ?
   AND (SELECT n.number FROM ci_runs n
-       WHERE n.repo_id = r.repo_id AND n.ref = r.ref AND n.number > r.number
+       WHERE n.repo_id = r.repo_id AND n.source_id = r.source_id AND n.ref = r.ref AND n.number > r.number
        ORDER BY n.number LIMIT 1 OFFSET ?) IS NOT NULL
   AND r.landing_id IS NULL
   AND NOT EXISTS (SELECT 1 FROM ci_jobs j
-                  WHERE j.run_id = r.id AND j.status IN ('pending', 'queued', 'running'))
+                  WHERE j.run_id = r.id
+                    AND (j.status IN ('pending', 'queued', 'running') OR j.source_completion_pending = 1))
   AND NOT EXISTS (SELECT 1 FROM deployments d WHERE d.run_id = r.id)
   AND NOT EXISTS (SELECT 1 FROM deployments d WHERE d.teardown_run_id = r.id)`;
 
@@ -105,11 +106,19 @@ export const ciRuns: CategoryCleanup<Item> = {
     const ids = JSON.stringify(items.map((i) => i.id).filter((id) => !kept.has(id)));
     // One transaction: measure the runs that still match, then delete them
     // (jobs, steps and logs cascade).
-    const [sizes, deleted] = await ctx.env.DB.batch<{ id: string; rows: number; bytes: number }>([
+    const [sizes, , deleted] = await ctx.env.DB.batch<{ id: string; rows: number; bytes: number }>([
       ctx.env.DB.prepare(
         `SELECT r.id, ${SIZE} FROM ci_runs r
          WHERE r.id IN (SELECT value FROM json_each(?)) AND ${MATCHES}`,
       ).bind(ids, account, cutoff, offset),
+      ctx.env.DB.prepare(`DELETE FROM timeline_source_roots WHERE consumer_kind = 'ci'
+        AND consumer_id IN (SELECT r.id FROM ci_runs r
+          WHERE r.id IN (SELECT value FROM json_each(?)) AND ${MATCHES})`).bind(
+        ids,
+        account,
+        cutoff,
+        offset,
+      ),
       ctx.env.DB.prepare(
         `DELETE FROM ci_runs AS r
          WHERE r.id IN (SELECT value FROM json_each(?)) AND ${MATCHES}

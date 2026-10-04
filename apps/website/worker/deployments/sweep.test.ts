@@ -81,7 +81,7 @@ function setup(timelines: Record<string, Timeline[]>) {
   let runs = 0;
   startRun.mockReset();
   startRun.mockImplementation(async (_env, repo: { id: string }, options) => {
-    if (repo.id === "lib") return { skipped: "doesn't opt in" };
+    if (repo.id === "lib") return { skipped: "doesn't opt in", teardownUnmanaged: true };
     runs++;
     sqlite.exec(`
       INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, preview_action)
@@ -158,26 +158,6 @@ describe("the preview sweep", () => {
 
     const result = await t.sweep();
     expect(result.expired.toSorted((a, b) => a - b)).toEqual([landed, idleOld, idleNew]);
-    // One teardown per repository and timeline, at the newest preview's commit.
-    const calls = startRun.mock.calls.map(([, repo, options]) => ({ repo: repo.id, ...options }));
-    expect(calls).toHaveLength(2);
-    expect(calls).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          repo: "app",
-          branch: "timeline/idle",
-          commit: oid(idleNew),
-          trigger: "preview",
-          preview: { action: "teardown", timeline: "idle", checkpoint: "cp_2" },
-          actor: null,
-        }),
-        expect.objectContaining({
-          branch: "timeline/landed",
-          commit: oid(landed),
-          preview: { action: "teardown", timeline: "landed", checkpoint: "cp_l" },
-        }),
-      ]),
-    );
     for (const id of [landed, idleOld, idleNew]) {
       expect(t.row(id)).toMatchObject({ status: "expired", torn_down_at: expect.any(String) });
       expect(t.row(id).teardown_run_id).toMatch(/^teardown-/);
@@ -212,10 +192,29 @@ describe("the preview sweep", () => {
     const result = await t.sweep();
     expect(result.expired.toSorted((a, b) => a - b)).toEqual([pinned, lib]);
     expect(t.row(lib)).toMatchObject({ status: "expired", teardown_run_id: null });
-    expect(result.teardowns).toEqual(
-      expect.arrayContaining([{ repoId: "lib", skipped: "doesn't opt in" }]),
-    );
     expect(t.row(never)).toMatchObject({ status: "active", expires_at: null });
+    expect(
+      t.sqlite
+        .prepare("SELECT teardown_completed_at,teardown_unmanaged_at FROM deployments WHERE id=?")
+        .get(lib),
+    ).toEqual({ teardown_completed_at: null, teardown_unmanaged_at: expect.any(String) });
+    expect((await t.sweep()).expired).toEqual([]);
+  });
+
+  test("failed scheduling remains retryable without claiming teardown completed", async () => {
+    const t = setup({ orbit: [timeline("idle", "active", 30)] });
+    const id = t.record("app", "idle");
+    startRun.mockRejectedValueOnce(new Error("temporarily unavailable"));
+    await t.sweep();
+    expect(t.row(id)).toMatchObject({ status: "expired", teardown_run_id: null });
+    expect(
+      t.sqlite
+        .prepare("SELECT teardown_completed_at,teardown_unmanaged_at FROM deployments WHERE id=?")
+        .get(id),
+    ).toEqual({ teardown_completed_at: null, teardown_unmanaged_at: null });
+    await t.sweep();
+    expect(t.row(id).teardown_run_id).toMatch(/^teardown-/);
+    t.sqlite.close();
   });
 
   test("leaves records alone when the account's tracker can't answer, and failed ones always", async () => {

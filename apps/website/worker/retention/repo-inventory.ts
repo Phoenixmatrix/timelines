@@ -49,6 +49,13 @@ export const REPO_TABLES = [
   "repo_mirrors",
   "repo_refs",
   "step_contexts",
+  "source_operations",
+  "source_progress_members",
+  "source_integration_receipts",
+  "source_integration_inputs",
+  "source_integration_members",
+  "timeline_work_sources",
+  "timeline_source_roots",
   "tracker_repo_subscriptions",
   "wiki_pages",
 ];

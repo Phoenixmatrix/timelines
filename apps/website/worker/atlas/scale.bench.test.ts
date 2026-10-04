@@ -240,7 +240,7 @@ async function buildWorld(log: (line: string) => void) {
     ...workspaceNames.map((n) => [`r_${n}`, n]),
   ] as const) {
     insert.run(id, name, `scale-${id}`, `https://${id}`);
-    git.add(`https://${id}`, { "refs/heads/main": "0".repeat(39) + "1" });
+    git.add(`https://${id}`, { "refs/heads/main": "0".repeat(39) + "1" }, undefined, `scale-${id}`);
     sqlite
       .prepare(`INSERT INTO kg_state (repo_id, indexed_commit) VALUES (?, ?)`)
       .run(id, "0".repeat(39) + "1");

@@ -42,6 +42,22 @@ export const TABLE_GROUPS: TableGroup[] = [
     },
   },
   {
+    id: "tracker-activity",
+    database: "db",
+    scope: "account",
+    label: "Timeline work sources and integration evidence",
+    tables: {
+      timeline_work_sources: REPO,
+      source_operations: REPO,
+      source_progress_members: REPO,
+      source_integration_receipts: REPO,
+      source_integration_members: REPO,
+      source_integration_inputs: REPO,
+      timeline_source_roots: REPO,
+      timeline_source_migrations: "owner_id = ?1",
+    },
+  },
+  {
     id: "push-log",
     database: "db",
     scope: "account",

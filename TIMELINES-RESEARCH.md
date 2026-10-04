@@ -2,7 +2,7 @@
 
 Date: 2026-10-02.
 
-Status: built and shipped (2026-10-03). This began as research and owner
+Historical status: built and shipped (2026-10-03). This began as research and owner
 decisions for CORE-50; the owner answered the open questions in two interviews
 on 2026-10-02, the second for CORE-62, and later rows under
 [Decisions](#decisions) came while building. The work was filed as CORE-62 to
@@ -13,6 +13,40 @@ reference, and knowledge and `gm why` read them. What is left is listed under
 [A path to build it](#a-path-to-build-it) as later work and follow-ups.
 CORE-42 (timeline visualization in the tracker) and CORE-51 (discussions) were
 blocked on CORE-50.
+
+**Storage/landing superseded by CORE-255 (2026-10-04).** The dated research,
+interviews and CORE-50/77 decisions below describe the original canonical-branch
+implementation, not the current storage contract. Current timelines own one
+Artifacts repository per `(timeline, canonical repository)` with opaque
+`work_<id>` identity and physical `refs/heads/work`; `timeline/<slug>` remains a
+logical overlay/environment label and a legacy migration ref.
+Canonical permissions/tombstones govern source-qualified Git/API reads and writes.
+The account Tracker reserves pinned fork snapshots and durable operation intents;
+missing/migrating sources fail closed, not back to old canonical branches.
+
+Current landing materializes B→T (explicit logical-base tree to approved work
+tree) onto pinned canonical O. The result is a gated single-parent commit, or a
+no-op receipt: no WIP commits are uploaded to canonical. Every repository is
+prepared/gated before any main CAS; movement requires re-preparation/re-gating.
+There is no distributed transaction, and partial retry/cancel preserves successful
+receipts. Full WIP history and exact ancestry remain in owned sources, with
+integration provenance for steps, why, release notes and late local sync; matching
+change IDs alone never prove integration. Nested work needs exact admitted
+ancestry and an unambiguous integrated dependency baseline.
+
+Ended owned history is read-only, then expires under `timeline-work-sources`,
+enabled by default: `landedDays=30`, `abandonedDays=90`, both configurable in
+Data retention. The owner confirmed these defaults and the public Git URL
+`/<owner>/<repo>@<slug>.git` while folding CORE-252 into CORE-255. Canonical
+`timeline/*` pushes are refused with the corresponding timeline URL.
+Tracker detail (`endedTimelineDays=180` when enabled), published wiki output,
+and preview expiry remain separate policies. Live consumers and dependency
+roots delay Git deletion, not completed output metadata. Purged Git sources
+report expiry without canonical fallback. Active/experimental legacy work has
+a finite migration; completed records become canonical-historical without
+rewriting old main history. See the authoritative
+[server contract](apps/website/README.md#timelines) and exact
+[CLI migration commands](apps/cli/README.md#timelines).
 
 ## Conclusion
 
@@ -127,10 +161,10 @@ There are three readings, from thinnest to thickest:
    precedents are Upsun (every branch is a full environment) and Figma
    branches.
 
-The design presents the third and implements it as the first, one subsystem at
-a time. One account-level record holds the timeline. Each subsystem stores a
-timeline id next to its own data and filters by it, and none of them forks its
-storage.
+The original design presented the third and implemented it as the first, one
+subsystem at a time. Its account-level record and scoped subsystem data remain,
+but its no-fork storage design is superseded: CORE-255 owns separate work Git
+repositories while keeping canonical authorization and account coordination.
 
 **Naming:** "Timeline". CORE-42's time axis is a variation of the same concept,
 to be designed later.
@@ -148,7 +182,8 @@ to be designed later.
   with write access approves the current checkpoint. Agents never approve.
 - **Lineage:** a `parent` (main or another timeline) and a fork point, which is
   a commit per repository plus a tracker cursor.
-- **Per repository:** a bookmark `timeline/<slug>`.
+- **Per repository (original design, superseded):** a canonical bookmark
+  `timeline/<slug>`; current work uses its owned source's `refs/heads/work`.
 - **`status`:** `active`, `idle` (no pushes for the org's idle period, 7 days by
   default), `waiting` (a checkpoint awaits approval), `landing` (queued),
   `partly landed` (some repositories advanced, the rest retrying), `landed`,
@@ -375,6 +410,9 @@ returns:
 
 ### What is global and what belongs to a timeline
 
+This table records the original design. Its canonical timeline branch storage
+is superseded by the current owned-source contract above.
+
 | Thing                       | Main                                     | Timeline                                                                                      |
 | --------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------- |
 | Code                        | Trunk                                    | Bookmark `timeline/<slug>` in each repository it touches                                      |
@@ -390,27 +428,26 @@ returns:
 | GitHub mirror               | Main and tags                            | Not mirrored                                                                                  |
 | People, agents, permissions | Global                                   | Global; the timeline records which agents worked in it                                        |
 
-### Git: branches, merges, and the history git doesn't keep
+### Historical Git design (storage and canonical landing superseded)
 
-- **A timeline's work lives on `timeline/<slug>` in each repository.** A checkout
-  bound to a timeline pushes there: `.gitmatrix/agent.local.yml` names the
-  timeline, and new worktrees inherit that file.
-- **Merges are the native mechanism.** A timeline forks from main or from
-  another timeline, and merges into another timeline or into main as a real git
-  merge. This keeps compatibility with ordinary git tools and with the GitHub
-  mirror.
+- **Originally, work lived on canonical `timeline/<slug>` branches.** CORE-255
+  replaces these with owned work repositories; checkout binding still lives in
+  `.gitmatrix/agent.local.yml` and new worktrees inherit it.
+- **Native merges remain a work-history mechanism**, including explicit sync
+  with main or another timeline. They are no longer canonical landing:
+  compact landing does not upload WIP ancestors or a second parent.
 - **gm has real merge support** (CORE-66): `gm merge <rev>` creates a merge
   change, every rewrite keeps all parents, conflicts on merges are recorded like
   on any other change, and `gm log` draws the graph (CORE-67).
-- **The server keeps the history git doesn't:**
+- **The original server-history proposal was:**
   - a ref-update log (old commit, new commit, actor, agent, time), which doesn't
     exist today;
   - change membership: on each push it reads the `change-id` headers and records
     the timeline each change first appeared in, and every timeline it was later
     merged into;
   - the timeline events listed above.
-- **Main's history gains merge commits.** Code that walks first-parent history
-  must treat a landing merge's second parent as the timeline's work (CORE-72):
+- **Original merge-based consumer design (superseded for compact landings):**
+  First-parent consumers treated a landing merge's second parent as timeline work (CORE-72):
   - release notes: a range includes what each merge landed (the commits only
     its other parents reach), issue keys come from those commits too, and each
     entry records its landing merge and the timeline branch git or the push
@@ -423,7 +460,7 @@ returns:
     marked with what it merged; the knowledge build diffs snapshots of
     successive heads and needs no change.
 
-### Landing
+### Historical landing design (superseded by compact landing above)
 
 - **The queue merges the approved checkpoint into the current main.** It runs
   the gates on that merge and advances main to the merge commit: the
@@ -451,7 +488,8 @@ returns:
   `gitmatrix/landing/<slug>`, where the repository's own pipeline runs with
   `trigger == "landing"`; landings run in parallel and serialize at each
   main's compare-and-swap, so one that lost the race merges onto the new main
-  and is tested again. `apps/website/README.md` ("Landing") has the details.
+  and is tested again. The current replacement is documented in
+  [the website README](apps/website/README.md#timelines).
   The job's landing credential is its own CI job credential, which
   Gitmatrix's git proxy accepts only for reads and for pushes to that one
   landing branch (CORE-157).

@@ -165,6 +165,85 @@ function setup() {
 }
 
 describe("release note generation", () => {
+  test("compact landing groups exact durable source inputs and regenerates after work Git expires", async () => {
+    const r = setup();
+    r.issues.set("ENG-1", issue("ENG-1"));
+    const base = r.commit("Initial import");
+    const wip = r.commit("Implement parser ENG-1", undefined, undefined, {
+      parents: [base],
+      branch: true,
+    });
+    const revised = r.commit("Finish parser ENG-1", undefined, undefined, {
+      parents: [wip],
+      branch: true,
+    });
+    const input = [await r.source.commit(revised), await r.source.commit(wip)];
+    const compact = r.commit("Land parser", undefined, undefined, { parents: [base] });
+    r.sqlite.exec(`
+      INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
+      VALUES('work_parser','repo','tl_parser','parser','acc','work-physical','https://work','archived','allocation','canonical','${base}','base-tree','refs/heads/main','canonical','${base}','base-tree','refs/heads/main',1,'now','now');
+      INSERT INTO source_integration_receipts(id,landing_id,checkpoint_id,repo_id,source_id,source_commit,source_tree,logical_base_json,dependencies_json,canonical_base,canonical_commit,canonical_tree,noop,status,created_at,completed_at)
+      VALUES('receipt','landing','checkpoint','repo','work_parser','${revised}','work-tree','{}','[]','${base}','${compact}','compact-tree',0,'complete','now','now');
+    `);
+    r.sqlite
+      .prepare(
+        "INSERT INTO source_integration_inputs(receipt_id,repo_id,commits_json) VALUES('receipt','repo',?)",
+      )
+      .run(JSON.stringify(input));
+    const readCommit = r.source.commit.bind(r.source);
+    r.source.commit = async (oid) => {
+      if (oid === wip || oid === revised)
+        throw new Error("WIP object must never be read in canonical");
+      return readCommit(oid);
+    };
+    const changed: string[] = [];
+    r.source.changes = async (oid) => {
+      if (oid === wip || oid === revised) throw new Error("Source diff requested from canonical");
+      changed.push(oid);
+      return [
+        { kind: "function.added", name: "parser", path: "parser.ts", summary: "Added parser" },
+      ];
+    };
+    await r.run();
+    const first = r.entries(DAY);
+    expect(first.find((entry) => entry.issue_key === "ENG-1")).toMatchObject({
+      commits: JSON.stringify([compact]),
+      landing_oid: compact,
+      timeline_id: "tl_parser",
+    });
+    expect(changed).toContain(compact);
+    const saved = r.sqlite
+      .prepare(
+        "SELECT provenance, regeneration_inputs FROM release_note_entries WHERE issue_key='ENG-1'",
+      )
+      .get() as { provenance: string; regeneration_inputs: string };
+    expect(JSON.parse(saved.provenance)).toEqual([
+      {
+        source: {
+          sourceId: "work_parser",
+          repoId: "repo",
+          timelineId: "tl_parser",
+          kind: "timeline-work",
+          ref: "refs/heads/work",
+          commit: revised,
+          tree: "work-tree",
+        },
+        receiptId: "receipt",
+        commits: [revised, wip],
+      },
+    ]);
+    expect(
+      JSON.parse(saved.regeneration_inputs).commits.map(
+        (commit: ArtifactsCommitMetadata) => commit.hash,
+      ),
+    ).toEqual([revised, wip]);
+    r.sqlite.exec(
+      "UPDATE timeline_work_sources SET state='purged', artifacts_remote=NULL; DELETE FROM release_note_entries; DELETE FROM release_notes;",
+    );
+    await r.run();
+    expect(r.entries(DAY)).toEqual(first);
+  });
+
   test("groups commits under the issues they cite, writes each entry once, and introduces the release", async () => {
     const r = setup();
     r.issues.set("ENG-1", issue("ENG-1"));

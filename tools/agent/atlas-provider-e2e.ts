@@ -626,6 +626,7 @@ export async function runAtlasProviderE2E(
     const labelOf = async (button: Locator) =>
       ((await button.locator("span").first().textContent()) ?? "").trim();
     let parent = capability;
+    let selectedFile = false;
     for (let depth = 0; depth < 4; depth++) {
       const buttons = scope.getByRole("list", { name: `Inside ${parent}` }).getByRole("button");
       await expect(buttons.first()).toBeVisible();
@@ -644,18 +645,24 @@ export async function runAtlasProviderE2E(
       await previousHeading.waitForElementState("hidden");
       await previousHeading.dispose();
       await expect(heading(scope, label)).toBeVisible();
-      if (label.endsWith(".ts")) break;
+      const selected = new URL(page.url()).searchParams.get("select") ?? "";
+      selectedFile = selected.startsWith("file:") || selected.startsWith(`${repo.id}/file:`);
+      if (selectedFile) break;
       parent = label;
     }
     const file = path.at(-1)!;
-    assert(file.endsWith(".ts"), `Drilling ${capability} reached no file: ${path.join(" › ")}`);
+    assert(selectedFile, `Drilling ${capability} reached no file: ${path.join(" › ")}`);
     const link = scope
-      .locator(`a[href^="/${repo.owner}/${repo.name}/blob/${repo.head}/"][href$="/${file}"]`)
+      .locator(`a[href^="/${repo.owner}/${repo.name}/blob/${repo.head}/"]`)
+      .filter({ hasText: new RegExp(`(?:^|/)${escape(file)}(?::\\d+)?$`) })
       .first();
     await expect(link).toBeVisible();
     const href = (await link.getAttribute("href")) ?? "";
+    const target = new URL(href, page.url());
+    assert.equal(target.searchParams.get("source"), "canonical");
+    assert(target.pathname.endsWith(`/${file}`));
     await link.click();
-    await page.waitForURL((url) => url.pathname === href);
+    await page.waitForURL((url) => url.href === target.href);
     const symbol = SYMBOL[file];
     if (symbol) await expect(page.getByText(symbol).first()).toBeVisible();
     return { path, source: href };
@@ -784,7 +791,7 @@ export async function runAtlasProviderE2E(
       const overview = await api<AtlasOverview>(`${atlasOf(ledger)}/overview`);
       assert.equal(overview.snapshot.id, stats.atlasSnapshot, "The build's snapshot is published");
       assert.deepEqual(overview.snapshot.vector, [
-        { repoId: ledger.id, commit: ledger.head, buildId: build.id },
+        { repoId: ledger.id, sourceId: "canonical", commit: ledger.head, buildId: build.id },
       ]);
       const model = described.model!;
       const capabilities: Record<string, unknown>[] = [];
@@ -801,6 +808,7 @@ export async function runAtlasProviderE2E(
         assert.equal(inferred.model, model);
         assert.deepEqual(inferred.basis, {
           repoId: ledger.id,
+          sourceId: "canonical",
           commit: ledger.head,
           buildId: build.id,
         });
@@ -811,12 +819,18 @@ export async function runAtlasProviderE2E(
           `${entity.name}: ${entity.summary}`,
         );
         assert(inferred.sources.length > 0, "Prose rests on source files");
+        const citationMembers = await capabilityOfFiles(
+          ledger,
+          inferred.sources.map((source) => source.path),
+        );
         for (const source of inferred.sources) {
           assert.equal(source.commit, ledger.head, "Citations are at the snapshot's commit");
           assert.equal(source.repoId, ledger.id);
-          assert(
-            paths.includes(source.path) || source.path === "index.ts",
-            `${source.path} isn't a member`,
+          assert.equal(source.sourceId, "canonical", "Canonical prose cannot cite timeline work");
+          assert.equal(
+            citationMembers.get(source.path),
+            entity.id,
+            `${source.path} isn't a primary member`,
           );
           assert.match(source.blob ?? "", /^[0-9a-f]{40}$/, "Citations name the immutable blob");
         }
@@ -829,6 +843,7 @@ export async function runAtlasProviderE2E(
         assert(folders.size >= 2, "Its sources span both folders");
         for (const e of sources.items) {
           assert.equal(e.commit, ledger.head);
+          assert.equal(e.sourceId, "canonical", "Atlas evidence must identify its code source");
           assert.equal(e.analysis, "analyzed");
         }
         capabilities.push({
@@ -845,6 +860,7 @@ export async function runAtlasProviderE2E(
             inferredAt: inferred.inferredAt,
             sources: inferred.sources.map((s) => ({
               path: s.path,
+              sourceId: s.sourceId,
               commit: s.commit,
               blob: s.blob,
               range: s.range,
@@ -955,6 +971,11 @@ export async function runAtlasProviderE2E(
       for (const f of resolved.evidence.importers.files) {
         assert.equal(f.repoId, shop.id);
         assert.equal(f.commit, shop.head, "Importers are cited at the shop's own commit");
+        assert.equal(
+          f.sourceId,
+          "canonical",
+          "Registry resolution cannot import work-source evidence",
+        );
         assert(SHOP_CAPABILITY.includes(f.path), f.path);
       }
       const composition = await api<AtlasWorkspaceComposition>(`${ws}/composition?repos=${names}`);
@@ -971,6 +992,15 @@ export async function runAtlasProviderE2E(
         [ledger.head, shop.head].sort((a, b) => a.localeCompare(b)),
         "Each repository at its own commit: no common head",
       );
+      for (const repo of composition.snapshot.repos) {
+        for (const vector of repo.snapshot?.vector ?? []) {
+          assert.equal(
+            vector.sourceId,
+            "canonical",
+            "Workspace Atlas must isolate canonical snapshots",
+          );
+        }
+      }
       evidence.workspace = {
         repos: repoVectors,
         shopBuild: {
@@ -1176,7 +1206,7 @@ export async function runAtlasProviderE2E(
         const overview = await api<AtlasOverview>(`${atlasOf(repo)}/overview`, tokenOf(repo));
         assert.equal(overview.snapshot.id, stats.atlasSnapshot);
         assert.deepEqual(overview.snapshot.vector, [
-          { repoId: repo.id, commit: repo.head, buildId: build.id },
+          { repoId: repo.id, sourceId: "canonical", commit: repo.head, buildId: build.id },
         ]);
         const caps = [
           await sharedCapability(repo, LEDGER_CAPABILITY),

@@ -15,13 +15,15 @@ import type { RepoDetail } from "../../../shared/api.ts";
 import { Page } from "../../components/AppShell.tsx";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { CopyField, RoleChip, VisibilityChip, link, popMotion } from "../../components/ui.tsx";
-import { forgetRepoData, repoData, routeData } from "../../lib/repoData.ts";
-import { repoPath } from "../../lib/refs.ts";
+import { forgetRepoData, repoData, requestSource, routeData } from "../../lib/repoData.ts";
+import { repoPath, sourceUrl } from "../../lib/refs.ts";
 import { repoSections } from "../../lib/repoSections.ts";
 import { useViewer } from "../../lib/session.ts";
 
-export async function repoLoader({ params }: LoaderFunctionArgs) {
-  return routeData(repoData.detail(params.owner ?? "", params.repo ?? ""));
+export async function repoLoader({ params, request }: LoaderFunctionArgs) {
+  const owner = params.owner ?? "";
+  const name = params.repo ?? "";
+  return routeData(repoData.detail(owner, name, await requestSource(owner, name, request), true));
 }
 
 /**
@@ -37,7 +39,12 @@ export function repoShouldRevalidate({
   defaultShouldRevalidate,
 }: ShouldRevalidateFunctionArgs) {
   if (formMethod || currentUrl.href === nextUrl.href) return defaultShouldRevalidate;
-  return currentParams.owner !== nextParams.owner || currentParams.repo !== nextParams.repo;
+  return (
+    currentParams.owner !== nextParams.owner ||
+    currentParams.repo !== nextParams.repo ||
+    currentUrl.searchParams.get("source") !== nextUrl.searchParams.get("source") ||
+    currentUrl.searchParams.get("tl") !== nextUrl.searchParams.get("tl")
+  );
 }
 
 export function useRepo(): RepoDetail {
@@ -56,7 +63,7 @@ function Tab({
 }) {
   const { pathname } = useLocation();
   const current = sections.some((section) =>
-    section === "" ? pathname === to : pathname.startsWith(section),
+    section === "" ? pathname === to.split("?")[0] : pathname.startsWith(section),
   );
   // On narrow screens the tab row scrolls; keep the current tab in it.
   const ref = useRef<HTMLAnchorElement>(null);
@@ -77,7 +84,8 @@ function Tab({
 
 function ClonePopover({ repo }: { repo: RepoDetail }) {
   const viewer = useViewer();
-  const canPush = repo.viewerRole === "write" || repo.viewerRole === "admin";
+  const canPush =
+    repo.sourceState !== "archived" && (repo.viewerRole === "write" || repo.viewerRole === "admin");
   return (
     <Popover.Root>
       <Popover.Trigger className="mk-btn mk-btn--primary">
@@ -101,8 +109,14 @@ function ClonePopover({ repo }: { repo: RepoDetail }) {
                     personal access token
                   </Link>{" "}
                   as the password.{" "}
-                  {canPush ? "You can push to this repository." : "You can clone but not push."}
+                  {repo.sourceState === "archived"
+                    ? "This archived source is read-only until retention expires."
+                    : canPush
+                      ? "You can push to this repository."
+                      : "You can clone but not push."}
                 </>
+              ) : repo.source?.kind === "timeline-work" ? (
+                "Work sources require an authorized Gitmatrix account."
               ) : repo.visibility === "public" ? (
                 "Public repositories clone without signing in. Pushing needs an account with write access."
               ) : null}
@@ -132,13 +146,27 @@ export function RepoLayout() {
               {repo.owner.slug}
             </Link>
             <span className="font-normal text-ink-faint">/</span>
-            <Link to={base} className="text-ink no-underline">
+            <Link to={sourceUrl(base, repo.source?.sourceId)} className="text-ink no-underline">
               <bdi>{repo.name}</bdi>
             </Link>
           </h1>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <VisibilityChip visibility={repo.visibility} />
             <RoleChip role={repo.viewerRole} />
+            {repo.source?.kind === "timeline-work" && (
+              <>
+                <span className="text-body-sm text-ink-muted" title={repo.source.sourceId}>
+                  {repo.sourceState === "expired"
+                    ? "Expired work source · published data retained"
+                    : repo.sourceState === "archived"
+                      ? "Archived work source · read-only"
+                      : "Timeline work source"}
+                </span>
+                <Link className={`${link} text-body-sm`} to={`${base}?tl=main`}>
+                  Canonical code
+                </Link>
+              </>
+            )}
             {repo.importedFrom && (
               <span className="text-body-sm text-ink-faint">
                 Imported from{" "}
@@ -152,7 +180,7 @@ export function RepoLayout() {
             </p>
           )}
         </div>
-        {repo.state === "ready" && <ClonePopover repo={repo} />}
+        {repo.state === "ready" && repo.sourceState !== "expired" && <ClonePopover repo={repo} />}
       </header>
 
       {repo.state === "importing" ? (

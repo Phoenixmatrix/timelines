@@ -12,6 +12,7 @@
 // Going back or reloading keeps whatever the URL says.
 
 import { redirect, replace, type DataRouter, type MiddlewareFunction } from "react-router";
+import type { CodeSource } from "../../shared/code-source.ts";
 
 export const SCOPE_PARAM = "tl";
 const MAIN = "main";
@@ -49,6 +50,7 @@ function join(path: string, params: URLSearchParams, hash: string): string {
 export function withScope(href: string, slug: string | null): string {
   const { path, params, hash } = split(href);
   params.set(SCOPE_PARAM, slug ?? MAIN);
+  if (!slug) params.delete("source");
   return join(path, params, hash);
 }
 
@@ -149,23 +151,40 @@ const CODE = /^\/([^/]+)\/([^/]+)\/(tree|blob|commits)\/(.+)$/;
 export function switchScope(
   location: { pathname: string; search: string; hash?: string },
   slug: string | null,
-  repo?: { defaultBranch: string; branches: string[] } | null,
+  repo?: {
+    defaultBranch: string;
+    branches: string[];
+    source?: CodeSource;
+    targetSource?: CodeSource;
+  } | null,
 ): string {
   let pathname = location.pathname;
   const code = repo ? CODE.exec(pathname) : null;
   if (repo && code) {
     const [, owner, name, view, tail] = code as unknown as [string, string, string, string, string];
     const old = scopeOf(location.search);
-    const from = [repo.defaultBranch, ...(old ? [scopeBookmark(old)] : [])].find(
-      (ref) => tail === ref || tail.startsWith(`${ref}/`),
-    );
+    const from = [
+      repo.defaultBranch,
+      ...(repo.source ? [repo.source.ref.replace(/^refs\/heads\//, "")] : []),
+      ...(old ? [scopeBookmark(old)] : []),
+    ].find((ref) => tail === ref || tail.startsWith(`${ref}/`));
     if (from) {
-      const bookmark = slug ? scopeBookmark(slug) : null;
-      const to = bookmark && repo.branches.includes(bookmark) ? bookmark : repo.defaultBranch;
+      const bookmark = slug
+        ? (repo.targetSource?.ref.replace(/^refs\/heads\//, "") ?? scopeBookmark(slug))
+        : null;
+      const to =
+        bookmark && (repo.targetSource || repo.branches.includes(bookmark))
+          ? bookmark
+          : repo.defaultBranch;
       pathname = `/${owner}/${name}/${view}/${to}${tail.slice(from.length)}`;
     }
   }
-  return withScope(`${pathname}${location.search}${location.hash ?? ""}`, slug);
+  const params = new URLSearchParams(location.search);
+  params.delete("source");
+  if (slug && repo?.targetSource && repo.targetSource.sourceId !== "canonical") {
+    params.set("source", repo.targetSource.sourceId);
+  }
+  return withScope(join(pathname, params, location.hash ?? ""), slug);
 }
 
 /**
@@ -178,8 +197,8 @@ export function endedHint(status: "landed" | "abandoned", pathname: string): str
   if (status === "abandoned")
     return tracker
       ? "read-only, its issues as it left them. Main has its finished work back to do."
-      : "read-only; its bookmarks are gone and its records stay.";
-  return "read-only; its work is on main.";
+      : "read-only; progress history remains available until source retention expires.";
+  return "read-only while retained; the approved result is on main and progress history has separate retention.";
 }
 
 /** What the scope means on the page you're on, for the banner. */
@@ -209,19 +228,20 @@ export function scopeHint(
       return "Release notes cover landed work; what this timeline landed is marked.";
     if (repoHasBookmark === false && ["", "tree", "commits", "ci"].includes(section))
       return `This repository isn't part of the timeline; showing main.`;
-    if (section === "ci") return `Runs on ${bookmark}.`;
+    if (section === "ci") return "Runs in this timeline's work source.";
     if (section === "" || section === "tree" || section === "blob" || section === "commits")
-      return `Code on ${bookmark}, unless the path names another branch.`;
+      return "Code in this timeline's work source, unless the path pins another commit.";
   }
   return "Main plus this timeline's work.";
 }
 
 /** The timeline's bookmark in a repository, if the timeline touches it. */
 export function bookmarkIn(
-  repo: { branches: { shortName: string }[] },
+  repo: { branches: { shortName: string }[]; source?: CodeSource },
   slug: string | null,
 ): string | null {
   if (!slug) return null;
+  if (repo.source?.kind === "timeline-work") return repo.source.ref.replace(/^refs\/heads\//, "");
   const bookmark = scopeBookmark(slug);
   return repo.branches.some((branch) => branch.shortName === bookmark) ? bookmark : null;
 }

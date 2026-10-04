@@ -42,19 +42,17 @@ fn fetch_origin(ws: &Workspace, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// A checkout bound to a timeline works on its bookmark. If origin doesn't
-/// have it (abandoned, landed and removed, or not fetched yet), syncing or
-/// pushing would aim at main instead, so both stop and say why.
+/// A bound checkout never falls back to canonical main when its source ref is absent.
 fn require_timeline(ws: &Workspace) -> Result<()> {
     if let Some(slug) = &ws.timeline
         && !ws.on_timeline()
     {
         return Err(GmError::new(
             "timeline_missing",
-            format!("This checkout works in timeline {slug}, but origin has no timeline/{slug}."),
+            format!("This checkout works in timeline {slug}, but its owned source has not been fetched."),
         )
         .hint(format!(
-            "`gm fetch` if it's new. Otherwise it may have been abandoned: `gm timeline show {slug}`. Go back to main with `gm timeline use main`."
+            "`gm fetch` to fetch the source, or inspect `gm timeline show {slug}`. Explicitly go back to main with `gm timeline use main`."
         ))
         .exit(exit::CONFLICT));
     }
@@ -142,6 +140,9 @@ pub fn fetch(ctx: &Ctx) -> Result<Json> {
     let mut ws = Workspace::open(&ctx.cwd)?;
     let before = ws.trunk.as_ref().map(|t| t.oid);
     fetch_origin(&ws, &config)?;
+    if let Some(slug) = &ws.timeline {
+        super::timeline::fetch_work(ctx, &config, slug)?;
+    }
     ws.refresh_trunk()?;
     let after = ws.trunk.as_ref().map(|t| t.oid);
     Ok(Json(json!({
@@ -153,6 +154,166 @@ pub fn fetch(ctx: &Ctx) -> Result<Json> {
         })),
         "hint": if before != after { Some("Run `gm sync` to rebase your changes onto the new trunk.") } else { None },
     })))
+}
+
+/// A compact landing admits exact objects, not every revision sharing a change id.
+fn sync_ended_source(
+    ws: &mut Workspace,
+    config: &Config,
+    ctx: &Ctx,
+    source: &super::timeline::WorkSource,
+) -> Result<(String, Vec<Oid>, Rebased)> {
+    let slug = ws.timeline.as_deref().expect("bound source");
+    let anchor = ws
+        .repo
+        .find_reference(&format!("refs/remotes/gm-work/timeline/{slug}"))?
+        .peel_to_commit()?
+        .id();
+    let repo = super::server::current_repo(ctx)?;
+    let lineage = remote::api(
+        config,
+        "GET",
+        &format!(
+            "/repos/{repo}/sources/{}/lineage?commit={anchor}",
+            source.id
+        ),
+        None,
+    )?;
+    match lineage["status"].as_str() {
+        Some("integrated") => {}
+        Some("expired") => {
+            return Err(GmError::new(
+                "source_expired",
+                "Source retention has expired; automatic lineage sync is unavailable.",
+            )
+            .hint("Local work is intact. Recover it explicitly onto a new timeline."));
+        }
+        _ => {
+            return Err(GmError::new(
+                "source_lineage_unresolved",
+                "No unique exact integration receipt exists for this source anchor.",
+            )
+            .hint("Local work is intact; inspect the timeline landing before retrying.")
+            .exit(exit::CONFLICT));
+        }
+    }
+    let anchor_text = anchor.to_string();
+    if !lineage["members"].as_array().is_some_and(|members| {
+        members
+            .iter()
+            .any(|m| m.as_str() == Some(anchor_text.as_str()))
+    }) {
+        return Err(GmError::new(
+            "invalid_response",
+            "Lineage response did not admit the requested exact source anchor.",
+        ));
+    }
+    let oid = |field: &serde_json::Value| -> Result<Oid> {
+        Oid::from_str(field.as_str().ok_or_else(|| {
+            GmError::new(
+                "invalid_response",
+                "Lineage snapshot is missing its commit.",
+            )
+        })?)
+        .map_err(Into::into)
+    };
+    let admitted = oid(&lineage["integration"]["source"]["commit"])?;
+    let base = oid(&lineage["integration"]["logicalBase"]["commit"])?;
+    let canonical = oid(&lineage["canonical"]["commit"])?;
+    if lineage["integration"]["source"]["sourceId"].as_str() != Some(source.id.as_str())
+        || !(anchor == admitted || ws.repo.graph_descendant_of(admitted, anchor)?)
+    {
+        return Err(GmError::new(
+            "invalid_response",
+            "Lineage receipt does not cover this source.",
+        ));
+    }
+    ws.commit(canonical)?;
+    let graph = ws.graph()?;
+    let mut walk = ws.repo.revwalk()?;
+    walk.push(admitted)?;
+    walk.hide(base)?;
+    let mut exact = HashSet::new();
+    let mut revisions: HashMap<String, Vec<Oid>> = HashMap::new();
+    for oid in walk {
+        let oid = oid?;
+        exact.insert(oid);
+        revisions
+            .entry(ws.change_id(&ws.commit(oid)?))
+            .or_default()
+            .push(oid);
+    }
+    // A receipt for the remote tip is not proof that the local stack belongs to
+    // it. Refuse a divergent checkout before rewriting any object or bookmark.
+    let mut local_walk = ws.repo.revwalk()?;
+    local_walk.push(ws.wc())?;
+    local_walk.hide(base)?;
+    let mut related = ws.wc() == canonical || ws.repo.graph_descendant_of(ws.wc(), canonical)?;
+    for oid in local_walk {
+        let oid = oid?;
+        if oid == canonical
+            || exact.contains(&oid)
+            || revisions.contains_key(&ws.change_id(&ws.commit(oid)?))
+        {
+            related = true;
+            break;
+        }
+    }
+    if !related {
+        return Err(GmError::new(
+            "source_lineage_unresolved",
+            "The local stack has no admitted source ancestor or revision.",
+        )
+        .hint("Local work is intact. Explicitly recover it onto a new timeline.")
+        .exit(exit::CONFLICT));
+    }
+    let mut abandoned: HashMap<Oid, Vec<Oid>> =
+        exact.iter().map(|oid| (*oid, vec![canonical])).collect();
+    let mut expected = HashMap::new();
+    let mut rewritten = HashMap::new();
+    let mut conflicts = Vec::new();
+    for local in &graph.topo {
+        if exact.contains(local) {
+            continue;
+        }
+        let commit = ws.commit(*local)?;
+        let candidates = revisions.get(&ws.change_id(&commit));
+        let original = candidates.filter(|v| v.len() == 1).map(|v| v[0]);
+        if let Some(original) = original {
+            let tree = ws.landed_tree_on_local_parents(&commit, original)?;
+            expected.insert(*local, tree);
+            if *local != ws.wc() && tree == commit.tree_id() {
+                abandoned.insert(*local, vec![canonical]);
+            } else if commit.parent_ids().all(|p| !graph.topo.contains(&p)) {
+                let (tree, paths) = ws.rebased_tree_after_landing(&commit, &[canonical], tree)?;
+                let new = ws.rewrite_commit(&commit, &[canonical], tree, None)?;
+                let change = ws.change_id(&commit);
+                drop(commit);
+                rewritten.insert(*local, new);
+                if !paths.is_empty() {
+                    ws.view.conflicts.insert(change.clone(), paths.clone());
+                    conflicts.push((change, paths));
+                }
+            }
+        } else if candidates.is_some_and(|v| v.len() > 1) {
+            return Err(GmError::new(
+                "source_lineage_ambiguous",
+                "Several admitted revisions match a local change; no work was discarded.",
+            )
+            .hint("Recover the local change explicitly using its exact commit."));
+        }
+    }
+    if !ctx.dry_run {
+        ws.repo.reference(
+            &format!("refs/gm/source-sync/{}/{}", source.id, ws.wc()),
+            ws.wc(),
+            true,
+            "before compact-source sync",
+        )?;
+    }
+    let mut rebased = ws.rebase_descendants_after_landing(rewritten, abandoned, &expected)?;
+    rebased.conflicts.extend(conflicts);
+    Ok(("Reconciled exact source lineage onto canonical main. The ended-source push guard remains: explicitly start a new timeline or `gm timeline use main`.".into(), vec![ws.wc()], rebased))
 }
 
 /// Fetch, then move every stack of changes that was built on trunk onto the
@@ -172,6 +333,13 @@ fn sync_in(ws: &mut Workspace, config: &Config, ctx: &Ctx) -> Result<(String, Ve
         })
         .collect();
     fetch_origin(ws, config)?;
+    if let Some(slug) = ws.timeline.clone() {
+        let source = super::timeline::fetch_work(ctx, config, &slug)?;
+        if source.ended {
+            ws.refresh_trunk()?;
+            return sync_ended_source(ws, config, ctx, &source);
+        }
+    }
     ws.refresh_trunk()?;
     require_timeline(ws)?;
     let Some(trunk) = ws.trunk.as_ref().map(|t| (t.oid, t.name.clone())) else {
@@ -531,15 +699,25 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
     let config = Config::load();
     let mut ws = Workspace::open(&ctx.cwd)?;
     require_origin(&ws)?;
-    if args.queue {
-        if ws.on_timeline() {
-            return Err(GmError::new(
-                "timeline_bound",
-                "Queued main pushes are not allowed in a timeline.",
-            )
-            .hint("Use `gm push` and timeline checkpoint/land so approval remains enforced.")
+    if args.queue && ws.timeline.is_some() {
+        return Err(GmError::new(
+            "timeline_bound",
+            "Queued main pushes are not allowed in a timeline.",
+        )
+        .hint("Use timeline checkpoint/land; explicitly `gm timeline use main` for main work.")
+        .exit(exit::CONFLICT));
+    }
+    let source = ws
+        .timeline
+        .as_deref()
+        .map(|slug| super::timeline::work_source(ctx, &config, slug))
+        .transpose()?;
+    if source.as_ref().is_some_and(|s| s.ended) {
+        return Err(GmError::new("timeline_ended", "This source is read-only; no push was attempted.")
+            .hint("Run `gm sync` to recover local work, then explicitly start a new timeline or `gm timeline use main`.")
             .exit(exit::CONFLICT));
-        }
+    }
+    if args.queue {
         let main = ws.main().map(|m| m.name.as_str()).unwrap_or("main");
         if args.bookmark.as_deref().is_some_and(|name| name != main) {
             return Err(GmError::usage(
@@ -578,6 +756,13 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         .unwrap_or_else(|| "main".into());
     let bookmark = args.bookmark.clone().unwrap_or_else(|| trunk_name.clone());
     let to_trunk = bookmark == trunk_name;
+    if source.is_some() && !to_trunk {
+        return Err(GmError::new(
+            "timeline_bound",
+            "A bound work source accepts only its work bookmark; omit --bookmark.",
+        )
+        .exit(exit::CONFLICT));
+    }
     if let Some(slug) = &ws.timeline {
         let main = ws.main().map(|m| m.name.as_str()).unwrap_or("main");
         if bookmark == main {
@@ -623,7 +808,11 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
             dry_run: ctx.dry_run,
             queue: None,
             bookmark: bookmark.clone(),
-            remote_ref: format!("refs/heads/{bookmark}"),
+            remote_ref: if source.is_some() {
+                "refs/heads/work".into()
+            } else {
+                format!("refs/heads/{bookmark}")
+            },
             pushed: Vec::new(),
             message: format!("{sync_note}Nothing to push: {bookmark} already has everything."),
             working_copy: Change::load(&ws, wc)?,
@@ -807,7 +996,11 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         });
     }
 
-    let remote_tracking = format!("refs/remotes/origin/{bookmark}");
+    let remote_tracking = if source.is_some() {
+        format!("refs/remotes/gm-work/{bookmark}")
+    } else {
+        format!("refs/remotes/origin/{bookmark}")
+    };
     let remote_oid = ws
         .repo
         .find_reference(&remote_tracking)
@@ -838,7 +1031,11 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
             dry_run: true,
             queue: None,
             bookmark: bookmark.clone(),
-            remote_ref: format!("refs/heads/{bookmark}"),
+            remote_ref: if source.is_some() {
+                "refs/heads/work".into()
+            } else {
+                format!("refs/heads/{bookmark}")
+            },
             pushed,
             message: summary.replace("Pushed", "Would push"),
             working_copy,
@@ -848,12 +1045,18 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         });
     }
 
-    let refspec = format!("{rev}:refs/heads/{bookmark}");
+    let remote_ref = if source.is_some() {
+        "refs/heads/work".to_string()
+    } else {
+        format!("refs/heads/{bookmark}")
+    };
+    let refspec = format!("{rev}:{remote_ref}");
     let lease = format!(
-        "--force-with-lease=refs/heads/{bookmark}:{}",
+        "--force-with-lease={remote_ref}:{}",
         remote_oid.map(|o| o.to_string()).unwrap_or_default()
     );
-    let mut git_args = vec!["push", "--quiet", "origin", refspec.as_str()];
+    let destination = source.as_ref().map(|s| s.url.as_str()).unwrap_or("origin");
+    let mut git_args = vec!["push", "--quiet", destination, refspec.as_str()];
     if !to_trunk {
         git_args.insert(1, lease.as_str());
     }
@@ -891,7 +1094,7 @@ pub fn push(ctx: &Ctx, args: &cli::PushArgs) -> Result<Pushed> {
         dry_run: false,
         queue: None,
         bookmark: bookmark.clone(),
-        remote_ref: format!("refs/heads/{bookmark}"),
+        remote_ref,
         pushed,
         message: summary,
         working_copy: Change::load(&ws, ws.wc())?,
@@ -913,7 +1116,7 @@ fn upload_push_context(
     let steps = if super::steps::journal_dir(ws).exists() {
         match super::steps::repo_slug(ctx) {
             Ok(repo) => {
-                let uploads = super::steps::upload_commits(config, &repo, ws, outgoing);
+                let uploads = super::steps::upload_commits(ctx, config, &repo, ws, outgoing);
                 if !uploads.failed.is_empty() {
                     warnings.push(format!(
                         "{} step context(s) weren't uploaded; run `gm context sync` to retry.",

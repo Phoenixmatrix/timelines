@@ -146,8 +146,13 @@ export class TestServer {
   }
 
   /** Move `branch` of `repo` (owner/name) to `commit`, as a push would; null deletes it. */
-  async push(repo: string, branch: string, commit: string | null): Promise<void> {
-    await browserCommands.gmWorld("push", { world: this.#world(), repo, branch, commit });
+  async push(
+    repo: string,
+    branch: string,
+    commit: string | null,
+    sourceId?: string,
+  ): Promise<void> {
+    await browserCommands.gmWorld("push", { world: this.#world(), repo, branch, commit, sourceId });
   }
 
   #world(): string {

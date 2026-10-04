@@ -1026,34 +1026,51 @@ linked work in `worker/tracker/work.ts`.
 
 ### Timelines
 
-A timeline (`TIMELINES-RESEARCH.md`) is an account-wide line of work with a
-bookmark `timeline/<slug>` in each repository it touches. Records and their
-events live in the tracker's Durable Object, beside the issues and leases that
-landing and abandoning will change with them. Every change to either is also
+A timeline is an account-wide line of work. Each `(timeline, canonical repository)`
+owns one Artifacts work repository, shared by its agents, with an opaque
+`work_<id>` source and physical `refs/heads/work` (`bookmark: "work"`).
+`timeline/<slug>` remains a logical overlay/environment label, not its Git ref.
+Records and events live in the account Tracker Durable Object beside the issues
+and leases that landing and abandoning change. Every change is also
 logged in the tracker's event log, which the snapshot and change feed include
 only with `timelines=1`, because older gm binaries fail on entity types they
 don't know (gm now skips them). gm asks for timelines and keeps them in its
 replica; `gm tracker status` lists them offline. `shared/timelines.ts` defines the
 wire types.
 
-| Route                                                   | Contract                                                                                          |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `GET /api/tracker/:owner/timelines?status=&stalled=`    | Every timeline, newest first; `stalled=true`: open, no push for the idle period, not experimental |
-| `POST /api/tracker/:owner/timelines`                    | `{slug, name?, policy?, experimental?, parent?, repos?}`: write each bookmark, then the record    |
-| `GET /api/tracker/:owner/timelines/:slug?after=&limit=` | The timeline and its events, oldest first; page on with `next`                                    |
-| `PATCH /api/tracker/:owner/timelines/:slug`             | `{name?, experimental?, expectedVersion?}`                                                        |
-| `POST /api/tracker/:owner/timelines/:slug/abandon`      | Record the abandon event with each bookmark's last commit, then delete the bookmarks              |
-| `GET /api/tracker/:owner/timeline-graph`                | Every timeline, the newest 5,000 events across them, names and workspaces: the graph's data       |
-| `POST /api/tracker/:owner/timelines/:slug/land`         | Queue the head checkpoint to land (`LandResult`), or 409 with why not                             |
-| `GET /api/tracker/:owner/timelines/:slug/landing`       | `{landing}`: its newest landing, or null                                                          |
+| Route                                                   | Contract                                                                                                                       |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /api/tracker/:owner/timelines?status=&stalled=`    | Every timeline, newest first; `stalled=true`: open, no push for the idle period, not experimental                              |
+| `POST /api/tracker/:owner/timelines`                    | `{slug, name?, policy?, experimental?, parent?, repos?}`: reserve and initialize pinned owned sources, then publish the record |
+| `GET /api/tracker/:owner/timelines/:slug?after=&limit=` | The timeline and its events, oldest first; page on with `next`                                                                 |
+| `PATCH /api/tracker/:owner/timelines/:slug`             | `{name?, experimental?, expectedVersion?}`                                                                                     |
+| `POST /api/tracker/:owner/timelines/:slug/abandon`      | End the timeline and archive owned sources read-only; preserve completed integration receipts                                  |
+| `GET /api/tracker/:owner/timeline-graph`                | Every timeline, the newest 5,000 events across them, names and workspaces: the graph's data                                    |
+| `POST /api/tracker/:owner/timelines/:slug/land`         | Queue the head checkpoint to land (`LandResult`), or 409 with why not                                                          |
+| `GET /api/tracker/:owner/timelines/:slug/landing`       | `{landing}`: its newest landing, or null                                                                                       |
 
-- **Forking** needs tracker membership and write access to each repository,
-  which must belong to the tracker's account. Each bookmark starts at the
-  parent's bookmark in that repository, else the default branch's tip, unless
-  `{repo, commit}` names a commit. The Worker writes bookmarks with a
-  receive-pack request to Artifacts (ref commands and an empty pack); if any
-  repository refuses, or the record can't be made, the bookmarks already
-  written are removed.
+- **Forking** needs tracker membership and canonical-repository write access;
+  repositories must belong to that account (at most 20 per timeline). The
+  parent source, commit and tree are pinned before allocation: the parent's
+  owned work head, otherwise canonical main, or the requested `{repo, commit}`.
+  The Tracker reserves a provider name and durable allocation intent before
+  native fork; retries recover that reservation, never silently fork a newer
+  tip. Readiness requires the exact pinned commit/tree, a verified CAS of
+  `refs/heads/work`, and revocation of initial provider credentials.
+- **Source routing** preserves canonical authorization and deletion tombstones.
+  Git uses `/<owner>/<repo>@<slug>.git`; object/history APIs use
+  `?source=work_<id>` (`canonical` is qualified by repository). The slug routes
+  to a durable owned-source identity even after Tracker detail expires. Canonical
+  `timeline/*` pushes are refused with the actual timeline URL; the old
+  `/sources/<id>.git` transport does not remain as an alias. No provider URL
+  or token is exposed to clients. Missing/migrating source metadata fails closed,
+  never falls back to a canonical `timeline/<slug>` branch. Full acknowledged
+  progress and pre-rewrite predecessors are rooted, not just checkpoints;
+  durable mutation intents fence pushes against admitted landings and keep
+  ambiguous provider outcomes fenced until reconciliation.
+  CI retains the immutable `sourceId` and exact commit, with `timelineSlug`
+  identifying its public Git address. Local and Sandbox runners validate the
+  trusted origin, canonical repository, slug and source-ID pin before checkout.
 - **The graph** (`/tracker/:owner/timelines`, linked from Issues and Release
   notes; CORE-81) draws main down the middle and a lane per timeline, newest
   first: forks, merges between timelines, landings on main, abandoned lanes
@@ -1071,71 +1088,79 @@ wire types.
   account's idle period, 7 days by default): the graph's Stalled filter, its
   status groups (quiet experiments are grouped apart), `?stalled=true` and
   `gm timeline list --stalled`.
-- **Merges** are found after each push (`waitUntil`), from the push log: a
-  commit on the pushed line's own first-parent chain whose other parent has
-  been the tip of main or another timeline bookmark. Each is one event,
-  listed in both sides' histories. Pushes also record the agents that worked
-  in a timeline.
-- **Abandoning** is for the timeline's accountable person, acting as
-  themselves, and the agent that started it. Abandoning again retries the
-  bookmarks still there and records nothing new.
-- **Landing** (CORE-77, `worker/timelines/landing.ts`) merges the head
-  checkpoint into each repository's current main, tests the merge, and only
-  then advances main to it. An `auto` timeline queues itself when its
-  checkpoint is green (each repository's newest CI run of its commit on the
-  bookmark succeeded; a repository with no run has nothing to wait for), an
-  `approval` one when a person approves the checkpoint while it's still the
-  head; `gm timeline land`, the inspector's Land button and `POST …/land`
-  queue it by hand (write access to every repository) or say why not
-  (`needs_approval`, `not_green`, `checkpoint_stale`, `no_checkpoint`). The
-  experimental flag changes nothing. A landing (`Landing` in
-  `shared/timelines.ts`) lives in the tracker beside its timeline, which is
-  `landing` meanwhile. Per repository:
-  1. The Worker points `refs/heads/gitmatrix/landing/<slug>` at the
-     checkpoint's commit and starts a merge run there: one Gitmatrix job
-     (`land`, `worker/ci/landing.ts`), not the repository's ci.yml. It
-     fetches and pushes through Gitmatrix's git proxy with its own job
-     credential (`gmj_…`, CORE-157). The proxy (`worker/git/http.ts`) takes a
-     job credential only from a running landing merge job, for its own
-     repository, and reads each push's commands before forwarding any of it:
-     one update of `refs/heads/gitmatrix/landing/<slug>` (or git's empty
-     probe), anything else a 403. No Artifacts token reaches the sandbox. The
-     job fetches main, merges the checkpoint with `--no-ff` into the main
-     commit the landing pinned, and force-pushes the merge to the landing
-     branch. A conflict
-     exits 42 and lists the files.
-  2. The Worker checks the merge's parents (main's pinned commit, then the
-     checkpoint's), then runs the repository's pipeline on it: jobs see
-     `trigger == "landing"` and `branch == "gitmatrix/landing/<slug>"`, so
-     `branch == "main"` deploys don't run. Like a preview run, it is stored as
-     `manual` with its landing (`ci_runs.landing_id`, as is the merge run),
-     and the API, the CI pages and `GITMATRIX_TRIGGER` report it as
-     `landing`; no ci.yml, or no job for it, means nothing gates it.
-  3. Only once every repository's merge passed does any main move: one
-     repository at a time, a compare-and-swap from the pinned commit to the
-     merge, then what a push to main sets off (`git/effects.ts`: the push log
-     and timeline activity, CI on main, the mirror, knowledge, release notes).
-     A main that moved since is merged and tested again (five tries); once
-     another repository advanced, the timeline is `partly_landed`.
-  4. When every main advanced, the tracker folds the timeline's view into
-     main and records it `landed` (with `endedAt`) in one transaction: its
-     issues are done and their retained leases released. Its bookmarks and
-     landing branches are deleted after that, so knowledge overlays end as
-     landed.
+- **Merges and progress** retain the work source's full Git history and
+  source-qualified ref-update/membership evidence. Push events record agents
+  and timeline dependencies; a logical timeline label alone is not source identity.
+- **Abandoning** is for the accountable person or the agent that started the
+  timeline. It ends writes and archives work sources rather than deleting their
+  history. Settled partial landings retain successful receipts; abandoning never
+  rewinds a canonical repository already advanced.
+- **Landing** (`worker/timelines/landing.ts`) is compact, not a WIP merge into
+  canonical. `auto` admission requires a green current checkpoint; `approval`
+  requires a person's approval of that exact head. New work supersedes approval,
+  and admitted landing fences source writes. Manual `gm timeline land`, the
+  inspector and `POST …/land` use the same checks.
+  1. Pin **B** (explicit logical-base tree), **O** (current canonical main tree)
+     and **T** (approved work tree). Trusted materialization applies B→T onto O,
+     preserving independent canonical edits and reporting ordinary conflicts.
+     It creates one commit whose sole parent is pinned main, or a no-op receipt
+     if the resulting tree is unchanged. No WIP commit objects or refs are
+     uploaded to canonical, including staging.
+  2. Run repository landing gates on the exact compact candidate. CI reports
+     `trigger == "landing"` and `branch == "gitmatrix/landing/<slug>"`, not
+     main; its job credential is restricted to the admitted repository/source
+     and landing ref. No ci.yml or matching job means nothing gates that repo.
+  3. Prepare and gate **every repository before the first main CAS**. Advance
+     mains individually from their pinned heads; a moving main requires
+     re-preparation and re-gating (at most five attempts). There is no distributed
+     transaction: after any successful advance, remaining failures are
+     `partly_landed`. Durable CAS intents and integration receipts reconcile
+     uncertain results, and retry never replays a successful repository.
+     Same-checkpoint recovery retains tested sibling candidates and gate identities;
+     only an unadvanced main that actually moved requires new preparation.
+     Transport failures during dependency revalidation defer progress without
+     invalidating this prepared state; confirmed missing or invalid dependency
+     evidence still stops landing as `blocked_dependency`.
+  4. When every repository has its receipt, fold the tracker view into main,
+     mark the timeline landed, complete its issues and release retained leases.
+     Archive work sources read-only; canonical push effects drive main CI,
+     mirrors, knowledge and release notes. No-op receipts still preserve lineage.
 
-  There is no automatic sync: a conflict stops the landing (`conflict`, with
-  the timeline back to `active`) and asks for one in its reason and the
-  timeline's events: merge main into the timeline, push, make a new
-  checkpoint, and land that. Failing gates stop it too (`failed`); main never
-  advances to a merge that wasn't tested. A green checkpoint doesn't retry a
-  stopped landing on its own; landing again by hand does. Each step reads the
-  landing's version, its runs and the refs afresh and acts idempotently: the
-  end of each CI run moves it on (`CiRun`'s `landing` step), and so do the
-  hourly cron and `gm timeline land`. Landings proceed in parallel and
-  serialize at the compare-and-swap: one that lost the race merges onto the
-  new main and tests again. Timeline events record `landing` outcomes
-  (`queued`, `conflict`, `failed`, `partly_landed`, `landed`); abandoning a
-  timeline that is landing stops the landing.
+  Conflicts or failed gates stop landing. Explicitly sync/rebase the work, push
+  and renew checkpoint/approval when it changes; a stopped landing is retried by
+  hand, not by a green checkpoint alone. Cancellation cannot roll back successful
+  CAS receipts or discard an unresolved provider outcome. Landing reservations
+  honor cancellation before a provider operation starts. Once CAS has begun, an
+  uncertain result stays fenced until its exact outcome is reconciled; a concurrent
+  main advance cannot manufacture a successful receipt.
+
+  **Nested eligibility** uses exact ancestry, not matching change IDs. A child
+  forked at parent P0 waits for a completed parent integration covering P0
+  (including exact membership in a later approved P1). Its initial B remains
+  P0's tree, not compact canonical C or P1. Later foreign merges require one
+  unique maximal integrated baseline covering the dependency closure; otherwise
+  `blocked_dependency` asks for reviewed sync/rebase. Main movement cannot pick
+  a new base automatically or replay reverted foreign content.
+
+  **Provenance** links canonical receipts to the approved source snapshot,
+  logical base, dependencies and exact progress members. Steps, `why`, release
+  notes and issue attribution follow this mapping instead of expecting a
+  landing merge's second parent. Context identity remains canonical repository,
+  change ID and commit OID, with existing author/redaction rules.
+
+**Finite legacy cutover.** `gm timeline migrate <slug>` (or
+`POST …/timelines/:slug/migrate`) freezes legacy admission, forks active and
+experimental work at pinned snapshots, and switches only when all owned sources
+are ready. Then `gm timeline use <slug>`, checkpoint and renew approval.
+Completed/abandoned records receive `canonical-historical` provenance; old
+canonical history is never rewritten and tombstones are never resurrected.
+In-flight legacy landings must settle first. Inspect `gm timeline show <slug>`;
+resolve a stopped unadvanced landing with
+`gm timeline migrate <slug> --resolve cancel-unadvanced --expected-version <version> --note "<reason>"`.
+For a stopped partial landing use `--resolve accept-partial-and-abandon` with the
+same required version/note: successful receipts stay, the whole timeline is
+abandoned, and a subsequent plain `migrate` records historical provenance.
+This is a finite conversion, not two permanent active write modes.
 
 **Views.** Issues have a view per timeline, projected from the one event log
 (`worker/tracker/views.ts`). A mutation request with `timeline: <slug>` is
@@ -1213,10 +1238,12 @@ and redirect (a root middleware); going back, forward or reloading keeps what
 the URL says. What each surface does with it:
 
 - **Tracker**: the timeline's view (above); the timeline graph centres on it.
-- **Code browser**: a repository and its history open on `timeline/<slug>` when
-  the timeline touches it; a path that names a branch keeps it, and switching
-  follows main's or the old bookmark to the new one.
-- **CI**: runs on the bookmark (`GET …/ci?ref=`), and Run starts one there.
+- **Code browser**: code, history, diffs, semantic changes and permalinks carry
+  the owned `source` and physical work ref. Navigation preserves that source;
+  explicit main selection returns to canonical. Missing sources show an error,
+  not main's content under a timeline label.
+- **CI**: lists and runs use the source as well as ref; identical ref names or
+  commit IDs in different sources do not select canonical runs.
 - **Packages**: the console's default query adds `branch:timeline/<slug>`.
 - **Knowledge**: the timeline's overlay and its wiki pages; the tab's old
   `?timeline=` is rewritten to `?tl=`.
@@ -1456,31 +1483,25 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
 - **Robustness:** model calls have deadlines and back off on Workers AI rate
   limits; a failed file is retried next build; the coordinator's watchdog
   stops a hung build and retries it once.
-- **Timeline overlays** (`worker/knowledge/overlay.ts`, CORE-83): every push to
-  a `timeline/<slug>` bookmark recomputes that timeline's graph diff against
-  main's indexed graph: the files it changed since its merge base with main,
-  applied over main's snapshot, both graphs built from cached analyses with
-  main's concepts and summaries, then diffed (`kg_overlays`,
-  `kg_overlay_changes`; `GET …/knowledge/overlays` and
-  `…/knowledge/overlay?ref=timeline/<slug>`; the Knowledge tab's timeline
-  picker). Only blobs nothing has analyzed cost model calls, and they are cached
-  for when the timeline lands; no alignment, synthesis, indexing or wiki runs,
-  and main's graph, wiki and builds are untouched. A push that moves only
-  timeline bookmarks starts no main build. One overlay per timeline (three per
-  repository) runs at a time; main's next build recomputes them against it.
-  When a bookmark disappears its last overlay is kept, read-only (CORE-139):
-  `ended_reason` is `landed` or `abandoned` from the timeline's record in the
-  tracker, or `ended` when the tracker did not say (rechecked for two days, on
-  read). Ended overlays are never computed again, even if the bookmark is
-  pushed again; only an `ended` one whose timeline the tracker still doesn't
-  end comes back to life. The API reports them with `state: "ended"` and
-  `ended: {reason, at}`; the Knowledge tab lists them under "Ended".
+- **Timeline overlays** (`worker/knowledge/overlay.ts`, CORE-83): a push to an
+  owned work source recomputes that timeline's graph diff against main's indexed
+  graph using its explicit logical-base/source snapshot. `timeline/<slug>` is
+  still the overlay's logical ref (`…/knowledge/overlay?ref=timeline/<slug>`),
+  not a branch to read in canonical. Object reads and caches retain source
+  identity; only previously unanalyzed blobs need model calls. Main's graph,
+  wiki and builds are untouched by work pushes. One overlay per timeline
+  (three per repository) runs at a time; main's next build recomputes active
+  overlays against it. Ending a timeline keeps its last overlay read-only with
+  `state: "ended"` and `ended: {reason, at}`. Archived reads remain source-bound;
+  expiry is explicit rather than a fallback to canonical.
+  File topics use stable ordering, so introducing a work-only file cannot reorder
+  an unchanged canonical file's topics and falsely report it as changed.
 - **Timeline wiki pages** (`worker/knowledge/pages.ts`, CORE-84): written at
   checkpoints and on demand, never on every push. Making a checkpoint queues a
   page set per repository (`kg_page_sets`, keyed by the checkpoint, so asking
   again is the same set) after the response; the coordinator starts the
   oldest queued sets, one per timeline and two per repository. The Workflow
-  diffs the timeline at the set's commit against main as an overlay does, then
+  reads the page set's pinned source commit and logical base, then
   writes the component pages it adds or changes (at most 12, most changed
   first), Architecture when components come or go, and a glossary of its
   concepts (no model), with main's wiki code, into `kg_page_set_pages`, never
@@ -2018,7 +2039,7 @@ jobs:
 
 | Gitmatrix starts | When                                                                                                   | Run                                                               |
 | ---------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
-| `create`         | A checkpoint is made (`gm timeline checkpoint`), in each of its repositories                           | At that repository's checkpoint commit, on `timeline/<slug>`      |
+| `create`         | A checkpoint is made (`gm timeline checkpoint`), in each of its repositories                           | At that repository's checkpoint commit in its recorded source     |
 | `teardown`       | The hourly sweep finds a timeline's previews in a repository all due (expiry below)                    | At the newest preview's commit, with its checkpoint, by Gitmatrix |
 | `create` again   | Someone revives a checkpoint's preview: the button on the checkpoint, `gm timeline revive`, or the API | At the checkpoint's commit; what it records is marked rebuilt     |
 
@@ -2027,11 +2048,15 @@ Each preview run's jobs get `GITMATRIX_TRIGGER=preview`,
 for a teardown of previews recorded without one) and `GITMATRIX_COMMIT`. A
 repository whose ci.yml at that commit doesn't opt in, or has no job for the
 action, gets no run; neither does one with a broken ci.yml (its push run
-already failed). A run checks out from `timeline/<slug>` while the bookmark
-exists; after the timeline lands or is abandoned it names the default branch,
-and the runners fetch the commit by id. In flight, the same action for the same checkpoint is one
-run; re-running a preview run repeats it. Preview runs don't count toward
-`coalesce_after`, and a push's run is never answered by a preview run.
+already failed). A run checks out the checkpoint's recorded source and commit,
+including archived work sources after landing or abandonment; it never substitutes
+the default branch. A purged source returns `source_expired` (410). Each queued
+or actually running job retains a source claim. Canceling its parent is not proof
+that the runner stopped: local runners acknowledge completion, and Sandbox jobs
+stop their container before reporting a terminal result. In flight, the same
+action for the same checkpoint is one run; re-running repeats it.
+Preview runs don't count toward `coalesce_after`, and a push's run is never
+answered by a preview run.
 
 Preview runs are stored as `manual` runs with `preview_action`, `timeline_slug`
 and `checkpoint_id` set (`ci_runs.trigger`'s CHECK can't widen without
@@ -2050,8 +2075,9 @@ together once every one is due: they're marked `expired` with `tornDownAt`
 (and `teardownRun` when a run started), and the records stay. If the account's
 tracker can't answer, nothing is torn down until the next hour.
 
-**Revival.** Any checkpoint's preview can be rebuilt in one action, whatever
-became of its timeline, for example to look into last week's work. The run's
+**Revival.** A checkpoint's preview can be rebuilt while its recorded source
+remains retained and readable, including landed or abandoned timelines. Purged
+sources return explicit expiry, not canonical checkout. The run's
 deployment record is `revived: true`, with `rebuiltFrom` naming the earlier
 record of the checkpoint, and the UI says "Preview (rebuilt)": it is rebuilt
 from the commit with migrations plus seed and can differ from the original if
@@ -2484,15 +2510,18 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
 ## Data retention
 
 Everything Gitmatrix keeps costs storage, so data past its useful life can be
-cleaned up by **retention categories** (PRD CORE-195). Every new category is
-**disabled until an administrator enables it**: a fresh or upgraded deployment
-deletes nothing it didn't delete before.
+cleaned up by **retention categories** (PRD CORE-195). Policy categories are
+opt-in except **Timeline work Git repositories** (CORE-255), enabled by default
+at 30 days after landing and 90 days after abandonment. Administrators can change
+both durations or disable that policy; preview teardown and Atlas snapshots
+retain their always-active controls.
 
 - **Categories** are defined once in `worker/retention/categories.ts`: id
   (kebab-case, stored, never renamed), scope (`account` or `site`), label,
   description, `never` (what it never deletes, in plain words) and thresholds
   (whole numbers with `min`, `max` and the PRD `default`). `control` is
-  `policy` (off until enabled), `active` (always runs: preview teardown, whose
+  `policy` (configurable; `defaultEnabled` otherwise defaults false), `active`
+  (always runs: preview teardown, whose
   numbers are the `account_settings` preview columns, the same ones
   `/settings/previews` changes, and Atlas snapshot retention, which an account
   can tighten within `ATLAS_RETENTION_BOUNDS` but never loosen) or `fixed`
@@ -2502,9 +2531,9 @@ deletes nothing it didn't delete before.
   `retention_policies` per account, `retention_site_policies` for site
   categories and site-wide defaults of account categories. Each value
   resolves account, then site-wide default, then category default; `enabled`
-  ends at false. Enabling a category without values applies its defaults. A
-  stored value outside today's bounds is ignored. `enabledTargets(d1)` lists
-  what scheduled runs cover (empty with nothing enabled).
+  ends at `defaultEnabled ?? false`. Enabling without values applies defaults.
+  A stored value outside today's bounds is ignored. `enabledTargets(d1)` includes
+  inherited default-enabled policies as well as explicit account/site choices.
 - **Audit:** every change records who changed which category from what to
   what in `retention_policy_changes`; the settings responses include the
   latest 20.
@@ -2518,6 +2547,33 @@ deletes nothing it didn't delete before.
 Unknown categories or thresholds, fractional or out-of-bounds values, site
 categories at account level and read-only categories are rejected with 400,
 and a rejected request stores nothing.
+
+**Owned timeline work archives.** Landing/abandonment archives full WIP history
+read-only. `timeline-work-sources` is enabled by default and independently selects
+landed sources after `landedDays=30` and abandoned sources after
+`abandonedDays=90`. The durable allocation inventory preserves the authoritative
+end disposition and time; missing disposition never guesses the shorter window.
+Tracker detail (`tracker-activity.endedTimelineDays`, default 180 when enabled),
+published knowledge (`ended-timeline-data`) and previews have separate policies.
+Expiring any of those does not authorize early Git deletion. Expiring Git leaves
+retained published overlays/page sets readable under canonical permissions and
+their exact source identity; their source-code links report expiry.
+The repository metadata shell labels expired work and omits its clone action;
+metadata reads do not substitute canonical refs or require the deleted Git store.
+
+Before deletion, an admission fence rejects new consumers. Existing dependencies,
+operations and actual consumers drain: CI cancellation is acknowledged by the
+runner, managed preview teardown hands its exact source claim to the job before
+its preview claim is released, and Workflow completion/termination is confirmed.
+A `tornDownAt` scheduling marker alone does not acknowledge teardown completion;
+unmanaged previews have no invented teardown job. Unknown Workflow state or a
+failed stop keeps its claim. Completed output metadata does not pin Git forever.
+Retained child dependencies protect required bases and exact ancestry evidence.
+Once eligible sources enter purge, reads return `source_expired` (410), never
+canonical fallback. Canonical deletion tombstones immediately block all work
+routes, fence/drain operations and enumerate every reserved, ready, archived or
+purging provider name for cleanup. The 24-hour orphan inventory recognizes owned
+reservations before allocation begins.
 
 ### Categories, defaults and what they never delete
 
@@ -2561,6 +2617,13 @@ bounds shown.
   timelines that ended more than the given days ago. Defaults when enabled: Days
   after the timeline ended: 90 (`days`, 1–3650). Never deletes: data of open
   timelines; anything on the main line.
+- **Timeline work Git repositories** (`timeline-work-sources`, account scope; on
+  by default). Read-only work Git repositories expire independently of Tracker
+  details and published outputs, after landing or abandonment. Defaults: Days
+  after landing: 30 (`landedDays`, 1–3650); Days after abandonment: 90
+  (`abandonedDays`, 1–3650). Never deletes: canonical Git repositories and
+  historical canonical sources; open timeline sources; sources required by live
+  dependencies or unacknowledged consumers.
 - **Push log** (`push-log`, account scope; off until enabled). Push log entries
   older than the given days, and records of changes on branches or bookmarks
   that no longer exist, last seen before then. Defaults when enabled: Days after
@@ -2971,8 +3034,10 @@ everything it owned, everywhere, in two steps:
 holds in every store (D1 tables, registry, Durable Objects, Artifacts,
 Vectorize, AI Search, previews) and its deletion's progress;
 `POST /api/dev/repo-purge {repo, action: "terminate"|"resume"}` kills or
-restarts a purge and `POST /api/dev/repo-orphans {action: "plant"|"sweep"}`
-plants and sweeps orphans (isolated agent environments only). E2E:
+resumes only the named repository's purge; resume leaves live Workflow instances
+alone. The hourly cron still considers all unfinished deletions.
+`POST /api/dev/repo-orphans {action: "plant"|"sweep"}` plants and sweeps orphans
+(isolated agent environments only). E2E:
 `repository-deletion-purges-everything-and-resumes` (ready: Artifacts, a live
 preview's teardown, a killed purge resumed, the name reused) and the
 `repository-deletion` stage of `agent test-ai` (Vectorize, AI Search).

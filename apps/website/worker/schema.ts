@@ -11,6 +11,86 @@ import type { QueueStatus } from "../shared/merge-queue.ts";
  * (The package registry keeps its own database: registry/core/db.ts.)
  */
 export interface Database {
+  source_integration_inputs: { receipt_id: string; repo_id: string; commits_json: string };
+  timeline_source_roots: {
+    repo_id: string;
+    source_id: string;
+    consumer_kind: string;
+    consumer_id: string;
+    commit_oid: string;
+    created_at: string;
+  };
+  timeline_work_sources: {
+    source_id: string;
+    repo_id: string;
+    timeline_id: string;
+    timeline_slug: string;
+    owner_id: string;
+    artifacts_name: string;
+    artifacts_remote: string | null;
+    state: "reserved" | "creating" | "ready" | "archived" | "purging" | "purged" | "failed";
+    version: Generated<number>;
+    allocation_operation_id: string;
+    fork_source_id: string;
+    fork_commit: string;
+    fork_tree: string;
+    fork_ref: string;
+    initial_source_id: string;
+    initial_commit: string;
+    initial_tree: string;
+    initial_ref: string;
+    work_ref: Generated<string>;
+    initial_token_revoked: Generated<number>;
+    created_at: string;
+    updated_at: string;
+    archived_at: string | null;
+    archive_disposition: Generated<"landed" | "abandoned" | null>;
+    expiry_requested_at: Generated<string | null>;
+    error: string | null;
+  };
+  source_operations: {
+    id: string;
+    owner_id: string;
+    timeline_id: string;
+    repo_id: string;
+    source_id: string;
+    kind: string;
+    state: "admitted" | "ambiguous" | "accepted" | "rejected";
+    data: string;
+    created_at: string;
+    updated_at: string;
+  };
+  source_progress_members: {
+    repo_id: string;
+    source_id: string;
+    commit_oid: string;
+    operation_id: string;
+    created_at: string;
+  };
+  source_integration_receipts: {
+    id: string;
+    landing_id: string;
+    checkpoint_id: string;
+    repo_id: string;
+    source_id: string;
+    source_commit: string;
+    source_tree: string;
+    logical_base_json: string;
+    dependencies_json: string;
+    canonical_base: string;
+    canonical_commit: string;
+    canonical_tree: string;
+    noop: number;
+    status: "intent" | "integrated" | "complete";
+    created_at: string;
+    completed_at: string | null;
+  };
+  source_integration_members: {
+    receipt_id: string;
+    repo_id: string;
+    source_id: string;
+    commit_oid: string;
+  };
   merge_queue: {
     repo_id: string;
     id: string;
@@ -354,6 +434,7 @@ export interface Database {
     inputs_hash: string;
   };
   kg_overlays: {
+    source_id: Generated<string>;
     repo_id: string;
     ref: string;
     overlay_id: string | null;
@@ -475,6 +556,7 @@ export interface Database {
   };
   /** Wiki pages for a timeline at a checkpoint, or on demand (CORE-84). */
   kg_page_sets: {
+    source_id: Generated<string>;
     repo_id: string;
     ref: string;
     set_key: string;
@@ -492,6 +574,8 @@ export interface Database {
     ai_snapshot: Generated<string | null>;
   };
   kg_page_set_pages: {
+    source_id: Generated<string>;
+    source_locations: Generated<string>;
     repo_id: string;
     ref: string;
     set_key: string;
@@ -636,6 +720,8 @@ export interface Database {
     updated_at: string;
   };
   release_note_entries: {
+    provenance: Generated<string>;
+    regeneration_inputs: Generated<string>;
     id: string;
     repo_id: string;
     release: string;
@@ -681,16 +767,19 @@ export interface Database {
     retained_from: Generated<string | null>;
   };
   ci_refs: {
+    source_id: Generated<string>;
     repo_id: string;
     ref: string;
     oid: string;
   };
   repo_refs: {
+    source_id: Generated<string>;
     repo_id: string;
     ref: string;
     oid: string;
   };
   ref_updates: {
+    source_id: Generated<string>;
     id: Generated<number>;
     repo_id: string;
     ref: string;
@@ -703,6 +792,7 @@ export interface Database {
     created_at: Generated<string>;
   };
   change_refs: {
+    source_id: Generated<string>;
     repo_id: string;
     change_id: string;
     ref: string;
@@ -713,6 +803,7 @@ export interface Database {
     last_seen_at: Generated<string>;
   };
   ci_runs: {
+    source_id: Generated<string>;
     id: string;
     repo_id: string;
     number: number;
@@ -743,6 +834,7 @@ export interface Database {
     preview_revived: Generated<number>;
     /** The deployment record a revival rebuilds, when there was one. */
     preview_rebuilt_from: Generated<number | null>;
+    preview_teardown_of: Generated<number | null>;
     /**
      * A landing run (CORE-77): its merge job or the gates on its merge, stored
      * with trigger 'manual' like a preview run and reported as 'landing'.
@@ -752,6 +844,9 @@ export interface Database {
     queue_id: Generated<string | null>;
   };
   ci_jobs: {
+    source_id: Generated<string>;
+    /** Historical terminal status lacking evidence that its source consumer stopped. */
+    source_completion_pending: Generated<number>;
     id: string;
     run_id: string;
     repo_id: string;
@@ -813,6 +908,7 @@ export interface Database {
   };
   /** Where a repository's code is deployed (CORE-78); rows outlive their previews. */
   deployments: {
+    source_id: Generated<string>;
     id: Generated<number>;
     repo_id: string;
     environment: string;
@@ -838,6 +934,8 @@ export interface Database {
     /** When the preview sweep expired it, and the teardown run it started. */
     torn_down_at: Generated<string | null>;
     teardown_run_id: Generated<string | null>;
+    teardown_completed_at: Generated<string | null>;
+    teardown_unmanaged_at: Generated<string | null>;
   };
   /** Per-account settings; a missing row means the defaults. */
   /** The context attached to a step: a commit an agent made in a timeline (CORE-231). */

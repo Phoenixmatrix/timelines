@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { forgetUpstreamTokens, isArtifactsError } from "../artifacts.ts";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
 import {
   type TimelineStore,
@@ -6,12 +7,21 @@ import {
   type NewCheckpoint,
   type NewTimeline,
   type PushActivity,
+  type SourcePush,
 } from "./timelines.ts";
 import type { MutationRequest } from "../../shared/tracker.ts";
 import type { ChronicleOptions } from "./chronicle.ts";
 import type { QueueFailure } from "../../shared/merge-queue.ts";
 import type { SearchQuery } from "../search/query.ts";
-import type { Landing, TimelineStatus } from "../../shared/timelines.ts";
+import type { Checkpoint, Landing, Timeline, TimelineStatus } from "../../shared/timelines.ts";
+import type { TimelineRepo } from "../../shared/timelines.ts";
+import type { WorkSourceRow } from "../timelines/sources.ts";
+import {
+  initializeWorkSource,
+  type InitializedWorkSource,
+  type WorkSourceInput,
+} from "../timelines/sources.ts";
+import type { RepoRow } from "../db.ts";
 import {
   clearStorage,
   pendingRetirement,
@@ -44,6 +54,7 @@ export type TrackerReply<T> =
 export class Tracker extends DurableObject<Env> implements Purgeable {
   private store: TrackerStore;
   private timelines: TimelineStore;
+  private sourceInitializers = new Map<string, Promise<InitializedWorkSource>>();
   private transaction: <T>(fn: () => T) => T;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -67,6 +78,156 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
         };
       throw error;
     }
+  }
+  /** Isolated agent harness only: preserve pre-cutover records without active write fallback. */
+  seedLegacySourceFixture(
+    agentId: string,
+    input: {
+      timeline: Timeline;
+      checkpoint: Checkpoint | null;
+      landing: Landing | null;
+      approved?: boolean;
+    },
+  ): TrackerReply<Timeline> {
+    return this.reply(() => {
+      if (
+        Reflect.get(this.env, "DEV_MODE") !== "true" ||
+        !agentId ||
+        Reflect.get(this.env, "AGENT_ID") !== agentId
+      )
+        throw new TrackerError(
+          403,
+          "forbidden",
+          "Legacy fixtures require an isolated agent runtime.",
+        );
+      const { timeline, checkpoint, landing } = input;
+      const prefix = "source-migration-";
+      const repos = timeline.repos;
+      if (
+        !timeline.id.startsWith(prefix) ||
+        !timeline.slug.startsWith(prefix) ||
+        timeline.id.length > 100 ||
+        timeline.slug.length > 64 ||
+        repos.length < 1 ||
+        repos.length > 2 ||
+        new Set(repos.map((repo) => repo.id)).size !== repos.length ||
+        repos.some((repo) => repo.source || repo.logicalBase || repo.dependencies) ||
+        JSON.stringify(input).length > 50_000 ||
+        (checkpoint &&
+          (checkpoint.timelineId !== timeline.id ||
+            !checkpoint.id.startsWith(prefix) ||
+            checkpoint.repos.length !== repos.length ||
+            checkpoint.repos.some(
+              (repo) =>
+                !repos.some((entry) => entry.id === repo.id) ||
+                repo.source ||
+                repo.logicalBase ||
+                repo.dependencies,
+            ))) ||
+        (landing &&
+          (landing.timelineId !== timeline.id ||
+            landing.slug !== timeline.slug ||
+            !landing.id.startsWith(prefix) ||
+            landing.checkpointId !== checkpoint?.id ||
+            landing.repos.length !== repos.length ||
+            landing.repos.some(
+              (repo) =>
+                !repos.some((entry) => entry.id === repo.id) ||
+                repo.source ||
+                repo.logicalBase ||
+                repo.dependencies,
+            )))
+      )
+        throw new TrackerError(400, "invalid_input", "Invalid bounded legacy source fixture.");
+      return this.transaction(() => {
+        const sql = this.ctx.storage.sql;
+        if (
+          sql
+            .exec(
+              "SELECT id FROM timelines WHERE id = ? OR json_extract(data, '$.slug') = ?",
+              timeline.id,
+              timeline.slug,
+            )
+            .toArray().length ||
+          sql
+            .exec(
+              "SELECT source_id FROM timeline_source_allocations WHERE timeline_id = ?",
+              timeline.id,
+            )
+            .toArray().length ||
+          sql
+            .exec(
+              "SELECT id FROM timeline_reservations WHERE id = ? OR slug = ?",
+              timeline.id,
+              timeline.slug,
+            )
+            .toArray().length
+        )
+          throw new TrackerError(
+            409,
+            "already_exists",
+            "Legacy fixture already exists or owns a source.",
+          );
+        sql.exec(
+          "INSERT INTO timelines (id, data) VALUES (?, ?)",
+          timeline.id,
+          JSON.stringify(timeline),
+        );
+        if (checkpoint) {
+          sql.exec(
+            "INSERT INTO timeline_checkpoints (id, timeline_id, number, data) VALUES (?, ?, ?, ?)",
+            checkpoint.id,
+            timeline.id,
+            checkpoint.number,
+            JSON.stringify(checkpoint),
+          );
+          for (const repo of checkpoint.repos)
+            sql.exec(
+              "INSERT INTO timeline_heads (timeline_id, repo_id, oid) VALUES (?, ?, ?)",
+              timeline.id,
+              repo.id,
+              repo.commit,
+            );
+          if (input.approved) {
+            const eventId = `${checkpoint.id}-approval`;
+            const event = {
+              id: eventId,
+              timelineId: timeline.id,
+              kind: "approval",
+              checkpointId: checkpoint.id,
+              number: checkpoint.number,
+              requestId: `${checkpoint.id}-request`,
+              outcome: "approved",
+              note: null,
+              actorId: timeline.accountableId,
+              accountableId: timeline.accountableId,
+              createdAt: checkpoint.createdAt,
+            };
+            const row = sql
+              .exec(
+                "INSERT INTO timeline_events (id, data) VALUES (?, ?) RETURNING seq",
+                eventId,
+                JSON.stringify(event),
+              )
+              .one();
+            sql.exec(
+              "INSERT INTO timeline_event_index (timeline_id, seq) VALUES (?, ?)",
+              timeline.id,
+              row.seq,
+            );
+          }
+        }
+        if (landing)
+          sql.exec(
+            "INSERT INTO timeline_landings (id, timeline_id, created_at, data) VALUES (?, ?, ?, ?)",
+            landing.id,
+            timeline.id,
+            landing.createdAt,
+            JSON.stringify(landing),
+          );
+        return timeline;
+      });
+    });
   }
   snapshot(access: Access, timeline?: string, withTimelines = false) {
     return this.reply(() => this.store.snapshot(access, timeline, withTimelines));
@@ -136,6 +297,242 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
       ...this.timelines.graph(limit),
       issues: this.store.timelineIssues(),
     }));
+  }
+  timelineById(timelineId: string) {
+    return this.reply(() => this.timelines.byId(timelineId));
+  }
+  reserveTimeline(access: Access, slug: string, parent: string | null, input: string) {
+    return this.reply(() => this.timelines.reserveTimeline(access, slug, parent, input));
+  }
+  async cancelReservedCreation(access: Access, slug: string) {
+    const claim = this.reply(() => this.timelines.cancelReservedCreation(access, slug));
+    if (!claim.ok) return claim;
+    if (claim.value === null) return { ok: true as const, value: null };
+    for (const allocation of claim.value) {
+      const pending = this.sourceInitializers.get(
+        `${allocation.timeline_id}:${allocation.repo_id}`,
+      );
+      if (pending) await pending.catch(() => undefined);
+      let row = this.timelines.getWorkSource(allocation.source_id);
+      if (row.state === "creating") {
+        // A restarted initializer may still have an outstanding remote fork.
+        // Missing by name is not proof that its delayed creation cannot arrive.
+        try {
+          using provider = await this.env.ARTIFACTS.get(row.artifacts_name);
+          await provider.info();
+        } catch (error) {
+          if (!isArtifactsError(error, "NOT_FOUND")) throw error;
+          return this.reply(() => {
+            throw new TrackerError(
+              409,
+              "source_initialization_pending",
+              "Creation is cancelled, but an unresolved source allocation still needs reconciliation. Retry cancellation after initialization settles.",
+            );
+          });
+        }
+      }
+      if (row.state !== "purged") {
+        row = this.timelines.transitionWorkSource(row.source_id, row.version, "purging");
+        await this.env.DB.prepare(
+          "UPDATE timeline_work_sources SET state=?,version=?,updated_at=? WHERE source_id=? AND repo_id=? AND timeline_id=?",
+        )
+          .bind(row.state, row.version, row.updated_at, row.source_id, row.repo_id, row.timeline_id)
+          .run();
+        forgetUpstreamTokens(row.artifacts_name);
+        try {
+          await this.env.ARTIFACTS.delete(row.artifacts_name);
+        } catch (error) {
+          if (!isArtifactsError(error, "NOT_FOUND")) throw error;
+        }
+        row = this.timelines.transitionWorkSource(row.source_id, row.version, "purged");
+      }
+      await this.env.DB.prepare(
+        "UPDATE timeline_work_sources SET state=?,version=?,updated_at=? WHERE source_id=? AND repo_id=? AND timeline_id=?",
+      )
+        .bind(row.state, row.version, row.updated_at, row.source_id, row.repo_id, row.timeline_id)
+        .run();
+      await this.env.DB.prepare(
+        "DELETE FROM timeline_source_roots WHERE repo_id=? AND consumer_kind='dependency' AND consumer_id=?",
+      )
+        .bind(row.repo_id, row.timeline_id)
+        .run();
+    }
+    return { ok: true as const, value: { cancelled: true as const, slug } };
+  }
+  async initializeWorkSource(
+    repo: RepoRow,
+    input: WorkSourceInput,
+  ): Promise<TrackerReply<InitializedWorkSource>> {
+    const permitted = this.reply(() => this.timelines.assertCreationOpen(input.timelineId));
+    if (!permitted.ok) return permitted;
+    const key = `${input.timelineId}:${repo.id}`;
+    const existing = this.sourceInitializers.get(key);
+    const pending = existing ?? initializeWorkSource(this.env, repo, input);
+    if (!existing) this.sourceInitializers.set(key, pending);
+    try {
+      return { ok: true, value: await pending };
+    } catch (error) {
+      return this.reply(() => {
+        throw error;
+      });
+    } finally {
+      if (!existing) this.sourceInitializers.delete(key);
+    }
+  }
+  async reconcileDeletedSource(sourceId: string) {
+    let row = this.timelines.getWorkSource(sourceId);
+    const pending = this.sourceInitializers.get(`${row.timeline_id}:${row.repo_id}`);
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        /* Read the durable allocation after the initializer settled. */
+      }
+      row = this.timelines.getWorkSource(sourceId);
+    }
+    const tombstone = await this.env.DB.prepare(
+      "SELECT id FROM repos WHERE id=? AND deleted_at IS NOT NULL",
+    )
+      .bind(row.repo_id)
+      .first();
+    if (!tombstone)
+      return this.reply(() => {
+        throw new TrackerError(
+          409,
+          "source_not_deleted",
+          "Canonical repository is not tombstoned.",
+        );
+      });
+    if (row.state === "creating") {
+      // A ready capability proves the named provider fork finished. NOT_FOUND
+      // cannot prove an ambiguous provider request will never create it.
+      using provider = await this.env.ARTIFACTS.get(row.artifacts_name);
+      await provider.info();
+      row = this.timelines.transitionWorkSource(sourceId, row.version, "failed");
+      await this.env.DB.prepare(
+        "UPDATE timeline_work_sources SET state=?,version=?,updated_at=? WHERE source_id=? AND state='creating'",
+      )
+        .bind(row.state, row.version, row.updated_at, row.source_id)
+        .run();
+    }
+    return { ok: true as const, value: row };
+  }
+  reserveWorkSource(repo: { id: string; owner_id: string }, input: WorkSourceInput) {
+    return this.reply(() => this.timelines.reserveWorkSource(repo, input));
+  }
+  getWorkSource(sourceId: string) {
+    return this.reply(() => this.timelines.getWorkSource(sourceId));
+  }
+  async transitionWorkSource(
+    sourceId: string,
+    version: number,
+    state: WorkSourceRow["state"],
+    remote?: string,
+  ) {
+    const result = this.reply(() =>
+      this.timelines.transitionWorkSource(sourceId, version, state, remote),
+    );
+    if (result.ok && state === "archived") {
+      const row = result.value;
+      await this.env.DB.prepare(`UPDATE timeline_work_sources
+        SET state='archived',version=?,updated_at=?,archived_at=?,archive_disposition=?
+        WHERE source_id=? AND repo_id=? AND timeline_id=? AND version<=?
+          AND state NOT IN ('purging','purged')`)
+        .bind(
+          row.version,
+          row.updated_at,
+          row.archived_at,
+          row.archive_disposition,
+          row.source_id,
+          row.repo_id,
+          row.timeline_id,
+          row.version,
+        )
+        .run();
+    }
+    return result;
+  }
+  async beginSourcePush(input: SourcePush) {
+    const admitted = this.reply(() => this.timelines.beginSourcePush(input, true));
+    if (!admitted.ok) return admitted;
+    const now = new Date().toISOString();
+    try {
+      const projected = await this.env.DB.prepare(`INSERT INTO source_operations
+        (id,owner_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
+        SELECT ?,owner_id,?,?,?,'push','admitted',?,?,? FROM repos WHERE id=? AND deleted_at IS NULL
+        ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at WHERE source_operations.state='admitted'
+        RETURNING id`)
+        .bind(
+          input.operationId,
+          input.timelineId,
+          input.repoId,
+          input.sourceId,
+          JSON.stringify(input),
+          now,
+          now,
+          input.repoId,
+        )
+        .first();
+      if (!projected) {
+        this.timelines.finishSourcePush(input.operationId, "rejected");
+        return this.reply(() => {
+          throw new TrackerError(409, "source_frozen", "Repository deletion fenced this push.");
+        });
+      }
+      this.timelines.activateSourcePush(input.operationId);
+      return admitted;
+    } catch (error) {
+      const operation = this.timelines.sourcePush(input.operationId);
+      if (operation.state === "projecting")
+        this.timelines.finishSourcePush(input.operationId, "rejected");
+      throw error;
+    }
+  }
+  async finishSourcePush(operationId: string, outcome: "accepted" | "rejected" | "ambiguous") {
+    const result = this.reply(() => this.timelines.finishSourcePush(operationId, outcome));
+    if (result.ok) {
+      const operation = this.timelines.sourcePush(operationId);
+      await this.env.DB.prepare(
+        "UPDATE source_operations SET state=?,updated_at=? WHERE id=? AND repo_id=? AND source_id=? AND state IN ('admitted','ambiguous')",
+      )
+        .bind(
+          operation.state,
+          new Date().toISOString(),
+          operationId,
+          operation.repoId,
+          operation.sourceId,
+        )
+        .run();
+    }
+    return result;
+  }
+  sourcePushes(repoId?: string) {
+    return this.reply(() => this.timelines.sourcePushes(repoId));
+  }
+  sourcePush(operationId: string, repoId: string, sourceId: string) {
+    return this.reply(() => this.timelines.sourcePush(operationId, repoId, sourceId));
+  }
+  async rejectUnprojectedSourcePush(operationId: string, repoId: string, sourceId: string) {
+    const operation = this.timelines.sourcePush(operationId, repoId, sourceId);
+    if (operation.state !== "projecting") return { ok: true as const, value: false };
+    const result = await this.finishSourcePush(operationId, "rejected");
+    return result.ok ? { ok: true as const, value: true } : result;
+  }
+  resolveLegacyLanding(
+    timelineId: string,
+    expectedVersion: number,
+    action: "cancel-unadvanced" | "accept-partial-and-abandon",
+    note: string,
+  ) {
+    return this.reply(() =>
+      this.timelines.resolveLegacyLanding(timelineId, expectedVersion, action, note),
+    );
+  }
+  beginLegacyMigration(timelineId: string) {
+    return this.reply(() => this.timelines.beginLegacyMigration(timelineId));
+  }
+  completeLegacyMigration(timelineId: string, repos: TimelineRepo[]) {
+    return this.reply(() => this.timelines.completeLegacyMigration(timelineId, repos));
   }
   prepareTimeline(slug: string, parent: string | null) {
     return this.reply(() => this.timelines.prepare(slug, parent));

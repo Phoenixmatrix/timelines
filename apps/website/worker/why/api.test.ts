@@ -9,6 +9,7 @@ import { recordRefs } from "../ref-log/record.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { fakeHistory } from "../testing/history.ts";
 import { Timing } from "../timing.ts";
+import * as artifacts from "../artifacts.ts";
 import { byCommit, parseCommit, parseLines, why } from "./api.ts";
 
 // loadRepo's module reaches the knowledge coordinator, a Durable Object.
@@ -262,6 +263,9 @@ async function setup() {
     return { status: response.status, body: (await response.json()) as WhyResponse };
   };
   return {
+    sqlite,
+    env,
+    git,
     get,
     commits: { m0, x1, m1, x2, landing },
     landingUpdate,
@@ -273,6 +277,66 @@ async function setup() {
 }
 
 describe("GET /why", () => {
+  test("work provenance uses exact compact membership and remains truthful after source expiry", async () => {
+    const t = await setup();
+    const { m0, x1, x2, landing } = t.commits;
+    const source = {
+      sourceId: "work_search",
+      repoId: "app",
+      timelineId: "tl_search",
+      kind: "timeline-work" as const,
+      ref: "refs/heads/work",
+    };
+    t.sqlite.exec(`
+      INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,initial_token_revoked,created_at,updated_at)
+      VALUES('work_search','app','tl_search','search','orbit','work-search','https://work','archived','allocate','canonical','${m0}','base-tree','refs/heads/main','canonical','${m0}','base-tree','refs/heads/main',1,'now','now');
+      INSERT INTO source_integration_receipts(id,landing_id,checkpoint_id,repo_id,source_id,source_commit,source_tree,logical_base_json,dependencies_json,canonical_base,canonical_commit,canonical_tree,noop,status,created_at,completed_at)
+      VALUES('receipt','ld_search','cp_2','app','work_search','${x2}','work-tree','{}','[]','${m0}','${landing}','canonical-tree',0,'complete','now','now');
+      INSERT INTO source_integration_members(receipt_id,repo_id,source_id,commit_oid) VALUES('receipt','app','work_search','${x2}');
+    `);
+    for (const checkpoint of t.checkpoints)
+      checkpoint.checkpoint.repos[0]!.source = {
+        ...source,
+        commit: checkpoint.checkpoint.repos[0]!.commit,
+        tree: "work-tree",
+      };
+    t.queued.repos[0]!.source = { ...source, commit: x2, tree: "work-tree" };
+    const resolve = vi
+      .spyOn(artifacts, "lsRefs")
+      .mockResolvedValue([{ name: "refs/heads/main", oid: landing }]);
+    try {
+      const compact = await t.get("ann", `source=work_search&commit=${x2}:${CHANGE}`);
+      expect(compact.status).toBe(200);
+      expect(compact.body.chains[0]).toMatchObject({
+        source,
+        lineage: { status: "integrated" },
+        landing: { via: "compact", commit: landing, update: null, queue: { id: "ld_search" } },
+      });
+      expect(compact.body.chains[0]!.checkpoints.map((checkpoint) => checkpoint.commit)).toEqual([
+        x2,
+      ]);
+      const rewritten = await t.get("ann", `source=work_search&commit=${x1}:${CHANGE}`);
+      expect(rewritten.body.chains[0]).toMatchObject({
+        lineage: { status: "unknown" },
+        landing: null,
+      });
+      t.sqlite.exec(
+        "UPDATE timeline_work_sources SET state='purged', artifacts_remote=NULL WHERE source_id='work_search'",
+      );
+      const expired = await t.get("ann", `source=work_search&commit=${x2}:${CHANGE}`);
+      expect(expired.body.chains[0]).toMatchObject({
+        commit: null,
+        lineage: { status: "expired" },
+        landing: { via: "compact", commit: landing },
+      });
+      expect(
+        (await t.get("ann", `source=work_search&path=src/app.ts&line=2&rev=${x2}`)).status,
+      ).toBe(410);
+    } finally {
+      resolve.mockRestore();
+    }
+  });
+
   test("follows a line to its commit, change, timeline, issue, checkpoints, approval and landing", async () => {
     const t = await setup();
     const { x1, x2, m1, landing } = t.commits;

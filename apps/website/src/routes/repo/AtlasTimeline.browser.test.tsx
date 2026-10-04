@@ -13,6 +13,7 @@
 import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { AtlasTimeline } from "../../../shared/atlas.ts";
+import type { TimelineDetail } from "../../../shared/timelines.ts";
 import { atlasFixtureRepo, commitId, settled } from "../../testing/atlas.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer, type Recorded } from "../../testing/server.ts";
@@ -25,14 +26,21 @@ test("a timeline in capabilities, across repositories, ended and expired", async
   await server.repo("orbit", "engine");
   const slug = `atlas-${commitId().slice(0, 8)}`;
   const bookmark = `timeline/${slug}`;
-  // The timeline's work, on its own bookmark; main stays at `head`.
+  // Allocate a real owned source: work never moves canonical main.
+  const created = await server.call<TimelineDetail>("POST", "/api/tracker/orbit/timelines", {
+    slug,
+    repos: [{ repo: `orbit/${repo.name}`, commit: repo.head }],
+  });
+  const sourceId = created.timeline.repos[0]!.source!.sourceId;
   const tip = commitId();
-  await server.push(`orbit/${repo.name}`, bookmark, tip);
-  await repo.dev({ action: "overlay", ref: bookmark, commit: tip, base: repo.head });
+  await server.push(`orbit/${repo.name}`, "work", tip, sourceId);
+  await repo.dev({ action: "overlay", ref: bookmark, sourceId, commit: tip, base: repo.head });
   const expected = await server.call<AtlasTimeline>(
     "GET",
     `${repo.api}/atlas/timeline?ref=${encodeURIComponent(bookmark)}`,
   );
+  expect(expected.repos[0]!.sourceId).toBe(sourceId);
+  expect(sourceId, "Timeline evidence has an owned source").toMatch(/^work_/);
   const search = expected.regions?.find((r) => r.id !== "group:unclassified");
   expect(search, "The timeline touches search's capability").toBeDefined();
   const reached = search!.imports.added[0]?.name;
@@ -144,13 +152,23 @@ test("a timeline in capabilities, across repositories, ended and expired", async
   await expect.element(files).not.toMatchTextContent("notify/email.ts");
   await expect.element(suggest).toBeVisible();
   const filtered = app.url();
+  const baseLink = files
+    .getByRole("listitem")
+    .filter({ hasText: "search/rank.ts" })
+    .getByRole("link", { name: `Main's, at ${short(repo.head)}` })
+    .element() as HTMLAnchorElement;
+  const baseUrl = new URL(baseLink.href);
+  expect(baseUrl.pathname).toBe(`/orbit/${repo.name}/blob/${repo.head}/search/rank.ts`);
+  expect(baseUrl.searchParams.get("source")).toBe("canonical");
+  expect(baseUrl.searchParams.get("tl")).toBe("main");
 
   // 4. Source on the timeline's commit, scoped to the timeline; Back returns.
   await userEvent.click(suggest.getByRole("link", { name: `Source at ${short(tip)}` }));
   await app.waitForUrl(
     (url) =>
       url.pathname === `/orbit/${repo.name}/blob/${tip}/search/suggest.ts` &&
-      url.searchParams.get("tl") === slug,
+      url.searchParams.get("tl") === slug &&
+      url.searchParams.get("source") === sourceId,
   );
   await app.back();
   await app.waitForUrl((url) => url.href === filtered.href);
@@ -197,7 +215,7 @@ test("a timeline in capabilities, across repositories, ended and expired", async
 
   // 5. The timeline lands: its overlay is kept read-only, and reading it asks
   // for nothing (no write, no page writing offered).
-  await repo.dev({ action: "end", ref: bookmark, reason: "landed" });
+  await repo.dev({ action: "end", ref: bookmark, sourceId, reason: "landed" });
   mark = server.requests.length;
   await app.navigate(`${repo.base}?tl=${slug}`);
   await expect.element(panel).toMatchTextContent("This timeline landed");

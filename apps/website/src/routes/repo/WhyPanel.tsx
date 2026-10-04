@@ -11,7 +11,7 @@ import type { WhyChain, WhyResponse } from "../../../shared/why.ts";
 import { link } from "../../components/ui.tsx";
 import { api } from "../../lib/api.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
-import { blobUrl, commitsUrl } from "../../lib/refs.ts";
+import { blobUrl, commitsUrl, sourceUrl, treeUrl } from "../../lib/refs.ts";
 
 const fade =
   "transition-opacity duration-200 data-[starting-style]:opacity-0 data-[ending-style]:opacity-0";
@@ -26,9 +26,13 @@ export function whyPath(
   rev: string,
   start: number,
   end: number,
+  sourceId?: string,
 ) {
   const line = start === end ? `${start}` : `${start}-${end}`;
-  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/why?path=${encodeURIComponent(path)}&line=${line}&rev=${encodeURIComponent(rev)}`;
+  return sourceUrl(
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/why?path=${encodeURIComponent(path)}&line=${line}&rev=${encodeURIComponent(rev)}`,
+    sourceId,
+  );
 }
 
 /** "line 3", "lines 3–5", "lines 3, 7 and 9". */
@@ -63,7 +67,7 @@ export function WhyPanel({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const request = whyPath(repo.owner.slug, repo.name, path, rev, start, end);
+  const request = whyPath(repo.owner.slug, repo.name, path, rev, start, end, repo.source?.sourceId);
   const [state, setState] = useState<{
     request: string;
     result?: WhyResponse;
@@ -183,10 +187,28 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
                 · <code className="mk-mono">{shortOid(commit.oid)}</code>
               </span>
               <span className="flex flex-wrap gap-x-3">
-                <Link className={link} to={blobUrl(owner, name, commit.oid, path)}>
+                <Link
+                  className={link}
+                  to={blobUrl(
+                    owner,
+                    name,
+                    commit.oid,
+                    path,
+                    chain.source?.sourceId ?? result.source?.sourceId,
+                  )}
+                >
                   File at this commit
                 </Link>
-                <Link className={link} to={commitsUrl(owner, name, commit.oid)}>
+                <Link
+                  className={link}
+                  to={commitsUrl(
+                    owner,
+                    name,
+                    commit.oid,
+                    "",
+                    chain.source?.sourceId ?? result.source?.sourceId,
+                  )}
+                >
                   History from here
                 </Link>
               </span>
@@ -327,7 +349,11 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
         <Step title="Landing">
           {chain.landing ? (
             <span>
-              {chain.landing.via === "queue" ? "Landed on " : "Reached "}
+              {chain.landing.via === "compact"
+                ? "Integrated as a compact result on "
+                : chain.landing.via === "queue"
+                  ? "Landed by historical merge on "
+                  : "Reached "}
               <code className="mk-mono">{refName(chain.landing.ref)}</code>
               {chain.landing.timeline && (
                 <>
@@ -366,6 +392,51 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
             <span className="text-ink-muted">Not on {defaultBranch} yet.</span>
           )}
         </Step>
+        {chain.lineage && (
+          <Step title="Source receipt">
+            {chain.lineage.integration ? (
+              <>
+                <Link
+                  className={link}
+                  to={treeUrl(
+                    owner,
+                    name,
+                    chain.lineage.integration.canonical.commit,
+                    "",
+                    "canonical",
+                  )}
+                >
+                  Canonical result {shortOid(chain.lineage.integration.canonical.commit)}
+                </Link>
+                <Link
+                  className={link}
+                  to={commitsUrl(
+                    owner,
+                    name,
+                    chain.lineage.integration.source.commit,
+                    "",
+                    chain.lineage.integration.source.sourceId,
+                  )}
+                >
+                  Approved progress history
+                </Link>
+                <span className="text-ink-muted">
+                  Exact source membership; progress commits are not canonical ancestors.
+                </span>
+              </>
+            ) : (
+              <span className="text-ink-muted">
+                {chain.lineage.status === "expired"
+                  ? "Source expired; progress objects are no longer retained."
+                  : chain.lineage.status === "ambiguous"
+                    ? "Multiple integration receipts; no unique mapping."
+                    : chain.lineage.status === "pending"
+                      ? "This source has not completed integration."
+                      : "No admitted source membership recorded."}
+              </span>
+            )}
+          </Step>
+        )}
 
         <Step title="Discussion">
           <span className="text-ink-faint">{chain.discussions.reason}</span>

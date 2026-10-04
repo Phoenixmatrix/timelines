@@ -19,6 +19,7 @@ import { daysBefore } from "../engine.ts";
 
 interface Item {
   repo: string;
+  source: string;
   ref: string;
   rows: number;
   bytes: number;
@@ -32,10 +33,19 @@ const MATCHES = `o.repo_id IN (SELECT id FROM repos WHERE owner_id = ?)
   AND o.ended_at IS NOT NULL AND o.ended_at < ?
   AND o.removed_at IS NULL`;
 
+// Pages can be requested before an overlay exists. Their archived source
+// supplies the end date, so such roots do not retain a fork forever.
+const OVERLAYS = `(SELECT repo_id,source_id,ref,overlay_id,stats,ended_at,removed_at FROM kg_overlays
+  UNION ALL SELECT p.repo_id,p.source_id,p.ref,'','{}',s.archived_at,NULL
+    FROM kg_page_sets p JOIN timeline_work_sources s ON s.source_id=p.source_id AND s.repo_id=p.repo_id
+    WHERE s.state IN ('archived','purging','purged') AND s.archived_at IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM kg_overlays o WHERE o.repo_id=p.repo_id AND o.source_id=p.source_id AND o.ref=p.ref)
+    GROUP BY p.repo_id,p.source_id,p.ref,s.archived_at)`;
+
 const CHANGES = `FROM kg_overlay_changes c WHERE c.repo_id = o.repo_id AND c.overlay_id = o.overlay_id`;
 const REGROUPING = `FROM atlas_timeline_regroupings g WHERE g.repo_id = o.repo_id AND g.overlay_id = o.overlay_id`;
-const SETS = `FROM kg_page_sets p WHERE p.repo_id = o.repo_id AND p.ref = o.ref`;
-const PAGES = `FROM kg_page_set_pages p WHERE p.repo_id = o.repo_id AND p.ref = o.ref`;
+const SETS = `FROM kg_page_sets p WHERE p.repo_id = o.repo_id AND p.source_id = o.source_id AND p.ref = o.ref`;
+const PAGES = `FROM kg_page_set_pages p WHERE p.repo_id = o.repo_id AND p.source_id = o.source_id AND p.ref = o.ref`;
 
 /** An ended timeline's rows (overlay changes, regrouping, page sets and pages) and their bytes. */
 const SIZE = `(SELECT count(*) ${CHANGES}) + (SELECT count(*) ${REGROUPING})
@@ -61,42 +71,53 @@ export const endedTimelineData: CategoryCleanup<Item> = {
   async select(ctx, cursor) {
     const [account, cutoff] = scope(ctx);
     const limit = Math.min(ctx.limit, MAX_TIMELINES);
-    const space = cursor?.indexOf(" ") ?? -1;
-    const after =
-      cursor && space > 0 ? [cursor.slice(0, space), cursor.slice(space + 1)] : ["", ""];
+    const after: string[] = cursor ? (JSON.parse(cursor) as string[]) : ["", "", ""];
     const { results } = await ctx.env.DB.prepare(
-      `SELECT o.repo_id AS repo, o.ref, ${SIZE} FROM kg_overlays o
-       WHERE ${MATCHES} AND (o.repo_id, o.ref) > (?, ?)
-       ORDER BY o.repo_id, o.ref LIMIT ?`,
+      `SELECT o.repo_id AS repo, o.source_id AS source, o.ref, ${SIZE} FROM ${OVERLAYS} o
+       WHERE ${MATCHES} AND (o.repo_id, o.source_id, o.ref) > (?, ?, ?)
+       ORDER BY o.repo_id, o.source_id, o.ref LIMIT ?`,
     )
-      .bind(account, cutoff, after[0], after[1], limit)
+      .bind(account, cutoff, after[0], after[1], after[2], limit)
       .all<Item>();
     const last = results.at(-1);
     return {
       items: results,
-      next: results.length < limit || !last ? null : `${last.repo} ${last.ref}`,
+      next:
+        results.length < limit || !last ? null : JSON.stringify([last.repo, last.source, last.ref]),
       count: results.reduce((sum, r) => sum + r.rows, 0),
       bytes: results.reduce((sum, r) => sum + r.bytes, 0),
     };
   },
   async remove(ctx, items) {
     const [account, cutoff] = scope(ctx);
-    const keys = JSON.stringify(items.map((i) => [i.repo, i.ref]));
+    const keys = JSON.stringify(items.map((i) => [i.repo, i.source, i.ref]));
     // The overlays of these items that still match, as a subquery over `o`.
-    const chosen = `FROM kg_overlays o
-      WHERE (o.repo_id, o.ref) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))
+    const chosen = `FROM ${OVERLAYS} o
+      WHERE (o.repo_id, o.source_id, o.ref) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?))
         AND ${MATCHES}`;
     const bind = [keys, account, cutoff] as const;
     // One transaction: measure, delete what hangs off each overlay, then mark
     // the overlays (which takes them out of the predicate: run twice, the
     // second finds nothing).
-    const [sizes, , , , , marked] = await ctx.env.DB.batch<{
+    const [sizes] = await ctx.env.DB.batch<{
       repo: string;
+      source: string;
       ref: string;
       rows: number;
       bytes: number;
     }>([
-      ctx.env.DB.prepare(`SELECT o.repo_id AS repo, o.ref, ${SIZE} ${chosen}`).bind(...bind),
+      ctx.env.DB.prepare(
+        `SELECT o.repo_id AS repo, o.source_id AS source, o.ref, ${SIZE} ${chosen}`,
+      ).bind(...bind),
+      ctx.env.DB.prepare(`DELETE FROM timeline_source_roots WHERE
+        (consumer_kind = 'knowledge-overlay' AND consumer_id IN
+          (SELECT o.repo_id || ':' || o.source_id || ':' || o.overlay_id ${chosen}))
+        OR (consumer_kind = 'knowledge-pages' AND consumer_id IN
+          (SELECT p.repo_id || ':' || p.source_id || ':' || p.ref || ':' || p.set_key
+           FROM kg_page_sets p JOIN ${OVERLAYS} o ON p.repo_id=o.repo_id AND p.source_id=o.source_id AND p.ref=o.ref
+           WHERE (o.repo_id,o.source_id,o.ref) IN
+             (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]'),json_extract(value,'$[2]') FROM json_each(?))
+             AND ${MATCHES}))`).bind(...bind, ...bind),
       ctx.env.DB.prepare(
         `DELETE FROM kg_overlay_changes
          WHERE (repo_id, overlay_id) IN (SELECT o.repo_id, o.overlay_id ${chosen})`,
@@ -107,21 +128,20 @@ export const endedTimelineData: CategoryCleanup<Item> = {
       ).bind(...bind),
       ctx.env.DB.prepare(
         `DELETE FROM kg_page_set_pages
-         WHERE (repo_id, ref) IN (SELECT o.repo_id, o.ref ${chosen})`,
+         WHERE (repo_id, source_id, ref) IN (SELECT o.repo_id, o.source_id, o.ref ${chosen})`,
       ).bind(...bind),
       ctx.env.DB.prepare(
         `DELETE FROM kg_page_sets
-         WHERE (repo_id, ref) IN (SELECT o.repo_id, o.ref ${chosen})`,
+         WHERE (repo_id, source_id, ref) IN (SELECT o.repo_id, o.source_id, o.ref ${chosen})`,
       ).bind(...bind),
       ctx.env.DB.prepare(
         `UPDATE kg_overlays AS o SET removed_at = ?, stats = '{}'
-         WHERE (o.repo_id, o.ref) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))
+         WHERE (o.repo_id, o.source_id, o.ref) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?))
            AND ${MATCHES}
-         RETURNING repo_id AS repo, ref`,
+         RETURNING repo_id AS repo, source_id AS source, ref`,
       ).bind(ctx.now.toISOString(), ...bind),
     ]);
-    const done = new Set((marked?.results ?? []).map((r) => `${r.repo} ${r.ref}`));
-    const removed = (sizes?.results ?? []).filter((r) => done.has(`${r.repo} ${r.ref}`));
+    const removed = sizes?.results ?? [];
     return {
       count: removed.reduce((sum, r) => sum + r.rows, 0),
       bytes: removed.reduce((sum, r) => sum + r.bytes, 0),

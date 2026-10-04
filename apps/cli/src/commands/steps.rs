@@ -389,6 +389,7 @@ fn entry_lookup(ws: &Workspace, oid: Oid, persist: bool) -> Result<Option<(PathB
     entry["upload"]["commitOid"] = json!(oid.to_string());
     entry["upload"]["summary"] = json!(summary_of(ws, oid)?);
     entry["upload"]["committedAt"] = json!(commit_time(ws, oid)?);
+    entry["upload"]["timeline"] = json!(ws.timeline);
     entry["uploaded"] = json!(false);
     if persist {
         fs::write(&path, serde_json::to_vec_pretty(&entry).unwrap_or_default())
@@ -405,11 +406,24 @@ pub struct Uploads {
     pub failed: Vec<String>,
 }
 
-fn upload_one(config: &Config, repo: &str, path: &PathBuf, mut entry: Value) -> Result<()> {
+fn upload_one(
+    ctx: &Ctx,
+    config: &Config,
+    repo: &str,
+    path: &PathBuf,
+    mut entry: Value,
+) -> Result<()> {
+    let source = match entry["upload"]["timeline"].as_str() {
+        Some(slug) => format!(
+            "?source={}",
+            super::timeline::work_source(ctx, config, slug)?.id
+        ),
+        None => String::new(),
+    };
     remote::api(
         config,
         "POST",
-        &format!("/repos/{repo}/steps"),
+        &format!("/repos/{repo}/steps{source}"),
         Some(&entry["upload"]),
     )?;
     entry["uploaded"] = json!(true);
@@ -419,7 +433,13 @@ fn upload_one(config: &Config, repo: &str, path: &PathBuf, mut entry: Value) -> 
 
 /// Uploads the context of these commits (with inherited context for rewritten
 /// ones). Failures are reported, never fatal: `gm context sync` retries.
-pub fn upload_commits(config: &Config, repo: &str, ws: &Workspace, oids: &[Oid]) -> Uploads {
+pub fn upload_commits(
+    ctx: &Ctx,
+    config: &Config,
+    repo: &str,
+    ws: &Workspace,
+    oids: &[Oid],
+) -> Uploads {
     let mut result = Uploads::default();
     for oid in oids {
         let Ok(Some((path, entry))) = entry_for(ws, *oid) else {
@@ -428,7 +448,7 @@ pub fn upload_commits(config: &Config, repo: &str, ws: &Workspace, oids: &[Oid])
         if entry["uploaded"].as_bool() == Some(true) {
             continue;
         }
-        match upload_one(config, repo, &path, entry) {
+        match upload_one(ctx, config, repo, &path, entry) {
             Ok(()) => result.uploaded += 1,
             Err(e) => result
                 .failed
@@ -439,7 +459,7 @@ pub fn upload_commits(config: &Config, repo: &str, ws: &Workspace, oids: &[Oid])
 }
 
 /// Uploads every journal entry the server doesn't have yet.
-pub fn upload_pending(config: &Config, repo: &str, ws: &Workspace) -> Uploads {
+pub fn upload_pending(ctx: &Ctx, config: &Config, repo: &str, ws: &Workspace) -> Uploads {
     let mut result = Uploads::default();
     for (path, entry) in entries_all(ws) {
         if entry["uploaded"].as_bool() == Some(true) {
@@ -449,7 +469,7 @@ pub fn upload_pending(config: &Config, repo: &str, ws: &Workspace) -> Uploads {
             .as_str()
             .unwrap_or("")
             .to_string();
-        match upload_one(config, repo, &path, entry) {
+        match upload_one(ctx, config, repo, &path, entry) {
             Ok(()) => result.uploaded += 1,
             Err(e) => {
                 result
@@ -645,13 +665,17 @@ pub fn lookup(ctx: &Ctx, ws: &Workspace, oids: &[Oid]) -> (HashMap<Oid, StepView
         return (found, None);
     };
     let config = Config::load();
+    let source = match super::timeline::source_query(ctx, &config) {
+        Ok(source) => source,
+        Err(error) => return (found, Some(error.message)),
+    };
     for chunk in oids.chunks(100) {
         let list = chunk
             .iter()
             .map(Oid::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let path = format!("/repos/{repo}/steps?commits={list}&limit=100");
+        let path = format!("/repos/{repo}/steps?commits={list}&limit=100&{source}");
         match remote::api(&config, "GET", &path, None) {
             Ok(page) => {
                 for step in page["steps"].as_array().into_iter().flatten() {
@@ -774,7 +798,7 @@ pub fn sync(ctx: &Ctx) -> Result<Synced> {
             message: format!("dry run: {pending} step context(s) would be uploaded"),
         });
     }
-    let uploads = upload_pending(&config, &repo, &ws);
+    let uploads = upload_pending(ctx, &config, &repo, &ws);
     let message = if uploads.failed.is_empty() {
         format!("Uploaded {} step context(s).", uploads.uploaded)
     } else {

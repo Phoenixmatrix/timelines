@@ -4,13 +4,13 @@
 // ?tl=, the code browser and CI follow its bookmark, the Knowledge tab's old
 // ?timeline= becomes ?tl=, the graph's inspector flags it experimental (the
 // banner shows it, Stalled leaves it out), and Back to main leaves it. The
-// timeline, its bookmark and the flag are the Worker's own, in memory; file
-// listings and CI runs are canned.
+// timeline, its owned work source and the flag are the Worker's own, in memory;
+// file listings and CI runs are canned, with source addressing asserted.
 
 import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { CiRunList } from "../../shared/api.ts";
-import type { TimelineList } from "../../shared/timelines.ts";
+import type { Timeline, TimelineList } from "../../shared/timelines.ts";
 import type { TrackerList } from "../../shared/tracker.ts";
 import { commitId } from "../testing/atlas.ts";
 import { cannedFiles } from "../testing/git.ts";
@@ -24,15 +24,23 @@ test("a timeline chosen in the rail scopes code, CI, Knowledge and the timelines
   await server.push("orbit/engine", "main", head);
   const slug = `switch-${commitId().slice(0, 8)}`;
   const name = `Switcher ${slug.slice(-8)}`;
-  const bookmark = `timeline/${slug}`;
-  // Forking writes the bookmark in the repository at main's tip.
-  await server.call("POST", "/api/tracker/orbit/timelines", {
-    slug,
-    name,
-    repos: ["orbit/engine"],
-  });
+  const bookmark = "work";
+  // Forking allocates a separately authorized source, never a canonical work bookmark.
+  const created = await server.call<{ timeline: Timeline }>(
+    "POST",
+    "/api/tracker/orbit/timelines",
+    {
+      slug,
+      name,
+      repos: ["orbit/engine"],
+    },
+  );
+  const source = created.timeline.repos[0]!.source!;
+  expect(source.kind).toBe("timeline-work");
+  const workHead = commitId();
+  await server.push("orbit/engine", bookmark, workHead, source.sourceId);
   // Files, history and runs need git objects and runners, which aren't here.
-  cannedFiles(server, head);
+  cannedFiles(server, workHead);
   server.on("GET", "/api/repos/:owner/:name/ci", (): CiRunList => ({ runs: [], runner: "local" }));
 
   const app = renderApp("/orbit/engine");
@@ -42,10 +50,27 @@ test("a timeline chosen in the rail scopes code, CI, Knowledge and the timelines
 
   await userEvent.click(page.getByRole("button", { name: /^Timeline: main/ }));
   await userEvent.click(page.getByRole("link", { name: new RegExp(name) }));
-  await app.waitForUrl((url) => url.searchParams.get("tl") === slug);
+  await app.waitForUrl(
+    (url) =>
+      url.searchParams.get("tl") === slug && url.searchParams.get("source") === source.sourceId,
+  );
   await expect.element(banner).toMatchTextContent(name);
-  await expect.element(banner).toMatchTextContent(`Code on ${bookmark}`);
   await expect.element(page.getByLabelText("Branch or tag")).toMatchTextContent(bookmark);
+  const readme = page.getByRole("link", { name: "README.md", exact: true });
+  await expect
+    .poll(() =>
+      new URL(readme.element().getAttribute("href")!, "https://gitmatrix.invalid").searchParams.get(
+        "source",
+      ),
+    )
+    .toBe(source.sourceId);
+  expect(
+    server.requests.some(
+      (request) =>
+        request.url.pathname.endsWith("/tree") &&
+        request.url.searchParams.get("source") === source.sourceId,
+    ),
+  ).toBe(true);
 
   // Links carry the scope, and so does navigating by them.
   const ci = page.getByRole("link", { name: "CI", exact: true });
@@ -53,12 +78,12 @@ test("a timeline chosen in the rail scopes code, CI, Knowledge and the timelines
   await userEvent.click(ci);
   await app.waitForUrl((url) => url.pathname.endsWith("/ci"));
   expect(app.url().searchParams.get("tl"), "Navigation keeps the scope").toBe(slug);
-  await expect.element(banner).toMatchTextContent(`Runs on ${bookmark}`);
   expect(
     server.requests.some(
       (r) =>
         r.url.pathname === "/api/repos/orbit/engine/ci" &&
-        r.url.searchParams.get("ref") === bookmark,
+        r.url.searchParams.get("ref") === bookmark &&
+        r.url.searchParams.get("source") === source.sourceId,
     ),
     "CI lists the bookmark's runs",
   ).toBe(true);
@@ -92,6 +117,7 @@ test("a timeline chosen in the rail scopes code, CI, Knowledge and the timelines
 
   await userEvent.click(banner.getByRole("link", { name: "Back to main" }));
   await app.waitForUrl((url) => url.searchParams.get("tl") === "main");
+  expect(app.url().searchParams.get("source")).toBeNull();
   await expect.element(banner).not.toBeInTheDocument();
 });
 

@@ -4,7 +4,7 @@
 //
 // Resolution, per category and threshold:
 // - account categories: the account's stored value, else the site-wide
-//   default, else the category's default; `enabled` likewise, ending at false.
+//   default, else the category's default; `enabled` likewise, normally false.
 // - site categories: the site's stored value, else the category's default.
 // - "active" categories always run, per account. Previews' thresholds live in
 //   account_settings (the columns the preview sweep reads), so changing them
@@ -87,7 +87,7 @@ function resolve(
       }
     }
   }
-  let enabled = c.control !== "policy";
+  let enabled = c.control !== "policy" || c.defaultEnabled === true;
   let enabledFrom: PolicySource = "default";
   if (c.control === "policy")
     for (const level of levels) {

@@ -4,8 +4,8 @@
 // (worker/retention/policies.ts, api.ts), the cleanup engine, the admin UI and
 // the usage report.
 //
-// Every "policy" category is disabled until an administrator enables it; then
-// its thresholds default to the values here, each configurable within bounds,
+// "policy" categories are disabled until an administrator enables them unless
+// defaultEnabled is set; thresholds default to the values here, within bounds,
 // per account (account scope) or for the whole site (site scope; site
 // administrators also set site-wide defaults for account categories).
 //
@@ -99,6 +99,24 @@ export const CATEGORIES = [
       "Knowledge overlays, regroupings and page sets of timelines that ended more than the given days ago.",
     never: ["Data of open timelines", "Anything on the main line"],
     thresholds: [days("days", "Days after the timeline ended", 90)],
+  },
+  {
+    id: "timeline-work-sources",
+    scope: "account",
+    control: "policy",
+    defaultEnabled: true,
+    label: "Timeline work Git repositories",
+    description:
+      "Read-only work Git repositories expire independently of Tracker details and published outputs, after landing or abandonment.",
+    never: [
+      "Canonical Git repositories and historical canonical sources",
+      "Open timeline sources",
+      "Sources required by live dependencies or unacknowledged consumers",
+    ],
+    thresholds: [
+      days("landedDays", "Days after landing", 30),
+      days("abandonedDays", "Days after abandonment", 90),
+    ],
   },
   {
     id: "push-log",

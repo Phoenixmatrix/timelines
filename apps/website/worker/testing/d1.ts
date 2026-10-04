@@ -9,10 +9,12 @@ export /** Enough of D1 over node:sqlite for Kysely (kysely-d1) and Better Auth'
 function d1(sqlite: DatabaseSync): D1Database {
   const statement = (sql: string, params: SQLInputValue[] = []) => {
     const run = () => {
+      const total = () => (sqlite.prepare("SELECT total_changes() AS c").get() as { c: number }).c;
+      const before = total();
       const prepared = sqlite.prepare(sql);
       const results = prepared.all(...params) as Record<string, unknown>[];
-      const { c } = sqlite.prepare("SELECT changes() AS c").get() as { c: number };
-      return { results, changes: c };
+      // D1 counts trigger writes too, not just the outer statement's changes().
+      return { results, changes: total() - before };
     };
     return {
       bind: (...next: SQLInputValue[]) => statement(sql, next),

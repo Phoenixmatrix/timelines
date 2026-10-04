@@ -17,7 +17,7 @@ import { batch, db, nowIso } from "../schema.ts";
 import { releaseHeld, UNCHANGED } from "./coalesce.ts";
 import { concurrencyGate } from "./concurrency.ts";
 import { stages, type JobSpec } from "./config.ts";
-import { doneEvent, type StoredJob } from "./jobs.ts";
+import { doneEvent, failDispatch, type StoredJob } from "./jobs.ts";
 import { sandbox } from "./sandbox.ts";
 import { startWorkflow, type RunParams } from "./trigger.ts";
 import { afterRun, settled } from "../timelines/landing.ts";
@@ -130,10 +130,16 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     await step.do("release", DB_STEP, async () => {
       const run = await kdb
         .selectFrom("ci_runs")
-        .select(["repo_id", "ref"])
+        .select(["repo_id", "source_id", "ref"])
         .where("id", "=", runId)
         .executeTakeFirstOrThrow();
-      return releaseHeld(this.env.DB, run.repo_id, run.ref, (id) => startWorkflow(this.env, id));
+      return releaseHeld(
+        this.env.DB,
+        run.repo_id,
+        run.ref,
+        (id) => startWorkflow(this.env, id),
+        run.source_id,
+      );
     });
 
     // A landing's merge or gates move the landing on; a timeline's own run may
@@ -277,13 +283,9 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
           ? "No runner finished this job in time. Under `vp dev` runners start on their own; otherwise run `gm runner --once`."
           : `The sandbox failed: ${error instanceof Error ? error.message : String(error)}`;
       await step.do(`fail:${job.name}`, DB_STEP, async () => {
-        await kdb
-          .updateTable("ci_jobs")
-          .set({ status: "failed", error: message, finished_at: nowIso() })
-          .where("id", "=", job.id)
-          .where("status", "in", ["pending", "queued", "running"])
-          .execute();
+        await failDispatch(d1, job.id, message);
       });
+      return "failed";
     }
 
     return step.do(`result:${job.name}`, DB_STEP, async () => {

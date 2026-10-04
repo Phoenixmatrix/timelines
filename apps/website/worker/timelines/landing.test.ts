@@ -1,670 +1,660 @@
-// The landing queue (CORE-77): two timelines landing in parallel (one when
-// green, one after approval), a conflict that asks for a sync, gates that
-// fail, and a multi-repository landing that is partly landed and retries.
-// Git and CI are the in-memory fakes: a merge job "runs" when a test points
-// the landing branch at a merge commit and marks its run finished.
-
-import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
-import type { Landing, LandResult, TimelineDetail } from "../../shared/timelines.ts";
-import type { Issue, Snapshot } from "../../shared/tracker.ts";
-import { issueToken } from "../api/tokens.ts";
-import { tokenCredential, type AppEnv } from "../auth.ts";
+import { describe, expect, test, vi } from "vite-plus/test";
+import type { Landing, LandingRepo, Timeline } from "../../shared/timelines.ts";
+import type { SourceSnapshot } from "../../shared/code-source.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
-import { durableStorage } from "../testing/durable.ts";
-import { fakeRemotes, type FakeRemote } from "../testing/remote.ts";
-import { Tracker } from "../tracker/object.ts";
-import { tracker as trackerRoutes } from "../tracker/api.ts";
-import { trackerObject } from "../tracker/stub.ts";
-import { logPush } from "./activity.ts";
-import { timelines } from "./api.ts";
-import { afterRun, progress, workerDeps, type LandingDeps } from "./landing.ts";
+import { progress, type LandingDeps } from "./landing.ts";
+import { measure } from "./checkpoints.ts";
+import { lsRefs } from "../artifacts.ts";
+import type * as Artifacts from "../artifacts.ts";
+import {
+  admittedReceipts,
+  recordIntent,
+  revisionClosure,
+  validateDependencies,
+  validateMergeEdges,
+} from "./integration.ts";
 
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
-
-const oid = (n: number) => n.toString(16).padStart(40, "0");
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
-
-async function setup() {
+vi.mock("../artifacts.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof Artifacts>()),
+  lsRefs: vi.fn(),
+}));
+vi.mock("../tracker/stub.ts", () => ({
+  trackerObject: (env: Env, owner: string) => env.TRACKER.getByName(owner),
+}));
+const oid = (value: number) => value.toString(16).padStart(40, "0");
+function fixture(count = 2) {
   const sqlite = migratedDatabase();
-  // Ann owns Orbit; Ben writes to its repositories; his agent bot works for him.
-  sqlite.exec(`
-    INSERT INTO accounts (id, kind, slug, display_name, member_repo_role) VALUES
-      ('ann', 'user', 'ann', 'Ann', NULL), ('ben', 'user', 'ben', 'Ben', NULL),
-      ('orbit', 'org', 'orbit', 'Orbit', 'read');
-    INSERT INTO org_members (org_id, user_id, role) VALUES
-      ('orbit', 'ann', 'owner'), ('orbit', 'ben', 'member');
-    INSERT INTO agents (id, name, accountable_id) VALUES ('agt_bot', 'bot', 'ben');
-    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
-      ('app', 'orbit', 'app', 'private', 'r-app', 'https://app'),
-      ('lib', 'orbit', 'lib', 'private', 'r-lib', 'https://lib');
-    INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES
-      ('app', 'ben', 'write'), ('lib', 'ben', 'write');
-  `);
-  const git = fakeRemotes();
-  const remotes: Record<string, FakeRemote> = {
-    app: git.add("https://app", { "refs/heads/main": oid(1) }),
-    lib: git.add("https://lib", { "refs/heads/main": oid(2) }),
+  sqlite.exec(
+    "INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner')",
+  );
+  const graphs = new Map<
+    string,
+    Map<string, { parents: string[]; treeHash: string; hash: string; message: string }>
+  >();
+  const refs = new Map<string, Map<string, string>>();
+  const repos: LandingRepo[] = [];
+  for (let n = 0; n < count; n++) {
+    const id = `repo${n}`,
+      sourceId = `work_${n}`,
+      base = oid(n * 10 + 1),
+      work = oid(n * 10 + 2),
+      candidate = oid(n * 10 + 3);
+    sqlite.exec(`INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote) VALUES('${id}','owner','${id}','private','${id}','https://${id}');
+      INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,initial_token_revoked)
+      VALUES('${sourceId}','${id}','timeline','test','owner','${sourceId}','https://${sourceId}','ready','allocation${n}','canonical','${base}','${oid(101)}','refs/heads/main','canonical','${base}','${oid(101)}','refs/heads/main','now','now',1);`);
+    graphs.set(
+      id,
+      new Map([
+        [base, { parents: [], treeHash: oid(101), hash: base, message: "base" }],
+        [candidate, { parents: [base], treeHash: oid(102), hash: candidate, message: "compact" }],
+      ]),
+    );
+    graphs.set(
+      sourceId,
+      new Map([
+        [base, { parents: [], treeHash: oid(101), hash: base, message: "base" }],
+        [work, { parents: [base], treeHash: oid(102), hash: work, message: "work" }],
+      ]),
+    );
+    refs.set(
+      id,
+      new Map([
+        ["refs/heads/main", base],
+        ["refs/heads/gitmatrix/landing/test", candidate],
+      ]),
+    );
+    refs.set(sourceId, new Map([["refs/heads/work", work]]));
+    const source: SourceSnapshot = {
+      repoId: id,
+      sourceId,
+      kind: "timeline-work",
+      timelineId: "timeline",
+      ref: "refs/heads/work",
+      commit: work,
+      tree: oid(102),
+    };
+    repos.push({
+      id,
+      owner: "owner",
+      name: id,
+      commit: work,
+      base,
+      merge: candidate,
+      attempt: 1,
+      state: "tested",
+      mergeRun: { id: `merge${n}`, number: 1 },
+      gateRun: null,
+      reason: null,
+      source,
+      logicalBase: {
+        repoId: id,
+        sourceId: "canonical",
+        kind: "canonical",
+        timelineId: null,
+        ref: "refs/heads/main",
+        commit: base,
+        tree: oid(101),
+      },
+      dependencies: [],
+    });
+  }
+  let current: Landing = {
+    id: "landing",
+    timelineId: "timeline",
+    slug: "test",
+    checkpointId: "checkpoint",
+    checkpointNumber: 1,
+    state: "advancing",
+    repos,
+    reason: null,
+    trigger: "request",
+    requestedBy: { actorId: "owner", accountableId: "owner", agentId: null },
+    version: 1,
+    createdAt: "now",
+    updatedAt: "now",
   };
-  vi.stubGlobal("fetch", git.fetch);
-  const trackers = new Map<string, Tracker>();
-  const workflows: string[] = [];
+  const tracker = {
+    saveLanding: async (next: Landing, version: number) => {
+      if (version !== current.version) return { ok: false, code: "version_conflict" };
+      current = { ...next, version: version + 1 };
+      return { ok: true, value: current };
+    },
+    landing: async () => ({ ok: true, value: current }),
+    completeLanding: async (_access: unknown, next: Landing) => {
+      current = { ...next, state: "landed", version: next.version + 1 };
+      return { ok: true, value: current };
+    },
+    transitionWorkSource: async (sourceId: string, version: number, state: string) => ({
+      ok: true,
+      value: {
+        source_id: sourceId,
+        version: version + 1,
+        state,
+        archived_at: "2026-10-04T00:00:00Z",
+        updated_at: "2026-10-04T00:00:00Z",
+      },
+    }),
+  };
   const env = {
     DB: d1(sqlite),
-    ARTIFACTS: git.artifacts,
-    CI_RUNNER: "local",
-    // Like Workflows: an instance id is created once.
-    CI_RUN: {
-      create: async ({ id }: { id: string }) => {
-        if (workflows.includes(id)) throw new Error(`instance ${id} already exists`);
-        workflows.push(id);
-        return { id };
-      },
-      get: async (id: string) => {
-        if (!workflows.includes(id)) throw new Error(`no instance ${id}`);
-        return { id };
-      },
-    },
-    TRACKER: {
-      getByName: (id: string) => {
-        if (!trackers.has(id)) {
-          const { sql, transactionSync } = durableStorage();
-          const ctx = { storage: { sql, transactionSync } } as unknown as DurableObjectState;
-          trackers.set(id, new Tracker(ctx, {} as Env));
-        }
-        return trackers.get(id);
-      },
+    TRACKER: { getByName: () => tracker },
+    ARTIFACTS: {
+      get: async (name: string) => ({
+        readCommit: async (commit: string) => graphs.get(name)?.get(commit) ?? null,
+        [Symbol.dispose]() {},
+      }),
     },
   } as unknown as Env;
-  const server = new Hono<AppEnv>();
-  server.use("*", async (c, next) => {
-    const credential = await tokenCredential(c);
-    c.set("actor", credential.kind === "token" ? credential.actor : null);
-    return next();
-  });
-  server.route("/api/tracker/:owner/timelines", timelines);
-  server.route("/api", trackerRoutes);
-  const tokens = {
-    ann: (await issueToken(env.DB, "ann", "t", "write")).secret,
-    ben: (await issueToken(env.DB, "ben", "t", "write")).secret,
-    bot: (await issueToken(env.DB, "ben", "t", "write", undefined, "agt_bot")).secret,
-  };
-  const pending: Promise<unknown>[] = [];
-  const drain = async () => {
-    while (pending.length) await Promise.all(pending.splice(0));
-  };
-  const executionCtx = {
-    waitUntil: (work: Promise<unknown>) => pending.push(work),
-    passThroughOnException() {},
-    props: {},
-  } as unknown as ExecutionContext;
-  const raw = async (who: keyof typeof tokens, method: string, path: string, body?: unknown) => {
-    const response = await server.request(
-      `/api${path}`,
-      {
-        method,
-        headers: {
-          authorization: `Bearer ${tokens[who]}`,
-          ...(body === undefined ? {} : { "content-type": "application/json" }),
-        },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      },
-      env,
-      executionCtx,
-    );
-    await drain();
-    return { status: response.status, body: (await response.json()) as any };
-  };
-  const call = (who: keyof typeof tokens, method: string, path: string, body?: unknown) =>
-    raw(who, method, `/tracker/orbit/timelines${path}`, body);
-
-  // CI as the queue sees it: merge jobs start for real (rows and a Workflow);
-  // gates are rows the test finishes; parents are what the merge job made.
-  const parents = new Map<string, string[]>();
-  const moved: string[] = [];
-  /** Ref writes go through here: a test may step in, as another worker would. */
-  const hooks: {
-    beforeWrite?: (repo: string, ref: string) => void | Promise<void>;
-  } = {};
-  const base = workerDeps(env, (work) => pending.push(work));
+  const writes: string[] = [],
+    starts: string[] = [];
   const deps: LandingDeps = {
-    ...base,
-    writeRefs: async (repo, writes) => {
-      for (const write of writes) await hooks.beforeWrite?.(repo.id, write.ref);
-      return base.writeRefs(repo, writes);
+    refs: async (repo) => new Map(refs.get(repo.artifacts_name)),
+    parents: async (repo, commit) => graphs.get(repo.artifacts_name)?.get(commit)?.parents ?? null,
+    writeRefs: async (repo, changes) =>
+      changes.map((change) => {
+        const target = refs.get(repo.artifacts_name)!;
+        if ((target.get(change.ref) ?? null) !== change.old)
+          return { ref: change.ref, ok: false, reason: "stale" };
+        if (change.new) target.set(change.ref, change.new);
+        else target.delete(change.ref);
+        if (change.ref === "refs/heads/main") writes.push(repo.id);
+        return { ref: change.ref, ok: true };
+      }),
+    startMerge: async (repo) => {
+      starts.push(repo.id);
     },
-    parents: async (_repo, commit) => parents.get(commit) ?? (git.commits.has(commit) ? [] : null),
-    startGates: async (repo, options) => {
-      sqlite
-        .prepare(
-          `INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, title, status, landing_id)
-           VALUES (?, ?, (SELECT coalesce(max(number), 0) + 1 FROM ci_runs WHERE repo_id = ?), ?, ?, 'manual', 'gates', 'queued', ?)`,
-        )
-        .run(options.runId, repo.id, repo.id, options.commit, options.branch, options.landingId);
-      sqlite
-        .prepare(
-          `INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner) VALUES (?, ?, ?, 'test', '{}', 'queued', 'local')`,
-        )
-        .run(`job-${options.runId}`, options.runId, repo.id);
-      return { runId: options.runId };
-    },
-    mainMoved: (repo, actor) => {
-      moved.push(repo.id);
-      pending.push(logPush(env, repo, actor));
-    },
+    startGates: async () => ({ skipped: "no pipeline" }),
+    runOutcome: async () => null,
+    mainMoved() {},
+    refsDeleted: async () => {},
   };
-
-  let commit = 100;
-  /** Push work to a timeline's bookmark in a repository. */
-  const push = (repo: string, slug: string) => {
-    const at = oid(++commit);
-    git.commits.add(at);
-    remotes[repo]!.refs.set(`refs/heads/timeline/${slug}`, at);
-    return at;
-  };
-  const landing = async (slug: string): Promise<Landing> =>
-    (await call("ben", "GET", `/${slug}/landing`)).body.landing;
-  const repoOf = async (slug: string, repo: string) =>
-    (await landing(slug)).repos.find((r) => r.id === repo)!;
-  const finish = async (runId: string, status: "succeeded" | "failed", exitCode?: number) => {
-    sqlite
-      .prepare(`UPDATE ci_runs SET status = ?, finished_at = ? WHERE id = ?`)
-      .run(status, new Date().toISOString(), runId);
-    sqlite
-      .prepare(`UPDATE ci_jobs SET status = ?, exit_code = ? WHERE run_id = ?`)
-      .run(status, exitCode ?? (status === "succeeded" ? 0 : 1), runId);
-    await afterRun(env, deps, runId);
-    await drain();
-  };
-  /** The merge job of a repository's current attempt merged cleanly. */
-  const merged = async (slug: string, repo: string) => {
-    const r = await repoOf(slug, repo);
-    const merge = oid(++commit);
-    git.commits.add(merge);
-    parents.set(merge, [r.base!, r.commit]);
-    remotes[repo]!.refs.set(`refs/heads/gitmatrix/landing/${slug}`, merge);
-    await finish(r.mergeRun!.id, "succeeded");
-    return merge;
-  };
-  /** The gates on a repository's merge finished. */
-  const gates = async (slug: string, repo: string, status: "succeeded" | "failed" = "succeeded") =>
-    finish((await repoOf(slug, repo)).gateRun!.id, status);
-  const mutate = (who: keyof typeof tokens, mutations: unknown[], timeline?: string) =>
-    raw(who, "POST", "/tracker/orbit/mutate", {
-      operationId: crypto.randomUUID(),
-      mutations,
-      ...(timeline ? { timeline } : {}),
-    });
-  const snapshot = async (timeline?: string): Promise<Snapshot> =>
-    (await raw("ben", "GET", `/tracker/orbit/snapshot${timeline ? `?timeline=${timeline}` : ""}`))
-      .body;
-  await mutate("ann", [
-    { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } },
-    { kind: "issue.create", id: "a", data: { teamId: "team", title: "Search" } },
-    { kind: "issue.create", id: "b", data: { teamId: "team", title: "UI" } },
-  ]);
-  /** The bot claims and finishes an issue inside a timeline. */
-  const finishIssue = async (id: string, slug: string) => {
-    const claimed = await mutate(
-      "bot",
-      [{ kind: "issue.claim", id, data: { agent: "bot" } }],
-      slug,
-    );
-    await mutate(
-      "bot",
-      [
-        {
-          kind: "issue.complete",
-          id,
-          data: { leaseToken: claimed.body.results[0].leaseToken, evidence: "Done." },
-        },
-      ],
-      slug,
-    );
-  };
-  const fork = async (slug: string, policy: "auto" | "approval", repos = ["orbit/app"]) =>
-    (await call("bot", "POST", "", { slug, policy, repos })).body.timeline;
-  const checkpoint = async (slug: string) =>
-    (await call("bot", "POST", `/${slug}/checkpoints`, {})).body;
-  /** A CI run of a commit on the bookmark, still running. */
-  const running = (repo: string, slug: string, commit: string) => {
-    const id = crypto.randomUUID().replaceAll("-", "");
-    sqlite
-      .prepare(
-        `INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, title, status)
-         VALUES (?, ?, (SELECT coalesce(max(number), 0) + 1 FROM ci_runs WHERE repo_id = ?), ?, ?, 'push', 'x', 'running')`,
-      )
-      .run(id, repo, repo, commit, `timeline/${slug}`);
-    return id;
-  };
-  /** A green CI run of the checkpoint's commit on the bookmark, which just ended. */
-  const green = (repo: string, slug: string, commit: string) =>
-    finish(running(repo, slug, commit), "succeeded");
-  const detail = async (slug: string): Promise<TimelineDetail> =>
-    (await call("ben", "GET", `/${slug}`)).body;
   return {
+    sqlite,
     env,
     deps,
-    sqlite,
-    remotes,
-    hooks,
-    workflows,
-    moved,
-    call,
-    mutate,
-    snapshot,
-    push,
-    fork,
-    checkpoint,
-    green,
-    running,
-    merged,
-    gates,
-    finish,
-    landing,
-    repoOf,
-    finishIssue,
-    detail,
+    refs,
+    graphs,
+    writes,
+    starts,
+    get current() {
+      return current;
+    },
+    run: () => progress(env, deps, "owner", current),
   };
 }
 
-describe("the landing queue", () => {
-  test("two timelines land in parallel: one when green, one after approval", async () => {
-    const t = await setup();
-    await t.fork("search", "auto");
-    await t.fork("ui", "approval");
-    await t.finishIssue("a", "search");
-    await t.finishIssue("b", "ui");
-    const searchWork = t.push("app", "search");
-    const uiWork = t.push("app", "ui");
-    const searchRun = t.running("app", "search", searchWork);
-    await t.checkpoint("search");
-    const ui = await t.checkpoint("ui");
-    // Its CI is still running: not green, not queued.
-    expect(await t.landing("search")).toBeNull();
-    const wait = await t.call("bot", "POST", "/search/land");
-    expect(wait.body).toMatchObject({ code: "not_green" });
-    expect(wait.body.error).toMatch(/CI run #1 on orbit\/app is still running/);
-
-    // An approval timeline doesn't land on its own, nor on request, before approval.
-    const early = await t.call("bot", "POST", "/ui/land");
-    expect(early.status).toBe(409);
-    expect(early.body).toMatchObject({ code: "needs_approval" });
-    expect(early.body.error).toMatch(/needs a person's approval/);
-
-    // The auto timeline's checkpoint goes green: it enters the queue.
-    await t.finish(searchRun, "succeeded");
-    expect(await t.landing("search")).toMatchObject({
-      state: "merging",
-      trigger: "auto",
-      repos: [{ id: "app", base: oid(1), commit: searchWork, attempt: 1 }],
+describe("compact landing state", () => {
+  test("a failing gate blocks every repository", async () => {
+    const f = fixture();
+    f.current.repos[1]!.state = "testing";
+    f.current.repos[1]!.gateRun = { id: "gate", number: 2 };
+    f.deps.runOutcome = async () => ({
+      number: 2,
+      status: "failed",
+      conflict: false,
+      failedJobs: ["verify"],
     });
-    expect(t.remotes.app!.refs.get("refs/heads/gitmatrix/landing/search")).toBe(searchWork);
-    expect((await t.detail("search")).timeline.status).toBe("landing");
-
-    // A person approves ui's checkpoint: it enters the queue too.
-    const ask = await t.mutate("bot", [
-      {
-        kind: "request.open",
-        id: "req-ui",
-        data: {
-          issueId: "b",
-          kind: "approval",
-          prompt: "Land ui?",
-          checkpoint: ui.checkpoint.id,
-        },
-      },
-    ]);
-    expect(ask.status).toBe(200);
-    await t.mutate("ben", [{ kind: "request.answer", id: "req-ui", data: { approved: true } }]);
-    expect(await t.landing("ui")).toMatchObject({ state: "merging", trigger: "approval" });
-
-    // search merges, its gates pass, and main advances to the tested merge.
-    const searchMerge = await t.merged("search", "app");
-    expect(await t.repoOf("search", "app")).toMatchObject({ state: "testing", merge: searchMerge });
-    expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(oid(1));
-    expect(await trackerObject(t.env, "orbit").landingForCommit("app", searchMerge)).toEqual({
-      ok: true,
-      value: null,
+    expect((await f.run()).state).toBe("failed");
+    expect(f.writes).toEqual([]);
+  });
+  test("moving B is rematerialized before any CAS on A", async () => {
+    const f = fixture();
+    const b = f.current.repos[1]!;
+    f.graphs.get(b.id)!.set(oid(99), {
+      parents: [b.base!],
+      treeHash: oid(103),
+      hash: oid(99),
+      message: "main moved",
     });
-    await t.gates("search", "app");
-    expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(searchMerge);
-    expect(await t.landing("search")).toMatchObject({ state: "landed" });
-    expect(t.moved).toEqual(["app"]);
-
-    // ui's merge was tested on the old main: main moved, so it merges again.
-    await t.merged("ui", "app");
-    await t.gates("ui", "app");
-    expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(searchMerge);
-    expect(await t.repoOf("ui", "app")).toMatchObject({
-      state: "merging",
-      attempt: 2,
-      base: searchMerge,
-      commit: uiWork,
-    });
-    const uiMerge = await t.merged("ui", "app");
-    await t.gates("ui", "app");
-    expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(uiMerge);
-    expect(await t.landing("ui")).toMatchObject({ state: "landed" });
-    // Exact repository advances remain discoverable after a later landing.
-    expect(await trackerObject(t.env, "orbit").landingForCommit("app", searchMerge)).toEqual({
-      ok: true,
-      value: await t.landing("search"),
-    });
-    expect(await trackerObject(t.env, "orbit").landingForCommit("lib", searchMerge)).toEqual({
-      ok: true,
-      value: null,
-    });
-
-    // Both landed: bookmarks and landing branches gone, issues done, leases released.
-    for (const slug of ["search", "ui"]) {
-      const { timeline, events } = await t.detail(slug);
-      expect(timeline.status).toBe("landed");
-      expect(timeline.endedAt).toEqual(expect.any(String));
-      expect(t.remotes.app!.refs.has(`refs/heads/timeline/${slug}`)).toBe(false);
-      expect(t.remotes.app!.refs.has(`refs/heads/gitmatrix/landing/${slug}`)).toBe(false);
-      expect(
-        events.filter((e) => e.kind === "landing").map((e) => (e as { outcome: string }).outcome),
-      ).toEqual(["queued", "landed"]);
+    f.refs.get(b.id)!.set("refs/heads/main", oid(99));
+    await f.run();
+    expect(f.writes).toEqual([]);
+    expect(f.starts).toContain(b.id);
+    expect(f.current.repos[1]!.base).toBe(oid(99));
+  });
+  test("concurrent progress waits for the admitted CAS instead of failing a live publication", async () => {
+    const f = fixture(1);
+    const base = f.current.repos[0]!.base!;
+    const write = f.deps.writeRefs.bind(f.deps);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    f.deps.writeRefs = async (repo, changes) => {
+      if (changes[0]!.ref === "refs/heads/main") {
+        entered.resolve();
+        await release.promise;
+      }
+      return write(repo, changes);
+    };
+    const first = f.run();
+    await entered.promise;
+    try {
+      expect((await f.run()).state).toBe("advancing");
+      expect(f.refs.get("repo0")!.get("refs/heads/main")).toBe(base);
+      expect(f.writes).toEqual([]);
+    } finally {
+      release.resolve();
+      await first;
     }
-    const main = await t.snapshot();
-    for (const id of ["a", "b"])
-      expect(main.issues.find((i) => i.id === id)).toMatchObject({
-        status: "done",
-        doneIn: null,
-        claim: null,
-      });
-  });
-
-  test("a conflict stops the landing and asks for a sync; main doesn't move", async () => {
-    const t = await setup();
-    await t.fork("search", "auto");
-    await t.finishIssue("a", "search");
-    const work = t.push("app", "search");
-    await t.checkpoint("search");
-    await t.green("app", "search", work);
-    const run = (await t.repoOf("search", "app")).mergeRun!;
-    await t.finish(run.id, "failed", 42);
-    const landing = await t.landing("search");
-    expect(landing).toMatchObject({
-      state: "conflict",
-      repos: [{ state: "conflict" }],
-    });
-    expect(landing.reason).toMatch(/needs a sync: merge main into timeline\/search/);
-    expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(oid(1));
-    const { timeline, events } = await t.detail("search");
-    expect(timeline.status).toBe("active");
-    expect(events.at(-1)).toMatchObject({ kind: "landing", outcome: "conflict" });
-    // The issue is still done in the timeline, its lease retained.
-    const issue = (await t.snapshot()).issues.find((i) => i.id === "a") as Issue;
-    expect(issue).toMatchObject({
-      status: "done_in_timeline",
-      claim: { retainedIn: { slug: "search" } },
-    });
-    // Green again doesn't retry the same checkpoint on its own.
-    await t.green("app", "search", work);
-    expect((await t.landing("search")).id).toBe(landing.id);
-    // After a sync and a new checkpoint, it lands.
-    const synced = t.push("app", "search");
-    await t.checkpoint("search");
-    await t.green("app", "search", synced);
-    expect(await t.landing("search")).toMatchObject({ state: "merging" });
-    await t.merged("search", "app");
-    await t.gates("search", "app");
-    expect(await t.landing("search")).toMatchObject({ state: "landed" });
-  });
-
-  test("failing gates stop it: main never advances to an untested merge", async () => {
-    const t = await setup();
-    await t.fork("search", "approval");
-    t.push("app", "search");
-    await t.checkpoint("search");
-    // Approval timelines need a person; asking to land without one says so.
-    const refused = await t.call("ben", "POST", "/search/land");
-    expect(refused.body.code).toBe("needs_approval");
-    await t.fork("quick", "auto");
-    t.push("app", "quick");
-    await t.checkpoint("quick");
-    // No CI ran on it: nothing to wait for, so it's green and queued already.
-    const queued = await t.call("ben", "POST", "/quick/land");
-    expect(queued.status).toBe(200);
-    expect((queued.body as LandResult).queued).toBe(false);
-    await t.merged("quick", "app");
-    await t.gates("quick", "app", "failed");
-    const landing = await t.landing("quick");
-    expect(landing.state).toBe("failed");
-    expect(landing.reason).toMatch(/The gates failed on the merge into orbit\/app's main/);
-    expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(oid(1));
-    expect((await t.detail("quick")).timeline.status).toBe("active");
-    // Asking again retries.
-    const again = await t.call("ben", "POST", "/quick/land");
-    expect(again.status).toBe(202);
-    expect((again.body as LandResult).landing.id).not.toBe(landing.id);
-  });
-
-  test("across repositories: prepared everywhere first, then partly landed, then retried", async () => {
-    const t = await setup();
-    await t.fork("wide", "auto", ["orbit/app", "orbit/lib"]);
-    t.push("app", "wide");
-    t.push("lib", "wide");
-    await t.checkpoint("wide");
-    await t.call("ben", "POST", "/wide/land");
-    expect((await t.landing("wide")).repos.map((r) => r.state)).toEqual(["merging", "merging"]);
-    await t.merged("wide", "app");
-    await t.gates("wide", "app");
-    // app's merge passed, but lib isn't prepared: nothing advances yet.
-    expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(oid(1));
-    expect(await t.landing("wide")).toMatchObject({ state: "merging" });
-    const libMerge = await t.merged("wide", "lib");
-    // Meanwhile someone pushes to lib's main.
-    t.remotes.lib!.refs.set("refs/heads/main", oid(900));
-    await t.gates("wide", "lib");
-    const partly = await t.landing("wide");
-    expect(t.remotes.app!.refs.get("refs/heads/main")).not.toBe(oid(1));
-    expect(t.remotes.lib!.refs.get("refs/heads/main")).toBe(oid(900));
-    expect(partly.repos).toMatchObject([
-      { id: "app", state: "advanced" },
-      { id: "lib", state: "merging", attempt: 2, base: oid(900) },
-    ]);
-    expect(partly.repos[1]!.reason).toBeNull();
-    expect(libMerge).not.toBe(oid(900));
-    const { timeline, events } = await t.detail("wide");
-    expect(timeline.status).toBe("partly_landed");
-    expect(events.at(-1)).toMatchObject({ kind: "landing", outcome: "partly_landed" });
-    expect(
-      await trackerObject(t.env, "orbit").landingForCommit("app", partly.repos[0]!.merge!),
-    ).toEqual({ ok: true, value: partly });
-    expect(await trackerObject(t.env, "orbit").landingForCommit("lib", libMerge)).toEqual({
-      ok: true,
-      value: null,
-    });
-    // lib retries onto its new main, and the timeline lands.
-    const retried = await t.merged("wide", "lib");
-    await t.gates("wide", "lib");
-    expect(t.remotes.lib!.refs.get("refs/heads/main")).toBe(retried);
-    expect((await t.detail("wide")).timeline.status).toBe("landed");
-    expect(await t.landing("wide")).toMatchObject({
-      state: "landed",
-      repos: [{ state: "advanced" }, { state: "advanced", attempt: 2 }],
-    });
-    expect(await trackerObject(t.env, "orbit").landingForCommit("lib", retried)).toEqual({
-      ok: true,
-      value: await t.landing("wide"),
-    });
-    expect(await trackerObject(t.env, "orbit").landingForCommit("lib", libMerge)).toEqual({
-      ok: true,
-      value: null,
+    expect((await f.run()).state).toBe("landed");
+    expect(f.writes).toEqual(["repo0"]);
+    expect(f.sqlite.prepare("SELECT status FROM source_integration_receipts").get()).toEqual({
+      status: "complete",
     });
   });
-
-  test("an approval of a checkpoint that's no longer the head doesn't land", async () => {
-    const t = await setup();
-    await t.fork("ui", "approval");
-    t.push("app", "ui");
-    const cp = await t.checkpoint("ui");
-    await t.mutate("bot", [
-      {
-        kind: "request.open",
-        id: "req",
-        data: { issueId: "b", kind: "approval", prompt: "Land?", checkpoint: cp.checkpoint.id },
-      },
-    ]);
-    // New commits: the request is withdrawn as superseded, so approving fails.
-    t.push("app", "ui");
-    await t.checkpoint("ui");
-    const answer = await t.mutate("ben", [
-      { kind: "request.answer", id: "req", data: { approved: true } },
-    ]);
-    expect(answer.status).toBe(409);
-    expect(await t.landing("ui")).toBeNull();
-  });
-
-  test("abandoning a timeline while it lands stops the landing", async () => {
-    const t = await setup();
-    await t.fork("search", "auto");
-    t.push("app", "search");
-    await t.checkpoint("search");
-    await t.merged("search", "app");
-    const abandoned = await t.call("bot", "POST", "/search/abandon");
-    expect(abandoned.status).toBe(200);
-    await t.gates("search", "app");
-    expect(await t.landing("search")).toMatchObject({
-      state: "failed",
-      reason: "search was abandoned while it was landing.",
-    });
-    expect(t.remotes.app!.refs.get("refs/heads/main")).toBe(oid(1));
-    expect((await t.detail("search")).timeline).toMatchObject({
-      status: "abandoned",
-      endedAt: expect.any(String),
+  test("a tombstone before provider submission releases the known-unsubmitted admission", async () => {
+    const f = fixture(1);
+    const base = f.current.repos[0]!.base!;
+    f.sqlite.exec(`CREATE TRIGGER tombstone_after_landing_admission
+      AFTER INSERT ON source_operations WHEN NEW.kind='landing'
+      BEGIN UPDATE repos SET deleted_at='2026-10-04' WHERE id=NEW.repo_id; END`);
+    await f.run();
+    expect(f.writes).toEqual([]);
+    expect(f.refs.get("repo0")!.get("refs/heads/main")).toBe(base);
+    expect(f.sqlite.prepare("SELECT state FROM source_operations").get()).toEqual({
+      state: "rejected",
     });
   });
-
-  test("two looks at the same landing at once start one merge, and neither fails", async () => {
-    const t = await setup();
-    await t.fork("race", "approval");
-    const work = t.push("app", "race");
-    await t.checkpoint("race");
-    const tracker = (t.env.TRACKER as unknown as { getByName(id: string): Tracker }).getByName(
-      "orbit",
-    );
-    const access = {
-      actorId: "ben",
-      principalId: "ben",
-      agents: [],
-      owner: { id: "orbit", slug: "orbit", displayName: "Orbit" },
-      canAdmin: false,
-      members: [],
-      repos: [],
+  test("timeout after CAS reconciles candidate ancestry without duplicate publication", async () => {
+    const f = fixture(1),
+      write = f.deps.writeRefs.bind(f.deps);
+    f.deps.writeRefs = async (repo, changes) => {
+      const result = await write(repo, changes);
+      if (changes[0]!.ref === "refs/heads/main") throw new Error("timeout after provider success");
+      return result;
     };
-    const cp = (await t.call("ben", "GET", "/race/checkpoints/1")).body;
-    await t.mutate("bot", [
-      {
-        kind: "request.open",
-        id: "req-race",
-        data: { issueId: "a", kind: "approval", prompt: "Land?", checkpoint: cp.checkpoint.id },
-      },
-    ]);
-    // Approve in the tracker itself, without the route's own look: both looks
-    // below are the first to move the queued landing on.
-    const answered = tracker.mutate(
-      { ...access, writableRepoIds: ["app"] },
-      {
-        operationId: "approve-race",
-        mutations: [{ kind: "request.answer", id: "req-race", data: { approved: true } }],
-      },
-    );
-    expect(answered.ok).toBe(true);
-    const begun = tracker.beginLanding(access, "race", {
-      trigger: "approval",
-      green: { ok: true, why: null },
-      agentId: null,
+    await f.run();
+    expect(f.writes).toEqual(["repo0"]);
+    const candidate = f.current.repos[0]!.merge!;
+    f.graphs.get("repo0")!.set(oid(90), {
+      parents: [candidate],
+      treeHash: oid(105),
+      hash: oid(90),
+      message: "later main",
     });
-    if (!begun.ok) throw new Error(begun.error);
-    // The look that saves the merge run first is slow to write the landing
-    // branch: the other finds the run saved but not started, starts it, and
-    // the first one's write then finds the branch already moved.
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => (release = resolve));
-    let held = 0;
-    t.hooks.beforeWrite = async (_repo, ref) => {
-      if (ref === "refs/heads/gitmatrix/landing/race" && held++ === 0) await gate;
-    };
-    const first = progress(t.env, t.deps, "orbit", begun.value.landing);
-    const second = progress(t.env, t.deps, "orbit", begun.value.landing);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    release();
-    const [a, b] = await Promise.all([first, second]);
-    expect(held).toBe(2);
-    expect(a.id).toBe(b.id);
-    const landing = await t.landing("race");
-    expect(landing).toMatchObject({ state: "merging", reason: null, repos: [{ attempt: 1 }] });
-    const runs = t.sqlite
-      .prepare(`SELECT id FROM ci_runs WHERE landing_id = ?`)
-      .all(landing.id) as { id: string }[];
-    expect(runs.map((r) => r.id)).toEqual([landing.repos[0]!.mergeRun!.id]);
-    expect(t.workflows.filter((id) => id === runs[0]!.id)).toHaveLength(1);
-    expect(
-      t.sqlite.prepare(`SELECT count(*) AS n FROM ci_jobs WHERE run_id = ?`).get(runs[0]!.id),
-    ).toEqual({ n: 1 });
-    expect(t.remotes.app!.refs.get("refs/heads/gitmatrix/landing/race")).toBe(work);
-    // And it goes on to land.
-    t.hooks.beforeWrite = undefined;
-    await t.merged("race", "app");
-    await t.gates("race", "app");
-    expect(await t.landing("race")).toMatchObject({ state: "landed" });
+    f.refs.get("repo0")!.set("refs/heads/main", oid(90));
+    expect((await f.run()).state).toBe("landed");
+    expect(f.writes).toEqual(["repo0"]);
+    expect(f.sqlite.prepare("SELECT status FROM source_integration_receipts").get()).toEqual({
+      status: "complete",
+    });
   });
-
-  test("asking to land while the auto queue moves it on answers with the landing", async () => {
-    const t = await setup();
-    await t.fork("both", "auto");
-    t.push("app", "both");
-    const [made, asked] = await Promise.all([
-      t.checkpoint("both"),
-      new Promise((resolve) => setTimeout(resolve, 0)).then(() =>
-        t.call("bot", "POST", "/both/land"),
-      ),
-    ]);
-    expect(made.checkpoint.number).toBe(1);
-    // Before the checkpoint it says why not; after, it's the same landing.
-    if (asked.status === 409) expect(asked.body.code).toBe("no_checkpoint");
-    else expect([200, 202]).toContain(asked.status);
-    const landing = await t.landing("both");
-    expect(landing).toMatchObject({ state: "merging", reason: null });
-  });
-
-  test("a landing branch someone else already pointed at the checkpoint isn't an error", async () => {
-    const t = await setup();
-    // Green after the checkpoint: the run's end queues it, through this test's deps,
-    // and another worker writes the landing branch just before this one does.
-    const queue = async (slug: string, other: (work: string) => string) => {
-      await t.fork(slug, "auto");
-      const work = t.push("app", slug);
-      const run = t.running("app", slug, work);
-      await t.checkpoint(slug);
-      const branch = `refs/heads/gitmatrix/landing/${slug}`;
-      let raced = false;
-      t.hooks.beforeWrite = (repo, ref) => {
-        if (repo !== "app" || ref !== branch) return;
-        t.hooks.beforeWrite = undefined;
-        raced = true;
-        t.remotes.app!.refs.set(branch, other(work));
+  test.each(["before", "after"] as const)(
+    "publication %s the main observation preserves prepared candidates and gates",
+    async (timing) => {
+      const f = fixture();
+      for (const [index, repo] of f.current.repos.entries())
+        repo.gateRun = { id: `gate${index}`, number: 2 };
+      const prepared = structuredClone(f.current.repos);
+      const a = prepared[0]!;
+      const readRefs = f.deps.refs.bind(f.deps);
+      let reads = 0;
+      f.deps.refs = async (repo) => {
+        if (repo.id === a.id && repo.artifacts_name === a.id && ++reads === 2) {
+          const observed = new Map(await readRefs(repo));
+          // Another progress request completes CAS after this request's initial
+          // validation, but crashes before saving the advanced Tracker state.
+          await recordIntent(f.env, f.current, a, oid(102));
+          await f.deps.writeRefs(repo, [{ ref: "refs/heads/main", old: a.base, new: a.merge }]);
+          f.sqlite.exec(`INSERT INTO source_operations
+          (id,owner_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
+          VALUES('landing:landing:repo0','owner','timeline','repo0','work_0','landing','accepted','{}','now','now')`);
+          f.graphs.get(a.id)!.set(oid(90), {
+            parents: [a.merge!],
+            treeHash: oid(105),
+            hash: oid(90),
+            message: "independent main movement after CAS",
+          });
+          f.refs.get(a.id)!.set("refs/heads/main", oid(90));
+          return timing === "after" ? observed : readRefs(repo);
+        }
+        return readRefs(repo);
       };
-      await t.finish(run, "succeeded");
-      expect(raced).toBe(true);
-      return { work, landing: await t.landing(slug) };
+      const gates = vi.spyOn(f.deps, "startGates");
+      expect((await f.run()).state).toBe("landed");
+      expect(f.starts).toEqual([]);
+      expect(gates).not.toHaveBeenCalled();
+      expect(f.writes).toEqual(["repo0", "repo1"]);
+      expect(f.refs.get(a.id)!.get("refs/heads/main")).toBe(oid(90));
+      for (const [index, repo] of f.current.repos.entries()) {
+        expect(repo.merge).toBe(prepared[index]!.merge);
+        expect(repo.mergeRun).toEqual(prepared[index]!.mergeRun);
+        expect(repo.gateRun).toEqual(prepared[index]!.gateRun);
+      }
+      expect(
+        f.sqlite
+          .prepare("SELECT repo_id,status FROM source_integration_receipts ORDER BY repo_id")
+          .all(),
+      ).toEqual([
+        { repo_id: "repo0", status: "complete" },
+        { repo_id: "repo1", status: "complete" },
+      ]);
+    },
+  );
+  test("a dependency read transport failure preserves prepared work for the next progress request", async () => {
+    const f = fixture();
+    for (const [index, repo] of f.current.repos.entries())
+      repo.gateRun = { id: `gate${index}`, number: 2 };
+    const prepared = structuredClone(f.current.repos);
+    const parents = f.deps.parents.bind(f.deps);
+    let interrupted = false;
+    f.deps.parents = async (repo, commit) => {
+      if (repo.id === "repo1" && f.writes.includes("repo0") && !interrupted) {
+        interrupted = true;
+        throw new Error("Peer closed WebSocket: 1006");
+      }
+      return parents(repo, commit);
     };
-    // It already points at the checkpoint: carry on, and start the merge once.
-    const same = await queue("stale", (work) => work);
-    expect(same.landing).toMatchObject({ state: "merging", reason: null });
-    expect(t.workflows.filter((id) => id === same.landing.repos[0]!.mergeRun!.id)).toHaveLength(1);
-    // It points somewhere else: stop, saying why.
-    const moved = await queue("moved", () => oid(1));
-    expect(moved.landing).toMatchObject({
-      state: "failed",
-      reason: expect.stringMatching(/Couldn't point gitmatrix\/landing\/moved at the checkpoint/),
+    const gates = vi.spyOn(f.deps, "startGates");
+    expect((await f.run()).state).toBe("advancing");
+    expect(f.current.repos[0]!.state).toBe("advanced");
+    expect(f.current.repos[1]!.state).toBe("tested");
+    expect(f.writes).toEqual(["repo0"]);
+
+    expect((await f.run()).state).toBe("landed");
+    expect(f.writes).toEqual(["repo0", "repo1"]);
+    expect(f.starts).toEqual([]);
+    expect(gates).not.toHaveBeenCalled();
+    for (const [index, repo] of f.current.repos.entries()) {
+      expect(repo.merge).toBe(prepared[index]!.merge);
+      expect(repo.mergeRun).toEqual(prepared[index]!.mergeRun);
+      expect(repo.gateRun).toEqual(prepared[index]!.gateRun);
+    }
+  });
+  test("confirmed missing source evidence still blocks before any canonical publication", async () => {
+    const f = fixture();
+    f.graphs.get("work_1")!.delete(f.current.repos[1]!.commit);
+    expect((await f.run()).state).toBe("blocked_dependency");
+    expect(f.current.repos[1]!.state).toBe("blocked_dependency");
+    expect(f.writes).toEqual([]);
+    for (const repo of f.current.repos)
+      expect(f.refs.get(repo.id)!.get("refs/heads/main")).toBe(repo.base);
+  });
+  test("unknown force-rewritten CAS outcome blocks without recomputing or replaying", async () => {
+    const f = fixture(1),
+      write = f.deps.writeRefs.bind(f.deps);
+    f.deps.writeRefs = async (repo, changes) => {
+      await write(repo, changes);
+      throw new Error("timeout");
+    };
+    await f.run();
+    f.graphs
+      .get("repo0")!
+      .set(oid(95), { parents: [], treeHash: oid(105), hash: oid(95), message: "force rewrite" });
+    f.refs.get("repo0")!.set("refs/heads/main", oid(95));
+    expect((await f.run()).state).toBe("failed");
+    expect(f.writes).toEqual(["repo0"]);
+    expect(f.current.repos[0]!.casIntent).toBeDefined();
+  });
+  test("a reset exactly to the CAS base cannot replay an admitted outcome", async () => {
+    const f = fixture(1);
+    const base = f.current.repos[0]!.base!;
+    const write = f.deps.writeRefs.bind(f.deps);
+    f.deps.writeRefs = async (repo, changes) => {
+      await write(repo, changes);
+      throw new Error("lost result after success");
+    };
+    await f.run();
+    f.refs.get("repo0")!.set("refs/heads/main", base);
+    f.deps.writeRefs = write;
+    expect((await f.run()).state).toBe("failed");
+    expect(f.writes).toEqual(["repo0"]);
+    expect(f.refs.get("repo0")!.get("refs/heads/main")).toBe(base);
+    expect(f.sqlite.prepare("SELECT state FROM source_operations").get()).toEqual({
+      state: "ambiguous",
     });
+  });
+  test("a prepared intent without admission reprepares against moved main", async () => {
+    const f = fixture(1);
+    const repo = f.current.repos[0]!;
+    await recordIntent(f.env, f.current, repo, oid(102));
+    repo.casIntent = { base: repo.base!, candidate: repo.merge!, tree: oid(102) };
+    f.graphs.get(repo.id)!.set(oid(94), {
+      parents: [repo.base!],
+      treeHash: oid(194),
+      hash: oid(94),
+      message: "new main",
+    });
+    f.refs.get(repo.id)!.set("refs/heads/main", oid(94));
+    await f.run();
+    expect(f.writes).toEqual([]);
+    expect(f.current.repos[0]).toMatchObject({ base: oid(94), attempt: repo.attempt + 1 });
+    expect(f.current.repos[0]?.mergeRun?.id).not.toBe(repo.mergeRun?.id);
+    expect(f.refs.get(repo.id)?.get("refs/heads/main")).toBe(oid(94));
+  });
+  test("partial success is fixed while B reprepares and is not replayed after canonical revert", async () => {
+    const f = fixture(),
+      write = f.deps.writeRefs.bind(f.deps);
+    f.deps.writeRefs = async (repo, changes) => {
+      const result = await write(repo, changes);
+      if (repo.id === "repo0" && changes[0]!.ref === "refs/heads/main") {
+        const b = f.current.repos[1]!;
+        f.graphs.get(b.id)!.set(oid(91), {
+          parents: [b.base!],
+          treeHash: oid(106),
+          hash: oid(91),
+          message: "moved B",
+        });
+        f.refs.get(b.id)!.set("refs/heads/main", oid(91));
+      }
+      return result;
+    };
+    await f.run();
+    expect(f.writes).toEqual(["repo0"]);
+    expect(f.current.repos[0]!.state).toBe("advanced");
+    const a = f.current.repos[0]!;
+    f.graphs.get(a.id)!.set(oid(92), {
+      parents: [a.merge!],
+      treeHash: oid(101),
+      hash: oid(92),
+      message: "reverted A",
+    });
+    f.refs.get(a.id)!.set("refs/heads/main", oid(92));
+    await f.run();
+    expect(f.writes).toEqual(["repo0"]);
+  });
+  test("no-op records complete membership without adding a commit", async () => {
+    const f = fixture(1),
+      repo = f.current.repos[0]!;
+    repo.merge = repo.base;
+    expect((await f.run()).state).toBe("landed");
+    expect(f.writes).toEqual([]);
+    expect(f.sqlite.prepare("SELECT noop,status FROM source_integration_receipts").get()).toEqual({
+      noop: 1,
+      status: "complete",
+    });
+  });
+});
+
+describe("exact nested admission", () => {
+  test("measurement selects imported P1 after completed admission but preserves a pure P0 child", async () => {
+    const f = fixture(1);
+    const parent = f.current.repos[0]!;
+    const p0 = parent.source!;
+    const p1 = { ...p0, commit: oid(80), tree: oid(180) };
+    const graph = f.graphs.get(p0.sourceId)!;
+    graph.set(p1.commit, {
+      parents: [p0.commit],
+      treeHash: p1.tree,
+      hash: p1.commit,
+      message: "P1",
+    });
+    parent.source = p1;
+    parent.commit = p1.commit;
+    await recordIntent(f.env, f.current, parent, oid(102));
+    f.sqlite.exec(`INSERT INTO timeline_work_sources
+      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,initial_token_revoked)
+      VALUES('work_child','repo0','child','child','owner','work_child','https://work_child','ready','child-allocation','${p0.sourceId}','${p0.commit}','${p0.tree}','refs/heads/work','${p0.sourceId}','${p0.commit}','${p0.tree}','refs/heads/work','now','now',1);
+      INSERT INTO source_progress_members(repo_id,source_id,commit_oid,operation_id,created_at)
+      VALUES('repo0','${p0.sourceId}','${p1.commit}','parent-push','now')`);
+    const child = {
+      ...parent,
+      source: { ...p0, sourceId: "work_child", timelineId: "child" },
+      logicalBase: p0,
+      dependencies: [],
+    };
+    const timeline = { id: "child", repos: [child] } as unknown as Timeline;
+    const childGraph = new Map(graph);
+    childGraph.set(oid(81), {
+      parents: [p0.commit],
+      treeHash: oid(181),
+      hash: oid(81),
+      message: "child",
+    });
+    childGraph.set(oid(82), {
+      parents: [oid(81), p1.commit],
+      treeHash: oid(182),
+      hash: oid(82),
+      message: "import",
+    });
+    f.graphs.set("work_child", childGraph);
+    f.refs.set("work_child", new Map([["refs/heads/work", oid(82)]]));
+    vi.mocked(lsRefs).mockImplementation(async (_env, name) =>
+      [...f.refs.get(name)!].map(([name, oid]) => ({ name, oid })),
+    );
+    const actor = { id: "owner", slug: "owner", displayName: "Owner", isSiteAdmin: false };
+    const [unintegrated] = await measure(f.env, actor, timeline);
+    expect(unintegrated!.logicalBase).toEqual(p0);
+    expect(unintegrated!.dependencies?.map((dependency) => dependency.source.commit)).toEqual([
+      p1.commit,
+    ]);
+    await expect(
+      validateDependencies(f.env, { ...parent, ...unintegrated! }, new Set([parent.base!])),
+    ).rejects.toThrow("blocked_dependency");
+    f.sqlite.exec("UPDATE source_integration_receipts SET status='complete'");
+    f.refs.get(parent.id)!.set("refs/heads/main", parent.merge!);
+    // Completing the parent cannot repair a previously reviewed checkpoint.
+    await expect(
+      validateDependencies(
+        f.env,
+        { ...parent, ...unintegrated! },
+        new Set([parent.base!, parent.merge!]),
+      ),
+    ).rejects.toThrow();
+    const [measured] = await measure(f.env, actor, timeline);
+    expect(measured!.logicalBase).toEqual(p1);
+    expect(measured!.commit).toBe(unintegrated!.commit);
+    expect(unintegrated!.logicalBase).toEqual(p0);
+    expect(measured!.dependencies?.map((dependency) => dependency.source.commit)).toEqual([
+      p1.commit,
+    ]);
+    await expect(
+      validateDependencies(
+        f.env,
+        { ...parent, ...measured! },
+        new Set([parent.base!, parent.merge!]),
+      ),
+    ).resolves.toBeUndefined();
+    f.refs.get("work_child")!.set("refs/heads/work", oid(81));
+    expect((await measure(f.env, actor, timeline))[0]!.logicalBase).toEqual(p0);
+    f.refs.get("work_child")!.set("refs/heads/work", oid(82));
+    f.sqlite.exec(`INSERT INTO source_integration_receipts
+      SELECT 'duplicate','duplicate',checkpoint_id,repo_id,source_id,source_commit,source_tree,logical_base_json,dependencies_json,canonical_base,canonical_commit,canonical_tree,noop,status,created_at,completed_at FROM source_integration_receipts;
+      INSERT INTO source_integration_members SELECT 'duplicate',repo_id,source_id,commit_oid FROM source_integration_members WHERE receipt_id='landing:repo0'`);
+    const [ambiguous] = await measure(f.env, actor, timeline);
+    expect(ambiguous!.logicalBase).toEqual(p0);
+    await expect(
+      validateDependencies(
+        f.env,
+        { ...parent, ...ambiguous! },
+        new Set([parent.base!, parent.merge!]),
+      ),
+    ).rejects.toThrow("blocked_dependency");
+    f.sqlite.exec(
+      "DELETE FROM source_integration_members WHERE receipt_id='duplicate'; DELETE FROM source_integration_receipts WHERE id='duplicate'",
+    );
+    f.sqlite.exec("UPDATE source_integration_receipts SET status='intent'");
+    f.refs.get("work_child")!.set("refs/heads/work", oid(82));
+    const [unproved] = await measure(f.env, actor, timeline);
+    expect(unproved!.logicalBase).toEqual(p0);
+    expect(unproved!.dependencies).toEqual(unintegrated!.dependencies);
+    await expect(
+      validateDependencies(
+        f.env,
+        { ...parent, ...unproved! },
+        new Set([parent.base!, parent.merge!]),
+      ),
+    ).rejects.toThrow("blocked_dependency");
+  });
+  test("unrecorded and incomparable merge inputs block instead of replaying foreign work", async () => {
+    const graph: Record<string, string[]> = {
+      base: [],
+      local: ["base"],
+      foreign: ["base"],
+      merge: ["local", "foreign"],
+    };
+    const read = async (oid: string) => graph[oid] ?? null;
+    await expect(validateMergeEdges("merge", "base", [], read)).rejects.toThrow(
+      "blocked_dependency",
+    );
+    await expect(validateMergeEdges("merge", "base", ["foreign"], read)).resolves.toBeUndefined();
+    const f = fixture(1),
+      repo = f.current.repos[0]!;
+    await recordIntent(f.env, f.current, repo, oid(102));
+    f.sqlite.exec("UPDATE source_integration_receipts SET status='complete'");
+    const dependency = { source: repo.source!, base: repo.logicalBase! };
+    const imported = { ...repo, logicalBase: repo.source!, dependencies: [dependency] };
+    await expect(
+      validateDependencies(f.env, imported, new Set([repo.base!, repo.merge!])),
+    ).resolves.toBeUndefined();
+    f.sqlite
+      .exec(`INSERT INTO source_integration_receipts SELECT 'second','second',checkpoint_id,repo_id,source_id,source_commit,source_tree,logical_base_json,dependencies_json,canonical_base,canonical_commit,canonical_tree,noop,status,created_at,completed_at FROM source_integration_receipts;
+      INSERT INTO source_integration_members SELECT 'second',repo_id,source_id,commit_oid FROM source_integration_members WHERE receipt_id='landing:repo0';`);
+    await expect(
+      validateDependencies(f.env, imported, new Set([repo.base!, repo.merge!])),
+    ).rejects.toThrow("blocked_dependency");
+  });
+  test("full graph closure traverses both parents and blocks unavailable evidence", async () => {
+    const parents: Record<string, string[]> = {
+      tip: ["left", "right"],
+      left: ["base"],
+      right: ["foreign"],
+      foreign: ["base"],
+      base: [],
+    };
+    expect(await revisionClosure("tip", async (oid) => parents[oid] ?? null)).toEqual(
+      new Set(Object.keys(parents)),
+    );
+    delete parents.foreign;
+    await expect(revisionClosure("tip", async (oid) => parents[oid] ?? null)).rejects.toThrow(
+      "unavailable",
+    );
+  });
+  test("P0 membership in later P1 admits exact P0, not the compact canonical tree", async () => {
+    const f = fixture(1),
+      parent = f.current.repos[0]!;
+    const p0 = parent.commit,
+      p1 = oid(80);
+    f.graphs
+      .get(parent.source!.sourceId)!
+      .set(p1, { parents: [p0], treeHash: oid(180), hash: p1, message: "P1" });
+    parent.commit = p1;
+    parent.source = { ...parent.source!, commit: p1, tree: oid(180) };
+    await recordIntent(f.env, f.current, parent, oid(102));
+    const exact = { ...parent.source, commit: p0, tree: oid(102) };
+    const child = {
+      ...parent,
+      source: { ...parent.source, sourceId: "work_child" },
+      logicalBase: exact,
+      dependencies: [],
+    };
+    const canonical = new Set([parent.base!, parent.merge!]);
+    await expect(validateDependencies(f.env, child, canonical)).rejects.toThrow(
+      "blocked_dependency",
+    );
+    f.sqlite.exec("UPDATE source_integration_receipts SET status='complete'");
+    await expect(validateDependencies(f.env, child, canonical)).resolves.toBeUndefined();
+    expect(child.logicalBase.commit).toBe(p0);
+    expect((await admittedReceipts(f.env, exact, canonical))[0]!.source_commit).toBe(p1);
+    await expect(validateDependencies(f.env, child, new Set([parent.base!]))).rejects.toThrow(
+      "blocked_dependency",
+    );
+    await expect(
+      validateDependencies(
+        f.env,
+        { ...child, logicalBase: { ...exact, commit: oid(999) } },
+        canonical,
+      ),
+    ).rejects.toThrow("blocked_dependency");
   });
 });

@@ -47,6 +47,7 @@ export async function landedTimelines(
       .selectFrom("ref_updates")
       .select(["ref", "new_oid"])
       .where("repo_id", "=", repoId)
+      .where("source_id", "=", "canonical")
       .where("new_oid", "in", tips.slice(start, start + 90))
       .where("ref", "like", "refs/heads/%")
       .orderBy("id", "desc")

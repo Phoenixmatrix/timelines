@@ -120,6 +120,33 @@ const rows = (sqlite: DatabaseSync, table: string, where = "") =>
   (sqlite.prepare(`SELECT count(*) AS n FROM ${table} ${where}`).get() as { n: number }).n;
 
 describe("Atlas projections", () => {
+  test("a work source cannot replace a published canonical projection", async () => {
+    const { sqlite, db } = setup();
+    seedGraph(sqlite);
+    await project(db, "canonical-tip");
+    const before = await currentSnapshot(db, scope);
+    await expect(
+      beginRepoProjection(db, "r1", [
+        {
+          repoId: "r1",
+          sourceId: "work_other",
+          commit: "work-tip",
+          buildId: "work-build",
+        },
+      ]),
+    ).rejects.toThrow("canonical source");
+    expect(await currentSnapshot(db, scope)).toEqual(before);
+    expect(rows(sqlite, "atlas_snapshots")).toBe(1);
+    expect(before?.vector).toEqual([
+      {
+        repoId: "r1",
+        sourceId: "canonical",
+        commit: "canonical-tip",
+        buildId: "b-canonical-tip",
+      },
+    ]);
+  });
+
   test("project the graph into one primary tree with deduplicated counts", async () => {
     const { sqlite, db } = setup();
     seedGraph(sqlite);
@@ -127,7 +154,9 @@ describe("Atlas projections", () => {
 
     const current = await currentSnapshot(db, scope);
     expect(current).toMatchObject({ id: snapshotId, seq, status: "published", partial: true });
-    expect(current?.vector).toEqual([{ repoId: "r1", commit: "c1", buildId: "b-c1" }]);
+    expect(current?.vector).toEqual([
+      { repoId: "r1", sourceId: "canonical", commit: "c1", buildId: "b-c1" },
+    ]);
     expect(current?.entities).toBe(14); // 10 graph nodes + 4 groups
     expect(current?.edges).toBe(12);
 

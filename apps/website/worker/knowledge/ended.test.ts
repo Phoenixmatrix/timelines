@@ -63,11 +63,38 @@ async function setup() {
     INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('repo', '${oid(1)}');
   `);
   const git = fakeRemotes();
-  const remote = git.add("https://app", {
-    "refs/heads/main": oid(1),
-    [FAST]: oid(2),
-    [SIDE]: oid(3),
-  });
+  git.add("https://app", { "refs/heads/main": oid(1) }, "refs/heads/main", artifacts);
+  const fastRemote = git.add(
+    "https://fast",
+    { "refs/heads/work": oid(2) },
+    "refs/heads/work",
+    `${artifacts}-fast`,
+  );
+  const sideRemote = git.add(
+    "https://side",
+    { "refs/heads/work": oid(3) },
+    "refs/heads/work",
+    `${artifacts}-side`,
+  );
+  for (const slug of ["fast", "side"])
+    sqlite
+      .prepare(`
+    INSERT INTO timeline_work_sources
+      (source_id, repo_id, timeline_id, timeline_slug, owner_id, artifacts_name, artifacts_remote,
+       state, allocation_operation_id, fork_source_id, fork_commit, fork_tree, fork_ref,
+       initial_token_revoked, created_at, updated_at, initial_source_id, initial_commit, initial_tree, initial_ref)
+    VALUES (?, 'repo', ?, ?, 'ann', ?, ?, 'ready', ?, 'canonical', ?, 'tree', 'refs/heads/main', 1, 'now', 'now',
+      'canonical', '${oid(1)}', 'tree', 'refs/heads/main')
+  `)
+      .run(
+        `work_${slug}`,
+        slug,
+        slug,
+        `${artifacts}-${slug}`,
+        `https://${slug}`,
+        `op-${slug}`,
+        oid(1),
+      );
   vi.stubGlobal("fetch", git.fetch);
   // Timelines in Ann's tracker; `side` has no record (someone's own branch).
   const timelines: Record<string, TimelineStatus> = { fast: "active" };
@@ -107,12 +134,12 @@ async function setup() {
   /** What a finished overlay run leaves: its row, one change, and the coordinator told. */
   const finish = async (ref: string, buildId: string, commit: string) => {
     sqlite.exec(`
-      INSERT INTO kg_overlays (repo_id, ref, overlay_id, head_commit, base_commit, stats,
+      INSERT INTO kg_overlays (repo_id, source_id, ref, overlay_id, head_commit, base_commit, stats,
           updated_at, status, attempted_commit)
-        VALUES ('repo', '${ref}', '${buildId}', '${commit}', '${oid(1)}',
+        VALUES ('repo', 'work_${ref === FAST ? "fast" : "side"}', '${ref}', '${buildId}', '${commit}', '${oid(1)}',
           '{"counts":{"file":{"added":1,"changed":0,"removed":0}},"stored":1}',
           '2026-10-01T00:00:00.000Z', 'succeeded', '${commit}')
-        ON CONFLICT (repo_id, ref) DO UPDATE SET overlay_id = excluded.overlay_id,
+        ON CONFLICT (repo_id, source_id, ref) DO UPDATE SET overlay_id = excluded.overlay_id,
           head_commit = excluded.head_commit;
       INSERT INTO kg_overlay_changes (repo_id, overlay_id, node_id, kind, change, name, path)
         VALUES ('repo', '${buildId}', 'file:new.ts', 'file', 'added', 'new.ts', 'new.ts');
@@ -150,7 +177,7 @@ async function setup() {
     expect(response.status).toBe(200);
     return (await response.json()) as T;
   };
-  return { sqlite, remote, timelines, push, started, finish, overlays, get };
+  return { sqlite, fastRemote, sideRemote, timelines, push, started, finish, overlays, get };
 }
 
 describe("ended overlays", () => {
@@ -165,8 +192,8 @@ describe("ended overlays", () => {
     // `fast` is abandoned (the tracker ends it, then deletes its bookmark);
     // `side`'s bookmark is deleted by hand.
     t.timelines.fast = "abandoned";
-    t.remote.refs.delete(FAST);
-    t.remote.refs.delete(SIDE);
+    t.fastRemote.refs.delete("refs/heads/work");
+    t.sideRemote.refs.delete("refs/heads/work");
     await t.push();
     expect(t.started().size).toBe(0);
     expect(t.overlays()).toEqual([
@@ -193,8 +220,8 @@ describe("ended overlays", () => {
 
     // The bookmarks come back. The abandoned timeline's overlay stays as it
     // was; `side` never ended as far as the tracker knows, so it goes on.
-    t.remote.refs.set(FAST, oid(4));
-    t.remote.refs.set(SIDE, oid(5));
+    t.fastRemote.refs.set("refs/heads/work", oid(4));
+    t.sideRemote.refs.set("refs/heads/work", oid(5));
     await t.push();
     expect([...t.started().keys()]).toEqual([SIDE]);
     expect(t.overlays()).toEqual([
@@ -219,7 +246,7 @@ describe("ended overlays", () => {
     await t.finish(SIDE, first.get(SIDE)!, oid(3));
     // The bookmark goes before the landing is recorded.
     t.timelines.fast = "landing";
-    t.remote.refs.delete(FAST);
+    t.fastRemote.refs.delete("refs/heads/work");
     await t.push();
     expect(t.overlays()[0]).toMatchObject({ ref: FAST, ended_reason: "ended" });
     t.timelines.fast = "landed";
@@ -234,7 +261,7 @@ describe("ended overlays", () => {
     const first = t.started();
     await t.finish(FAST, first.get(FAST)!, oid(2));
     await t.finish(SIDE, first.get(SIDE)!, oid(3));
-    t.remote.refs.delete(SIDE);
+    t.sideRemote.refs.delete("refs/heads/work");
     await t.push();
     const before = await t.get<KnowledgeOverlay>("/overlay?ref=timeline/side");
     expect(before.ended).toEqual({ reason: "ended", at: expect.any(String), removedAt: null });
@@ -266,7 +293,7 @@ describe("ended overlays", () => {
     ]);
 
     // The bookmark comes back: the overlay is computed again from scratch.
-    t.remote.refs.set(SIDE, oid(3));
+    t.sideRemote.refs.set("refs/heads/work", oid(3));
     await t.push();
     expect([...t.started().keys()]).toEqual([SIDE]);
     expect(t.overlays()[1]).toEqual({ ref: SIDE, head_commit: null, ended_reason: null, ended: 0 });

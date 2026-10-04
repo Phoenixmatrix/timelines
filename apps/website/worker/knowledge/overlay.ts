@@ -1,8 +1,8 @@
 // Knowledge overlays (CORE-83): each timeline's graph diff against main.
 //
-// Every push to a `timeline/<slug>` bookmark recomputes that timeline's
-// overlay; main's graph (kg_nodes, kg_edges), concepts and wiki are never
-// written. An overlay is:
+// Every push to an owned timeline work source recomputes that timeline's
+// overlay; its logical timeline ref is a display/storage key, never a canonical Git ref.
+// Main's graph, concepts and wiki are never written. An overlay is:
 //
 //   1. the files the timeline changed: its tree against the merge base with
 //      main's indexed commit, so work main did since the fork doesn't read as
@@ -17,9 +17,8 @@
 // timeline lands. No concept alignment, synthesis, indexing or wiki: a concept
 // the timeline introduces shows as added under its own name, unaligned.
 //
-// When the bookmark disappears (the timeline landed or was abandoned), its last
-// overlay is kept, read-only (CORE-139): marked ended with the reason the
-// timeline's record in the tracker gives, and never computed again.
+// When a work source is archived (the timeline landed or was abandoned), its last
+// overlay is kept read-only and late workflow publications are fenced in D1.
 
 import type {
   KnowledgeOverlayChange,
@@ -301,12 +300,17 @@ export async function planOverlay(
   reader: CommitReader & TreeReader,
   commit: string,
   base: string,
+  logicalBase?: { commit: string; tree: string },
 ): Promise<OverlayPlan> {
-  const found = await mergeBase(reader, commit, base);
+  const found = logicalBase
+    ? { base: logicalBase.commit, truncated: false }
+    : await mergeBase(reader, commit, base);
   const head = await reader.commit(commit);
   if (!head) throw new Error(`Commit ${commit} not found`);
   // No shared history found: compare with main's indexed tree directly.
-  const from = await reader.commit(found.base ?? base);
+  const from = logicalBase
+    ? { treeHash: logicalBase.tree }
+    : await reader.commit(found.base ?? base);
   if (!from) throw new Error(`Commit ${found.base ?? base} not found`);
   return {
     base,
@@ -335,8 +339,9 @@ export async function overlayGraphs(
   d1: D1Database,
   repo: { id: string; full_name: string },
   changes: FileChange[],
+  snapshot = "current",
 ): Promise<OverlayGraphs> {
-  const main = await loadSnapshot(d1, repo.id, "current");
+  const main = await loadSnapshot(d1, repo.id, snapshot);
   const files = applyChanges(main, changes);
   const analyses = await loadAnalyses(d1, [
     ...main.map((f) => f.blob),
@@ -367,6 +372,7 @@ export async function computeOverlay(
   commit: string,
   plan: OverlayPlan,
   stats: Record<string, unknown>,
+  snapshot?: string,
 ): Promise<{ base: string | null; counts: KnowledgeOverlaySummary["counts"]; stored: number }> {
   // The commit first, then its files: if a main build lands in between, the
   // coordinator sees a newer base and computes the overlay again.
@@ -375,8 +381,8 @@ export async function computeOverlay(
     .select("indexed_commit")
     .where("repo_id", "=", repo.id)
     .executeTakeFirst();
-  const base = state?.indexed_commit ?? null;
-  const graphs = await overlayGraphs(d1, repo, plan.changes);
+  const base = snapshot ? plan.base : (state?.indexed_commit ?? null);
+  const graphs = await overlayGraphs(d1, repo, plan.changes, snapshot);
   const changes = diffGraphs(graphs.main, graphs.timeline);
   const stored = await storeOverlay(
     d1,
@@ -418,8 +424,21 @@ export async function storeOverlay(
   kept: boolean;
 }> {
   const counts = countChanges(changes);
+  const sourceId = typeof stats.sourceId === "string" ? stats.sourceId : "canonical";
   const kept = changes.slice(0, MAX_CHANGES);
   const k = db(d1);
+  const published = await k
+    .selectFrom("kg_overlays")
+    .select(["overlay_id", "ended_at"])
+    .where("repo_id", "=", repoId)
+    .where("source_id", "=", sourceId)
+    .where("ref", "=", ref)
+    .executeTakeFirst();
+  // A step replay after publication must not delete the snapshot readers already use.
+  // In particular, archiving between publication and the workflow acknowledgement
+  // leaves that exact snapshot immutable even when the same workflow retries.
+  if (published?.ended_at) return { base, counts, stored: 0, kept: false };
+  if (published?.overlay_id === overlayId) return { base, counts, stored: kept.length, kept: true };
   const statements: Statement[] = [
     // A retried step starts over.
     k
@@ -453,6 +472,7 @@ export async function storeOverlay(
     .selectFrom("kg_overlays")
     .select("overlay_id")
     .where("repo_id", "=", repoId)
+    .where("source_id", "=", sourceId)
     .where("ref", "=", ref)
     .executeTakeFirst();
   // Point at the new changes, then drop the old ones: readers never see half.
@@ -460,6 +480,7 @@ export async function storeOverlay(
     .insertInto("kg_overlays")
     .values({
       repo_id: repoId,
+      source_id: typeof stats.sourceId === "string" ? stats.sourceId : "canonical",
       ref,
       overlay_id: overlayId,
       head_commit: commit,
@@ -473,9 +494,10 @@ export async function storeOverlay(
     })
     .onConflict((oc) =>
       oc
-        .columns(["repo_id", "ref"])
+        .columns(["repo_id", "source_id", "ref"])
         .doUpdateSet((eb) => ({
           overlay_id: eb.ref("excluded.overlay_id"),
+          source_id: eb.ref("excluded.source_id"),
           head_commit: eb.ref("excluded.head_commit"),
           base_commit: eb.ref("excluded.base_commit"),
           merge_base: eb.ref("excluded.merge_base"),
@@ -536,11 +558,13 @@ export async function overlayFailed(
   ref: string,
   commit: string,
   error: string,
+  sourceId = "canonical",
 ) {
   await db(d1)
     .insertInto("kg_overlays")
     .values({
       repo_id: repoId,
+      source_id: sourceId,
       ref,
       status: "failed",
       attempted_commit: commit,
@@ -549,7 +573,7 @@ export async function overlayFailed(
     })
     .onConflict((oc) =>
       oc
-        .columns(["repo_id", "ref"])
+        .columns(["repo_id", "source_id", "ref"])
         .doUpdateSet((eb) => ({
           status: eb.ref("excluded.status"),
           attempted_commit: eb.ref("excluded.attempted_commit"),
@@ -629,6 +653,7 @@ export async function endedOverlays(
     .selectFrom("kg_overlays")
     .select(["ref", "ended_reason"])
     .where("repo_id", "=", repoId)
+    .where("source_id", "!=", "canonical")
     .where("ended_at", "is not", null)
     .execute();
   return new Map(rows.map((r) => [r.ref, r.ended_reason ?? "ended"]));
@@ -654,7 +679,12 @@ export async function setEndReason(
  * A bookmark is back for a timeline the tracker never said had ended (it was
  * deleted by hand, or isn't a tracked timeline): its overlay is live again.
  */
-export async function reopenOverlay(d1: D1Database, repoId: string, ref: string) {
+export async function reopenOverlay(
+  d1: D1Database,
+  repoId: string,
+  ref: string,
+  sourceId = "canonical",
+) {
   await db(d1)
     .updateTable("kg_overlays")
     // Live again. If retention removed its changes (CORE-201), forget the
@@ -671,6 +701,7 @@ export async function reopenOverlay(d1: D1Database, repoId: string, ref: string)
         .end(),
     }))
     .where("repo_id", "=", repoId)
+    .where("source_id", "=", sourceId)
     .where("ref", "=", ref)
     .where("ended_reason", "=", "ended")
     .execute();
@@ -680,6 +711,7 @@ export async function reopenOverlay(d1: D1Database, repoId: string, ref: string)
 
 export interface OverlayRun {
   buildId: string;
+  sourceId?: string;
   /** The timeline commit it covers. */
   commit: string;
   /** Main's indexed commit when it started. */
@@ -690,7 +722,7 @@ export interface OverlayRun {
 export interface OverlayState {
   running: OverlayRun | null;
   /** What the last finished attempt covered; a scan skips a bookmark still there. */
-  done: { commit: string; base: string | null } | null;
+  done: { commit: string; base: string | null; sourceId?: string } | null;
   retries: number;
   lastError: string | null;
 }

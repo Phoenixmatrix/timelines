@@ -42,6 +42,8 @@ import { claim, jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
 import { mintJobToken } from "./registry.ts";
 import { startRun } from "./trigger.ts";
 import { landingSlugOf } from "../../shared/timelines.ts";
+import { resolveSource } from "../timelines/sources.ts";
+import { ciSource } from "./source.ts";
 
 const PAGE = 30;
 const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/;
@@ -58,6 +60,7 @@ type RunRow = InferResult<ReturnType<typeof selectRuns>>[number];
 
 const toRun = (row: RunRow): CiRunSummary => ({
   id: row.id,
+  sourceId: row.source_id,
   number: row.number,
   commit: row.commit_oid,
   ref: row.ref,
@@ -96,6 +99,7 @@ ci.get("/", async (c) => {
   const ref = c.req.query("ref")?.replace(/^refs\/heads\//, "");
   let query = selectRuns(db(c.env.DB))
     .where("r.repo_id", "=", repo.row.id)
+    .where("r.source_id", "=", c.req.query("source") ?? "canonical")
     .where("r.number", "<", before);
   if (ref) query = query.where("r.ref", "=", ref);
   const results = await query.orderBy("r.number", "desc").limit(PAGE).execute();
@@ -105,20 +109,22 @@ ci.get("/", async (c) => {
 ci.post("/runs", async (c) => {
   const repo = await loadRepo(c, "write");
   if (repo instanceof Response) return repo;
-  const body = await readJson<{ ref: string }>(c);
-  const branch = (body.ref ?? repo.row.default_branch).replace(/^refs\/heads\//, "");
+  const body = await readJson<{ ref: string; source?: string }>(c);
+  const source = await resolveSource(c.env, repo.row, body.source ?? c.req.query("source"));
+  const branch = (body.ref ?? source.repo.default_branch).replace(/^refs\/heads\//, "");
   const reader = new RepoReader(
     c.env,
-    repo.row.artifacts_name,
-    repo.row.artifacts_remote,
+    source.repo.artifacts_name,
+    source.repo.artifacts_remote,
     c.get("timing"),
     (work) => c.executionCtx.waitUntil(work),
+    source.source.kind === "timeline-work" ? source.source.ref : undefined,
   );
   const refs = await reader.refs();
   await reader.close();
   const target = refs.branches.find((b) => b.shortName === branch);
   if (!target) return fail(c, 404, `No branch named ${branch}.`);
-  const started = await startRun(c.env, repo.row, {
+  const started = await startRun(c.env, source.repo, {
     branch,
     commit: target.oid,
     trigger: "manual",
@@ -417,6 +423,12 @@ runner.post("/claim", async (c) => {
     if (!(await claim(c.env.DB, candidate.id, runnerName))) continue;
     const job = await loadJob(c.env.DB, candidate.id);
     if (!job) continue;
+    try {
+      await ciSource(c.env, job.repo_id, job.source_id, { runId: job.run_id });
+    } catch (error) {
+      await report(c.env, job.id, { done: { status: "failed", error: String(error) } });
+      continue;
+    }
     await kdb
       .updateTable("ci_runs")
       .set((eb) => ({

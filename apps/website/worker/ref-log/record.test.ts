@@ -56,6 +56,69 @@ function setup() {
 }
 
 describe("recordRefs", () => {
+  test("identical refs and OIDs in three sources retain independent rewrite histories", async () => {
+    const t = setup();
+    const a = t.commit("samechange");
+    const rewritten = t.commit("samechange");
+    const push = (source: string, oid: string) =>
+      recordRefs(d1(t.sqlite), "repo", new Map([["refs/heads/main", oid]]), ann, t.read, source);
+    for (const source of ["canonical", "work_a", "work_b"]) await push(source, a);
+    await push("work_a", rewritten);
+    expect(
+      t.sqlite.prepare("SELECT source_id, oid FROM repo_refs ORDER BY source_id").all(),
+    ).toEqual([
+      { source_id: "canonical", oid: a },
+      { source_id: "work_a", oid: rewritten },
+      { source_id: "work_b", oid: a },
+    ]);
+    expect(
+      t.sqlite
+        .prepare(
+          "SELECT source_id, first_commit_oid, last_commit_oid FROM change_refs ORDER BY source_id",
+        )
+        .all(),
+    ).toEqual([
+      { source_id: "canonical", first_commit_oid: a, last_commit_oid: a },
+      { source_id: "work_a", first_commit_oid: a, last_commit_oid: rewritten },
+      { source_id: "work_b", first_commit_oid: a, last_commit_oid: a },
+    ]);
+    expect(
+      t.sqlite
+        .prepare("SELECT source_id, old_oid, new_oid FROM ref_updates WHERE old_oid IS NOT NULL")
+        .all(),
+    ).toEqual([{ source_id: "work_a", old_oid: a, new_oid: rewritten }]);
+    expect(await push("canonical", a)).toEqual([]);
+    expect(await push("work_b", a)).toEqual([]);
+  });
+
+  test("source-scoped change batches remain within D1's binding limit", async () => {
+    const t = setup();
+    let tip = t.commit("change0");
+    for (let n = 1; n < 35; n++) tip = t.commit(`change${n}`, tip);
+    const database = d1(t.sqlite);
+    const prepare = database.prepare.bind(database);
+    database.prepare = (sql) => {
+      const statement = prepare(sql);
+      const bind = statement.bind.bind(statement);
+      statement.bind = (...values) => {
+        if (values.length > 100) throw new Error("D1 binding limit exceeded");
+        return bind(...values);
+      };
+      return statement;
+    };
+    await recordRefs(
+      database,
+      "repo",
+      new Map([["refs/heads/work", tip]]),
+      ann,
+      t.read,
+      "work_many",
+    );
+    expect(
+      t.sqlite.prepare("SELECT count(*) AS n FROM change_refs WHERE source_id='work_many'").get(),
+    ).toEqual({ n: 35 });
+  });
+
   test("a first push logs the created refs, attributed to the person and agent, with their changes", async () => {
     const t = setup();
     const a = t.commit("aaaa");

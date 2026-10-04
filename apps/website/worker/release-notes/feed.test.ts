@@ -33,6 +33,8 @@ function row(overrides: Partial<FeedRow> & { subject: string }): FeedRow {
     landing_oid: null,
     timeline_id: null,
     timeline_branch: null,
+    provenance: "[]",
+    regeneration_inputs: "{}",
     ...overrides,
   };
 }

@@ -22,6 +22,7 @@ export interface JobCaller {
   runId: string;
   runNumber: number;
   repoId: string;
+  sourceId: string;
   commit: string;
   /** The run's branch, without refs/heads/. */
   ref: string;
@@ -62,6 +63,7 @@ export async function jobCaller(d1: D1Database, secret: string): Promise<JobCall
       "r.id as runId",
       "r.number as runNumber",
       "r.commit_oid as commit",
+      "r.source_id as sourceId",
       "r.ref",
       "r.actor_id as actorId",
       "r.agent_id as agentId",
@@ -75,6 +77,8 @@ export async function jobCaller(d1: D1Database, secret: string): Promise<JobCall
     .where("t.token_hash", "=", await hashToken(secret))
     .where("t.expires_at", ">", nowIso())
     .where("j.status", "in", ["queued", "running"])
+    .where("r.status", "in", ["queued", "running"])
+    .whereRef("j.source_id", "=", "r.source_id")
     .executeTakeFirst();
   return row ?? null;
 }

@@ -28,7 +28,49 @@ The final `e2e.complete` event prints the local evidence directory. Inspect:
 - `ai-e2e.json`: unique fixture repository, observed build status/commit, graph file/symbol membership, generated overview body/model/commit, exact entity and passage results, API observations and per-stage timings. `knowledge-build` and `index-visibility` are separate timings. `indexVisibility` records each retrieval attempt's elapsed time and separate `entityFound` / `passageFound` outcomes.
 - `ai-e2e.json` also records real avatar generation (`avatars`) and owned Gateway records (`gateway`) for knowledge, explicit embeddings and assistant streaming/titles. It checks successful uncached inference, empty request/response payloads, and `text/event-stream` assistant responses. Avatar records must stay within the existing ten-call budget, with successful records matching the decoded images returned by the API; its existing contract permits partial generation when styles are refused. Cloudflare excludes AI Search's built-in Workers AI embedding/reranking from Gateway logs/analytics; keep that documented exception separate from application embeddings.
 
-The Copper Finch fixture must produce a successful build of its pushed commit; a `checksum.ts` file linked to `copperFinchChecksum`; a generated overview explaining checksum behavior at that commit; and both the matching Vectorize entity and an AI Search code passage containing the fixture function and modulus. After the daily and tag release-note stages, it completes a `CF-1` tracker issue in a workspace subscribed to the fixture and pushes a commit citing it on a new day: that day's notes must hold an issue entry for `CF-1` (team `CF`, the citing commit, a recorded model, non-internal, describing batch parcel verification), the earlier tag's notes must not change, and the `team:cf` feed must include it (`ai-e2e.json` keeps `issueNotes` and `teamFeed`). Last, it pushes twice to a `timeline/copper-limits` bookmark forked before that commit: each push's overlay must be up to date at the pushed commit, measured against main's indexed commit from the fork point, list the added `limits.ts` file and its new symbols, and never list main's own files, while main's graph, wiki pages and builds stay exactly as before (`overlay`, `overlayMain`). Then it forks a tracked `timeline/copper-pages` from main, pushes a `receipts.ts` commit and makes a checkpoint: the checkpoint's wiki page set must succeed at that commit, measured against main's indexed commit, with at least one written component or glossary page (a component page records its model and describes the receipts), visible through the pages API and the checkpoint view, while main's graph, wiki and builds still stay as before (`timelinePages`). These are real assertions, not a non-empty-result check. A provider failure, missing wiki, graph mismatch or index-visibility deadline fails the command. Build timeout means inspect build status/phase; search timeout after a successful build means inspect indexing/visibility and the separate entity/passage evidence. Do not turn a provider outage into a pass.
+The Copper Finch fixture must produce a successful build of its pushed commit;
+a `checksum.ts` file linked to `copperFinchChecksum`; a generated overview
+explaining checksum behavior at that commit; and both the matching Vectorize
+entity and an AI Search code passage containing the fixture function and modulus.
+After daily/tag release-note stages, it completes `CF-1` in a subscribed
+workspace and pushes a citing commit on a new day. That day's issue entry must
+record `CF-1`, team `CF`, the commit and a model, be non-internal and describe
+batch parcel verification; the earlier tag stays unchanged and `team:cf` includes
+it (`issueNotes`, `teamFeed` in `ai-e2e.json`).
+
+The owned-source stages in `tools/agent/provider-e2e.ts` create `copper-limits`
+through the timeline API at a pinned earlier canonical snapshot. They assert
+`work_<id>` identity, `timeline-work` kind, timeline/repository identity,
+`refs/heads/work`, and exact logical-base commit/tree, then push twice through
+`/<owner>/<repo>@<slug>.git` to `HEAD:refs/heads/work`. The local branch
+and overlay label `timeline/copper-limits` are not a canonical timeline branch.
+Source-qualified overlays must track both exact heads, add `limits.ts` and its
+symbols, measure against main's indexed graph from the pinned fork point, and
+exclude canonical-only files. Owned transport must advertise the acknowledged
+head; the source-qualified timeline Atlas must show `limits.ts`, not main's
+`verify-all.ts`. Main's refs, graph, wiki and builds must remain unchanged
+(`overlay`, `overlayMain`).
+
+Next, a distinct API-created `copper-pages` source receives `receipts.ts` and a
+checkpoint. Its source ID, exact commit/tree and logical base must survive the
+checkpoint and generated page set. The page set must succeed at that commit
+against main's indexed graph and write a component or glossary page (component
+prose records a model and describes receipts), visible via API and checkpoint
+view. Its overlay must contain receipts and exclude `limits.ts`: two owned
+sources sharing physical ref `work` must not share graph changes. Main remains
+unchanged (`timelinePages`). These are required assertions, not a claim that a
+particular run passed. A provider failure, missing wiki, graph mismatch or
+index-visibility deadline fails the command. Build timeout means inspect build
+status/phase; search timeout after a successful build means inspect indexing and
+the separate entity/passage evidence. Never turn a provider outage into a pass.
+
+The compact-landing stage must land the approved source tree as a single-parent
+canonical commit without importing WIP ancestry, then read its release provenance.
+After the work Git source expires, its commit API must return 410 while the same
+published timeline page remains readable with unchanged body, source ID and
+`generatedIn`. Do not expire `ended-timeline-data` to release completed producers:
+published output has separate retention, and live Workflow claims must drain
+through confirmed completion or termination.
 
 Beside it, the Semantic Code Atlas runs against the same real providers (`tools/agent/atlas-provider-e2e.ts`, evidence under `atlas` in `ai-e2e.json`). A ledger repository's two capabilities, each spanning two folders, must be named and summarized by the default model with provenance (model, basis repository/commit/build) and citations at the snapshot's commit, drilled through on the Knowledge tab from capability to file to its blob, with no Atlas call or build while browsing. A shop repository importing the ledger's registry package (published to the npm feed and granted as its source) must resolve to it in the workspace Atlas, citing a source in each repository at its own commit. A README push must reuse prose whose inputs didn't change and publish within 30 seconds of the graph. Then three accounts the environment configures through `ATLAS_CONFIG` (`ATLAS_PROVIDER_CONFIG`) build the ledger again: marco with no priced model (`disabled`, no call), jun with a model Workers AI refuses (`provider_error`, failed calls charged once, never retried) and sam with a one-call build cap (one current summary, the rest `budget_exhausted` with cap `calls`). Each keeps its structure and sources and shows its Map state notice and inspector note. `providerUsage` lists every Atlas call with its tokens and cost.
 
