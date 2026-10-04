@@ -24,8 +24,10 @@
  *              raster carrying its provenance
  */
 
+import { Menu } from "@base-ui/react/menu";
 import {
   ArrowClockwiseIcon,
+  CaretDownIcon,
   FunnelSimpleIcon,
   MagnifyingGlassIcon,
   StarIcon,
@@ -51,7 +53,7 @@ import {
 } from "../../../shared/tracker.ts";
 import { ActivityStrip } from "../../components/ActivityStrip.tsx";
 import { SettingsPage } from "../../components/SettingsPage.tsx";
-import { FormError, SelectField, Tip, useToast } from "../../components/ui.tsx";
+import { FormError, popMotion, SelectField, Tip, useToast } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { useViewer } from "../../lib/session.ts";
 import { timelineQuery, type trackerLoader } from "./loaders.ts";
@@ -607,23 +609,43 @@ function Workbench({ data }: { data: TrackerView }) {
             setCreateError("");
           }}
         />
-        <button
-          className="mk-btn mk-btn--primary h-(--size-field)"
-          disabled={busy || !createTeam || !title.trim()}
-        >
-          Create
-        </button>
-        <button
-          type="button"
-          className="mk-btn h-(--size-field)"
-          onClick={() => {
-            setCreateError("");
-            setCreateTitle(title);
-            setCreateOpen(true);
-          }}
-        >
-          Add details
-        </button>
+        <div role="group" aria-label="Create issue" className="inline-flex shrink-0">
+          <button
+            type="submit"
+            className="mk-btn mk-btn--primary h-(--size-field) rounded-r-none focus-visible:z-10"
+            disabled={busy || uncertain || !createTeam || !title.trim()}
+          >
+            Create
+          </button>
+          <Menu.Root>
+            <Menu.Trigger
+              type="button"
+              aria-label="More create options"
+              className="mk-btn mk-btn--primary h-(--size-field) min-w-11 rounded-l-none border-l border-solid border-signal-ink/20 px-3 focus-visible:z-10"
+              disabled={busy || uncertain}
+            >
+              <CaretDownIcon aria-hidden />
+            </Menu.Trigger>
+            <Menu.Portal>
+              <Menu.Positioner align="end" sideOffset={6} className="z-50">
+                <Menu.Popup className={`mk-popup ${popMotion}`}>
+                  <Menu.Item
+                    className="mk-menu-item min-h-11"
+                    disabled={busy || uncertain}
+                    onClick={() => {
+                      if (busy || uncertain) return;
+                      setCreateError("");
+                      setCreateTitle(title);
+                      setCreateOpen(true);
+                    }}
+                  >
+                    Add details
+                  </Menu.Item>
+                </Menu.Popup>
+              </Menu.Positioner>
+            </Menu.Portal>
+          </Menu.Root>
+        </div>
       </form>
     </fieldset>
   );

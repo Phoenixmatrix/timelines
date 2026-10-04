@@ -781,10 +781,10 @@ quality and real-service E2E gate in addition to this semantic-specific smoke.
 ## Distributed issue tracker
 
 Open `/tracker` from the global navigation. Select an account, create a team,
-and capture a title-only issue with **Create**. For more context up front, choose
-**Add details**: the dialog carries over the title, selected team and current
-workspace scope, and lets you set a Markdown description, type, status, priority,
-assignee and workspaces. **Create and edit** saves the issue and immediately
+and capture a title-only issue with the default **Create** action. The adjacent
+arrow opens **Add details**: the dialog carries over the title draft, selected
+team and current workspace scope, and lets you set a Markdown description, type,
+status, priority, assignee and workspaces. **Create and edit** saves the issue and immediately
 opens the existing editor for acceptance criteria, labels and relationships,
 including from the blocker graph. Rejected submissions keep the draft; an
 unconfirmed submission stays open with an idempotent retry rather than creating
@@ -799,6 +799,17 @@ The search bar's **Clear search** (×) button clears both typed text and applied
 query filters immediately, shows all issues, and returns focus to the input.
 It preserves the selected layout and sort, and the empty query survives reload.
 The button disappears when both the input and applied query are empty.
+
+Bare ticket numbers match the exact issue number across teams (`223` does not
+match `2230` or a title mentioning 223); full keys such as `CORE-223` match only
+that key, case-insensitively. Other words and quoted phrases such as
+`"release notes"` search keys, titles and labels. Quoting a number or full key
+does not turn off exact ticket matching. Existing filters still apply, and a
+leading `-` excludes a match.
+
+Same-origin absolute links in tracker Markdown navigate within the app without
+a full reload. External links and modified clicks keep normal browser behavior;
+relative links and fragment links remain native anchors.
 
 Assignee facets select exactly that actor's issues: people use their account
 slug, while agents use their stable ID (`assignee:agt_…`). Agents with the same
@@ -2557,6 +2568,14 @@ person can: code and its knowledge graph, issues, CI, packages, repository
 settings. It chats in a column docked beside the page (rail button or ⌘J /
 Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
 
+On non-phone screens, **Expand the assistant** opens a wide overlay over the
+page, capped at 72rem. It keeps the normal desktop dock's reserved width, so the
+page does not narrow further; collapse (or Escape while expanded) restores the
+narrow panel without resetting the conversation or draft. Phones already use
+the full screen. Short prompts use a compact one-row field; longer drafts grow
+to a height cap and scroll inside the field. The composer can also scroll in a
+short viewport, independently of the conversation.
+
 - **Where it runs.** `worker/assistant/agent.ts`: an `AIChatAgent` (Cloudflare
   Agents SDK) Durable Object per conversation, named `<userId>:<chatId>` by
   `worker/api/assistant.ts` from the signed-in actor, so nobody reaches someone
@@ -2605,9 +2624,12 @@ Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
   suffix, not a page. A repository's own `.agents/skills/*/SKILL.md` join them when
   the chat is about it.
 - **The web** (`src/assistant/`): page context (repository, file and lines,
-  issue, run) goes with each message and shows as a removable chip; receipts
-  fold finished reads into one line; typing while an approval waits declines it
-  and redirects; approved writes revalidate the page.
+  issue, run) is included by default. **In context:** names the page that will
+  accompany the next message; its remove button switches to **Not in context:**
+  and excludes that page context until re-enabled with the plus button. Removing
+  it does not erase context already sent with earlier messages. Receipts fold
+  finished reads into one line; typing while an approval waits declines it and
+  redirects; approved writes revalidate the page.
   Approvals and browser-tool results continue through the AI SDK's automatic
   submission predicates, with the existing assistant message and page context.
   The server stream receives `originalMessages` to retain that message's identity.

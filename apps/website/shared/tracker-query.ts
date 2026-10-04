@@ -7,7 +7,8 @@
 //   status:backlog|todo|in_progress|done|done_in_timeline|canceled
 //   team:CORE  ws:packages  assignee:jun|me|none  label:perf  type:bug  p:1
 //   since:7d until:2026-09-01   (last activity: updatedAt)
-//   parent:CORE-12   words match key, title and labels; - excludes.
+//   parent:CORE-12   numbers/full keys match tickets exactly (case-insensitive);
+//   other words match key, title and labels; - excludes.
 
 import {
   actorName,
@@ -306,7 +307,18 @@ export function compile(query: string, index: IssueIndex, viewerId: string, now:
     );
     groups.set(filter.key, group);
   }
-  const words = parsed.words;
+  const tickets: Predicate[] = [];
+  const words: ParsedQuery["words"] = [];
+  for (const word of parsed.words) {
+    if (/^\d+$/.test(word.text)) {
+      const suffix = `-${word.text}`;
+      tickets.push((issue) => issue.key.endsWith(suffix) !== word.negated);
+    } else if (/^[a-z][a-z0-9]{1,5}-\d+$/.test(word.text)) {
+      tickets.push((issue) => (issue.key.toLowerCase() === word.text) !== word.negated);
+    } else {
+      words.push(word);
+    }
+  }
   return {
     parsed,
     matches(issue, except) {
@@ -315,6 +327,7 @@ export function compile(query: string, index: IssueIndex, viewerId: string, now:
         if (positive.length && !positive.some((p) => p(issue))) return false;
         if (negative.some((p) => p(issue))) return false;
       }
+      for (const ticket of tickets) if (!ticket(issue)) return false;
       if (words.length) {
         const haystack = `${issue.key} ${issue.title} ${issue.labels.join(" ")}`.toLowerCase();
         for (const word of words) if (haystack.includes(word.text) === word.negated) return false;

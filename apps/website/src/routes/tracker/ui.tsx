@@ -3,6 +3,7 @@ import { Combobox } from "@base-ui/react/combobox";
 import { FlagIcon } from "@phosphor-icons/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Link } from "react-router";
 import {
   actorName,
   claimAttribution,
@@ -186,7 +187,22 @@ const MARKDOWN =
 export const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
   return (
     <div className={MARKDOWN}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a({ node: _node, href, ...props }) {
+            // Link handles same-origin absolute URLs and leaves external URLs
+            // and modified clicks to the browser. Keep relative/hash links native.
+            return href && /^(?:https?:)?\/\//i.test(href) ? (
+              <Link to={href} {...props} />
+            ) : (
+              <a href={href} {...props} />
+            );
+          },
+        }}
+      >
+        {text}
+      </ReactMarkdown>
     </div>
   );
 });

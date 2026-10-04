@@ -196,12 +196,12 @@ export function ApprovalCard({
   const long = (body?.length ?? 0) > 400;
   return (
     <section
-      className="mk-enter-up flex flex-col gap-3 rounded-pane bg-raised p-3"
+      className="mk-enter-up flex min-w-0 shrink-0 flex-col gap-3 rounded-pane bg-raised p-3 [overflow-wrap:anywhere]"
       aria-label={`Approve: ${title}`}
     >
       <div className="flex items-start gap-2">
         <HandIcon className="mt-0.5 size-4 shrink-0 text-ink-muted" aria-hidden />
-        <h3 className="m-0 text-body font-semibold">{title}</h3>
+        <h3 className="m-0 min-w-0 text-body font-semibold">{title}</h3>
       </div>
       {fields.length > 0 && (
         <dl className="m-0 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-body-sm">
@@ -215,7 +215,7 @@ export function ApprovalCard({
       )}
       {body && (
         <div
-          className={`rounded-control bg-sunken px-3 py-2 ${long && !more ? "max-h-40 overflow-hidden" : ""}`}
+          className={`min-w-0 shrink-0 rounded-control bg-sunken px-3 py-2 ${long && !more ? "max-h-40 overflow-hidden" : "overflow-x-auto"}`}
         >
           <ChatMarkdown text={body} />
         </div>
@@ -230,7 +230,7 @@ export function ApprovalCard({
           {more ? "Show less" : "Show all"}
         </button>
       )}
-      <div className="flex items-center justify-end gap-2">
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
         <button
           type="button"
           className="mk-btn mk-btn--ghost mk-btn--sm max-sm:h-11"

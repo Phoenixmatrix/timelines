@@ -234,6 +234,37 @@ describe("query language", () => {
     expect(keys("is:open -core")).toEqual(["WEB-1"]);
   });
 
+  it("matches whole ticket numbers and case-insensitive keys, not mentions or substrings", () => {
+    const issues = [
+      issue("CORE-98", { title: "Search tickets", labels: ["perf"] }),
+      issue("WEB-98", { teamId: "t-web", title: "Search tickets", status: "done" }),
+      issue("CORE-198"),
+      issue("CORE-980"),
+      issue("CORE-7", { title: "Mention CORE-98", labels: ["98"] }),
+      issue("UI2-98"),
+    ];
+    const snap = snapshot(issues);
+    const index = buildIndex(snap, snap.serverTime);
+    const keys = (query: string) => {
+      const compiled = compile(query, index, "m-priya", NOW);
+      return issues.filter((i) => compiled.matches(i)).map((i) => i.key);
+    };
+    expect(keys("98")).toEqual(["CORE-98", "WEB-98", "UI2-98"]);
+    expect(keys("CoRe-98")).toEqual(["CORE-98"]);
+    expect(keys("uI2-98")).toEqual(["UI2-98"]);
+    expect(keys("99")).toEqual([]);
+    expect(keys("CORE-99")).toEqual([]);
+    expect(keys("98 team:core is:open search label:perf")).toEqual(["CORE-98"]);
+    expect(keys("98 team:web is:open")).toEqual([]);
+    expect(keys("98 -core-98")).toEqual(["WEB-98", "UI2-98"]);
+    expect(keys("-98")).toEqual(["CORE-198", "CORE-980", "CORE-7"]);
+    expect(keys("search -98")).toEqual([]);
+    expect(keys("mention")).toEqual(["CORE-7"]);
+    expect(keys('"mention core-98"')).toEqual(["CORE-7"]);
+    expect(keys("label:98")).toEqual(["CORE-7"]);
+    expect(keys("core")).toEqual(["CORE-98", "CORE-198", "CORE-980", "CORE-7"]);
+  });
+
   it("filters by last activity with durations and dates", () => {
     const issues = [
       issue("CORE-1", { updatedAt: ago(2) }),

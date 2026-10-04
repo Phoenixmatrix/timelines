@@ -1,9 +1,15 @@
-// The assistant's column. From 1280px it docks beside the page, which reflows
-// and stays usable (the assistant opens pages there for you); narrower, it
-// floats over the right edge; on phones it takes the screen.
+// The assistant reserves a narrow desktop column even when expanded over the
+// page. Below 1280px it floats; on phones it already takes the whole screen.
 
 import { Popover } from "@base-ui/react/popover";
-import { ClockCounterClockwiseIcon, NotePencilIcon, TrashIcon, XIcon } from "@phosphor-icons/react";
+import {
+  ArrowsInSimpleIcon,
+  ArrowsOutSimpleIcon,
+  ClockCounterClockwiseIcon,
+  NotePencilIcon,
+  TrashIcon,
+  XIcon,
+} from "@phosphor-icons/react";
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import type { AssistantChat } from "../../shared/assistant.ts";
 import { popMotion, Tip } from "../components/ui.tsx";
@@ -44,6 +50,8 @@ export function AssistantDock() {
   const phone = useMedia("(max-width: 639px)");
   const docked = useMedia("(min-width: 1280px)");
   const [chats, setChats] = useState<AssistantChat[] | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const wide = expanded && !phone;
 
   const refresh = useCallback(() => {
     api<{ chats: AssistantChat[] }>("/assistant/chats")
@@ -54,15 +62,17 @@ export function AssistantDock() {
     if (assistant.open) refresh();
   }, [assistant.open, refresh]);
 
-  // Escape steps out: closes the floating panel (a docked one stays put).
+  // Escape collapses first; otherwise it closes only a floating panel.
   useEffect(() => {
-    if (!assistant.open || docked) return;
+    if (!assistant.open || (docked && !wide)) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.defaultPrevented) assistant.hide();
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      if (wide) setExpanded(false);
+      else assistant.hide();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [assistant, docked]);
+  }, [assistant, docked, wide]);
 
   // Load the chat's code while the browser is idle, ready for the first open.
   useEffect(() => {
@@ -79,74 +89,90 @@ export function AssistantDock() {
   const title = assistant.fresh ? "New conversation" : current?.title || "Conversation";
 
   return (
-    <aside
-      aria-label="Assistant"
-      // Docked, it's part of the layout: it fades in rather than sliding, since
-      // a slide would push it past the window and flash a horizontal scrollbar.
-      data-docked={docked ? "" : undefined}
-      className={[
-        "gm-dock flex flex-col bg-pane",
-        docked
-          ? "sticky top-0 h-dvh w-[26rem] shrink-0"
-          : phone
-            ? "fixed inset-0 z-40"
-            : "fixed inset-y-0 right-0 z-40 w-[min(26rem,100vw)] shadow-[var(--shadow-float),0_0_0_1px_var(--line-soft)]",
-      ].join(" ")}
-    >
-      <header className="flex h-14 shrink-0 items-center gap-1 border-b border-line-soft pr-2 pl-4">
-        <h2 className="m-0 min-w-0 flex-1 truncate text-body font-semibold" title={title}>
-          {title}
-        </h2>
-        <History
-          chats={chats}
-          current={assistant.chatId}
-          onPick={(id) => assistant.openChat(id)}
-          onDelete={async (id) => {
-            await api(`/assistant/chats/${id}`, { method: "DELETE" });
-            if (id === assistant.chatId) assistant.newChat();
-            refresh();
-          }}
-        />
-        <Tip label="New conversation" side="bottom">
-          <button
-            type="button"
-            className={iconButton}
-            aria-label="New conversation"
-            onClick={() => assistant.newChat()}
-          >
-            <NotePencilIcon aria-hidden />
-          </button>
-        </Tip>
-        <Tip label="Close (⌘J)" side="bottom">
-          <button
-            type="button"
-            className={iconButton}
-            aria-label="Close the assistant"
-            onClick={() => assistant.hide()}
-          >
-            <XIcon aria-hidden />
-          </button>
-        </Tip>
-      </header>
-      <Suspense
-        fallback={
-          loaded ? (
-            <loaded.ChatPlaceholder page={page} />
-          ) : (
-            <div className="flex-1" aria-busy="true" />
-          )
-        }
+    <div className={docked ? "sticky top-0 h-dvh w-[26rem] shrink-0" : "contents"}>
+      <aside
+        aria-label="Assistant"
+        data-docked={docked ? "" : undefined}
+        data-expanded={wide ? "" : undefined}
+        className={[
+          "gm-dock flex min-h-0 min-w-0 flex-col overflow-hidden bg-pane",
+          wide
+            ? "fixed inset-y-4 right-4 z-40 w-[min(72rem,calc(100vw-6rem))] rounded-pane shadow-[var(--shadow-float)]"
+            : docked
+              ? "absolute inset-0"
+              : phone
+                ? "fixed inset-0 z-40"
+                : "fixed inset-y-0 right-0 z-40 w-[min(26rem,100vw)] shadow-[var(--shadow-float),0_0_0_1px_var(--line-soft)]",
+        ].join(" ")}
       >
-        <Chat
-          key={assistant.chatId}
-          chatId={assistant.chatId}
-          fresh={assistant.fresh}
-          page={page}
-          compact={phone}
-          onTurnEnd={refresh}
-        />
-      </Suspense>
-    </aside>
+        <header className="flex h-14 shrink-0 items-center gap-1 border-b border-line-soft pr-2 pl-4">
+          <h2 className="m-0 min-w-0 flex-1 truncate text-body font-semibold" title={title}>
+            {title}
+          </h2>
+          <History
+            chats={chats}
+            current={assistant.chatId}
+            onPick={(id) => assistant.openChat(id)}
+            onDelete={async (id) => {
+              await api(`/assistant/chats/${id}`, { method: "DELETE" });
+              if (id === assistant.chatId) assistant.newChat();
+              refresh();
+            }}
+          />
+          <Tip label="New conversation" side="bottom">
+            <button
+              type="button"
+              className={iconButton}
+              aria-label="New conversation"
+              onClick={() => assistant.newChat()}
+            >
+              <NotePencilIcon aria-hidden />
+            </button>
+          </Tip>
+          {!phone && (
+            <Tip label={wide ? "Collapse the assistant" : "Expand the assistant"} side="bottom">
+              <button
+                type="button"
+                className={iconButton}
+                aria-label={wide ? "Collapse the assistant" : "Expand the assistant"}
+                aria-expanded={wide}
+                onClick={() => setExpanded(!expanded)}
+              >
+                {wide ? <ArrowsInSimpleIcon aria-hidden /> : <ArrowsOutSimpleIcon aria-hidden />}
+              </button>
+            </Tip>
+          )}
+          <Tip label="Close (⌘J)" side="bottom">
+            <button
+              type="button"
+              className={iconButton}
+              aria-label="Close the assistant"
+              onClick={() => assistant.hide()}
+            >
+              <XIcon aria-hidden />
+            </button>
+          </Tip>
+        </header>
+        <Suspense
+          fallback={
+            loaded ? (
+              <loaded.ChatPlaceholder page={page} />
+            ) : (
+              <div className="flex-1" aria-busy="true" />
+            )
+          }
+        >
+          <Chat
+            key={assistant.chatId}
+            chatId={assistant.chatId}
+            fresh={assistant.fresh}
+            page={page}
+            compact={phone}
+            onTurnEnd={refresh}
+          />
+        </Suspense>
+      </aside>
+    </div>
   );
 }
 

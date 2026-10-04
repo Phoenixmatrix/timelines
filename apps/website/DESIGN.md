@@ -142,6 +142,8 @@ The global navigation is a narrow vertical rail on desktop and a sticky horizont
 
 The tracker-specific approved composition is recorded in `.impeccable/surfaces/src-routes-tracker-tracker-tsx.md`: capture and scope controls above a 42/58 selection/detail split, independently scrolling above 760px. The board and dependency graph remain in the selection pane. On phones the selected issue replaces the collection; filters and account actions progressively disclose. Tracker controls retain 44px touch targets through 760px, and the return link clears the sticky navigation. This split is a surface decision, not a requirement for unrelated pages.
 
+The assistant reserves a 26rem desktop dock from 1280px upward. Expanding it overlays the page with a wider panel, capped at 72rem, without changing that reserved column or shrinking the underlying page further. Collapse preserves the conversation and draft; Escape collapses the expanded panel first. Below the docking breakpoint it floats, and below 640px it already fills the screen.
+
 ## Elevation & Depth
 
 Tonal layering does most of the work. Floating menus and popovers use the existing soft, offset `shadow-float` token; the dock uses `shadow-dock`. Ordinary sections use restrained separators. Selected rows and focused fields use the incumbent fine signal stroke rather than decorative shadows. Motion is limited to established short state transitions and respects reduced-motion preferences.
@@ -156,9 +158,15 @@ Controls have gently rounded corners, panes slightly broader corners, and tags a
 
 Primary buttons use amber with dark signal ink; secondary buttons use a raised neutral surface. Ghost actions are visually subordinate. Disabled controls retain readable labels and explain invalid actions nearby. Fields are recessed, with a clear focus treatment and action-local errors. Use the existing Base UI select/combobox components and native controls rather than simulating interactions with generic elements.
 
+Tracker capture is a split action: **Create** remains the default title-only submission; the adjacent arrow reveals **Add details**, carrying the title draft, team and workspace scope into the dialog. Keep this secondary path subordinate rather than presenting two competing primary buttons.
+
+The assistant composer starts at one row for short prompts, grows to a capped height and scrolls longer drafts within the field. Its containing form can scroll in short viewports without taking over conversation scrolling. **In context:** names the page included with the next message; removing it changes the label to **Not in context:** and the control to a plus for re-inclusion. This affects subsequent messages, not context already sent.
+
 ### Navigation and metadata
 
 Navigation uses links; view toggles use pressed buttons. Workspace names are underlined links in labelled metadata, while labels remain inert tags. Repeated actions name their issue, repository or workspace in accessible labels.
+
+Same-origin absolute links in tracker Markdown use client-side navigation; external links, modified clicks, relative links and fragments retain browser behavior. Tracker search treats bare numbers and full issue keys as exact ticket lookups, even when quoted; other words and quoted phrases search keys, titles and labels. Keep filter and exclusion semantics intact.
 
 ### Issue selection and handoff
 
