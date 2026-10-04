@@ -750,6 +750,8 @@ export interface Database {
     landing_id: Generated<string | null>;
     /** Independent default-branch merge queue identity, not a timeline landing. */
     queue_id: Generated<string | null>;
+    /** 1 for a step run (CORE-235): the light run for a timeline push, never full CI. */
+    step: Generated<number>;
   };
   ci_jobs: {
     id: string;
@@ -857,6 +859,18 @@ export interface Database {
     deleted_at: string | null;
     deleted_by: string | null;
     created_at: Generated<string>;
+  };
+  /** What a step run produced, by commit (CORE-235). */
+  step_artifacts: {
+    id: string;
+    repo_id: string;
+    commit_oid: string;
+    run_id: string;
+    kind: "test-summary" | "screenshot" | "document";
+    /** JSON; for test-summary, StepTestSummary. */
+    data: string;
+    object_key: string | null;
+    created_at: string;
   };
   /** A person's one set of generated avatar options (CORE-116). */
   avatar_generations: {

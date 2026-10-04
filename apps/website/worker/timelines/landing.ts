@@ -162,6 +162,8 @@ export async function greenness(
       .where("repo_id", "=", repo.id)
       .where("commit_oid", "=", repo.commit)
       .where("ref", "=", branch)
+      // Step runs are light checks per push, not the timeline's CI (CORE-235).
+      .where("step", "=", 0)
       .orderBy("number", "desc")
       .executeTakeFirst();
     if (!run || run.status === "succeeded") continue;
@@ -727,10 +729,11 @@ export async function afterRun(env: Env, deps: LandingDeps, runId: string): Prom
     const run = await db(env.DB)
       .selectFrom("ci_runs as c")
       .innerJoin("repos as r", "r.id", "c.repo_id")
-      .select(["c.ref", "r.owner_id"])
+      .select(["c.ref", "r.owner_id", "c.step"])
       .where("c.id", "=", runId)
       .executeTakeFirst();
-    if (!run) return;
+    // A step run is a light check, not the timeline's CI: it never lands one.
+    if (!run || run.step) return;
     const landingSlug = landingSlugOf(run.ref);
     if (landingSlug) {
       const reply = await trackerObject(env, run.owner_id).landingForRun(landingSlug, runId);

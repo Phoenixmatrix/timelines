@@ -65,6 +65,36 @@ const step = (n: number, over: Partial<StepUpload> = {}): StepUpload => ({
 });
 
 describe("step context", () => {
+  test("a step carries its step runs' artifacts, newest first (CORE-235)", async () => {
+    const s = setup();
+    await s.upload(step(1));
+    const summary = (status: string) =>
+      JSON.stringify({
+        status,
+        passed: 1,
+        failed: 0,
+        jobs: [{ name: "lint", status: "succeeded", exitCode: 0, durationMs: 900 }],
+      });
+    s.sqlite.exec(`
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step)
+        VALUES ('run1', 'repo', 1, '${oid(1)}', 'timeline/search', 'manual', 'failed', 1),
+               ('run2', 'repo', 2, '${oid(1)}', 'timeline/search', 'manual', 'succeeded', 1);
+      INSERT INTO step_artifacts (id, repo_id, commit_oid, run_id, kind, data, created_at) VALUES
+        ('run1:test-summary', 'repo', '${oid(1)}', 'run1', 'test-summary', '${summary("failed")}', '2026-10-04T00:01:00.000Z'),
+        ('run2:test-summary', 'repo', '${oid(1)}', 'run2', 'test-summary', '${summary("succeeded")}', '2026-10-04T00:02:00.000Z');
+    `);
+    const page = (await (await s.call("")).json()) as StepPage;
+    expect(page.steps[0]!.artifacts.map((a) => [a.runNumber, a.kind, a.data.status])).toEqual([
+      [2, "test-summary", "succeeded"],
+      [1, "test-summary", "failed"],
+    ]);
+    const versions = (await (await s.call("/change0001")).json()) as StepVersions;
+    expect(versions.versions[0]!.artifacts).toHaveLength(2);
+    await s.upload(step(2));
+    const two = (await (await s.call("")).json()) as StepPage;
+    expect(two.steps.find((x) => x.commitOid === oid(2))!.artifacts).toEqual([]);
+  });
+
   test("an agent uploads a step; it reads back with its context and author", async () => {
     const s = setup();
     const made = await s.upload(step(1));

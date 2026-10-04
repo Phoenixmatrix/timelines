@@ -57,7 +57,19 @@ export interface JobSpec {
    * unchanged, and counts as passed for the jobs that need it.
    */
   paths?: string[];
+  /**
+   * The runs it belongs to (`on:` on the job): null for the default (push,
+   * manual and landing runs; previews by `if:`). Only jobs listing `step`
+   * run in step runs, the light run for each push to a timeline (CORE-235).
+   */
+  on?: JobTrigger[] | null;
+  /** A step job `gm test` also runs on the developer's machine. */
+  local?: boolean;
 }
+
+/** What a job can list in its own `on:`. */
+export type JobTrigger = "push" | "preview" | "step";
+const JOB_TRIGGERS = new Set<JobTrigger>(["push", "preview", "step"]);
 
 export interface Pipeline {
   branches: string[] | null;
@@ -66,6 +78,11 @@ export interface Pipeline {
    * preview runs (trigger "preview", action "create" or "teardown").
    */
   preview: boolean;
+  /**
+   * Opted in to step runs with `on: step`: each push to a timeline bookmark
+   * also starts a run of the jobs that list `step` in their own `on:`.
+   */
+  step: boolean;
   /** Runs in flight on a branch before further pushes coalesce into one held run. */
   coalesceAfter: number | null;
   env: Record<string, string>;
@@ -141,6 +158,9 @@ export function parsePipeline(source: string): Pipeline {
   const preview = "preview" in on;
   if (preview && Object.keys(record(on.preview, "on.preview")).length)
     throw new ConfigError("on.preview takes no options; jobs choose an action with if:.");
+  const step = "step" in on;
+  if (step && Object.keys(record(on.step, "on.step")).length)
+    throw new ConfigError("on.step takes no options; jobs join step runs with their own on: step.");
   const branches =
     push.branches === undefined ? null : stringList(push.branches, "on.push.branches");
   let coalesceAfter: number | null = null;
@@ -194,6 +214,23 @@ export function parsePipeline(source: string): Pipeline {
         );
       return clean;
     });
+    const jobOn =
+      job.on === undefined
+        ? null
+        : stringList(job.on, `jobs.${name}.on`).map((trigger) => {
+            if (!JOB_TRIGGERS.has(trigger as JobTrigger))
+              throw new ConfigError(`jobs.${name}.on lists push, preview or step.`);
+            return trigger as JobTrigger;
+          });
+    if (jobOn && jobOn.length === 0) throw new ConfigError(`jobs.${name}.on lists no trigger.`);
+    if (jobOn?.includes("step") && !step)
+      throw new ConfigError(
+        `jobs.${name} runs on step, but ${CONFIG_PATH} doesn't opt in to step runs (on: step).`,
+      );
+    if (job.local !== undefined && typeof job.local !== "boolean")
+      throw new ConfigError(`jobs.${name}.local must be true or false.`);
+    if (job.local && !jobOn?.includes("step"))
+      throw new ConfigError(`jobs.${name}.local is for step jobs (on: step).`);
     return {
       name,
       needs: stringList(job.needs, `jobs.${name}.needs`),
@@ -206,6 +243,8 @@ export function parsePipeline(source: string): Pipeline {
       steps,
       concurrency: (job.concurrency as string | undefined) ?? null,
       paths,
+      on: jobOn,
+      local: job.local === true,
     };
   });
 
@@ -217,9 +256,16 @@ export function parsePipeline(source: string): Pipeline {
         throw new ConfigError(`jobs.${job.name}.needs names unknown job "${need}".`);
     }
     if (job.if) evaluate(job.if, { branch: "", trigger: "push", commit: "", runner: "local" });
+    // A step run has only step jobs: what one needs must be there too.
+    if (job.on?.includes("step"))
+      for (const need of job.needs)
+        if (!jobs.find((j) => j.name === need)?.on?.includes("step"))
+          throw new ConfigError(
+            `jobs.${job.name} runs on step, so what it needs must too: ${need}.`,
+          );
   }
   stages(jobs);
-  return { branches, preview, coalesceAfter, env, jobs };
+  return { branches, preview, step, coalesceAfter, env, jobs };
 }
 
 /** Jobs grouped into stages: each stage only needs jobs from earlier stages. */
@@ -262,7 +308,7 @@ export function branchMatches(branch: string, patterns: string[] | null): boolea
 export interface ConditionContext {
   branch: string;
   /** `landing`: the gates on a timeline's merge into main, before main moves (CORE-77). */
-  trigger: "push" | "manual" | "preview" | "landing";
+  trigger: "push" | "manual" | "preview" | "landing" | "step";
   commit: string;
   /** Where jobs run: "local" (gm runner under vp dev) or "sandbox" (deployed). */
   runner: "local" | "sandbox";
@@ -278,7 +324,15 @@ const CONDITION_NAMES = new Set(["branch", "trigger", "commit", "runner", "actio
  * jobs that ask for it, so there a job without an `if:` doesn't run (pushes'
  * checks and deploys stay out of previews, and teardowns stay cheap).
  */
-export function jobRuns(job: Pick<JobSpec, "if">, context: ConditionContext): boolean {
+export function jobRuns(job: Pick<JobSpec, "if" | "on">, context: ConditionContext): boolean {
+  const on = job.on ?? null;
+  // Step runs are light: only the jobs that list step (CORE-235).
+  if (context.trigger === "step")
+    return !!on?.includes("step") && (job.if === null || evaluate(job.if, context));
+  if (on) {
+    if (!on.includes(context.trigger === "preview" ? "preview" : "push")) return false;
+    return job.if === null || evaluate(job.if, context);
+  }
   if (job.if === null) return context.trigger !== "preview";
   return evaluate(job.if, context);
 }

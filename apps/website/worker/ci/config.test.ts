@@ -192,3 +192,76 @@ test("this repository's pipeline is set up to run in Sandbox containers", () => 
   expect(evaluate(e2e, { ...base, runner: "local" })).toBe(true);
   expect(evaluate(e2e, { ...base, runner: "sandbox" })).toBe(false);
 });
+
+describe("step runs (CORE-235)", () => {
+  const STEPS = `
+on:
+  push: {}
+  step: {}
+jobs:
+  lint:
+    on: step
+    local: true
+    steps: [vp check]
+  unit:
+    on: [push, step]
+    needs: [lint]
+    steps: [vp test run]
+  build:
+    steps: [vp build]
+  e2e:
+    if: trigger != "preview"
+    steps: [vp run e2e]
+`;
+  const at = (trigger: ConditionContext["trigger"]): ConditionContext => ({
+    branch: "timeline/search",
+    trigger,
+    commit: "c",
+    runner: "sandbox",
+  });
+
+  test("a project opts in with on: step; jobs join with their own on:", () => {
+    const pipeline = parsePipeline(STEPS);
+    expect(pipeline.step).toBe(true);
+    expect(parsePipeline("on: [push, step]\njobs:\n  a:\n    on: step\n    steps: [x]").step).toBe(
+      true,
+    );
+    expect(parsePipeline("jobs:\n  a:\n    steps: [x]").step).toBe(false);
+    const byName = new Map(pipeline.jobs.map((job) => [job.name, job]));
+    expect(byName.get("lint")).toMatchObject({ on: ["step"], local: true });
+    expect(byName.get("unit")).toMatchObject({ on: ["push", "step"], local: false });
+    expect(byName.get("build")).toMatchObject({ on: null, local: false });
+  });
+
+  test("a step run has only step jobs; other runs keep their jobs", () => {
+    const jobs = parsePipeline(STEPS).jobs;
+    const running = (trigger: ConditionContext["trigger"]) =>
+      jobs.filter((job) => jobRuns(job, at(trigger))).map((job) => job.name);
+    // e2e only excludes previews: it still stays out of step runs.
+    expect(running("step")).toEqual(["lint", "unit"]);
+    expect(running("push")).toEqual(["unit", "build", "e2e"]);
+    expect(running("manual")).toEqual(["unit", "build", "e2e"]);
+    expect(running("preview")).toEqual([]);
+  });
+
+  test("step jobs explain what's wrong", () => {
+    const fails = (source: string, message: RegExp) =>
+      expect(() => parsePipeline(source)).toThrow(message);
+    fails("jobs:\n  a:\n    on: step\n    steps: [x]", /doesn't opt in to step runs \(on: step\)/);
+    fails("on: step\njobs:\n  a:\n    local: true\n    steps: [x]", /local is for step jobs/);
+    fails(
+      "on: step\njobs:\n  a:\n    on: step\n    local: yes please\n    steps: [x]",
+      /local must be true or false/,
+    );
+    fails("on: step\njobs:\n  a:\n    on: nightly\n    steps: [x]", /lists push, preview or step/);
+    fails("on: step\njobs:\n  a:\n    on: []\n    steps: [x]", /lists no trigger/);
+    fails(
+      "on: step\njobs:\n  a:\n    steps: [x]\n  b:\n    on: step\n    needs: [a]\n    steps: [y]",
+      /runs on step, so what it needs must too: a/,
+    );
+    fails(
+      "on:\n  step:\n    branches: [x]\njobs:\n  a:\n    steps: [x]",
+      /on.step takes no options/,
+    );
+  });
+});

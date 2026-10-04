@@ -1922,7 +1922,8 @@ The model catalog lives in `shared/ai.ts`; provider adapters live in
 
 Repositories declare a pipeline in `.gitmatrix/ci.yml`; every push that moves
 a matching branch starts a run (also: the Run button, `gm runs start`, re-runs,
-and [preview runs](#the-preview-contract) for projects that opt in).
+and, for projects that opt in, [preview runs](#the-preview-contract) and
+[step runs](#step-runs)).
 
 ```yaml
 on:
@@ -1937,7 +1938,7 @@ jobs:
       - run: vp test
   deploy:
     needs: [test] # runs only if test succeeded
-    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger (push, manual, preview, landing), commit, runner, action
+    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger (push, manual, preview, landing, step), commit, runner, action
     secrets: [CLOUDFLARE_API_TOKEN] # `gm secret set`, masked in logs
     timeout_minutes: 15 # default 20
     instance: standard-2 # sandbox size (default standard-1)
@@ -2008,13 +2009,54 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   non-zero with the failing job named; `gm runs logs --job <name>` has the output.
 - **Job variables.** `CI`, `GITMATRIX`, `GITMATRIX_REPOSITORY`, `GITMATRIX_BRANCH`,
   `GITMATRIX_COMMIT`, `GITMATRIX_RUN_NUMBER`, `GITMATRIX_JOB`, `GITMATRIX_TRIGGER`
-  (`push`, `manual` or `preview`) and `GITMATRIX_TOKEN`; `GITMATRIX_TIMELINE` on a
+  (`push`, `manual`, `preview`, `landing` or `step`) and `GITMATRIX_TOKEN`; `GITMATRIX_TIMELINE` on a
   timeline's bookmark and in preview runs, which also get `GITMATRIX_CHECKPOINT`
   and `GITMATRIX_PREVIEW_ACTION`. A job's `env:` and secrets come after them.
 
 API: `/api/repos/:o/:n/ci` (runs, `?ref=<branch>` for one branch's, run detail,
 logs with `?after=`, cancel, re-run, commit statuses, secrets) and
 `/api/ci/runner` (claim, report).
+
+### Step runs
+
+An agent working in a timeline pushes at every meaningful step (CORE-226). A
+**step run** is the light check each of those pushes gets, the way pull-request
+checks are lighter than main's (CORE-235). A repository opts in with `on: step`,
+and a job joins step runs by listing `step` in its own `on:`:
+
+```yaml
+on:
+  push: {}
+  step: {} # opt in: each push to timeline/<slug> also starts a step run
+jobs:
+  lint:
+    on: step # only in step runs
+    local: true # `gm test` runs it on the developer's machine too
+    steps: [vp check]
+  unit:
+    on: [push, step] # in push runs and step runs
+    needs: [lint] # a step job may only need step jobs
+    steps: [vp test run --changed]
+  build: # no on: the default runs (push, manual, landing), never step runs
+    steps: [vp build]
+```
+
+- **Only step jobs run.** A job without its own `on:` never joins a step run,
+  even if its `if:` would allow it, so adding `on: step` changes nothing else.
+  Jobs see `trigger == "step"` and `GITMATRIX_TRIGGER=step`.
+- **Beside the push's run, never instead of it.** `onPush` starts the step run
+  after the push run for a moved `timeline/<slug>` bookmark. It's stored with
+  `ci_runs.step = 1` (and trigger `manual`, like previews), and it never answers
+  for a commit's CI: the push run's dedupe and coalescing, the landing and
+  checkpoint green checks, the tracker's commit status and auto-landing all
+  leave step runs out.
+- **Results attach to the step.** When a step run ends, `recordStepRun`
+  (`worker/steps/runs.ts`) stores a `test-summary` artifact in `step_artifacts`
+  (the run's status, each job's status, exit code and duration), keyed by
+  commit, so it attaches to every step version of that commit, whenever its
+  context is uploaded. The steps API returns them as `artifacts`, newest
+  first (`StepArtifact`, `shared/steps.ts`). The schema allows `screenshot` and
+  `document` artifacts with a stored object later.
 
 ### Deployments and previews
 

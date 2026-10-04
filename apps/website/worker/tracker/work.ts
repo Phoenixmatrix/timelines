@@ -285,6 +285,7 @@ export async function linkedWork(
           .selectAll()
           .where("repo_id", "=", repoId)
           .where("commit_oid", "in", part)
+          .where("step", "=", 0)
           .orderBy("number", "desc")
           .limit(WORK_LIMIT + 1)
           .execute()),

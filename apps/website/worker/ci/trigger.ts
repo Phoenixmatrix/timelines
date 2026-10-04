@@ -22,7 +22,7 @@ import {
 } from "./config.ts";
 import { activeRun, anyHeld, inFlight, lastPassed, releaseHeld, UNCHANGED } from "./coalesce.ts";
 import type { StoredJob } from "./jobs.ts";
-import { landingSlugOf } from "../../shared/timelines.ts";
+import { landingSlugOf, timelineSlugOf } from "../../shared/timelines.ts";
 import { isQueueSourceBranch } from "../../shared/merge-queue.ts";
 
 export interface CiRepo {
@@ -97,7 +97,7 @@ export async function startRun(
      * `trigger == "landing"`; the run is stored as manual with its landing
      * (`landing_id`), as previews are.
      */
-    trigger: "push" | "manual" | "preview" | "landing";
+    trigger: "push" | "manual" | "preview" | "landing" | "step";
     /** With trigger "preview": its action, timeline and checkpoint. */
     preview?: PreviewRun;
     /** With trigger "landing": the landing whose merge it tests. */
@@ -147,12 +147,14 @@ export async function startRun(
       }
     }
     // A run of this commit already in flight on the branch answers for it.
+    const step = options.trigger === "step";
     const existing = await activeRun(
       env.DB,
       repo.id,
       options.branch,
       options.commit,
       preview && { action: preview.action, checkpoint: preview.checkpoint },
+      step,
     );
     if (existing) {
       // Queue callers persist their run identity before I/O. A different run
@@ -170,6 +172,11 @@ export async function startRun(
       return {
         skipped: `${CONFIG_PATH} at ${options.commit.slice(0, 12)} doesn't opt in to previews (on: preview).`,
       };
+    // Step runs are opt-in too, and a broken ci.yml already failed the push's run.
+    if (step && !pipeline?.step)
+      return {
+        skipped: `${CONFIG_PATH} at ${options.commit.slice(0, 12)} doesn't opt in to step runs (on: step).`,
+      };
     if (
       pipeline &&
       options.trigger === "push" &&
@@ -180,7 +187,9 @@ export async function startRun(
 
     const runId = options.runId ?? crypto.randomUUID().replaceAll("-", "");
     const stored =
-      options.trigger === "preview" || options.trigger === "landing" ? "manual" : options.trigger;
+      options.trigger === "preview" || options.trigger === "landing" || step
+        ? "manual"
+        : options.trigger;
     const context = {
       branch: options.branch,
       trigger: options.trigger,
@@ -189,6 +198,8 @@ export async function startRun(
       action: preview?.action ?? "",
     };
     // A project may opt in and handle only one action: no run for the other.
+    if (step && !pipeline!.jobs.some((job) => jobRuns(job, context)))
+      return { skipped: `No job in ${CONFIG_PATH} runs on step.` };
     if (preview && !pipeline!.jobs.some((job) => jobRuns(job, context)))
       return { skipped: `No job in ${CONFIG_PATH} runs for preview ${preview.action}.` };
     if (options.queueId && pipeline && !pipeline.jobs.some((job) => jobRuns(job, context)))
@@ -217,6 +228,7 @@ export async function startRun(
           "preview_rebuilt_from",
           "landing_id",
           "queue_id",
+          "step",
         ])
         .expression((eb) =>
           eb
@@ -244,6 +256,7 @@ export async function startRun(
                 .val(options.trigger === "landing" ? (options.landingId ?? null) : null)
                 .as("landing_id"),
               eb.val(options.queueId ?? null).as("queue_id"),
+              eb.val(step ? 1 : 0).as("step"),
             ])
             .where("repo_id", "=", repo.id)
             .having((eb) =>
@@ -423,16 +436,23 @@ export async function onPush(
     if (known.size === 0 && row.ref !== refs.headBranch) continue;
     // A landing's merge is tested by the landing itself (timelines/landing.ts).
     if (landingSlugOf(row.ref) || isQueueSourceBranch(row.ref)) continue;
-    try {
-      await startRun(env, repo, {
-        branch: row.ref,
-        commit: row.oid,
-        trigger: "push",
-        actor,
-        waitUntil,
-      });
-    } catch (error) {
-      console.error("CI: could not start a run", { repo: repo.id, ref: row.ref, error });
+    // A push to a timeline also gets its light step run (CORE-235), when the
+    // repository opts in; it never stands in for the push's own run.
+    const triggers = timelineSlugOf(`refs/heads/${row.ref}`)
+      ? (["push", "step"] as const)
+      : (["push"] as const);
+    for (const trigger of triggers) {
+      try {
+        await startRun(env, repo, {
+          branch: row.ref,
+          commit: row.oid,
+          trigger,
+          actor,
+          waitUntil,
+        });
+      } catch (error) {
+        console.error("CI: could not start a run", { repo: repo.id, ref: row.ref, trigger, error });
+      }
     }
   }
 }

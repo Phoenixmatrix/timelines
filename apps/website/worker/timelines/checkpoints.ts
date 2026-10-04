@@ -115,6 +115,7 @@ export async function view(
           .select(["repo_id", "number", "status", "commit_oid", "created_at", "preview_action"])
           .where("repo_id", "=", repo.id)
           .where("commit_oid", "=", repo.commit)
+          .where("step", "=", 0)
           .orderBy("number", "desc")
           .limit(RUNS_PER_COMMIT)
           .execute(),

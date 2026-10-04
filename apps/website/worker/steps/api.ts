@@ -20,10 +20,12 @@ import {
   type ContextEntry,
   type ContextSource,
   type Step,
+  type StepArtifact,
   type StepAuthor,
   type StepContextBody,
   type StepPage,
   type StepTest,
+  type StepTestSummary,
   type StepUpload,
   type StepVersions,
 } from "../../shared/steps.ts";
@@ -140,7 +142,10 @@ async function authorsOf(d1: D1Database, rows: Row[]): Promise<Map<string, StepA
   return authors;
 }
 
-function toStep(row: Row, authors: Map<string, StepAuthor>): Step {
+/** D1 bounds bound parameters per query: commits looked up at once. */
+const ROWS_PER_QUERY = 90;
+
+function toStep(row: Row, authors: Map<string, StepAuthor>): Omit<Step, "artifacts"> {
   let context = EMPTY_CONTEXT;
   try {
     context = { ...EMPTY_CONTEXT, ...(JSON.parse(row.context) as Partial<StepContextBody>) };
@@ -163,7 +168,49 @@ function toStep(row: Row, authors: Map<string, StepAuthor>): Step {
 
 async function present(c: Context<AppEnv>, rows: Row[]) {
   const authors = await authorsOf(c.env.DB, rows);
-  return rows.map((row) => toStep(row, authors));
+  const artifacts = await artifactsOf(c.env.DB, rows);
+  return rows.map((row) => ({
+    ...toStep(row, authors),
+    artifacts: artifacts.get(row.commit_oid) ?? [],
+  }));
+}
+
+/** Step runs' artifacts for these steps' commits, newest first (CORE-235). */
+async function artifactsOf(d1: D1Database, rows: Row[]): Promise<Map<string, StepArtifact[]>> {
+  const out = new Map<string, StepArtifact[]>();
+  const repoId = rows[0]?.repo_id;
+  if (!repoId) return out;
+  const commits = [...new Set(rows.map((r) => r.commit_oid))];
+  for (let i = 0; i < commits.length; i += ROWS_PER_QUERY) {
+    const found = await db(d1)
+      .selectFrom("step_artifacts as a")
+      .innerJoin("ci_runs as r", "r.id", "a.run_id")
+      .select(["a.id", "a.commit_oid", "a.run_id", "a.kind", "a.data", "a.created_at", "r.number"])
+      .where("a.repo_id", "=", repoId)
+      .where("a.commit_oid", "in", commits.slice(i, i + ROWS_PER_QUERY))
+      .orderBy("a.created_at", "desc")
+      .execute();
+    for (const row of found) {
+      let data: Record<string, unknown> = {};
+      try {
+        data = JSON.parse(row.data) as Record<string, unknown>;
+      } catch {
+        // Keep the artifact; its data is unreadable.
+      }
+      const base = {
+        id: row.id,
+        runId: row.run_id,
+        runNumber: row.number,
+        createdAt: row.created_at,
+      };
+      const artifact: StepArtifact =
+        row.kind === "test-summary"
+          ? { ...base, kind: "test-summary", data: data as unknown as StepTestSummary }
+          : { ...base, kind: row.kind, data, url: null };
+      out.set(row.commit_oid, [...(out.get(row.commit_oid) ?? []), artifact]);
+    }
+  }
+  return out;
 }
 
 /** Whether a push has shown this commit as this change (worker/ref-log). */

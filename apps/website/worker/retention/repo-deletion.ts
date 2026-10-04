@@ -980,6 +980,7 @@ export const CHILD_ROWS: [table: string, where: string][] = [
   ["ci_steps", "job_id IN (SELECT id FROM ci_jobs WHERE repo_id = ?1)"],
   ["ci_jobs", "repo_id = ?1"],
   ["deployments", "repo_id = ?1"],
+  ["step_artifacts", "repo_id = ?1"],
   ["ci_runs", "repo_id = ?1"],
   ["kg_edges", "repo_id = ?1"],
   ["kg_nodes", "repo_id = ?1"],

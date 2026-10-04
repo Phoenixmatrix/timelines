@@ -77,7 +77,40 @@ export interface Step {
   /** Deleted or redacted: the context is gone, the step stays. */
   deleted: boolean;
   context: StepContextBody;
+  /** What step runs of this commit produced, newest first (CORE-235). */
+  artifacts: StepArtifact[];
 }
+
+/** One job of a step run, in a test summary. */
+export interface StepJobResult {
+  name: string;
+  status: "succeeded" | "failed" | "cancelled" | "skipped";
+  exitCode: number | null;
+  durationMs: number | null;
+}
+
+/** A step run's results: the first artifact kind. */
+export interface StepTestSummary {
+  status: "succeeded" | "failed" | "cancelled";
+  passed: number;
+  failed: number;
+  jobs: StepJobResult[];
+}
+
+/**
+ * Something a step run produced, attached to the step by commit. A test
+ * summary carries its data inline; screenshots and documents (later) point at
+ * a stored object.
+ */
+export type StepArtifact = {
+  id: string;
+  runId: string;
+  runNumber: number;
+  createdAt: string;
+} & (
+  | { kind: "test-summary"; data: StepTestSummary }
+  | { kind: "screenshot" | "document"; data: Record<string, unknown>; url: string | null }
+);
 
 /** GET /api/repos/:owner/:name/steps: a page of steps, newest first. */
 export interface StepPage {

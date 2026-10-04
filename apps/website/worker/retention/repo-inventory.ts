@@ -48,6 +48,7 @@ export const REPO_TABLES = [
   "repo_collaborators",
   "repo_mirrors",
   "repo_refs",
+  "step_artifacts",
   "step_contexts",
   "tracker_repo_subscriptions",
   "wiki_pages",

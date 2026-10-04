@@ -11,6 +11,7 @@
 // Either way the job's state lives in D1, so the Workflow reads the outcome
 // from there.
 
+import { recordStepRun } from "../steps/runs.ts";
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type { CiJobStatus } from "../../shared/api.ts";
 import { batch, db, nowIso } from "../schema.ts";
@@ -125,6 +126,9 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
         .execute();
       return status;
     });
+
+    // A step run's results attach to its step (CORE-235).
+    await step.do("step-artifacts", DB_STEP, async () => recordStepRun(this.env.DB, runId));
 
     // A slot on the branch is free: the newest held run starts, covering older ones.
     await step.do("release", DB_STEP, async () => {

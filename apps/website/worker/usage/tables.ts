@@ -54,7 +54,7 @@ export const TABLE_GROUPS: TableGroup[] = [
     database: "db",
     scope: "account",
     label: "Step context (work context per commit)",
-    tables: { step_contexts: REPO },
+    tables: { step_contexts: REPO, step_artifacts: REPO },
   },
   {
     id: "ci-logs",
