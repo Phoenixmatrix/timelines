@@ -4,12 +4,7 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import config from "../cloudflare.config.ts";
 import { WORKER_FIRST } from "../shared/worker-first.ts";
-import {
-  previewKey,
-  previewResources,
-  previewVariables,
-  type PreviewResources,
-} from "./preview.ts";
+import { previewResources, previewVariables, type PreviewResources } from "./preview.ts";
 
 const resources: PreviewResources = {
   name: "timeline-faster-search",
@@ -18,6 +13,8 @@ const resources: PreviewResources = {
   bucket: "gitmatrix-preview-faster-search",
   artifacts: "gitmatrix-preview-faster-search",
   secret: "a".repeat(64),
+  accessIssuer: "https://preview-tests.cloudflareaccess.com",
+  accessAudience: "preview-tests",
 };
 
 interface Built {
@@ -83,14 +80,6 @@ describe("cloudflare.config.ts in preview mode", () => {
     expect(worker.env.AUTH_FAILURES).toMatchObject({ namespace: "4402" });
   });
 
-  test("runs every request through the access gate, keyed from the secret", async () => {
-    const { worker } = await build(true, previewVariables(resources));
-    expect(worker.assets.runWorkerFirst).toBe(true);
-    expect(worker.env.ASSETS).toMatchObject({ type: "assets" });
-    expect(worker.env.PREVIEW_KEY).toMatchObject({ value: previewKey(resources.secret) });
-    expect(previewKey(resources.secret)).not.toBe(resources.secret);
-  });
-
   test("leaves out Workflows, queues, cron, email, AI, the domain and the Secrets Store", async () => {
     const built = await build(true, previewVariables(resources));
     const types = Object.values(built.worker.env).map((binding) => binding.type);
@@ -145,7 +134,8 @@ describe("cloudflare.config.ts in preview mode", () => {
     expect(worker.previewUrls).toBe(true);
     expect(worker.assets.runWorkerFirst).toEqual(WORKER_FIRST);
     expect(worker.env.ASSETS).toBeUndefined();
-    expect(worker.env.PREVIEW_KEY).toBeUndefined();
+    expect(worker.env.PREVIEW_ACCESS_ISSUER).toBeUndefined();
+    expect(worker.env.PREVIEW_ACCESS_AUD).toBeUndefined();
   });
 });
 

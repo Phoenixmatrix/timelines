@@ -110,7 +110,7 @@ export interface FixtureTarget {
   /** Where disposable clones go. */
   work: string;
   env: NodeJS.ProcessEnv;
-  /** Sent with every API request, e.g. a preview's access key (worker/preview-gate.ts). */
+  /** Sent with every API request, e.g. Cloudflare Access service-token headers. */
   headers?: Record<string, string>;
 }
 

@@ -1,6 +1,9 @@
-import { createHash } from "node:crypto";
-
 type Environment = Record<string, string | undefined>;
+
+export interface PreviewAccess {
+  accessIssuer: string;
+  accessAudience: string;
+}
 
 /**
  * What a timeline preview binds in place of production's resources (CORE-80).
@@ -9,7 +12,7 @@ type Environment = Record<string, string | undefined>;
  * reads them when cf builds a Preview (`isPreview`). Nothing here falls back
  * to a production resource: a missing variable fails the build.
  */
-export interface PreviewResources {
+export interface PreviewResources extends PreviewAccess {
   /** The Worker Preview's name, `timeline-<slug>`; also the seed's environment id. */
   name: string;
   /** The preview's own D1 databases (ids). */
@@ -33,6 +36,8 @@ const VARIABLES = {
   bucket: "GITMATRIX_PREVIEW_BUCKET",
   artifacts: "GITMATRIX_PREVIEW_ARTIFACTS",
   secret: "GITMATRIX_PREVIEW_SECRET",
+  accessIssuer: "GITMATRIX_PREVIEW_ACCESS_ISSUER",
+  accessAudience: "GITMATRIX_PREVIEW_ACCESS_AUD",
 } as const satisfies Record<keyof PreviewResources, string>;
 
 /** The resources a preview build binds, from the environment tools/preview sets. */
@@ -48,6 +53,7 @@ export function previewResources(env: Environment): PreviewResources {
   ) as unknown as PreviewResources;
   if (resources.secret.length < 32)
     throw new Error("GITMATRIX_PREVIEW_SECRET must be at least 32 characters.");
+  previewAccess(env);
   return resources;
 }
 
@@ -61,10 +67,14 @@ export function previewVariables(resources: PreviewResources): Record<string, st
   );
 }
 
-/**
- * The preview's access key, derived from its secret so the link people get
- * never carries the secret that signs sessions and seals registry keys.
- */
-export function previewKey(secret: string): string {
-  return createHash("sha256").update(`gitmatrix-preview-access:${secret}`).digest("hex");
+/** Public Access configuration; checked before a create can replace any resources. */
+export function previewAccess(env: Environment): PreviewAccess {
+  const accessIssuer = env.GITMATRIX_PREVIEW_ACCESS_ISSUER?.trim() ?? "";
+  const accessAudience = env.GITMATRIX_PREVIEW_ACCESS_AUD?.trim() ?? "";
+  if (!/^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/.test(accessIssuer) || !accessAudience)
+    throw new Error(
+      "Set GITMATRIX_PREVIEW_ACCESS_ISSUER to the HTTPS Cloudflare Access team origin " +
+        "and GITMATRIX_PREVIEW_ACCESS_AUD to the preview application's audience.",
+    );
+  return { accessIssuer, accessAudience };
 }

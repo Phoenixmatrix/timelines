@@ -1,137 +1,199 @@
-// A preview's access gate (CORE-80): nothing in a preview answers without its
-// key, and outside a preview there is no gate.
-
-import { describe, expect, test, vi } from "vite-plus/test";
+import { exportJWK, generateKeyPair, SignJWT, type JWTPayload } from "jose";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vite-plus/test";
 import { workerFirst } from "../shared/worker-first.ts";
-import { previewFetch, previewGate, sameKey, type TokenCheck } from "./preview-gate.ts";
+import { previewFetch, previewGate } from "./preview-gate.ts";
 
-const KEY = "a1".repeat(32);
-const preview = { PREVIEW_MODE: "true", PREVIEW_KEY: KEY };
-const noTokens: TokenCheck = async () => false;
+const issuer = "https://preview-test.cloudflareaccess.com";
+const audience = "preview-application";
+const preview = {
+  PREVIEW_MODE: "true",
+  PREVIEW_ACCESS_ISSUER: issuer,
+  PREVIEW_ACCESS_AUD: audience,
+};
+const get = (path: string, headers: Record<string, string> = {}) =>
+  new Request(`https://timeline-x-gitmatrix.example.workers.dev${path}`, { headers });
+const assertion = (token: string) => ({ "Cf-Access-Jwt-Assertion": token });
+let privateKey: CryptoKey;
+let forgedKey: CryptoKey;
 
-const get = (path: string, headers: Record<string, string> = {}, method = "GET") =>
-  new Request(`https://timeline-x-gitmatrix.example.workers.dev${path}`, { method, headers });
+beforeAll(async () => {
+  const trusted = await generateKeyPair("RS256");
+  privateKey = trusted.privateKey;
+  forgedKey = (await generateKeyPair("RS256")).privateKey;
+  const publicKey = { ...(await exportJWK(trusted.publicKey)), kid: "access-key", alg: "RS256" };
+  vi.stubGlobal("fetch", async (url: string) => {
+    if (String(url) !== `${issuer}/cdn-cgi/access/certs`) {
+      return new Response(null, { status: 503 });
+    }
+    return Response.json({ keys: [publicKey] });
+  });
+});
+
+afterAll(() => vi.unstubAllGlobals());
+
+function sign(claims: JWTPayload = {}, key = privateKey) {
+  const now = Math.floor(Date.now() / 1000);
+  return new SignJWT({ iss: issuer, aud: [audience], iat: now, exp: now + 300, ...claims })
+    .setProtectedHeader({ alg: "RS256", kid: "access-key" })
+    .sign(key);
+}
 
 describe("previewGate", () => {
-  test("no key: 401 with the access-link page", async () => {
-    const response = await previewGate(get("/"), preview, noTokens);
-    expect(response?.status).toBe(401);
-    expect(await response?.text()).toContain(
-      "This preview needs its access link; open it from the deployment in Gitmatrix.",
-    );
-    // The API, persona sign-in and the seed's identity route are all behind it.
-    for (const path of ["/api/session", "/api/dev/environment", "/orbit/engine.git/info/refs"])
-      expect((await previewGate(get(path), preview, noTokens))?.status).toBe(401);
+  test("accepts signed human and service assertions without requiring shared identity claims", async () => {
+    for (const claims of [
+      { email: "person@example.com", sub: "human-id", type: "app" },
+      { common_name: "agent.access", sub: "", type: "app" },
+    ]) {
+      expect(await previewGate(get("/", assertion(await sign(claims))), preview)).toBeNull();
+    }
   });
 
-  test("the cookie passes", async () => {
-    expect(
-      await previewGate(
-        get("/api/session", { cookie: `x=1; gm_preview=${KEY}` }),
-        preview,
-        noTokens,
-      ),
-    ).toBeNull();
-  });
-
-  test("the key in the URL sets the cookie and redirects without it", async () => {
-    const response = await previewGate(
-      get(`/orbit/engine?tab=code&preview_key=${KEY}`),
-      preview,
-      noTokens,
-    );
-    expect(response?.status).toBe(302);
-    expect(response?.headers.get("location")).toBe("/orbit/engine?tab=code");
-    const cookie = response?.headers.get("set-cookie") ?? "";
-    expect(cookie).toContain(`gm_preview=${KEY}`);
-    for (const attribute of ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"])
-      expect(cookie).toContain(attribute);
-    // Host-only: no Domain attribute.
-    expect(cookie).not.toMatch(/domain=/i);
-  });
-
-  test("the x-preview-key header passes", async () => {
-    expect(
-      await previewGate(get("/api/dev/environment", { "x-preview-key": KEY }), preview, noTokens),
-    ).toBeNull();
-  });
-
-  test("a wrong key gets the 401, wherever it is", async () => {
-    const wrong = "b2".repeat(32);
+  test("denies old preview credentials, app PATs, and unsigned Access identity headers", async () => {
     for (const request of [
-      get(`/?preview_key=${wrong}`),
-      get("/", { cookie: `gm_preview=${wrong}` }),
-      get("/", { "x-preview-key": wrong }),
-      get("/", { "x-preview-key": KEY.slice(0, 10) }),
-      // A key in the URL only works for a page visit.
-      get(`/api/session?preview_key=${KEY}`, {}, "POST"),
-    ])
-      expect((await previewGate(request, preview, noTokens))?.status).toBe(401);
+      get("/"),
+      get("/?preview_key=old-key"),
+      get("/", { cookie: "gm_preview=old-key" }),
+      get("/", { "x-preview-key": "old-key" }),
+      get("/", { authorization: "Bearer gmx_live" }),
+      get("/", { "Cf-Access-Authenticated-User-Email": "person@example.com" }),
+      get("/", { "CF-Access-Client-Id": "id", "CF-Access-Client-Secret": "secret" }),
+      get("/", assertion("forged")),
+    ]) {
+      const response = await previewGate(request, { ...preview, PREVIEW_KEY: "old-key" });
+      expect(response?.status).toBe(401);
+      expect(response?.headers.get("cache-control")).toBe("no-store");
+    }
   });
 
-  test("a live access token passes (they're only minted behind the gate); a dead one doesn't", async () => {
-    const check = vi.fn<TokenCheck>(async (header) => header === "Bearer gmx_live");
+  test.each([
+    ["wrong audience", { aud: ["another-application"] }],
+    ["wrong issuer", { iss: "https://other.cloudflareaccess.com" }],
+    ["expired", { exp: 1 }],
+    ["missing expiry", { exp: undefined }],
+    ["not yet valid", { nbf: 4_000_000_000 }],
+    ["missing audience", { aud: undefined }],
+    ["missing issuer", { iss: undefined }],
+  ] satisfies [string, JWTPayload][])(
+    "rejects a signed assertion with %s",
+    async (_name, claims) => {
+      expect((await previewGate(get("/", assertion(await sign(claims))), preview))?.status).toBe(
+        401,
+      );
+    },
+  );
+
+  test("rejects a forged signature even with the trusted key ID and claims", async () => {
+    const token = await sign({}, forgedKey);
+    expect((await previewGate(get("/", assertion(token)), preview))?.status).toBe(401);
+  });
+
+  test("rejects an attacker-selected signing algorithm", async () => {
+    const token = await new SignJWT({ iss: issuer, aud: audience, exp: 4_000_000_000 })
+      .setProtectedHeader({ alg: "HS256", kid: "access-key" })
+      .sign(new TextEncoder().encode("attacker-secret"));
+    expect((await previewGate(get("/", assertion(token)), preview))?.status).toBe(401);
+  });
+
+  test("fails closed on missing or malformed Access configuration", async () => {
+    const token = await sign();
+    for (const configuration of [
+      { PREVIEW_ACCESS_ISSUER: undefined },
+      { PREVIEW_ACCESS_ISSUER: "http://preview-test.cloudflareaccess.com" },
+      { PREVIEW_ACCESS_ISSUER: `${issuer}/` },
+      { PREVIEW_ACCESS_ISSUER: `${issuer}/untrusted-path` },
+      { PREVIEW_ACCESS_ISSUER: "https://attacker.example.com" },
+      { PREVIEW_ACCESS_AUD: undefined },
+      { PREVIEW_ACCESS_AUD: "" },
+      { PREVIEW_ACCESS_AUD: " " },
+      { PREVIEW_ACCESS_AUD: 123 },
+    ]) {
+      expect(
+        (await previewGate(get("/", assertion(token)), { ...preview, ...configuration }))?.status,
+      ).toBe(401);
+    }
+  });
+
+  test("fails closed if the signing keys cannot be retrieved", async () => {
+    const unavailableIssuer = "https://unavailable.cloudflareaccess.com";
+    const token = await sign({ iss: unavailableIssuer });
     expect(
-      await previewGate(get("/api/session", { authorization: "Bearer gmx_live" }), preview, check),
-    ).toBeNull();
-    expect(
-      (await previewGate(get("/api/session", { authorization: "Bearer gmx_dead" }), preview, check))
-        ?.status,
+      (
+        await previewGate(get("/", assertion(token)), {
+          ...preview,
+          PREVIEW_ACCESS_ISSUER: unavailableIssuer,
+        })
+      )?.status,
     ).toBe(401);
   });
 
-  test("a preview without a key lets nothing through", async () => {
-    const keyless = { PREVIEW_MODE: "true" };
-    const live: TokenCheck = async () => true;
-    expect((await previewGate(get("/?preview_key="), keyless, live))?.status).toBe(401);
+  test("does not gate production or local development", async () => {
+    expect(await previewGate(get("/api/session"), {})).toBeNull();
     expect(
-      (await previewGate(get("/", { authorization: "Bearer gmx_x" }), keyless, live))?.status,
-    ).toBe(401);
-  });
-
-  test("outside a preview there is no gate", async () => {
-    expect(await previewGate(get("/api/session"), {}, noTokens)).toBeNull();
-    expect(
-      await previewGate(get("/"), { PREVIEW_MODE: "false", PREVIEW_KEY: KEY }, noTokens),
+      await previewGate(get("/", assertion("invalid")), {
+        ...preview,
+        PREVIEW_MODE: "false",
+      }),
     ).toBeNull();
-  });
-
-  test("keys compare by value", () => {
-    expect(sameKey(KEY, KEY)).toBe(true);
-    expect(sameKey(`${KEY}0`, KEY)).toBe(false);
-    expect(sameKey("", KEY)).toBe(false);
-    expect(sameKey(KEY, "")).toBe(false);
   });
 });
 
 describe("previewFetch", () => {
+  const ctx = {} as ExecutionContext; // The assets router does not provide ctx.access.
   const app = { fetch: vi.fn(async () => new Response("app")) };
   const assets = { fetch: vi.fn(async () => new Response("asset")) };
-  const env = { ...preview, ASSETS: assets } as unknown as Env;
-  const ctx = {} as ExecutionContext;
-  const key = { cookie: `gm_preview=${KEY}` };
+  const env = Object.assign({} as Env, preview, { ASSETS: assets });
+  const routes: [string, string][] = [
+    ["/api/session", "app"],
+    ["/api/dev/environment", "app"],
+    ["/orbit/engine.git/info/refs", "app"],
+    ["/v2/orbit/engine/manifests/latest", "app"],
+    ["/orbit/engine", "asset"],
+    ["/assets/index.js", "asset"],
+  ];
 
-  test("past the gate, the app answers its paths and the assets the rest", async () => {
-    expect(
-      await (await previewFetch(get("/api/session", key), env, ctx, app, noTokens)).text(),
-    ).toBe("app");
-    expect(
-      await (
-        await previewFetch(get("/orbit/engine.git/info/refs", key), env, ctx, app, noTokens)
-      ).text(),
-    ).toBe("app");
-    expect(
-      await (await previewFetch(get("/orbit/engine", key), env, ctx, app, noTokens)).text(),
-    ).toBe("asset");
-    expect(
-      await (await previewFetch(get("/assets/index.js", key), env, ctx, app, noTokens)).text(),
-    ).toBe("asset");
+  test("routes signed human and service requests to the app or static assets", async () => {
+    for (const claims of [{ email: "person@example.com" }, { common_name: "agent.access" }]) {
+      const headers = assertion(await sign(claims));
+      for (const [path, body] of routes) {
+        expect(await (await previewFetch(get(path, headers), env, ctx, app)).text()).toBe(body);
+      }
+      expect(
+        await (
+          await previewFetch(
+            get("/api/events", {
+              ...headers,
+              Upgrade: "websocket",
+            }),
+            env,
+            ctx,
+            app,
+          )
+        ).text(),
+      ).toBe("app");
+    }
   });
 
-  test("short of it, neither does", async () => {
+  test("denies API, git, registry, assets and websocket requests before either handler", async () => {
     app.fetch.mockClear();
     assets.fetch.mockClear();
-    expect((await previewFetch(get("/assets/index.js"), env, ctx, app, noTokens)).status).toBe(401);
+    for (const headers of [{}, assertion(await sign({}, forgedKey))]) {
+      for (const [path] of routes) {
+        expect((await previewFetch(get(path, headers), env, ctx, app)).status).toBe(401);
+      }
+      expect(
+        (
+          await previewFetch(
+            get("/api/events", {
+              ...headers,
+              Upgrade: "websocket",
+            }),
+            env,
+            ctx,
+            app,
+          )
+        ).status,
+      ).toBe(401);
+    }
     expect(app.fetch).not.toHaveBeenCalled();
     expect(assets.fetch).not.toHaveBeenCalled();
   });

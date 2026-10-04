@@ -940,6 +940,31 @@ Credentials live in `~/.config/gitmatrix/gm.json`; `GM_SERVER` and `GM_TOKEN`
 override them. Inside a CI job, `GITMATRIX_URL` and `GITMATRIX_TOKEN` are used
 when those aren't set, so `gm pkg upload` and `gm pkg published` act as the job.
 
+For Cloudflare Access-protected previews, supply `GITMATRIX_ACCESS_TOKEN` in
+the process environment as JSON containing the nonempty strings
+`cf-access-client-id` and `cf-access-client-secret`, and set
+`GITMATRIX_ACCESS_ORIGIN` to the exact preview HTTPS origin (no path, query,
+userinfo, or wildcard). HTTP is accepted only for localhost test servers.
+Both variables are required together; malformed settings fail without printing
+their values. `gm` does not load `.env` files automatically.
+
+The CLI sends the two standard `CF-Access-Client-Id` and
+`CF-Access-Client-Secret` headers only to that origin, alongside—not instead
+of—the Gitmatrix `Authorization` token. This covers JSON, device/SSH sign-in,
+streamed responses, uploads, downloads, and Git clone/fetch/push. Access
+credentials are never saved in `gm.json`, remote URLs, or Git configuration.
+Git receives them through ephemeral `GIT_CONFIG_*` environment entries; Git
+tracing is disabled for these subprocesses to avoid logging headers.
+
+Protected HTTP requests do not follow redirects, even within the same origin.
+With Access configured, Git subprocesses also reject all HTTP redirects,
+overriding existing URL-specific redirect settings: Git's custom headers are
+scoped to the initial URL, not a redirect destination. Use canonical repository
+URLs rather than redirecting aliases. Other origins receive no Access headers.
+When neither Access variable is set, ordinary production behavior is unchanged.
+As with any environment secret, run only trusted local executables/helpers;
+process environments are not a security boundary against the same OS user.
+
 ## Develop
 
 ```bash

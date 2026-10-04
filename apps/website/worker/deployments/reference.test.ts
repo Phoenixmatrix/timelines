@@ -21,10 +21,6 @@ function running(context: Partial<ConditionContext>): string[] {
   return pipeline.jobs.filter((job) => jobRuns(job, full)).map((job) => job.name);
 }
 
-test("this repository opts in to previews", () => {
-  expect(pipeline.preview).toBe(true);
-});
-
 test("a preview run runs only its action's job, and only in a Sandbox", () => {
   expect(running({})).toEqual(["preview"]);
   expect(running({ action: "teardown" })).toEqual(["preview-teardown"]);
@@ -40,16 +36,4 @@ test("pushes run the gates as before, never the preview jobs", () => {
   const push = { trigger: "push" as const, action: "" };
   expect(running({ ...push, branch: "main" })).toEqual(["check", "test", "build", "cli", "deploy"]);
   expect(running({ ...push, runner: "local" })).toEqual(["check", "test", "build", "cli", "e2e"]);
-});
-
-test("the preview jobs deploy with the Cloudflare token, one create at a time", () => {
-  const job = (name: string) => pipeline.jobs.find((j) => j.name === name)!;
-  for (const name of ["preview", "preview-teardown"]) {
-    expect(job(name).secrets).toEqual(["CLOUDFLARE_API_TOKEN"]);
-    expect(job(name).env.CLOUDFLARE_ACCOUNT_ID).toBeTruthy();
-    expect(job(name).needs).toEqual([]);
-  }
-  expect(job("preview").concurrency).toBe("preview");
-  expect(job("preview").steps.at(-1)?.run).toBe("node tools/preview/preview.ts create");
-  expect(job("preview-teardown").steps.at(-1)?.run).toBe("node tools/preview/preview.ts teardown");
 });

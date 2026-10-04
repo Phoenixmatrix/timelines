@@ -1,6 +1,6 @@
 import { bindings, defineConfig, defineContainer, exports, triggers } from "cf/config";
 import { developmentEnvironment } from "./vite/environment.ts";
-import { previewKey, previewResources } from "./vite/preview.ts";
+import { previewResources } from "./vite/preview.ts";
 
 // Remote services have no local emulator, so dev talks to the real ones
 // (Artifacts, Workers AI, Vectorize, AI Search). D1, the Durable Object and
@@ -205,8 +205,9 @@ export default defineConfig(({ mode, isPreview }) => {
         ...(preview
           ? {
               PREVIEW_MODE: bindings.text("true"),
-              // The access key every request must present (or a token minted behind it).
-              PREVIEW_KEY: bindings.text(previewKey(preview.secret)),
+              // Verify Access assertions before serving preview APIs or assets.
+              PREVIEW_ACCESS_ISSUER: bindings.text(preview.accessIssuer),
+              PREVIEW_ACCESS_AUD: bindings.text(preview.accessAudience),
               // The gate passes asset requests on through this.
               ASSETS: bindings.assets(),
               AGENT_ID: bindings.text(preview.name),

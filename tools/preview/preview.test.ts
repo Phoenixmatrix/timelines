@@ -4,9 +4,8 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { previewKey } from "../../apps/website/vite/preview.ts";
 import {
-  accessLink,
+  accessHeaders,
   bounded,
   create,
   deletePreview,
@@ -22,6 +21,14 @@ import {
 } from "./preview.ts";
 
 const WORKER_ID = "826276d4ee384ccd9e1f6635ab45011a";
+const accessEnv = {
+  GITMATRIX_PREVIEW_ACCESS_ISSUER: "https://preview-tests.cloudflareaccess.com",
+  GITMATRIX_PREVIEW_ACCESS_AUD: "preview-tests",
+  GITMATRIX_ACCESS_TOKEN: JSON.stringify({
+    "cf-access-client-id": "test-client.access",
+    "cf-access-client-secret": "test-secret",
+  }),
+};
 
 /** A Cloudflare account in memory: D1s, buckets, namespaces and Previews. */
 function fakeCloudflare(state: {
@@ -210,7 +217,7 @@ await test("create tears down, provisions fresh data, deploys in preview mode, s
         steps.push(`gm ${args.join(" ")}`);
       },
     },
-    { slug: "faster-search", account: "acct", env: {} },
+    { slug: "faster-search", account: "acct", env: accessEnv },
   );
   assert.equal(url, "https://timeline-faster-search-gitmatrix.example.workers.dev");
   // The old Preview went first (found by name, deleted by id), then the old
@@ -246,11 +253,13 @@ await test("create tears down, provisions fresh data, deploys in preview mode, s
     GITMATRIX_PREVIEW_BUCKET: "gitmatrix-preview-faster-search",
     GITMATRIX_PREVIEW_ARTIFACTS: "gitmatrix-preview-faster-search",
     GITMATRIX_PREVIEW_SECRET: "s".repeat(64),
+    GITMATRIX_PREVIEW_ACCESS_ISSUER: accessEnv.GITMATRIX_PREVIEW_ACCESS_ISSUER,
+    GITMATRIX_PREVIEW_ACCESS_AUD: accessEnv.GITMATRIX_PREVIEW_ACCESS_AUD,
   });
   assert.deepEqual(steps, [
     `wait ${url} timeline-faster-search`,
     `seed ${url} db-1`,
-    `gm deploy record --url ${url}/?preview_key=${previewKey("s".repeat(64))}`,
+    `gm deploy record --url ${url}`,
   ]);
 });
 
@@ -410,21 +419,14 @@ await test("waitForPreview waits for this deployment's identity", async () => {
     () => Response.json({ id: "timeline-x", ready: false }),
     () => Response.json({ id: "timeline-x", ready: true }),
   ];
-  const seen: string[] = [];
   await waitForPreview(
     "https://p.example",
     { name: "timeline-x", secret: "k" },
     {
       delayMs: 0,
-      request: (async (url: string, init: RequestInit) => {
-        const headers = new Headers(init.headers);
-        seen.push(`${url} ${headers.get("authorization")} ${headers.get("x-preview-key")}`);
-        return answers.shift()!();
-      }) as typeof fetch,
+      request: (async () => answers.shift()!()) as typeof fetch,
     },
   );
-  assert.equal(seen.length, 4);
-  assert.equal(seen[0], `https://p.example/api/dev/environment Bearer k ${previewKey("k")}`);
   await assert.rejects(
     waitForPreview(
       "https://p.example",
@@ -491,16 +493,38 @@ await test("jobFrom takes only the preview contract's variables", () => {
   assert.throws(() => jobFrom({ ...env, CLOUDFLARE_ACCOUNT_ID: "" }), /CLOUDFLARE_ACCOUNT_ID/);
 });
 
-await test("the access link carries a derived key that nothing prints", () => {
-  const secret = "q".repeat(64);
-  const key = previewKey(secret);
-  assert.match(key, /^[0-9a-f]{64}$/);
-  assert.notEqual(key, secret);
-  assert.equal(accessLink("https://p.example", key), `https://p.example/?preview_key=${key}`);
-  hide(secret);
-  hide(key);
+await test("invalid Access configuration cannot replace an existing preview", async () => {
+  for (const env of [
+    {},
+    { ...accessEnv, GITMATRIX_PREVIEW_ACCESS_AUD: "" },
+    { ...accessEnv, GITMATRIX_PREVIEW_ACCESS_ISSUER: "https://untrusted.example" },
+    { ...accessEnv, GITMATRIX_ACCESS_TOKEN: "not-json" },
+    { ...accessEnv, GITMATRIX_ACCESS_TOKEN: "{}" },
+  ]) {
+    const fake = fakeCloudflare({ previews: ["timeline-faster-search"] });
+    await assert.rejects(
+      create(
+        {
+          cloudflare: fake.cloudflare,
+          wait: async () => assert.fail("must fail before deploy"),
+          seed: async () => assert.fail("must fail before seed"),
+          record: async () => assert.fail("must fail before record"),
+        },
+        { slug: "faster-search", account: "acct", env },
+      ),
+      /GITMATRIX_(?:PREVIEW_ACCESS|ACCESS_TOKEN)/,
+    );
+    assert.equal(fake.calls.length, 0);
+    assert.deepEqual([...fake.previews.keys()], ["timeline-faster-search"]);
+  }
+});
+
+await test("preview credentials never escape into reported child output", () => {
+  const sessionSecret = "private-session-signing-secret";
+  hide(sessionSecret);
+  accessHeaders(accessEnv);
   assert.equal(
-    redact(`recorded ${accessLink("https://p.example", key)} with ${secret}`),
-    "recorded https://p.example/?preview_key=[hidden] with [hidden]",
+    redact(`${accessEnv.GITMATRIX_ACCESS_TOKEN} test-client.access test-secret ${sessionSecret}`),
+    "[hidden] [hidden] [hidden] [hidden]",
   );
 });

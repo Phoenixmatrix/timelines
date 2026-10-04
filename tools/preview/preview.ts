@@ -21,9 +21,11 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { loadEnvFile } from "node:process";
 import {
-  previewKey,
+  previewAccess,
   previewVariables,
+  type PreviewAccess,
   type PreviewResources,
 } from "../../apps/website/vite/preview.ts";
 import { seedFixtures } from "../agent/seed.ts";
@@ -304,6 +306,7 @@ export async function provision(
   cloudflare: Cloudflare,
   all: Names,
   secret: string,
+  access: PreviewAccess,
 ): Promise<PreviewResources> {
   const db = await createDatabase(cloudflare, all.db);
   const registryDb = await createDatabase(cloudflare, all.registryDb);
@@ -314,6 +317,7 @@ export async function provision(
   await cloudflare.cf(["r2", "buckets", "create", "--name", all.bucket]);
   await cloudflare.cf(["artifacts", "namespaces", "create", "--namespace", all.artifacts]);
   return {
+    ...access,
     name: all.preview,
     db,
     registryDb,
@@ -391,28 +395,52 @@ export function redact(text: string): string {
   return out;
 }
 
-/**
- * The link Gitmatrix records: the preview with its access key, which the
- * preview trades for a cookie (worker/preview-gate.ts). Whoever can read the
- * repository's deployment records can open it.
- */
-export function accessLink(url: string, key: string): string {
-  return `${url}/?preview_key=${key}`;
+/** The service credential stays in the caller's environment, never in a preview URL. */
+export function accessHeaders(env: NodeJS.ProcessEnv): Record<string, string> {
+  const token = env.GITMATRIX_ACCESS_TOKEN ?? "";
+  hide(token);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(token);
+  } catch {
+    throw new Error("GITMATRIX_ACCESS_TOKEN must contain the Access service token JSON.");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    throw new Error("GITMATRIX_ACCESS_TOKEN must contain the Access service token JSON.");
+  const id: unknown = Reflect.get(parsed, "cf-access-client-id");
+  const secret: unknown = Reflect.get(parsed, "cf-access-client-secret");
+  if (
+    typeof id !== "string" ||
+    typeof secret !== "string" ||
+    !/^[\x21-\x7e]+$/.test(id) ||
+    !/^[\x21-\x7e]+$/.test(secret)
+  )
+    throw new Error(
+      "GITMATRIX_ACCESS_TOKEN needs nonempty cf-access-client-id and cf-access-client-secret.",
+    );
+  hide(id);
+  hide(secret);
+  return { "CF-Access-Client-Id": id, "CF-Access-Client-Secret": secret };
 }
 
 /** Wait until the new deployment answers as this preview, with its database ready. */
 export async function waitForPreview(
   origin: string,
   resources: Pick<PreviewResources, "name" | "secret">,
-  { request = fetch as Fetch, tries = 60, delayMs = 5000 } = {},
+  {
+    request = fetch as Fetch,
+    tries = 60,
+    delayMs = 5000,
+    headers = {} as Record<string, string>,
+  } = {},
 ): Promise<void> {
   let last = "no answer";
   for (let attempt = 0; attempt < tries; attempt++) {
     try {
       const response = await request(`${origin}/api/dev/environment`, {
         headers: {
+          ...headers,
           Authorization: `Bearer ${resources.secret}`,
-          "x-preview-key": previewKey(resources.secret),
         },
         signal: AbortSignal.timeout(10_000),
         redirect: "error",
@@ -479,32 +507,32 @@ export interface Job {
 export interface CreateDeps {
   cloudflare: Cloudflare;
   /** Seed the deployed preview through its API (tools/agent's fixtures). */
-  seed(origin: string, resources: PreviewResources): Promise<void>;
+  seed(origin: string, resources: PreviewResources, headers: Record<string, string>): Promise<void>;
   /** `gm deploy record`, with the job's variables. */
   record(args: string[]): Promise<void>;
-  wait(origin: string, resources: PreviewResources): Promise<void>;
+  wait(origin: string, resources: PreviewResources, headers: Record<string, string>): Promise<void>;
   secret?: string;
 }
 
 /** create: tear down, provision, deploy in preview mode, seed, record. Returns the URL. */
 export async function create(deps: CreateDeps, job: Job): Promise<string> {
+  const access = previewAccess(job.env);
+  const headers = accessHeaders(job.env);
   const all = await teardown(deps.cloudflare, job.account, job.slug);
   const secret = deps.secret ?? randomBytes(32).toString("hex");
-  const key = previewKey(secret);
   hide(secret);
-  hide(key);
-  const resources = await provision(deps.cloudflare, all, secret);
+  const resources = await provision(deps.cloudflare, all, secret, access);
   // isPreview builds cloudflare.config.ts's preview mode, bound to these resources.
   const output = await deps.cloudflare.cf(
     ["previews", "deploy", all.preview],
     previewVariables(resources),
   );
   const url = previewUrl(output);
-  await deps.wait(url, resources);
-  await deps.seed(url, resources);
+  await deps.wait(url, resources, headers);
+  await deps.seed(url, resources, headers);
   // GITMATRIX_TIMELINE and GITMATRIX_CHECKPOINT file it under timeline/<slug>.
-  // The recorded link carries the access key; nothing prints it.
-  await deps.record(["deploy", "record", "--url", accessLink(url, key)]);
+  // Access protects the hostname; recorded links contain no bearer capability.
+  await deps.record(["deploy", "record", "--url", url]);
   return url;
 }
 
@@ -584,10 +612,17 @@ export function jobFrom(env: NodeJS.ProcessEnv): Job & { action: "create" | "tea
 function withoutCloudflare(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const rest = { ...env };
   delete rest.CLOUDFLARE_API_TOKEN;
+  delete rest.GITMATRIX_ACCESS_TOKEN;
+  delete rest.GITMATRIX_ACCESS_ORIGIN;
   return rest;
 }
 
 async function main(argv: string[]): Promise<void> {
+  try {
+    loadEnvFile(join(root, ".env"));
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+  }
   const job = jobFrom(process.env);
   if (argv[0] !== job.action)
     throw new Error(`Asked to ${argv[0]}, but this preview run is a ${job.action}.`);
@@ -614,8 +649,8 @@ async function main(argv: string[]): Promise<void> {
         {
           cloudflare,
           record,
-          wait: (origin, resources) => waitForPreview(origin, resources),
-          seed: async (origin, resources) => {
+          wait: (origin, resources, headers) => waitForPreview(origin, resources, { headers }),
+          seed: async (origin, resources, headers) => {
             await seedFixtures({
               id: resources.name,
               secret: resources.secret,
@@ -623,8 +658,12 @@ async function main(argv: string[]): Promise<void> {
               gm,
               dir: join(scratch, "seed"),
               work: scratch,
-              env: gmEnv,
-              headers: { "x-preview-key": previewKey(resources.secret) },
+              env: {
+                ...gmEnv,
+                GITMATRIX_ACCESS_ORIGIN: origin,
+                GITMATRIX_ACCESS_TOKEN: job.env.GITMATRIX_ACCESS_TOKEN,
+              },
+              headers,
             });
           },
         },

@@ -365,7 +365,7 @@ fn env_token() -> Option<String> {
 pub fn upload(config: &Config, path: &str, bytes: Vec<u8>) -> Result<Value> {
     let (token, _) = credential(config)?;
     let url = format!("{}{}", config.server(), path);
-    let mut req = agent().put(&url);
+    let mut req = agent(&url, false)?.put(&url);
     if let Some(t) = &token {
         req = req.header("authorization", &format!("Bearer {t}"));
     }
@@ -404,12 +404,7 @@ pub fn artifact(
     head: bool,
 ) -> Result<ureq::http::Response<ureq::Body>> {
     let url = format!("{}{}", config.server(), path);
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .middleware(cli_source)
-        .max_redirects(0)
-        .build()
-        .into();
+    let agent = agent(&url, true)?;
     let fetch = |token: Option<&str>| {
         let mut request = if head {
             agent.head(&url)
@@ -460,12 +455,114 @@ fn cli_source(
     next.handle(request)
 }
 
-fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+// Access credentials are deliberately not part of Config: they belong only to
+// this process and one explicitly named origin.
+struct Access {
+    origin: String,
+    client_id: ureq::http::HeaderValue,
+    client_secret: ureq::http::HeaderValue,
+}
+
+fn access_error() -> GmError {
+    GmError::usage(
+        "Set both GITMATRIX_ACCESS_TOKEN (JSON with nonempty cf-access-client-id and cf-access-client-secret strings) and GITMATRIX_ACCESS_ORIGIN (an exact HTTPS origin; HTTP is allowed only on localhost).",
+    )
+}
+
+fn origin(url: &str) -> Option<String> {
+    let uri: ureq::http::Uri = url.parse().ok()?;
+    let scheme = uri.scheme_str()?;
+    let authority = uri.authority()?;
+    let host = authority.host().to_ascii_lowercase();
+    if authority.as_str().contains('@')
+        || host.contains('*')
+        || !matches!(scheme, "https" | "http")
+        || (scheme == "http" && !matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]"))
+    {
+        return None;
+    }
+    let port = authority
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let authority_text = authority.as_str().to_ascii_lowercase();
+    if authority_text != host && authority_text != format!("{host}:{port}") {
+        return None;
+    }
+    Some(format!("{scheme}://{host}:{port}"))
+}
+
+impl Access {
+    fn load() -> Result<Option<Self>> {
+        let token = std::env::var_os("GITMATRIX_ACCESS_TOKEN");
+        let scoped = std::env::var_os("GITMATRIX_ACCESS_ORIGIN");
+        let (token, scoped) = match (token, scoped) {
+            (None, None) => return Ok(None),
+            (Some(token), Some(scoped)) => (
+                token.into_string().map_err(|_| access_error())?,
+                scoped.into_string().map_err(|_| access_error())?,
+            ),
+            _ => return Err(access_error()),
+        };
+        let uri: ureq::http::Uri = scoped.parse().map_err(|_| access_error())?;
+        if uri.path() != "/" || uri.query().is_some() || scoped.contains('#') {
+            return Err(access_error());
+        }
+        let origin = origin(&scoped).ok_or_else(access_error)?;
+        let value: Value = serde_json::from_str(&token).map_err(|_| access_error())?;
+        let object = value.as_object().ok_or_else(access_error)?;
+        if object.len() != 2
+            || ["cf-access-client-id", "cf-access-client-secret"]
+                .iter()
+                .any(|key| {
+                    object
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_none_or(|v| v.trim().is_empty())
+                })
+        {
+            return Err(access_error());
+        }
+        let header = |key: &str| -> Result<ureq::http::HeaderValue> {
+            let mut header =
+                ureq::http::HeaderValue::from_str(object[key].as_str().ok_or_else(access_error)?)
+                    .map_err(|_| access_error())?;
+            header.set_sensitive(true);
+            Ok(header)
+        };
+        Ok(Some(Self {
+            origin,
+            client_id: header("cf-access-client-id")?,
+            client_secret: header("cf-access-client-secret")?,
+        }))
+    }
+}
+
+fn agent(url: &str, no_redirects: bool) -> Result<ureq::Agent> {
+    let access = Access::load()?.filter(|access| origin(url).as_deref() == Some(&access.origin));
+    let protected = access.is_some();
+    let mut builder = ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .middleware(cli_source)
-        .build()
-        .into()
+        .middleware(cli_source);
+    if let Some(access) = access {
+        builder = builder.middleware(
+            move |mut request: ureq::http::Request<ureq::SendBody>,
+                  next: ureq::middleware::MiddlewareNext| {
+                request
+                    .headers_mut()
+                    .insert("cf-access-client-id", access.client_id.clone());
+                request
+                    .headers_mut()
+                    .insert("cf-access-client-secret", access.client_secret.clone());
+                next.handle(request)
+            },
+        );
+    }
+    // ureq must never replay a custom credential on a redirect. Protected
+    // requests require the canonical endpoint, including same-origin redirects.
+    if protected || no_redirects {
+        builder = builder.max_redirects(0);
+    }
+    Ok(builder.build().into())
 }
 
 /// Call the JSON API. Non-2xx responses become errors carrying the server's message.
@@ -488,12 +585,15 @@ pub fn api(config: &Config, method: &str, path: &str, body: Option<&Value>) -> R
 /// protocols that answer with error bodies by design (OAuth device polling).
 pub fn post_raw(config: &Config, path: &str, body: &Value) -> Result<(u16, Value)> {
     let url = format!("{}/api{}", config.server(), path);
-    let mut response = agent().post(&url).send_json(body.clone()).map_err(|e| {
-        GmError::new(
-            "server_unreachable",
-            format!("Could not reach {}: {e}", config.server()),
-        )
-    })?;
+    let mut response = agent(&url, false)?
+        .post(&url)
+        .send_json(body.clone())
+        .map_err(|e| {
+            GmError::new(
+                "server_unreachable",
+                format!("Could not reach {}: {e}", config.server()),
+            )
+        })?;
     let status = response.status().as_u16();
     let text = response.body_mut().read_to_string().unwrap_or_default();
     let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
@@ -508,7 +608,7 @@ pub fn api_with(
     token: Option<&str>,
 ) -> Result<Value> {
     let url = format!("{}/api{}", config.server(), path);
-    let agent = agent();
+    let agent = agent(&url, false)?;
     let auth = token.map(|t| format!("Bearer {t}"));
     let unreachable = |e: ureq::Error| {
         GmError::new(
@@ -570,7 +670,7 @@ pub fn stream_lines(
     use std::io::BufRead;
     let (token, _) = credential(config)?;
     let url = format!("{}/api{}", config.server(), path);
-    let mut req = agent().post(&url);
+    let mut req = agent(&url, false)?.post(&url);
     if let Some(t) = &token {
         req = req.header("authorization", format!("Bearer {t}"));
     }
@@ -616,9 +716,27 @@ fn status_error(status: u16, value: &Value) -> GmError {
     }
 }
 
+fn hide_git_access(command: &mut Command) {
+    command.env_remove("GIT_CONFIG_PARAMETERS");
+    command.env_remove("GITMATRIX_ACCESS_TOKEN");
+    // Git/curl traces can print arbitrary custom headers and config values.
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("GIT_TRACE") || name == "GIT_CURL_VERBOSE")
+        {
+            command.env_remove(name);
+        }
+    }
+    for name in ["GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"] {
+        command.env(name, "0");
+    }
+}
+
 /// Run git with the stored token sent as a Bearer header to the server only,
 /// passed through the environment so it never shows up in `ps`.
 fn git_command(config: &Config, cwd: &Path, args: &[&str]) -> Result<Command> {
+    let access = Access::load()?;
     let mut command = Command::new("git");
     command
         .current_dir(cwd)
@@ -632,6 +750,51 @@ fn git_command(config: &Config, cwd: &Path, args: &[&str]) -> Result<Command> {
         entries.push((
             format!("http.{}/.extraHeader", config.server()),
             format!("Authorization: Bearer {token}"),
+        ));
+    }
+    if let Some(access) = access {
+        hide_git_access(&mut command);
+        let mut inspect = Command::new("git");
+        hide_git_access(&mut inspect);
+        let redirect_keys = inspect
+            .current_dir(cwd)
+            .args([
+                "config",
+                "--name-only",
+                "--get-regexp",
+                r"^http\..*followredirects$",
+            ])
+            .output()
+            .map_err(git_missing)?;
+        if !redirect_keys.status.success() && redirect_keys.status.code() != Some(1) {
+            return Err(GmError::usage(
+                "Could not inspect Git redirect configuration safely.",
+            ));
+        }
+        for key in String::from_utf8_lossy(&redirect_keys.stdout).lines() {
+            entries.push((key.to_owned(), "false".into()));
+        }
+        entries.push((
+            format!("http.{}/.extraHeader", access.origin),
+            format!(
+                "CF-Access-Client-Id: {}",
+                access.client_id.to_str().map_err(|_| access_error())?
+            ),
+        ));
+        entries.push((
+            format!("http.{}/.extraHeader", access.origin),
+            format!(
+                "CF-Access-Client-Secret: {}",
+                access.client_secret.to_str().map_err(|_| access_error())?
+            ),
+        ));
+        // Git scopes extraHeader to the initial URL, not redirect targets.
+        // Override existing URL-specific redirect rules too: Git gives them
+        // precedence over the unscoped setting regardless of config source.
+        entries.push(("http.followRedirects".into(), "false".into()));
+        entries.push((
+            format!("http.{}/.followRedirects", access.origin),
+            "false".into(),
         ));
     }
     command.env("GIT_CONFIG_COUNT", entries.len().to_string());

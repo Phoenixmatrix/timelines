@@ -1882,7 +1882,7 @@ checkpoint ─▶ preview run (create) ─▶ preview job ─▶ node tools/prev
    3. an R2 bucket and an Artifacts namespace: gitmatrix-preview-<slug>
    4. cf previews deploy timeline-<slug>, in preview mode, bound to 2–3
    5. the agent fixtures (tools/agent/seed.ts) through the preview's own API
-   6. gm deploy record --url <URL>/?preview_key=<key>   → timeline/<slug>, at the checkpoint
+   6. gm deploy record --url <URL>   → timeline/<slug>, at the checkpoint
 expiry ─▶ preview run (teardown) ─▶ preview-teardown job ─▶ … preview.ts teardown
    delete the Preview (Cloudflare API: `cf previews` can only deploy),
    then the D1s, the bucket (emptied first) and the namespace (repositories first)
@@ -1905,57 +1905,94 @@ expiry ─▶ preview run (teardown) ─▶ preview-teardown job ─▶ … prev
   local server's preview runs deploy nothing. Creates share the `preview`
   concurrency group: one at a time per repository, and a waiting create gives
   way to a newer one for the same timeline. The jobs use the deploy job's
-  `CLOUDFLARE_API_TOKEN` (D1, R2, Artifacts and Workers edit). `gm` comes from
-  the job owner's generic registry (the newest gm main published, checked
+  `CLOUDFLARE_API_TOKEN` (D1, R2, Artifacts and Workers edit), plus
+  `GITMATRIX_ACCESS_TOKEN` for the preview's HTTP and Git requests. `gm` comes
+  from the job owner's generic registry (the newest gm main published, checked
   against its SHA-256) unless `GITMATRIX_PREVIEW_GM` names one.
 - **A failed create** records the checkpoint's preview as `failed`, and the
   job fails. Re-run it, or revive the checkpoint.
 
-**The access link.** Persona sign-in needs no password, so a preview's URL
-alone opens nothing. Every request, static assets included, passes the gate
-in `worker/preview-gate.ts` first, or gets a 401 page ("This preview needs its
-access link; open it from the deployment in Gitmatrix."). It passes with the
-preview's access key, which tools/preview derives from the secret it generates
-for each create (`previewKey` in `vite/preview.ts`; the key is never the
-secret itself), presented in one of three ways:
+**Cloudflare Access, independent of preview lifetime.** The account's
+`Gitmatrix previews` self-hosted Access application protects
+`*-gitmatrix.fward.workers.dev`. This includes named timeline previews,
+deployment URLs, and production-version preview URLs, but not
+`gitmatrix.fward.dev`. The application and its policies are permanent:
+**preview teardown must never delete them.** A Preview can disappear from
+Cloudflare's management API while its old route still serves (CORE-216);
+the hostname policy continues to require authentication even then.
 
-- `?preview_key=<key>` on a page visit, which sets the `gm_preview` cookie
-  (HttpOnly, Secure, SameSite=Lax, this host only) and redirects to the same
-  page without the key;
-- the `gm_preview` cookie;
-- the `x-preview-key` header, which tools/preview's seeding sends.
+The owner signs in using the existing **Cloudflare** identity provider,
+with an Allow policy restricted to the owner's email. Agents use a separate
+**Service Auth** policy restricted to the `gitmatrix-preview-agents` service
+token, not a Bypass policy. The hostname application also supports WebSockets;
+Cloudflare's Worker-level Access destinations currently do not.
 
-Keys compare in constant time. A request with a live personal access token
-passes too: tokens are only ever minted behind the gate (persona sign-in, the
-`/api/dev` routes), and gm, which pushes the fixture repositories, can't send
-other headers. The API, git, persona sign-in and `/api/dev/environment` all
-sit behind the gate. A preview without a key lets nothing through.
+**Agent credentials.** `GITMATRIX_ACCESS_TOKEN` is a JSON object containing
+`cf-access-client-id` and `cf-access-client-secret`, kept in the ignored root
+`.env` (mode `0600`) for local agents and the repository secret of the same
+name for CI. `tools/preview/preview.ts` loads the local `.env` without
+overriding the process environment. Do not copy it into source, images,
+deployment URLs, browser bundles, or logs. Worktrees do not copy secrets.
+The service token expires; rotate it in Access and update both stores before
+expiry. Never remove the Access application to work around an expired token.
 
-**The recorded link is a capability.** tools/preview records the preview as
-`<URL>/?preview_key=<key>`, so the link on the checkpoint and in `gm deploy
-list` is what opens it. matrixorg/gitmatrix is a private repository, so its
-deployment records are visible only to people with access to it: **anyone with
-read access to the repository can open its previews** and sign in as any
-persona there, with the fixtures only. The key changes with every create, so a
-new checkpoint (or teardown) retires old links. The script never prints the
-key or the secret: what it echoes is masked, and it reports the recorded
-deployment's id, not its URL.
+Send the two values as `CF-Access-Client-Id` and `CF-Access-Client-Secret`
+headers. They authenticate to Access; `Authorization` remains available for
+Gitmatrix's own token. Example for an agent running Node from this checkout:
+
+```sh
+node --env-file=.env --input-type=module -e '
+const token = JSON.parse(process.env.GITMATRIX_ACCESS_TOKEN);
+const response = await fetch(process.argv[1], {
+  headers: {
+    "CF-Access-Client-Id": token["cf-access-client-id"],
+    "CF-Access-Client-Secret": token["cf-access-client-secret"],
+  },
+  redirect: "error",
+});
+console.log(response.status);
+' "$PREVIEW_URL"
+```
+
+For `gm`, export the token from `.env` and set `GITMATRIX_ACCESS_ORIGIN` to
+the exact preview origin (no path) as well as `GM_SERVER`. The compiled CLI
+uses the headers for API, streaming, package and Git requests only to that
+origin, does not persist them, and refuses authenticated redirects. Preview
+seeding supplies this scope automatically; calls that record deployments
+on the production server receive neither Access credential variable.
+
+**Origin verification.** New timeline previews require a correctly signed
+`Cf-Access-Jwt-Assertion` for `PREVIEW_ACCESS_ISSUER` and
+`PREVIEW_ACCESS_AUD` before serving any API, Git, WebSocket or static request.
+`worker/preview-gate.ts` validates RS256 signatures against the team's public
+keys, issuer, audience and expiry, failing closed on missing configuration,
+invalid assertions or unavailable keys. Plain Gitmatrix tokens, the former
+preview-key header/cookie/query parameter, and forged identity headers do
+not bypass it. Access-authenticated humans and service tokens can then use
+the preview's seeded persona sign-in. Recorded URLs are ordinary links,
+not bearer capabilities.
 
 **Production prerequisites.** Before the first preview:
 
 - The repository secret `CLOUDFLARE_API_TOKEN` can edit Workers (Worker
   Previews), D1, R2 (buckets and objects) and Artifacts (namespaces and their
   repositories), on the account the jobs name.
+- The persistent Access application above is configured before previews
+  are deployed. Its service-token policy accepts the repository's
+  `GITMATRIX_ACCESS_TOKEN`; the preview CI job supplies the public
+  `GITMATRIX_PREVIEW_ACCESS_ISSUER` and `GITMATRIX_PREVIEW_ACCESS_AUD`.
+  Missing or invalid Access settings fail a create before existing preview
+  resources are replaced.
 - Worker Previews are served on the `gitmatrix` Worker's workers.dev subdomain
   (`<preview>-gitmatrix.<subdomain>.workers.dev`), so previews must be enabled
   there. `cloudflare.config.ts` does it: deployed, the Worker sets
   `previewUrls: true` and `workersDev: false`, and each production deploy
   sets the subdomain to `enabled: false`, `previews_enabled: true` (before
   previews: both false). Production itself still answers only on
-  gitmatrix.fward.dev. The trade-off, approved on 2026-10-03: each production
-  version is also reachable at its own version preview URL,
-  `<version>-gitmatrix.<subdomain>.workers.dev`, with production's bindings;
-  sign-in there doesn't share production's cookies, since Better Auth trusts
+  gitmatrix.fward.dev. Each production version is also reachable at its own
+  version preview URL, `<version>-gitmatrix.<subdomain>.workers.dev`, with
+  production's bindings, **behind the same persistent Access application**.
+  Sign-in there does not share production cookies, since Better Auth trusts
   only `PUBLIC_URL`.
 - The Worker's `previews_base_config` stays empty (it was null on
   2026-10-03): bindings set there would be inherited by every preview,
@@ -1994,7 +2031,7 @@ So in a preview, pushes and the UI work against the fixtures, but CI,
 knowledge, release notes and mirrors don't run. `AGENT_ID` and `AGENT_SECRET`
 (the Preview's name and the generated secret) guard the `/api/dev` routes
 tools/preview seeds through, behind the access gate, as they do for agent
-environments. A preview also binds `PREVIEW_KEY` and `ASSETS`, and runs the
+environments. A preview also binds its Access issuer/audience and `ASSETS`, and runs the
 Worker first for every path (`runWorkerFirst: true`): the gate hands the app
 its routes (`shared/worker-first.ts`, the same list production uses) and
 `ASSETS` the rest.
