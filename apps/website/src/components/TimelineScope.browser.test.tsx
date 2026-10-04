@@ -95,6 +95,24 @@ test("a timeline chosen in the rail scopes code, CI, Knowledge and the timelines
   await expect.element(banner).not.toBeInTheDocument();
 });
 
+test("settings graph navigation keeps its account rather than the default tracker", async () => {
+  const server = await TestServer.start({ world: true });
+  const trackers = await server.call<TrackerList>("GET", "/api/tracker");
+  const personal = trackers.trackers.find((tracker) => tracker.slug === "marco")!;
+  server.on("GET", "/api/tracker", { ...trackers, defaultOwnerId: personal.id });
+
+  const app = renderApp("/settings/ai?owner=orbit");
+  await userEvent.click(page.getByRole("button", { name: /^Timeline: main/ }));
+  const graph = page.getByRole("link", { name: "Timeline graph", exact: true });
+  await expect.element(graph).toHaveAttribute("href", "/tracker/orbit/timelines");
+  await userEvent.click(graph);
+  await app.waitForUrl((url) => url.pathname === "/tracker/orbit/timelines");
+  await expect.element(page.getByRole("heading", { name: "Timelines", exact: true })).toBeVisible();
+  await expect
+    .element(page.getByRole("button", { name: /^Timeline: main/ }))
+    .toHaveAttribute("aria-current", "page");
+});
+
 test.each(["empty", "failed"] as const)(
   "Home can open the default account's graph when its timeline list is %s",
   async (state) => {

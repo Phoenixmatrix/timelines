@@ -128,13 +128,18 @@ const PLACES = new Set([
 
 /**
  * The account whose timelines a page is about: the tracker's owner, or the
- * account in the path (`/:owner`, `/:owner/:repo/...`, `/:owner/-/...`).
- * Null on pages that belong to no account (Home, Needs you, settings).
+ * account in the path (`/:owner`, `/:owner/:repo/...`, `/:owner/-/...`), or
+ * settings' account context. Null on pages that belong to no account.
  */
 export function scopeOwner(pathname: string, search = ""): string | null {
   const [first = "", second] = pathname.split("/").slice(1);
   if (first === "tracker") return second ? decodeURIComponent(second) : null;
-  if (pathname === "/settings/preferences") return new URLSearchParams(search).get("tracker");
+  if (first === "settings") {
+    const params = new URLSearchParams(search);
+    return (
+      params.get("owner") ?? (pathname === "/settings/preferences" ? params.get("tracker") : null)
+    );
+  }
   return PLACES.has(first) ? null : decodeURIComponent(first);
 }
 

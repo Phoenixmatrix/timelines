@@ -114,6 +114,8 @@ Timelines are a first-class place, so they get a mark of their own in the rail i
 
 The rail has one Timelines control (CORE-218): its branded mark opens quick scope switching and the timeline graph, instead of separate switcher and graph buttons. The tile marks the graph as the current place; the amber dot still marks a selected timeline on other pages. Search, ended timelines and the scope banner remain available. The graph action stays reachable while the list loads or fails, using the current account or the default-tracker route when no account is resolved.
 
+Settings retain the account named by `?owner=` when opening timelines, even when another tracker is the user's default. Preferences also retains its `?tracker=` context when no `owner` is supplied.
+
 ## Colors
 
 ### Primary
