@@ -250,7 +250,7 @@ export function ApprovalCard({
   );
 }
 
-/** What the assistant is doing before its first words arrive. */
+/** What the assistant is doing while nothing else shows it: before its first words, and between steps. */
 export function StatusLine({ text }: { text: string }) {
   return (
     <p className="m-0 flex items-center gap-2 text-body-sm text-ink-muted" role="status">

@@ -37,6 +37,14 @@ import { recordPurge } from "../durable/record.ts";
 import { credential, type AssistantCredential } from "./identity.ts";
 import { apiClient } from "./internal.ts";
 import { clefState, planFrom, questions, type TurnPlan } from "./plan.ts";
+import {
+  cleanStatus,
+  PROGRESS_INSTRUCTIONS,
+  progressPrompt,
+  stepFromMessage,
+  WORKING,
+  type ProgressStep,
+} from "./progress.ts";
 import { sentenceCase } from "./titles.ts";
 import { builtinSkills, preloaded, repositorySkills, SkillRegistry } from "./skills.ts";
 import { buildTools } from "./tools.ts";
@@ -50,10 +58,14 @@ export const ASSISTANT_MODELS = {
   deep: "@cf/zai-org/glm-5.3",
   /** Chat titles: a few words, the cheapest capable model. */
   title: "@cf/ibm-granite/granite-4.0-h-micro",
+  /** Mid-turn status lines: a few words, as fast as possible (progress.ts). */
+  status: "@cf/ibm-granite/granite-4.0-h-micro",
 } as const;
 
 /** clef must answer fast or not at all: a turn never waits on routing. */
 const PLAN_DEADLINE_MS = 2500;
+/** A status that arrives later than this would describe a step already under way. */
+const STATUS_DEADLINE_MS = 4000;
 
 export interface CliTurn {
   write: boolean;
@@ -176,6 +188,29 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     }
   }
 
+  /** A few words on what the turn is doing now, or null if the small model can't say in time. */
+  private async progress(request: string, step: ProgressStep): Promise<string | null> {
+    try {
+      const { text: reply, usage } = await generateText({
+        model: createWorkersAI({ binding: this.env.AI })(
+          ASSISTANT_MODELS.status,
+          aiGatewayOptions(this.env, "assistant-status"),
+        ),
+        instructions: PROGRESS_INSTRUCTIONS,
+        prompt: progressPrompt(request, step),
+        maxOutputTokens: 16,
+        abortSignal: AbortSignal.timeout(STATUS_DEADLINE_MS),
+      });
+      await recordAiCall(this.env, ASSISTANT_MODELS.status, usageTokens(usage), {
+        work: this.#aiWork(),
+      });
+      return cleanStatus(reply);
+    } catch (error) {
+      console.warn("assistant: no status line for this step", error);
+      return null;
+    }
+  }
+
   /** The directory row for this chat: created on its first turn, touched after each. */
   private async touch(source: "web" | "cli") {
     const { userId, chatId } = this.owner;
@@ -287,6 +322,38 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
           ...loaded.map((skill) => `## Skill: ${skill.name}\n\n${skill.body}`),
         ].join("\n\n");
 
+        // Between steps nothing streams while the model reads what its tools
+        // returned. The chat says so at once, then in the small model's words;
+        // a status that arrives after the step's first output is dropped.
+        let between: number | null = null;
+        const show = (value: string) => {
+          try {
+            writer.write({ type: "data-status", data: { text: value }, transient: true });
+          } catch {
+            // The turn ended before the status was ready.
+          }
+        };
+        const nextStep = web
+          ? ({ stepNumber, steps }: { stepNumber: number; steps: readonly ProgressStep[] }) => {
+              const previous =
+                stepNumber === 0
+                  ? options?.continuation
+                    ? stepFromMessage(lastReply)
+                    : null
+                  : steps.at(-1);
+              if (!previous) return;
+              between = stepNumber;
+              if (stepNumber > 0) show(WORKING);
+              void this.progress(text(lastUser), previous).then((line) => {
+                if (line && between === stepNumber) show(line);
+              });
+            }
+          : undefined;
+        const output = (type: string) => {
+          if (type === "text-delta" || type === "tool-input-start" || type === "tool-call")
+            between = null;
+        };
+
         const workersai = createWorkersAI({ binding: this.env.AI });
         const result = streamText({
           model: workersai(model, {
@@ -306,26 +373,24 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
           tools: { ...active, ...registry.tools() },
           stopWhen: stepCountIs(plan.tier === "deep" ? 30 : 16),
           abortSignal: options?.abortSignal,
-          onChunk: cli
-            ? async ({ chunk }) => {
-                if (chunk.type === "text-delta")
-                  await cli.emit({ type: "text", delta: chunk.text });
-                else if (chunk.type === "tool-call")
-                  await cli.emit({
-                    type: "tool",
-                    name: chunk.toolName,
-                    label: toolLabel(
-                      chunk.toolName,
-                      (chunk.input ?? {}) as Record<string, unknown>,
-                    ),
-                  });
-              }
-            : undefined,
+          onStepStart: nextStep,
+          onChunk: async ({ chunk }) => {
+            output(chunk.type);
+            if (!cli) return;
+            if (chunk.type === "text-delta") await cli.emit({ type: "text", delta: chunk.text });
+            else if (chunk.type === "tool-call")
+              await cli.emit({
+                type: "tool",
+                name: chunk.toolName,
+                label: toolLabel(chunk.toolName, (chunk.input ?? {}) as Record<string, unknown>),
+              });
+          },
           // Metering (CORE-207): the turn's model steps and tokens.
           onFinish: (async (event: {
             steps?: unknown[];
             totalUsage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
           }) => {
+            between = null;
             await recordAiCall(this.env, model, usageTokens(event.totalUsage), {
               calls: event.steps?.length || 1,
               work: this.#aiWork(),

@@ -2427,6 +2427,14 @@ Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
   `@cf/zai-org/glm-5.3` for planning and hard turns) and reasoning effort, the
   tools the model sees, the skills preloaded into its instructions, and whether
   Code Mode is offered. Chat titles come from `@cf/ibm-granite/granite-4.0-h-micro`.
+- **Between steps** (`progress.ts`, CORE-87): once tools return, the model reads
+  their results with nothing streaming. On the web each new step (and a
+  continuation after a page opens) sends a "Thinking" status at once, then the
+  same granite model's few words about what's happening, written from the
+  request and the last step's calls and results (Gateway component
+  `assistant-status`, 4 s deadline). A line that arrives after the step's first
+  output is dropped. The chat shows the status line whenever a turn is under way
+  and no running tool or streaming text already shows it (`waiting.ts`).
 - **Tools** (`tools.ts`): reads (`list_repos`, `list_files`, `read_file`,
   `list_commits`, `semantic_changes`, `search_code`, `read_wiki`, `find_issues`,
   `show_issue`, `ci_runs`, `ci_run`, `ci_logs`, `find_packages`, `api_get`) and

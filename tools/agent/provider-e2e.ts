@@ -781,10 +781,18 @@ export async function runProviderE2E(
         page.setDefaultTimeout(120_000);
         await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
         let rejectNextResponse = false;
+        // The turn's stream chunks, in order, for the between-steps status check.
+        const chunks: { type: string; data?: { text?: string } }[] = [];
         await page.routeWebSocket(/\/api\/assistant\/chats\//, (socket) => {
           const server = socket.connectToServer();
           server.onMessage((message) => {
             const frame = JSON.parse(message.toString());
+            if (frame.type === "cf_agent_use_chat_response" && frame.body)
+              try {
+                chunks.push(JSON.parse(frame.body));
+              } catch {
+                // Not a chunk.
+              }
             if (
               rejectNextResponse &&
               frame.type === "cf_agent_use_chat_response" &&
@@ -981,6 +989,35 @@ export async function runProviderE2E(
             retryRecovered: true,
             redirectSkippedWrite: true,
           };
+          enter("assistant-between-steps");
+          // CORE-87: once a tool returns, the chat says the turn is still
+          // working, and asks the small status model for the words.
+          chunks.length = 0;
+          await composer.fill(
+            `Use show_issue to read ${created[0].key} in owner ${persona}, then reply with its title.`,
+          );
+          await page.getByRole("button", { name: "Send", exact: true }).click();
+          await waitFor(stage, 120_000, async () => {
+            const messages: Message[] = await api(messagesPath);
+            const last = messages.at(-1);
+            return (
+              last?.role === "assistant" &&
+              last.parts.some((part) => part.type === "tool-show_issue") &&
+              last.parts.some((part) => part.type === "text" && part.text?.includes(title))
+            );
+          });
+          await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeHidden();
+          const toolReturned = chunks.findIndex((chunk) => chunk.type === "tool-output-available");
+          assert(toolReturned >= 0, "The between-steps turn must call a tool");
+          const statuses = chunks
+            .slice(toolReturned + 1)
+            .filter((chunk) => chunk.type === "data-status")
+            .map((chunk) => chunk.data?.text ?? "");
+          assert(
+            statuses.includes("Thinking"),
+            `A status must follow the tool's result, before the next step: ${JSON.stringify(chunks.map((c) => c.type))}`,
+          );
+          evidence.assistantProgress = { chatId, statuses };
           enter("avatar-generation");
           // A real person's cookie session is required: agent bearer tokens cannot
           // spend their one-time image generation allowance.
@@ -1554,6 +1591,7 @@ export async function runProviderE2E(
         },
         { key: "assistant", component: "assistant", minimum: 1 },
         { key: "assistant-title", component: "assistant-title", minimum: 1 },
+        { key: "assistant-status", component: "assistant-status", minimum: 1 },
         {
           key: "avatars",
           component: "avatars",

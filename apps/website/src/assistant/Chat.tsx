@@ -32,6 +32,9 @@ import {
 } from "./parts.tsx";
 import { useAssistant } from "./state.tsx";
 import { suggestionsFor } from "./suggestions.ts";
+import { waitingFor } from "./waiting.ts";
+
+const STALL_MS = 300;
 
 interface Part {
   type: string;
@@ -217,10 +220,17 @@ export default function Chat({
   };
 
   const last = messages[messages.length - 1];
-  const waiting =
-    busy &&
-    (last?.role !== "assistant" ||
-      !last.parts.some((p) => (p.type === "text" && p.text?.trim()) || isTool(p)));
+  const wait = waitingFor(messages, busy);
+  // Between steps, a moment's pause (text ending before a tool call starts)
+  // shouldn't flash the line; a real wait shows it, at first in generic words.
+  const [stalled, setStalled] = useState(false);
+  useEffect(() => {
+    if (wait !== "step") return setStalled(false);
+    setStatus(null);
+    const timer = setTimeout(() => setStalled(true), STALL_MS);
+    return () => clearTimeout(timer);
+  }, [wait]);
+  const waiting = wait === "start" || (wait === "step" && stalled);
   const closeIfCompact = compact ? () => assistant.hide() : undefined;
 
   return (

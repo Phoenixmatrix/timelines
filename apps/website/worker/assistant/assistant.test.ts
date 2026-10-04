@@ -2,6 +2,7 @@ import { describe, expect, test } from "vite-plus/test";
 import { describeWrite, toolLabel } from "../../shared/assistant.ts";
 import { allowedPath } from "./internal.ts";
 import { planFrom, questions } from "./plan.ts";
+import { cleanStatus, progressPrompt, stepFromMessage } from "./progress.ts";
 import { sentenceCase } from "./titles.ts";
 import { parseSkill } from "./skills.ts";
 import { clip, compact } from "./tools.ts";
@@ -118,6 +119,67 @@ describe("approvals say what the request does", () => {
     expect(toolLabel("navigate", { path: "/tracker/o/issues/A-1", label: "A-1" })).toBe(
       "Opened A-1",
     );
+  });
+});
+
+describe("status lines between steps", () => {
+  test("the small model reads the request and what the last step did, briefly", () => {
+    const prompt = progressPrompt("Why did run #44 fail?", {
+      text: "Let me check the run.",
+      toolCalls: [{ toolName: "ci_run", toolCallId: "a", input: { number: 44 } }],
+      toolResults: [{ toolCallId: "a", output: { status: "failed", log: "x".repeat(5000) } }],
+    });
+    expect(prompt).toContain("Request: Why did run #44 fail?");
+    expect(prompt).toContain("- Read CI run #44\n  Result: {");
+    expect(prompt).toContain("Just said: Let me check the run.");
+    expect(prompt.length).toBeLessThan(1200);
+  });
+
+  test("a continued reply's last step comes from its message", () => {
+    const step = stepFromMessage({
+      parts: [
+        { type: "step-start" },
+        { type: "tool-show_issue", toolCallId: "old", input: { key: "A-1" }, output: {} },
+        { type: "step-start" },
+        { type: "text", text: "Opening it." },
+        {
+          type: "tool-navigate",
+          toolCallId: "nav",
+          input: { path: "/tracker/o/issues/A-2", label: "A-2" },
+          output: { opened: "/tracker/o/issues/A-2" },
+        },
+      ],
+    });
+    expect(step).toEqual({
+      text: "Opening it.",
+      toolCalls: [
+        {
+          toolName: "navigate",
+          toolCallId: "nav",
+          input: { path: "/tracker/o/issues/A-2", label: "A-2" },
+        },
+      ],
+      toolResults: [{ toolCallId: "nav", output: { opened: "/tracker/o/issues/A-2" } }],
+    });
+    // An approved write that hasn't run, or a reply without tools: nothing to say yet.
+    expect(
+      stepFromMessage({
+        parts: [{ type: "tool-create_issue", toolCallId: "w", input: {} }],
+      }),
+    ).toBeNull();
+    expect(stepFromMessage({ parts: [{ type: "text", text: "Hi" }] })).toBeNull();
+    expect(stepFromMessage(undefined)).toBeNull();
+  });
+
+  test("replies become a short line, or nothing", () => {
+    expect(cleanStatus("“Comparing the failing jobs.”")).toBe("Comparing the failing jobs");
+    expect(cleanStatus("Status: checking who owns CORE-12…\nmore")).toBe(
+      "Checking who owns CORE-12",
+    );
+    expect(cleanStatus("")).toBeNull();
+    expect(
+      cleanStatus("I am now going to read every one of the issues and summarize them for you"),
+    ).toBeNull();
   });
 });
 
