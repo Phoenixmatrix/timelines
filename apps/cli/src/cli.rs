@@ -107,6 +107,9 @@ pub enum Command {
     Sync,
     /// Land changes on trunk (or a bookmark) on Gitmatrix. There are no pull requests.
     Push(PushArgs),
+    /// Submit, inspect and monitor asynchronous main merge admissions
+    #[command(subcommand)]
+    Queue(QueueCommand),
     /// Timelines: parallel lines of work on `timeline/<slug>` that land on main later
     #[command(subcommand, visible_alias = "tl")]
     Timeline(crate::commands::timeline::TimelineCommand),
@@ -434,6 +437,12 @@ pub struct PushArgs {
     /// Fetch and rebase onto the latest trunk first.
     #[arg(long)]
     pub sync: bool,
+    /// Upload for server-side merge gates without advancing main immediately.
+    #[arg(long)]
+    pub queue: bool,
+    /// Link an issue key or ID to this queue admission (repeatable).
+    #[arg(long = "issue", requires = "queue")]
+    pub issues: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -641,6 +650,45 @@ pub struct SemanticListArgs {
     /// Language: typescript, tsx, rust, python, go, markdown, xml, json, html, css.
     #[arg(long)]
     pub language: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub enum QueueCommand {
+    /// Recent admissions, newest first
+    List {
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+        #[arg(long, value_parser = ["queued", "merging", "testing", "advancing", "landed", "failed", "cancelled", "covered"])]
+        status: Option<String>,
+    },
+    /// Inspect an admission and its failure/deployment evidence
+    Show {
+        id: String,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// Wait for landing; --deploy also requires the final main pipeline to succeed
+    Wait {
+        id: String,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+        #[arg(long)]
+        deploy: bool,
+    },
+    /// Cancel pending work without rewinding main
+    Cancel {
+        id: String,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
+    /// Retry a failed or cancelled admission of the same commit
+    Retry {
+        id: String,
+        #[arg(short = 'R', long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

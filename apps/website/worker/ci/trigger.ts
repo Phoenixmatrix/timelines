@@ -23,6 +23,7 @@ import {
 import { activeRun, anyHeld, inFlight, lastPassed, releaseHeld, UNCHANGED } from "./coalesce.ts";
 import type { StoredJob } from "./jobs.ts";
 import { landingSlugOf } from "../../shared/timelines.ts";
+import { isQueueSourceBranch } from "../../shared/merge-queue.ts";
 
 export interface CiRepo {
   id: string;
@@ -92,6 +93,8 @@ export async function startRun(
     preview?: PreviewRun;
     /** With trigger "landing": the landing whose merge it tests. */
     landingId?: string;
+    /** With trigger "landing": the admitted queue entry whose candidate it tests. */
+    queueId?: string;
     /** Who pushed or started it: a person, or an agent acting for one. */
     actor: Pick<Actor, "id" | "agent"> | null;
     waitUntil: Waiter;
@@ -102,6 +105,10 @@ export async function startRun(
   // CI_RUN is production's Workflow: a preview records no runs at all.
   if (!productionOnly(env, "workflow", `a ${options.trigger} run of ${options.branch}`))
     return { skipped: "Previews don't run CI." };
+  if (isQueueSourceBranch(options.branch))
+    return { skipped: "Queue source refs are staging only; CI runs on their merge candidate." };
+  if (options.queueId && (options.trigger !== "landing" || options.landingId))
+    throw new Error("A queue gate run needs landing trigger and no timeline landing.");
   const preview = options.trigger === "preview" ? (options.preview ?? null) : null;
   if (options.trigger === "preview" && !preview)
     throw new Error("A preview run needs its action and timeline.");
@@ -113,6 +120,23 @@ export async function startRun(
     options.waitUntil,
   );
   try {
+    if (options.queueId && options.runId) {
+      const recorded = await db(env.DB)
+        .selectFrom("ci_runs")
+        .select(["id", "number", "repo_id", "queue_id", "ref", "commit_oid"])
+        .where("id", "=", options.runId)
+        .executeTakeFirst();
+      if (recorded) {
+        if (
+          recorded.repo_id !== repo.id ||
+          recorded.queue_id !== options.queueId ||
+          recorded.ref !== options.branch ||
+          recorded.commit_oid !== options.commit
+        )
+          throw new Error("The saved queue gate run does not match this candidate.");
+        return { runId: recorded.id, number: recorded.number };
+      }
+    }
     // A run of this commit already in flight on the branch answers for it.
     const existing = await activeRun(
       env.DB,
@@ -121,7 +145,12 @@ export async function startRun(
       options.commit,
       preview && { action: preview.action, checkpoint: preview.checkpoint },
     );
-    if (existing) return { runId: existing.id, number: existing.number };
+    if (existing) {
+      // Queue callers persist their run identity before I/O. A different run
+      // on the same object cannot stand in for that attempt's gate evidence.
+      if (!options.queueId || existing.id === options.runId)
+        return { runId: existing.id, number: existing.number };
+    }
     const found = await pipelineAt(reader, options.commit);
     if (!found) return { skipped: `No ${CONFIG_PATH} at ${options.commit.slice(0, 12)}.` };
     const { pipeline, error, title } = found;
@@ -153,6 +182,8 @@ export async function startRun(
     // A project may opt in and handle only one action: no run for the other.
     if (preview && !pipeline!.jobs.some((job) => jobRuns(job, context)))
       return { skipped: `No job in ${CONFIG_PATH} runs for preview ${preview.action}.` };
+    if (options.queueId && pipeline && !pipeline.jobs.some((job) => jobRuns(job, context)))
+      return { skipped: `No job in ${CONFIG_PATH} runs for the queue's landing gates.` };
     const kdb = db(env.DB);
     const statements: Parameters<typeof batch>[1] = [
       kdb
@@ -176,6 +207,7 @@ export async function startRun(
           "preview_revived",
           "preview_rebuilt_from",
           "landing_id",
+          "queue_id",
         ])
         .expression((eb) =>
           eb
@@ -202,6 +234,7 @@ export async function startRun(
               eb
                 .val(options.trigger === "landing" ? (options.landingId ?? null) : null)
                 .as("landing_id"),
+              eb.val(options.queueId ?? null).as("queue_id"),
             ])
             .where("repo_id", "=", repo.id),
         ),
@@ -369,7 +402,7 @@ export async function onPush(
     // default branch gets a run then.
     if (known.size === 0 && row.ref !== refs.headBranch) continue;
     // A landing's merge is tested by the landing itself (timelines/landing.ts).
-    if (landingSlugOf(row.ref)) continue;
+    if (landingSlugOf(row.ref) || isQueueSourceBranch(row.ref)) continue;
     try {
       await startRun(env, repo, {
         branch: row.ref,

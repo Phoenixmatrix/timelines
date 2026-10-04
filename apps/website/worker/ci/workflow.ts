@@ -21,6 +21,7 @@ import { doneEvent, type StoredJob } from "./jobs.ts";
 import { sandbox } from "./sandbox.ts";
 import { startWorkflow, type RunParams } from "./trigger.ts";
 import { afterRun, settled } from "../timelines/landing.ts";
+import { afterQueueRun } from "../merge-queue/index.ts";
 
 interface PlannedJob {
   id: string;
@@ -139,6 +140,16 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     // make its checkpoint green (CORE-77). Never throws.
     await step.do("landing", DB_STEP, async () => {
       await settled(this.env, (deps) => afterRun(this.env, deps, runId));
+    });
+    await step.do("merge-queue", DB_STEP, async () => {
+      const run = await kdb
+        .selectFrom("ci_runs")
+        .select("repo_id")
+        .where("id", "=", runId)
+        .executeTakeFirstOrThrow();
+      const work: Promise<unknown>[] = [];
+      await afterQueueRun(this.env, run.repo_id, runId, (promise) => work.push(promise));
+      while (work.length) await Promise.allSettled(work.splice(0));
     });
   }
 

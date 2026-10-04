@@ -83,7 +83,7 @@ export function statusLabel(issue: Pick<Issue, "status" | "doneIn">): string {
     return issue.doneIn ? `Done in ${issue.doneIn.slug}` : "Done in a timeline";
   return statuses.find((status) => status.value === issue.status)?.label ?? issue.status;
 }
-export const types = ["task", "bug", "prd", "chore", "research"];
+export const types = ["task", "bug", "prd", "chore", "research", "remediation"];
 /** One casing everywhere: "Task", "Bug", "PRD". */
 export const typeLabel = (type: string) =>
   type === "prd" ? "PRD" : type[0]!.toUpperCase() + type.slice(1);

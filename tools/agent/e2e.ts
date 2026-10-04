@@ -30,6 +30,7 @@ import {
   atlasWorkspaceScenario,
 } from "./atlas-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
+import { runQueueE2E } from "./queue-e2e.ts";
 
 type Evidence = {
   scenario: string;
@@ -1666,6 +1667,10 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     } finally {
       await request(`${timelinesApi}/${slug}/abandon`, fixtures.tokens.jun, "POST").catch(() => {});
     }
+  });
+
+  await scenario("queue-concurrency-failure-fencing-and-push-recovery", async () => {
+    await runQueueE2E(ctx, fixtures, gm, record);
   });
 
   await scenario("agent-setup-memorable-persistent-identities", async () => {

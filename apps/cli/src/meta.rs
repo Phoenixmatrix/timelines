@@ -55,8 +55,8 @@ pub const COMMANDS: &[Meta] = &[
     meta!("workspace subscribe", git: "", kw: "repository workspace association subscription", mutates: true, out: Out::Other("{operationId,queued,entities:[Subscription],cursor}"), ex: ["gm workspace subscribe launch --repo REPO_ID"]),
     meta!("workspace unsubscribe", git: "", kw: "remove repository workspace subscription", mutates: true, out: Out::Other("{operationId,queued,entities:[],cursor}"), ex: ["gm workspace unsubscribe SUBSCRIPTION_ID"]),
     meta!("issue create", git: "", kw: "ticket task bug prd markdown acceptance offline stable id default team timeline required never policy", mutates: true, out: Out::Other("{operationId,queued,entities:[Issue],cursor,team?:{key,source,why,change}}; --team defaults to .gitmatrix scope, then your default team; offline key is null until synchronized; Issue.timelineUse is agent_decides (default), required or never, with timelinePolicy auto|approval|null"), ex: ["gm issue create 'Ship search' --team ENG --type prd --description-file spec.md", "gm issue create 'Migrate billing' --team ENG --timeline-use required --timeline-policy approval"]),
-    meta!("issue list", git: "", kw: "tickets issues filter search status team workspace bounded default all teams", mutates: false, out: Out::Other("{team:{key,source,why,change},issues:[Issue],total,truncated,offline,readinessAdvisory,cursor,cachedAt,timeline,next}"), ex: ["gm issue list --workspace launch --limit 20", "gm issue list --timeline search"]),
-    meta!("issue ready", git: "", kw: "ready frontier agent unblocked available work dependency blockers", mutates: false, out: Out::Other("{team:{key,source,why,change},issues:[Issue],total,truncated,offline,readinessAdvisory:true,cursor,cachedAt,timeline,next}; acquire an online claim before work"), ex: ["gm issue ready --limit 10"]),
+    meta!("issue list", git: "", kw: "tickets issues filter search status type remediation queue failure team workspace bounded default all teams", mutates: false, out: Out::Other("{team:{key,source,why,change},issues:[Issue],total,truncated,offline,readinessAdvisory,cursor,cachedAt,timeline,next}; Issue.queueFailure is read-only merge/gate/deployment evidence"), ex: ["gm issue list --workspace launch --limit 20", "gm issue list --type remediation"]),
+    meta!("issue ready", git: "", kw: "ready frontier agent unblocked available work dependency blockers type remediation queue failure", mutates: false, out: Out::Other("{team:{key,source,why,change},issues:[Issue],total,truncated,offline,readinessAdvisory:true,cursor,cachedAt,timeline,next}; acquire an online claim before work"), ex: ["gm issue ready --limit 10", "gm issue ready --type remediation"]),
     meta!("issue show", git: "", kw: "bounded context creator attribution ancestors parent prd blockers dependents checkpoint evidence", mutates: false, out: Out::Other("{issue:{...,createdBy,creatorDisplay},ancestors,links,relatedIssues,notes,limitPerSection,truncated,ready,readinessAdvisory,cursor,cachedAt,offline,timeline}"), ex: ["gm issue show ENG-1 --limit 20"]),
     meta!("issue history", git: "", kw: "audit history creator attribution actor agent accountable source timestamp mutation before after pagination online", mutates: false, out: Out::Other("{issueId,creator:AuditActor|null,events:[{cursor,operationId,actorId,actor:{id,kind,name,accountable},source,kind,mutationKind,entityType,entityId,before,entity,createdAt}],nextBefore:number|null,hasMore}; newest first; --before is exclusive; online only"), ex: ["gm issue history ENG-1 --owner orbit --limit 50", "gm issue history ENG-1 --owner orbit --before 120 --json"]),
     meta!("issue update", git: "", kw: "edit issue version optimistic status assignment acceptance labels timeline required never policy", mutates: true, out: Out::Other("{operationId,queued,entities:[Issue],cursor}"), ex: ["gm issue update ENG-1 --data '{\"priority\":1}' --offline", "gm issue update ENG-1 --timeline-use required --timeline-policy auto"]),
@@ -112,7 +112,12 @@ pub const COMMANDS: &[Meta] = &[
     meta!("clone", git: "git clone", kw: "download copy checkout repository get code progress transfer quiet", mutates: true, out: Out::Typed(schema_of::<crate::commands::network::Cloned>), ex: ["gm clone orbit/engine", "gm clone orbit/engine ./engine", "gm clone orbit/engine --quiet"]),
     meta!("fetch", git: "git fetch", kw: "download remote update refresh get latest", mutates: true, out: Out::Other("{trunk:{before,after}|null,updated_refs:[name]}"), ex: ["gm fetch"]),
     meta!("sync", git: "git pull --rebase", kw: "pull update rebase onto latest trunk catch up refresh", mutates: true, out: OP, ex: ["gm sync"]),
-    meta!("push", git: "git push", kw: "upload publish land ship merge deploy send pull request pr", mutates: true, out: Out::Typed(schema_of::<crate::commands::network::Pushed>), ex: ["gm push", "gm push --sync", "gm push -b feature-x"]),
+    meta!("push", git: "git push", kw: "upload publish land ship merge deploy send pull request pr queue asynchronous issue", mutates: true, out: Out::Typed(schema_of::<crate::commands::network::Pushed>), ex: ["gm push --queue --issue ENG-1", "gm push", "gm push --sync", "gm push -b feature-x"]),
+    meta!("queue list", git: "", kw: "merge queue admissions status failure deployment pending", mutates: false, out: Out::Other("{entries:[QueueEntry]}"), ex: ["gm queue list", "gm queue list --status failed -R owner/repo"]),
+    meta!("queue show", git: "", kw: "merge queue admission status evidence remediation conflict deployment", mutates: false, out: Out::Other("{entry:QueueEntry}; QueueEntry includes id,commit,status,coveredBy,mergeRun,gateRun,deployRun,deployStatus,failure,remediationIssueId"), ex: ["gm queue show COMMIT_ID"]),
+    meta!("queue wait", git: "", kw: "merge queue monitor wait landing main pipeline deployment covered verdict", mutates: false, out: Out::Other("{entry:QueueEntry}; follows coveredBy; exit 0 only on landing (and succeeded main pipeline with --deploy), nonzero on failure/cancel/timeout"), ex: ["gm queue wait COMMIT_ID --deploy --timeout 1800"]),
+    meta!("queue cancel", git: "", kw: "merge queue cancel pending admission no rewind", mutates: true, out: Out::Other("{entry:QueueEntry}; --dry-run: {dry_run,id,action}"), ex: ["gm queue cancel COMMIT_ID"]),
+    meta!("queue retry", git: "", kw: "merge queue retry failed cancelled admission same commit", mutates: true, out: Out::Other("{entry:QueueEntry}; --dry-run: {dry_run,id,action}"), ex: ["gm queue retry COMMIT_ID"]),
     meta!("timeline start", git: "git switch -c (shared, server-side)", kw: "timeline start create fork parallel line work branch experiment approval policy agent separate", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline,bookmarks:[{repoId,ref,ok,reason?}],use:<timeline use result>}; --dry-run: {dry_run,owner,request,use}"), ex: ["gm timeline start search-v2", "gm timeline start search-v2 --policy approval --name \"Search v2\"", "gm timeline start probe --experimental --from search-v2", "gm timeline start shared --repo orbit/engine --repo orbit/web"]),
     meta!("timeline list", git: "git branch -r --list 'origin/timeline/*'", kw: "timelines list parallel lines status landed abandoned stalled idle quiet", mutates: false, out: Out::Other("{timelines:[Timeline],owner,current,idleDays?}"), ex: ["gm timeline list", "gm timeline list --status active", "gm timeline list --stalled"]),
     meta!("timeline show", git: "", kw: "timeline show events history fork merge landing which timeline am i in", mutates: false, out: Out::Other("{timeline:Timeline,events:[TimelineEvent],next,current}"), ex: ["gm timeline show", "gm timeline show search-v2 --after 40"]),
@@ -537,11 +542,33 @@ gm is change-based (like jj), not commit-and-stage based (like git).
     gm commit -m "Add retry to fetch"   # describe @, start a fresh @ on top
     # ...edit more...
     gm commit -m "Cover retry in tests"
-    gm push --sync                 # rebase onto latest trunk, then land it
+    gm push --queue --issue ENG-1   # asynchronous admission; not landing proof
 
 `gm commit` is cheap: make one per logical step. To fix an earlier step,
 edit files and run `gm squash --into <change id>`, or `gm edit <change id>`
 then `gm new` to come back on top.
+
+## Asynchronous main merge queue
+For independent main work, `gm push --queue --issue ENG-1` uploads a deterministic
+source ref and returns `queue.id`. The server merges onto current main, runs gates,
+then advances main only with a passing candidate. Admission does not mark local
+work immutable or prove deployment. Checkpoint the ID on the original issue.
+    gm queue show COMMIT_ID
+    gm queue wait COMMIT_ID --deploy --timeout 1800
+    gm queue list --status failed
+Monitor at work boundaries, not with busy polling. Keep/renew the original lease
+or complete it only with honest evidence and a durable monitoring handoff. Start
+new independent work from current trunk in another worktree; use `gm sync` later
+to reconcile landed history. A lost response is not success: inspect the exact
+commit ID before resubmitting. Queue failure never falls back to a direct push.
+P0 `remediation` issues carry read-only `queueFailure` evidence. Use
+`gm issue ready --type remediation`, then normal online claim/lease commands;
+inspect conflict paths and run logs, submit a tested fix, and resolve only with
+actual evidence. `gm queue retry ID` retries the same failed/cancelled source;
+a changed fix commit needs a new `gm push --queue`.
+Ordinary `gm push` and native Git pushes remain the explicit direct recovery path
+for queue/configuration repairs. Timeline work still uses `gm push`, checkpoints,
+and approved timeline landing; `--queue` is refused in a bound timeline.
 
 ## Revisions
 `@` working copy · `@-` its (first) parent · `@--` grandparent · `trunk` · a change id

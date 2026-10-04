@@ -17,6 +17,7 @@ import { waitForIndexVisibility, type VisibilityReport } from "./index-visibilit
 import { searchItemStatus } from "./search-item-status.ts";
 import { runAtlasProviderE2E } from "./atlas-provider-e2e.ts";
 import { command, validateEnvironment, type Environment } from "./environment.ts";
+import { runQueueAiE2E } from "./queue-ai-e2e.ts";
 
 interface GatewayLog {
   id: string;
@@ -1602,6 +1603,32 @@ export async function runProviderE2E(
           return successful.length >= requirement.minimum;
         });
       }
+      enter("queue-real-conflict-repair");
+      // Finish other provider work before attributing this bounded queue's usage.
+      const atlasError = await atlas;
+      if (atlasError) throw atlasError;
+      await api(settingsPath, "PATCH", {
+        features: { knowledge: false, wiki: false, atlas: false, releaseNotes: false },
+        models: { classification: "clef", task: "gemma-4-26b-a4b-it" },
+      });
+      const queueEvidence: Record<string, unknown> = { outcome: "running" };
+      evidence.queue = queueEvidence;
+      await runQueueAiE2E(ctx, fixtures, queueEvidence);
+      await waitFor("queue-gateway-evidence", 120_000, async () => {
+        const logs = await gatewayLogs(owned, String(queueEvidence.startedAt), "knowledge");
+        queueEvidence.usage = logs;
+        const successful = logs.filter((log) => log.success && !log.cached);
+        const repair = successful.filter((log) => log.model.includes("gemma-4-26b"));
+        const classifier = successful.filter((log) => log.model.toLowerCase().includes("clef"));
+        assert(logs.length <= 8, "Queue submissions must not create an inference retry loop");
+        if (!repair.length || !classifier.length) return false;
+        assert.equal(repair.length, 1, "Only the safe documentation conflict may invoke repair");
+        assert(
+          repair[0]!.tokensIn > 0 && repair[0]!.tokensOut > 0,
+          "Real repair must record token usage",
+        );
+        return true;
+      });
     }
     evidence.outcome = "passed";
   } catch (error) {

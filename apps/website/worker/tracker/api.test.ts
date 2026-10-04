@@ -4,6 +4,7 @@ import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import type { Access } from "./store.ts";
+import { defaultOwner, preferencesFor, savePreferences } from "./preferences.ts";
 import { tracker } from "./api.ts";
 
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
@@ -28,6 +29,7 @@ function setup(actor: Actor | null = ann) {
   });
   app.route("/api", tracker);
   return {
+    database: env.DB,
     call: (path: string, init: RequestInit = {}) => app.request(`/api${path}`, init, env),
     snapshot,
     getByName,
@@ -114,6 +116,52 @@ describe("tracker preferences", () => {
     expect((await call("/tracker/orbit/preferences", { method: "DELETE" })).status).toBe(204);
     expect(await (await call("/tracker/orbit/preferences")).json()).toEqual({ preferences: null });
     expect(await (await call("/tracker")).json()).toMatchObject({ defaultOwnerId: "ann" });
+  });
+  test("the last save wins at the same clock time, including an existing tracker", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-04T12:00:00.000Z"));
+    try {
+      const { call } = setup();
+      const preferences = { teamId: null, view: "list", query: "" };
+      for (const owner of ["ann", "orbit", "ann", "orbit"]) {
+        expect((await call(`/tracker/${owner}/preferences`, put(preferences))).status).toBe(200);
+        expect(await (await call("/tracker")).json()).toMatchObject({ defaultOwnerId: owner });
+      }
+      expect((await call("/tracker/orbit/preferences", { method: "DELETE" })).status).toBe(204);
+      expect(await (await call("/tracker")).json()).toMatchObject({ defaultOwnerId: "ann" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  test("concurrent same-clock saves are ordered atomically and isolated by person and tracker", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const clock = new Date("2026-10-04T12:00:00.000Z");
+    try {
+      const { database } = setup();
+      const benPreferences = { teamId: "t-ben", view: "board" as const, query: "is:blocked" };
+      vi.setSystemTime(new Date("2026-10-05T12:00:00.000Z"));
+      const ben = await savePreferences(database, "ben", "orbit", benPreferences);
+      vi.setSystemTime(clock);
+      const saves = [
+        { owner: "ann", teamId: "t-ann", view: "list" as const, query: "" },
+        { owner: "orbit", teamId: "t-core", view: "board" as const, query: "is:ready" },
+      ];
+      const saved = await Promise.all(
+        saves.map(({ owner, ...preferences }) =>
+          savePreferences(database, "ann", owner, preferences),
+        ),
+      );
+      expect(saved[0]!.updatedAt).toBe(clock.toISOString());
+      expect(saved[1]!.updatedAt > saved[0]!.updatedAt).toBe(true);
+      for (const [index, { owner }] of saves.entries())
+        expect(await preferencesFor(database, "ann", owner)).toEqual(saved[index]);
+      expect(await defaultOwner(database, "ann")).toBe("orbit");
+      expect(await preferencesFor(database, "ben", "orbit")).toEqual(ben);
+      expect(await defaultOwner(database, "ben")).toBe("orbit");
+      expect(await preferencesFor(database, "ben", "ann")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
   test("reject malformed values and trackers the person can't open", async () => {
     const { call } = setup();

@@ -38,6 +38,7 @@ import { previewSettingsApi } from "./deployments/settings.ts";
 import { aiSettingsApi } from "./settings/ai.ts";
 import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./retention/api.ts";
 import { pricesApi } from "./usage/prices-api.ts";
+import { queueApi } from "./merge-queue/index.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -66,7 +67,10 @@ api.use(async (c, next) => {
     c.req.path.startsWith("/api/dev/") ||
     c.req.path === "/api/tokens/device" ||
     // A CI job's credential reaches only its deployments, which check it.
-    jobRoute(c)
+    jobRoute(c) ||
+    // The queue resolution endpoint validates only its current merge-job credential.
+    (c.req.method === "POST" &&
+      /^\/api\/repos\/[^/]+\/[^/]+\/queue\/[0-9a-f]{40}\/resolve$/.test(c.req.path))
   ) {
     c.set("actor", null);
     return next();
@@ -106,6 +110,7 @@ api.route("/repos/:owner/:name/knowledge", knowledge);
 api.route("/repos/:owner/:name/atlas", atlas);
 api.route("/repos/:owner/:name/release-notes", releaseNotes);
 api.route("/repos/:owner/:name/ci", ci);
+api.route("/repos/:owner/:name/queue", queueApi);
 api.route("/repos/:owner/:name", refLog);
 api.route("/repos/:owner/:name", why);
 api.route("/repos/:owner/:name", deployments);

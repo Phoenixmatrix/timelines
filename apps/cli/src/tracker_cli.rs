@@ -176,7 +176,7 @@ pub struct IssueCreate {
     /// Acceptance criteria file, or '-' for stdin.
     #[arg(long)]
     pub acceptance_file: Option<PathBuf>,
-    #[arg(long, default_value="task", value_parser=["task","bug","prd","chore","research"])]
+    #[arg(long, default_value="task", value_parser=["task","bug","prd","chore","research","remediation"])]
     pub r#type: String,
     #[arg(long, default_value="todo", value_parser=["backlog","todo","in_progress","done","canceled"])]
     pub status: String,
@@ -239,6 +239,9 @@ pub struct ListIssues {
     pub workspace: Option<String>,
     #[arg(long)]
     pub status: Option<String>,
+    /// Filter by issue type, including automatic queue remediation.
+    #[arg(long, value_parser=["task","bug","prd","chore","research","remediation"])]
+    pub r#type: Option<String>,
     #[arg(long)]
     pub search: Option<String>,
     #[arg(long, default_value_t=50, value_parser=clap::value_parser!(u16).range(1..=500))]

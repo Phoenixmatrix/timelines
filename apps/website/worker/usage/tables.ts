@@ -66,6 +66,7 @@ export const TABLE_GROUPS: TableGroup[] = [
       ci_job_tokens: JOB,
       ci_refs: REPO,
       ci_secrets: REPO,
+      merge_queue: REPO,
     },
   },
   {

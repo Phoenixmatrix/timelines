@@ -28,6 +28,13 @@ pub struct View {
     pub conflicts: BTreeMap<String, Vec<String>>,
 }
 
+/// Admission receipts are not undoable workspace state: undoing a local edit
+/// cannot undo a request already sent to the server.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueueSubmission {
+    pub revisions: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Operation {
     pub id: String,
@@ -81,6 +88,26 @@ impl Store {
         let tmp = self.dir.join("view.json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(view)?)?;
         fs::rename(tmp, self.dir.join("view.json"))?;
+        Ok(())
+    }
+
+    pub fn queue_submissions(&self) -> Result<BTreeMap<String, BTreeMap<String, QueueSubmission>>> {
+        let path = self.dir.join("queue.json");
+        match fs::read(path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn save_queue_submissions(
+        &self,
+        submissions: &BTreeMap<String, BTreeMap<String, QueueSubmission>>,
+    ) -> Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let tmp = self.dir.join("queue.json.tmp");
+        fs::write(&tmp, serde_json::to_vec_pretty(submissions)?)?;
+        fs::rename(tmp, self.dir.join("queue.json"))?;
         Ok(())
     }
 

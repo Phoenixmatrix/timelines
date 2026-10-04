@@ -309,6 +309,7 @@ export function buildTools(context: ToolContext) {
           ])
           .optional(),
         team: z.string().optional().describe("Team key, e.g. CORE"),
+        type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
         label: z.string().optional(),
         ready: z
           .boolean()
@@ -316,7 +317,7 @@ export function buildTools(context: ToolContext) {
           .describe("Only issues ready to start: todo, unblocked, unclaimed"),
         limit: z.number().int().min(1).max(200).optional(),
       }),
-      execute: async ({ owner, query, status = "open", team, label, ready, limit = 25 }) => {
+      execute: async ({ owner, query, status = "open", team, type, label, ready, limit = 25 }) => {
         const snap = await snapshot(owner);
         if ("error" in snap) return snap;
         const teamId = team
@@ -343,6 +344,7 @@ export function buildTools(context: ToolContext) {
                 : i.status === status,
           )
           .filter((i) => !teamId || i.teamId === teamId)
+          .filter((i) => !type || i.type === type)
           .filter((i) => !label || i.labels.includes(label))
           .filter((i) => !ready || (i.status === "todo" && !blocked.has(i.id) && !i.claim))
           .filter((i) => {
@@ -362,7 +364,7 @@ export function buildTools(context: ToolContext) {
     }),
     show_issue: tool({
       description:
-        "Everything about one issue. Returns {key, title, status, priority, team, description, acceptance, parent, children: [string], blockedBy: [string], blocks: [key], related: [string], comments: [{kind, by, at, body}], url}.",
+        "Everything about one issue. Returns {key, title, status, priority, team, description, acceptance, queueFailure: read-only system failure evidence or null, parent, children: [string], blockedBy: [string], blocks: [key], related: [string], comments: [{kind, by, at, body}], url}.",
       inputSchema: z.object({ owner: OWNER, key: KEY }),
       execute: async ({ owner, key }) => {
         const snap = await snapshot(owner);
@@ -375,6 +377,7 @@ export function buildTools(context: ToolContext) {
           ...issueRow(issue, snap),
           description: clip(issue.description, 8000),
           acceptance: clip(issue.acceptance, 3000),
+          queueFailure: issue.queueFailure ?? null,
           parent: issue.parentId ? keyOf(issue.parentId) : null,
           children: snap.issues
             .filter((i) => i.parentId === issue.id)
@@ -514,7 +517,7 @@ export function buildTools(context: ToolContext) {
         title: z.string().min(1).max(300),
         description: z.string().optional().describe("Markdown"),
         acceptance: z.string().optional().describe("Markdown acceptance criteria"),
-        type: z.enum(["task", "bug", "prd", "chore", "research"]).optional(),
+        type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
         priority: z.number().int().min(0).max(4).optional().describe("0 is most urgent"),
         parent: KEY.optional(),
         labels: z.array(z.string()).optional(),
@@ -583,7 +586,7 @@ export function buildTools(context: ToolContext) {
             acceptance: z.string().optional(),
             status: z.enum(["backlog", "todo", "in_progress", "done", "canceled"]).optional(),
             priority: z.number().int().min(0).max(4).optional(),
-            type: z.enum(["task", "bug", "prd", "chore", "research"]).optional(),
+            type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
             labels: z.array(z.string()).optional(),
           })
           .refine((c) => Object.keys(c).length > 0, "Change at least one field."),

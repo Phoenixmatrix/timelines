@@ -60,8 +60,13 @@ const toRun = (row: RunRow): CiRunSummary => ({
   number: row.number,
   commit: row.commit_oid,
   ref: row.ref,
-  trigger: row.preview_action ? "preview" : row.landing_id ? "landing" : row.trigger,
+  trigger: row.preview_action
+    ? "preview"
+    : row.landing_id || row.queue_id
+      ? "landing"
+      : row.trigger,
   landing: row.landing_id ? { id: row.landing_id, timeline: landingSlugOf(row.ref) } : null,
+  queueId: row.queue_id,
   preview: row.preview_action
     ? {
         action: row.preview_action,
@@ -233,11 +238,18 @@ ci.post("/runs/:number{[0-9]+}/rerun", async (c) => {
       "checkpoint_id",
       "preview_revived",
       "preview_rebuilt_from",
+      "queue_id",
     ])
     .where("repo_id", "=", repo.row.id)
     .where("number", "=", Number(c.req.param("number")))
     .executeTakeFirst();
   if (!run) return fail(c, 404, "No such run.");
+  if (run.queue_id)
+    return fail(
+      c,
+      409,
+      "Retry this entry through the merge queue so its attempt and credentials stay fenced.",
+    );
   // Re-running a preview run repeats its action for the same checkpoint.
   const preview =
     run.preview_action && run.timeline_slug

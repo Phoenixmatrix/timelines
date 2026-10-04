@@ -10,6 +10,7 @@ import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.
 import { retentionCron, runRetentionJob, type RetentionJob } from "./retention/runs.ts";
 import { runJob, scheduleSweeps, type Job } from "../registry/jobs/index.ts";
 import { settled, sweepLandings } from "./timelines/landing.ts";
+import { sweepQueue } from "./merge-queue/index.ts";
 import { checkCatalogDaily } from "./usage/prices.ts";
 
 export default {
@@ -93,6 +94,11 @@ export default {
     ctx.waitUntil(
       settled(env, (deps) => sweepLandings(env, deps)).catch((error) =>
         console.error("Landing: sweep failed", error),
+      ),
+    );
+    ctx.waitUntil(
+      sweepQueue(env, (work) => ctx.waitUntil(work)).catch((error) =>
+        console.error("Merge queue: sweep failed", error),
       ),
     );
   },

@@ -2,12 +2,14 @@ import { Hono, type Context } from "hono";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { forgetUpstreamTokens, upstreamToken } from "../artifacts.ts";
 import { landingJob } from "../ci/landing.ts";
+import { queueMergeJob } from "../ci/queue-auth.ts";
 import { findRepo, roleFor, sqlNow } from "../db.ts";
 import { jobSecret } from "../deployments/job.ts";
 import { invalidateRefs } from "../objects.ts";
 import { atLeast } from "../permissions.ts";
 import { db } from "../schema.ts";
 import { landingBranch } from "../../shared/timelines.ts";
+import { isQueueSourceBranch } from "../../shared/merge-queue.ts";
 import { afterPush } from "./effects.ts";
 import { readReceivePackCommands, type ReceiveCommand } from "./receive-pack.ts";
 
@@ -81,13 +83,23 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     return c.text("This token is read-only. Create a token with write scope to push.\n", 403);
   }
 
-  // A push's pack, counted on its way through: Artifacts reports no
-  // repository sizes, so metering estimates them from this (CORE-207).
+  // Inspect only a bounded command prefix while the original body streams upstream.
+  // Unknown/signed pushes retain ordinary effects; a source-only push stages objects.
+  let body = c.req.raw.body;
+  let sourceOnly = Promise.resolve(false);
+  if (service === "git-receive-pack" && c.req.method === "POST" && body) {
+    const encoding = c.req.header("content-encoding")?.toLowerCase();
+    if (!encoding || encoding === "identity" || encoding === "gzip") {
+      const [forwarded, inspection] = body.tee();
+      body = forwarded;
+      sourceOnly = queueSourceOnly(inspection, encoding === "gzip");
+    }
+  }
   const pack =
-    service === "git-receive-pack" && c.req.method === "POST" && c.req.raw.body
-      ? meterPack(c.req.raw.body, c.req.header("content-length"))
+    service === "git-receive-pack" && c.req.method === "POST" && body
+      ? meterPack(body, c.req.header("content-length"))
       : null;
-  const upstream = await forward(c, repo, service, endpoint, pack?.body ?? c.req.raw.body);
+  const upstream = await forward(c, repo, service, endpoint, pack?.body ?? body);
   if (upstream instanceof Response) {
     if (credential.kind === "token") {
       c.executionCtx.waitUntil(
@@ -99,11 +111,36 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
       );
     }
     if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok) {
-      afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
+      if (!(await sourceOnly))
+        afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
+      else invalidateRefs(repo.artifacts_name);
       if (pack) c.executionCtx.waitUntil(recordPushedBytes(c.env, repo.id, pack.done));
     }
   }
   return respond(upstream);
+}
+
+async function queueSourceOnly(body: ReadableStream<Uint8Array>, gzip: boolean): Promise<boolean> {
+  try {
+    if (gzip)
+      body = body.pipeThrough(
+        new DecompressionStream("gzip") as ReadableWritablePair<Uint8Array, Uint8Array>,
+      );
+    const request = await readReceivePackCommands(body);
+    // Do not wait for tee cancellation: the forwarding branch is still consuming.
+    void request.body.cancel().catch(() => {});
+    return (
+      !request.pushCert &&
+      request.commands.length > 0 &&
+      request.commands.every(
+        (command) =>
+          command.ref.startsWith("refs/heads/") &&
+          isQueueSourceBranch(command.ref.slice("refs/heads/".length)),
+      )
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -120,7 +157,8 @@ async function landingProxy(
   name: string,
   secret: string,
 ) {
-  const access = await landingJob(c.env.DB, secret, owner, name);
+  const landing = await landingJob(c.env.DB, secret, owner, name);
+  const access = landing.ok ? landing : await queueMergeJob(c.env.DB, secret, owner, name);
   if (!access.ok) return c.text(`${access.error}\n`, access.status);
   if (service === "git-upload-pack" || endpoint === "info/refs")
     return respond(await forward(c, access.repo, service, endpoint, c.req.raw.body));
@@ -139,10 +177,20 @@ async function landingProxy(
   } catch (error) {
     return c.text(`Couldn't read the push: ${(error as Error).message}.\n`, 400);
   }
-  const refusal = landingPushRefusal(request, access.slug);
+  const refusal =
+    "slug" in access
+      ? landingPushRefusal(request, access.slug)
+      : queuePushRefusal(request, access.branch);
   if (refusal) {
     await request.body.cancel().catch(() => {});
     return c.text(`${refusal}\n`, 403);
+  }
+  if (!("slug" in access)) {
+    const current = await queueMergeJob(c.env.DB, secret, owner, name, access.queueId);
+    if (!current.ok || current.runId !== access.runId || current.attempt !== access.attempt) {
+      await request.body.cancel().catch(() => {});
+      return c.text("This queue merge attempt is no longer current.\n", 403);
+    }
   }
   // The body goes on decompressed, so without its encoding.
   const upstream = await forward(c, access.repo, service, endpoint, request.body, true);
@@ -166,6 +214,23 @@ export function landingPushRefusal(
   if (command.ref !== allowed)
     return `A landing's merge job may push only to ${allowed}, not ${command.ref}.`;
   if (/^0+$/.test(command.new)) return `A landing's merge job can't delete ${allowed}.`;
+  return null;
+}
+
+/** Queue credentials may publish only their current attempt's candidate. */
+export function queuePushRefusal(
+  request: { commands: ReceiveCommand[]; pushCert: boolean },
+  branch: string,
+): string | null {
+  const allowed = `refs/heads/${branch}`;
+  if (request.pushCert) return "A queue merge job can't make a signed push.";
+  if (request.commands.length > 1)
+    return `A queue merge job pushes one ref, ${allowed}; this push updates ${request.commands.length}.`;
+  const command = request.commands[0];
+  if (!command) return null; // git's empty probe before a large push
+  if (command.ref !== allowed)
+    return `A queue merge job may push only to ${allowed}, not ${command.ref}.`;
+  if (/^0+$/.test(command.new)) return `A queue merge job can't delete ${allowed}.`;
   return null;
 }
 

@@ -213,3 +213,59 @@ jobs:
     expect(payload.env.GITMATRIX_TRIGGER).toBe("landing");
   });
 });
+
+describe("queue gates", () => {
+  test("a source staging ref never starts a pipeline, including a manual request", async () => {
+    const t = setup();
+    for (const trigger of ["push", "manual"] as const) {
+      expect(
+        await t.start({
+          branch: `gitmatrix/queue/${oid(9)}`,
+          trigger,
+          preview: undefined,
+        }),
+      ).toEqual({ skipped: expect.stringContaining("staging only") });
+    }
+    expect(t.created).toEqual([]);
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM ci_runs").get()).toEqual({ n: 0 });
+  });
+
+  test("a queue with no runnable landing gate is not an all-skipped success", async () => {
+    const t = setup();
+    files.ciYml = "jobs:\n  deploy:\n    if: trigger == 'push'\n    steps: [deploy]\n";
+    expect(
+      await t.start({
+        branch: `gitmatrix/landing/queue-${oid(9)}-1`,
+        trigger: "landing",
+        preview: undefined,
+        queueId: oid(9),
+        runId: "queue-gates",
+      }),
+    ).toEqual({ skipped: expect.stringContaining("No job") });
+    expect(t.created).toEqual([]);
+  });
+
+  test("the current queue gate cannot adopt an unrelated manual run of the same object", async () => {
+    const t = setup();
+    files.ciYml = "jobs:\n  gate:\n    steps: [check]\n";
+    const branch = `gitmatrix/landing/queue-${oid(9)}-1`;
+    const manual = await t.start({ branch, trigger: "manual", preview: undefined });
+    if (!("runId" in manual)) throw new Error(manual.skipped);
+    const gates = await t.start({
+      branch,
+      trigger: "landing",
+      preview: undefined,
+      queueId: oid(9),
+      runId: "queue-gates",
+    });
+    expect(gates).toEqual({ runId: "queue-gates", number: 2 });
+    expect(t.jobs("queue-gates")).toEqual([
+      { id: expect.any(String), name: "gate", status: "pending" },
+    ]);
+    const job = await loadJob(t.env.DB, t.jobs("queue-gates")[0]!.id);
+    const payload = await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" });
+    expect(payload.env.GITMATRIX_TRIGGER).toBe("landing");
+    expect(payload.env.GITMATRIX_QUEUE_ID).toBe(oid(9));
+    expect(payload.env.GITMATRIX_TIMELINE).toBeUndefined();
+  });
+});

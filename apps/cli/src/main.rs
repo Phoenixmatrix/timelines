@@ -167,6 +167,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Fetch => out(f, network::fetch(ctx)),
         Command::Sync => out(f, network::sync(ctx)),
         Command::Push(a) => out(f, network::push(ctx, &a)),
+        Command::Queue(c) => out(f, commands::queue::run(ctx, &c)),
         Command::Timeline(c) => out(f, commands::timeline::run(ctx, &c)),
         Command::Auth(cli::AuthCommand::GitCredential { operation }) => {
             // Git reads this helper's stdout in its own key=value format.

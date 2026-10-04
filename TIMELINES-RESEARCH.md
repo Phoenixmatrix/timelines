@@ -35,6 +35,14 @@ blocked on CORE-50.
   - later, other signals.
 
   Plain pushes to main stay as they are.
+  CORE-136 adds an explicit `gm push --queue` option for independent default-branch
+  work, not an interception of ordinary/native pushes. Its per-repository merge
+  queue is separate from timeline landing. Timeline-bound `--queue` submissions
+  are rejected: use checkpoint/land instead. Queue scheduling or bounded AI
+  conflict repair never weakens a timeline's pinned approval, approves a newer
+  checkpoint, or bypasses its required gates. Queue failure remediation and its
+  read-only evidence are shared tracker records across timeline views; they do
+  not alter original issue leases or make timeline work complete on main.
 
 - **Timelines are git branches joined by real merges, with more history than
   git keeps.**
