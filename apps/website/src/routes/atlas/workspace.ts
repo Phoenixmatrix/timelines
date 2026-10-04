@@ -13,7 +13,7 @@
 // that carries over.
 //
 // Layout. Every repository with an Atlas gets its own column ("band"), in
-// selection order, each a fixed TOP_WIDTH cells wide. Inside its band a
+// selection order, each a fixed TOP_WIDTH slots wide. Inside its band a
 // repository's regions sit in their own stable slots (buildTerritory,
 // CORE-165), exactly as on its repository map, so slot numbers that two
 // repositories share never collide. A band's position depends only on the
@@ -69,11 +69,14 @@ import {
   CELL,
   ChildLoader,
   GAP,
+  OVERHANG,
+  shiftTerritory,
   TOP_WIDTH,
   type Expanded,
   type Load,
   type Territory,
   type TerritoryCell,
+  type Tile,
 } from "../repo/territory.ts";
 
 // ---- selection -------------------------------------------------------------------
@@ -174,8 +177,8 @@ export function coverageOf(
 export const BAND_PAD = GAP;
 export const BAND_HEADER = 120;
 export const BAND_GUTTER = CELL / 2;
-/** A band is always this wide: its repository's grid width plus padding. */
-export const BAND_WIDTH = TOP_WIDTH * (CELL + GAP) - GAP + BAND_PAD * 2;
+/** A band is always this wide: its repository's slot grid, how far countries reach past it, and padding. */
+export const BAND_WIDTH = TOP_WIDTH * (CELL + GAP) - GAP + OVERHANG * 2 + BAND_PAD * 2;
 /** The territory height a band with nothing to draw keeps. */
 const EMPTY_HEIGHT = CELL / 2;
 
@@ -206,6 +209,7 @@ export function buildWorkspaceTerritory(
 ): WorkspaceTerritory {
   const cells: TerritoryCell[] = [];
   const byId = new Map<string, TerritoryCell>();
+  const tiles: Tile[] = [];
   const bands: Band[] = [];
   let height = 0;
   const drawn = coverage.filter((c) => c.state === "ready" || c.state === "revoked");
@@ -214,13 +218,12 @@ export function buildWorkspaceTerritory(
     const repo = entry.state === "ready" ? entry.repo : null;
     const own = repo ? regions.filter((r) => r.repoId === repo.id) : [];
     const local = buildTerritory(own, expanded, repo?.snapshot?.seq ?? 0);
-    const dx = x + BAND_PAD;
-    const dy = BAND_HEADER;
-    for (const cell of local.cells) {
-      const moved = { ...cell, x: cell.x + dx, y: cell.y + dy };
-      cells.push(moved);
-      byId.set(moved.id, moved);
+    const moved = shiftTerritory(local, x + BAND_PAD, BAND_HEADER);
+    for (const cell of moved.cells) {
+      cells.push(cell);
+      byId.set(cell.id, cell);
     }
+    tiles.push(...moved.tiles);
     const h = BAND_HEADER + (local.cells.length ? local.height : EMPTY_HEIGHT) + BAND_PAD;
     bands.push({
       name: entry.name,
@@ -234,7 +237,7 @@ export function buildWorkspaceTerritory(
     height = Math.max(height, h);
   });
   const width = bands.length ? bands.length * (BAND_WIDTH + BAND_GUTTER) - BAND_GUTTER : 0;
-  return { cells, byId, width, height, bands };
+  return { cells, byId, tiles, left: 0, top: 0, width, height, bands };
 }
 
 /** The repository id a namespaced workspace id belongs to. */

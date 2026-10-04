@@ -1,12 +1,21 @@
-// The capability territory on canvas (CORE-168): the regions the bounded
-// Atlas API returned, in their stable slots, with expanded regions' children
-// nested inside. Semantic zoom: children and labels appear only once their
-// cell is big enough on screen to read. The region list beside the map is the
-// accessible path; this canvas is a picture of it.
+// The capability map on canvas (CORE-168, CORE-47): a continent of hex
+// tiles, one country per capability the bounded Atlas API returned, in its
+// stable place, with structural groups as islands offshore. Expanded regions
+// divide their land into provinces. Selecting a capability draws its one-hop
+// routes: what it uses and what uses it. Semantic zoom: provinces and labels
+// appear only once they're big enough on screen to read. The region list
+// beside the map is the accessible path; this canvas is a picture of it.
 
 import { ArrowsOutIcon, MinusIcon, PlusIcon } from "@phosphor-icons/react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { cellAt, type Territory, type TerritoryCell } from "./territory.ts";
+import {
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { cellAt, TILE, type Territory, type TerritoryCell, type Tile } from "./territory.ts";
 
 interface View {
   x: number;
@@ -14,21 +23,21 @@ interface View {
   k: number;
 }
 
-/** On-screen sizes (px) before children are drawn, and before a cell gets a label. */
-const SHOW = { children: 140, label: 64, counts: 120 };
+/** On-screen sizes (px): a parent's before its children are drawn, and a region's before it gets a label. */
+const SHOW = { children: 140, label: 40, counts: 96 };
 const segments = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-
-function cssVar(name: string): string {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || "#888";
-}
+const SQ3 = Math.sqrt(3);
 
 function fitView(t: Territory, w: number, h: number): View {
   const pad = 24;
-  const k = Math.min(
-    (w - pad * 2) / Math.max(1, t.width),
-    (h - pad * 2 - 40) / Math.max(1, t.height),
-  );
-  return { k, x: (w - t.width * k) / 2, y: pad + 40 + (h - pad * 2 - 40 - t.height * k) / 2 };
+  const tw = Math.max(1, t.width - t.left);
+  const th = Math.max(1, t.height - t.top);
+  const k = Math.min((w - pad * 2) / tw, (h - pad * 2 - 40) / th);
+  return {
+    k,
+    x: (w - tw * k) / 2 - t.left * k,
+    y: pad + 40 + (h - pad * 2 - 40 - th * k) / 2 - t.top * k,
+  };
 }
 
 /**
@@ -59,10 +68,142 @@ export interface MapTie {
   active: boolean;
 }
 
+/** One hop from the selection: a region it uses (out) or that uses it (in), and how many imports. */
+export interface MapRoute {
+  id: string;
+  direction: "out" | "in";
+  weight: number;
+}
+
 const NO_TIES: readonly MapTie[] = [];
+const NO_ROUTES: readonly MapRoute[] = [];
 const NO_EMPHASIS: ReadonlySet<string> = new Set();
 
 const fileLabel = (n: number) => `${n.toLocaleString()} file${n === 1 ? "" : "s"}`;
+
+/** A stable number in [0, 1) from two coordinates: the land's grain. */
+const grain = (x: number, y: number) => {
+  const s = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+  return s - Math.floor(s);
+};
+
+/** The paths a territory is drawn with, built once per territory. */
+interface Scene {
+  /** Land, by region, province shade and grain: hexes with a hairline gap, and without (far out). */
+  fills: { region: string; shade: number; grain: number; gapped: Path2D; solid: Path2D }[];
+  /** Edges between two countries, coasts, and the coasts of structural islands. */
+  borders: Path2D;
+  coast: Path2D;
+  isles: Path2D;
+  /** Each top-level region's tiles, for where routes leave and land. */
+  tilesOf: Map<string, Tile[]>;
+  /** The tiles of any drawn cell, its children's included. */
+  tilesIn: (id: string) => readonly Tile[];
+  outline: (id: string) => Path2D;
+}
+
+function hexPath(path: Path2D, x: number, y: number, r: number) {
+  path.moveTo(x + (r * SQ3) / 2, y - r / 2);
+  path.lineTo(x + (r * SQ3) / 2, y + r / 2);
+  path.lineTo(x, y + r);
+  path.lineTo(x - (r * SQ3) / 2, y + r / 2);
+  path.lineTo(x - (r * SQ3) / 2, y - r / 2);
+  path.lineTo(x, y - r);
+  path.closePath();
+}
+
+function sceneOf(territory: Territory): Scene {
+  const fills = new Map<string, Scene["fills"][number]>();
+  const tilesOf = new Map<string, Tile[]>();
+  for (const tile of territory.tiles) {
+    const g = Math.floor(grain(tile.x, tile.y) * 3);
+    const key = `${tile.region}|${tile.shade}|${g}`;
+    let fill = fills.get(key);
+    if (!fill) {
+      fill = {
+        region: tile.region,
+        shade: tile.shade,
+        grain: g,
+        gapped: new Path2D(),
+        solid: new Path2D(),
+      };
+      fills.set(key, fill);
+    }
+    hexPath(fill.gapped, tile.x, tile.y, TILE * 0.93);
+    hexPath(fill.solid, tile.x, tile.y, TILE * 1.02);
+    const list = tilesOf.get(tile.region) ?? [];
+    list.push(tile);
+    tilesOf.set(tile.region, list);
+  }
+  // A top-level edge seen twice runs between two countries; once, it's a coast.
+  const seen = new Map<string, number>();
+  const at = (v: number) => Math.round(v * 4);
+  const mid = (e: number[], i: number) => `${at(e[i]! + e[i + 2]!)},${at(e[i + 1]! + e[i + 3]!)}`;
+  const tops = territory.cells.filter((c) => c.depth === 0 && c.size);
+  for (const c of tops)
+    for (let i = 0; i < c.edges.length; i += 4) {
+      const m = mid(c.edges, i);
+      seen.set(m, (seen.get(m) ?? 0) + 1);
+    }
+  const borders = new Path2D();
+  const coast = new Path2D();
+  const isles = new Path2D();
+  const drawn = new Set<string>();
+  for (const c of tops)
+    for (let i = 0; i < c.edges.length; i += 4) {
+      const m = mid(c.edges, i);
+      const shared = (seen.get(m) ?? 0) > 1;
+      if (shared && drawn.has(m)) continue;
+      drawn.add(m);
+      const path = shared ? borders : c.structural ? isles : coast;
+      path.moveTo(c.edges[i]!, c.edges[i + 1]!);
+      path.lineTo(c.edges[i + 2]!, c.edges[i + 3]!);
+    }
+  const outlines = new Map<string, Path2D>();
+  const outline = (id: string) => {
+    let path = outlines.get(id);
+    if (path) return path;
+    path = new Path2D();
+    const e = territory.byId.get(id)?.edges ?? [];
+    for (let i = 0; i < e.length; i += 4) {
+      path.moveTo(e[i]!, e[i + 1]!);
+      path.lineTo(e[i + 2]!, e[i + 3]!);
+    }
+    outlines.set(id, path);
+    return path;
+  };
+  const inside = new Map<string, readonly Tile[]>();
+  const tilesIn = (id: string) => {
+    const top = tilesOf.get(id);
+    if (top) return top;
+    let list = inside.get(id);
+    if (list) return list;
+    let root = territory.byId.get(id);
+    while (root?.parent) root = territory.byId.get(root.parent);
+    list = root
+      ? (tilesOf.get(root.id) ?? []).filter((t) => {
+          const at = territory.byId.get(t.cell);
+          return at ? isInside(territory, at, id) : false;
+        })
+      : [];
+    inside.set(id, list);
+    return list;
+  };
+  return { fills: [...fills.values()], borders, coast, isles, tilesOf, tilesIn, outline };
+}
+
+const nearestTile = (tiles: readonly Tile[] | undefined, x: number, y: number): Tile | null => {
+  let hit: Tile | null = null;
+  let best = Infinity;
+  for (const t of tiles ?? []) {
+    const d = (t.x - x) ** 2 + (t.y - y) ** 2;
+    if (d < best) {
+      best = d;
+      hit = t;
+    }
+  }
+  return hit;
+};
 
 export function AtlasTerritory({
   territory,
@@ -72,6 +213,7 @@ export function AtlasTerritory({
   label,
   bands = NO_BANDS,
   ties = NO_TIES,
+  routes = NO_ROUTES,
   origin,
   emphasis = NO_EMPHASIS,
   emphasisNote = null,
@@ -87,6 +229,8 @@ export function AtlasTerritory({
   bands?: readonly MapBand[];
   /** Regions joined across bands, drawn over them. */
   ties?: readonly MapTie[];
+  /** The selection's one-hop links to other regions on the map. */
+  routes?: readonly MapRoute[];
   /** Where a cell comes from, for its hover card (e.g. its repository). */
   origin?: (cell: TerritoryCell) => string | null;
   /** Regions outlined as well as drawn, e.g. the capabilities a timeline touches (CORE-186). */
@@ -96,6 +240,7 @@ export function AtlasTerritory({
 }) {
   const wrap = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
+  const mini = useRef<HTMLCanvasElement>(null);
   const view = useRef<View>({ x: 0, y: 0, k: 1 });
   const size = useRef({ w: 0, h: 0 });
   const fitted = useRef(false);
@@ -105,7 +250,11 @@ export function AtlasTerritory({
   const pinch = useRef<number | null>(null);
   const [frame, setFrame] = useState(0);
   const [hover, setHover] = useState<{ cell: TerritoryCell; x: number; y: number } | null>(null);
+  const [overview, setOverview] = useState(false);
+  const miniView = useRef({ mx: 0, my: 0, ms: 1 });
   const redraw = () => setFrame((f) => f + 1);
+  const scene = useMemo(() => sceneOf(territory), [territory]);
+  const hovered = hover?.cell.id ?? null;
 
   const animateTo = (target: View) => {
     cancelAnimationFrame(flight.current);
@@ -157,7 +306,17 @@ export function AtlasTerritory({
   useEffect(() => {
     if (!target || !size.current.w) return;
     const { w, h } = size.current;
-    const k = Math.min(40, (w * 0.55) / target.w, (h * 0.55) / target.h);
+    let k = Math.min(40, (w * 0.55) / target.w, (h * 0.55) / target.h);
+    // A country keeps its neighbours in view, where its routes go, while
+    // still close enough for its areas to show.
+    if (target.depth === 0)
+      k = Math.min(
+        k,
+        Math.max(
+          fitView(territory, w, h).k * 1.25,
+          (SHOW.children * 1.1) / Math.min(target.w, target.h),
+        ),
+      );
     animateTo({
       k,
       x: w / 2 - (target.x + target.w / 2) * k,
@@ -183,8 +342,9 @@ export function AtlasTerritory({
 
   useEffect(() => {
     const el = canvas.current;
+    const box = wrap.current;
     const { w, h } = size.current;
-    if (!el || !w) return;
+    if (!el || !box || !w) return;
     const dpr = window.devicePixelRatio || 1;
     if (el.width !== Math.round(w * dpr) || el.height !== Math.round(h * dpr)) {
       el.width = Math.round(w * dpr);
@@ -193,24 +353,60 @@ export function AtlasTerritory({
       el.style.height = `${h}px`;
     }
     const ctx = el.getContext("2d")!;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-    const { x: tx, y: ty, k } = view.current;
-    const color = {
-      region: cssVar("--surface"),
-      child: cssVar("--raised"),
-      grandchild: cssVar("--pane"),
-      structural: cssVar("--sunken"),
-      line: cssVar("--line"),
-      soft: cssVar("--line-soft"),
-      ink: cssVar("--ink"),
-      muted: cssVar("--ink-muted"),
-      faint: cssVar("--ink-faint"),
-      signal: cssVar("--signal-line"),
-      changed: cssVar("--data-berry"),
-      emphasis: cssVar("--data-teal"),
+    const style = getComputedStyle(box);
+    const token = (name: string) => style.getPropertyValue(name).trim() || "#888";
+    const pair = (name: string, fallback: [number, number]): [number, number] => {
+      const [a, b] = token(name).split(/\s+/).map(Number);
+      return Number.isFinite(a) && Number.isFinite(b) ? [a!, b!] : fallback;
     };
+    const num = (name: string, fallback: number) => {
+      const v = Number(token(name));
+      return Number.isFinite(v) ? v : fallback;
+    };
+    const color = {
+      sea: token("--map-sea"),
+      seaFar: token("--map-sea-far"),
+      shallows: token("--map-shallows"),
+      coast: token("--map-coast"),
+      border: token("--map-border"),
+      soft: token("--line-soft"),
+      ink: token("--ink"),
+      muted: token("--ink-muted"),
+      faint: token("--ink-faint"),
+      rail: token("--rail"),
+      signal: token("--signal-line"),
+      changed: token("--data-berry"),
+      uses: token("--data-teal"),
+      usedBy: token("--data-violet"),
+      emphasis: token("--data-teal"),
+    };
+    const land = pair("--map-land", [0.355, 0.05]);
+    const isle = pair("--map-isle", [0.29, 0.006]);
+    const halo = pair("--map-halo", [0.17, 0.012]);
+    const lift = num("--map-land-lift", 0.075);
+    const dim = num("--map-land-dim", -0.07);
+    const step = num("--map-land-step", 0.022);
     const font = getComputedStyle(document.body).fontFamily;
+    const mono = token("--font-mono");
+    const { x: tx, y: ty, k } = view.current;
+    const sx = (x: number) => x * k + tx;
+    const sy = (y: number) => y * k + ty;
+
+    // The sea: deeper in the middle of the view, fading to the pane at its edges.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const sea = ctx.createRadialGradient(
+      w * 0.45,
+      h * 0.5,
+      0,
+      w * 0.45,
+      h * 0.5,
+      Math.hypot(w, h) * 0.6,
+    );
+    sea.addColorStop(0, color.sea);
+    sea.addColorStop(1, color.seaFar);
+    ctx.fillStyle = sea;
+    ctx.fillRect(0, 0, w, h);
+
     const fitText = (text: string, max: number): string | null => {
       if (ctx.measureText(text).width <= max) return text;
       if (ctx.measureText("…").width > max) return null;
@@ -224,15 +420,41 @@ export function AtlasTerritory({
       }
       return lo > 0 ? `${text.slice(0, starts[lo]).trimEnd()}…` : null;
     };
+    /** Up to two lines of at most `max` px, the second cut short if it must be. */
+    const lines = (text: string, max: number): string[] => {
+      if (ctx.measureText(text).width <= max) return [text];
+      const words = text.split(/\s+/);
+      let first = "";
+      let i = 0;
+      for (; i < words.length; i++) {
+        const next = first ? `${first} ${words[i]}` : words[i]!;
+        if (first && ctx.measureText(next).width > max) break;
+        first = next;
+      }
+      const rest = words.slice(i).join(" ");
+      const head = fitText(first, max);
+      if (!head) return [];
+      const tail = rest && fitText(rest, max);
+      return tail ? [head, tail] : [head];
+    };
+    const opened = (c: TerritoryCell) => Math.min(c.w, c.h) * k >= SHOW.children;
     const visibleParent = (c: TerritoryCell): boolean => {
       if (!c.parent) return true;
       const parent = territory.byId.get(c.parent);
-      return !!parent && Math.min(parent.w, parent.h) * k >= SHOW.children && visibleParent(parent);
+      return !!parent && opened(parent) && visibleParent(parent);
+    };
+    const shown = (c: TerritoryCell) => c.size > 0 && visibleParent(c);
+    /** About how wide a region is on screen: the side of a square of its tiles. */
+    const span = (c: TerritoryCell) => Math.sqrt(c.size) * TILE * 1.75 * k;
+    const topOf = (c: TerritoryCell): TerritoryCell => {
+      let cell = c;
+      while (cell.parent) cell = territory.byId.get(cell.parent) ?? cell;
+      return cell;
     };
 
     for (const b of bands) {
-      const x = b.x * k + tx;
-      const y = b.y * k + ty;
+      const x = sx(b.x);
+      const y = sy(b.y);
       const bw = b.w * k;
       const bh = b.h * k;
       if (x > w || y > h || x + bw < 0 || y + bh < 0) continue;
@@ -247,6 +469,7 @@ export function AtlasTerritory({
       ctx.font = `650 ${titleSize}px ${font}`;
       ctx.fillStyle = color.ink;
       ctx.textBaseline = "top";
+      ctx.textAlign = "left";
       const title = fitText(b.label, bw - 24);
       const top = y + Math.max(4, Math.min(14, strip * 0.18));
       if (title) ctx.fillText(title, x + 12, top);
@@ -258,118 +481,497 @@ export function AtlasTerritory({
       }
     }
 
+    // Who the selection talks to: their countries stay lit, the rest sink.
+    const sel = selected ? territory.byId.get(selected) : undefined;
+    const lit = new Set<string>();
+    const drawnRoutes = routes.filter((r) => {
+      const c = territory.byId.get(r.id);
+      return c && c.id !== sel?.id && shown(c);
+    });
+    if (sel && drawnRoutes.length) {
+      lit.add(topOf(sel).id);
+      for (const r of drawnRoutes) lit.add(topOf(territory.byId.get(r.id)!).id);
+    }
+    const hueOf = new Map<string, number>();
+    const structural = new Set<string>();
+    for (const c of territory.cells)
+      if (c.depth === 0) {
+        hueOf.set(c.id, c.hue);
+        if (c.structural) structural.add(c.id);
+      }
+    const selTop = sel ? topOf(sel).id : null;
+
+    // World space from here: lines are set in screen pixels over k.
+    ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    const px = (n: number) => n / k;
+
+    // Shallow water: soft rings around every coast.
+    ctx.strokeStyle = color.shallows;
+    for (const [width, alpha] of [
+      [TILE * 4.2, 0.025],
+      [TILE * 2.7, 0.035],
+      [TILE * 1.5, 0.06],
+      [TILE * 0.7, 0.1],
+    ] as const) {
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = width;
+      ctx.stroke(scene.coast);
+      ctx.globalAlpha = alpha * 0.7;
+      ctx.stroke(scene.isles);
+    }
+    ctx.globalAlpha = 1;
+
+    const far = TILE * k < 3;
+    for (const f of scene.fills) {
+      const isleLand = structural.has(f.region);
+      const [l0, c0] = isleLand ? isle : land;
+      let l = l0 + (f.shade - 1) * step + (f.grain - 1) * step * 0.45;
+      let c = c0;
+      if (f.region === selTop) {
+        l += lift;
+        c *= 1.35;
+      } else if (lit.size && !lit.has(f.region)) {
+        l += dim;
+        c *= 0.55;
+      }
+      ctx.fillStyle = `oklch(${l.toFixed(3)} ${c.toFixed(3)} ${isleLand ? 70 : (hueOf.get(f.region) ?? 70)})`;
+      ctx.fill(far ? f.solid : f.gapped);
+    }
+
+    // Provinces: a fine line between children, once they're drawn.
+    ctx.strokeStyle = color.border;
     for (const c of territory.cells) {
-      if (!visibleParent(c)) continue;
-      const x = c.x * k + tx;
-      const y = c.y * k + ty;
-      const cw = c.w * k;
-      const ch = c.h * k;
-      if (x > w || y > h || x + cw < 0 || y + ch < 0 || cw < 1.5) continue;
-      const radius = Math.min(10, cw / 8, ch / 8);
-      ctx.beginPath();
-      ctx.roundRect(x, y, cw, ch, radius);
-      ctx.fillStyle = c.structural
-        ? color.structural
-        : c.depth === 0
-          ? color.region
-          : c.depth === 1
-            ? color.child
-            : color.grandchild;
-      ctx.fill();
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = c.depth === 0 ? color.line : color.soft;
-      if (c.structural) ctx.setLineDash([4, 4]);
-      ctx.stroke();
+      if (c.depth === 0 || !shown(c)) continue;
+      ctx.globalAlpha = topOf(c).id === selTop ? 0.75 : 0.5;
+      ctx.lineWidth = px(c.depth === 1 ? 1.4 : 1);
+      ctx.stroke(scene.outline(c.id));
+    }
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = Math.max(px(2.5), TILE * 0.22);
+    ctx.stroke(scene.borders);
+    ctx.strokeStyle = color.coast;
+    ctx.lineWidth = px(1.5);
+    ctx.stroke(scene.coast);
+    ctx.setLineDash([px(4), px(4)]);
+    ctx.stroke(scene.isles);
+    ctx.setLineDash([]);
+
+    for (const c of territory.cells) {
+      if (!emphasis.has(c.id) || !shown(c)) continue;
+      // Dashed, so it reads without colour.
+      ctx.strokeStyle = color.emphasis;
+      ctx.lineWidth = px(2.5);
+      ctx.setLineDash([px(7), px(4)]);
+      ctx.stroke(scene.outline(c.id));
       ctx.setLineDash([]);
-      if (emphasis.has(c.id)) {
-        // Outside the selection's ring, dashed so it reads without colour.
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = color.emphasis;
-        ctx.setLineDash([7, 4]);
+    }
+    const hoverCell = hovered ? territory.byId.get(hovered) : undefined;
+    if (hoverCell && hoverCell.id !== selected && shown(hoverCell)) {
+      ctx.strokeStyle = color.ink;
+      ctx.globalAlpha = 0.6;
+      ctx.lineWidth = px(1.5);
+      ctx.stroke(scene.outline(hoverCell.id));
+      ctx.globalAlpha = 1;
+    }
+
+    // Routes: from the edge of the selection nearest each region, curving
+    // into it; uses bend one way and used-by the other, so a pair that use
+    // each other draw as two.
+    const pills: { x: number; y: number; text: string; color: string }[] = [];
+    if (sel?.size && drawnRoutes.length) {
+      const own = sel.depth === 0 ? scene.tilesOf.get(sel.id) : undefined;
+      // Leave from inside the edge facing each region, so routes fan out
+      // around the selection instead of all leaving its nearest corner.
+      const radius = Math.sqrt((sel.size * 2.6) / Math.PI) * TILE * 0.75;
+      const from = (x: number, y: number) => {
+        const dx = x - sel.anchor.x;
+        const dy = y - sel.anchor.y;
+        const d = Math.hypot(dx, dy) || 1;
+        return (
+          nearestTile(own, sel.anchor.x + (dx / d) * radius, sel.anchor.y + (dy / d) * radius) ??
+          sel.anchor
+        );
+      };
+      const heavy = new Set(
+        [...drawnRoutes]
+          .sort((a, b) => b.weight - a.weight)
+          .slice(0, 6)
+          .map((r) => `${r.direction}|${r.id}`),
+      );
+      for (const r of [...drawnRoutes].sort((a, b) => a.weight - b.weight)) {
+        const other = territory.byId.get(r.id)!;
+        const start = from(other.anchor.x, other.anchor.y);
+        const land =
+          other.depth === 0 ? nearestTile(scene.tilesOf.get(other.id), start.x, start.y) : null;
+        // Into the country a tile or two, toward its middle.
+        const end = land
+          ? (() => {
+              const dx = other.anchor.x - land.x;
+              const dy = other.anchor.y - land.y;
+              const d = Math.hypot(dx, dy) || 1;
+              const into = Math.min(d, TILE * 2.5);
+              return { x: land.x + (dx / d) * into, y: land.y + (dy / d) * into };
+            })()
+          : other.anchor;
+        const dx = end.x - start.x;
+        const dy = end.y - start.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const bend = (r.direction === "out" ? 1 : -1) * Math.min(len * 0.18, TILE * 7);
+        const cx = (start.x + end.x) / 2 - (dy / len) * bend;
+        const cy = (start.y + end.y) / 2 + (dx / len) * bend;
+        // Arrows point the way the dependency goes: from the user to the used.
+        const [a, b] = r.direction === "out" ? [start, end] : [end, start];
+        const stroke = r.direction === "out" ? color.uses : color.usedBy;
+        const width = Math.min(6, 1.3 + Math.sqrt(r.weight) * 0.55);
         ctx.beginPath();
-        ctx.roundRect(x - 4, y - 4, cw + 8, ch + 8, radius + 4);
+        ctx.moveTo(a.x, a.y);
+        ctx.quadraticCurveTo(cx, cy, b.x, b.y);
+        ctx.strokeStyle = color.border;
+        ctx.globalAlpha = 0.6;
+        ctx.lineWidth = px(width + 3.5);
         ctx.stroke();
-        ctx.setLineDash([]);
-      }
-      if (c.id === selected) {
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = color.signal;
-        ctx.beginPath();
-        ctx.roundRect(x - 1, y - 1, cw + 2, ch + 2, radius + 1);
+        ctx.globalAlpha = 0.95;
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = px(width);
         ctx.stroke();
-      }
-      if (c.changed && cw >= 16) {
+        ctx.globalAlpha = 1;
+        const angle = Math.atan2(b.y - cy, b.x - cx);
+        const head = px(5 + width);
         ctx.beginPath();
-        ctx.arc(x + cw - 9, y + 9, 3.5, 0, Math.PI * 2);
-        ctx.fillStyle = color.changed;
+        ctx.moveTo(b.x + Math.cos(angle) * head * 0.4, b.y + Math.sin(angle) * head * 0.4);
+        ctx.lineTo(b.x - Math.cos(angle - 0.5) * head, b.y - Math.sin(angle - 0.5) * head);
+        ctx.lineTo(b.x - Math.cos(angle + 0.5) * head, b.y - Math.sin(angle + 0.5) * head);
+        ctx.closePath();
+        ctx.fillStyle = stroke;
         ctx.fill();
-      }
-      if (cw < SHOW.label) continue;
-      const size = c.depth === 0 ? 15 : 12.5;
-      ctx.font = `${c.depth === 0 ? 650 : 550} ${size}px ${font}`;
-      ctx.fillStyle = c.structural ? color.muted : color.ink;
-      ctx.textBaseline = "top";
-      const name = fitText(c.entity.name, cw - 24);
-      if (name) ctx.fillText(name, x + 10, y + 10);
-      if (cw >= SHOW.counts && ch >= 48) {
-        ctx.font = `450 12px ${font}`;
-        ctx.fillStyle = color.faint;
-        const files = c.entity.counts.files;
-        const line = loading.has(c.id)
-          ? "Loading…"
-          : files !== undefined
-            ? fileLabel(files)
-            : c.entity.kind === "file"
-              ? (c.entity.path ?? "")
-              : "";
-        const text = line && fitText(line, cw - 20);
-        if (text) ctx.fillText(text, x + 10, y + 10 + size + 6);
+        if (heavy.has(`${r.direction}|${r.id}`))
+          pills.push({
+            x: sx(0.25 * a.x + 0.5 * cx + 0.25 * b.x),
+            y: sy(0.25 * a.y + 0.5 * cy + 0.25 * b.y),
+            text: r.weight.toLocaleString(),
+            color: stroke,
+          });
       }
     }
 
-    // Ties over the cells: arcs between the members' centres, left to right,
+    if (sel?.size && shown(sel)) {
+      // The selection: a soft amber halo under a firm line.
+      ctx.strokeStyle = color.signal;
+      ctx.globalAlpha = 0.28;
+      ctx.lineWidth = px(9);
+      ctx.stroke(scene.outline(sel.id));
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = px(2.5);
+      ctx.stroke(scene.outline(sel.id));
+    }
+
+    // Ties over the land: arcs between the members' middles, left to right,
     // bowed upward so a tie never runs through a region it doesn't join.
     for (const tie of [...ties].sort((a, b) => Number(a.active) - Number(b.active))) {
       const members = tie.cells
         .map((id) => territory.byId.get(id))
-        .filter((c): c is TerritoryCell => !!c && visibleParent(c))
-        .sort((a, b) => a.x - b.x || a.y - b.y);
+        .filter((c): c is TerritoryCell => !!c && shown(c))
+        .sort((a, b) => a.anchor.x - b.anchor.x || a.anchor.y - b.anchor.y);
       if (members.length < 2) continue;
-      ctx.lineWidth = tie.active ? 2.5 : 1.5;
+      ctx.lineWidth = px(tie.active ? 2.5 : 1.5);
       ctx.strokeStyle = tie.active ? color.signal : color.muted;
-      ctx.setLineDash(tie.active ? [] : [6, 5]);
+      ctx.setLineDash(tie.active ? [] : [px(6), px(5)]);
       ctx.beginPath();
       members.forEach((c, i) => {
-        const cx = (c.x + c.w / 2) * k + tx;
-        const cy = (c.y + c.h / 2) * k + ty;
         if (i === 0) {
-          ctx.moveTo(cx, cy);
+          ctx.moveTo(c.anchor.x, c.anchor.y);
           return;
         }
         const p = members[i - 1]!;
-        const px = (p.x + p.w / 2) * k + tx;
-        const py = (p.y + p.h / 2) * k + ty;
-        const lift = Math.min(160, Math.hypot(cx - px, cy - py) * 0.3);
-        ctx.quadraticCurveTo((px + cx) / 2, Math.min(py, cy) - lift, cx, cy);
+        const lift = Math.min(
+          px(160),
+          Math.hypot(c.anchor.x - p.anchor.x, c.anchor.y - p.anchor.y) * 0.3,
+        );
+        ctx.quadraticCurveTo(
+          (p.anchor.x + c.anchor.x) / 2,
+          Math.min(p.anchor.y, c.anchor.y) - lift,
+          c.anchor.x,
+          c.anchor.y,
+        );
       });
       ctx.stroke();
       ctx.setLineDash([]);
       for (const c of members) {
-        const cx = (c.x + c.w / 2) * k + tx;
-        const cy = (c.y + c.h / 2) * k + ty;
         ctx.beginPath();
-        ctx.arc(cx, cy, tie.active ? 5 : 3.5, 0, Math.PI * 2);
+        ctx.arc(c.anchor.x, c.anchor.y, px(tie.active ? 5 : 3.5), 0, Math.PI * 2);
         ctx.fillStyle = tie.active ? color.signal : color.muted;
         ctx.fill();
         if (!tie.active) continue;
-        ctx.lineWidth = 2;
+        ctx.lineWidth = px(2);
         ctx.strokeStyle = color.signal;
-        ctx.beginPath();
-        ctx.roundRect(c.x * k + tx - 1, c.y * k + ty - 1, c.w * k + 2, c.h * k + 2, 10);
-        ctx.stroke();
+        ctx.stroke(scene.outline(c.id));
       }
     }
-  }, [frame, territory, selected, loading, bands, ties, emphasis]);
+
+    // ---- labels, in screen space ------------------------------------------------
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round";
+    const placed: { x0: number; y0: number; x1: number; y1: number }[] = [];
+    const free = (b: { x0: number; y0: number; x1: number; y1: number }) =>
+      !placed.some((p) => b.x0 < p.x1 && b.x1 > p.x0 && b.y0 < p.y1 && b.y1 > p.y0);
+    const haloOf = (c: TerritoryCell) =>
+      `oklch(${halo[0]} ${halo[1]} ${c.structural ? 70 : c.hue} / 0.85)`;
+    const text = (
+      t: string,
+      x: number,
+      y: number,
+      fill: string,
+      haloFill: string,
+      weight: number,
+      sizePx: number,
+      family = font,
+    ) => {
+      ctx.font = `${weight} ${sizePx}px ${family}`;
+      ctx.lineWidth = sizePx * 0.34;
+      ctx.strokeStyle = haloFill;
+      ctx.strokeText(t, x, y);
+      ctx.fillStyle = fill;
+      ctx.fillText(t, x, y);
+    };
+    const changedDot = (x: number, y: number) => {
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = color.changed;
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = color.border;
+      ctx.stroke();
+    };
+    /**
+     * A name in a pill on a region's land, near its top: the selection, and
+     * countries whose provinces are drawn (their middles go to the provinces).
+     */
+    const pill = (c: TerritoryCell, active: boolean) => {
+      const sizePx = c.depth === 0 ? 14 : 13;
+      ctx.font = `700 ${sizePx}px ${font}`;
+      const name = fitText(c.entity.name, 260);
+      if (!name) return;
+      const dot = c.changed ? 14 : 0;
+      const wpx = ctx.measureText(name).width + 22 + dot;
+      const hpx = 26;
+      const crown = nearestTile(scene.tilesIn(c.id), c.anchor.x, c.y + TILE + (hpx / 2 + 4) / k);
+      const at = crown ?? c.anchor;
+      // Kept on screen, but within the region's own extent.
+      const clampTo = (v: number, lo: number, hi: number) =>
+        Math.min(Math.max(v, lo), Math.max(lo, hi));
+      const x = clampTo(
+        sx(at.x),
+        Math.max(wpx / 2 + 6, sx(c.x) + wpx / 2),
+        Math.min(w - wpx / 2 - 6, sx(c.x + c.w) - wpx / 2),
+      );
+      const y0 = clampTo(
+        sy(at.y),
+        hpx / 2 + 44,
+        Math.min(h - hpx / 2 - 6, sy(c.y + c.h) - hpx / 2),
+      );
+      let box: { x0: number; y0: number; x1: number; y1: number } | null = null;
+      for (const dy of active ? [0] : [0, 1, 2]) {
+        const y = y0 + dy * (hpx + 4);
+        const b = { x0: x - wpx / 2, y0: y - hpx / 2, x1: x + wpx / 2, y1: y + hpx / 2 };
+        if (active || free(b)) {
+          box = b;
+          break;
+        }
+      }
+      if (!box) return;
+      const y = (box.y0 + box.y1) / 2;
+      placed.push(box);
+      ctx.beginPath();
+      ctx.roundRect(box.x0, box.y0, wpx, hpx, 8);
+      ctx.fillStyle = color.rail;
+      ctx.fill();
+      ctx.lineWidth = active ? 1.5 : 1;
+      ctx.strokeStyle = active ? color.signal : color.soft;
+      ctx.stroke();
+      if (dot) changedDot(box.x0 + 13, y);
+      ctx.fillStyle = color.ink;
+      ctx.fillText(name, x + dot / 2, y + 0.5);
+    };
+    const opensInto = (c: TerritoryCell) =>
+      opened(c) && territory.cells.some((d) => d.parent === c.id && d.size > 0);
+
+    if (sel && shown(sel) && sel.size) pill(sel, true);
+    for (const p of pills) {
+      ctx.font = `500 11px ${mono}`;
+      const wpx = ctx.measureText(p.text).width + 12;
+      const box = { x0: p.x - wpx / 2, y0: p.y - 9, x1: p.x + wpx / 2, y1: p.y + 9 };
+      if (!free(box)) continue;
+      placed.push(box);
+      ctx.beginPath();
+      ctx.roundRect(p.x - wpx / 2, p.y - 8.5, wpx, 17, 8.5);
+      ctx.fillStyle = color.rail;
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = p.color;
+      ctx.stroke();
+      ctx.fillStyle = color.ink;
+      ctx.fillText(p.text, p.x, p.y + 0.5);
+    }
+    // Biggest first, so a crowded view keeps the names of the largest regions.
+    const order = territory.cells
+      .filter((c) => shown(c) && c.id !== sel?.id)
+      .sort((a, b) => a.depth - b.depth || b.size - a.size);
+    // Parents whose children show get a pill, and their children the inline labels.
+    for (const c of order) if (opensInto(c)) pill(c, false);
+    for (const c of order) {
+      if (opensInto(c)) continue;
+      const room = span(c);
+      if (room < SHOW.label) continue;
+      const x = sx(c.anchor.x);
+      const y = sy(c.anchor.y);
+      if (x < -200 || x > w + 200 || y < -60 || y > h + 60) continue;
+      const sizePx =
+        c.depth === 0
+          ? Math.min(17, 11.5 + (c.entity.layout?.bucket ?? 3) * 0.6)
+          : c.depth === 1
+            ? 12
+            : 11.5;
+      const weight = c.depth === 0 ? 700 : 600;
+      ctx.font = `${weight} ${sizePx}px ${font}`;
+      const name = lines(c.entity.name, Math.max(84, Math.min(room * 0.95, 180)));
+      if (!name.length) continue;
+      const counts = room >= SHOW.counts;
+      const line = sizePx * 1.18;
+      const countLine = loading.has(c.id)
+        ? "Loading…"
+        : c.entity.counts.files !== undefined
+          ? fileLabel(c.entity.counts.files)
+          : "";
+      const width = Math.max(...name.map((n) => ctx.measureText(n).width));
+      const height = name.length * line + (counts && countLine ? 15 : 0);
+      // At its anchor, or nudged up or down if something's there already.
+      let spot: { x: number; y: number } | null = null;
+      for (const dy of [0, -0.6, 0.6, -1.2, 1.2]) {
+        const cy = y + dy * height;
+        const box = {
+          x0: x - width / 2 - 4,
+          y0: cy - height / 2 - 2,
+          x1: x + width / 2 + 4,
+          y1: cy + height / 2 + 2,
+        };
+        if (!free(box)) continue;
+        if (dy) {
+          const under = cellAt(territory, (x - tx) / k, (cy - ty) / k);
+          if (!under || (under.id !== c.id && !isInside(territory, under, c.id))) continue;
+        }
+        placed.push(box);
+        spot = { x, y: cy };
+        break;
+      }
+      if (!spot) continue;
+      const related = !lit.size || lit.has(topOf(c).id);
+      const top = spot.y - height / 2 + line / 2;
+      name.forEach((n, i) =>
+        text(
+          n,
+          spot.x,
+          top + i * line,
+          c.structural || !related ? color.muted : color.ink,
+          haloOf(c),
+          weight,
+          sizePx,
+        ),
+      );
+      if (counts && countLine)
+        text(
+          countLine,
+          spot.x,
+          top + name.length * line - 2,
+          color.muted,
+          haloOf(c),
+          450,
+          10.5,
+          mono,
+        );
+      if (c.changed) changedDot(spot.x - width / 2 - 9, top);
+    }
+    // Changed regions too small for a label still show their dot.
+    for (const c of order) {
+      if (!c.changed || span(c) >= SHOW.label || span(c) < 8 || opensInto(c)) continue;
+      changedDot(sx(c.anchor.x), sy(c.anchor.y));
+    }
+
+    // The minimap, once the view no longer shows everything.
+    const all = fitView(territory, w, h);
+    const whole =
+      k <= all.k * 1.05 &&
+      sx(territory.left) >= -2 &&
+      sy(territory.top) >= -2 &&
+      sx(territory.width) <= w + 2 &&
+      sy(territory.height) <= h + 2;
+    const wantMini = !whole && w >= 560 && h >= 320;
+    if (wantMini !== overview) setOverview(wantMini);
+    const m = mini.current;
+    if (!m || !wantMini) return;
+    const mw = 156;
+    const mh = 104;
+    if (m.width !== Math.round(mw * dpr)) {
+      m.width = Math.round(mw * dpr);
+      m.height = Math.round(mh * dpr);
+    }
+    const mc = m.getContext("2d")!;
+    mc.setTransform(dpr, 0, 0, dpr, 0, 0);
+    mc.clearRect(0, 0, mw, mh);
+    mc.fillStyle = color.seaFar;
+    mc.globalAlpha = 0.92;
+    mc.fillRect(0, 0, mw, mh);
+    mc.globalAlpha = 1;
+    const tw = territory.width - territory.left;
+    const th = territory.height - territory.top;
+    const ms = Math.min((mw - 12) / tw, (mh - 12) / th);
+    const mx = (mw - tw * ms) / 2 - territory.left * ms;
+    const my = (mh - th * ms) / 2 - territory.top * ms;
+    mc.setTransform(dpr * ms, 0, 0, dpr * ms, dpr * mx, dpr * my);
+    for (const f of scene.fills) {
+      const isleLand = structural.has(f.region);
+      const [l0, c0] = isleLand ? isle : land;
+      const l = l0 + (f.region === selTop ? lift * 2 : 0);
+      mc.fillStyle = `oklch(${l.toFixed(3)} ${(c0 * 1.3).toFixed(3)} ${isleLand ? 70 : (hueOf.get(f.region) ?? 70)})`;
+      mc.fill(f.solid);
+    }
+    mc.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const vx = mx + ((0 - tx) / k) * ms;
+    const vy = my + ((0 - ty) / k) * ms;
+    mc.strokeStyle = color.signal;
+    mc.lineWidth = 1.5;
+    mc.beginPath();
+    mc.roundRect(vx, vy, (w / k) * ms, (h / k) * ms, 3);
+    mc.stroke();
+    miniView.current = { mx, my, ms };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- hover redraws only when its region changes
+  }, [
+    frame,
+    territory,
+    scene,
+    selected,
+    loading,
+    bands,
+    ties,
+    routes,
+    emphasis,
+    hovered,
+    overview,
+  ]);
+
+  /** Centre the view on a point of the minimap. */
+  const jump = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const { mx, my, ms } = miniView.current;
+    const wx = (event.clientX - rect.left - mx) / ms;
+    const wy = (event.clientY - rect.top - my) / ms;
+    const { k } = view.current;
+    view.current = { k, x: size.current.w / 2 - wx * k, y: size.current.h / 2 - wy * k };
+    redraw();
+  };
 
   const local = (event: { clientX: number; clientY: number }) => {
     const rect = canvas.current!.getBoundingClientRect();
@@ -380,11 +982,18 @@ export function AtlasTerritory({
     const hit = cellAt(territory, (sx - x) / k, (sy - y) / k);
     if (!hit) return null;
     // Never pick deeper than what's drawn.
-    let cell: TerritoryCell | null = hit;
-    while (cell?.parent) {
-      const parent: TerritoryCell = territory.byId.get(cell.parent)!;
-      if (Math.min(parent.w, parent.h) * k >= SHOW.children) break;
-      cell = parent;
+    const chain: TerritoryCell[] = [];
+    for (
+      let c: TerritoryCell | undefined = hit;
+      c;
+      c = c.parent ? territory.byId.get(c.parent) : undefined
+    )
+      chain.unshift(c);
+    let cell = chain[0]!;
+    for (const c of chain.slice(1)) {
+      const parent = territory.byId.get(c.parent!)!;
+      if (Math.min(parent.w, parent.h) * k < SHOW.children) break;
+      cell = c;
     }
     return cell;
   };
@@ -430,7 +1039,7 @@ export function AtlasTerritory({
             return;
           }
           const cell = pick(p.x, p.y);
-          setHover(cell ? { cell, x: p.x, y: p.y } : null);
+          setHover((now) => (cell ? { cell, x: p.x, y: p.y } : now === null ? now : null));
         }}
         onPointerUp={(event) => {
           pointers.current.delete(event.pointerId);
@@ -470,6 +1079,19 @@ export function AtlasTerritory({
           <ArrowsOutIcon weight="bold" aria-hidden />
         </button>
       </div>
+      <canvas
+        ref={mini}
+        aria-hidden
+        hidden={!overview}
+        className="absolute right-2 bottom-2 h-[104px] w-[156px] cursor-pointer touch-none rounded-plate shadow-[var(--shadow-float)]"
+        onPointerDown={(event) => {
+          event.currentTarget.setPointerCapture(event.pointerId);
+          jump(event);
+        }}
+        onPointerMove={(event) => {
+          if (event.buttons) jump(event);
+        }}
+      />
       {hover && (
         <div
           className="pointer-events-none absolute z-10 max-w-64 rounded-plate bg-raised px-2.5 py-1.5 text-body-sm shadow-[var(--shadow-float)]"
@@ -491,4 +1113,15 @@ export function AtlasTerritory({
       )}
     </div>
   );
+}
+
+/** Whether `cell` lies inside the region `id`. */
+function isInside(territory: Territory, cell: TerritoryCell, id: string): boolean {
+  for (
+    let c: TerritoryCell | undefined = cell;
+    c;
+    c = c.parent ? territory.byId.get(c.parent) : undefined
+  )
+    if (c.id === id) return true;
+  return false;
 }
