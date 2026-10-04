@@ -181,9 +181,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         }
         Command::Step(a) => out(f, commands::test::step(ctx, &a)),
         Command::Hook { harness } => {
-            if harness == "claude-code" {
-                commands::hooks::claude_code(ctx);
-            }
+            commands::hooks::capture(ctx, &harness);
             Ok(())
         }
         Command::Steps(a) if a.follow => commands::steps::follow(ctx, &a),

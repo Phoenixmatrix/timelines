@@ -681,6 +681,57 @@ fn hook(s: &Sandbox, session: &str, prompt: &str, env: &[(&str, &str)]) -> (i32,
 }
 
 #[test]
+fn codex_and_oh_my_pi_hooks_share_the_contract_and_name_their_harness() {
+    let s = Sandbox::new();
+    let timeline = [("GM_TIMELINE", "search")];
+    let run = |harness: &str, prompt: &str| {
+        use std::io::Write as _;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gm"))
+            .current_dir(s.work())
+            .args(["hook", harness])
+            .env("GM_TIMELINE", "search")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let event = json!({"session_id": harness, "cwd": s.work(), "prompt": prompt});
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!((out.status.code(), out.stdout.len()), (Some(0), 0));
+    };
+    run("codex", "Add a cache");
+    // An unknown harness is ignored, quietly.
+    run("nonsense", "Not kept");
+    git(
+        &s.root.join("seed"),
+        &["push", "-q", "origin", "main:timeline/search"],
+    );
+    s.ok(&["sync"], &timeline);
+    s.edit("cache.rs", "fn cache() {}\n");
+    let file = s.context_file("## Why\nSpeed.\n");
+    s.ok(&["commit", "-m", "Cache", "--context", &file], &timeline);
+    s.ok(&["push"], &timeline);
+    let up = s.api.uploads()[0].clone();
+    assert_eq!(up["instructions"][0]["text"], json!("Add a cache"));
+    assert_eq!(up["instructions"].as_array().unwrap().len(), 1, "{up}");
+    assert_eq!(up["coverage"]["instructions"], json!("hook:codex"));
+    // Oh My Pi's extension calls `gm hook pi`.
+    run("pi", "Use the pi hook");
+    s.edit("cache.rs", "fn cache() { 1 }\n");
+    s.ok(&["commit", "-m", "More", "--context", &file], &timeline);
+    s.ok(&["push"], &timeline);
+    let next = s.api.uploads()[1].clone();
+    assert_eq!(next["instructions"][0]["text"], json!("Use the pi hook"));
+    assert_eq!(next["coverage"]["instructions"], json!("hook:pi"));
+}
+
+#[test]
 fn the_claude_code_hook_puts_the_persons_words_on_the_next_step() {
     let s = Sandbox::new();
     let timeline = [("GM_TIMELINE", "search")];

@@ -125,7 +125,7 @@ pub enum Command {
     /// Harness hooks (installed by `gm agent setup`); not for direct use
     #[command(hide = true)]
     Hook {
-        /// The harness: claude-code.
+        /// The harness: claude-code, codex or pi (Oh My Pi).
         harness: String,
     },
     /// Sign in to a Gitmatrix server

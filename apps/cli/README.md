@@ -819,6 +819,17 @@ gm context sync                                     # retries uploads a push cou
   (Claude Code would add its output to the conversation) and never fails a
   prompt. Without a hook, the agent records them itself (`agent`), and the
   Story notes that some context may be missing.
+- **Codex and Oh My Pi** use the same contract (CORE-242), each under its own
+  harness id. For Codex (0.114+), `gm agent setup` adds the same
+  `UserPromptSubmit` hook to `.codex/hooks.json` (`gm hook codex`); Codex runs
+  a project hook only once the person trusts it (`/hooks` in Codex), and it
+  too adds hook output to the conversation, so the hook stays silent. For Oh
+  My Pi, setup writes `.omp/extensions/gitmatrix-steps.ts`, an extension whose
+  `input` handler (each submitted message, steering typed mid-turn included)
+  hands the text to `gm hook pi`. Oh My Pi raises `input` for the
+  interactive prompt and RPC sessions, not for one-shot print mode (`omp -p`),
+  so those prompts aren't captured. Coverage names the harness whose hook ran
+  (`hook:codex`, `hook:pi`); a harness whose hook didn't run is never claimed.
 
 Reading it back, for an agent picking up the work or a person investigating:
 
