@@ -40,6 +40,7 @@ import {
   useSearchParams,
   type LoaderFunctionArgs,
 } from "react-router";
+import { useLiveSearchParams } from "../../lib/searchParams.ts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DEFAULT_QUERY,
@@ -1181,7 +1182,7 @@ function Sources({ detail, base }: { detail: PackageDetail; base: string }) {
 export function PackageConsole() {
   const data = useLoaderData<typeof packageConsoleLoader>();
   const { detail, page, query } = data;
-  const [params, setParams] = useSearchParams();
+  const [params, setParams] = useLiveSearchParams();
   const contentsVersion = params.get("version");
   const revalidator = useRevalidator();
   const toast = useToast();

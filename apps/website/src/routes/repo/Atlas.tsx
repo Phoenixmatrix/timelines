@@ -26,6 +26,7 @@ import {
   type LoaderFunctionArgs,
   type ShouldRevalidateFunctionArgs,
 } from "react-router";
+import { useLiveSearchParams } from "../../lib/searchParams.ts";
 import type { KnowledgeOverlaySummary, KnowledgeStatus, WikiCatalog } from "../../../shared/api.ts";
 import type {
   AtlasEntitySummary,
@@ -312,7 +313,7 @@ function Territory({
   // read once mounted, after the view this one replaces has said.
   const arrival = () =>
     landed && place.current?.scope === `${ref.owner}/${ref.name}` ? place.current : null;
-  const [params, setParams] = useSearchParams();
+  const [params, setParams] = useLiveSearchParams();
   const url = readAtlasUrl(params);
   const timeline = scopeOf(params);
   const navigationType = useNavigationType();

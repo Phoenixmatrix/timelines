@@ -8,9 +8,9 @@ import {
   redirect,
   data as routeData,
   useLoaderData,
-  useSearchParams,
   type LoaderFunctionArgs,
 } from "react-router";
+import { useLiveSearchParams } from "../../lib/searchParams.ts";
 import type { CommitSummary, HistoryPage } from "../../../shared/api.ts";
 import type { CommitDiff, DiffFile } from "../../../shared/diff.ts";
 import type { Step, StepPage, StepVersions } from "../../../shared/steps.ts";
@@ -141,7 +141,7 @@ const agentOf = (row: StoryRow) =>
 export function Story() {
   const detail = useLoaderData() as TimelineDetail;
   const { timeline } = detail;
-  const [params, setParams] = useSearchParams();
+  const [params, setParams] = useLiveSearchParams();
   const repo =
     timeline.repos.find((r) => `${r.owner}/${r.name}` === params.get("repo")) ?? timeline.repos[0];
   const { rows, error, loading, more } = useStory(detail, repo);

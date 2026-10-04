@@ -2989,7 +2989,14 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await gm(["pkg", "upload", artifact, `${granted}/1.0.0/artifact.txt`, "--owner", repo.owner]);
       await gm(["pkg", "grant", `generic/${granted}`, doomed, "--owner", repo.owner]);
 
-      const before = await inventory();
+      // The push log is written after the push answers (waitUntil), so wait for
+      // its row rather than racing it under load (CORE-258).
+      const before = await poll(
+        inventory,
+        (seen) => (seen.d1.ref_updates ?? 0) >= 1,
+        "the push log to record the fixture's push",
+        30_000,
+      );
       assert.equal(before.repo?.deletedAt, null);
       assert.equal(before.artifacts.exists, true, "Its Artifacts repository exists");
       assert.deepEqual(before.previews, { live: 1, teardownsOpen: 0 });

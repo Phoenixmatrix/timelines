@@ -29,10 +29,10 @@ import {
   useLocation,
   useNavigate,
   useNavigationType,
-  useSearchParams,
   type LoaderFunctionArgs,
   type ShouldRevalidateFunctionArgs,
 } from "react-router";
+import { useLiveSearchParams } from "../../lib/searchParams.ts";
 import type { AccountPage, RepoSummary } from "../../../shared/api.ts";
 import {
   ATLAS_WORKSPACE_MAX_REPOS,
@@ -380,7 +380,7 @@ function WorkspaceView({
   accountRepos: RepoSummary[];
 }) {
   const base = `/${encodeURIComponent(owner)}/-/atlas`;
-  const [params, setParams] = useSearchParams();
+  const [params, setParams] = useLiveSearchParams();
   const url = readAtlasUrl(params);
   const links = parseLinkState(params.get("links"));
   const navigationType = useNavigationType();

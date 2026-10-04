@@ -56,23 +56,29 @@ function make(seed: number, issues = 120) {
 }
 
 describe("the Chronicle's development history", () => {
-  test("makes thousands of real events over the window, and is reproducible", () => {
-    const a = make(7);
-    const events = (a.db.prepare("SELECT count(*) AS n FROM events").get() as { n: number }).n;
-    expect(events).toBeGreaterThan(1500);
-    expect(a.result.applied).toBeGreaterThan(1500);
-    // The plan rarely meets a refusal it didn't foresee.
-    expect(a.result.skipped).toBeLessThan(a.result.issues / 10);
-    const times = a.db
-      .prepare(
-        "SELECT min(json_extract(data, '$.createdAt')) AS first, max(json_extract(data, '$.createdAt')) AS last FROM events",
-      )
-      .get() as { first: string; last: string };
-    expect(Date.parse(times.first)).toBeGreaterThanOrEqual(END - 30 * 86_400_000);
-    expect(Date.parse(times.last)).toBeLessThan(END);
-    const b = make(7);
-    expect(b.result).toEqual(a.result);
-  });
+  // Two full 120-issue histories (about 3,000 real mutations): ~1.5 s alone,
+  // past Vitest's 5 s default on a loaded 4-core gate (CORE-258).
+  test(
+    "makes thousands of real events over the window, and is reproducible",
+    { timeout: 30_000 },
+    () => {
+      const a = make(7);
+      const events = (a.db.prepare("SELECT count(*) AS n FROM events").get() as { n: number }).n;
+      expect(events).toBeGreaterThan(1500);
+      expect(a.result.applied).toBeGreaterThan(1500);
+      // The plan rarely meets a refusal it didn't foresee.
+      expect(a.result.skipped).toBeLessThan(a.result.issues / 10);
+      const times = a.db
+        .prepare(
+          "SELECT min(json_extract(data, '$.createdAt')) AS first, max(json_extract(data, '$.createdAt')) AS last FROM events",
+        )
+        .get() as { first: string; last: string };
+      expect(Date.parse(times.first)).toBeGreaterThanOrEqual(END - 30 * 86_400_000);
+      expect(Date.parse(times.last)).toBeLessThan(END);
+      const b = make(7);
+      expect(b.result).toEqual(a.result);
+    },
+  );
 
   test("the showcase issue reads back as its planned span", () => {
     const { store, ann, result } = make(3, 40);
