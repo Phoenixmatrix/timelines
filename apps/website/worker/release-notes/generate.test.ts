@@ -13,6 +13,7 @@ import {
 import { releaseIndex, releaseNotesFor, toEntry, type EntryRow } from "./read.ts";
 import { RepoReader } from "../objects.ts";
 import { landedTimelines } from "./timelines.ts";
+import { releaseNotes } from "../retention/cleanups/release-notes.ts";
 import * as semantic from "../semantic/feed.ts";
 
 const DAY = `@day:${new Date(1_790_000_000_000).toISOString().slice(0, 10)}`;
@@ -414,6 +415,75 @@ describe("release note generation", () => {
     expect((await r.run()).releases).toBe(0);
     expect(r.sqlite.prepare("SELECT release FROM release_notes").all()).toEqual([]);
   });
+  test("retention removes old releases' notes and mentions, keeps the latest, and they never come back", async () => {
+    const r = setup();
+    const T0 = 1_790_000_000;
+    const day = (n: number) =>
+      `@day:${new Date((T0 + n * 86_400) * 1000).toISOString().slice(0, 10)}`;
+    for (const key of ["ENG-1", "ENG-2", "ENG-3"]) r.issues.set(key, issue(key));
+    r.tags.set("v0", r.commit("Old work (ENG-1) (ENG-9)", T0));
+    r.commit("More old work (ENG-2)", T0 + 86_400);
+    r.tags.set("v1", r.commit("New work (ENG-3) (ENG-2)", T0 + 2 * 86_400));
+    await r.run();
+    const notes = () =>
+      (
+        r.sqlite.prepare("SELECT release FROM release_notes ORDER BY release").all() as {
+          release: string;
+        }[]
+      ).map((n) => n.release);
+    const mentions = () =>
+      (
+        r.sqlite
+          .prepare("SELECT issue_key FROM release_note_mentions ORDER BY issue_key")
+          .all() as {
+          issue_key: string;
+        }[]
+      ).map((m) => m.issue_key);
+    expect(notes()).toEqual([day(0), day(1), day(2), "v0", "v1"]);
+    expect(mentions()).toEqual(["ENG-1", "ENG-2", "ENG-3", "ENG-9"]);
+
+    // Half a day after the newest work, keeping one day: days 0 and 1 go, and
+    // tag v0 (its work is day 0's).
+    const now = new Date((T0 + 2.5 * 86_400) * 1000);
+    const ctx = {
+      env: r.env,
+      target: { scope: "account", accountId: "acc" } as const,
+      thresholds: { days: 1 },
+      now,
+      limit: 10,
+    };
+    const { items } = await releaseNotes.select(ctx, null);
+    expect(items.map((i) => i.release)).toEqual([day(0), day(1), "v0"]);
+    const removed = await releaseNotes.remove(ctx, items);
+    expect(removed.count).toBe(items.reduce((n, i) => n + i.rows, 0));
+    expect(notes()).toEqual([day(2), "v1"]);
+    expect(r.entries(day(0))).toEqual([]);
+    // ENG-1 was cited only there; ENG-2 still is. ENG-9 never resolved: the
+    // next generation recomputes it.
+    expect(mentions()).toEqual(["ENG-2", "ENG-3", "ENG-9"]);
+    expect(r.sqlite.prepare("SELECT retained_from FROM release_note_state").get()).toEqual({
+      retained_from: new Date(now.getTime() - 86_400_000).toISOString(),
+    });
+
+    // The generator writes nothing for the removed releases and pays nothing.
+    const again = await r.run();
+    expect(again.newCalls).toEqual([]);
+    expect(notes()).toEqual([day(2), "v1"]);
+    expect(mentions()).toEqual(["ENG-2", "ENG-3"]);
+    expect(await releaseNotes.remove(ctx, items)).toEqual({ count: 0, bytes: 0 });
+
+    // Much later every release is old: the latest day and the latest tag stay.
+    const later = { ...ctx, now: new Date((T0 + 400 * 86_400) * 1000) };
+    expect((await releaseNotes.select(later, null)).items).toEqual([]);
+    // A new push after the horizon is written as usual; the old latest day
+    // stays until something newer is out, then goes.
+    r.commit("Fresh work (ENG-3)", T0 + 401 * 86_400);
+    await r.run();
+    expect(notes()).toEqual([day(2), day(401), "v1"]);
+    const last = await releaseNotes.select(later, null);
+    expect(last.items.map((i) => i.release)).toEqual([day(2)]);
+  });
+
   test("bounded daily history marks every observed day incomplete", async () => {
     const r = setup();
     r.issues.set("ENG-1", issue("ENG-1"));

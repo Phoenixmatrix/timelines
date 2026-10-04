@@ -2491,6 +2491,24 @@ CORE-201, `worker/retention/cleanups/`:
   (`scopePolicy`), a shorter period brings stamped priors' expiry forward, and
   a change flags the account's scopes so the hourly sweep applies it.
 
+### Auth hygiene and release notes
+
+CORE-206, `worker/retention/cleanups/`:
+
+- **`auth-hygiene`** (site) deletes sign-in state that ended more than `days`
+  ago, by each table's own expiry: expired `auth_sessions`,
+  `auth_verifications` (sign-in codes), `auth_device_codes`, `auth_lockouts`
+  past their `until`, `ssh_challenges`, expired `access_tokens` (revoking a
+  token already deletes it; a token without an expiry never expires) and
+  `ci_job_tokens`. The cutoff is at least a day in the past, so live
+  sessions, valid tokens and active lockouts never match.
+- **`release-notes`** deletes release notes released more than `days` ago
+  with their entries, and mentions of issues only they cited, never each
+  repository's latest daily or latest tagged release. It records the cutoff
+  in `release_note_state.retained_from`; the generator then never writes
+  notes for an older release again (it would pay a model to rebuild them),
+  while releases still stored stay current.
+
 ### Usage and costs
 
 **Settings → Usage & costs** (`/settings/usage?owner=<slug>`, an account's

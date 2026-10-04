@@ -659,6 +659,8 @@ export interface Database {
     ai_snapshot: Generated<string | null>;
     lease_id: Generated<string | null>;
     generation_refs: Generated<string | null>;
+    /** Releases before it were removed by retention: never regenerated (CORE-206). */
+    retained_from: Generated<string | null>;
   };
   ci_refs: {
     repo_id: string;

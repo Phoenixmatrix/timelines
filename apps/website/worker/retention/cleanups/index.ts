@@ -16,6 +16,8 @@ import { previewRecords } from "./preview-records.ts";
 import { aiUsage, durableRegistry, usageHistory } from "./usage.ts";
 import { closedIssues, trackerActivity } from "./tracker.ts";
 import { registryAudit, registryProxyCache } from "./registry.ts";
+import { authHygiene } from "./auth-hygiene.ts";
+import { releaseNotes } from "./release-notes.ts";
 
 // Items are opaque to the engine: each cleanup gets back what it selected.
 // oxlint-disable-next-line typescript/no-explicit-any
@@ -35,6 +37,8 @@ const CLEANUPS: Partial<Record<CategoryId, CategoryCleanup<any>>> = {
   "analysis-caches": analysisCaches,
   "ai-spend": aiSpend,
   "assistant-chats": assistantChats,
+  "release-notes": releaseNotes,
+  "auth-hygiene": authHygiene,
 };
 
 export function cleanupFor(id: string): CategoryCleanup | undefined {

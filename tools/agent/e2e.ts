@@ -2780,6 +2780,67 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
+  await scenario("auth-hygiene-keeps-sign-in-and-tokens-working", async () => {
+    // CORE-206, in the real runtime: a site administrator's dry run then run
+    // of "auth-hygiene" removes sign-in state that ended a month ago; every
+    // live token still authenticates, gm still works, and a browser sign-in
+    // still lands.
+    const written = await json<Record<string, string>>(
+      "/api/dev/auth-expired",
+      ctx.env.GITMATRIX_AGENT_SECRET ?? "",
+      "POST",
+      { account: "jun" },
+    );
+    const runs = "/api/admin/retention/runs";
+    const admin = fixtures.tokens.priya;
+    const hygiene = async (dryRun: boolean) => {
+      const started = await json<{ id: number }>(
+        runs,
+        admin,
+        "POST",
+        { dryRun, categories: ["auth-hygiene"] },
+        [202],
+      );
+      const done = await poll(
+        () =>
+          json<{ status: string; items: number; bytes: number }>(`${runs}/${started.id}`, admin),
+        (r) => r.status !== "queued" && r.status !== "running",
+        `auth hygiene run ${started.id}`,
+      );
+      assert.equal(done.status, "succeeded", JSON.stringify(done));
+      return done;
+    };
+    // Marco can't run site categories.
+    await request(runs, ownerToken, "POST", { dryRun: true, categories: ["auth-hygiene"] }, [403]);
+    const dry = await hygiene(true);
+    assert(dry.items >= Object.keys(written).length, `The dry run lists them: ${dry.items}`);
+    const removed = await hygiene(false);
+    assert.equal(removed.items, dry.items, "The run removes what the dry run listed");
+    assert.equal(removed.bytes, dry.bytes);
+    assert.equal((await hygiene(true)).items, 0, "Nothing is left to remove");
+
+    for (const persona of ["priya", "marco", "jun", "sam"] as const)
+      await request(api, fixtures.tokens[persona]);
+    await request(api, fixtures.readToken);
+    await gm(["auth", "status"], "jun");
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ baseURL: ctx.origin });
+    const page = await context.newPage();
+    try {
+      const expect = playwrightExpect.configure({ timeout: 15_000 });
+      await page.goto("/signin");
+      await page.getByRole("button", { name: /Continue as jun/i }).click();
+      await page.waitForURL((url) => url.pathname !== "/signin");
+      await page.goto(`/${fullName}`);
+      await expect(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+    record({ written: Object.keys(written), dry: dry.items, removed: removed.items });
+  });
+
   await scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;

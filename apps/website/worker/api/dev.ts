@@ -94,6 +94,7 @@ dev.use("*", async (c, next) => {
       "/repo-inventory",
       "/repo-purge",
       "/repo-orphans",
+      "/auth-expired",
       "/assistant-chat",
     ].some((path) => c.req.path.endsWith(path))
   ) {
@@ -320,6 +321,46 @@ dev.post("/assistant-chat", async (c) => {
     .bind(id)
     .first();
   return c.json({ instance: await instance(), listed: row !== null });
+});
+
+// Auth hygiene in the real runtime (CORE-206): sign-in state that ended a
+// month ago for a persona, for the "auth-hygiene" category to remove. Returns
+// what it wrote, by table.
+dev.post("/auth-expired", async (c) => {
+  const { account } = await readJson<{ account: string }>(c);
+  const found = account ? await findAccountBySlug(c.env.DB, account) : null;
+  if (!found) return fail(c, 404, "No such account.");
+  const ended = new Date(Date.now() - 30 * 86_400_000).toISOString();
+  const id = crypto.randomUUID();
+  await c.env.DB.batch([
+    // A Better Auth user's id is the account id (worker/better-auth.ts).
+    c.env.DB.prepare(
+      `INSERT OR IGNORE INTO auth_users (id, name, email, createdAt, updatedAt)
+       VALUES (?1, ?2, ?3, ?4, ?4)`,
+    ).bind(found.id, found.display_name, `${found.slug}@personas.invalid`, ended),
+    c.env.DB.prepare(
+      `INSERT INTO auth_sessions (id, expiresAt, token, createdAt, updatedAt, userId)
+       VALUES (?1, ?2, ?1, ?2, ?2, ?3)`,
+    ).bind(`ses_${id}`, ended, found.id),
+    c.env.DB.prepare(
+      `INSERT INTO auth_verifications (id, identifier, value, expiresAt, createdAt, updatedAt)
+       VALUES (?1, ?2, '000000', ?3, ?3, ?3)`,
+    ).bind(`ver_${id}`, `sign-in-otp-${found.slug}`, ended),
+    c.env.DB.prepare(`INSERT INTO auth_lockouts (key, until) VALUES (?, ?)`).bind(
+      `ip:e2e-${id}`,
+      ended,
+    ),
+    c.env.DB.prepare(
+      `INSERT INTO access_tokens (id, user_id, name, scope, token_hash, last_four, expires_at)
+       VALUES (?1, ?2, 'expired', 'read', ?1, 'xxxx', ?3)`,
+    ).bind(`tok_${id}`, found.id, ended),
+  ]);
+  return c.json({
+    auth_sessions: `ses_${id}`,
+    auth_verifications: `ver_${id}`,
+    auth_lockouts: `ip:e2e-${id}`,
+    access_tokens: `tok_${id}`,
+  });
 });
 
 dev.get("/environment", async (c) => {

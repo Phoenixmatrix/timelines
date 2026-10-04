@@ -168,7 +168,7 @@ export const CATEGORIES = [
     control: "policy",
     label: "Release notes",
     description: "Release notes older than the given days, with their entries and mentions.",
-    never: ["The latest release's notes"],
+    never: ["Each repository's latest daily and latest tagged release notes"],
     thresholds: [days("days", "Days after publishing", 730)],
   },
   {
@@ -276,7 +276,7 @@ export const CATEGORIES = [
     label: "Auth hygiene",
     description:
       "Expired sign-in sessions, lockouts, SSH challenges, verification codes and expired or revoked tokens, the given days after they ended.",
-    never: ["Live sessions and valid tokens"],
+    never: ["Live sessions, valid tokens and active lockouts"],
     thresholds: [days("days", "Days after expiry", 7)],
   },
   {
