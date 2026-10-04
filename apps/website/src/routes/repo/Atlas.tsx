@@ -367,8 +367,8 @@ function Territory({
     return ready;
   }, [loads]);
   const territory = useMemo(
-    () => buildTerritory(overview.regions, expanded, snapshot.seq),
-    [overview.regions, expanded, snapshot.seq],
+    () => buildTerritory(overview.regions, expanded, snapshot.seq, overview.links),
+    [overview.regions, expanded, snapshot.seq, overview.links],
   );
   const territoryRef = useRef(territory);
   territoryRef.current = territory;

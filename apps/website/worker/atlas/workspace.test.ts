@@ -274,6 +274,58 @@ describe("Atlas workspace scope", () => {
     expect(s.touched).toEqual([]);
   });
 
+  test("the overview's links and areas are each repository's own, in its ids", async () => {
+    const { sqlite, s, open, secret } = await world();
+    const area = (repo: string, seq: number, parent: string, id: string, name: string) =>
+      sqlite
+        .prepare(
+          `INSERT INTO atlas_entities (scope, entity_id, from_seq, kind, parent_id, sort_key, name, data, content_hash)
+           VALUES (?, ?, ?, 'area', ?, ?, ?, '{"counts":{"files":2}}', 'h')`,
+        )
+        .run(repoScope(repo), id, seq, parent, `${name.toLowerCase()}\u0000${id}`, name);
+    area("r_open", open.seq, "component:c0000", "area:b", "Berths");
+    area("r_open", open.seq, "component:c0000", "area:a", "Anchors");
+    area("r_secret", secret.seq, "component:c0000", "area:z", SECRET);
+    const link = (repo: string, seq: number, src: string, dst: string, weight: number) =>
+      sqlite
+        .prepare(
+          `INSERT INTO atlas_edges (scope, src, dst, kind, from_seq, weight) VALUES (?, ?, ?, 'depends_on', ?, ?)`,
+        )
+        .run(repoScope(repo), src, dst, seq, weight);
+    link("r_open", open.seq, "component:c0001", "component:c0000", 4);
+    // c0009 is too small to be among the overview's regions: its link isn't either.
+    link("r_open", open.seq, "component:c0009", "component:c0000", 2);
+    link("r_secret", secret.seq, "component:c0001", "component:c0002", 3);
+    const overview = await s.get<AtlasWorkspaceOverview>("overview?repos=open,secret");
+    const shown = new Set(overview.regions.map((r) => r.id));
+    expect(shown.has("r_open/component:c0009")).toBe(false);
+    const areasOf = (o: AtlasWorkspaceOverview, id: string) =>
+      o.regions
+        .find((r) => r.id === id)
+        ?.areas?.map((a) => [a.id, a.parentId, a.repoId, a.name, a.counts.files]);
+    expect(areasOf(overview, "r_open/component:c0000")).toEqual([
+      ["r_open/area:a", "r_open/component:c0000", "r_open", "Anchors", 2],
+      ["r_open/area:b", "r_open/component:c0000", "r_open", "Berths", 2],
+    ]);
+    expect(areasOf(overview, "r_secret/component:c0000")).toEqual([
+      ["r_secret/area:z", "r_secret/component:c0000", "r_secret", SECRET, 2],
+    ]);
+    expect(overview.regions.find((r) => r.id === "r_open/component:c0001")?.areas).toBeUndefined();
+    expect(overview.catalogue.items.every((r) => r.areas === undefined)).toBe(true);
+    expect([...overview.links].sort((a, b) => a.src.localeCompare(b.src))).toEqual([
+      { src: "r_open/component:c0001", dst: "r_open/component:c0000", weight: 4 },
+      { src: "r_secret/component:c0001", dst: "r_secret/component:c0002", weight: 3 },
+    ]);
+    // Without the secret repository in the scope, nothing of its shows; c0009
+    // now makes the overview, and so does its link.
+    const alone = await s.get<AtlasWorkspaceOverview>("overview?repos=open");
+    expect(JSON.stringify(alone)).not.toContain(SECRET);
+    expect([...alone.links].sort((a, b) => a.src.localeCompare(b.src))).toEqual([
+      { src: "r_open/component:c0001", dst: "r_open/component:c0000", weight: 4 },
+      { src: "r_open/component:c0009", dst: "r_open/component:c0000", weight: 2 },
+    ]);
+  });
+
   test("ranked pages merge repositories exactly, ties broken by repository", async () => {
     const sqlite = database();
     // Identical repositories: every key ties across them.

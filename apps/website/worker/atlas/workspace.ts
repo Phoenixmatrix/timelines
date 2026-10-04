@@ -1,7 +1,8 @@
 // The Atlas across an explicit workspace scope (CORE-161), mounted at
 // /api/accounts/:owner/atlas.
 //
-//   GET /overview?repos=a,b[&snapshot=]                 regions of every selected repository, ranked together
+//   GET /overview?repos=a,b[&snapshot=]                 regions of every selected repository, ranked together,
+//                                                       and each repository's imports between its own
 //   GET /regions?repos=…&cursor=                        more of that catalogue
 //   GET /children?repos=…&id=<repoId>/<entity>          one entity's children, as /api/repos/…/atlas
 //   GET /detail | /ancestors | /relations | /evidence   the same, by namespaced id
@@ -57,8 +58,8 @@ import { Hono, type Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import {
   ATLAS_CATALOGUE_SUMMARY_CHARS,
+  ATLAS_OVERVIEW_AREAS,
   ATLAS_OVERVIEW_REGIONS,
-  ATLAS_OVERVIEW_SUMMARY_CHARS,
   ATLAS_PAGE_DEFAULT,
   ATLAS_WORKSPACE_MAX_REPOS,
   type AtlasCompositeCapability,
@@ -89,7 +90,17 @@ import {
 import type { AppEnv } from "../auth.ts";
 import { findAccountBySlug, readableRepo, selectRepos } from "../db.ts";
 import { sha256 } from "../knowledge/util.ts";
-import { analysisOf, failWith, full, lean, limitOf, principalOf, refOf, region } from "./api.ts";
+import {
+  analysisOf,
+  failWith,
+  full,
+  lean,
+  limitOf,
+  overviewRegion,
+  principalOf,
+  refOf,
+  region,
+} from "./api.ts";
 import {
   cursorSecret,
   signCursor,
@@ -108,7 +119,9 @@ import {
   edgesAt,
   entityAt,
   evidenceCountAt,
+  areasAt,
   evidenceFilesAt,
+  regionLinksAt,
   regionsAt,
   relationsAt,
   repoScope,
@@ -587,6 +600,25 @@ workspaceAtlas.get("/overview", async (c) => {
   const top = merged.regions.slice(0, ATLAS_OVERVIEW_REGIONS);
   const rest = merged.regions.slice(ATLAS_OVERVIEW_REGIONS);
   const last = rest.at(-1);
+  // Each repository's own areas, and imports between its own regions: never across repositories.
+  const extras = await Promise.all(
+    ctx.read.map(async (r) => {
+      const ids = top.filter((t) => t.repoId === r.id).map((t) => t.id);
+      if (!r.snapshot || !ids.length)
+        return { repoId: r.id, links: [], areas: new Map<string, never[]>() };
+      const [own, areas] = await Promise.all([
+        regionLinksAt(d1, r.scope, r.snapshot.seq, ids),
+        areasAt(d1, r.scope, r.snapshot.seq, ids, ATLAS_OVERVIEW_AREAS),
+      ]);
+      return {
+        repoId: r.id,
+        links: own.map((l) => ({ ...l, src: qualify(r.id, l.src), dst: qualify(r.id, l.dst) })),
+        areas,
+      };
+    }),
+  );
+  const links = extras.flatMap((e) => e.links);
+  const areasOf = (r: RankedRegion) => extras.find((e) => e.repoId === r.repoId)?.areas.get(r.id);
   const catalogue = await page(
     c,
     { ...ctx, cursor: null },
@@ -597,9 +629,15 @@ workspaceAtlas.get("/overview", async (c) => {
   );
   const body: AtlasWorkspaceOverview = {
     ...(await envelope(c, ctx as Scope<unknown>, ctx.read, true)),
-    regions: top.map((r) => shapeRegion(r, ATLAS_OVERVIEW_SUMMARY_CHARS)),
+    regions: top.map((r) => {
+      const shaped = inRepo(r.repoId, overviewRegion(r, areasOf(r)));
+      return shaped.areas
+        ? { ...shaped, areas: shaped.areas.map((a) => inRepo(r.repoId, a)) }
+        : shaped;
+    }),
     catalogue,
     totalRegions,
+    links,
   };
   return c.json(body);
 });

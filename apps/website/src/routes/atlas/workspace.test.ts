@@ -50,7 +50,7 @@ const repo = (
       : null,
 });
 
-/** A capability of `repoId` in `slot`: two repositories use the same slots on purpose. */
+/** A capability of `repoId`: two repositories use the same slots on purpose. */
 const cap = (repoId: string, local: string, slot: number, files = 10): AtlasRegion => ({
   id: `${repoId}/${local}`,
   repoId,
@@ -138,11 +138,10 @@ describe("selection", () => {
 });
 
 describe("workspace layout", () => {
-  test("repositories sharing slot numbers never overlap; each stays in its band", () => {
+  test("repositories' maps never overlap; each stays in its band", () => {
     const t = layout(["api", "web", "docs"], [A, B, C]);
     const top = t.cells.filter((c) => c.depth === 0);
     expect(top).toHaveLength(allRegions.length);
-    // Neighbours' bounds overlap where their borders wind; their land never does.
     const land = new Map<string, string>();
     for (const tile of t.tiles) {
       const at = `${Math.round(tile.x)},${Math.round(tile.y)}`;
@@ -208,7 +207,8 @@ describe("workspace layout", () => {
       grown.filter((r) => r.repoId !== "r3"),
       new Map(),
     );
-    for (const region of [...regionsOf.r1, ...regionsOf.r2])
+    // web's own map may rearrange around its new capabilities; api's doesn't move.
+    for (const region of regionsOf.r1)
       expect(rect(after, region.id)).toEqual(rect(before, region.id));
     expect(after.bands.map((b) => [b.name, b.coverage.state])).toEqual([
       ["api", "ready"],
@@ -278,6 +278,7 @@ const overview = (repos: AtlasWorkspaceRepo[], id = "ws1.tag.2.2"): AtlasWorkspa
     ...envelope,
     regions,
     totalRegions: regions.length,
+    links: [],
     catalogue: {
       ...envelope,
       items: [],

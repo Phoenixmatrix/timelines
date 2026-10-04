@@ -1799,6 +1799,40 @@ export async function childrenAt(
   };
 }
 
+/**
+ * The first `perParent` areas of each of `parentIds` in snapshot `seq`, in
+ * `childrenAt` order: one query for every region an overview shows.
+ */
+export async function areasAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  parentIds: readonly string[],
+  perParent: number,
+): Promise<Map<string, AtlasEntity[]>> {
+  const out = new Map<string, AtlasEntity[]>();
+  if (!parentIds.length) return out;
+  const rows = await d1
+    .prepare(
+      `SELECT * FROM (
+         SELECT entity_id, kind, parent_id, name, path, summary, data, from_seq, sort_key,
+                ROW_NUMBER() OVER (PARTITION BY parent_id ORDER BY sort_key) AS n
+         FROM atlas_entities
+         WHERE scope = ? AND parent_id IN (${parentIds.map(() => "?").join(", ")})
+           AND kind = 'area' AND ${VISIBLE}
+       ) WHERE n <= ? ORDER BY parent_id, sort_key`,
+    )
+    .bind(scope, ...parentIds, seq, seq, perParent)
+    .all<Parameters<typeof toEntity>[0] & { sort_key: string }>();
+  for (const row of rows.results) {
+    const parent = row.parent_id ?? "";
+    const list = out.get(parent) ?? [];
+    list.push(toEntity(row));
+    out.set(parent, list);
+  }
+  return out;
+}
+
 /** Edges leaving (or, with `incoming`, arriving at) an entity in snapshot `seq`. */
 export async function edgesAt(
   d1: D1Database,
@@ -1973,6 +2007,31 @@ export async function edgeCountsAt(
     .bind(scope, entityId, seq, seq, ...(kind === null ? [] : [kind]))
     .all<{ kind: string; n: number }>();
   return Object.fromEntries(rows.results.map((r) => [r.kind, Number(r.n)]));
+}
+
+/**
+ * The `depends_on` edges between any two of `ids` in snapshot `seq`. Bounded
+ * by the caller: the overview passes its own (at most ATLAS_OVERVIEW_REGIONS)
+ * regions, so this is at most n·(n−1) rows, never the graph.
+ */
+export async function regionLinksAt(
+  d1: D1Database,
+  scope: string,
+  seq: number,
+  ids: readonly string[],
+): Promise<{ src: string; dst: string; weight: number }[]> {
+  if (ids.length < 2) return [];
+  const marks = ids.map(() => "?").join(", ");
+  const rows = await d1
+    .prepare(
+      `SELECT g.src, g.dst, g.weight FROM atlas_edges g
+       WHERE g.scope = ? AND g.kind = 'depends_on' AND ${visibleAs("g")}
+         AND g.src IN (${marks}) AND g.dst IN (${marks}) AND g.src <> g.dst
+       ORDER BY g.src, g.dst`,
+    )
+    .bind(scope, seq, seq, ...ids, ...ids)
+    .all<{ src: string; dst: string; weight: number }>();
+  return rows.results.map((r) => ({ src: r.src, dst: r.dst, weight: Number(r.weight) }));
 }
 
 /** Where a relation page stopped: [the other end's id, kind]. */

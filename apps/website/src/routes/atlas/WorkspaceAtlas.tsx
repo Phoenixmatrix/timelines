@@ -463,7 +463,7 @@ function WorkspaceView({
     return ready;
   }, [state.loads]);
   const territory = useMemo(
-    () => buildWorkspaceTerritory(coverage, overview?.regions ?? [], expanded),
+    () => buildWorkspaceTerritory(coverage, overview?.regions ?? [], expanded, overview?.links),
     [coverage, overview, expanded],
   );
   const territoryRef = useRef(territory);

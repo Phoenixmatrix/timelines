@@ -1,211 +1,235 @@
 import { describe, expect, test } from "vite-plus/test";
 import type { AtlasEntitySummary, AtlasRegion } from "../../../shared/atlas.ts";
-import { buildTerritory, cellAt, ChildLoader, TILE, type Load } from "./territory.ts";
+import {
+  buildTerritory,
+  cellAt,
+  ChildLoader,
+  HEX,
+  shiftTerritory,
+  type Load,
+} from "./territory.ts";
 
-const cap = (id: string, slot: number, files: number, since = 1): AtlasRegion => ({
+const SQ3 = Math.sqrt(3);
+
+const entity = (id: string, kind: string, files = 0): AtlasEntitySummary => ({
   id,
-  kind: "capability",
-  parentId: "repo",
+  kind,
+  parentId: null,
   name: id,
-  path: null,
+  path: kind === "file" ? id : null,
   summary: "",
   counts: { files },
   structural: false,
-  since,
-  layout: {
-    slot,
-    col: slot % 4,
-    row: Math.floor(slot / 4),
-    bucket: Math.ceil(Math.log2(files + 1)),
-    fill: Math.min(1, 0.3 + 0.07 * Math.ceil(Math.log2(files + 1))),
-  },
-  size: { files, members: files },
-  summaryTruncated: false,
 });
-const group = (id: string): AtlasRegion => ({
-  ...cap(id, 0, 3),
-  kind: "group",
-  structural: true,
-  layout: undefined,
-});
-const file = (id: string): AtlasEntitySummary => ({
-  id,
-  kind: "file",
-  parentId: null,
-  name: id,
-  path: id,
-  summary: "",
-  counts: {},
-  structural: false,
-});
-const rect = (t: ReturnType<typeof buildTerritory>, id: string) => {
-  const c = t.byId.get(id)!;
-  return [c.x, c.y, c.w, c.h];
+const area = (id: string, files = 1) => entity(id, "area", files);
+const file = (id: string) => entity(id, "file");
+/** A capability; `areas` lists its concepts' file counts, as the overview does. */
+const cap = (id: string, areas: number[] = [], since = 1): AtlasRegion => {
+  const files = areas.reduce((s, n) => s + n, 0) || 3;
+  return {
+    ...entity(id, "capability", files),
+    parentId: "repo",
+    counts: { files, areas: areas.length },
+    since,
+    size: { files, members: files },
+    summaryTruncated: false,
+    ...(areas.length ? { areas: areas.map((n, i) => area(`${id}/area:${i}`, n)) } : {}),
+  };
+};
+const group = (id: string): AtlasRegion => ({ ...cap(id), kind: "group", structural: true });
+const link = (src: string, dst: string, weight: number) => ({ src, dst, weight });
+
+type T = ReturnType<typeof buildTerritory>;
+/** A country's own hexagons (not the small ones drawn on them). */
+const own = (t: T, region: string) => t.tiles.filter((x) => x.region === region && !x.host);
+const middle = (t: T, region: string) => {
+  const tiles = own(t, region);
+  return [
+    tiles.reduce((s, x) => s + x.x, 0) / tiles.length,
+    tiles.reduce((s, x) => s + x.y, 0) / tiles.length,
+  ] as const;
+};
+const apart = (t: T, a: string, b: string) => {
+  const [ax, ay] = middle(t, a);
+  const [bx, by] = middle(t, b);
+  return Math.hypot(ax - bx, ay - by);
 };
 
 describe("territory geometry", () => {
-  test("regions sit in their stable slots; expanding one moves no other", () => {
+  test("every concept is one hexagon of its country, the largest in the middle", () => {
+    const t = buildTerritory([cap("cap:a", [3, 20, 5, 8])], new Map(), 1);
+    const country = t.byId.get("cap:a")!;
+    expect(country.size).toBe(4);
+    const tiles = own(t, "cap:a");
+    expect(tiles).toHaveLength(4);
+    expect(new Set(tiles.map((x) => x.cell))).toEqual(
+      new Set([0, 1, 2, 3].map((i) => `cap:a/area:${i}`)),
+    );
+    for (const tile of tiles) {
+      expect(tile.r).toBe(HEX);
+      const concept = t.byId.get(tile.cell)!;
+      expect(concept.parent).toBe("cap:a");
+      expect(concept.hex).toBe(HEX);
+    }
+    // The 20-file concept sits where the country's name goes; it's drawn lightest.
+    const biggest = t.byId.get("cap:a/area:1")!;
+    expect(biggest.anchor).toEqual(country.anchor);
+    expect(tiles.find((x) => x.cell === "cap:a/area:1")!.shade).toBe(2);
+  });
+
+  test("a region without concepts is a single hexagon; one known only by count, unnamed ones", () => {
+    const counted: AtlasRegion = { ...cap("cap:c"), counts: { files: 9, areas: 5 } };
+    const t = buildTerritory([cap("cap:a"), counted], new Map(), 1);
+    expect(own(t, "cap:a").map((x) => x.cell)).toEqual(["cap:a"]);
+    expect(t.byId.get("cap:a")!.hex).toBe(HEX);
+    const unnamed = own(t, "cap:c");
+    expect(unnamed).toHaveLength(5);
+    for (const tile of unnamed) expect(tile.cell).toBe("cap:c");
+  });
+
+  test("countries never touch: there's always sea between them", () => {
+    const t = buildTerritory(
+      [
+        cap("cap:a", [9, 8, 7, 6, 5, 4, 3]),
+        cap("cap:b", [5, 4, 3]),
+        cap("cap:c"),
+        cap("cap:d", [2, 2]),
+      ],
+      new Map(),
+      1,
+      [link("cap:a", "cap:b", 30), link("cap:b", "cap:c", 10), link("cap:d", "cap:a", 4)],
+    );
+    // Neighbouring hexagons' middles are r·√3 apart; one of sea between makes it twice that.
+    for (const a of t.tiles)
+      for (const b of t.tiles)
+        if (!a.host && !b.host && a.region !== b.region)
+          expect(Math.hypot(a.x - b.x, a.y - b.y)).toBeGreaterThan(HEX * SQ3 * 1.5);
+  });
+
+  test("countries that import each other sit together", () => {
     const regions = [
-      cap("cap:a", 0, 40),
-      cap("cap:b", 1, 10),
-      cap("cap:c", 5, 3),
-      group("group:u"),
+      cap("cap:web", [6, 5, 4]),
+      cap("cap:store", [6, 5, 4]),
+      cap("cap:ui", [5, 4, 3]),
+      cap("cap:db", [5, 4, 3]),
     ];
-    const before = buildTerritory(regions, new Map(), 1);
+    const t = buildTerritory(regions, new Map(), 1, [
+      link("cap:web", "cap:ui", 40),
+      link("cap:ui", "cap:web", 10),
+      link("cap:store", "cap:db", 40),
+    ]);
+    // Each sits as close to its partner as to anything else on the map.
+    for (const [a, b] of [
+      ["cap:web", "cap:ui"],
+      ["cap:store", "cap:db"],
+    ] as const)
+      for (const other of regions)
+        if (other.id !== a && other.id !== b)
+          expect(apart(t, a, b)).toBeLessThanOrEqual(apart(t, a, other.id));
+    expect(apart(t, "cap:web", "cap:ui")).toBeLessThan(apart(t, "cap:web", "cap:db"));
+  });
+
+  test("one overview always draws the same map; opening a hexagon moves nothing", () => {
+    const regions = [cap("cap:a", [4, 3, 2]), cap("cap:b", [2, 1]), cap("cap:c"), group("group:u")];
+    const links = [link("cap:a", "cap:b", 3)];
+    const before = buildTerritory(regions, new Map(), 1, links);
+    expect(buildTerritory(regions, new Map(), 1, links).tiles).toEqual(before.tiles);
+    const files = ["file:a/1.ts", "file:a/2.ts", "file:a/3.ts"].map(file);
     const after = buildTerritory(
       regions,
-      new Map([["cap:a", [file("file:a/1.ts"), file("file:a/2.ts")]]]),
+      new Map([
+        ["cap:a/area:0", files],
+        ["cap:c", [file("file:c.ts")]],
+      ]),
       1,
+      links,
     );
-    for (const id of ["cap:a", "cap:b", "cap:c", "group:u"])
-      expect(rect(after, id)).toEqual(rect(before, id));
-    // The children are drawn inside their parent.
-    const [px, py, pw, ph] = rect(after, "cap:a") as [number, number, number, number];
-    for (const id of ["file:a/1.ts", "file:a/2.ts"]) {
-      const [x, y, w, h] = rect(after, id) as [number, number, number, number];
-      expect(x).toBeGreaterThanOrEqual(px);
-      expect(y).toBeGreaterThanOrEqual(py);
-      expect(x + w).toBeLessThanOrEqual(px + pw);
-      expect(y + h).toBeLessThanOrEqual(py + ph);
+    expect(after.tiles.filter((x) => !x.host)).toEqual(before.tiles);
+    // Its files are small hexagons on it, inside its outline.
+    const host = after.byId.get("cap:a/area:0")!;
+    expect(host.inner).toBeGreaterThan(0);
+    for (const f of files) {
+      const cell = after.byId.get(f.id)!;
+      expect(cell.parent).toBe(host.id);
+      expect(cell.depth).toBe(2);
+      expect(cell.hex).toBe(host.inner);
+      const off = Math.hypot(cell.anchor.x - host.anchor.x, cell.anchor.y - host.anchor.y);
+      expect(off + cell.hex).toBeLessThanOrEqual(host.hex);
+      // Pointing at it finds it, not the hexagon it's drawn on.
+      expect(cellAt(after, cell.anchor.x, cell.anchor.y)?.id).toBe(f.id);
     }
-    const one = after.byId.get("file:a/1.ts")!;
-    expect(cellAt(after, one.anchor.x, one.anchor.y)?.id).toBe("file:a/1.ts");
+    expect(after.byId.get("file:c.ts")!.parent).toBe("cap:c");
   });
 
-  test("a region growing within its bucket, appearing or leaving moves no other", () => {
-    const base = buildTerritory([cap("cap:a", 0, 40), cap("cap:b", 1, 10)], new Map(), 1);
-    const later = buildTerritory(
-      // b grows within its bucket, a new region takes a slot away from both.
-      [cap("cap:a", 0, 40), cap("cap:b", 1, 12), cap("cap:new", 11, 6)],
-      new Map(),
-      2,
-    );
-    expect(rect(later, "cap:a")).toEqual(rect(base, "cap:a"));
-    expect(rect(later, "cap:b")).toEqual(rect(base, "cap:b"));
-    const gone = buildTerritory([cap("cap:b", 1, 10)], new Map(), 3);
-    // b only gains the border a gave up.
-    const before = land(base, "cap:b");
-    const now = land(gone, "cap:b");
-    for (const at of before) expect(now.has(at), at).toBe(true);
-  });
-
-  test("a neighbour growing moves only the borders it shares", () => {
-    const regions = [
-      cap("cap:a", 0, 40),
-      cap("cap:b", 1, 10),
-      cap("cap:c", 4, 20),
-      cap("cap:far", 7, 8),
-    ];
-    const base = buildTerritory(regions, new Map(), 1);
-    // b jumps three buckets.
-    const grown = buildTerritory(
-      regions.map((r) => (r.id === "cap:b" ? cap("cap:b", 1, 90) : r)),
-      new Map(),
-      2,
-    );
-    // The others only lose land, and only to b.
-    for (const id of ["cap:a", "cap:c", "cap:far"]) {
-      const was = land(base, id);
-      for (const at of land(grown, id)) expect(was.has(at), `${id} ${at}`).toBe(true);
-    }
-    const gained = land(grown, "cap:b");
-    for (const at of land(base, "cap:b")) expect(gained.has(at), at).toBe(true);
-    expect(gained.size).toBeGreaterThan(land(base, "cap:b").size);
-    // A region that doesn't border it doesn't change at all.
-    expect(rect(grown, "cap:far")).toEqual(rect(base, "cap:far"));
-  });
-
-  test("more files means more land, in buckets", () => {
+  test("a country past its room lists the rest without drawing them", () => {
     const t = buildTerritory(
-      [cap("cap:small", 0, 2), cap("cap:mid", 2, 20), cap("cap:big", 8, 200)],
+      [
+        cap(
+          "cap:a",
+          Array.from({ length: 40 }, () => 1),
+        ),
+      ],
       new Map(),
       1,
     );
-    const size = (id: string) => t.byId.get(id)!.size;
-    expect(size("cap:small")).toBeGreaterThan(0);
-    expect(size("cap:mid")).toBeGreaterThan(size("cap:small"));
-    expect(size("cap:big")).toBeGreaterThan(size("cap:mid"));
+    expect(own(t, "cap:a")).toHaveLength(37);
+    const rest = t.cells.filter((c) => c.parent === "cap:a" && c.size === 0);
+    expect(rest).toHaveLength(3);
   });
 
-  test("children divide their parent's land: all of it, and nothing outside it", () => {
-    const children = [file("file:a/1.ts"), file("file:a/2.ts"), file("file:a/3.ts")].map(
-      (f, i) => ({ ...f, counts: { files: [10, 20, 10][i]! } }),
-    );
+  test("structural groups are islands below the land", () => {
     const t = buildTerritory(
-      [cap("cap:a", 0, 40), cap("cap:b", 1, 10)],
-      new Map([["cap:a", children]]),
-      1,
-    );
-    const parent = t.byId.get("cap:a")!;
-    const mine = land(t, "cap:a");
-    expect(mine.size).toBe(parent.size);
-    let total = 0;
-    for (const child of children) {
-      const cell = t.byId.get(child.id)!;
-      expect(cell.parent).toBe("cap:a");
-      expect(cell.size).toBeGreaterThan(0);
-      total += cell.size;
-      for (const tile of t.tiles.filter((x) => x.cell === child.id))
-        expect(mine.has(key(tile))).toBe(true);
-    }
-    expect(total).toBe(parent.size);
-    // Shares follow files: the 20-file child holds about half.
-    const half = t.byId.get("file:a/2.ts")!.size / parent.size;
-    expect(half).toBeGreaterThan(0.35);
-    expect(half).toBeLessThan(0.65);
-  });
-
-  test("structural groups are islands below the continent, touching nothing", () => {
-    const t = buildTerritory(
-      [cap("cap:a", 0, 40), cap("cap:b", 5, 30), group("group:u"), group("group:c")],
+      [cap("cap:a", [4, 3, 2]), cap("cap:b", [5, 1]), group("group:u"), group("group:c")],
       new Map(),
       1,
     );
-    const continent = t.tiles.filter((x) => !x.region.startsWith("group:"));
-    const bottom = Math.max(...continent.map((x) => x.y));
+    const land = t.tiles.filter((x) => !x.region.startsWith("group:"));
+    const bottom = Math.max(...land.map((x) => x.y));
     for (const id of ["group:u", "group:c"]) {
       const g = t.byId.get(id)!;
       expect(g.structural).toBe(true);
-      expect(g.size).toBeGreaterThan(0);
-      expect(g.y).toBeGreaterThan(bottom);
-      // No tile of it sits next to another region's.
-      for (const tile of t.tiles.filter((x) => x.region === id))
-        for (const other of t.tiles)
-          if (other.region !== id)
-            expect(Math.hypot(tile.x - other.x, tile.y - other.y)).toBeGreaterThan(TILE * 2);
+      expect(own(t, id)).toHaveLength(1);
+      expect(g.anchor.y).toBeGreaterThan(bottom);
     }
   });
 
-  test("every region gets a label spot on its own land, and an outline", () => {
+  test("every drawn cell gets a label spot on its own hexagon, and an outline", () => {
     const t = buildTerritory(
-      [cap("cap:a", 0, 40), cap("cap:b", 1, 10), group("group:u")],
-      new Map(),
+      [cap("cap:a", [4, 2]), cap("cap:b"), group("group:u")],
+      new Map([["cap:b", [file("file:b.ts")]]]),
       1,
     );
     for (const c of t.cells) {
-      expect(cellAt(t, c.anchor.x, c.anchor.y)?.id).toBe(c.id);
       expect(c.edges.length % 4).toBe(0);
       expect(c.edges.length).toBeGreaterThan(0);
+      // A country's label sits on its middle concept; everything else's on itself.
+      const at = cellAt(t, c.anchor.x, c.anchor.y)?.id;
+      if (c.id === "cap:a") expect(t.byId.get(at!)!.parent).toBe("cap:a");
+      else if (c.id === "cap:b") expect(at).toBe("file:b.ts");
+      else expect(at).toBe(c.id);
     }
   });
 
+  test("shifting moves everything by the same amount", () => {
+    const t = buildTerritory([cap("cap:a", [2, 1])], new Map(), 1);
+    const s = shiftTerritory(t, 100, -50);
+    expect(s.left).toBe(t.left + 100);
+    expect(s.top).toBe(t.top - 50);
+    const a = t.byId.get("cap:a/area:0")!;
+    expect(cellAt(s, a.anchor.x + 100, a.anchor.y - 50)?.id).toBe(a.id);
+  });
+
   test("a first snapshot marks nothing changed: there's nothing to compare with", () => {
-    const t = buildTerritory([cap("cap:a", 0, 40, 1)], new Map(), 1);
+    const t = buildTerritory([cap("cap:a", [], 1)], new Map(), 1);
     expect(t.byId.get("cap:a")!.changed).toBe(false);
   });
 
   test("change markers come from the snapshot each region last changed in", () => {
-    const t = buildTerritory([cap("cap:a", 0, 40, 7), cap("cap:b", 1, 10, 3)], new Map(), 7);
+    const t = buildTerritory([cap("cap:a", [], 7), cap("cap:b", [], 3)], new Map(), 7);
     expect(t.byId.get("cap:a")!.changed).toBe(true);
     expect(t.byId.get("cap:b")!.changed).toBe(false);
   });
 });
-
-const key = (tile: { x: number; y: number }) => `${Math.round(tile.x)},${Math.round(tile.y)}`;
-/** Where a top-level region's tiles are. */
-function land(t: ReturnType<typeof buildTerritory>, id: string): Set<string> {
-  return new Set(t.tiles.filter((x) => x.region === id).map(key));
-}
 
 describe("child loading", () => {
   const deferred = <T>() => {

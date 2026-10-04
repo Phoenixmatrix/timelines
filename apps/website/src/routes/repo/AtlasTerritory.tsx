@@ -1,10 +1,11 @@
-// The capability map on canvas (CORE-168, CORE-47): a continent of hex
-// tiles, one country per capability the bounded Atlas API returned, in its
-// stable place, with structural groups as islands offshore. Expanded regions
-// divide their land into provinces. Selecting a capability draws its one-hop
-// routes: what it uses and what uses it. Semantic zoom: provinces and labels
-// appear only once they're big enough on screen to read. The region list
-// beside the map is the accessible path; this canvas is a picture of it.
+// The capability map on canvas (CORE-168, CORE-47): islands of hexagons,
+// each one something. A capability is a country of its concepts, placed
+// beside the capabilities it's linked with; structural groups are islands
+// below. Selecting a capability draws its one-hop routes: what it uses and
+// what uses it. Semantic zoom: far out, countries carry their names; closer,
+// each concept's hexagon carries its own; closer still, a hexagon shows its
+// files as small hexagons, named once they're big enough to read. The region
+// list beside the map is the accessible path; this canvas is a picture of it.
 
 import { ArrowsOutIcon, MinusIcon, PlusIcon } from "@phosphor-icons/react";
 import {
@@ -15,7 +16,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { cellAt, TILE, type Territory, type TerritoryCell, type Tile } from "./territory.ts";
+import { cellAt, HEX, type Territory, type TerritoryCell, type Tile } from "./territory.ts";
 
 interface View {
   x: number;
@@ -23,10 +24,18 @@ interface View {
   k: number;
 }
 
-/** On-screen sizes (px): a parent's before its children are drawn, and a region's before it gets a label. */
-const SHOW = { children: 140, label: 40, counts: 96 };
+/**
+ * On-screen circumradius (px) at which a country's concepts are named and
+ * can be picked, a hexagon's small ones are drawn and picked, and a small
+ * one is named.
+ */
+const SHOW = { concepts: 30, inside: 12, named: 24 };
 const segments = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const SQ3 = Math.sqrt(3);
+
+/** Whether a cell's children are drawn, named and picked at zoom k. */
+const openAt = (c: TerritoryCell, k: number) =>
+  c.inner > 0 && c.inner * k >= (c.hex ? SHOW.inside : SHOW.concepts);
 
 function fitView(t: Territory, w: number, h: number): View {
   const pad = 24;
@@ -81,24 +90,19 @@ const NO_EMPHASIS: ReadonlySet<string> = new Set();
 
 const fileLabel = (n: number) => `${n.toLocaleString()} file${n === 1 ? "" : "s"}`;
 
-/** A stable number in [0, 1) from two coordinates: the land's grain. */
-const grain = (x: number, y: number) => {
-  const s = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
-  return s - Math.floor(s);
-};
-
 /** The paths a territory is drawn with, built once per territory. */
 interface Scene {
-  /** Land, by region, province shade and grain: hexes with a hairline gap, and without (far out). */
-  fills: { region: string; shade: number; grain: number; gapped: Path2D; solid: Path2D }[];
-  /** Edges between two countries, coasts, and the coasts of structural islands. */
-  borders: Path2D;
+  /**
+   * Hexagons by region, shade and host: each country's plate (its hexagons
+   * whole, so it reads as one piece of land) and faces (a little smaller, so
+   * the plate shows between them). Small hexagons have a host and no plate.
+   */
+  fills: { region: string; shade: number; host: string | null; face: Path2D; plate: Path2D }[];
+  /** Coasts of countries, and of structural islands. */
   coast: Path2D;
   isles: Path2D;
-  /** Each top-level region's tiles, for where routes leave and land. */
+  /** Each top-level region's own hexagons, for where routes leave and land. */
   tilesOf: Map<string, Tile[]>;
-  /** The tiles of any drawn cell, its children's included. */
-  tilesIn: (id: string) => readonly Tile[];
   outline: (id: string) => Path2D;
 }
 
@@ -116,49 +120,38 @@ function sceneOf(territory: Territory): Scene {
   const fills = new Map<string, Scene["fills"][number]>();
   const tilesOf = new Map<string, Tile[]>();
   for (const tile of territory.tiles) {
-    const g = Math.floor(grain(tile.x, tile.y) * 3);
-    const key = `${tile.region}|${tile.shade}|${g}`;
+    const key = `${tile.region}|${tile.shade}|${tile.host ?? ""}`;
     let fill = fills.get(key);
     if (!fill) {
       fill = {
         region: tile.region,
         shade: tile.shade,
-        grain: g,
-        gapped: new Path2D(),
-        solid: new Path2D(),
+        host: tile.host,
+        face: new Path2D(),
+        plate: new Path2D(),
       };
       fills.set(key, fill);
     }
-    hexPath(fill.gapped, tile.x, tile.y, TILE * 0.93);
-    hexPath(fill.solid, tile.x, tile.y, TILE * 1.02);
+    if (tile.host) {
+      hexPath(fill.face, tile.x, tile.y, tile.r * 0.86);
+      continue;
+    }
+    hexPath(fill.plate, tile.x, tile.y, tile.r * 1.005);
+    hexPath(fill.face, tile.x, tile.y, tile.r * 0.9);
     const list = tilesOf.get(tile.region) ?? [];
     list.push(tile);
     tilesOf.set(tile.region, list);
   }
-  // A top-level edge seen twice runs between two countries; once, it's a coast.
-  const seen = new Map<string, number>();
-  const at = (v: number) => Math.round(v * 4);
-  const mid = (e: number[], i: number) => `${at(e[i]! + e[i + 2]!)},${at(e[i + 1]! + e[i + 3]!)}`;
-  const tops = territory.cells.filter((c) => c.depth === 0 && c.size);
-  for (const c of tops)
-    for (let i = 0; i < c.edges.length; i += 4) {
-      const m = mid(c.edges, i);
-      seen.set(m, (seen.get(m) ?? 0) + 1);
-    }
-  const borders = new Path2D();
   const coast = new Path2D();
   const isles = new Path2D();
-  const drawn = new Set<string>();
-  for (const c of tops)
+  for (const c of territory.cells) {
+    if (c.depth !== 0 || !c.size) continue;
+    const path = c.structural ? isles : coast;
     for (let i = 0; i < c.edges.length; i += 4) {
-      const m = mid(c.edges, i);
-      const shared = (seen.get(m) ?? 0) > 1;
-      if (shared && drawn.has(m)) continue;
-      drawn.add(m);
-      const path = shared ? borders : c.structural ? isles : coast;
       path.moveTo(c.edges[i]!, c.edges[i + 1]!);
       path.lineTo(c.edges[i + 2]!, c.edges[i + 3]!);
     }
+  }
   const outlines = new Map<string, Path2D>();
   const outline = (id: string) => {
     let path = outlines.get(id);
@@ -172,24 +165,7 @@ function sceneOf(territory: Territory): Scene {
     outlines.set(id, path);
     return path;
   };
-  const inside = new Map<string, readonly Tile[]>();
-  const tilesIn = (id: string) => {
-    const top = tilesOf.get(id);
-    if (top) return top;
-    let list = inside.get(id);
-    if (list) return list;
-    let root = territory.byId.get(id);
-    while (root?.parent) root = territory.byId.get(root.parent);
-    list = root
-      ? (tilesOf.get(root.id) ?? []).filter((t) => {
-          const at = territory.byId.get(t.cell);
-          return at ? isInside(territory, at, id) : false;
-        })
-      : [];
-    inside.set(id, list);
-    return list;
-  };
-  return { fills: [...fills.values()], borders, coast, isles, tilesOf, tilesIn, outline };
+  return { fills: [...fills.values()], coast, isles, tilesOf, outline };
 }
 
 const nearestTile = (tiles: readonly Tile[] | undefined, x: number, y: number): Tile | null => {
@@ -204,6 +180,9 @@ const nearestTile = (tiles: readonly Tile[] | undefined, x: number, y: number): 
   }
   return hit;
 };
+
+/** A file's or symbol's own name: the last part of its path. */
+const shortName = (c: TerritoryCell) => c.entity.path?.split("/").pop() || c.entity.name;
 
 export function AtlasTerritory({
   territory,
@@ -307,16 +286,12 @@ export function AtlasTerritory({
     if (!target || !size.current.w) return;
     const { w, h } = size.current;
     let k = Math.min(40, (w * 0.55) / target.w, (h * 0.55) / target.h);
-    // A country keeps its neighbours in view, where its routes go, while
-    // still close enough for its areas to show.
-    if (target.depth === 0)
-      k = Math.min(
-        k,
-        Math.max(
-          fitView(territory, w, h).k * 1.25,
-          (SHOW.children * 1.1) / Math.min(target.w, target.h),
-        ),
-      );
+    // A country: close enough to name its concepts, while its neighbours,
+    // where its routes go, stay in view where they can.
+    if (target.depth === 0 && !target.hex) {
+      const named = (SHOW.concepts * 1.1) / HEX;
+      k = Math.max(named, Math.min(k, Math.max(named * 1.3, fitView(territory, w, h).k * 1.25)));
+    }
     animateTo({
       k,
       x: w / 2 - (target.x + target.w / 2) * k,
@@ -420,32 +395,37 @@ export function AtlasTerritory({
       }
       return lo > 0 ? `${text.slice(0, starts[lo]).trimEnd()}…` : null;
     };
-    /** Up to two lines of at most `max` px, the second cut short if it must be. */
-    const lines = (text: string, max: number): string[] => {
-      if (ctx.measureText(text).width <= max) return [text];
-      const words = text.split(/\s+/);
-      let first = "";
-      let i = 0;
-      for (; i < words.length; i++) {
-        const next = first ? `${first} ${words[i]}` : words[i]!;
-        if (first && ctx.measureText(next).width > max) break;
-        first = next;
+    /** Up to `most` lines of at most `max` px, the last cut short if it must be. */
+    const lines = (text: string, max: number, most = 2): string[] => {
+      const out: string[] = [];
+      let words = text.split(/\s+/).filter(Boolean);
+      while (words.length && out.length < most) {
+        if (out.length === most - 1) {
+          const last = fitText(words.join(" "), max);
+          if (last) out.push(last);
+          break;
+        }
+        let line = "";
+        let i = 0;
+        for (; i < words.length; i++) {
+          const next = line ? `${line} ${words[i]}` : words[i]!;
+          if (line && ctx.measureText(next).width > max) break;
+          line = next;
+        }
+        const fitted = fitText(line, max);
+        if (!fitted) break;
+        out.push(fitted);
+        words = words.slice(i);
       }
-      const rest = words.slice(i).join(" ");
-      const head = fitText(first, max);
-      if (!head) return [];
-      const tail = rest && fitText(rest, max);
-      return tail ? [head, tail] : [head];
+      return out;
     };
-    const opened = (c: TerritoryCell) => Math.min(c.w, c.h) * k >= SHOW.children;
+    const opened = (c: TerritoryCell) => openAt(c, k);
     const visibleParent = (c: TerritoryCell): boolean => {
       if (!c.parent) return true;
       const parent = territory.byId.get(c.parent);
       return !!parent && opened(parent) && visibleParent(parent);
     };
     const shown = (c: TerritoryCell) => c.size > 0 && visibleParent(c);
-    /** About how wide a region is on screen: the side of a square of its tiles. */
-    const span = (c: TerritoryCell) => Math.sqrt(c.size) * TILE * 1.75 * k;
     const topOf = (c: TerritoryCell): TerritoryCell => {
       let cell = c;
       while (cell.parent) cell = territory.byId.get(cell.parent) ?? cell;
@@ -510,10 +490,10 @@ export function AtlasTerritory({
     // Shallow water: soft rings around every coast.
     ctx.strokeStyle = color.shallows;
     for (const [width, alpha] of [
-      [TILE * 4.2, 0.025],
-      [TILE * 2.7, 0.035],
-      [TILE * 1.5, 0.06],
-      [TILE * 0.7, 0.1],
+      [HEX * 0.75, 0.03],
+      [HEX * 0.48, 0.045],
+      [HEX * 0.26, 0.07],
+      [HEX * 0.11, 0.11],
     ] as const) {
       ctx.globalAlpha = alpha;
       ctx.lineWidth = width;
@@ -523,34 +503,48 @@ export function AtlasTerritory({
     }
     ctx.globalAlpha = 1;
 
-    const far = TILE * k < 3;
-    for (const f of scene.fills) {
-      const isleLand = structural.has(f.region);
+    const tone = (region: string, shade: number, extra = 0) => {
+      const isleLand = structural.has(region);
       const [l0, c0] = isleLand ? isle : land;
-      let l = l0 + (f.shade - 1) * step + (f.grain - 1) * step * 0.45;
+      let l = l0 + (shade - 1) * step + extra;
       let c = c0;
-      if (f.region === selTop) {
+      if (region === selTop) {
         l += lift;
         c *= 1.35;
-      } else if (lit.size && !lit.has(f.region)) {
+      } else if (lit.size && !lit.has(region)) {
         l += dim;
         c *= 0.55;
       }
-      ctx.fillStyle = `oklch(${l.toFixed(3)} ${c.toFixed(3)} ${isleLand ? 70 : (hueOf.get(f.region) ?? 70)})`;
-      ctx.fill(far ? f.solid : f.gapped);
+      return `oklch(${l.toFixed(3)} ${c.toFixed(3)} ${isleLand ? 70 : (hueOf.get(region) ?? 70)})`;
+    };
+    // Plates first, darker, so every country reads as one piece of land with its concepts on it.
+    for (const f of scene.fills) {
+      if (f.host) continue;
+      ctx.fillStyle = tone(f.region, 0, -step * 2.5);
+      ctx.fill(f.plate);
+    }
+    for (const f of scene.fills) {
+      if (f.host) continue;
+      ctx.fillStyle = tone(f.region, f.shade);
+      ctx.fill(f.face);
+    }
+    // What's inside a hexagon, once there's room to see it.
+    const hosts = new Map<string, boolean>();
+    const hostOpen = (id: string) => {
+      let open = hosts.get(id);
+      if (open === undefined) {
+        const host = territory.byId.get(id);
+        open = !!host && shown(host) && opened(host);
+        hosts.set(id, open);
+      }
+      return open;
+    };
+    for (const f of scene.fills) {
+      if (!f.host || !hostOpen(f.host)) continue;
+      ctx.fillStyle = tone(f.region, f.shade, step * 4);
+      ctx.fill(f.face);
     }
 
-    // Provinces: a fine line between children, once they're drawn.
-    ctx.strokeStyle = color.border;
-    for (const c of territory.cells) {
-      if (c.depth === 0 || !shown(c)) continue;
-      ctx.globalAlpha = topOf(c).id === selTop ? 0.75 : 0.5;
-      ctx.lineWidth = px(c.depth === 1 ? 1.4 : 1);
-      ctx.stroke(scene.outline(c.id));
-    }
-    ctx.globalAlpha = 1;
-    ctx.lineWidth = Math.max(px(2.5), TILE * 0.22);
-    ctx.stroke(scene.borders);
     ctx.strokeStyle = color.coast;
     ctx.lineWidth = px(1.5);
     ctx.stroke(scene.coast);
@@ -584,7 +578,7 @@ export function AtlasTerritory({
       const own = sel.depth === 0 ? scene.tilesOf.get(sel.id) : undefined;
       // Leave from inside the edge facing each region, so routes fan out
       // around the selection instead of all leaving its nearest corner.
-      const radius = Math.sqrt((sel.size * 2.6) / Math.PI) * TILE * 0.75;
+      const radius = Math.max(0, Math.min(sel.w, sel.h) / 2 - HEX * 0.6);
       const from = (x: number, y: number) => {
         const dx = x - sel.anchor.x;
         const dy = y - sel.anchor.y;
@@ -603,22 +597,22 @@ export function AtlasTerritory({
       for (const r of [...drawnRoutes].sort((a, b) => a.weight - b.weight)) {
         const other = territory.byId.get(r.id)!;
         const start = from(other.anchor.x, other.anchor.y);
-        const land =
+        const landing =
           other.depth === 0 ? nearestTile(scene.tilesOf.get(other.id), start.x, start.y) : null;
-        // Into the country a tile or two, toward its middle.
-        const end = land
+        // Onto the near edge of the country, a little way in.
+        const end = landing
           ? (() => {
-              const dx = other.anchor.x - land.x;
-              const dy = other.anchor.y - land.y;
+              const dx = start.x - landing.x;
+              const dy = start.y - landing.y;
               const d = Math.hypot(dx, dy) || 1;
-              const into = Math.min(d, TILE * 2.5);
-              return { x: land.x + (dx / d) * into, y: land.y + (dy / d) * into };
+              const out = Math.min(d, HEX * 0.35);
+              return { x: landing.x + (dx / d) * out, y: landing.y + (dy / d) * out };
             })()
           : other.anchor;
         const dx = end.x - start.x;
         const dy = end.y - start.y;
         const len = Math.hypot(dx, dy) || 1;
-        const bend = (r.direction === "out" ? 1 : -1) * Math.min(len * 0.18, TILE * 7);
+        const bend = (r.direction === "out" ? 1 : -1) * Math.min(len * 0.18, HEX * 1.6);
         const cx = (start.x + end.x) / 2 - (dy / len) * bend;
         const cy = (start.y + end.y) / 2 + (dx / len) * bend;
         // Arrows point the way the dependency goes: from the user to the used.
@@ -685,13 +679,13 @@ export function AtlasTerritory({
           return;
         }
         const p = members[i - 1]!;
-        const lift = Math.min(
+        const rise = Math.min(
           px(160),
           Math.hypot(c.anchor.x - p.anchor.x, c.anchor.y - p.anchor.y) * 0.3,
         );
         ctx.quadraticCurveTo(
           (p.anchor.x + c.anchor.x) / 2,
-          Math.min(p.anchor.y, c.anchor.y) - lift,
+          Math.min(p.anchor.y, c.anchor.y) - rise,
           c.anchor.x,
           c.anchor.y,
         );
@@ -747,10 +741,11 @@ export function AtlasTerritory({
       ctx.stroke();
     };
     /**
-     * A name in a pill on a region's land, near its top: the selection, and
-     * countries whose provinces are drawn (their middles go to the provinces).
+     * A name in a pill along a region's top edge: the selection, and regions
+     * whose insides are named (their middles go to what's inside).
      */
     const pill = (c: TerritoryCell, active: boolean) => {
+      if (!active && (sx(c.x + c.w) < 0 || sx(c.x) > w || sy(c.y + c.h) < 0 || sy(c.y) > h)) return;
       const sizePx = c.depth === 0 ? 14 : 13;
       ctx.font = `700 ${sizePx}px ${font}`;
       const name = fitText(c.entity.name, 260);
@@ -758,18 +753,16 @@ export function AtlasTerritory({
       const dot = c.changed ? 14 : 0;
       const wpx = ctx.measureText(name).width + 22 + dot;
       const hpx = 26;
-      const crown = nearestTile(scene.tilesIn(c.id), c.anchor.x, c.y + TILE + (hpx / 2 + 4) / k);
-      const at = crown ?? c.anchor;
       // Kept on screen, but within the region's own extent.
       const clampTo = (v: number, lo: number, hi: number) =>
         Math.min(Math.max(v, lo), Math.max(lo, hi));
       const x = clampTo(
-        sx(at.x),
+        sx(c.anchor.x),
         Math.max(wpx / 2 + 6, sx(c.x) + wpx / 2),
         Math.min(w - wpx / 2 - 6, sx(c.x + c.w) - wpx / 2),
       );
       const y0 = clampTo(
-        sy(at.y),
+        sy(c.y + (c.hex ? c.hex * 0.42 : 0)) + (c.hex ? 0 : 6),
         hpx / 2 + 44,
         Math.min(h - hpx / 2 - 6, sy(c.y + c.h) - hpx / 2),
       );
@@ -819,38 +812,43 @@ export function AtlasTerritory({
     // Biggest first, so a crowded view keeps the names of the largest regions.
     const order = territory.cells
       .filter((c) => shown(c) && c.id !== sel?.id)
-      .sort((a, b) => a.depth - b.depth || b.size - a.size);
-    // Parents whose children show get a pill, and their children the inline labels.
+      .sort(
+        (a, b) => a.depth - b.depth || (b.entity.counts.files ?? 0) - (a.entity.counts.files ?? 0),
+      );
+    // Regions whose insides are named get a pill; what's inside, the names in line.
     for (const c of order) if (opensInto(c)) pill(c, false);
     for (const c of order) {
       if (opensInto(c)) continue;
-      const room = span(c);
-      if (room < SHOW.label) continue;
+      const leaf = c.depth > 0 && c.hex > 0 && c.hex < HEX;
+      // Room for a name across the middle of its hexagon, or of its country's.
+      const room = c.hex ? c.hex * SQ3 * k * 0.86 : Math.min(c.w * k * 0.7, 240);
+      if (c.hex && c.hex * k < (leaf ? SHOW.named : SHOW.concepts) * 0.85) continue;
       const x = sx(c.anchor.x);
       const y = sy(c.anchor.y);
       if (x < -200 || x > w + 200 || y < -60 || y > h + 60) continue;
+      const files = c.entity.counts.files;
       const sizePx =
-        c.depth === 0
-          ? Math.min(17, 11.5 + (c.entity.layout?.bucket ?? 3) * 0.6)
-          : c.depth === 1
-            ? 12
-            : 11.5;
-      const weight = c.depth === 0 ? 700 : 600;
+        c.depth === 0 && !c.hex
+          ? Math.min(17, 12 + Math.log2((files ?? 0) + 1) * 0.6)
+          : leaf
+            ? 11
+            : 12.5;
+      const weight = leaf ? 500 : c.depth === 0 ? 700 : 600;
       ctx.font = `${weight} ${sizePx}px ${font}`;
-      const name = lines(c.entity.name, Math.max(84, Math.min(room * 0.95, 180)));
+      const name = lines(leaf ? shortName(c) : c.entity.name, Math.max(40, room), leaf ? 2 : 3);
       if (!name.length) continue;
-      const counts = room >= SHOW.counts;
+      const counts = !leaf && (c.hex ? c.hex * k >= 52 : true);
       const line = sizePx * 1.18;
       const countLine = loading.has(c.id)
         ? "Loading…"
-        : c.entity.counts.files !== undefined
-          ? fileLabel(c.entity.counts.files)
+        : files !== undefined
+          ? fileLabel(files)
           : "";
       const width = Math.max(...name.map((n) => ctx.measureText(n).width));
       const height = name.length * line + (counts && countLine ? 15 : 0);
-      // At its anchor, or nudged up or down if something's there already.
+      // At its anchor, or nudged up or down (inside it) if something's there already.
       let spot: { x: number; y: number } | null = null;
-      for (const dy of [0, -0.6, 0.6, -1.2, 1.2]) {
+      for (const dy of c.hex ? [0] : [0, -0.6, 0.6, -1.2, 1.2]) {
         const cy = y + dy * height;
         const box = {
           x0: x - width / 2 - 4,
@@ -894,9 +892,14 @@ export function AtlasTerritory({
         );
       if (c.changed) changedDot(spot.x - width / 2 - 9, top);
     }
-    // Changed regions too small for a label still show their dot.
+    // Changed concepts and regions too small for a label still show their
+    // dot; files and symbols only once they're named.
     for (const c of order) {
-      if (!c.changed || span(c) >= SHOW.label || span(c) < 8 || opensInto(c)) continue;
+      const r = c.hex || HEX;
+      if (!c.changed || opensInto(c) || r * k < 3 || r < HEX) continue;
+      if (c.hex && c.hex * k >= (c.hex < HEX && c.depth > 0 ? SHOW.named : SHOW.concepts) * 0.85)
+        continue;
+      if (!c.hex) continue;
       changedDot(sx(c.anchor.x), sy(c.anchor.y));
     }
 
@@ -932,11 +935,12 @@ export function AtlasTerritory({
     const my = (mh - th * ms) / 2 - territory.top * ms;
     mc.setTransform(dpr * ms, 0, 0, dpr * ms, dpr * mx, dpr * my);
     for (const f of scene.fills) {
+      if (f.host) continue;
       const isleLand = structural.has(f.region);
       const [l0, c0] = isleLand ? isle : land;
       const l = l0 + (f.region === selTop ? lift * 2 : 0);
       mc.fillStyle = `oklch(${l.toFixed(3)} ${(c0 * 1.3).toFixed(3)} ${isleLand ? 70 : (hueOf.get(f.region) ?? 70)})`;
-      mc.fill(f.solid);
+      mc.fill(f.plate);
     }
     mc.setTransform(dpr, 0, 0, dpr, 0, 0);
     const vx = mx + ((0 - tx) / k) * ms;
@@ -991,8 +995,7 @@ export function AtlasTerritory({
       chain.unshift(c);
     let cell = chain[0]!;
     for (const c of chain.slice(1)) {
-      const parent = territory.byId.get(c.parent!)!;
-      if (Math.min(parent.w, parent.h) * k < SHOW.children) break;
+      if (!openAt(territory.byId.get(c.parent!)!, k)) break;
       cell = c;
     }
     return cell;
