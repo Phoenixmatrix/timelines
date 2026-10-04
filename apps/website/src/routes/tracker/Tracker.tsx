@@ -1020,10 +1020,10 @@ function Workbench({ data }: { data: TrackerView }) {
                 <Tip label="Close (Escape)">
                   <Link
                     to={closeHref}
-                    className="mk-btn mk-btn--ghost mk-btn--icon mk-btn--sm absolute top-2 right-2 z-[1] no-underline"
+                    className="mk-btn mk-btn--ghost mk-btn--sm absolute top-2 right-2 z-[1] size-8 p-0 no-underline max-sm:size-11 [&_svg]:size-[18px]"
                     aria-label="Close the issue"
                   >
-                    <XIcon weight="bold" />
+                    <XIcon aria-hidden />
                   </Link>
                 </Tip>
                 <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">{inspector}</div>
