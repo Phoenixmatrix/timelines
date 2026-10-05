@@ -261,6 +261,66 @@ await test("diagnostic redaction removes personal and CI bearer credentials", ()
   assert.equal(message, "[REDACTED] [REDACTED] Authorization: Bearer [REDACTED]");
 });
 
+await test("a stuck expired environment doesn't block creating another (CORE-292)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-sweep-"));
+  try {
+    const root = join(home, "worktree");
+    const directory = join(home, ".local/state/gitmatrix-agent/environments");
+    const bin = join(home, "bin");
+    await mkdir(directory, { recursive: true });
+    await mkdir(root, { recursive: true });
+    await mkdir(bin);
+    const env = owned(root);
+    env.created -= 172_800_000;
+    env.expires -= 172_800_000;
+    const journal = join(directory, `${env.id}.json`);
+    await writeFile(journal, JSON.stringify(env));
+    // Cloudflare refuses to delete the namespace, as with a stuck Artifacts one.
+    await writeFile(
+      join(bin, "cf"),
+      `#!${process.execPath}\nconsole.error('409 [10202] Namespace is not empty'); process.exit(1);\n`,
+      { mode: 0o700 },
+    );
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const childEnv = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` };
+    // cleanupExpired itself still reports the failure...
+    await assert.rejects(
+      command(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`,
+        ],
+        { env: childEnv },
+      ),
+      /Cleanup incomplete/,
+    );
+    // ...but the sweep before a create warns and lets it go on.
+    const output = await command(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import {sweepBeforeCreate} from ${JSON.stringify(module)}; const errors = []; console.error = (...parts) => errors.push(parts.join(" ")); await sweepBeforeCreate(); console.log(JSON.stringify({ continued: true, errors }));`,
+      ],
+      { env: childEnv },
+    );
+    const result = JSON.parse(output.trim().split("\n").at(-1) ?? "{}") as {
+      continued: boolean;
+      errors: string[];
+    };
+    assert.equal(result.continued, true);
+    const deferred = result.errors.find((line) => line.includes("environment.cleanup_deferred"));
+    assert.ok(deferred, "the deferred cleanup is reported");
+    assert.match(deferred, new RegExp(env.id));
+    // The journal stays for the next sweep.
+    assert.equal((JSON.parse(await readFile(journal, "utf8")) as Environment).status, "deleting");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 for (const gateway of [undefined, "pending", "created"] as const)
   await test(`cleanup retries incomplete ${gateway ? `${gateway} Gateway` : "legacy vector"} deletions without repeating completed providers`, async () => {
     const home = await mkdtemp(join(tmpdir(), "gitmatrix-cleanup-"));

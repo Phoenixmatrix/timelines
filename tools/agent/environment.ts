@@ -515,13 +515,33 @@ async function allocatePort(): Promise<number> {
  * Provisions an owned environment, or returns this worktree's existing one.
  * Paid AI resources (AI Gateway, Vectorize, AI Search) only when `ai`.
  */
+/**
+ * Sweep expired environments before creating one, without letting a stuck one
+ * block everyone (CORE-292): a namespace Cloudflare refuses to delete would
+ * otherwise stop every agent's setup on the machine. The failing journals stay
+ * for the next sweep (hourly maintenance retries them); this reports and goes on.
+ */
+export async function sweepBeforeCreate(): Promise<void> {
+  try {
+    await cleanupExpired();
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        event: "environment.cleanup_deferred",
+        message: "Some expired environments could not be destroyed yet; continuing.",
+        detail: String(error instanceof Error ? error.message : error),
+      }),
+    );
+  }
+}
+
 export async function createEnvironment(
   root: string,
   ephemeral = false,
   ai = false,
 ): Promise<Environment> {
   root = await realpath(root);
-  await cleanupExpired();
+  await sweepBeforeCreate();
   return registryLock(async () => {
     const existing = await inventory();
     if (!ephemeral) {
