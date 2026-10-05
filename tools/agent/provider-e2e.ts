@@ -3092,9 +3092,16 @@ export async function runProviderE2E(
         usageEvidence.account = ownerAccount;
         let rows: ReturnType<typeof reconcileUsage>["rows"] = [];
         await waitFor("usage-reconciliation", 180_000, async () => {
-          const logs = await collectGatewayLogs((page) =>
-            gatewayLogs(owned, String(evidence.startedAt), "knowledge", undefined, page),
-          );
+          // Release notes log under their own component (CORE-290's componentOf).
+          const logs = (
+            await Promise.all(
+              ["knowledge", "release-notes"].map((component) =>
+                collectGatewayLogs((page) =>
+                  gatewayLogs(owned, String(evidence.startedAt), component, undefined, page),
+                ),
+              ),
+            )
+          ).flat();
           const result = reconcileUsage(await appUsage(), logs, ownerAccount);
           rows = result.rows;
           usageEvidence.rows = result.rows;
