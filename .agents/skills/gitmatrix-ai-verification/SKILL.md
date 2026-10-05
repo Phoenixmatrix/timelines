@@ -1,29 +1,50 @@
 ---
 name: gitmatrix-ai-verification
-description: Verify changes to real knowledge builds, graph extraction, generated wiki, embeddings/Vectorize or AI Search using owned isolated resources. Required before claiming AI behavior works; ordinary ready intentionally does not run AI.
+description: Verify changes to real knowledge builds, graph extraction, generated wiki, embeddings/Vectorize, AI Search, the assistant, release notes, avatars or the Atlas using owned isolated resources, and decide when an agent environment needs paid AI at all. Required before claiming AI behavior works; ordinary ready and agent setup intentionally run no AI.
 ---
 
 # Real AI verification
 
 ## When required
 
-Run after changing knowledge scheduling/builds, extraction/model prompts, wiki generation, embedding/index schemas, AI Search indexing/retrieval, AI Gateway routing, or their API/UI consumers. `vp run ready` and `vp run agent test` cover non-AI journeys and real mirror transport, not AI correctness. Never infer AI correctness from their success.
+Run after changing knowledge scheduling/builds, extraction/model prompts, wiki generation, embedding/index schemas, AI Search indexing/retrieval, AI Gateway routing, the assistant, release-note generation, avatars, Atlas descriptions, or their API/UI consumers. `vp run ready` and `vp run agent test` cover non-AI journeys and real mirror transport, not AI correctness. Never infer AI correctness from their success.
+
+## AI is opt-in everywhere else
+
+AI costs real money (CORE-284), so nothing turns it on by default:
+
+- `vp run agent setup` provisions no Workers AI, AI Gateway, Vectorize or AI Search, and seeds without paid Knowledge builds. The UI shows its honest AI-off states; that is the expected state for almost all work, including UI around AI features (browser-mode tests cover those against canned APIs).
+- `vp run agent setup --ai` (after `vp run agent destroy` when an environment exists, or `reset --ai`) only when the change is to knowledge, wiki, embeddings, AI Search, the assistant, release-note generation, avatars or Atlas descriptions and you need to see it working with real models interactively. `vp run agent status` shows each environment's `ai`. Destroy it when done: an AI environment's pushes start paid builds.
+- The canonical `vp dev` binds no AI unless started with `GITMATRIX_DEV_AI=enabled`; it prints which when it starts. Never opt it in to build large repositories (this one cost ~$44).
 
 ## Prerequisites and command
 
 Use this worktree's Linux agent workflow with Node 24+, Vite+, Rust, Git, Chromium dependencies and authenticated `cf` access. Discover operations with `cf cli search "<anonymous action/resource description>"`, then the selected command's help; never Wrangler. Select an authorized development account with `CLOUDFLARE_ACCOUNT_ID`; optionally select `GITMATRIX_CF_PROFILE`. The harness needs real Artifacts, Workers AI, Vectorize, AI Search and AI Gateway permissions, including Gateway log reads. Missing access is a blocker, not a reason to mock, skip or weaken assertions.
 
 ```sh
-vp run agent test-ai
+vp run agent test-ai --dry-run   # which stages your change maps to, and why; spends nothing
+vp run agent test-ai             # run them
 ```
 
-This builds this worktree's gm with Cargo freshness checks (compiled outputs may be reused), provisions uniquely named owned resources, migrates local databases, starts an isolated origin, seeds fixtures, and exercises real providers. It consumes paid inference, embeddings and provider storage/indexing, including knowledge work triggered by seeded repositories; run deliberately, not in automatic CI or in a retry loop. Four live environments per user and a 24-hour expiry apply. Never point it at the canonical development server or shared namespaces. Normal `agent setup` remains AI-enabled; only automatic non-AI test environments omit AI bindings/resources.
+### Targeted stages
+
+test-ai runs only the stages that the paths you changed against `origin/main` (commits, working tree, untracked files) map to, plus the stages they build on (`requires`). Each stage is defined beside the code that runs it, with its path globs: `COPPER_FINCH_STAGES` in `tools/agent/provider-e2e.ts` (knowledge, search, assistant, avatars, knowledge-edit, release-notes, overlays, timeline-pages, repository-deletion, queue) and `ATLAS_STAGES` in `tools/agent/atlas-provider-e2e.ts` (atlas-describe, atlas-workspace, atlas-reuse, atlas-disabled, atlas-refused, atlas-exhausted). Paths in `SHARED_PATHS` (`tools/agent/ai-stages.ts`: bindings, Worker entry points, Gateway and model layer, AI settings, the harness lifecycle, dependency versions) run every stage. A change that maps to nothing provisions nothing and exits successfully.
+
+- `--stage <id>[,<id>]` and `--all` add stages; nothing removes a stage whose code changed. `--base <ref>` compares against another ref.
+- `--resume` after a failure reruns the failed, unreached and changed stages: a stage is skipped only if it passed in this worktree's previous run from the same merge base with the same content in every changed file that maps to it. Its prerequisites still run (the environment is new).
+- Within 30 minutes of a failed run, a full run is refused, and so is any rerun when nothing those stages verify has changed, unless `--force`. Inspect the evidence and fix the cause; never run test-ai in a loop. Use `--force` only for a provider outage you've confirmed.
+- When you change code a stage verifies but its globs don't cover, extend that stage's `paths` in the same change (`ai-stages.test.ts` checks every mapped path exists and runs its stage).
+
+Every selected stage keeps all of its real assertions; a targeted run is the same verification, only of fewer stages.
+
+This builds this worktree's gm with Cargo freshness checks (compiled outputs may be reused), provisions uniquely named owned resources, migrates local databases, starts an isolated origin, seeds fixtures, and exercises real providers. It consumes paid inference, embeddings and provider storage/indexing, including knowledge work triggered by seeded repositories; run deliberately, not in automatic CI or in a retry loop. Four live environments per user and a 24-hour expiry apply. Never point it at the canonical development server or shared namespaces. test-ai always provisions its own AI environment; it doesn't need (or use) a `setup --ai` environment.
 
 ## Exact evidence and honest failures
 
 The final `e2e.complete` event prints the local evidence directory. Inspect:
 
-- `completion.json`: mode, overall success, environment ID, requested resource selection, cleanup state, failed lifecycle stages.
+- `completion.json`: mode, overall success, environment ID, requested resource selection, cleanup state, failed lifecycle stages, and the AI stages run (`aiStages`) with their outcomes (`aiStageOutcomes`, `failedAiStages`).
+- `ai-e2e.json` `selection`: the merge base, changed paths, each run stage's reasons (`changed` with the matching paths, `requested`, `all`, `required` by which stages) and each skipped stage's reason; `stages`: each stage's outcome; `cost`: the owned Gateway's logged spend for the run (calls, USD, per model; AI Search's built-in embedding/reranking excluded) and the Atlas's own recorded usage.
 - `timings.json`: elapsed milliseconds and pass/fail for prepare, provision, migrate, start, seed, scenarios, shutdown and cleanup (executed stages only).
 - `ai-e2e.json`: unique fixture repository, observed build status/commit, graph file/symbol membership, generated overview body/model/commit, exact entity and passage results, API observations and per-stage timings. `knowledge-build` and `index-visibility` are separate timings. `indexVisibility` records each retrieval attempt's elapsed time and separate `entityFound` / `passageFound` outcomes.
 - `ai-e2e.json` also records real avatar generation (`avatars`) and owned Gateway records (`gateway`) for knowledge, explicit embeddings and assistant streaming/titles. It checks successful uncached inference, empty request/response payloads, and `text/event-stream` assistant responses. Avatar records must stay within the existing ten-call budget, with successful records matching the decoded images returned by the API; its existing contract permits partial generation when styles are refused. Cloudflare excludes AI Search's built-in Workers AI embedding/reranking from Gateway logs/analytics; keep that documented exception separate from application embeddings.

@@ -7,7 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { command, validateEnvironment, redact, context, loadEnvironment } from "./environment.ts";
+import {
+  aiEnabled,
+  command,
+  validateEnvironment,
+  redact,
+  context,
+  loadEnvironment,
+} from "./environment.ts";
 import type { Environment } from "./environment.ts";
 import { developmentEnvironment } from "../../apps/website/vite/environment.ts";
 
@@ -41,6 +48,7 @@ function runtime(env: Environment): Record<string, string> {
     GITMATRIX_VECTORIZE_INDEX: env.id,
     GITMATRIX_SEARCH_NAMESPACE: env.id,
     GITMATRIX_AI_GATEWAY: env.id,
+    GITMATRIX_AGENT_AI: "enabled",
     GITMATRIX_AGENT_SECRET: env.secret,
     GITMATRIX_CI_DISPATCH_SECRET: env.dispatchSecret,
     GITMATRIX_CI_RUNNER: "local",
@@ -117,6 +125,103 @@ await test("runtime rejects cross-environment stores and credentials while accep
       }),
     /TMPDIR/,
   );
+});
+
+await test("agent mode binds AI only when its environment provisioned it", () => {
+  const env = owned();
+  assert.equal(developmentEnvironment(runtime(env)).ai, true);
+  const off = { ...runtime(env), GITMATRIX_AGENT_AI: "disabled", GITMATRIX_AI_GATEWAY: undefined };
+  assert.equal(developmentEnvironment(off).ai, false);
+  for (const value of [undefined, "", "yes"])
+    assert.throws(
+      () => developmentEnvironment({ ...runtime(env), GITMATRIX_AGENT_AI: value }),
+      /GITMATRIX_AGENT_AI/,
+    );
+  // The canonical server: off unless GITMATRIX_DEV_AI=enabled.
+  assert.equal(developmentEnvironment({}).ai, false);
+  assert.equal(developmentEnvironment({ GITMATRIX_DEV_AI: "1" }).ai, false);
+  assert.equal(developmentEnvironment({ GITMATRIX_DEV_AI: "enabled" }).ai, true);
+});
+
+await test("setup provisions no AI resources unless --ai", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-setup-ai-"));
+  try {
+    const bin = join(home, "bin");
+    await mkdir(bin);
+    const calls = join(home, "calls");
+    await writeFile(calls, "");
+    await writeFile(
+      join(bin, "cf"),
+      `#!${process.execPath}\nconst args=process.argv.slice(2); if(args[0]==='auth'){console.log(JSON.stringify({authenticated:true,tokenValid:true,accounts:[{id:'${"a".repeat(32)}'}]}));process.exit(0)} require('node:fs').appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n'); console.log('{}');\n`,
+      { mode: 0o700 },
+    );
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const provision = async (root: string, ai: boolean | undefined) => {
+      await mkdir(root, { recursive: true });
+      await writeFile(calls, "");
+      const output = await command(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import {context, createEnvironment, listEnvironments} from ${JSON.stringify(module)}; const env = await createEnvironment(${JSON.stringify(root)}, false${ai === undefined ? "" : `, ${ai}`}); console.log(JSON.stringify({env, listed: await listEnvironments(), vars: (await context(env)).env}));`,
+        ],
+        { env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` } },
+      );
+      const { env, listed, vars } = JSON.parse(output.trim().split("\n").at(-1)!) as {
+        env: Environment;
+        listed: { id: string; ai: boolean }[];
+        vars: Record<string, string>;
+      };
+      const operations = (await readFile(calls, "utf8"))
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as string[]);
+      return { env, listed, vars, operations };
+    };
+    // The default: Artifacts only, and the environment says AI is off.
+    const plain = await provision(join(home, "plain"), undefined);
+    assert.deepEqual(
+      plain.operations.map((args) => args.slice(0, 3).join(" ")),
+      ["artifacts namespaces create"],
+    );
+    assert.deepEqual(plain.env.resources, {
+      artifacts: "created",
+      vectors: "deleted",
+      search: "deleted",
+      gateway: "deleted",
+    });
+    assert.equal(plain.env.ai, false);
+    assert.equal(aiEnabled(plain.env), false);
+    assert.equal(plain.listed.find((e) => e.id === plain.env.id)?.ai, false);
+    // The server it starts binds no AI.
+    assert.equal(plain.vars.GITMATRIX_AGENT_AI, "disabled");
+    assert.equal(developmentEnvironment(plain.vars).ai, false);
+    // Asking for AI on that environment refuses rather than silently staying off.
+    await assert.rejects(provision(join(home, "plain"), true), /setup --ai/);
+    // --ai: the Gateway, Vectorize and AI Search too.
+    const paid = await provision(join(home, "paid"), true);
+    assert.deepEqual(
+      paid.operations.map((args) => args.slice(0, 2).join(" ")),
+      [
+        "artifacts namespaces",
+        "ai-gateway gateways",
+        "vectorize create",
+        "vectorize metadata-index",
+        "vectorize metadata-index",
+        "vectorize metadata-index",
+        "ai-search namespace",
+        "ai-search create",
+      ],
+    );
+    assert.equal(paid.env.ai, true);
+    assert.equal(paid.listed.find((e) => e.id === paid.env.id)?.ai, true);
+    assert.equal(paid.vars.GITMATRIX_AGENT_AI, "enabled");
+    assert.equal(developmentEnvironment(paid.vars).ai, true);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 await test("nonzero subprocess is rejected even with valid success-shaped JSON", async () => {

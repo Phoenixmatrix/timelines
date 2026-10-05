@@ -24,12 +24,15 @@ vp run agent up
 ```
 
 Use the origin printed by `up`. Setup builds the worktree's CLI, installs and
-checks Chromium, provisions dedicated Artifacts/Vectorize/AI Search resources,
-migrates both local D1 databases, and seeds deterministic Git/tracker fixtures.
-Use `vp run agent inspect` for data, `vp run agent test` for non-AI real-service
-E2E, and `vp run agent test-ai` when verifying knowledge/wiki/search capabilities.
-Automatic E2E provisions only Artifacts and disables background AI work; normal
-interactive setup remains AI-enabled. Use `vp run agent destroy` when finished.
+checks Chromium, provisions a dedicated Artifacts namespace, migrates both local
+D1 databases, and seeds deterministic Git/tracker fixtures. It provisions **no
+paid AI** (Workers AI, AI Gateway, Vectorize, AI Search) and starts no Knowledge
+builds; the app shows its AI-off states. `vp run agent setup --ai` adds them, for
+changes to knowledge, wiki, embeddings, AI Search, the assistant, release-note
+generation, avatars or Atlas descriptions only. Use `vp run agent inspect` for
+data, `vp run agent test` for non-AI real-service E2E, and `vp run agent test-ai`
+(targeted at the stages your change maps to) when verifying AI capabilities.
+Use `vp run agent destroy` when finished.
 Hourly cleanup and 24-hour expiry bound resource accumulation; see the root README
 for costs and failure recovery.
 
@@ -39,7 +42,7 @@ with the runtime imports in `shared/semantic/`: discovering another parser on
 first source navigation can reload the dev page and interrupt browser E2E.
 
 There is no local Artifacts, Workers AI, Vectorize or AI Search emulator.
-These bindings use real services; D1, Durable Objects and Workflows run locally
+These bindings (the AI ones only when opted in) use real services; D1, Durable Objects and Workflows run locally
 under the environment's `.gitmatrix-agent` state directory. The pinned Vite
 plugin v2 reads `cloudflare.config.ts` directly. A pinned Miniflare lifecycle
 patch makes local `cf d1` commands exit normally; do not terminate them early
@@ -47,7 +50,11 @@ after merely seeing output.
 
 The canonical source host remains a separate, owner-managed environment:
 from this directory, `vp run db:migrate`, `vp run db:seed` and `vp dev` use port 5180 and
-`.wrangler/state`. Feature agents must not reuse that state or test mutations
+`.wrangler/state`. Its AI is opt-in: plain `vp dev` binds no Workers AI, AI
+Gateway, Vectorize or AI Search and prints `AI is off` when it starts;
+`GITMATRIX_DEV_AI=enabled vp dev` binds the shared development resources
+(`gitmatrix-dev`, `gitmatrix-knowledge`, `gitmatrix`), and every repository
+pushed to it then gets paid Knowledge builds. Feature agents must not reuse that state or test mutations
 against it. **Load samples** creates four small empty named repositories;
 the agent harness fills them through real `gm` commits, without GitHub imports.
 

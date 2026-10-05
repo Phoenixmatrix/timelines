@@ -31,6 +31,14 @@ release. Add a tool name to select part of the graph. For example, run
 - Follow the root [agent-first workflow](README.md#agent-first-development).
   Each agent uses its own source `gm worktree`, `vp install`, and
   `vp run agent setup`; run the app with `vp run agent up`.
+- AI costs money, so it is **opt-in**. `agent setup` provisions no Workers AI,
+  AI Gateway, Vectorize or AI Search and seeds without paid Knowledge builds;
+  the UI shows its AI-off states. Use `vp run agent setup --ai` (after
+  `agent destroy` if the environment exists) only when your change is to
+  knowledge, wiki, embeddings, AI Search, the assistant, release-note
+  generation, avatars or Atlas descriptions and you must see it working with
+  real models. `agent status` shows each environment's `ai`. The canonical
+  `vp dev` is AI-off too unless started with `GITMATRIX_DEV_AI=enabled`.
 - Use the printed isolated origin and `vp run agent gm -- ...` for product
   testing. That wrapper uses this worktree's compiled binary, credentials and
   external disposable workspace. Never test mutations on canonical port 5180,
@@ -42,10 +50,13 @@ release. Add a tool name to select part of the graph. For example, run
   every workspace's tests/builds and fresh real CLI/API/browser/mirror E2E,
   without AI inference or AI resource provisioning. E2E runs **only here**:
   server CI skips it (too expensive per push), so `ready` is the only place
-  it runs before code lands. For changes to knowledge,
-  wiki, embeddings or AI Search, follow
+  it runs before code lands. For changes to knowledge, wiki, embeddings, AI
+  Search, the assistant, release notes, avatars or the Atlas, follow
   `.agents/skills/gitmatrix-ai-verification/SKILL.md` and explicitly run
-  `vp run agent test-ai`. Also exercise the specific changed consumer path.
+  `vp run agent test-ai`: it runs only the stages your changed paths map to
+  (`--dry-run` shows them). Run it once, deliberately: after a failure, fix
+  the cause and use `--resume`; it refuses unchanged reruns and full reruns
+  for 30 minutes. Also exercise the specific changed consumer path.
   Missing required services, browser dependencies or credentials are failures.
 - After a change to gm (`apps/cli`) deploys, install the new release for
   every agent on this machine: follow
