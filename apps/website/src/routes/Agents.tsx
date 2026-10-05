@@ -1,9 +1,11 @@
 // Your agents: identities that work on their own, accountable to you.
 
-import { KeyIcon, RobotIcon } from "@phosphor-icons/react";
+import { CheckIcon, KeyIcon, RobotIcon, XIcon } from "@phosphor-icons/react";
 import { useEffect, useRef } from "react";
-import { Form, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
+import { Form, Link, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
 import type { Agent, AgentCapabilities, CreatedAccessToken } from "../../shared/api.ts";
+import { filterToken, type AgentEligibility } from "../../shared/tracker-query.ts";
+import { AgentTagChip } from "../components/Chips.tsx";
 import { SettingsPage } from "../components/SettingsPage.tsx";
 import { Card, ConfirmDialog, CopyField, FormError, TextField } from "../components/ui.tsx";
 import { api, attempt, field, load } from "../lib/api.ts";
@@ -12,7 +14,14 @@ import { requireViewer } from "../lib/session.ts";
 
 export async function agentsLoader({ request }: { request: Request }) {
   await requireViewer(request);
-  return load<{ agents: Agent[] }>("/agents", request);
+  const [{ agents }, eligibility] = await Promise.all([
+    load<{ agents: Agent[] }>("/agents", request),
+    // Which tracker work each agent can take (CORE-32); the page works without it.
+    api<AgentEligibility>("/agent-eligibility", { signal: request.signal }).catch(
+      (): AgentEligibility => ({ trackers: [] }),
+    ),
+  ]);
+  return { agents, eligibility };
 }
 
 type Result = { created: Agent } | { token: CreatedAccessToken; agent: string } | { error: string };
@@ -47,7 +56,7 @@ export async function agentsAction({ request }: { request: Request }): Promise<R
 }
 
 export function Agents() {
-  const { agents } = useLoaderData<typeof agentsLoader>();
+  const { agents, eligibility } = useLoaderData<typeof agentsLoader>();
   const result = useActionData<Result | null | undefined>();
   const navigation = useNavigation();
   const formRef = useRef<HTMLFormElement>(null);
@@ -77,7 +86,8 @@ export function Agents() {
             <CopyField value="gm agent setup" label="Command" />
             <span className="mk-hint">
               Add <code className="mk-mono">--model</code> or <code className="mk-mono">--tag</code>{" "}
-              to describe it, and <code className="mk-mono">--under CORE-4</code> to point it at a
+              to describe it (tags come from the tracker's tag catalog, the same names issues are
+              tagged with), and <code className="mk-mono">--under CORE-4</code> to point it at a
               project.
             </span>
           </div>
@@ -141,7 +151,7 @@ export function Agents() {
           ) : (
             <ul className="m-0 mt-4 list-none divide-y divide-line-soft p-0">
               {agents.map((agent) => (
-                <AgentRow key={agent.id} agent={agent} />
+                <AgentRow key={agent.id} agent={agent} eligibility={eligibility} />
               ))}
             </ul>
           )}
@@ -151,7 +161,7 @@ export function Agents() {
   );
 }
 
-function AgentRow({ agent }: { agent: Agent }) {
+function AgentRow({ agent, eligibility }: { agent: Agent; eligibility: AgentEligibility }) {
   // Minting navigates (a plain Form) so the page's action data carries the secret to show.
   const navigation = useNavigation();
   const minting =
@@ -185,7 +195,8 @@ function AgentRow({ agent }: { agent: Agent }) {
               </span>
             )}
           </div>
-          {agent.capabilities && <Profile profile={agent.capabilities} />}
+          {agent.capabilities && <Profile profile={agent.capabilities} eligibility={eligibility} />}
+          {!revoked && <TrackerWork agent={agent} eligibility={eligibility} />}
         </div>
         {!revoked && (
           <div className="flex shrink-0 flex-wrap justify-end gap-2 max-sm:w-full max-sm:justify-start max-sm:pl-8">
@@ -251,6 +262,77 @@ function TokenRow({ agent, token }: { agent: Agent; token: Agent["tokens"][numbe
   );
 }
 
+/**
+ * The open tracker work it can take: issues may require tags, models or
+ * hardware (CORE-32), and the agent only gets what its profile meets.
+ */
+function TrackerWork({ agent, eligibility }: { agent: Agent; eligibility: AgentEligibility }) {
+  const rows = eligibility.trackers.flatMap(({ tracker, agents }) => {
+    const work = agents.find((a) => a.agentId === agent.id);
+    return work && work.open > 0 ? [{ tracker, work }] : [];
+  });
+  if (!rows.length) return null;
+  return (
+    <ul
+      className="m-0 mt-1.5 flex list-none flex-col gap-1 p-0 text-body-sm"
+      aria-label={`${agent.name}'s tracker work`}
+    >
+      {rows.map(({ tracker, work }) => (
+        <li key={tracker.slug} className="text-ink-muted">
+          <Link
+            className="text-ink underline-offset-2 hover:underline"
+            to={`/tracker/${tracker.slug}?q=${encodeURIComponent(`is:open eligible:${agent.name}`)}`}
+          >
+            {tracker.displayName}
+          </Link>
+          {": "}
+          {work.requiring === 0
+            ? `no open issues require anything; it can take all ${work.open}`
+            : `eligible for ${work.open - work.requiring + work.eligible} of ${work.open} open issues`}
+          {work.takeable && work.takeable.length > 0 && (
+            <ul
+              className="m-0 mt-1 flex list-none flex-col gap-0.5 p-0 pl-3"
+              aria-label={`What ${agent.name} can take in ${tracker.displayName}`}
+            >
+              {work.takeable.map((issue) => (
+                <li key={issue.key} className="flex min-w-0 items-center gap-1.5">
+                  <CheckIcon className="size-3 shrink-0 text-online" weight="bold" aria-hidden />
+                  <Link
+                    className="flex min-w-0 items-baseline gap-1.5 text-ink no-underline hover:underline"
+                    to={`/tracker/${tracker.slug}/issues/${issue.key}`}
+                  >
+                    <span className="mk-mono shrink-0 text-ink-faint">{issue.key}</span>
+                    <span className="min-w-0 truncate">{issue.title}</span>
+                  </Link>
+                  {issue.requires && <span className="sr-only">(its requirements are met)</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+          {work.missing.length > 0 && (
+            <ul
+              className="m-0 mt-0.5 flex list-none flex-col gap-0.5 p-0 pl-3 text-ink-faint"
+              aria-label={`What ${agent.name} can't take in ${tracker.displayName}`}
+            >
+              {work.missing.map((issue) => (
+                <li key={issue.key} className="flex min-w-0 items-start gap-1.5">
+                  <XIcon className="mt-1 size-3 shrink-0" weight="bold" aria-hidden />
+                  <span className="min-w-0 [overflow-wrap:anywhere]">
+                    <span className="mk-mono">{issue.key}</span> {issue.unmet.join("; ")}
+                  </span>
+                </li>
+              ))}
+              {work.requiring - work.eligible > work.missing.length && (
+                <li>and {work.requiring - work.eligible - work.missing.length} more</li>
+              )}
+            </ul>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 const HARNESSES: Record<string, string> = {
   "claude-code": "Claude Code",
   codex: "Codex",
@@ -264,8 +346,31 @@ const HARNESSES: Record<string, string> = {
   "vscode-copilot-agent": "GitHub Copilot",
 };
 
+/**
+ * Where an agent tag leads (CORE-271): the open issues tagged with it in the
+ * first of your trackers whose tag catalog has it. Null when none has it.
+ */
+function tagHome(tag: string, eligibility: AgentEligibility): string | null {
+  const name = tag.toLowerCase();
+  const home = eligibility.trackers.find(({ tags }) =>
+    tags?.some((known) => known.toLowerCase() === name),
+  );
+  return home
+    ? `/tracker/${home.tracker.slug}?q=${encodeURIComponent(`is:open ${filterToken("tag", name)}`)}`
+    : null;
+}
+
 /** What the agent reported about itself: advice for choosing whom to delegate to. */
-function Profile({ profile }: { profile: AgentCapabilities }) {
+function Profile({
+  profile,
+  eligibility,
+}: {
+  profile: AgentCapabilities;
+  eligibility: AgentEligibility;
+}) {
+  // Catalogs are only known from servers that send them; without one, nothing is flagged.
+  const catalogs = eligibility.trackers.some(({ tags }) => tags !== undefined);
+  const strays = catalogs ? profile.tags.filter((tag) => !tagHome(tag, eligibility)) : [];
   const { environment: env } = profile;
   const memory = env.memoryBytes ? `${Math.round(env.memoryBytes / 2 ** 30)} GB` : null;
   const runs = [
@@ -280,11 +385,18 @@ function Profile({ profile }: { profile: AgentCapabilities }) {
       <span>{runs.join(" · ")}</span>
       {(profile.tags.length > 0 || profile.skills.length > 0) && (
         <div className="flex flex-wrap items-center gap-1.5">
-          {profile.tags.map((tag) => (
-            <span key={tag} className="mk-chip mk-chip--tag">
-              {tag}
-            </span>
-          ))}
+          {profile.tags.length > 0 && (
+            <ul className="m-0 flex list-none flex-wrap gap-1.5 p-0" aria-label="Agent tags">
+              {profile.tags.map((tag) => {
+                const to = tagHome(tag, eligibility);
+                return (
+                  <li key={tag} className="flex min-w-0">
+                    <AgentTagChip name={tag} to={to ?? undefined} unknown={catalogs && !to} />
+                  </li>
+                );
+              })}
+            </ul>
+          )}
           {profile.skills.length > 0 && (
             <span
               className="text-ink-faint"
@@ -294,6 +406,14 @@ function Profile({ profile }: { profile: AgentCapabilities }) {
             </span>
           )}
         </div>
+      )}
+      {strays.length > 0 && (
+        <span className="text-ink-faint">
+          {strays.join(", ")} {strays.length === 1 ? "isn't" : "aren't"} in any of your trackers'
+          tag catalogs, so no issue is tagged {strays.length === 1 ? "with it" : "with them"}.
+          Rename with <code className="mk-mono">gm agent setup --drop-tag</code> and{" "}
+          <code className="mk-mono">--tag</code>.
+        </span>
       )}
     </div>
   );

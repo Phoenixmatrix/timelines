@@ -77,7 +77,40 @@ export interface Step {
   /** Deleted or redacted: the context is gone, the step stays. */
   deleted: boolean;
   context: StepContextBody;
+  /** What step runs of this commit produced, newest first (CORE-235). */
+  artifacts: StepArtifact[];
 }
+
+/** One job of a step run, in a test summary. */
+export interface StepJobResult {
+  name: string;
+  status: "succeeded" | "failed" | "cancelled" | "skipped";
+  exitCode: number | null;
+  durationMs: number | null;
+}
+
+/** A step run's results: the first artifact kind. */
+export interface StepTestSummary {
+  status: "succeeded" | "failed" | "cancelled";
+  passed: number;
+  failed: number;
+  jobs: StepJobResult[];
+}
+
+/**
+ * Something a step run produced, attached to the step by commit. A test
+ * summary carries its data inline; screenshots and documents (later) point at
+ * a stored object.
+ */
+export type StepArtifact = {
+  id: string;
+  runId: string;
+  runNumber: number;
+  createdAt: string;
+} & (
+  | { kind: "test-summary"; data: StepTestSummary }
+  | { kind: "screenshot" | "document"; data: Record<string, unknown>; url: string | null }
+);
 
 /** GET /api/repos/:owner/:name/steps: a page of steps, newest first. */
 export interface StepPage {
@@ -111,3 +144,33 @@ export const EMPTY_CONTEXT: StepContextBody = {
   harness: null,
   model: null,
 };
+
+/** The live feed keeps a record this many days at most (CORE-244: an account may keep fewer). */
+export const STEP_FEED_DAYS = 7;
+
+/** The placeholder retention leaves for trimmed instructions and steering (CORE-244). */
+export const TRIMMED_TEXT = "(Removed by retention.)";
+
+/**
+ * One record of a timeline's live feed (CORE-239): small, never the context
+ * itself. `seq` orders a feed; readers may see a record twice and dedupe by
+ * (repo, commitOid).
+ */
+export interface StepFeedRecord {
+  seq: number;
+  /** owner/name */
+  repo: string;
+  timeline: string;
+  changeId: string;
+  commitOid: string;
+  summary: string;
+  issue: string | null;
+  author: { id: string; kind: "agent" | "person"; name: string };
+  /** From the step's own tests: null when it reported none. */
+  tests: { passed: number; failed: number } | null;
+  /** The step's context said why: a first line, at most 200 characters. */
+  why: string;
+  committedAt: string;
+  /** When the feed received it. */
+  at: string;
+}

@@ -24,12 +24,15 @@ vp run agent up
 ```
 
 Use the origin printed by `up`. Setup builds the worktree's CLI, installs and
-checks Chromium, provisions dedicated Artifacts/Vectorize/AI Search resources,
-migrates both local D1 databases, and seeds deterministic Git/tracker fixtures.
-Use `vp run agent inspect` for data, `vp run agent test` for non-AI real-service
-E2E, and `vp run agent test-ai` when verifying knowledge/wiki/search capabilities.
-Automatic E2E provisions only Artifacts and disables background AI work; normal
-interactive setup remains AI-enabled. Use `vp run agent destroy` when finished.
+checks Chromium, provisions a dedicated Artifacts namespace, migrates both local
+D1 databases, and seeds deterministic Git/tracker fixtures. It provisions **no
+paid AI** (Workers AI, AI Gateway, Vectorize, AI Search) and starts no Knowledge
+builds; the app shows its AI-off states. `vp run agent setup --ai` adds them, for
+changes to knowledge, wiki, embeddings, AI Search, the assistant, release-note
+generation, avatars or Atlas descriptions only. Use `vp run agent inspect` for
+data, `vp run agent test` for non-AI real-service E2E, and `vp run agent test-ai`
+(targeted at the stages your change maps to) when verifying AI capabilities.
+Use `vp run agent destroy` when finished.
 Hourly cleanup and 24-hour expiry bound resource accumulation; see the root README
 for costs and failure recovery.
 
@@ -39,7 +42,7 @@ with the runtime imports in `shared/semantic/`: discovering another parser on
 first source navigation can reload the dev page and interrupt browser E2E.
 
 There is no local Artifacts, Workers AI, Vectorize or AI Search emulator.
-These bindings use real services; D1, Durable Objects and Workflows run locally
+These bindings (the AI ones only when opted in) use real services; D1, Durable Objects and Workflows run locally
 under the environment's `.gitmatrix-agent` state directory. The pinned Vite
 plugin v2 reads `cloudflare.config.ts` directly. A pinned Miniflare lifecycle
 patch makes local `cf d1` commands exit normally; do not terminate them early
@@ -47,7 +50,11 @@ after merely seeing output.
 
 The canonical source host remains a separate, owner-managed environment:
 from this directory, `vp run db:migrate`, `vp run db:seed` and `vp dev` use port 5180 and
-`.wrangler/state`. Feature agents must not reuse that state or test mutations
+`.wrangler/state`. Its AI is opt-in: plain `vp dev` binds no Workers AI, AI
+Gateway, Vectorize or AI Search and prints `AI is off` when it starts;
+`GITMATRIX_DEV_AI=enabled vp dev` binds the shared development resources
+(`gitmatrix-dev`, `gitmatrix-knowledge`, `gitmatrix`), and every repository
+pushed to it then gets paid Knowledge builds. Feature agents must not reuse that state or test mutations
 against it. **Load samples** creates four small empty named repositories;
 the agent harness fills them through real `gm` commits, without GitHub imports.
 
@@ -67,11 +74,16 @@ CI's test job runs them on every push. E2E runs only in `vp run ready` and
 When a UI behaviour can be checked against a canned or in-memory API, it's a
 browser-mode test, not an E2E step.
 
+The browser test server can choose the next available port, so separate agent
+worktrees do not compete for Vitest's default port. The application dev server
+still requires its configured isolated port.
+
 ### Browser-mode tests
 
 Vitest's browser mode runs these in headless Chromium (Playwright's headless
 shell, which `vp run agent setup` installs; elsewhere run
-`vp exec playwright install --only-shell chromium` in this package). Run one file with
+`vp exec playwright install --only-shell chromium` in this package). In CI the
+image already has it (see "CI image" under [CI/CD](#cicd)). Run one file with
 `vp test --project browser src/palette/Palette.browser.test.tsx`; add
 `--project unit` for the Node tests alone. The helpers are in `src/testing/`:
 
@@ -96,6 +108,13 @@ pattern, handler)`, a URLPattern pathname), then, with `{ world: true }`, to
   canned (`cannedFiles()` in `git.ts`). No model, index or CI runner exists
   there; the Knowledge coordinator is idle. `atlasFixtureRepo()` (`atlas.ts`)
   publishes the Atlas fixture the way the non-AI E2E does.
+- `server.sql()` writes the rows only machinery the world lacks would write
+  (CI runs and jobs, deployments, wiki page sets, the push log), as it would;
+  `server.registrySql()` does the same in the registry's database (feeds,
+  packages, publishes).
+  `timelines.ts` builds on it: a timeline across repositories with work on
+  its bookmarks, checkpoints, approval requests, those rows, and a merge
+  run's end that moves a real landing on (`mergeRunEnded`).
 - `press()`, `pressUntil()` and `tap()` (`focus.ts`) drive the keyboard and
   touch; `browserCommands.emulateMedia()` sets reduced motion or a colour
   scheme; `page.viewport(w, h)` resizes.
@@ -106,6 +125,28 @@ and `expect.poll(() => el.getAttribute(...)).toMatch(...)` for patterns.
 Pass a timeout to `expect.element(locator, { timeout })`, not the matcher.
 Locator text with an apostrophe is safer as a RegExp. Restore what a test
 changes in the page (viewport, theme, emulated media) in a `finally`.
+
+## Commit panel
+
+There is no commit page (CORE-22): any repository page with `?commit=<sha>`
+opens the commit as a side panel over it (`src/routes/repo/CommitPanel.tsx`,
+mounted in the repository layout), and `/<owner>/<repo>?commit=<sha>` opens
+it over the Code page from anywhere else. A short hash is resolved first.
+Closing it (Escape, ×) returns to the page: Back, when a link on the page
+opened it (parents opened from the panel are Back steps too); otherwise it
+drops the parameter. The page under it never reloads for the parameter
+(`keepPageUnderPanel` in `src/lib/commitPanel.ts`). Use `CommitLink` (or
+`commitPanelUrl` off repository pages) for SHA links.
+
+It reads, each independently, so one failing source doesn't hide the others:
+the commit and its changed files with stats (`/commits/:oid/diff`; the log
+for one too large to diff), CI runs (`/ci?commit=`), packages published
+(`/api/packages/-/published?commit=`), deployments (`/deployments?commit=`),
+who made it (the step's author, `/steps?commits=`), and the why chain
+(`/why?commit=`: change id, refs reached and who pushed, timelines, landing).
+Issue keys in the message link only when the resolver confirms an issue the
+viewer can open; others stay text. People link to their profiles; agents are
+named as text. "Browse files at this commit" opens the tree.
 
 ## File history
 
@@ -169,6 +210,7 @@ never shares data with `vp dev`. mail.fward.dev is enabled for Email Sending.
 - A Sandbox has no Docker, so CI reuses the deployed CI image
   (`GITMATRIX_CI_IMAGE`). A change under `ci/` fails the job after the rest has
   shipped: run `vp run deploy` here, which builds the image and tags the commit.
+  Jobs that start after cf's container rollout run in the new image.
 
 The job's `CLOUDFLARE_API_TOKEN` is a repository CI secret (`gm secret set`).
 
@@ -215,8 +257,11 @@ boundaries, and continue unrelated work only under its own valid claim.
 The queue pins the base and source, prepares an exact two-parent candidate, runs
 the configured required merge gates on that candidate, then advances main with
 compare-and-swap. Missing/invalid configuration, no runnable gates or skipped
-required jobs fail closed. If main moves, the candidate must be merged and tested
-again. Failed/cancelled entries release scheduling capacity; retry fences off old
+required jobs fail closed. Persisted job specifications retain their `on` trigger
+restrictions, so step-only and preview-only jobs stay excluded when landing gates
+are verified; a skipped job that does apply still blocks landing. If main moves,
+the candidate must be merged and tested again. Failed/cancelled entries release
+scheduling capacity; retry fences off old
 attempts. Post-landing main CI/deployment is tracked separately: failure creates
 remediation without changing the landed status or rewinding main.
 Notification retries do not block deployment startup or failure remediation.
@@ -307,6 +352,70 @@ Anyone who can read the repository reads its steps. A step is **verified** once
 a push has shown Gitmatrix its commit, at upload (from `change_refs`) or on a
 later push (`worker/ref-log/record.ts`); until then it's "local, unverified".
 Context is the agent's account, shown as such next to what Gitmatrix verifies.
+
+### The live feed
+
+Each repository's steps in a timeline also go out live (CORE-239): a
+`StepFeed` Durable Object per repository and timeline (`<repoId>:<slug>`,
+`worker/steps/feed.ts`, the PRD's fallback ahead of K2) gets a small record
+when a new step is uploaded (`StepFeedRecord`: repository, timeline, change,
+commit, summary, issue, author, test counts, the first line of its why, never
+the context itself). It keeps the newest 100 records for a week.
+
+`GET /api/repos/:o/:n/steps/live?timeline=<slug>` streams them as Server-Sent
+Events (`id: <seq>`, `event: step`, `data: <record>`): what the feed has after
+`Last-Event-ID` (or `?after=`), then each new step as it arrives, with a
+keepalive comment every 25 s. The route checks the reader can read the
+repository, as for every step read; a stream ends after ten minutes and the
+reconnect (with `Last-Event-ID`) is checked again, so lost access closes the
+feed within that time. Records come at least once: readers dedupe by
+(repository, commit).
+
+The timeline page's **Live now** (`src/routes/tracker/LiveNow.tsx`) reads each
+repository's feed with `fetch` (not `EventSource`), and shows each agent's
+latest step, its test result, how many steps since when and its why, linked
+into the story. `gm steps --follow` streams the same feed.
+
+### Keeping work context
+
+A step's why, challenges, tests and coverage are kept as long as the
+repository. Three data-retention categories (CORE-244; see "Retention
+categories" below) cover the rest, on the account's Data retention page:
+`step-steering` trims instructions and steering text to a placeholder a year
+after the step's commit (sources and times stay), `step-artifacts` removes
+step-run summaries after 90 days, and `step-feed` keeps live feed records up
+to 7 days (an account can keep fewer). Like every policy category, the first
+two run once an administrator turns them on.
+
+### Why on a line
+
+`GET /api/repos/:o/:n/why` adds each chain's `step` (CORE-243,
+`stepsFor` in `worker/steps/api.ts`): the step context of the chain's commit,
+else the newest step of its change, so a line keeps its step after a rebase
+and after landing. The file view's **Why?** panel shows it under **Step
+context** (who recorded it, why, challenges, steering coverage, tests) and
+links to the step in the timeline's story; `gm why` prints the same.
+
+### The story view
+
+A timeline's **Story** (`/tracker/:owner/timelines/:slug/story`, linked from
+the timeline page; `src/routes/tracker/Story.tsx`) lists its commits newest
+first along the first-parent line of `timeline/<slug>` (the last commits once
+abandoned, the landed head once landed) down to the fork point, merges marked.
+Each row shows the step's summary, agent, time, test result and how complete
+its context is. Opening one shows the commit's diff beside its why,
+instructions, steering, challenges and tests, with the missing-hook note when
+a harness hook didn't record them. `j`/`k` (or ←/→) step through, Escape
+closes; filters by agent and issue and the step itself live in the URL; an
+amended change offers its earlier versions. On a phone the list and the step
+take the screen in turn.
+
+It reads `history` for the line, `steps?commits=` for the context in batches
+of 100, and the diff from `GET /api/repos/:o/:n/commits/:oid/diff`: the
+commit against its first parent as hunks, bounded by `DIFF_LIMITS`
+(`shared/diff.ts`: 300 files listed, 60 patched, 256 KiB per side, 400 tree
+reads; binary and oversized files are counted without hunks). Diffs are
+addressed by commit, so they're cached as immutable.
 
 ## Profile pictures and organization icons
 
@@ -479,10 +588,38 @@ you were. It lists, in labelled groups:
   **Conversations**: from `/api/search` as you type (debounced; signed-in
   only). Issues show their key, status and tracker; packages their format and
   owner; choosing a conversation reopens it in the assistant.
+- **Find**: **Find a repository…**, **an issue…**, **a person or
+  organization…**, **a package…**, **a conversation…** narrow search to that one
+  category, with up to 20 results instead of 5.
 
+Before anything is typed (CORE-152), the places don't fill the list: it opens
+on **Go to…** (selected, so Enter opens it), then this repository's code
+search, the likeliest **Create issue**, the assistant and the Find entries.
+**Go to…** is a second step, like Raycast's: it lists every place, this
+repository's sections first, and filters them as you type. Typing at the top
+still reaches every place directly. Signed out, the few places are listed as
+they are. Each second step (Go to, Find, code and wiki) shows above the input;
+× or Backspace on an empty query goes back.
+
+- **Jump to** (CORE-22): a reference goes straight to its place, first and
+  selected: an issue key (`CORE-22`), a commit hash (7–40 hex: the commit
+  panel, over the page in its repository; outside one, in the repositories
+  visited recently), `#12` or `run 12` (a bare number in a repository) for
+  that CI run, `pkg@1.2.0` for that version in its package's console, and a
+  timeline's slug (or `timeline/<slug>`). `src/lib/resolveRefs.ts` is the one
+  place references resolve: issue keys, hashes (in this repository, or each
+  recently visited one) and packages (the page owner's) through
+  `POST /api/refs/resolve`, runs through the CI API, timelines from the
+  tracker's list;
+- **Recent**: with nothing typed, right under **Go to…** (which stays
+  selected), the last eight distinct places you opened (repositories, issues,
+  CI runs, packages, timelines, commits), newest first, kept per viewer in this browser's `localStorage`
+  (`src/lib/recentPlaces.ts`; nothing when storage is unavailable);
+- **Timelines**: the tracker in view's timelines, matched by name and slug;
 - **Or**: fallbacks that act on what you typed, such as **Create issue “…”**,
   which proposes the text as a title in the current tracker (else the one
-  `/tracker` opens, else your own; the hint names it). Fallbacks come last and
+  `/tracker` opens, else your own; the hint names it), but never a reference
+  (a hash, an issue key, `#12`, `pkg@1.0`). Fallbacks come last and
   are never selected by default, so Enter on a search opens a result. **Ask
   Gitmatrix “…”** (CORE-96) submits the text to the assistant in a new
   conversation and opens it; it's the only palette action that reaches a model,
@@ -584,6 +721,66 @@ AI Search. The contract is `shared/search.ts`; each category is a provider in
 - **Failures stay local.** A category that throws or takes over 5 seconds
   comes back `{status: "unavailable", error}`, which is not "no matches", and
   the other groups are unaffected.
+
+## References in text
+
+Issue keys (`CORE-12`), this deployment's tracker issue URLs, commit hashes,
+`owner/repo` and `pkg@version` become links wherever people read text
+(CORE-22): commit titles (history, the file list), CI run titles and logs
+(hashes only), release-note titles and summaries, issue and comment
+Markdown, READMEs, wiki pages and assistant answers. Code (inline and
+fenced) is never touched, and nothing inside another address is a ref.
+
+**Only the server decides.** `shared/refs.ts` finds candidates;
+`POST /api/refs/resolve` (`worker/refs/`) answers for the viewer:
+
+```jsonc
+// request: at most 100 refs of at most 300 characters
+{ "refs": ["CORE-12", "3f2a9c1", "orbit/engine"], "context": { "owner": "orbit", "repo": "engine", "tracker": "orbit" } }
+// response: one result per ref, in order
+{ "results": [
+  { "ref": "CORE-12", "status": "resolved", "target": { "kind": "issue", "path": "/tracker/orbit/issues/…", "label": "CORE-12 · Title", "tracker": "orbit", "id": "…", "key": "CORE-12", "title": "…", "status": "todo" } },
+  { "ref": "3f2a9c1", "status": "resolved", "target": { "kind": "commit", "path": "/orbit/engine?commit=<40 hex>", "label": "…", "owner": "orbit", "repo": "engine", "sha": "<40 hex>" } },
+  { "ref": "orbit/engine", "status": "unresolved" } // or "ambiguous", with "candidates"
+] }
+```
+
+- **Issue keys** link only to an issue in a Gitmatrix tracker the viewer
+  belongs to. The page's tracker (`context.tracker`) is asked first, then the
+  trackers subscribed to the page's repository (and its owner's), then the
+  viewer's others (at most 25). The first tier with a match decides; two
+  matches there are `ambiguous` and render as a small chooser. A key nobody's
+  tracker has (`JIRA-9`, `UTF-8`) stays exactly as written: no dead links and
+  no guessing at external trackers.
+- **Tracker URLs** count only on this deployment's origins (`PUBLIC_URL` and
+  the request's), and only in the tracker they name. One of ours the viewer
+  can't open is `unresolved` with `ours: true` and reads as plain text; other
+  domains stay the links they were.
+- **Hashes** need a repository in context the viewer can read. A full hash
+  must name a commit; a short one (7 to 39 hex digits, at least one letter and
+  one digit) must prefix exactly one commit among the branch and tag tips, the
+  repository's CI runs and its latest 200 default-branch commits (Artifacts
+  can't expand an abbreviation). A hash opens the commit panel: inside the
+  repository, the current page with `?commit=<full hash>` (other parameters
+  kept), elsewhere `/<owner>/<repo>?commit=<full hash>`.
+- **`owner/repo`** must be readable; **`pkg@version`** looks in
+  `context.owner`'s feeds the registry lets the viewer read (the same name in
+  two formats is `ambiguous`).
+
+Responses are `private, no-store`; each request reads every tracker,
+repository and feed once. The client (`src/refs/`) takes the context from the
+address, batches every ref a render asks about into one request per context,
+and keeps answers for a minute (failures for ten seconds). Text renders at
+once and only gains link styling when the answer arrives; a failure leaves it
+as text. `LinkedText` is the plain-text linkifier, `useRefMarkdown` the remark
+plugin plus its `gm-ref` component.
+
+`/-/go/<ref>` (with optional `?owner=&repo=&tracker=`) opens whatever a ref
+names, for plain-text contexts and the palette: one match redirects, several
+get a chooser, none says so. `GET /api/refs/go/<ref>` is the same for scripts:
+a 302 to the target (or to `/-/go/` when it's ambiguous or unresolved), or the
+result as JSON with `Accept: application/json` or `?format=json` (404 when
+unresolved). `/go/` itself belongs to the Go module proxy.
 
 ## Semantic changes
 
@@ -726,14 +923,48 @@ quality and real-service E2E gate in addition to this semantic-specific smoke.
 ## Distributed issue tracker
 
 Open `/tracker` from the global navigation. Select an account, create a team,
-and capture a title-only issue with **Create**. For more context up front, choose
-**Add details**: the dialog carries over the title, selected team and current
-workspace scope, and lets you set a Markdown description, type, status, priority,
-assignee and workspaces. **Create and edit** saves the issue and immediately
-opens the existing editor for acceptance criteria, labels and relationships,
+and capture an issue with the default **Create** action. The compact type selector
+supports Bug, Research / investigation, and the other existing issue types.
+Prefix a title with `(tag)`, or several `(tag) (another tag)` groups, to apply
+catalog tags without retaining the prefixes in the title. Matching ignores case
+and reuses the catalog spelling. Unknown tags offer **Define tag**; creation
+waits until those definitions are accepted. Definitions remain drafts until the
+issue saves successfully. Parentheses elsewhere remain ordinary title text.
+The adjacent arrow opens **Add details**: the dialog carries the parsed title,
+tags, type, selected team and workspace scope, and adds a Markdown description,
+status, priority and assignee. **Create and edit** saves the issue and immediately
+opens the existing editor for acceptance criteria, tags and relationships,
 including from the blocker graph. Rejected submissions keep the draft; an
 unconfirmed submission stays open with an idempotent retry rather than creating
 another issue.
+
+The **Tags** picker searches the tracker's **tag catalog** and offers **Create tag**
+for a new name. Selecting or removing a tag in the issue editor saves immediately;
+in the creation dialog it remains part of the unsaved draft. Names are 1–100
+characters without NUL. Definitions persist after their last issue assignment is
+removed, and include tags used in timelines.
+
+**One vocabulary, three roles (CORE-271).** The catalog is the tracker's
+work-area vocabulary (`ux`, `data`, `frontend`…). An _issue's tags_ say what the
+work is about; an _agent's tags_ (`gm agent setup --tag ux`) say what work it
+suits and are chosen from the same catalog; a _requirement_ `tag:ux` means only
+agents tagged ux may claim the issue. In search, `tag:ux` means issues tagged ux,
+so `tag:ux` always reads "has tag ux" for whatever is filtered or claimed.
+Tagging an issue never restricts it by itself. Unknown names in agent tags or
+`tag:` requirements warn (gm, the inspector) and are kept, never refused. Git
+tags keep their own word on release pages ("Tagged releases"), and package
+dist-tags keep "tag" inside package screens.
+
+Old spellings keep working: the stored field and the snapshot catalog are still
+`labels` (the `tracker_labels` table is unchanged, so replicas sync as before);
+writes accept `tags` as well as `labels` (both at once must agree); the query
+term `label:` is an alias of `tag:` (also `labels:`/`tags:`), in the tracker and
+the release feed; `gm issue create|update --label` is an alias of `--tag`; the
+assistant's `labels`/`label` parameters are aliases of `tags`/`tag`; the release
+feed's `facets.labels` repeats `facets.tags`. Before CORE-271 the release feed
+read `tag:` as `release:`; `tag:day:…`, and a `tag:` naming a release the feed
+has, still do. `GET /api/tracker/:owner/tags` lists the catalog with counts
+(`{tags: [{name, issues, open}]}`) and `gm issue tags` prints it from the replica.
 
 The workbench keeps the list, board or blocker graph beside the selected issue;
 phones navigate from the list into detail. Expand a ticket into a Markdown PRD,
@@ -744,6 +975,23 @@ The search bar's **Clear search** (×) button clears both typed text and applied
 query filters immediately, shows all issues, and returns focus to the input.
 It preserves the selected layout and sort, and the empty query survives reload.
 The button disappears when both the input and applied query are empty.
+
+Bare ticket numbers match the exact issue number across teams (`223` does not
+match `2230` or a title mentioning 223); full keys such as `CORE-223` match only
+that key, case-insensitively. Other words and quoted phrases such as
+`"release notes"` search keys, titles and tags. Quoting a number or full key
+does not turn off exact ticket matching. Existing filters still apply, and a
+leading `-` excludes a match.
+
+Same-origin absolute links in tracker Markdown navigate within the app without
+a full reload. External links and modified clicks keep normal browser behavior;
+relative links and fragment links remain native anchors.
+
+Assignee facets select exactly that actor's issues: people use their account
+slug, while agents use their stable ID (`assignee:agt_…`). Agents with the same
+name but different accountable people remain distinct. `assignee:me` selects
+the signed-in identity and `assignee:none` selects unassigned issues; other
+active filters still apply.
 
 Use **Close issue** when work will not be completed. Choose Duplicate, Not planned,
 No longer needed, Cannot reproduce, or Other, then **Confirm close**. This saves
@@ -789,19 +1037,35 @@ read as `agent_decides`.
   without requiring a focus change or a resize.
 - **Coordination:** ready work is unblocked, unclaimed `todo` (or an expired
   claimed `in_progress` issue) with no open sub-issues, no other active lease
-  above it, and nothing waiting on a person (`readiness` in `shared/tracker.ts`,
-  mirrored by gm). Exclusive claims require an online transaction. Renew,
+  above it, nothing waiting on a person, and pickup permitted for the acting identity
+  (`readiness` in `shared/tracker.ts`, mirrored by gm). Exclusive claims require an online transaction. Renew,
   release and complete require the unexpired fencing token; completion also
   records evidence, rechecks blockers and refuses parents with open sub-issues.
   Tokens never appear in public snapshots or event feeds.
   Granting a lease also assigns an unassigned issue to its holder's identity in
   the same transaction and audit event. Delegated claims use the receiving
-  agent, not the delegator or session label. Existing assignees are preserved,
+  agent, not the delegator or session name. Existing assignees are preserved,
   including on renewal, handoff and takeover; ending a lease does not clear assignment.
   Lease grants use the same assignee validation as issue edits: the assignee
   (or an agent's accountable person) must be an account member and belong to any
   restricted owning team. Admin write access does not waive this requirement.
   Invalid assignments reject the claim atomically without changing the issue or lease.
+- **Pickup (CORE-49):** each issue has a global `pickup` policy, independent of
+  status and timeline: `anyone` (also the legacy default), `not_ready` (nobody
+  may start), or `human_only` (authenticated people, never agents). Choose
+  **Pickup** in **Add details** before creation or in **Edit issue** afterward;
+  edits autosave. Quick title-only capture uses Anyone. CLI create/update take
+  `--pickup anyone|not_ready|human_only`.
+  Ready lists exclude restricted issues for agents; `is:not_ready` and
+  `is:human_only` expose them explicitly. Human-only work remains available to a
+  person's `issue.next`. Explicit assignment, capabilities, session labels and
+  delegated claims do not bypass this policy. The server enforces it on claims,
+  renewal, resume, handoff, completion and direct work-status transitions.
+  Agents may restrict open pickup but cannot change an existing restricted
+  policy; a person must re-enable it. Incompatible active claims must be released
+  before restricting pickup; retained timeline claims must land or be abandoned.
+  Offline edits are advisory until server synchronization; rejected batches
+  remain explicit conflicts rather than silently granting access.
 - **Graph engineering (CORE-4):** agents work through issue graphs on their own.
   - _Agents_ are identities a person creates (Settings > Agents, `gm agent`); they
     act with their person's access but everything is attributed to the agent, and
@@ -812,7 +1076,8 @@ read as `agent_decides`.
     `show [NAME]` and `list --owner OWNER` expose profiles for human/agent choice.
     Tracker snapshots include member-accountable agents' capabilities, report
     timestamps and revocation state, but never their tokens. Capabilities do not
-    alter membership, assignment or lease authorization.
+    alter membership or permissions; they only decide eligibility for issues
+    with requirements (below).
     `GET /api/agents/:id` (`self` for an agent token) reads an owned profile;
     `PUT /api/agents/:id/capabilities` replaces its version-1 report. An agent's
     write token may update only itself; read tokens cannot update profiles.
@@ -822,8 +1087,52 @@ read as `agent_decides`.
     See the [CLI profile workflow](../cli/README.md#agent-capability-profiles)
     for detection limits, declaration replacement and privacy.
   - `issue.next` (`gm issue next`) picks and claims in one step: priority, then
-    the most open work transitively unblocked, then age; it skips PRDs and other
-    people's assignments.
+    the most open work transitively unblocked, then age; it skips PRDs, other
+    people's assignments, pickup restrictions and requirements the agent doesn't meet.
+  - _Requirements (CORE-32)_ say which agents may claim an issue: `requires`
+    on `issue.create`/`issue.update` (null clears; recorded in history like any
+    field) holds `tags` and `skills` (every one), `models`, `harnesses`, `os`,
+    `arch` and `runtime` (any one; `*` wildcards; all case-insensitive),
+    `minMemory` (bytes) and `minCpus`. `shared/requirements.ts` parses the text
+    form (`tag:ux model:claude-opus-* memory>=16GiB cpus>=8`, used by gm, the
+    inspector and the assistant) and matches it against the agent's reported
+    capabilities; issues without the field behave as before, and old replicas
+    ignore it. An agent that doesn't meet them can't `issue.claim` the issue,
+    isn't offered it (`issue.offer` to it, `issue.accept` by it) and `issue.next`
+    passes it over, reporting `skipped: {requirements, keys, message}`. Refusals
+    are 409 `requirements_unmet` with one `unmet` entry per requirement; an
+    agent with no reported capabilities is told to run `gm agent setup`.
+    People bypass capability requirements, not pickup or readiness rules. Assigning
+    an agent that doesn't meet them takes a person, the tracker owner or the agent's
+    accountable person; assignment overrides capabilities only. The inspector shows the mismatch. This is
+    eligibility, not authorization: capabilities are self-reported, and
+    permissions apply as before. The inspector edits requirements as chips and
+    lists each agent's eligibility; list and board rows mark them; the query
+    terms are `requires:ux` (`requires:tag:ux`, `requires:none`) and
+    `eligible:<agent>` (`eligible:me` for the acting agent). Settings > Agents
+    shows each agent's eligible open work per tracker (`GET /api/agent-eligibility`).
+  - _Requirements usability (CORE-272)._ The create dialog edits requirements with
+    the inspector's editor, and both offer **Require agents tagged with this
+    issue's tags** (`gm issue update --require-issue-tags`). **Tightening a claimed
+    issue is never silent:** when new `requires` no longer allow the agent holding
+    it (`tighteningEffect` in `shared/tracker-query.ts`, the same on both sides),
+    the inspector asks first, naming the holder, its session and what it misses,
+    and offers **Release the claim** or **Keep it**. `issue.update` then reports
+    `results[].claimEffect {actorId, agent, session, unmet, released}` and adds a
+    comment recording either choice. `releaseClaim: true` releases it (the issue
+    goes back to `todo`, unassigned from that agent so `next` does not hand it back); only a tracker owner or the agent's accountable person,
+    acting as themselves, may (403 otherwise). Without it the claim is kept. A
+    claim's own assignment doesn't exempt its holder here; people's claims are
+    never affected. gm prints the effect and takes `--release-claim`, and the
+    assistant's `update_issue` reports it and takes `releaseClaim`. List rows show
+    up to two issue tags (a `+N` for the rest) and board cards one; the
+    `requires` mark's tooltip and accessible name read plainly ("Only agents
+    tagged ux and with model claude-opus-*", `requirementsSentence`). The
+    inspector's eligible-agents list adds the profile change that would meet
+    each mismatch (`profileFix`), Settings > Agents lists a few issues each agent
+    can take now (`AgentWork.takeable`), and `issue.next` adds
+    `skipped.blocking` (the terms that kept the most issues) with the
+    `gm agent setup` flag that would meet them in its message.
   - _A lease covers its subtree._ Claiming a parent (allowed even with open
     sub-issues, which are never offered as work themselves) excludes everyone else
     below it; status and parent changes there need the covering token. The holder
@@ -927,7 +1236,7 @@ read as `agent_decides`.
   even after the editor closes. Preview controls remain usable, and typing during
   a pending save keeps newer text until its own versioned save completes.
   The complete **Edit issue** form stays open while moving between fields.
-  Text fields (including labels) save on blur; selects, the parent picker, and
+  Text fields save on blur; tag selection/removal, selects, the parent picker, and
   workspace checkboxes save immediately. Saves are serialized, preserving edits
   made while an earlier request is running, including when **Done** closes the
   form before either request finishes. The editor shows Updating, Updated, or
@@ -949,7 +1258,7 @@ read as `agent_decides`.
   status and parent relationships still resolve and enforce covering leases.
 - **Browser conflicts:** drafts persist for the tab session. Review named fields,
   choose individual remote values, then explicitly rebase; untouched remote
-  fields are retained. Labels and workspace membership compare as sets, so
+  fields are retained. Tags and workspace membership compare as sets, so
   reordering does not overwrite another person's changes. Errors remain beside
   the failed action. A known conflict is reported immediately, without waiting
   for the background refresh that supplies newer comparison fields.
@@ -1023,6 +1332,44 @@ linked work in `worker/tracker/work.ts`.
   `step_contexts_issue`), release-note entries by tracker and key
   (`release_note_entries_issue`); runs, deployments and packages by the
   commits found. Each list holds at most 50 items (`truncated`).
+- **Mentions** (CORE-22, `mentions` in the response) are commits whose
+  message names the issue's key, kept apart from that evidence: the issue
+  page and the inspector label them "Mentioned in". After each push the push
+  log's commit read (`worker/ref-log/record.ts`) feeds `worker/mentions`,
+  which resolves each key (`issueKeys()`) to a Gitmatrix tracker issue: first
+  trackers whose workspaces subscribe to the repository, then the owner's,
+  then (for a person's repository) their organizations'. Within a tier the
+  owner's tracker breaks a tie; otherwise the key is recorded `ambiguous` and
+  links nothing, and keys no tracker knows aren't recorded. Rows
+  (`commit_issue_mentions`) are one per repository, commit and key, keep
+  their first ref and time, and are listed by issue id in any repository the
+  viewer can read, with their own CI runs and packages; each SHA opens the
+  commit panel (`/<owner>/<repo>?commit=<sha>`). History pushed before the
+  index is read by the hourly cron: 20 repositories a run, the latest 200
+  first-parent commits of each default branch, once per repository
+  (`commit_mention_backfills`). Release notes resolve keys no subscribed
+  workspace covers through the same tiers (`repoIssues()`).
+
+**The view** (`/tracker/:owner?view=chronicle`, CORE-251; `src/routes/tracker/Chronicle*.tsx`,
+pure model in `chronicleModel.ts`): presets, zoom, group by and layout over the
+query bar; a brushable density overview; a canvas ruler and lanes (status,
+work spans, markers) with the playhead and a selectable range; the range
+summary or, for a selected issue or span, the inspector with linked work. The
+address holds `from`, `to`, `at` (the playhead), `rs`/`re` (a selected range),
+`span`, `group=team` and `layout=list`. It reads pages of `/chronicle` for a
+range half a window wider on each side, at most 10 pages, and never the
+change feed. Phones get the List layout, the accessible equivalent of the
+canvas. Design: root `DESIGN.md`, "Chronicle (time axis)".
+
+**Development history:** `POST /api/dev/chronicle {account, team, issues?, days?, seed?, link?}`
+(agent secret) makes `issues` issues of a new team worked by the account's
+people and a "builder" agent over `days`, through real tracker mutations
+under a controlled clock (`worker/tracker/chronicle-fixture.ts`). With
+`link: {repo: "owner/name", commit}` the showcase issue (its first) gets a
+step context at that commit and a release-note entry naming it, as the
+generator would store them, so its linked work reaches a real commit and its
+CI runs. E2E `browser-chronicle-scrub-range-span-and-links`
+(`tools/agent/chronicle-e2e.ts`) checks the page against the API's own answer.
 
 ### Timelines
 
@@ -1183,7 +1530,7 @@ shared fields (version, claim, assignee, waiting), and something only a
 timeline has is absent (`entity: null`). A timeline's view
 (`GET …/snapshot?timeline=<slug>`, `?tl=<slug>` in the web app, `--timeline`
 or `GM_TIMELINE` in gm) is main's with the scoped fields (title, description,
-acceptance, type, status, close reason, priority, parent, workspaces, labels)
+acceptance, type, status, close reason, priority, parent, workspaces, tags)
 and the links and comments of the timeline, its ancestors and the timelines
 merged into them replayed on top in event order. `issue.next` in a timeline
 picks from its view. Landing folds a timeline into main's tables as
@@ -1353,18 +1700,25 @@ shown only to viewers who can read every tracker that shaped it.
 **Team and organization views** (`worker/release-notes/feed.ts`): a tracker
 account's **Release notes** page (`/tracker/:owner/releases`, a place in the
 navigation rail; `/release-notes` opens your default tracker's) defaults to daily changes in its repositories and changes citing
-its teams' issues, ordered by `lastCommitAt` and grouped into UTC weeks. Named
-tags do not duplicate entries in the default feed. An explicit `kind:tag` or
-positive `release:` filter selects named snapshots when requested; `kind:daily`
+its teams' issues, ordered by `lastCommitAt` and grouped into UTC weeks. Tagged
+releases do not duplicate entries in the default feed. An explicit `kind:tag` or
+positive `release:` filter selects tagged releases (the "Tagged releases" chip) when requested; `kind:daily`
 selects daily history. An issue may have distinct updates on several days.
 A team's notes use `team:KEY`. Other filters are `repo:` (name or owner/name),
-`ws:`, `type:` (feature, fix, improvement, internal), `label:`,
+`ws:`, `type:` (feature, fix, improvement, internal), `tag:` (issue tags;
+`label:` is the old spelling),
 `release:` (a literal tag or `day:YYYY-MM-DD`), `timeline:` (what landed with
 `timeline/<slug>`), `since:`/`until:` (a date or `30d`,
 `2w`, `12h`), search words, and `-` to exclude; unknown tokens are reported back.
 Facets count the matching entries. It requires membership in the tracker
 account, and also applies repository visibility and per-entry tracker access.
 `gm release feed [QUERY] [--team KEY] [--owner OWNER]` is the CLI equivalent.
+
+The issue tracker's header shortcut carries its current single-team scope,
+including a saved default team; explicit URL filters take precedence. It drops
+issue-only filters so completed work is included. With no single team selected,
+the shortcut opens all account notes. The navigation rail always opens the
+account-wide feed.
 
 Real-provider coverage in `vp run agent test-ai` checks daily generation without
 tags, a second commit on a different UTC committer date despite unchanged
@@ -1411,7 +1765,18 @@ release introductions. Embedding models and dimensions remain fixed.
 
 `GET/PATCH /api/accounts/:slug/settings/ai` returns features, selected option IDs,
 the catalog, save provenance and `canManage`. PATCH accepts partial nested
-`features` and `models` objects; unknown keys and out-of-role model IDs are rejected.
+`features`, `models` and `knowledgeUpdates` (`quietMinutes`, `maxWaitMinutes`,
+whole minutes 0–1440) objects; unknown keys, out-of-role model IDs and other
+waits are rejected.
+PATCH also accepts `logBodies` (`{<component>: true|false|null}`, null removes the
+account's override): whether AI Gateway logs keep request and response bodies for
+the account's calls (CORE-290). The view's `logBodies` lists each component's site
+value, the account's override and the effective value, with the retention note.
+The site default is `GET/PATCH /api/admin/ai` (`{logBodies}`; site administrators,
+people only to change; null returns a component to the environment's default) and
+the **Site AI settings** page (`/settings/site-ai`). Tables: `site_ai_log_bodies`,
+`account_ai_log_bodies`; `worker/ai-gateway.ts` resolves them per call from a
+once-a-minute isolate cache.
 The [CLI equivalent](../cli/README.md#automatic-ai-settings) is `gm settings ai`.
 
 Policy is frozen when a Workflow is admitted or a release generation captures its
@@ -1436,10 +1801,16 @@ AI behavior is verified on demand, not by automatic CI. Follow the repository's
 and run `vp run agent test-ai` for real build/graph/wiki/Vectorize/AI Search evidence.
 The isolated non-AI test mode omits provider bindings, suppresses background builds,
 and rejects explicit rebuild/search with 503; production behavior is unchanged.
+Use `vp run agent test-ai --all` for a fresh check of the entire provider
+surface rather than only the stages selected by changed paths. Atlas evidence
+retains build statistics and the structural graph before membership assertions;
+description citations must belong to the capability's actual primary members
+and retain their exact commit and blob provenance.
 
 ```
 push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
-                       debounce 1.5s (max 8s), one build in flight, rebuild if dirty
+                       main's pushes pending until they settle (10 min quiet, 30 min at most),
+                       one update in flight, at the latest head
                      ─▶ KnowledgeBuild (Workflow, durable retried steps)
    snapshot ─▶ analyze ─▶ graph ─▶ align ─▶ concepts ─▶ synthesize ─▶ review ─▶ graph-final ─▶ index ─▶ wiki ─▶ finish
                  │           │        │          │            │                         │        │
@@ -1448,6 +1819,48 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
                                                       links, trim)                                         clef gate)
 ```
 
+- **Batched, asynchronous updates** (CORE-286). A push to main marks the
+  repository's Knowledge pending: the coordinator records main's new head, how
+  many pushes are waiting and when the first and last came. One update then
+  runs at the latest head once pushes have paused for the account's quiet
+  period, and never later than its longest wait after the first pending push
+  (10 and 30 minutes by default; `knowledgeUpdates` in the account's AI
+  settings, 0–1440 minutes each; development environments shorten both with
+  `GITMATRIX_KNOWLEDGE_QUIET_SECONDS` / `GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS`).
+  Pushes during an update wait for their own window. A repository's first
+  build, an explicit rebuild and a watchdog retry start at once, and a
+  repository admin can start the pending update now (`POST …/knowledge/update`,
+  the Knowledge tab's **Update now**). Timeline overlays and page sets keep
+  their own short debounce. The status says what Knowledge reflects:
+  `pending: {pushes, since, dueAt}` beside `indexedCommit` ("Reflects abc1234 ·
+  3 pushes pending · update at ~14:05").
+- **Updates, not rebuilds** (CORE-286). An update is driven by the diff from
+  the indexed commit: it reads only the trees that changed (an unchanged
+  subtree's files are the indexed ones), analyzes only new blobs, and every
+  model decision after that is reused unless its inputs changed: concept pairs
+  (by pair), salience (by the group's names and files), definitions (by the
+  concept's name, aliases and the files it is defined from, in its
+  repository; not by their summaries, which change wording on every edit),
+  reviews (by both entries), component and overview syntheses and wiki pages
+  (by their inputs hash). Pairs are decided over the whole repository's
+  candidates, so a newcomer that becomes one of an established concept's
+  closest is asked about too; names are embedded only when the set of concepts
+  changed. Review rounds run until nothing is left to ask, so one update
+  settles what its own push changed. Vectors follow the graph's change feed,
+  search items their blob or page versions, the Atlas its feed (CORE-166), and
+  only changed concept rows are written. A **full rebuild** (`POST
+…/knowledge/rebuild`, a repository's first build, or a new pipeline version
+  `kg_state.pipeline`) runs every phase over the whole repository, still
+  reusing decisions whose inputs are unchanged, and re-embeds every node.
+  `worker/knowledge/incremental.test.ts` builds one history twice through the
+  real Workflow with deterministic models, updates on one side and full
+  rebuilds on the other, and requires identical Knowledge after every push.
+- **Per-build AI cost** (CORE-286). Each step meters its model calls into its
+  build (`kg_builds.ai_usage`, by model, retried calls included); the build's
+  stats get `aiUsage` (calls, tokens, list-price cost by model) and `mode`
+  (`update` or `full`, with `fullBecause`), `pushes` and `treesRead`. The usage
+  report adds a **Knowledge updates** section: updates and full rebuilds over
+  30 days, their calls, cost each and the costliest repositories.
 - **Analysis per content, not per commit.** Each file version (blob) is
   analyzed once: exact structure from regex extractors (imports, symbols,
   resolved file/package edges), its role from the Classification model, and a
@@ -1476,7 +1889,9 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   (3+ files always stay); the rest become `topics` on their files. Once kept
   concepts have definitions, their related pairs are asked again with the
   definitions (`review`), which settles many that names alone left in between.
-  Decisions are stored, so a push only asks about the concepts it introduced.
+  Decisions are stored, so an update only asks about pairs it has never
+  decided: the concepts its push introduced and the neighbours whose closest
+  candidates they changed.
   The wording was picked on hand-labelled samples from this repo: the glossary
   framing with file paths ranked pairs best (AUC 0.94 vs 0.85 for the recipe's
   wording; file summaries made it worse) with all level-2 merges correct; the
@@ -1491,9 +1906,32 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
 - **Historical Clef/Qwen latency** on this repo: a 2-file push updated the graph
   in ~14s, summaries in ~40s, search in ~60s and the affected wiki page in ~90s.
   A first build of ~100 files took ~13 minutes (mostly writing every page once).
-- **Robustness:** model calls have deadlines and back off on Workers AI rate
-  limits; a failed file is retried next build; the coordinator's watchdog
-  stops a hung build and retries it once.
+- **Robustness:** model calls have deadlines by job (writing 180 s, fast
+  90 s, classification 60 s; a call past its deadline is aborted, though the
+  provider may still bill it) and back off on Workers AI rate limits (at most
+  six retries); a failed file is retried next build; the coordinator's
+  watchdog stops a hung build and retries it once.
+- **Paid work stops (CORE-285, `paid-work.ts`, `paid-steps.ts`):** each
+  Workflow step re-enters the build's metering context (AsyncLocalStorage
+  doesn't cross `step.do`), so its calls record in `ai_usage` for the
+  repository owner, not as `unattributed`. No call starts after a step
+  attempt's timeout (in-flight calls are aborted: the runtime has retried the
+  step), or once main's build is no longer `running` (the watchdog stopped it,
+  it failed, or the repository is being deleted), which fails the step without
+  retries. The watchdog terminates any instance it gives up on unless it
+  already ended, even when only its status was unreadable. A failed batch of
+  model calls starts nothing more and waits for those in flight.
+- **Metering matches the Gateway:** every call's AI Gateway log carries the
+  `account` and `feature` it is recorded under; failed attempts (rate limits,
+  timeouts, stops) count in `ai_usage.failed_calls`. `test-ai` reconciles the
+  fixture owner's `ai_usage` with the owned gateway's logs per feature and
+  model (`tools/agent/usage-reconciliation.ts`). Pagination follows the raw
+  provider page size, not the filtered count: sparse or empty filtered pages
+  must not truncate the audit. When comparing with the
+  account meter (`events.aiInference`), use plain `count()` and
+  `sum(neurons)`: that dataset is adaptively sampled and its aggregates are
+  already weighted by `sampleInterval`. Multiplying by it again squares the
+  weight, which overstated spend about 7× in CORE-284.
 - **Timeline overlays** (`worker/knowledge/overlay.ts`, CORE-83): a push to an
   owned work source recomputes that timeline's graph diff against main's indexed
   graph using its explicit logical-base/source snapshot. `timeline/<slug>` is
@@ -1895,7 +2333,8 @@ The model catalog lives in `shared/ai.ts`; provider adapters live in
 
 Repositories declare a pipeline in `.gitmatrix/ci.yml`; every push that moves
 a matching branch starts a run (also: the Run button, `gm runs start`, re-runs,
-and [preview runs](#the-preview-contract) for projects that opt in).
+and, for projects that opt in, [preview runs](#the-preview-contract) and
+[step runs](#step-runs)).
 
 ```yaml
 on:
@@ -1910,7 +2349,7 @@ jobs:
       - run: vp test
   deploy:
     needs: [test] # runs only if test succeeded
-    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger (push, manual, preview, landing), commit, runner, action
+    if: branch == "main" # ==, !=, &&, ||, () over branch, trigger (push, manual, preview, landing, step), commit, runner, action
     secrets: [CLOUDFLARE_API_TOKEN] # `gm secret set`, masked in logs
     timeout_minutes: 15 # default 20
     instance: standard-2 # sandbox size (default standard-1)
@@ -1930,7 +2369,8 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
 ```
 
 - **Runners.** Deployed, jobs run in Cloudflare Sandbox containers (image
-  `ci/Dockerfile`: Node 24, pnpm, Vite+, Rust, git). Under `vp dev` they run on
+  `ci/Dockerfile`: Node 24, pnpm, Vite+, Rust, git, and Chromium's headless
+  shell; see "CI image" below). Under `vp dev` they run on
   this machine instead, so development doesn't start paid containers, and
   they come and go the same way: when the CI Workflow queues a job it pings
   the dev server (`CI_DISPATCH_URL`), whose `vite/ci-runners.ts` plugin starts
@@ -1955,7 +2395,27 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   gate. No job consumes another's artifacts, and keeping them in one stage avoids
   a scheduler barrier. Real AI verification is an explicit agent command.
   Checkpoints of a timeline get a preview of the app
-  ([Gitmatrix's own previews](#gitmatrixs-own-previews)).
+  ([Gitmatrix's own previews](#gitmatrixs-own-previews)). Each push to a
+  timeline also gets a [step run](#step-runs) of just `step-check` (`vp check`:
+  format, lint, types) and `step-unit` (the website's unit tests related to the
+  step's changes, `vp test run --project unit --changed`), about 25 s locally;
+  `gm test` runs the same two jobs before `gm step` commits.
+- **CI image.** Besides the toolchains, `ci/Dockerfile` bakes Chromium's
+  headless shell for the browser-mode tests (CORE-248), with its system
+  libraries, at its `PLAYWRIGHT_VERSION`: about 540 MB of the image (260 MB
+  browser, the rest libraries and fonts). Browsers live in
+  `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, and `/root/.cache/ms-playwright`
+  links there for processes that don't inherit the variable;
+  `/usr/local/share/playwright-deps/<version>` marks the version whose libraries
+  are installed. The test job's "Chromium for browser-mode tests" step then
+  takes under a second: it skips `playwright install-deps` when the marker
+  matches the lockfile's Playwright, and `playwright install --only-shell`
+  finds the revision present. On an older image (a Playwright upgrade that
+  hasn't been deployed yet) the same step installs the libraries and fetches
+  the browser, about 20 s. A local runner isn't root, never installs
+  libraries, and uses the user's cache. `tools/agent/ci-image.test.ts` fails
+  when the ARG and `pnpm-lock.yaml` disagree, so a Playwright upgrade bumps
+  both and then needs `vp run deploy` from a machine with Docker.
 - **Both runners report the same way** (`worker/ci/jobs.ts`): batched log
   chunks, step transitions, the end. Secret values are masked server-side; a
   cancelled job is told so in the reply to its next report and kills its
@@ -1964,13 +2424,81 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   non-zero with the failing job named; `gm runs logs --job <name>` has the output.
 - **Job variables.** `CI`, `GITMATRIX`, `GITMATRIX_REPOSITORY`, `GITMATRIX_BRANCH`,
   `GITMATRIX_COMMIT`, `GITMATRIX_RUN_NUMBER`, `GITMATRIX_JOB`, `GITMATRIX_TRIGGER`
-  (`push`, `manual` or `preview`) and `GITMATRIX_TOKEN`; `GITMATRIX_TIMELINE` on a
+  (`push`, `manual`, `preview`, `landing` or `step`) and `GITMATRIX_TOKEN`; `GITMATRIX_TIMELINE` on a
   timeline's bookmark and in preview runs, which also get `GITMATRIX_CHECKPOINT`
   and `GITMATRIX_PREVIEW_ACTION`. A job's `env:` and secrets come after them.
 
 API: `/api/repos/:o/:n/ci` (runs, `?ref=<branch>` for one branch's, run detail,
 logs with `?after=`, cancel, re-run, commit statuses, secrets) and
 `/api/ci/runner` (claim, report).
+
+### Step runs
+
+An agent working in a timeline pushes at every meaningful step (CORE-226). A
+**step run** is the light check each of those pushes gets, the way pull-request
+checks are lighter than main's (CORE-235). A repository opts in with `on: step`,
+and a job joins step runs by listing `step` in its own `on:`:
+
+```yaml
+on:
+  push: {}
+  step: {} # opt in: each push to timeline/<slug> also starts a step run
+jobs:
+  lint:
+    on: step # only in step runs
+    local: true # `gm test` runs it on the developer's machine too
+    steps: [vp check]
+  unit:
+    on: [push, step] # in push runs and step runs
+    needs: [lint] # a step job may only need step jobs
+    steps: [vp test run --changed]
+  build: # no on: the default runs (push, manual, landing), never step runs
+    steps: [vp build]
+```
+
+- **Only step jobs run.** A job without its own `on:` never joins a step run,
+  even if its `if:` would allow it, so adding `on: step` changes nothing else.
+  Jobs see `trigger == "step"` and `GITMATRIX_TRIGGER=step`.
+- **Beside the push's run, never instead of it.** `onPush` starts the step run
+  after the push run for a moved `timeline/<slug>` bookmark. It's stored with
+  `ci_runs.step = 1` (and trigger `manual`, like previews), and it never answers
+  for a commit's CI: the push run's dedupe and coalescing, the landing and
+  checkpoint green checks, the tracker's commit status and auto-landing all
+  leave step runs out.
+- **Results attach to the step.** When a step run ends, `recordStepRun`
+  (`worker/steps/runs.ts`) stores a `test-summary` artifact in `step_artifacts`
+  (the run's status, each job's status, exit code and duration), keyed by
+  commit, so it attaches to every step version of that commit, whenever its
+  context is uploaded. The steps API returns them as `artifacts`, newest
+  first (`StepArtifact`, `shared/steps.ts`). The schema allows `screenshot` and
+  `document` artifacts with a stored object later.
+
+#### Heavy work waits for a quiet period
+
+Step runs are per step; a timeline's heavy work isn't (CORE-238). Its full CI
+(the push run) and its knowledge overlay run for the timeline's latest head
+once its pushes pause for the **quiet period**, ten minutes
+(`worker/timelines/quiet.ts`), or at once when a checkpoint is made:
+
+- **Full CI.** A push run on `timeline/<slug>` is stored with `quiet_until`
+  and its Workflow starts right away, then waits (`waitForEvent`
+  `quiet-release`, timing out at `quiet_until`). A newer push to the timeline
+  covers it (`cancelled`, `covered_by` the new run) and waits in its place; a
+  checkpoint (`POST …/timelines/:slug/checkpoints`) sends the event, so the
+  checkpoint's commit is tested now. A checkpoint can beat its push's run (runs
+  start after the push answers), so it also notes the commit on the branch's
+  `ci_refs` row (`quiet_released`) and a run of exactly that commit doesn't wait. Main and other branches never wait, and
+  step runs never do.
+- **Knowledge overlays.** The repository's coordinator remembers when it
+  first saw each timeline tip and starts the overlay once the tip has stood
+  for the quiet period (`scanOverlays`); a moved main still rebuilds overlays
+  at once. A checkpoint asks for its timelines' overlays now (`overlayNow`),
+  within the automatic-AI settings (CORE-190) like every overlay.
+- **Previews** already follow checkpoints only.
+
+Development environments may shorten it with `GITMATRIX_TIMELINE_QUIET_SECONDS`
+(agent environments use 3 s, so E2E exercises the wait); deployed Workers
+always wait ten minutes.
 
 ### Deployments and previews
 
@@ -2422,6 +2950,14 @@ person can: code and its knowledge graph, issues, CI, packages, repository
 settings. It chats in a column docked beside the page (rail button or ⌘J /
 Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
 
+On non-phone screens, **Expand the assistant** opens a wide overlay over the
+page, capped at 72rem. It keeps the normal desktop dock's reserved width, so the
+page does not narrow further; collapse (or Escape while expanded) restores the
+narrow panel without resetting the conversation or draft. Phones already use
+the full screen. Short prompts use a compact one-row field; longer drafts grow
+to a height cap and scroll inside the field. The composer can also scroll in a
+short viewport, independently of the conversation.
+
 - **Where it runs.** `worker/assistant/agent.ts`: an `AIChatAgent` (Cloudflare
   Agents SDK) Durable Object per conversation, named `<userId>:<chatId>` by
   `worker/api/assistant.ts` from the signed-in actor, so nobody reaches someone
@@ -2440,6 +2976,14 @@ Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
   `@cf/zai-org/glm-5.3` for planning and hard turns) and reasoning effort, the
   tools the model sees, the skills preloaded into its instructions, and whether
   Code Mode is offered. Chat titles come from `@cf/ibm-granite/granite-4.0-h-micro`.
+- **Between steps** (`progress.ts`, CORE-87): once tools return, the model reads
+  their results with nothing streaming. On the web each new step (and a
+  continuation after a page opens) sends a "Thinking" status at once, then the
+  same granite model's few words about what's happening, written from the
+  request and the last step's calls and results (Gateway component
+  `assistant-status`, 4 s deadline). A line that arrives after the step's first
+  output is dropped. The chat shows the status line whenever a turn is under way
+  and no running tool or streaming text already shows it (`waiting.ts`).
 - **Tools** (`tools.ts`): reads (`list_repos`, `list_files`, `read_file`,
   `list_commits`, `semantic_changes`, `search_code`, `read_wiki`, `find_issues`,
   `show_issue`, `ci_runs`, `ci_run`, `ci_logs`, `find_packages`, `api_get`) and
@@ -2459,12 +3003,37 @@ Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
   browser navigation routes, including ordinary answers that cite pages without
   navigating. Release-note browser links use `/:owner/:repo/releases` (or
   `/tracker/:owner/releases` for the tracker feed); `/release-notes` is a JSON API
-  suffix, not a page. A repository's own `.agents/skills/*/SKILL.md` join them when
-  the chat is about it.
+  suffix, not a page. Enabled personal skills and a repository's own
+  `.agents/skills/*/SKILL.md` join the catalog when the chat includes that repository.
+  Personal skills are available without repository context. Duplicate names resolve
+  built-in first, then personal, then repository; built-in names are reserved.
+  A skill may omit its description.
+- **Personal skills** (CORE-103): **Profile → Manage assistant skills**, or
+  **Settings → Personal → Assistant skills**, opens `/settings/skills`. Add or
+  edit a name, optional description and Markdown instructions; disable a skill
+  without deleting it, or confirm its removal. Skills belong to the signed-in
+  person, not the selected settings owner or an agent capability profile.
+  `GET/POST /api/account/skills` and `PUT/DELETE /api/account/skills/:id` manage
+  `assistant_personal_skills` in D1. Names use lowercase letters, digits and
+  hyphens (1–64 characters); descriptions allow 500 characters and instructions
+  20,000. Human-only CRUD checks ownership on every request.
+- **Slash commands.** Start a message with `/` to list authorized skills from
+  `GET /api/assistant/skills?repo=owner/name`; filtering matches names and
+  descriptions. Arrow keys move selection, Enter or Tab inserts the command
+  without sending, and Escape dismisses the list. Send `/name` with optional
+  arguments to preload its instructions for that turn, including approval and
+  navigation continuations. A persisted **Used /name** receipt identifies the
+  source; continuations retain that skill's identity and repository scope.
+  Unknown or unavailable commands remain ordinary text. A later user message
+  does not inherit the explicit invocation. The same leading-command syntax
+  works in `gm ask`; skills never grant permissions or bypass write approvals.
 - **The web** (`src/assistant/`): page context (repository, file and lines,
-  issue, run) goes with each message and shows as a removable chip; receipts
-  fold finished reads into one line; typing while an approval waits declines it
-  and redirects; approved writes revalidate the page.
+  issue, run) is included by default. **In context:** names the page that will
+  accompany the next message; its remove button switches to **Not in context:**
+  and excludes that page context until re-enabled with the plus button. Removing
+  it does not erase context already sent with earlier messages. Receipts fold
+  finished reads into one line; typing while an approval waits declines it and
+  redirects; approved writes revalidate the page.
   Approvals and browser-tool results continue through the AI SDK's automatic
   submission predicates, with the existing assistant message and page context.
   The server stream receives `originalMessages` to retain that message's identity.
@@ -2478,12 +3047,23 @@ Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
   them, or returns one JSON object to agents. It lands in the same transcript,
   so a terminal conversation continues on the web.
 
-`vp run agent test-ai` covers a real browser approval, exactly-once issue creation,
-conversation-aware follow-up, retry after an injected stream failure, redirecting
+`vp run agent test-ai` creates a personal skill through settings, reloads its
+configuration, selects it with the keyboard, and proves that its private
+instructions affect the real model response. It covers a real browser approval,
+exactly-once issue creation and skill receipt, conversation-aware follow-up
+without inherited invocation, retry after an injected stream failure, redirecting
 a pending approval without executing it or generating a second reply, and reload.
 It retains `assistant-approval.png` and `assistant-approval.zip` with the provider
 evidence. Provider stream errors also pass through the assistant's error handler
 so Worker logs include their message rather than only a provider stack trace.
+
+Before a stream opens, `worker/assistant/capacity.ts` retries only the Workers AI
+binding's `3021` inference-per-minute refusal: at most three retries after
+5, 15 and 45 seconds, within a 90-second acquisition deadline. Stop cancels
+the request or backoff. Once a stream opens, neither partial text nor tool
+steps are replayed; the acquisition deadline no longer applies. Exhaustion
+surfaces the original provider error. The SDK's existing transient-error
+retries remain enabled.
 
 ## Mirrors
 
@@ -2521,11 +3101,14 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
 ## Data retention
 
 Everything Gitmatrix keeps costs storage, so data past its useful life can be
-cleaned up by **retention categories** (PRD CORE-195). Policy categories are
-opt-in except **Timeline work Git repositories** (CORE-255), enabled by default
-at 30 days after landing and 90 days after abandonment. Administrators can change
-both durations or disable that policy; preview teardown and Atlas snapshots
-retain their always-active controls.
+cleaned up by **retention categories** (PRD CORE-195). Every new category is
+**disabled until an administrator enables it**: a fresh or upgraded deployment
+deletes nothing it didn't delete before. There are two exceptions. Auth hygiene
+always runs (CORE-249): expired sign-in state is worth nothing to keep.
+**Timeline work Git repositories** (CORE-255) is enabled by default at 30 days
+after landing and 90 days after abandonment; administrators can change both
+durations or disable that policy. Preview teardown and Atlas snapshots retain
+their always-active controls.
 
 - **Categories** are defined once in `worker/retention/categories.ts`: id
   (kebab-case, stored, never renamed), scope (`account` or `site`), label,
@@ -2536,15 +3119,17 @@ retain their always-active controls.
   numbers are the `account_settings` preview columns, the same ones
   `/settings/previews` changes, and Atlas snapshot retention, which an account
   can tighten within `ATLAS_RETENTION_BOUNDS` but never loosen) or `fixed`
-  (shown read-only; none today). Shapes for clients are in
+  (always runs with its defaults, shown read-only; stored values are ignored:
+  auth hygiene). Shapes for clients are in
   `shared/retention.ts`.
 - **Policies** (`worker/retention/policies.ts`) store only what was changed:
   `retention_policies` per account, `retention_site_policies` for site
   categories and site-wide defaults of account categories. Each value
   resolves account, then site-wide default, then category default; `enabled`
-  ends at `defaultEnabled ?? false`. Enabling without values applies defaults.
-  A stored value outside today's bounds is ignored. `enabledTargets(d1)` includes
-  inherited default-enabled policies as well as explicit account/site choices.
+  ends at `defaultEnabled ?? false`. Enabling a category without values
+  applies its defaults. A stored value outside today's bounds is ignored.
+  `enabledTargets(d1)` lists what scheduled runs cover: explicit account/site
+  choices, inherited default-enabled policies and the site's fixed categories.
 - **Audit:** every change records who changed which category from what to
   what in `retention_policy_changes`; the settings responses include the
   latest 20.
@@ -2614,8 +3199,8 @@ bounds shown.
   (`keepLatest`, 1–1000). Never deletes: the latest runs of each ref (the count
   below); running or queued runs, and runs with a job still running; runs a
   deployment, a landing or a package publish refers to. Can select the same
-  records as `ci-logs`: a dry run of both counts them under each, a run removes
-  each once.
+  records as `ci-logs`, `step-artifacts`: a dry run of both counts them under
+  each, a run removes each once.
 - **Expired preview deployment records** (`preview-records`, account scope; off
   until enabled). Records of preview deployments that expired more than the
   given days ago. Defaults when enabled: Days after expiry: 30 (`days`, 1–3650).
@@ -2631,6 +3216,23 @@ bounds shown.
   timelines that ended more than the given days ago. Defaults when enabled: Days
   after the timeline ended: 90 (`days`, 1–3650). Never deletes: data of open
   timelines; anything on the main line.
+- **Step instructions and steering** (`step-steering`, account scope; off until
+  enabled). The text of steps' instructions and steering (what people told their
+  agents), the given days after the step's commit, trimmed to a placeholder.
+  Defaults when enabled: Days after the step's commit: 365 (`days`, 1–3650).
+  Never deletes: a step's why, challenges, tests or coverage; the step itself
+  and its commit.
+- **Step run artifacts** (`step-artifacts`, account scope; off until enabled).
+  What step runs produced (test summaries), the given days after the run.
+  Defaults when enabled: Days after the step run: 90 (`days`, 1–3650). Never
+  deletes: the step and its context; the CI run that produced them. Can select
+  the same records as `ci-runs`: a dry run of both counts them under each, a run
+  removes each once.
+- **Live step feed** (`step-feed`, account scope; always on (it ran before
+  retention policies existed)). Each timeline's live feed keeps a step's small
+  record for the given days, enough for readers to catch up; the step itself
+  stays. An account can keep less, never more. Defaults: Days a feed record is
+  kept: 7 (`days`, 1–7). Never deletes: steps and their context.
 - **Timeline work Git repositories** (`timeline-work-sources`, account scope; on
   by default). Read-only work Git repositories expire independently of Tracker
   details and published outputs, after landing or abandonment. Defaults: Days
@@ -2708,11 +3310,11 @@ bounds shown.
   deletes: package versions and their contents; the newest publish record of
   each version still published; records of versions published from another
   branch (they keep them from becoming latest).
-- **Auth hygiene** (`auth-hygiene`, site scope; off until enabled). Expired
-  sign-in sessions, lockouts, SSH challenges, verification codes and expired or
-  revoked tokens, the given days after they ended. Defaults when enabled: Days
-  after expiry: 7 (`days`, 1–3650). Never deletes: live sessions, valid tokens
-  and active lockouts.
+- **Auth hygiene** (`auth-hygiene`, site scope; always on, read-only). Expired
+  sign-in sessions, sign-in and device codes, lockouts, SSH challenges and
+  expired tokens, the given days after they ended. Defaults: Days after expiry:
+  7 (`days`, 1–3650). Never deletes: live sessions, valid tokens and active
+  lockouts.
 - **AI spend records** (`ai-spend`, site scope; off until enabled). Per-call AI
   spend records older than the given days, rolled up to daily totals. Defaults
   when enabled: Days of per-call detail: 90 (`days`, 7–3650). Never deletes:
@@ -2761,9 +3363,10 @@ thresholds used, counts, estimated bytes, batches, errors and timings.
   uncounted). A failing category fails the run with its error; the others
   still run.
 - **Scheduled runs:** the hourly cron (`retentionCron`) starts one run a day
-  per target for its _enabled_ categories that have a cleanup, and restarts
-  runs whose lease lapsed. With nothing enabled it writes nothing at all
-  (gate 1, `worker/retention/engine.test.ts`).
+  per target for its _enabled_ and fixed categories that have a cleanup, and
+  restarts runs whose lease lapsed. With nothing enabled, its only run is the
+  site's daily auth hygiene, which touches nothing else (gate 1,
+  `worker/retention/engine.test.ts`).
 
 | Route                                          | Contract                                                                                                                                                             |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2870,8 +3473,9 @@ CORE-201, `worker/retention/cleanups/`:
 
 CORE-206, `worker/retention/cleanups/`:
 
-- **`auth-hygiene`** (site) deletes sign-in state that ended more than `days`
-  ago, by each table's own expiry: expired `auth_sessions`,
+- **`auth-hygiene`** (site, `fixed` since CORE-249: it always runs, daily, and
+  its 7 days can't be changed) deletes sign-in state that ended more than
+  `days` ago, by each table's own expiry: expired `auth_sessions`,
   `auth_verifications` (sign-in codes), `auth_device_codes`, `auth_lockouts`
   past their `until`, `ssh_challenges`, expired `access_tokens` (revoking a
   token already deletes it; a token without an expiry never expires) and

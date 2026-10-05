@@ -15,7 +15,8 @@
 
 import { ArrowClockwiseIcon } from "@phosphor-icons/react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router";
+import { Link } from "react-router";
+import { useLiveSearchParams } from "../../lib/searchParams.ts";
 import type {
   AtlasCounts,
   AtlasEntitySummary,
@@ -133,7 +134,7 @@ export function AtlasTimeline({
   /** The map's capabilities the timeline touches, as read (empty when it's gone). */
   onTouched?: (ids: ReadonlySet<string>) => void;
 }) {
-  const [params, setParams] = useSearchParams();
+  const [params, setParams] = useLiveSearchParams();
   const within = readTimelineWithin(params);
   const ref = `timeline/${timeline}`;
   const [loaded, setLoaded] = useState<Loaded | null>(null);

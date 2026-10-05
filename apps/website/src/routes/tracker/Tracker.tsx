@@ -24,8 +24,11 @@
  *              raster carrying its provenance
  */
 
+import { IssueTagChip } from "../../components/Chips.tsx";
+import { Menu } from "@base-ui/react/menu";
 import {
   ArrowClockwiseIcon,
+  CaretDownIcon,
   FunnelSimpleIcon,
   MagnifyingGlassIcon,
   StarIcon,
@@ -43,6 +46,7 @@ import {
 } from "react-router";
 import {
   fallbackTeam,
+  type IssueType,
   type Mutation,
   type MutationRequest,
   type MutationResult,
@@ -51,12 +55,14 @@ import {
 } from "../../../shared/tracker.ts";
 import { ActivityStrip } from "../../components/ActivityStrip.tsx";
 import { SettingsPage } from "../../components/SettingsPage.tsx";
-import { FormError, SelectField, Tip, useToast } from "../../components/ui.tsx";
+import { FormError, popMotion, SelectField, Tip, useToast } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { useViewer } from "../../lib/session.ts";
 import { timelineQuery, type trackerLoader } from "./loaders.ts";
 import { TrackerAdmin } from "./Admin.tsx";
 import { CreateIssue } from "./CreateIssue.tsx";
+import { parseCaptureTitle } from "./capture.ts";
+import { types, typeLabel } from "./ui.tsx";
 import { CREATE_INTENT, createIntentOf } from "../../palette/intents.ts";
 import {
   defaultsFromServer,
@@ -71,6 +77,7 @@ import {
 } from "./preferences.ts";
 import { acknowledge } from "./snapshot.ts";
 import { RelationLens } from "./Lens.tsx";
+import { Chronicle } from "./Chronicle.tsx";
 import { IssueDetail, type Mutate, type MutationOutcome } from "./IssueDetail.tsx";
 import { IssueLog } from "./Log.tsx";
 import { FacetColumn, IssueBoard } from "./Panels.tsx";
@@ -208,6 +215,12 @@ function Workbench({ data }: { data: TrackerView }) {
     [urlParams, defaults, snapshot],
   );
   const [title, setTitle] = useState("");
+  const [captureType, setCaptureType] = useState<IssueType>("task");
+  const [draftLabels, setDraftLabels] = useState<string[]>([]);
+  const captured = useMemo(
+    () => parseCaptureTitle(title, [...snapshot.labels, ...draftLabels]),
+    [title, snapshot.labels, draftLabels],
+  );
   const defaultTeam =
     (viewer ? fallbackTeam(snapshot, viewer.id) : null) ??
     snapshot.teams.find((team) => !team.archived)?.id ??
@@ -224,6 +237,8 @@ function Workbench({ data }: { data: TrackerView }) {
   // What the expanded creator starts with: the capture box's text, or a title
   // proposed from the palette (which leaves the capture box's draft alone).
   const [createTitle, setCreateTitle] = useState("");
+  const [createType, setCreateType] = useState<IssueType>("task");
+  const [createLabels, setCreateLabels] = useState<string[]>([]);
   const [editOnCreate, setEditOnCreate] = useState<string | null>(null);
   // The palette's Create issue hands off once, in router state (never the URL):
   // open the creator, then drop the intent so back or refresh can't replay it.
@@ -240,6 +255,8 @@ function Workbench({ data }: { data: TrackerView }) {
     });
     setCreateError("");
     setCreateTitle(intent.title);
+    setCreateType("task");
+    setCreateLabels([]);
     setCreateOpen(true);
     // Once per navigation that carries an intent.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -457,7 +474,10 @@ function Workbench({ data }: { data: TrackerView }) {
   const scoped = scopeLabel(query, now);
   // The graph view is about relationships: an issue there is the lens's
   // centre, and its details open beside it only when asked for.
-  const showInspector = !!(selected || route.issue) && (view !== "graph" || params.has("details"));
+  const showInspector =
+    !!(selected || route.issue) &&
+    view !== "chronicle" &&
+    (view !== "graph" || params.has("details"));
   const closeHref = (() => {
     if (view !== "graph" || !selected) return href();
     const next = new URLSearchParams(params);
@@ -471,6 +491,11 @@ function Workbench({ data }: { data: TrackerView }) {
         !f.negated &&
         (f.key === "status" || (f.key === "is" && f.value !== "open" && f.value !== "closed")),
     ).length === 1;
+  const releaseTeams = compiled.parsed.filters.filter((f) => f.key === "team" && !f.negated);
+  const releaseTeam = releaseTeams.length === 1 ? releaseTeams[0]!.value : null;
+  const releasesHref = `${base}/releases${
+    releaseTeam ? `?q=${encodeURIComponent(filterToken("team", releaseTeam))}` : ""
+  }`;
   const count = (
     <>
       {issues.length.toLocaleString()}
@@ -541,6 +566,7 @@ function Workbench({ data }: { data: TrackerView }) {
     const result = await mutate([{ kind: "issue.create", id, data: fields }]);
     if (result.ok) {
       setTitle("");
+      setDraftLabels([]);
       if (edit) {
         setCreateOpen(false);
         setEditOnCreate(id);
@@ -566,10 +592,21 @@ function Workbench({ data }: { data: TrackerView }) {
           event.preventDefault();
           if (busy || uncertain || !createTeam || !title.trim()) return;
           setCreateError("");
+          if (captured.error || captured.unknown.length || !captured.title) {
+            setCreateError(
+              captured.error ??
+                (captured.unknown.length
+                  ? "Define the new tags below before creating."
+                  : "Add an issue title after the tags."),
+            );
+            return;
+          }
           const result = await createIssue(
             {
               teamId: createTeam,
-              title: title.trim(),
+              title: captured.title,
+              type: captureType,
+              labels: captured.labels,
               workspaceIds: captureWorkspace ? [captureWorkspace.id] : [],
             },
             false,
@@ -589,12 +626,23 @@ function Workbench({ data }: { data: TrackerView }) {
           ]}
           onChange={(value) => setParam("captureTeam", value || null)}
         />
+        <SelectField
+          ariaLabel="Type for the new issue"
+          value={captureType}
+          className="w-28 shrink-0"
+          options={types.map((value) => ({
+            value,
+            label: value === "research" ? "Research / investigation" : typeLabel(value),
+          }))}
+          onChange={(value) => setCaptureType(value as IssueType)}
+        />
         <input
           ref={titleRef}
           aria-label="New issue title"
           aria-keyshortcuts={shortcuts ? "c n" : undefined}
+          aria-describedby="capture-tag-help"
           className="mk-input min-w-0 flex-1 basis-40"
-          placeholder="Capture an issue"
+          placeholder="(tag) Capture an issue"
           required
           maxLength={500}
           value={title}
@@ -603,23 +651,80 @@ function Workbench({ data }: { data: TrackerView }) {
             setCreateError("");
           }}
         />
-        <button
-          className="mk-btn mk-btn--primary h-(--size-field)"
-          disabled={busy || !createTeam || !title.trim()}
-        >
-          Create
-        </button>
-        <button
-          type="button"
-          className="mk-btn h-(--size-field)"
-          onClick={() => {
-            setCreateError("");
-            setCreateTitle(title);
-            setCreateOpen(true);
-          }}
-        >
-          Add details
-        </button>
+        <div role="group" aria-label="Create issue" className="inline-flex shrink-0">
+          <button
+            type="submit"
+            className="mk-btn mk-btn--primary h-(--size-field) rounded-r-none focus-visible:z-10"
+            disabled={busy || uncertain || !createTeam || !title.trim()}
+          >
+            Create
+          </button>
+          <Menu.Root>
+            <Menu.Trigger
+              type="button"
+              aria-label="More create options"
+              className="mk-btn mk-btn--primary h-(--size-field) min-w-11 rounded-l-none border-l border-solid border-signal-ink/20 px-3 focus-visible:z-10"
+              disabled={busy || uncertain}
+            >
+              <CaretDownIcon aria-hidden />
+            </Menu.Trigger>
+            <Menu.Portal>
+              <Menu.Positioner align="end" sideOffset={6} className="z-50">
+                <Menu.Popup className={`mk-popup ${popMotion}`}>
+                  <Menu.Item
+                    className="mk-menu-item min-h-11"
+                    disabled={busy || uncertain}
+                    onClick={() => {
+                      if (busy || uncertain) return;
+                      setCreateError("");
+                      if (captured.error || captured.unknown.length) {
+                        setCreateError(
+                          captured.error ?? "Define the new tags below before adding details.",
+                        );
+                        return;
+                      }
+                      setCreateTitle(captured.title);
+                      setCreateType(captureType);
+                      setCreateLabels(captured.labels);
+                      setCreateOpen(true);
+                    }}
+                  >
+                    Add details
+                  </Menu.Item>
+                </Menu.Popup>
+              </Menu.Positioner>
+            </Menu.Portal>
+          </Menu.Root>
+        </div>
+        <span id="capture-tag-help" className="sr-only">
+          Prefix the title with (tag) to apply a tag. Multiple prefixes are allowed. Define an
+          unknown tag below; new definitions are saved with the issue.
+        </span>
+        {(captured.labels.length > 0 || captured.unknown.length > 0) && (
+          <div
+            className="flex basis-full flex-wrap items-center gap-1.5"
+            aria-label="Capture tags"
+            aria-live="polite"
+          >
+            <span className="text-micro text-ink-muted">Tags</span>
+            {captured.labels.map((label) => (
+              <IssueTagChip key={label} name={label} />
+            ))}
+            {captured.unknown.map((label) => (
+              <button
+                key={label}
+                type="button"
+                className="mk-btn mk-btn--ghost mk-btn--sm max-w-full whitespace-normal [overflow-wrap:anywhere]"
+                onClick={() => {
+                  setDraftLabels((labels) => [...labels, label]);
+                  setCreateError("");
+                }}
+              >
+                Define tag “{label}”
+              </button>
+            ))}
+          </div>
+        )}
       </form>
     </fieldset>
   );
@@ -726,6 +831,17 @@ function Workbench({ data }: { data: TrackerView }) {
         )}
         {admin && <span className="flex-1" />}
         <div className="ml-auto flex items-center gap-1">
+          {!admin && (
+            <Link
+              className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
+              to={releasesHref}
+              aria-label={
+                releaseTeam ? `Release notes for ${releaseTeam.toUpperCase()}` : "All release notes"
+              }
+            >
+              Release notes
+            </Link>
+          )}
           <span className="max-sm:hidden">
             <Freshness receivedAt={clock.current.received} />
           </span>
@@ -754,6 +870,8 @@ function Workbench({ data }: { data: TrackerView }) {
         <CreateIssue
           snapshot={snapshot}
           initialTitle={createTitle}
+          initialType={createType}
+          initialLabels={createLabels}
           initialTeam={createTeam}
           initialWorkspaces={captureWorkspace ? [captureWorkspace.id] : []}
           busy={busy}
@@ -882,7 +1000,13 @@ function Workbench({ data }: { data: TrackerView }) {
                     role="radio"
                     aria-checked={view === v}
                     className="mk-segment"
-                    onClick={() => setParam("view", v)}
+                    onClick={() => {
+                      const next = new URLSearchParams(params);
+                      next.set("view", v);
+                      // The Chronicle is about what happened: closed work belongs in it.
+                      if (v === "chronicle" && query === DEFAULT_QUERY) next.set("q", "");
+                      setParams(next, { replace: true, preventScrollReset: true });
+                    }}
                   >
                     {VIEW_LABEL[v]}
                   </button>
@@ -894,8 +1018,8 @@ function Workbench({ data }: { data: TrackerView }) {
               className={`m-0 text-micro ${parsedUnknown.length ? "text-danger-text" : queryFocused ? "text-ink-faint" : "sr-only"}`}
             >
               {parsedUnknown.length
-                ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, ws:, assignee:, label:, type:, p:, since:, until:, parent:.`
-                : "is:ready is:blocked · status: · team: · ws: · assignee:me · label: · type: · p:1 · since:7d · parent:KEY · words match key and title; - excludes"}
+                ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, ws:, assignee:, tag:, type:, p:, since:, until:, parent:, requires:, eligible:.`
+                : "is:ready is:blocked · status: · team: · ws: · assignee:me · tag: · type: · p:1 · since:7d · parent:KEY · requires:ux · eligible:me · words match key, title and tags; - excludes"}
             </p>
             {defaultTeamEntry && (
               <DefaultTeamNote
@@ -944,12 +1068,26 @@ function Workbench({ data }: { data: TrackerView }) {
                 </span>
               </summary>
               <div className="flex flex-col gap-4 pt-2">
-                {view !== "graph" && strip("h-10")}
+                {view !== "graph" && view !== "chronicle" && strip("h-10")}
                 {facetColumn}
               </div>
             </details>
-            {view !== "graph" && <div className="max-lg:hidden">{strip("h-8")}</div>}
-            {issues.length === 0 ? (
+            {view !== "graph" && view !== "chronicle" && (
+              <div className="max-lg:hidden">{strip("h-8")}</div>
+            )}
+            {view === "chronicle" ? (
+              <Chronicle
+                owner={owner}
+                base={base}
+                query={query}
+                params={params}
+                setParams={(next, options) =>
+                  setParams(next, { ...options, preventScrollReset: true })
+                }
+                selectedIssue={route.issue ?? null}
+                serverNow={now}
+              />
+            ) : issues.length === 0 ? (
               <div className="mk-empty">
                 {snapshot.issues.length ? (
                   <>
@@ -1002,11 +1140,13 @@ function Workbench({ data }: { data: TrackerView }) {
           <aside
             aria-label={selected ? `Issue ${selected.key}` : "Narrow it down"}
             className={
-              showInspector
-                ? "relative flex min-w-0 flex-1 flex-col overflow-hidden rounded-pane bg-pane lg:max-w-[40rem] lg:flex-none lg:basis-[44%]"
-                : selected
-                  ? "hidden"
-                  : "hidden w-64 shrink-0 overflow-y-auto pr-1 lg:block"
+              view === "chronicle"
+                ? "hidden"
+                : showInspector
+                  ? "relative flex min-w-0 flex-1 flex-col overflow-hidden rounded-pane bg-pane lg:max-w-[40rem] lg:flex-none lg:basis-[44%]"
+                  : selected
+                    ? "hidden"
+                    : "hidden w-64 shrink-0 overflow-y-auto pr-1 lg:block"
             }
           >
             {showInspector ? (

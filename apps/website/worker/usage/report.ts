@@ -21,6 +21,7 @@ import {
   priceCost,
   USAGE_CONSTRUCTS,
   type CatalogPrice,
+  type KnowledgeUpdateSpend,
   type PriceProduct,
   type UsageCategoryLink,
   type UsageConstruct,
@@ -138,6 +139,8 @@ const CATEGORY_IDS: Record<string, string[]> = {
   "d1/atlas": ["atlas-snapshots"],
   "durable_objects/Tracker": ["closed-issues", "tracker-activity"],
   "durable_objects/Assistant": ["assistant-chats"],
+  "durable_objects/StepFeed": ["step-feed"],
+  "d1/step-context": ["step-steering", "step-artifacts"],
   "r2/registry_blobs": ["registry-proxy-cache"],
   "r2/registry_derived": ["registry-proxy-cache"],
   "r2/registry_blobs_all": ["registry-proxy-cache"],
@@ -526,6 +529,85 @@ function asRow(r: {
 }
 
 /** One account's report. */
+/**
+ * What Knowledge builds cost over the last 30 days (CORE-286), from each
+ * build's own meter: updates after pushes and full rebuilds, for one account
+ * (or every account, `null`).
+ */
+export async function knowledgeUpdateSpend(
+  d1: D1Database,
+  accountId: string | null,
+  now = new Date(),
+): Promise<KnowledgeUpdateSpend> {
+  const from = addDays(now.toISOString().slice(0, 10), -WINDOW_DAYS);
+  const { results } = await d1
+    .prepare(
+      `SELECT o.slug || '/' || r.name AS name,
+              coalesce(json_extract(b.stats, '$.mode'), '') AS mode,
+              count(*) AS builds,
+              count(json_extract(b.stats, '$.aiUsage.costUsd')) AS metered,
+              coalesce(sum(json_extract(b.stats, '$.aiUsage.calls')), 0) AS calls,
+              coalesce(sum(json_extract(b.stats, '$.aiUsage.costUsd')), 0) AS cost
+         FROM kg_builds b
+         JOIN repos r ON r.id = b.repo_id
+         JOIN accounts o ON o.id = r.owner_id
+        WHERE b.started_at >= ?1 AND b.status <> 'running' AND (?2 IS NULL OR r.owner_id = ?2)
+        GROUP BY r.id, mode`,
+    )
+    .bind(from, accountId)
+    .all<{
+      name: string;
+      mode: string;
+      builds: number;
+      metered: number;
+      calls: number;
+      cost: number;
+    }>();
+  const spend = () => ({
+    count: 0,
+    calls: 0,
+    costUsd: 0,
+    eachUsd: null as number | null,
+    metered: 0,
+  });
+  const updates = spend();
+  const full = spend();
+  let unmetered = 0;
+  const repos = new Map<
+    string,
+    { name: string; updates: number; fullRebuilds: number; costUsd: number }
+  >();
+  for (const row of results) {
+    const target = row.mode === "full" ? full : row.mode === "update" ? updates : null;
+    unmetered += row.builds - row.metered;
+    const repo = repos.get(row.name) ?? { name: row.name, updates: 0, fullRebuilds: 0, costUsd: 0 };
+    repo.costUsd += row.cost;
+    if (row.mode === "full") repo.fullRebuilds += row.builds;
+    else repo.updates += row.builds;
+    repos.set(row.name, repo);
+    if (!target) continue;
+    target.count += row.builds;
+    target.metered += row.metered;
+    target.calls += row.calls;
+    target.costUsd += row.cost;
+  }
+  const done = ({ metered, ...s }: ReturnType<typeof spend>) => ({
+    ...s,
+    costUsd: Math.round(s.costUsd * 1e4) / 1e4,
+    eachUsd: metered ? Math.round((s.costUsd / metered) * 1e4) / 1e4 : null,
+  });
+  return {
+    from,
+    updates: done(updates),
+    fullRebuilds: done(full),
+    unmetered,
+    repos: [...repos.values()]
+      .map((r) => ({ ...r, costUsd: Math.round(r.costUsd * 1e4) / 1e4 }))
+      .toSorted((a, b) => b.costUsd - a.costUsd || a.name.localeCompare(b.name))
+      .slice(0, 10),
+  };
+}
+
 export async function accountUsageReport(
   d1: D1Database,
   account: { id: string; slug: string; display_name: string },
@@ -557,15 +639,18 @@ export async function accountUsageReport(
           .execute()
       ).map(asRow)
     : [];
-  return buildReport({
-    scope: "account",
-    account: { slug: account.slug, displayName: account.display_name },
-    rows,
-    asOf,
-    timeline,
-    version,
-    partial,
-  });
+  return {
+    ...buildReport({
+      scope: "account",
+      account: { slug: account.slug, displayName: account.display_name },
+      rows,
+      asOf,
+      timeline,
+      version,
+      partial,
+    }),
+    knowledgeUpdates: await knowledgeUpdateSpend(d1, account.id),
+  };
 }
 
 /**
@@ -651,16 +736,19 @@ export async function siteUsageReport(d1: D1Database): Promise<UsageReport> {
     .map((a) => ({ slug: a.slug, displayName: a.display_name, monthlyUsd: totals.get(a.id) ?? 0 }))
     .toSorted((a, b) => b.monthlyUsd - a.monthlyUsd || a.slug.localeCompare(b.slug))
     .slice(0, MAX_ACCOUNTS);
-  return buildReport({
-    scope: "site",
-    account: null,
-    rows,
-    asOf,
-    timeline,
-    version,
-    accounts,
-    partial,
-  });
+  return {
+    ...buildReport({
+      scope: "site",
+      account: null,
+      rows,
+      asOf,
+      timeline,
+      version,
+      accounts,
+      partial,
+    }),
+    knowledgeUpdates: await knowledgeUpdateSpend(d1, null),
+  };
 }
 
 // ---- CSV ----------------------------------------------------------------------------

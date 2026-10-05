@@ -8,6 +8,7 @@
 //
 // GET /api/repos/:owner/:name/why serves it to the web app and to `gm why`.
 
+import type { Step } from "./steps.ts";
 import type { RefUpdate, SourceLineage } from "./api.ts";
 import type { CodeSource } from "./code-source.ts";
 import type {
@@ -207,6 +208,12 @@ export interface WhyChain {
   approval: (WhyApproval & { checkpointId: string; timeline: string; number: number }) | null;
   landing: WhyLanding | null;
   discussions: WhyDiscussions;
+  /**
+   * The step context behind the commit (CORE-243): its own step, or the
+   * newest step of its change when a rebase or landing replaced the commit
+   * (then `step.commitOid` differs). Null when no step was recorded.
+   */
+  step: Step | null;
 }
 
 export interface WhyResponse {
@@ -222,8 +229,11 @@ export interface WhyResponse {
   blame: WhyBlame | null;
   /** One per distinct commit, in the order of the first line each explains. */
   chains: WhyChain[];
-  /** Names for the person and agent ids the chains mention (approvers, checkpoint authors). */
-  people: Record<string, { name: string; kind: "person" | "agent" }>;
+  /**
+   * Names for the person and agent ids the chains mention (approvers, checkpoint
+   * authors); a person also has their account slug, for their profile.
+   */
+  people: Record<string, { name: string; kind: "person" | "agent"; slug?: string }>;
 }
 
 /** The person and agent ids a chain mentions. */

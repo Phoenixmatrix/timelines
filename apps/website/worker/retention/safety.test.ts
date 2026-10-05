@@ -4,7 +4,7 @@
 // account's Tracker Durable Object, assistant chats).
 //
 // - Gate 1: with nothing enabled, a full cron cycle of every retention job
-//   deletes nothing.
+//   deletes nothing but expired sign-in state (auth hygiene always runs).
 // - Gate 2, per category with a cleanup: its dry run deletes nothing and
 //   selects exactly what its run removes; the run is bounded (batches of at
 //   most the limit, calls of at most a few batches, resumed), idempotent,
@@ -32,7 +32,9 @@ import { pricesApi } from "../usage/prices-api.ts";
 import { accountUsageApi, siteUsageApi } from "../usage/report-api.ts";
 import { collectUsage } from "../usage/collect.ts";
 import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./api.ts";
-import { category, defaultValues } from "./categories.ts";
+import { CATEGORIES, category, defaultValues } from "./categories.ts";
+import { AUTH_TABLES } from "./cleanups/auth-hygiene.ts";
+import { cleanupFor } from "./cleanups/index.ts";
 import { resumeDeletions } from "./repo-deletion.ts";
 import { advanceRun, createRun, getRun, retentionCron } from "./runs.ts";
 import type { RetentionTarget } from "./policies.ts";
@@ -71,6 +73,8 @@ vi.mock("agents", async () => {
 });
 
 afterEach(() => vi.unstubAllGlobals());
+
+const RUNNABLE = CATEGORIES.filter((c) => cleanupFor(c.id)).map((c) => c.id);
 
 // ---- snapshots ------------------------------------------------------------------------
 
@@ -185,7 +189,18 @@ async function runOne(t: Rich, id: string, target: RetentionTarget, dryRun: bool
 
 // ---- the suite ------------------------------------------------------------------------
 
-describe("gate 1: nothing enabled, a full cron cycle deletes nothing", () => {
+describe("retention safety: coverage", () => {
+  test("every category with a cleanup has a fixture, and only those", () => {
+    // Work Git repositories have their own provider-backed suite (work-sources.test.ts).
+    expect(Object.keys(FIXTURES).sort()).toEqual(
+      RUNNABLE.filter((id) => id !== "timeline-work-sources").sort(),
+    );
+    for (const [id, fixture] of Object.entries(FIXTURES))
+      expect(fixture.target.scope, id).toBe(category(id)!.scope);
+  });
+});
+
+describe("gate 1: nothing enabled, a full cron cycle deletes nothing but expired sign-in state", () => {
   test("every hourly retention job over 26 hours, on the rich deployment", async () => {
     const t = richSeed();
     await t.ready;
@@ -210,13 +225,15 @@ describe("gate 1: nothing enabled, a full cron cycle deletes nothing", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const before = await snapshot(t);
     const waits: Promise<unknown>[] = [];
+    const scheduled: number[] = [];
     try {
       for (let hour = 0; hour <= 26; hour++) {
         const at = new Date(NOW.getTime() + hour * 3_600_000);
-        expect(await retentionCron(t.env, { now: at, advance: { now: at } })).toEqual({
-          scheduled: [],
-          restarted: [],
-        });
+        const cycle = await retentionCron(t.env, { now: at, advance: { now: at } });
+        expect(cycle.restarted).toEqual([]);
+        // The site's always-on auth hygiene, at most once in SCHEDULE_EVERY_MS.
+        expect(cycle.scheduled, `hour ${hour}`).toHaveLength(hour === 0 || hour === 23 ? 1 : 0);
+        scheduled.push(...cycle.scheduled);
         await sweepDurableInstances(t.env, at.getTime());
         await resumeDeletions(t.env, { waitUntil: (w) => void waits.push(w), now: at.getTime() });
         await collectUsage(t.env, at);
@@ -227,11 +244,19 @@ describe("gate 1: nothing enabled, a full cron cycle deletes nothing", () => {
       warn.mockRestore();
     }
     const after = await snapshot(t);
-    // Rows may be added (usage figures, registry bookkeeping), none removed or changed.
-    expect(changed(before, after, [], { onlyLosses: true })).toEqual([]);
+    // Rows may be added (usage figures, registry bookkeeping), none removed or
+    // changed, but for auth hygiene's (gate 2 checks it keeps what's live).
+    const auth = AUTH_TABLES.map((table) => `db:${table.name}`);
+    expect(changed(before, after, auth, { onlyLosses: true })).toEqual([]);
     for (const store of ["tracker", "r2", "chats"])
       expect(after[store], store).toEqual(before[store]);
-    expect(t.sqlite.prepare("SELECT count(*) AS n FROM cleanup_runs").get()).toEqual({ n: 0 });
+    for (const id of scheduled)
+      expect(await getRun(t.env.DB, { scope: "site" }, id)).toMatchObject({
+        trigger: "schedule",
+        status: "succeeded",
+        categories: [{ category: "auth-hygiene" }],
+      });
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM cleanup_runs").get()).toEqual({ n: 2 });
     expect(t.sent).toEqual([]);
   });
 });
@@ -462,7 +487,7 @@ const ROUTES: {
   {
     method: "PATCH",
     path: "/api/admin/retention",
-    body: { categories: { "auth-hygiene": { enabled: true } } },
+    body: { categories: { "registry-audit": { enabled: true } } },
     expect: { outsider: 403, member: 403, agent: 403, owner: 403, siteAdmin: 200 },
     write: true,
   },

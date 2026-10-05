@@ -7,11 +7,13 @@ import type {
   SourceLineage,
   TreeEntry,
 } from "../../../shared/api.ts";
+import { CommitLink } from "../../components/CommitLink.tsx";
 import { coAuthors } from "../../lib/commitAttribution.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { commitsUrl, treeUrl } from "../../lib/refs.ts";
 import { repoData } from "../../lib/repoData.ts";
 import { api } from "../../lib/api.ts";
+import { LinkedText } from "../../refs/RefLink.tsx";
 
 export function mergeHistory(previous: HistoryPage | null, page: HistoryPage): HistoryPage {
   if (!previous) return page;
@@ -134,13 +136,32 @@ export function Attribution({ commit }: { commit: CommitSummary }) {
 export function CommitInfo({ commit, repo }: { commit: CommitSummary; repo: RepoDetail }) {
   return (
     <div className="min-w-0 flex-1">
-      <Link
-        className="block truncate font-semibold text-ink no-underline hover:underline"
-        to={treeUrl(repo.owner.slug, repo.name, commit.oid, "", repo.source?.sourceId)}
-        title={firstLine(commit.message)}
-      >
-        {firstLine(commit.message)}
-      </Link>
+      {/* Refs in the title link to what they name; the rest opens the commit panel (CORE-22). */}
+      <span className="block truncate font-semibold" title={firstLine(commit.message)}>
+        <LinkedText
+          text={firstLine(commit.message)}
+          plain={(text) =>
+            // The commit panel reads canonical history; a work source's commit opens in its own source.
+            repo.source && repo.source.sourceId !== "canonical" ? (
+              <Link
+                className="text-ink no-underline hover:underline"
+                to={treeUrl(repo.owner.slug, repo.name, commit.oid, "", repo.source.sourceId)}
+              >
+                {text}
+              </Link>
+            ) : (
+              <CommitLink
+                className="text-ink no-underline hover:underline"
+                owner={repo.owner.slug}
+                name={repo.name}
+                sha={commit.oid}
+              >
+                {text}
+              </CommitLink>
+            )
+          }
+        />
+      </span>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
         <Attribution commit={commit} />
         <time

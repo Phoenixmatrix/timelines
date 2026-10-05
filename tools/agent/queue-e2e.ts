@@ -114,8 +114,12 @@ export async function queueFixture(
   await writeFile(
     join(root, ".gitmatrix", "ci.yml"),
     JSON.stringify({
-      on: { push: { branches: ["main"] } },
+      on: { push: { branches: ["main"] }, step: {} },
       jobs: {
+        "step-only": {
+          on: "step",
+          steps: ["exit 1"],
+        },
         gate: {
           if: 'trigger == "landing"',
           steps: [
@@ -173,6 +177,7 @@ export async function queueFixture(
     assert.equal(gates.commit, entry.candidate);
     assert.equal(gates.trigger, "landing");
     assert.equal(gates.jobs.find((job) => job.name === "gate")?.status, "succeeded");
+    assert.equal(gates.jobs.find((job) => job.name === "step-only")?.status, "skipped");
     await git(["fetch", "origin", "main"]);
     assert.equal(
       await git(["show", "-s", "--format=%P", entry.candidate]),
@@ -495,6 +500,8 @@ async function runActiveQueueDeletion(
     queue: QueueEntry;
   };
   const id = admitted.queue.id;
+  // The scheduler records the candidate as testing, then starts its gates on
+  // its next step: wait for the gate run, not just the status.
   const entry = await f.wait(
     id,
     (value) =>

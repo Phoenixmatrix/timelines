@@ -4,6 +4,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useLocation } from "react-router";
 import { timelineLabel, type ReleaseNoteEntry } from "../../shared/release-notes.ts";
 import { commitsUrl } from "../lib/refs.ts";
+import { LinkedText } from "../refs/RefLink.tsx";
+import { CommitLink } from "./CommitLink.tsx";
 import { link, Tip } from "./ui.tsx";
 
 export type ReleaseNoteDetailsSelection = {
@@ -84,7 +86,9 @@ export function ReleaseNoteDetails({
               key={entry.id}
               className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain p-4 [overflow-wrap:anywhere]"
             >
-              <h3 className="mt-0 mb-6 text-title">{entry.title}</h3>
+              <h3 className="mt-0 mb-6 text-title">
+                <LinkedText text={entry.title} />
+              </h3>
               <section className="mb-6">
                 <h4 className="mt-0 mb-2 text-body-sm font-semibold">Last commit</h4>
                 <time dateTime={entry.lastCommitAt} className="text-body-sm text-ink-muted">
@@ -121,12 +125,16 @@ export function ReleaseNoteDetails({
                       {entry.commits.map((oid) => (
                         <li key={oid} className="mk-mono text-body-sm">
                           {repo ? (
-                            <Link
+                            <CommitLink
                               className={link}
-                              to={commitsUrl(repo.owner, repo.name, oid, "", "canonical")}
+                              owner={repo.owner}
+                              name={repo.name}
+                              sha={oid}
+                              // Phones show one dialog at a time: the commit replaces these details.
+                              onClick={phone ? onClose : undefined}
                             >
                               {oid}
-                            </Link>
+                            </CommitLink>
                           ) : (
                             <span className="text-ink-muted">{oid}</span>
                           )}
@@ -140,18 +148,15 @@ export function ReleaseNoteDetails({
                 <section>
                   <h4 className="mt-0 mb-2 text-body-sm font-semibold">Landed with</h4>
                   {repo ? (
-                    <Link
+                    <CommitLink
                       className={`${link} mk-mono text-body-sm`}
-                      to={commitsUrl(
-                        repo.owner,
-                        repo.name,
-                        entry.timeline.landing,
-                        "",
-                        "canonical",
-                      )}
+                      owner={repo.owner}
+                      name={repo.name}
+                      sha={entry.timeline.landing}
+                      onClick={phone ? onClose : undefined}
                     >
                       {timelineLabel(entry.timeline)}
-                    </Link>
+                    </CommitLink>
                   ) : (
                     <span className="mk-mono text-body-sm text-ink-muted">
                       {timelineLabel(entry.timeline)}

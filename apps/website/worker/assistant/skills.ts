@@ -7,6 +7,12 @@ import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import type { CallApi } from "./internal.ts";
 import type { Group } from "./plan.ts";
+import type { UIMessage } from "ai";
+import type {
+  AssistantSkillInvocation,
+  AssistantSkillSummary,
+} from "../../shared/assistant-skills.ts";
+import { personalSkills, SKILL_NAME } from "./personal-skills.ts";
 
 interface Builtin {
   name: string;
@@ -41,7 +47,7 @@ Paths are under /api; pass them to api_get (GET) or api_write (everything else) 
 - GET /wiki — table of contents. GET /wiki/page?slug= — a page.
 - GET /repos/:o/:n/release-notes/range?from=&to= — release notes between two refs.
 - GET /repos/:o/:n/release-notes — daily UTC committer-date code updates and optional tag snapshots. GET /repos/:o/:n/release-notes/release?name=day:YYYY-MM-DD (or a tag) — entries and introduction. Commits and tags are not deployment evidence.
-- GET /tracker/:owner/release-notes?q= — daily updates by default; kind:tag or release:<tag> selects named snapshots. Filters include kind, team, repo, ws, type, label, release, since and until. lastCommitAt is Git committer time, not tracker completion or deployment time.
+- GET /tracker/:owner/release-notes?q= — daily updates by default; kind:tag or release:<tag> selects tagged releases. Filters include kind, team, repo, ws, type, tag (issue tags; label: is its old name), release, since and until. lastCommitAt is Git committer time, not tracker completion or deployment time.
 
 These are JSON API endpoints, not browser pages. Link people to the Releases pages in the navigation skill: browser routes use /releases, never /release-notes.
 
@@ -58,7 +64,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 - POST|PATCH|DELETE /packages/:owner/feeds[/:format/:key] — feeds and upstream proxies.
 
 ## Tracker (/tracker)
-- GET /tracker — trackers you can use. GET /tracker/:owner/snapshot — everything (teams, workspaces, issues, links, comments, requests, members, agents). GET /tracker/:owner/view — a lighter view.
+- GET /tracker — trackers you can use. GET /tracker/:owner/snapshot — everything (teams, workspaces, issues, links, comments, requests, members, agents). GET /tracker/:owner/view — a lighter view. GET /tracker/:owner/tags — the tag catalog with counts {tags: [{name, issues, open}]}; issue tags (the issue field is "labels", its old name; writes accept "tags" too), agent tags and requirement tag: values come from it.
 - POST /tracker/:owner/mutate {operationId: uuid, mutations: [...]}: kinds team.create|update, workspace.create|update, issue.create {id: uuid, data: {teamId, title, ...}} | issue.update {id, expectedVersion, data} , link.add {id, data: {fromId, toId, kind}} | link.remove, comment.add {id, data: {issueId, body, kind}}, subscription.add|remove, request.answer|cancel. Prefer the dedicated issue tools; use this for teams, workspaces and bulk changes.
 - GET /requests — open requests waiting on the person ("Needs you").
 - Claims, leases and handoffs (issue.claim, renew, complete…) belong to agents doing the work with gm, not to this chat.
@@ -150,7 +156,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 - Repository /<owner>/<repo> ; folder /<owner>/<repo>/tree/<ref>/<path> ; file /<owner>/<repo>/blob/<ref>/<path>#L10-L20 ; commits /<owner>/<repo>/commits/<ref> ; changes /<owner>/<repo>/changes ; CI /<owner>/<repo>/ci and /<owner>/<repo>/ci/<number> ; wiki /<owner>/<repo>/wiki/<slug> ; knowledge map /<owner>/<repo>/knowledge ; settings /<owner>/<repo>/settings
 - Repository release notes /<owner>/<repo>/releases ; a daily update or tag /<owner>/<repo>/releases/<name> (URL-encode the exact name returned by the release-notes API, including @day: for a daily update)
 - Tracker-wide release notes /tracker/<owner>/releases ; preserve feed filters with ?q=<URL-encoded query>. Do not use /release-notes in browser links: that suffix belongs to the JSON API.
-- Account settings: /settings/profile, /settings/tokens, /settings/ssh-keys, /settings/agents, /settings/invites, /settings/usage?owner=<account> (usage & costs), /settings/site-usage (site admins) ; new repository /new
+- Account settings: /settings/profile, /settings/tokens, /settings/ssh-keys, /settings/agents, /settings/invites, /settings/usage?owner=<account> (usage & costs), /settings/site-usage (site admins), /settings/ai?owner=<account> (AI settings), /settings/site-ai (site AI settings, site admins) ; new repository /new
 
 Use navigate when the person asks to go somewhere or see something, or to show what you just made or found; it opens beside the chat. Otherwise just link.`,
   },
@@ -183,10 +189,9 @@ Answer "how do I…" questions with the exact command.`,
   },
 ];
 
-export interface Skill {
-  name: string;
-  description: string;
+export interface Skill extends AssistantSkillSummary {
   body: string;
+  repo?: string;
 }
 
 /** Where skills come from: built in, or a repository's .agents/skills. */
@@ -195,16 +200,16 @@ export interface SkillSource {
 }
 
 /** name and description from a SKILL.md's frontmatter, and the body after it. */
-export function parseSkill(markdown: string): Skill | null {
+export function parseSkill(markdown: string): Pick<Skill, "name" | "description" | "body"> | null {
   const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(markdown);
   if (!match) return null;
   const field = (key: string) => {
-    const line = new RegExp(`^${key}:\\s*(.+)$`, "m").exec(match[1]!)?.[1]?.trim();
+    const line = new RegExp(`^${key}:[\\t ]*([^\\r\\n]*)$`, "m").exec(match[1]!)?.[1]?.trim();
     return line?.replace(/^(["'])(.*)\1$/, "$2") ?? null;
   };
   const name = field("name");
-  const description = field("description");
-  return name && description ? { name, description, body: match[2]!.trim() } : null;
+  const description = field("description") ?? "";
+  return name && SKILL_NAME.test(name) ? { name, description, body: match[2]!.trim() } : null;
 }
 
 /**
@@ -227,6 +232,21 @@ export class SkillRegistry {
 
   get(name: string): Skill | null {
     return this.skills.get(name) ?? null;
+  }
+
+  restore(receipt: AssistantSkillInvocation): Skill | null {
+    for (const skill of this.skills.values())
+      if (skill.id === receipt.id && skill.source === receipt.source) return skill;
+    return null;
+  }
+
+  summaries(): AssistantSkillSummary[] {
+    return [...this.skills.values()].map(({ id, name, description, source }) => ({
+      id,
+      name,
+      description,
+      source,
+    }));
   }
 
   catalog(except: readonly string[] = []): string {
@@ -257,7 +277,14 @@ export class SkillRegistry {
 /** The built-in skills. */
 export function builtinSkills(): SkillSource {
   return {
-    list: async () => BUILTIN.map(({ name, description, body }) => ({ name, description, body })),
+    list: async () =>
+      BUILTIN.map(({ name, description, body }) => ({
+        id: `builtin:${name}`,
+        source: "builtin",
+        name,
+        description,
+        body,
+      })),
   };
 }
 
@@ -297,10 +324,67 @@ export function repositorySkills(api: CallApi, repo: string): SkillSource {
           );
           const text = file.ok ? (file.body as { text: string | null }).text : null;
           const skill = text ? parseSkill(text) : null;
-          return skill ? { ...skill, description: `${skill.description} (from ${repo})` } : null;
+          return skill
+            ? { ...skill, id: `repo:${repo}:${dir.path}`, source: "repository" as const, repo }
+            : null;
         }),
       );
-      return skills.filter((s): s is Skill => s !== null);
+      return skills.filter((s) => s !== null);
     },
   };
+}
+
+/** One authorized catalog for both suggestions and model turns; first source wins. */
+export async function buildSkillRegistry(
+  d1: D1Database,
+  userId: string,
+  api: CallApi,
+  repo: string | null,
+) {
+  const registry = new SkillRegistry([
+    builtinSkills(),
+    {
+      list: async () =>
+        (await personalSkills(d1, userId))
+          .filter((skill) => skill.enabled)
+          .map(({ id, name, description, body }) => ({
+            id,
+            name,
+            description,
+            body,
+            source: "personal" as const,
+          })),
+    },
+    ...(repo ? [repositorySkills(api, repo)] : []),
+  ]);
+  await registry.load();
+  return registry;
+}
+
+/** Receipts contain identity and provenance, never executable instructions. */
+export function skillReceipt(message: UIMessage | undefined): AssistantSkillInvocation | null {
+  const part = message?.parts.find((part) => part.type === "data-skill");
+  if (!part || !("data" in part) || !part.data || typeof part.data !== "object") return null;
+  const data = part.data as Partial<AssistantSkillInvocation>;
+  return typeof data.id === "string" &&
+    typeof data.name === "string" &&
+    typeof data.description === "string" &&
+    (data.source === "builtin" || data.source === "personal" || data.source === "repository") &&
+    (data.repo === undefined || typeof data.repo === "string")
+    ? (data as AssistantSkillInvocation)
+    : null;
+}
+
+/** A continuation can only restore its recorded identity, never a same-name replacement. */
+export function resolveSkillInvocation(
+  registry: SkillRegistry,
+  message: string,
+  continuation: boolean,
+  receipt: AssistantSkillInvocation | null,
+): Skill | null {
+  if (continuation) {
+    return receipt ? registry.restore(receipt) : null;
+  }
+  const command = /^\/([a-z0-9][a-z0-9-]{0,63})(?=\s|$)/.exec(message);
+  return command ? registry.get(command[1]!) : null;
 }

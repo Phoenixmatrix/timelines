@@ -29,10 +29,10 @@ import {
   useLocation,
   useNavigate,
   useNavigationType,
-  useSearchParams,
   type LoaderFunctionArgs,
   type ShouldRevalidateFunctionArgs,
 } from "react-router";
+import { useLiveSearchParams } from "../../lib/searchParams.ts";
 import type { AccountPage, RepoSummary } from "../../../shared/api.ts";
 import {
   ATLAS_WORKSPACE_MAX_REPOS,
@@ -65,6 +65,7 @@ import {
 } from "../repo/atlasUrl.ts";
 import { AtlasTerritory, type MapBand } from "../repo/AtlasTerritory.tsx";
 import type { TerritoryCell } from "../repo/territory.ts";
+import { useMapRoutes } from "../repo/useMapRoutes.ts";
 import {
   BAND_HEADER,
   buildWorkspaceTerritory,
@@ -117,6 +118,16 @@ export function WorkspaceAtlas() {
   return (
     <Page full>
       <header className="flex flex-col gap-1">
+        <nav aria-label="Breadcrumb" className="text-body-sm text-ink-muted">
+          <Link
+            to={`/${encodeURIComponent(account.slug)}`}
+            className="text-ink-muted no-underline hover:text-ink"
+          >
+            <bdi>{account.slug}</bdi>
+          </Link>
+          <span className="px-1.5 text-ink-faint">/</span>
+          <span aria-current="page">Atlas</span>
+        </nav>
         <h1 className="m-0 text-headline">Atlas</h1>
         <p className="m-0 max-w-[70ch] text-ink-muted">
           Capabilities across the repositories you pick from <bdi>{account.displayName}</bdi>. Each
@@ -380,7 +391,7 @@ function WorkspaceView({
   accountRepos: RepoSummary[];
 }) {
   const base = `/${encodeURIComponent(owner)}/-/atlas`;
-  const [params, setParams] = useSearchParams();
+  const [params, setParams] = useLiveSearchParams();
   const url = readAtlasUrl(params);
   const links = parseLinkState(params.get("links"));
   const navigationType = useNavigationType();
@@ -452,7 +463,7 @@ function WorkspaceView({
     return ready;
   }, [state.loads]);
   const territory = useMemo(
-    () => buildWorkspaceTerritory(coverage, overview?.regions ?? [], expanded),
+    () => buildWorkspaceTerritory(coverage, overview?.regions ?? [], expanded, overview?.links),
     [coverage, overview, expanded],
   );
   const territoryRef = useRef(territory);
@@ -640,6 +651,11 @@ function WorkspaceView({
   const narrow = useMediaQuery(NARROW);
   narrowNow.current = narrow;
   const view: AtlasView = url.view ?? (narrow ? "outline" : "map");
+  const routes = useMapRoutes(
+    reader,
+    view === "map" && selected && mapFocus === selected.id ? selected : null,
+    snapshotId || null,
+  );
   const tree = useRef<HTMLDivElement>(null);
   const backToOutline = () => {
     const target =
@@ -956,6 +972,7 @@ function WorkspaceView({
                   territory={territory}
                   bands={bands}
                   ties={ties}
+                  routes={routes}
                   selected={mapFocus}
                   loading={loading}
                   emphasis={timeline ? touched : undefined}
@@ -1290,20 +1307,27 @@ function Legend() {
           repository never moves another's.
         </li>
         <li>
-          <strong className="text-ink">Area</strong> is how many files live there, in power-of-two
-          steps: not complexity, importance or quality.
+          <strong className="text-ink">Countries</strong> are capabilities. Their area is how many
+          files live there, in power-of-two steps: not complexity, importance or quality. Colours
+          only tell neighbours apart.
         </li>
         <li>
           <strong className="text-ink">Position</strong> is a stable landmark. Being near another
           region, in the same repository or the next column, doesn't mean they depend on each other.
         </li>
         <li>
-          <strong className="text-ink">Boundaries</strong> are primary membership: each file lives
-          in exactly one capability.
+          <strong className="text-ink">Borders</strong> are primary membership: each file lives in
+          exactly one capability. Opened capabilities show their areas as fainter lines inside.
         </li>
         <li>
-          <strong className="text-ink">Dashed regions</strong> are structural groups (unclassified
-          files, concepts, dependencies, folders), not capabilities.
+          <strong className="text-ink">Islands</strong> with a dashed coast are structural groups
+          (unclassified files, concepts, dependencies, folders), not capabilities.
+        </li>
+        <li>
+          <span className="mr-1 inline-block h-0.5 w-3 rounded-full bg-data-teal align-middle" />
+          <span className="mr-1 inline-block h-0.5 w-3 rounded-full bg-data-violet align-middle" />
+          <strong className="text-ink">Routes</strong>, with a capability selected: teal to what it
+          uses, violet from what uses it, thicker for more imports. Static imports only, one hop.
         </li>
         <li>
           <span

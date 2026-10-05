@@ -14,6 +14,7 @@ import { expect, onTestFinished } from "vite-plus/test";
 import { routes } from "../appRoutes.tsx";
 import { refreshTimelines } from "../components/TimelineScope.tsx";
 import { forgetAllRepoData } from "../lib/repoData.ts";
+import { resetRefResolutions } from "../refs/resolver.ts";
 import { applyTheme, storedTheme } from "../lib/theme.ts";
 import { scopeLinks } from "../lib/timelineScope.ts";
 import "../styles/app.css";
@@ -35,6 +36,7 @@ export interface RenderedApp {
 export function renderApp(path: string): RenderedApp {
   // Nothing an earlier test (or world) read is reused.
   forgetAllRepoData();
+  resetRefResolutions();
   refreshTimelines();
   applyTheme(storedTheme());
   const frame = location.href;

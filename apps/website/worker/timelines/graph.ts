@@ -36,7 +36,7 @@ timelineGraph.get("/", async (c) => {
 
   const actors: Record<string, TimelineActor> = {};
   for (const member of access.members)
-    actors[member.id] = { name: member.displayName, accountableId: null };
+    actors[member.id] = { name: member.displayName, accountableId: null, slug: member.slug };
   for (const agent of access.agents)
     actors[agent.id] = { name: agent.name, accountableId: agent.accountable.id };
 

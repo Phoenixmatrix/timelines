@@ -5,6 +5,9 @@ Work is tracked in Gitmatrix: {{SCOPE}}. The loop, in brief (the
 
 1. `gm issue next` picks and claims the most valuable ready issue in scope.
    Nothing ready means stop, not retry. No returned fencing token means no ownership.
+   `not_ready` pickup permits nobody to start; `human_only` permits people, never
+   agents, even when assigned or delegated. Only a person can change an existing
+   restricted policy. Ask them; do not bypass it with status changes or credentials.
 2. Choose where it goes before you start: the claim's `timelineRule` says
    whether the issue requires a timeline, never wants one, or leaves it to
    you (then read the description or PRD). Record it with a checkpoint:
@@ -35,23 +38,25 @@ Work is tracked in Gitmatrix: {{SCOPE}}. The loop, in brief (the
 ## Creating issues
 
 Classify the expertise needed by the actual scope and acceptance criteria, not
-by the intended agent. Use a small relevant set of issue labels, reusing the
-team's spelling. Without a team convention, use lowercase `ux` (usability and
-interaction design), `frontend` (client UI), `backend` (server logic), `data`
-(schemas and pipelines), `architecture` (system design), `api` (contracts and
-integrations), `security` (auth and threat mitigation), `testing` (test strategy
-and infrastructure), `infrastructure` (CI/CD and operations), or `documentation`
-(user and developer docs). Avoid synonyms and speculative labels; ordinary
-verification alone does not need `testing`.
+by the intended agent. Tag issues from the tracker's tag catalog (`gm issue
+tags` lists it), reusing its spelling. In a new tracker, use lowercase `ux`
+(usability and interaction design), `frontend` (client UI), `backend` (server
+logic), `data` (schemas and pipelines), `architecture` (system design), `api`
+(contracts and integrations), `security` (auth and threat mitigation), `testing`
+(test strategy and infrastructure), `infrastructure` (CI/CD and operations), or
+`documentation` (user and developer docs). Avoid synonyms and speculative tags;
+ordinary verification alone does not need `testing`.
 
-    gm issue create 'Fix keyboard navigation in search' --team ENG --type bug --label ux --label frontend
+    gm issue create 'Fix keyboard navigation in search' --team ENG --type bug --tag ux --tag frontend
 
-Substitute the actual team. Repeat `--label` for each area, then read back the
-returned issue key with `gm issue show <issue> --json` and check `labels`.
-These are suggested defaults for free-form issue labels, not an enforced
-catalog. They describe work, not agent capabilities. Agent profile tags and
-skills are self-reported, advisory delegation hints, not proof of expertise or
-claim restrictions; do not declare capabilities from issue labels.
+Substitute the actual team. Repeat `--tag` for each area, then read back the
+returned issue key with `gm issue show <issue>` and check its Tags line. A new
+name joins the catalog. An issue's tags describe work; an agent's tags (from the
+same catalog) say what work it suits; a `tag:ux` requirement limits claims to
+agents tagged ux. Tagging an issue never restricts claims. Agent profiles are
+self-reported, advisory delegation hints, not proof of expertise; do not declare
+an agent's tags from the issues it touches. (`--label` is the old spelling of
+`--tag` and still works.)
 
 ## Human intervention
 

@@ -281,6 +281,29 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
             false,
         ));
     }
+    // The harness's prompts reach the step journal through its hook (CORE-241,
+    // CORE-242): Claude Code and Codex settings, Oh My Pi's extension.
+    let hook_file = |path: &str, add: fn(&str) -> String| {
+        let current = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+        plan(&root, path, add(&current), false)
+    };
+    match harness.as_deref() {
+        Some("claude-code") => files.push(hook_file(
+            ".claude/settings.json",
+            super::hooks::with_claude_hook,
+        )),
+        Some("codex") => files.push(hook_file(
+            ".codex/hooks.json",
+            super::hooks::with_codex_hook,
+        )),
+        Some("pi") => files.push(plan(
+            &root,
+            ".omp/extensions/gitmatrix-steps.ts",
+            super::hooks::OMP_EXTENSION.to_string(),
+            false,
+        )),
+        _ => {}
+    }
     let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
     if !gitignore.lines().any(|l| l.trim() == profile::LOCAL_FILE) {
         let sep = if gitignore.is_empty() || gitignore.ends_with('\n') {
@@ -365,12 +388,20 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
 
     let report = report(&files);
     let intervention = profile::intervention(&project, &local);
+    // Agent tags come from the tracker's tag catalog (CORE-271): warn, never refuse.
+    let tag_check = if o.no_identity {
+        Value::Null
+    } else {
+        let owner = local.scope.owner.clone().or(project.tracker.owner.clone());
+        super::agents::tag_check(&Config::load(), owner.as_deref(), &local.tags)
+    };
     let value = json!({
         "dryRun": ctx.dry_run,
         "agent": name,
         "harness": harness,
         "model": local.model,
         "tags": local.tags,
+        "tagCatalog": tag_check,
         "scope": scope(&project, &local),
         "intervention": intervention,
         "identity": identity,
@@ -391,6 +422,10 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
     if let Some(profile) = identity["profile"].as_str() {
         text.push_str(&format!("  profile: {profile}\n"));
     }
+    if !local.tags.is_empty() {
+        text.push_str(&format!("  tags: {}\n", local.tags.join(", ")));
+    }
+    text.push_str(&super::agents::tag_check_text(&tag_check));
     if let Some(skills) = identity["skills"].as_array() {
         let names: Vec<&str> = skills.iter().filter_map(Value::as_str).collect();
         text.push_str(&format!(
@@ -646,6 +681,46 @@ mod tests {
                 &["web".into()]
             ),
             ["linux", "rust"]
+        );
+    }
+
+    #[test]
+    fn setup_installs_each_harness_step_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".gitmatrix")).unwrap();
+        let ctx = Ctx {
+            format: crate::output::Format::Json,
+            dry_run: false,
+            cwd: dir.path().to_path_buf(),
+            argv: String::new(),
+        };
+        let run = |harness: &str| {
+            setup(
+                &ctx,
+                &Options {
+                    harness: Some(harness.into()),
+                    no_identity: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        };
+        run("claude-code");
+        run("codex");
+        run("pi");
+        let read = |path: &str| std::fs::read_to_string(dir.path().join(path)).unwrap();
+        assert!(read(".claude/settings.json").contains("gm hook claude-code"));
+        assert!(read(".codex/hooks.json").contains("gm hook codex"));
+        assert_eq!(
+            read(".omp/extensions/gitmatrix-steps.ts"),
+            super::super::hooks::OMP_EXTENSION
+        );
+        // Again: nothing doubles.
+        run("codex");
+        let codex: serde_json::Value = serde_json::from_str(&read(".codex/hooks.json")).unwrap();
+        assert_eq!(
+            codex["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
+            1
         );
     }
 

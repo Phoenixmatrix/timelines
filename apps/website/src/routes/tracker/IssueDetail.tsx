@@ -6,6 +6,8 @@ import {
   attribution,
   claimAttribution,
   CLOSE_REASONS,
+  ISSUE_PICKUPS,
+  issuePickup,
   issueTimeline,
   issueTimelineText,
   leasedAncestor,
@@ -34,6 +36,7 @@ import {
   IssueState,
   MarkdownText,
   MultiCheck,
+  PickupField,
   statuses,
   statusLabel,
   TimelineFields,
@@ -46,7 +49,12 @@ import { DoneInTimelineCallout, LockedStatusHint, lockedIn } from "./DoneInTimel
 import { useViewer } from "../../lib/session.ts";
 import { Actor } from "./Actor.tsx";
 import { repoPath } from "../../lib/refs.ts";
+import { useRememberPlace } from "../../lib/recentPlaces.ts";
 import { AuditHistory, AuditIdentity } from "./AuditHistory.tsx";
+import { TagPicker } from "./Tags.tsx";
+import { IssueTagChip } from "../../components/Chips.tsx";
+import { LinkedWorkPanel } from "./LinkedWork.tsx";
+import { Requirements } from "./Requirements.tsx";
 
 export type MutationOutcome =
   | { ok: true; events: TrackerEvent[] }
@@ -60,6 +68,7 @@ const fieldNames: Record<keyof IssueFields, string> = {
   acceptance: "Acceptance criteria",
   type: "Type",
   status: "Status",
+  pickup: "Pickup",
   closeReason: "Close reason",
   timelineUse: "Timeline",
   timelinePolicy: "Timeline policy",
@@ -67,16 +76,17 @@ const fieldNames: Record<keyof IssueFields, string> = {
   assigneeId: "Assignee",
   parentId: "Parent issue",
   workspaceIds: "Workspaces",
-  labels: "Labels",
+  labels: "Tags",
 };
 const fieldKeys = Object.keys(fieldNames) as (keyof IssueFields)[];
-const textFields = new Set<keyof IssueFields>(["title", "description", "acceptance", "labels"]);
+const textFields = new Set<keyof IssueFields>(["title", "description", "acceptance"]);
 const fieldsOf = (issue: Issue): IssueFields => ({
   title: issue.title,
   description: issue.description,
   acceptance: issue.acceptance,
   type: issue.type,
   status: issue.status,
+  pickup: issuePickup(issue),
   closeReason: issue.closeReason ?? null,
   timelineUse: issueTimeline(issue).use,
   timelinePolicy: issueTimeline(issue).policy,
@@ -135,6 +145,12 @@ export function IssueDetail({
   initialEditing?: boolean;
 }) {
   const storageKey = `gitmatrix:issue-draft:${snapshot.owner.id}:${issue.id}`;
+  useRememberPlace({
+    kind: "issue",
+    title: issue.key,
+    detail: issue.title,
+    to: `/tracker/${encodeURIComponent(snapshot.owner.slug)}/issues/${encodeURIComponent(issue.id)}`,
+  });
   const initial: Draft = {
     version: issue.version,
     fields: fieldsOf(issue),
@@ -494,6 +510,7 @@ export function IssueDetail({
     if (key === "closeReason")
       return fields.closeReason ? CLOSE_REASONS[fields.closeReason] : "No reason recorded";
     if (key === "priority") return `P${fields.priority}`;
+    if (key === "pickup") return ISSUE_PICKUPS[issuePickup(fields)];
     if (key === "timelineUse") return issueTimelineText(fields);
     if (key === "timelinePolicy") return fields.timelinePolicy ?? "Either policy";
     return String(value);
@@ -875,6 +892,10 @@ export function IssueDetail({
                 onChange={(value) => change("assigneeId", value || null)}
               />
             </Field>
+            <PickupField
+              value={draft.fields.pickup}
+              onChange={(value) => change("pickup", value)}
+            />
             <TimelineFields
               use={draft.fields.timelineUse}
               policy={draft.fields.timelinePolicy}
@@ -890,11 +911,10 @@ export function IssueDetail({
               allowNone
               onChange={(value) => change("parentId", value || null)}
             />
-            <TextField
-              label="Labels (comma separated)"
-              value={draft.fields.labels.join(",")}
-              onChange={(event) => change("labels", event.target.value.split(","))}
-              onBlur={(event) => saveOnBlur(event, "labels")}
+            <TagPicker
+              options={snapshot.labels}
+              values={draft.fields.labels}
+              onChange={(values) => change("labels", values)}
             />
           </div>
           <MultiCheck
@@ -1017,6 +1037,8 @@ export function IssueDetail({
           <dd className="m-0 min-w-0">{typeLabel(issue.type)}</dd>
           <dt className="text-ink-faint">Priority</dt>
           <dd className="m-0 min-w-0">P{issue.priority}</dd>
+          <dt className="text-ink-faint">Pickup</dt>
+          <dd className="m-0 min-w-0">{ISSUE_PICKUPS[issuePickup(issue)]}</dd>
           <dt className="text-ink-faint">Timeline</dt>
           <dd className="m-0 min-w-0">{issueTimelineText(issue)}</dd>
           {issue.status === "canceled" && (
@@ -1036,7 +1058,7 @@ export function IssueDetail({
           <dt className="text-ink-faint">Assignee</dt>
           <dd className="m-0 min-w-0">
             {issue.assigneeId ? (
-              <Actor who={attribution(snapshot, issue.assigneeId)} />
+              <Actor who={attribution(snapshot, issue.assigneeId)} link />
             ) : (
               "Unassigned"
             )}
@@ -1060,17 +1082,16 @@ export function IssueDetail({
           )}
           {issue.labels.length > 0 && (
             <>
-              <dt className="text-ink-faint">Labels</dt>
+              <dt className="text-ink-faint">Tags</dt>
               <dd className="m-0 flex min-w-0 flex-wrap items-center gap-1">
                 {issue.labels.map((label) => (
-                  <span className="mk-chip mk-chip--tag" key={label}>
-                    {label}
-                  </span>
+                  <IssueTagChip name={label} key={label} />
                 ))}
               </dd>
             </>
           )}
         </dl>
+        <Requirements issue={issue} snapshot={snapshot} mutate={mutate} busy={busy} />
         {issue.queueFailure && (
           <section className={`${SECTION} mt-4`} aria-label="Queue failure">
             <h3 className={HEADING}>Queue failure</h3>
@@ -1156,6 +1177,7 @@ export function IssueDetail({
             <span>
               <Actor
                 who={claimAttribution(snapshot, covering!.claim!)}
+                link
                 className="font-semibold text-ink"
               />
               {covering!.claim!.delegatedFrom &&
@@ -1642,6 +1664,15 @@ export function IssueDetail({
           </button>
         </form>
       </section>
+      <section className={SECTION} aria-label="Linked work" data-issue-linked-work>
+        <LinkedWorkPanel
+          key={`${snapshot.owner.id}:${issue.id}`}
+          owner={snapshot.owner.slug}
+          issueId={issue.id}
+          issueKey={issue.key}
+          headingClassName={HEADING}
+        />
+      </section>
       <AuditHistory
         key={`${snapshot.owner.id}:${issue.id}`}
         issueId={issue.id}
@@ -1665,6 +1696,7 @@ export function IssueDetail({
               <header className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-micro text-ink-muted">
                 <Actor
                   who={attribution(snapshot, comment.actorId)}
+                  link
                   className="[&>span:last-child]:font-semibold [&>span:last-child]:text-ink"
                 />
                 <span className="inline-flex items-center gap-1.5" data-kind={comment.kind}>

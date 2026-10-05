@@ -306,6 +306,15 @@ export function summarize(
   for (const issue of issues) {
     const start = stateAt(issue, from);
     const end = stateAt(issue, to);
+    // Made after the range, or closed before it and untouched in it: not part of what it holds.
+    if (!start.status && !end.status) continue;
+    if (
+      (start.status === "done" || start.status === "canceled") &&
+      !issue.segments.some((s) => ms(s.at) > from && ms(s.at) <= to) &&
+      !issue.markers.some((m) => ms(m.at) >= from && ms(m.at) <= to) &&
+      !issue.spans.some((s) => workedMs(s, from, to, now) > 0)
+    )
+      continue;
     const a = start.status ?? "none";
     const b = end.status ?? "none";
     summary.startCounts[a] = (summary.startCounts[a] ?? 0) + 1;
@@ -474,6 +483,27 @@ export interface WorkReleaseNote {
   href: string;
 }
 
+/**
+ * A commit whose message names the issue (CORE-22): a mention, not evidence
+ * the work was done, so it's kept apart from the explicit lists above. Its
+ * own CI runs and packages ride along.
+ */
+export interface WorkMention {
+  repo: WorkRepo;
+  oid: string;
+  changeId: string | null;
+  /** The message's first line. */
+  title: string;
+  committedAt: string | null;
+  /** The branch or tag whose push first made it reachable; null when found in history. */
+  ref: string | null;
+  pushedAt: string;
+  /** Opens the commit panel: `/<owner>/<repo>?commit=<oid>`. */
+  href: string;
+  runs: WorkRun[];
+  packages: WorkPackage[];
+}
+
 /** GET /api/tracker/:owner/issues/:issue/work: what the issue's work produced, newest first. */
 export interface LinkedWork {
   issue: { id: string; key: string; title: string; status: IssueStatus };
@@ -484,6 +514,8 @@ export interface LinkedWork {
   packages: WorkPackage[];
   timelines: WorkTimeline[];
   releaseNotes: WorkReleaseNote[];
+  /** Commits that mention the issue by key, newest first. */
+  mentions: WorkMention[];
   /** A list stopped at its limit. */
   truncated: boolean;
 }

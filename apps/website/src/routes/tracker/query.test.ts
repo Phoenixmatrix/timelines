@@ -6,6 +6,7 @@ import {
   compile,
   facetsOf,
   parseQuery,
+  queryTokenSet,
   sortIssues,
   toggleToken,
   tokenize,
@@ -47,6 +48,7 @@ function snapshot(issues: Issue[], links: Link[] = []): Snapshot {
       { id: "m-jun", slug: "jun", displayName: "Jun Park" },
     ],
     agents: [],
+    labels: [],
     teams: [
       {
         id: "t-core",
@@ -134,6 +136,37 @@ describe("buildIndex", () => {
     expect(index.openBlockers.get("core-2")?.map((i) => i.key)).toEqual(["CORE-1"]);
     expect(index.byKey.get("core-1")?.id).toBe("core-1");
   });
+});
+
+it("keeps restricted pickup out of Ready while preserving explicit policy filters and human eligibility", () => {
+  const issues = [
+    issue("CORE-1"),
+    issue("CORE-2", { pickup: "not_ready" }),
+    issue("CORE-3", { pickup: "human_only", assigneeId: "agt-worker" }),
+    issue("CORE-4", { pickup: "human_only", status: "done" }),
+  ];
+  const snap = snapshot(issues);
+  snap.agents = [
+    {
+      id: "agt-worker",
+      name: "worker",
+      accountable: snap.members[0]!,
+      capabilities: null,
+      capabilitiesUpdatedAt: null,
+      revokedAt: null,
+    },
+  ];
+  const index = buildIndex(snap, snap.serverTime);
+  const keys = (query: string, viewer = "m-priya") => {
+    const compiled = compile(query, index, viewer, NOW);
+    return issues.filter((item) => compiled.matches(item)).map((item) => item.key);
+  };
+  expect(keys("is:ready")).toEqual(["CORE-1"]);
+  expect(keys("is:not_ready")).toEqual(["CORE-2"]);
+  expect(keys("is:human_only")).toEqual(["CORE-3"]);
+  expect(keys("is:open eligible:me")).toEqual(["CORE-1", "CORE-3"]);
+  expect(keys("is:open eligible:me", "agt-worker")).toEqual(["CORE-1"]);
+  expect(keys("is:closed")).toEqual(["CORE-4"]);
 });
 
 describe("done in a timeline", () => {
@@ -227,11 +260,78 @@ describe("query language", () => {
       return issues.filter((i) => c.matches(i)).map((i) => i.key);
     };
     expect(keys("team:core team:web is:open")).toEqual(["CORE-1", "WEB-1", "CORE-3"]);
-    expect(keys("team:core -label:perf")).toEqual(["CORE-2", "CORE-3"]);
+    expect(keys("team:core -tag:perf")).toEqual(["CORE-2", "CORE-3"]);
     expect(keys("assignee:jun ws:packages")).toEqual(["CORE-3"]);
     expect(keys("assignee:none is:closed")).toEqual(["CORE-2"]);
     expect(keys("web-1")).toEqual(["WEB-1"]);
     expect(keys("is:open -core")).toEqual(["WEB-1"]);
+  });
+
+  it("matches whole ticket numbers and case-insensitive keys, not mentions or substrings", () => {
+    const issues = [
+      issue("CORE-98", { title: "Search tickets", labels: ["perf"] }),
+      issue("WEB-98", { teamId: "t-web", title: "Search tickets", status: "done" }),
+      issue("CORE-198"),
+      issue("CORE-980"),
+      issue("CORE-7", { title: "Mention CORE-98", labels: ["98"] }),
+      issue("UI2-98"),
+    ];
+    const snap = snapshot(issues);
+    const index = buildIndex(snap, snap.serverTime);
+    const keys = (query: string) => {
+      const compiled = compile(query, index, "m-priya", NOW);
+      return issues.filter((i) => compiled.matches(i)).map((i) => i.key);
+    };
+    expect(keys("98")).toEqual(["CORE-98", "WEB-98", "UI2-98"]);
+    expect(keys("CoRe-98")).toEqual(["CORE-98"]);
+    expect(keys("uI2-98")).toEqual(["UI2-98"]);
+    expect(keys("99")).toEqual([]);
+    expect(keys("CORE-99")).toEqual([]);
+    expect(keys("98 team:core is:open search tag:perf")).toEqual(["CORE-98"]);
+    expect(keys("98 team:web is:open")).toEqual([]);
+    expect(keys("98 -core-98")).toEqual(["WEB-98", "UI2-98"]);
+    expect(keys("-98")).toEqual(["CORE-198", "CORE-980", "CORE-7"]);
+    expect(keys("search -98")).toEqual([]);
+    expect(keys("mention")).toEqual(["CORE-7"]);
+    expect(keys('"mention core-98"')).toEqual(["CORE-7"]);
+    expect(keys("tag:98")).toEqual(["CORE-7"]);
+    expect(keys("core")).toEqual(["CORE-98", "CORE-198", "CORE-980", "CORE-7"]);
+  });
+
+  it("filters by tag, with label: kept as an alias for the old spelling (CORE-271)", () => {
+    const issues = [
+      issue("CORE-1", { labels: ["UX", "frontend"] }),
+      issue("CORE-2", { labels: ["data"] }),
+      issue("CORE-3", { labels: ["needs design"] }),
+      issue("CORE-4"),
+    ];
+    const snap = snapshot(issues);
+    const index = buildIndex(snap, snap.serverTime);
+    const keys = (q: string) => {
+      const c = compile(q, index, "", NOW);
+      expect(c.parsed.unknown).toEqual([]);
+      return issues.filter((i) => c.matches(i)).map((i) => i.key);
+    };
+    for (const spelling of ["tag", "label", "Label", "tags", "labels"]) {
+      expect(keys(`${spelling}:ux`)).toEqual(["CORE-1"]);
+      expect(keys(`-${spelling}:ux`)).toEqual(["CORE-2", "CORE-3", "CORE-4"]);
+    }
+    expect(keys('tag:"needs design"')).toEqual(["CORE-3"]);
+    expect(keys("tag:ux label:data")).toEqual(["CORE-1", "CORE-2"]);
+    expect(parseQuery("label:ux").filters).toEqual([{ key: "tag", value: "ux", negated: false }]);
+    // A facet toggles the filter off whichever spelling put it there.
+    expect(toggleToken("is:open label:ux", "tag", "ux")).toBe("is:open");
+    expect(toggleToken("is:open", "tag", "ux")).toBe("is:open tag:ux");
+    expect(toggleToken('label:"needs design"', "tag", "needs design")).toBe("");
+    expect(queryTokenSet("label:UX -labels:data").has("tag:ux")).toBe(true);
+    expect(withoutKeys("label:ux tag:data team:core", ["tag"])).toBe("team:core");
+    const facets = facetsOf(issues, compile("label:ux", index, "", NOW), index, snap);
+    expect(facets.tag.map((f) => [f.token.key, f.token.value, f.count])).toEqual([
+      ["tag", "ux", 1],
+      ["tag", "frontend", 1],
+      ["tag", "data", 1],
+      ["tag", "needs design", 1],
+    ]);
   });
 
   it("filters by last activity with durations and dates", () => {
@@ -247,6 +347,68 @@ describe("query language", () => {
     };
     expect(keys("since:7d")).toEqual(["CORE-1"]);
     expect(keys(`until:${ago(7).slice(0, 10)}`)).toEqual(["CORE-2"]);
+  });
+
+  it("filters by requirements and by which agents meet them (CORE-32)", () => {
+    const issues = [
+      issue("CORE-1", { requires: { tags: ["ux"], minMemory: 16 * 2 ** 30 } }),
+      issue("CORE-2", { requires: { models: ["gpt-5*"] } }),
+      issue("CORE-3"),
+      issue("CORE-4", { requires: { tags: ["gpu"] }, assigneeId: "agt-blank" }),
+    ];
+    const snap = snapshot(issues);
+    const accountable = { id: "m-priya", slug: "priya", displayName: "Priya Raman" };
+    snap.agents = [
+      {
+        id: "agt-ux",
+        name: "designer",
+        accountable,
+        capabilities: {
+          version: 1,
+          harness: "claude-code",
+          model: "claude-opus-4-5",
+          environment: {
+            os: "linux",
+            arch: "x86_64",
+            runtime: "host",
+            cpuCount: 8,
+            memoryBytes: 32 * 2 ** 30,
+          },
+          tags: ["ux"],
+          skills: [],
+        },
+        capabilitiesUpdatedAt: ago(1),
+        revokedAt: null,
+      },
+      {
+        id: "agt-blank",
+        name: "blank",
+        accountable,
+        capabilities: null,
+        capabilitiesUpdatedAt: null,
+        revokedAt: null,
+      },
+    ];
+    const index = buildIndex(snap, snap.serverTime);
+    const keys = (q: string, viewer = "m-priya") => {
+      const c = compile(q, index, viewer, NOW);
+      return issues.filter((i) => c.matches(i)).map((i) => i.key);
+    };
+    expect(keys("requires:ux")).toEqual(["CORE-1"]);
+    expect(keys("requires:tag:ux")).toEqual(["CORE-1"]);
+    expect(keys("requires:memory>=16GiB")).toEqual(["CORE-1"]);
+    expect(keys("requires:gpt-5*")).toEqual(["CORE-2"]);
+    expect(keys("requires:none")).toEqual(["CORE-3"]);
+    expect(keys("-requires:none")).toEqual(["CORE-1", "CORE-2", "CORE-4"]);
+    expect(keys("eligible:designer")).toEqual(["CORE-1", "CORE-3"]);
+    expect(keys("eligible:agt-ux")).toEqual(["CORE-1", "CORE-3"]);
+    // Without capabilities only open-to-all work, and what's assigned to it.
+    expect(keys("eligible:blank")).toEqual(["CORE-3", "CORE-4"]);
+    expect(keys("-eligible:designer")).toEqual(["CORE-2", "CORE-4"]);
+    expect(keys("eligible:nobody")).toEqual([]);
+    // People can always claim; an agent viewer is checked itself.
+    expect(keys("eligible:me")).toEqual(["CORE-1", "CORE-2", "CORE-3", "CORE-4"]);
+    expect(keys("eligible:me", "agt-ux")).toEqual(["CORE-1", "CORE-3"]);
   });
 
   it("toggles tokens and strips keys", () => {
@@ -278,6 +440,43 @@ describe("facets, sorting and activity", () => {
       ["Ready", 2],
       ["Backlog", 1],
     ]);
+  });
+
+  it("selects the issues counted by agent, person and unassigned facets", () => {
+    const assigned = [
+      issue("CORE-1", { assigneeId: "agt-priya" }),
+      issue("CORE-2", { assigneeId: "agt-priya", status: "done" }),
+      issue("CORE-3", { assigneeId: "agt-jun" }),
+      issue("CORE-4", { assigneeId: "m-jun" }),
+      issue("CORE-5"),
+      issue("CORE-6", { assigneeId: "agt-missing" }),
+    ];
+    const snap = snapshot(assigned);
+    snap.agents = snap.members.map((accountable) => ({
+      id: accountable.id.replace("m-", "agt-"),
+      name: "claude-code",
+      accountable,
+      capabilities: null,
+      capabilitiesUpdatedAt: null,
+      revokedAt: null,
+    }));
+    const index = buildIndex(snap, snap.serverTime);
+    const facets = facetsOf(assigned, compile("", index, "m-priya", NOW), index, snap);
+    const cases = [
+      ["agt-priya", ["CORE-1", "CORE-2"]],
+      ["agt-jun", ["CORE-3"]],
+      ["jun", ["CORE-4"]],
+      ["none", ["CORE-5"]],
+      ["agt-missing", ["CORE-6"]],
+    ] as const;
+    for (const [value, expected] of cases) {
+      const facet = facets.assignee.find((entry) => entry.token.value === value)!;
+      const query = toggleToken("", facet.token.key, facet.token.value);
+      const selected = compile(query, index, "m-priya", NOW);
+      expect(assigned.filter((entry) => selected.matches(entry)).map((entry) => entry.key)).toEqual(
+        expected,
+      );
+    }
   });
 
   it("ranks what can move now first", () => {

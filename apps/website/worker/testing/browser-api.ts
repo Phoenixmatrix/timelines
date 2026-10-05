@@ -21,6 +21,8 @@ import { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
 import type { AppEnv } from "../auth.ts";
 import { accounts } from "../api/accounts.ts";
+import { personalSkillsApi } from "../api/personal-skills.ts";
+import { assistant } from "../api/assistant.ts";
 import { dev } from "../api/dev.ts";
 import { repos } from "../api/repos.ts";
 import { workspaceAtlas } from "../atlas/workspace.ts";
@@ -28,12 +30,17 @@ import { atlas } from "../atlas/api.ts";
 import { findRepo, findUserById } from "../db.ts";
 import { knowledge } from "../knowledge/api.ts";
 import { invalidateRefs } from "../objects.ts";
+import { refs } from "../refs/api.ts";
+import { trackerReleaseNotes } from "../release-notes/api.ts";
 import { search } from "../search/api.ts";
+import { aiSettingsApi, siteAiSettingsApi } from "../settings/ai.ts";
+import { steps } from "../steps/api.ts";
 import { timelines } from "../timelines/api.ts";
 import { timelineGraph } from "../timelines/graph.ts";
 import { resolveSource } from "../timelines/sources.ts";
 import { Timing } from "../timing.ts";
 import { tracker } from "../tracker/api.ts";
+import { agents } from "../api/agents.ts";
 import { Tracker } from "../tracker/object.ts";
 import { d1, migratedDatabase } from "./d1.ts";
 import { durableStorage } from "./durable.ts";
@@ -176,19 +183,36 @@ app.use(async (c, next) => {
   c.set("timing", new Timing());
   const world = worldOf(c.req.header("x-browser-test-world") ?? "");
   const persona = (c.req.header("x-browser-test-as") || world.persona) as Persona;
-  c.set("actor", persona ? await findUserById(c.env.DB, `acc_${persona}`) : null);
+  // One of the world's agents, signed in as if with its token (its person's access).
+  const agentId = c.req.header("x-browser-test-agent");
+  if (agentId) {
+    const agent = await c.env.DB.prepare("SELECT id, name, accountable_id FROM agents WHERE id = ?")
+      .bind(agentId)
+      .first<{ id: string; name: string; accountable_id: string }>();
+    if (!agent) throw new Error(`No agent ${agentId}`);
+    const person = await findUserById(c.env.DB, agent.accountable_id);
+    c.set("actor", person ? { ...person, agent: { id: agent.id, name: agent.name } } : null);
+  } else c.set("actor", persona ? await findUserById(c.env.DB, `acc_${persona}`) : null);
   await next();
 });
 app.route("/api/accounts/:owner/atlas", workspaceAtlas);
+app.route("/api/agents", agents);
+app.route("/api/accounts/:slug/settings/ai", aiSettingsApi);
+app.route("/api/admin/ai", siteAiSettingsApi);
 app.route("/api", accounts);
+app.route("/api/account/skills", personalSkillsApi);
+app.route("/api/assistant", assistant);
+app.route("/api/tracker/:owner/release-notes", trackerReleaseNotes);
 app.route("/api/tracker/:owner/timelines", timelines);
 app.route("/api/tracker/:owner/timeline-graph", timelineGraph);
 app.route("/api", tracker);
 app.route("/api/repos/:owner/:name/knowledge", knowledge);
 app.route("/api/repos/:owner/:name/atlas", atlas);
+app.route("/api/repos/:owner/:name/steps", steps);
 app.route("/api/repos", repos);
 app.route("/api/dev", dev);
 app.route("/api/search", search);
+app.route("/api/refs", refs);
 app.notFound((c) => c.json({ error: "Not found." }, 404));
 app.onError((error, c) => {
   console.error(error);
@@ -285,6 +309,23 @@ export async function world(action: string, input: unknown): Promise<unknown> {
     case "refs": {
       const world = worldOf(args.world ?? "");
       return Object.fromEntries((await remoteOf(world, args.repo ?? "", args.sourceId)).refs);
+    }
+    case "sql": {
+      // Rows only machinery the world lacks would write (CI runs,
+      // deployments, wiki page sets, packages published from CI), as that
+      // machinery would leave them; `database: "registry"` for the registry's.
+      const {
+        statement,
+        params = [],
+        database,
+      } = input as { statement: string; params?: unknown[]; database?: "registry" };
+      const world = worldOf(args.world ?? "");
+      const target = database === "registry" ? world.env.REGISTRY_DB : world.env.DB;
+      const { results } = await target
+        .prepare(statement)
+        .bind(...params)
+        .all();
+      return results;
     }
     default:
       throw new Error(`Unknown browser-test world action ${action}`);

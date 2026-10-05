@@ -13,19 +13,17 @@
 // that carries over.
 //
 // Layout. Every repository with an Atlas gets its own column ("band"), in
-// selection order, each a fixed TOP_WIDTH cells wide. Inside its band a
-// repository's regions sit in their own stable slots (buildTerritory,
-// CORE-165), exactly as on its repository map, so slot numbers that two
-// repositories share never collide. A band's position depends only on the
-// ready repositories selected before it: a repository growing or shrinking
-// never moves another, losing access mid-view leaves an empty band in place,
-// and picking one more appends a band without moving anything. Removing one
-// (or one becoming ready between visits) shifts the bands after it sideways as
-// a whole; nothing inside them moves. Repositories without an Atlas get no
-// band, only their row in the coverage list, so the map isn't shrunk by empty
-// columns. Columns rather than stacked rows because a band's height follows
-// its own content, and stacking would let one repository's growth push the
-// others.
+// selection order, as wide as its own map. Inside its band a repository's
+// regions are laid out from its own links (buildTerritory), exactly as on its
+// repository map. A band's position depends only on the ready repositories
+// selected before it and their maps' widths: losing access mid-view leaves an
+// empty band in place, and picking one more appends a band without moving
+// anything. A map before it growing wider, removing one, or one becoming
+// ready between visits shifts the bands after it sideways as a whole; nothing
+// inside them moves. Repositories without an Atlas get no band, only their
+// row in the coverage list, so the map isn't shrunk by empty columns.
+// Columns rather than stacked rows because a band's height follows its own
+// content, and stacking would let one repository's growth push the others.
 //
 // Session. One per scope (the page remounts it when the selection or account
 // changes, so nothing from the previous scope survives the switch). It reads
@@ -50,6 +48,7 @@ import {
   type AtlasError,
   type AtlasLinkState,
   type AtlasRegion,
+  type AtlasRegionLink,
   type AtlasWorkspaceComposition,
   type AtlasWorkspaceOverview,
   type AtlasWorkspacePage,
@@ -66,14 +65,14 @@ import {
 import { writeAtlasUrl } from "../repo/atlasUrl.ts";
 import {
   buildTerritory,
-  CELL,
   ChildLoader,
-  GAP,
-  TOP_WIDTH,
+  HEX,
+  shiftTerritory,
   type Expanded,
   type Load,
   type Territory,
   type TerritoryCell,
+  type Tile,
 } from "../repo/territory.ts";
 
 // ---- selection -------------------------------------------------------------------
@@ -171,13 +170,12 @@ export function coverageOf(
 // ---- layout ------------------------------------------------------------------------
 
 /** World units around and above a repository's own territory, and between bands. */
-export const BAND_PAD = GAP;
+export const BAND_PAD = HEX;
 export const BAND_HEADER = 120;
-export const BAND_GUTTER = CELL / 2;
-/** A band is always this wide: its repository's grid width plus padding. */
-export const BAND_WIDTH = TOP_WIDTH * (CELL + GAP) - GAP + BAND_PAD * 2;
-/** The territory height a band with nothing to draw keeps. */
-const EMPTY_HEIGHT = CELL / 2;
+export const BAND_GUTTER = HEX * 2;
+/** The narrowest a band is, and the territory height a band with nothing to draw keeps. */
+const MIN_WIDTH = HEX * 8;
+const EMPTY_HEIGHT = HEX * 3;
 
 export interface Band {
   /** The selected name: a ready repository, or one whose access went away mid-view. */
@@ -197,44 +195,55 @@ export interface WorkspaceTerritory extends Territory {
 /**
  * The map for a workspace: one band per selected repository, in selection
  * order, each holding only its own regions (ids `<repoId>/<id>`) laid out by
- * buildTerritory from their own slots, then shifted into the band.
+ * buildTerritory from their own links, then centred in the band.
  */
 export function buildWorkspaceTerritory(
   coverage: readonly Coverage[],
   regions: readonly AtlasRegion[],
   expanded: Expanded,
+  links: readonly AtlasRegionLink[] = [],
 ): WorkspaceTerritory {
   const cells: TerritoryCell[] = [];
   const byId = new Map<string, TerritoryCell>();
+  const tiles: Tile[] = [];
   const bands: Band[] = [];
   let height = 0;
+  let x = 0;
   const drawn = coverage.filter((c) => c.state === "ready" || c.state === "revoked");
-  drawn.forEach((entry, index) => {
-    const x = index * (BAND_WIDTH + BAND_GUTTER);
+  for (const entry of drawn) {
     const repo = entry.state === "ready" ? entry.repo : null;
     const own = repo ? regions.filter((r) => r.repoId === repo.id) : [];
-    const local = buildTerritory(own, expanded, repo?.snapshot?.seq ?? 0);
-    const dx = x + BAND_PAD;
-    const dy = BAND_HEADER;
-    for (const cell of local.cells) {
-      const moved = { ...cell, x: cell.x + dx, y: cell.y + dy };
-      cells.push(moved);
-      byId.set(moved.id, moved);
+    const ids = new Set(own.map((r) => r.id));
+    const local = buildTerritory(
+      own,
+      expanded,
+      repo?.snapshot?.seq ?? 0,
+      links.filter((l) => ids.has(l.src) && ids.has(l.dst)),
+    );
+    const empty = !local.cells.length;
+    const land = empty ? 0 : local.width - local.left;
+    const w = Math.max(MIN_WIDTH, land + BAND_PAD * 2);
+    const moved = shiftTerritory(local, x + (w - land) / 2 - local.left, BAND_HEADER - local.top);
+    for (const cell of moved.cells) {
+      cells.push(cell);
+      byId.set(cell.id, cell);
     }
-    const h = BAND_HEADER + (local.cells.length ? local.height : EMPTY_HEIGHT) + BAND_PAD;
+    tiles.push(...moved.tiles);
+    const h = BAND_HEADER + (empty ? EMPTY_HEIGHT : local.height - local.top) + BAND_PAD;
     bands.push({
       name: entry.name,
       repoId: entry.repo?.id ?? null,
       coverage: entry,
       x,
       y: 0,
-      w: BAND_WIDTH,
+      w,
       h,
     });
     height = Math.max(height, h);
-  });
-  const width = bands.length ? bands.length * (BAND_WIDTH + BAND_GUTTER) - BAND_GUTTER : 0;
-  return { cells, byId, width, height, bands };
+    x += w + BAND_GUTTER;
+  }
+  const width = bands.length ? x - BAND_GUTTER : 0;
+  return { cells, byId, tiles, left: 0, top: 0, width, height, bands };
 }
 
 /** The repository id a namespaced workspace id belongs to. */

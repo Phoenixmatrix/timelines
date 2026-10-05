@@ -3,16 +3,30 @@
 // query language over it, facet counts, and opened/closed activity buckets.
 // Everything here is pure, so it is tested without a browser.
 //
-//   is:ready is:waiting is:blocked is:claimed is:leased is:open is:closed
+//   is:ready is:waiting is:not_ready is:human_only is:blocked is:claimed is:leased is:open is:closed
 //   status:backlog|todo|in_progress|done|done_in_timeline|canceled
-//   team:CORE  ws:packages  assignee:jun|me|none  label:perf  type:bug  p:1
+//   team:CORE  ws:packages  assignee:jun|me|none  tag:perf  type:bug  p:1
+//   (tag: is the issue's tags from the tracker's tag catalog; label: still works)
 //   since:7d until:2026-09-01   (last activity: updatedAt)
-//   parent:CORE-12   words match key, title and labels; - excludes.
+//   parent:CORE-12   numbers/full keys match tickets exactly (case-insensitive);
+//   requires:ux|tag:ux|memory>=16GiB|none   eligible:builder|me (CORE-32: which
+//   agents meet an issue's requirements and pickup policy);
+//   other words match key, title and tags; - excludes.
 
+import {
+  hasRequirements,
+  requirementTerms,
+  unmetRequirements,
+  type IssueRequirements,
+  type UnmetRequirement,
+} from "./requirements.ts";
 import {
   actorName,
   claimHolder,
+  hasActiveClaim,
   leasedAncestor,
+  issuePickup,
+  ISSUE_PICKUPS,
   readiness,
   readinessIndex,
   type Issue,
@@ -22,6 +36,8 @@ import {
 
 export type IssueState =
   | "waiting"
+  | "not_ready"
+  | "human_only"
   | "claimed"
   | "leased"
   | "blocked"
@@ -35,6 +51,8 @@ export type IssueState =
 
 export const STATE_LABEL: Record<IssueState, string> = {
   waiting: "Waiting",
+  not_ready: "Not ready",
+  human_only: "Human only",
   ready: "Ready",
   in_progress: "In progress",
   claimed: "Claimed",
@@ -57,6 +75,8 @@ const STATE_RANK: Record<IssueState, number> = {
   in_progress: 4,
   todo: 5,
   blocked: 6,
+  not_ready: 6.1,
+  human_only: 6.2,
   // Finished, waiting for its timeline to land (CORE-74).
   done_in_timeline: 7,
   backlog: 8,
@@ -125,6 +145,7 @@ export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
     else if (issue.status === "done_in_timeline") value = "done_in_timeline";
     else if (why === "claimed") value = "claimed";
     else if (issue.status === "done" || issue.status === "canceled") value = issue.status;
+    else if (why === "not_ready" || why === "human_only") value = why;
     else if (why === "blocked") value = "blocked";
     else if (why === "leased_above") value = "leased";
     else if (why === "ready") value = "ready";
@@ -161,20 +182,33 @@ export const QUERY_KEYS = [
   "team",
   "ws",
   "assignee",
-  "label",
+  "tag",
   "type",
   "p",
   "since",
   "until",
   "parent",
+  "requires",
+  "eligible",
 ] as const;
 export type QueryKey = (typeof QUERY_KEYS)[number];
-const ALIASES: Record<string, QueryKey> = {
+/** Other spellings of a key; `label:` is the old name of `tag:` (CORE-271). */
+export const QUERY_ALIASES: Record<string, QueryKey> = {
   workspace: "ws",
   priority: "p",
   state: "is",
   owner: "assignee",
+  label: "tag",
+  labels: "tag",
+  tags: "tag",
 };
+/** The key a written key means, aliases included; undefined when it isn't one. */
+export function queryKey(name: string): QueryKey | undefined {
+  const lower = name.toLowerCase();
+  return (QUERY_KEYS as readonly string[]).includes(lower)
+    ? (lower as QueryKey)
+    : QUERY_ALIASES[lower];
+}
 
 export interface Filter {
   key: QueryKey;
@@ -204,10 +238,7 @@ export function parseQuery(query: string): ParsedQuery {
       parsed.words.push({ text: (negated ? token.slice(1) : token).toLowerCase(), negated });
       continue;
     }
-    const name = match[2]!.toLowerCase();
-    const key = (QUERY_KEYS as readonly string[]).includes(name)
-      ? (name as QueryKey)
-      : ALIASES[name];
+    const key = queryKey(match[2]!);
     if (!key || !match[3]) {
       parsed.unknown.push(token);
       continue;
@@ -221,20 +252,42 @@ export function filterToken(key: QueryKey, value: string, negated = false): stri
   return `${negated ? "-" : ""}${key}:${/\s/.test(value) ? `"${value}"` : value}`;
 }
 
-/** Add `key:value` to the query, or remove it when present. */
+/** A token with its key in the canonical spelling: `label:ux` reads `tag:ux`. */
+export function canonicalToken(token: string): string {
+  const match = /^(-?)([A-Za-z]+):(.*)$/.exec(token);
+  const key = match && queryKey(match[2]!);
+  return key ? `${match[1]}${key}:${match[3]}` : token;
+}
+
+/** Add `key:value` to the query, or remove it when present (in any spelling). */
 export function toggleToken(query: string, key: QueryKey, value: string): string {
   const tokens = tokenize(query);
   const token = filterToken(key, value);
-  const at = tokens.findIndex((t) => t.toLowerCase() === token.toLowerCase());
+  const at = tokens.findIndex(
+    (t) => canonicalToken(filterTokenOf(t)).toLowerCase() === token.toLowerCase(),
+  );
   if (at !== -1) tokens.splice(at, 1);
   else tokens.push(token);
   return tokens.join(" ");
 }
+/** The query's filters as filterToken writes them, lowercase: what a facet shows as pressed. */
+export function queryTokenSet(query: string): Set<string> {
+  return new Set(tokenize(query).map((t) => canonicalToken(filterTokenOf(t)).toLowerCase()));
+}
+/** A tokenized `key:value` written back the way filterToken writes it (quotes kept). */
+function filterTokenOf(token: string): string {
+  const match = /^(-?[A-Za-z]+:)(.*)$/.exec(token);
+  return match && /\s/.test(match[2]!) ? `${match[1]}"${match[2]}"` : token;
+}
 
-/** Replace every token of these keys. */
+/** Replace every token of these keys, whatever spelling they were written in. */
 export function withoutKeys(query: string, keys: QueryKey[]): string {
   return tokenize(query)
-    .filter((t) => !keys.some((k) => new RegExp(`^-?${k}:`, "i").test(t)))
+    .filter((t) => {
+      const match = /^-?([A-Za-z]+):/.exec(t);
+      const key = match && queryKey(match[1]!);
+      return !key || !keys.includes(key);
+    })
     .join(" ");
 }
 
@@ -267,8 +320,9 @@ function predicate(filter: Filter, index: IssueIndex, viewerId: string, now: num
     case "assignee":
       if (v === "none") return (i) => i.assigneeId === null;
       if (v === "me") return (i) => i.assigneeId === viewerId;
-      return (i) => !!i.assigneeId && index.memberSlug.get(i.assigneeId)?.toLowerCase() === v;
-    case "label":
+      return (i) =>
+        !!i.assigneeId && (index.memberSlug.get(i.assigneeId) ?? i.assigneeId).toLowerCase() === v;
+    case "tag":
       return (i) => i.labels.some((l) => l.toLowerCase() === v);
     case "type":
       return (i) => i.type === v;
@@ -286,7 +340,136 @@ function predicate(filter: Filter, index: IssueIndex, viewerId: string, now: num
       const parent = index.byKey.get(v) ?? index.byId.get(v);
       return (i) => !!parent && i.parentId === parent.id;
     }
+    case "requires":
+      if (v === "none") return (i) => !hasRequirements(i.requires);
+      // A whole term ("tag:ux", "memory>=16gib"), else any listed value ("ux").
+      return (i) =>
+        requirementTerms(i.requires).some((term) => {
+          const t = term.toLowerCase();
+          return t === v || t.slice(t.indexOf(":") + 1) === v;
+        });
+    case "eligible": {
+      const id = v === "me" ? viewerId : null;
+      const agents = index.people.agents.filter((a) =>
+        id ? a.id === id : a.id.toLowerCase() === v || a.name.toLowerCase() === v,
+      );
+      // People bypass capability requirements, but never the not-ready policy.
+      if (v === "me" && !agents.length) return (i) => issuePickup(i) !== "not_ready";
+      return (i) => agents.some((agent) => agentEligible(i, agent));
+    }
   }
+}
+
+/** Which open work an agent can take in one tracker (CORE-32), for the Agents page. */
+export interface AgentWork {
+  agentId: string;
+  /** Open issues other than PRDs. */
+  open: number;
+  /** Of those, the ones with requirements. */
+  requiring: number;
+  /** Of those, the ones it meets (or is assigned). */
+  eligible: number;
+  /** A few it doesn't meet, highest priority first, and why. */
+  missing: { key: string; title: string; unmet: string[] }[];
+  /**
+   * A few open issues it can take, to do first, highest priority first
+   * (CORE-272); absent from servers before it.
+   */
+  takeable?: { key: string; title: string; status: Issue["status"]; requires: boolean }[];
+}
+export interface AgentEligibility {
+  trackers: {
+    tracker: { slug: string; displayName: string };
+    agents: AgentWork[];
+    /** The tracker's tag catalog (CORE-271), which agents' tags are chosen from. */
+    tags?: string[];
+  }[];
+}
+
+/** An agent's open work in a snapshot: how much of it asks for what it doesn't report. */
+export function agentWork(
+  snapshot: Pick<Snapshot, "issues" | "agents">,
+  agentId: string,
+  limit = 5,
+): AgentWork {
+  const agent = snapshot.agents.find((a) => a.id === agentId);
+  const open = snapshot.issues.filter(
+    (i) => i.status !== "done" && i.status !== "canceled" && i.type !== "prd",
+  );
+  const requiring = open.filter((i) => hasRequirements(i.requires));
+  const missing = requiring
+    .filter((i) => !agent || !agentEligible(i, agent))
+    .sort((a, b) => a.priority - b.priority || a.key.localeCompare(b.key));
+  const order = (a: Issue, b: Issue) =>
+    Number(b.status === "todo") - Number(a.status === "todo") ||
+    a.priority - b.priority ||
+    a.key.localeCompare(b.key);
+  const takeable = open
+    .filter((i) => !i.claim && (!agent || agentEligible(i, agent)))
+    .filter((i) => i.status === "todo" || i.status === "backlog")
+    .sort(order)
+    .slice(0, limit)
+    .map((i) => ({
+      key: i.key,
+      title: i.title,
+      status: i.status,
+      requires: hasRequirements(i.requires),
+    }));
+  return {
+    agentId,
+    open: open.length,
+    requiring: requiring.length,
+    eligible: requiring.length - missing.length,
+    takeable,
+    missing: missing.slice(0, limit).map((i) => ({
+      key: i.key,
+      title: i.title,
+      unmet: [
+        ...(issuePickup(i) === "anyone" ? [] : [`Pickup: ${ISSUE_PICKUPS[issuePickup(i)]}.`]),
+        ...unmetRequirements(i.requires, agent?.capabilities ?? null).map((u) => u.message),
+      ],
+    })),
+  };
+}
+
+/**
+ * What new requirements would do to the claim on an issue (CORE-272): the
+ * holding agent, when it met the old ones (or missed less) and misses the new
+ * ones, with what it misses. Null when nothing changes for the holder: no
+ * active claim, or a person holds it.
+ * The tracker computes the same on save; the web previews it before.
+ */
+export function tighteningEffect(
+  issue: Issue,
+  requires: IssueRequirements | null | undefined,
+  agents: Snapshot["agents"],
+  now: string,
+): { agent: Snapshot["agents"][number]; unmet: UnmetRequirement[] } | null {
+  if (!issue.claim || !hasActiveClaim(issue, now)) return null;
+  const agent = agents.find((a) => a.id === issue.claim!.actorId);
+  // A claim assigns its holder, so assignment doesn't exempt it here: the
+  // editor decides, with the mismatch in view.
+  if (!agent) return null;
+  const unmet = unmetRequirements(requires, agent.capabilities);
+  if (!unmet.length) return null;
+  const before = new Set(
+    unmetRequirements(issue.requires, agent.capabilities).map((u) => u.wanted),
+  );
+  return unmet.some((u) => !before.has(u.wanted)) ? { agent, unmet } : null;
+}
+
+/**
+ * Whether an agent may claim an issue (CORE-32), as the tracker decides it:
+ * pickup permits agents, and it meets requirements or is explicitly assigned.
+ */
+export function agentEligible(
+  issue: Issue,
+  agent: Pick<Snapshot["agents"][number], "id" | "capabilities">,
+): boolean {
+  return (
+    issuePickup(issue) === "anyone" &&
+    (issue.assigneeId === agent.id || !unmetRequirements(issue.requires, agent.capabilities).length)
+  );
 }
 
 export interface Compiled {
@@ -305,7 +488,18 @@ export function compile(query: string, index: IssueIndex, viewerId: string, now:
     );
     groups.set(filter.key, group);
   }
-  const words = parsed.words;
+  const tickets: Predicate[] = [];
+  const words: ParsedQuery["words"] = [];
+  for (const word of parsed.words) {
+    if (/^\d+$/.test(word.text)) {
+      const suffix = `-${word.text}`;
+      tickets.push((issue) => issue.key.endsWith(suffix) !== word.negated);
+    } else if (/^[a-z][a-z0-9]{1,5}-\d+$/.test(word.text)) {
+      tickets.push((issue) => (issue.key.toLowerCase() === word.text) !== word.negated);
+    } else {
+      words.push(word);
+    }
+  }
   return {
     parsed,
     matches(issue, except) {
@@ -314,6 +508,7 @@ export function compile(query: string, index: IssueIndex, viewerId: string, now:
         if (positive.length && !positive.some((p) => p(issue))) return false;
         if (negative.some((p) => p(issue))) return false;
       }
+      for (const ticket of tickets) if (!ticket(issue)) return false;
       if (words.length) {
         const haystack = `${issue.key} ${issue.title} ${issue.labels.join(" ")}`.toLowerCase();
         for (const word of words) if (haystack.includes(word.text) === word.negated) return false;
@@ -354,11 +549,13 @@ export interface Facets {
   ws: FacetValue[];
   assignee: FacetValue[];
   type: FacetValue[];
-  label: FacetValue[];
+  tag: FacetValue[];
 }
 
 const STATE_TOKEN: Record<IssueState, { key: QueryKey; value: string }> = {
   waiting: { key: "is", value: "waiting" },
+  not_ready: { key: "is", value: "not_ready" },
+  human_only: { key: "is", value: "human_only" },
   ready: { key: "is", value: "ready" },
   claimed: { key: "is", value: "claimed" },
   leased: { key: "is", value: "leased" },
@@ -390,7 +587,7 @@ export function facetsOf(
   const wss = count<string>(["ws"], (i) => i.workspaceIds);
   const people = count<string>(["assignee"], (i) => [i.assigneeId ?? ""]);
   const kinds = count<string>(["type"], (i) => [i.type]);
-  const labels = count<string>(["label"], (i) => i.labels);
+  const tags = count<string>(["tag"], (i) => i.labels);
   const sorted = (values: FacetValue[]) => values.sort((a, b) => b.count - a.count);
   return {
     state: (Object.keys(STATE_RANK) as IssueState[])
@@ -425,9 +622,9 @@ export function facetsOf(
         count: n,
       })),
     ),
-    label: sorted(
-      [...labels].map(([l, n]) => ({
-        token: { key: "label" as const, value: l.toLowerCase() },
+    tag: sorted(
+      [...tags].map(([l, n]) => ({
+        token: { key: "tag" as const, value: l.toLowerCase() },
         label: l,
         count: n,
       })),

@@ -14,14 +14,16 @@ import {
   type ReleaseNotesIndex,
   type ReleaseNotesRelease,
 } from "../../../shared/release-notes.ts";
+import { CommitLink } from "../../components/CommitLink.tsx";
 import { RailSection, railClass } from "../../components/Rail.tsx";
 import {
   RELEASE_NOTE_DETAILS_ID,
   ReleaseNoteDetails,
 } from "../../components/ReleaseNoteDetails.tsx";
+import { LinkedText } from "../../refs/RefLink.tsx";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { shortOid, timeAgo } from "../../lib/format.ts";
-import { commitsUrl, repoPath } from "../../lib/refs.ts";
+import { repoPath } from "../../lib/refs.ts";
 import { scopeOf } from "../../lib/timelineScope.ts";
 import { useRepo } from "./RepoLayout.tsx";
 import { useEffect, useState } from "react";
@@ -69,8 +71,14 @@ function Entry({
 }) {
   return (
     <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
-      <div className="text-body font-semibold text-ink">{entry.title}</div>
-      {entry.summary && <p className="m-0 text-body-sm text-ink-muted">{entry.summary}</p>}
+      <div className="text-body font-semibold text-ink">
+        <LinkedText text={entry.title} />
+      </div>
+      {entry.summary && (
+        <p className="m-0 text-body-sm text-ink-muted">
+          <LinkedText text={entry.summary} />
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-micro text-ink-faint">
         {scope && landedTimelineSlug(entry.timeline) === scope && (
           <span className="mk-chip mk-chip--tag">This timeline</span>
@@ -107,7 +115,7 @@ function Sidebar({
       {(["daily", "tag"] as const).map((kind) => (
         <section key={kind} className="mb-5">
           <h2 className="mx-2.5 mt-0 mb-2 text-body-sm font-semibold">
-            {kind === "daily" ? "Daily updates" : "Tags"}
+            {kind === "daily" ? "Daily updates" : "Tagged releases"}
           </h2>
           <ul className="m-0 flex list-none flex-col gap-0.5 p-0">
             {index.releases
@@ -313,9 +321,14 @@ export function Releases() {
           {release.release.kind === "tag" && (
             <RailSection title="Range">
               <p className="m-0 text-body-sm text-ink-muted">
-                <Link className="mk-mono" to={commitsUrl(owner, repo.name, release.release.toOid)}>
+                <CommitLink
+                  className="mk-mono"
+                  owner={owner}
+                  name={repo.name}
+                  sha={release.release.toOid}
+                >
                   {shortOid(release.release.toOid)}
-                </Link>
+                </CommitLink>
                 {release.release.fromOid ? (
                   <>
                     {" "}
@@ -332,8 +345,8 @@ export function Releases() {
           )}
           <RailSection title="Code update history">
             <p className="m-0 text-body-sm text-ink-muted">
-              Daily updates group default-branch first-parent commits by UTC Git commit date. Tags
-              are optional named snapshots. Neither records a deployment.
+              Daily updates group default-branch first-parent commits by UTC Git commit date. Tagged
+              releases are optional named snapshots, one per Git tag. Neither records a deployment.
             </p>
           </RailSection>
           <p className="m-0 border-t border-line-soft pt-3 text-micro text-ink-faint">

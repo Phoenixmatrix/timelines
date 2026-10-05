@@ -725,6 +725,17 @@ export interface OverlayState {
   done: { commit: string; base: string | null; sourceId?: string } | null;
   retries: number;
   lastError: string | null;
+  /** The bookmark's latest tip and when this coordinator first saw it (CORE-238's quiet period). */
+  seen?: { commit: string; at: number } | null;
+}
+
+/** When the overlay scan waits for a timeline's pushes to pause (CORE-238). */
+export interface OverlayQuiet {
+  now: number;
+  /** The quiet period; 0 starts overlays right away. */
+  ms: number;
+  /** Bookmarks a checkpoint wants now, quiet or not. */
+  now_refs?: Set<string>;
 }
 
 /**
@@ -737,16 +748,37 @@ export function scanOverlays(
   tips: Map<string, string>,
   indexed: string | null,
   max = MAX_OVERLAYS,
-): { gone: string[]; start: [string, string][]; deferred: boolean } {
+  quiet: OverlayQuiet = { now: 0, ms: 0 },
+): {
+  gone: string[];
+  start: [string, string][];
+  deferred: boolean;
+  /** Tips first seen in this scan, to remember with when. */
+  seen: [string, string][];
+  /** When the earliest bookmark still in its quiet period is due; null if none. */
+  wakeAt: number | null;
+} {
   const gone = Object.keys(overlays).filter((ref) => !tips.has(ref) && !overlays[ref]!.running);
   const start: [string, string][] = [];
+  const seen: [string, string][] = [];
+  let wakeAt: number | null = null;
   let deferred = false;
-  if (!indexed) return { gone, start, deferred };
+  if (!indexed) return { gone, start, deferred, seen, wakeAt };
   let inFlight = Object.values(overlays).filter((o) => o.running).length;
   for (const [ref, commit] of tips) {
     const overlay = overlays[ref];
     if (overlay?.running) continue;
     if (overlay?.done?.commit === commit && overlay.done.base === indexed) continue;
+    // A moved tip waits until the timeline's pushes pause, unless a checkpoint wants it now.
+    if (quiet.ms > 0 && overlay?.done?.commit !== commit && !quiet.now_refs?.has(ref)) {
+      const since = overlay?.seen?.commit === commit ? overlay.seen.at : quiet.now;
+      if (overlay?.seen?.commit !== commit) seen.push([ref, commit]);
+      if (quiet.now - since < quiet.ms) {
+        const due = since + quiet.ms;
+        wakeAt = wakeAt === null ? due : Math.min(wakeAt, due);
+        continue;
+      }
+    }
     if (inFlight >= max) {
       deferred = true;
       continue;
@@ -754,5 +786,5 @@ export function scanOverlays(
     start.push([ref, commit]);
     inFlight += 1;
   }
-  return { gone, start, deferred };
+  return { gone, start, deferred, seen, wakeAt };
 }

@@ -8,7 +8,9 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import type { RepoDetail } from "../../../shared/api.ts";
 import type { WhyChain, WhyResponse } from "../../../shared/why.ts";
+import { CommitLink } from "../../components/CommitLink.tsx";
 import { link } from "../../components/ui.tsx";
+import { PersonLink } from "../../components/PersonLink.tsx";
 import { api } from "../../lib/api.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { blobUrl, commitsUrl, sourceUrl, treeUrl } from "../../lib/refs.ts";
@@ -117,7 +119,7 @@ export function WhyPanel({
                 Couldn't follow the history: {current.error}
               </p>
             ) : (
-              <WhyResult result={current.result!} path={path} />
+              <WhyResult result={current.result!} path={path} onLeave={() => onOpenChange(false)} />
             )}
           </div>
         </Dialog.Popup>
@@ -126,7 +128,16 @@ export function WhyPanel({
   );
 }
 
-function WhyResult({ result, path }: { result: WhyResponse; path: string }) {
+function WhyResult({
+  result,
+  path,
+  onLeave,
+}: {
+  result: WhyResponse;
+  path: string;
+  /** Closes this panel as a link opens the commit panel in its place. */
+  onLeave: () => void;
+}) {
   return (
     <div className="flex flex-col gap-6">
       {!result.tracker.readable && (
@@ -142,7 +153,7 @@ function WhyResult({ result, path }: { result: WhyResponse; path: string }) {
         </p>
       )}
       {result.chains.map((chain) => (
-        <Chain key={chain.oid} chain={chain} result={result} path={path} />
+        <Chain key={chain.oid} chain={chain} result={result} path={path} onLeave={onLeave} />
       ))}
     </div>
   );
@@ -163,12 +174,114 @@ function Step({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; path: string }) {
+/**
+ * The step behind the commit (CORE-243): who recorded it, its why and
+ * challenges, what steered it, its tests, and the way into the story.
+ */
+function StepContext({
+  chain,
+  tracker,
+  repo,
+  onLeave,
+}: {
+  chain: WhyChain;
+  tracker: string;
+  repo: string;
+  onLeave: () => void;
+}) {
+  const step = chain.step;
+  if (!step) return <span className="text-ink-faint">No context was recorded for this step.</span>;
+  if (step.deleted)
+    return <span className="text-ink-faint">An admin removed this step&rsquo;s context.</span>;
+  const { context } = step;
+  const first = (text: string) =>
+    text
+      .split("\n")
+      .find((l) => l.trim())
+      ?.trim() ?? "";
+  const failed = context.tests.filter((t) => t.exit !== 0).length;
+  const by =
+    step.author.kind === "agent"
+      ? `${step.author.name} for ${step.author.accountable.displayName}`
+      : step.author.name;
+  const story = step.timeline
+    ? `/tracker/${encodeURIComponent(tracker)}/timelines/${encodeURIComponent(step.timeline)}/story?${new URLSearchParams({ step: chain.oid, repo })}`
+    : null;
+  return (
+    <>
+      <span className="text-ink-muted">
+        By {by}
+        {step.commitOid !== chain.oid && (
+          <>
+            {", recorded on "}
+            <code className="mk-mono">{shortOid(step.commitOid)}</code>
+            {" before a rebase"}
+          </>
+        )}
+      </span>
+      {context.why.trim() && (
+        <span>
+          <span className="text-ink-faint">Why: </span>
+          {first(context.why)}
+        </span>
+      )}
+      {context.challenges.trim() && (
+        <span>
+          <span className="text-ink-faint">Challenges: </span>
+          {first(context.challenges)}
+        </span>
+      )}
+      {(context.instructions.length > 0 || context.steering.length > 0) && (
+        <span className="text-ink-muted">
+          {context.instructions.length}{" "}
+          {context.instructions.length === 1 ? "instruction" : "instructions"},{" "}
+          {context.steering.length} steering ({context.coverage.steering})
+        </span>
+      )}
+      {context.tests.length > 0 && (
+        <span className={failed ? "text-danger-text" : "text-online"}>
+          {failed
+            ? `${failed} of ${context.tests.length} tests failed`
+            : `${context.tests.length} tests passed`}
+        </span>
+      )}
+      {story && (
+        <Link className={link} to={story} onClick={onLeave}>
+          Open in the timeline&rsquo;s story
+        </Link>
+      )}
+    </>
+  );
+}
+
+function Chain({
+  chain,
+  result,
+  path,
+  onLeave,
+}: {
+  chain: WhyChain;
+  result: WhyResponse;
+  path: string;
+  onLeave: () => void;
+}) {
   const { owner, name, defaultBranch } = result.repo;
   const tracker = result.tracker.owner;
   const timelineUrl = (slug: string) =>
     `/tracker/${encodeURIComponent(tracker)}/timelines?tl=${encodeURIComponent(slug)}`;
-  const who = (id: string | null) => (id ? (result.people[id]?.name ?? id) : "someone");
+  const who = (id: string | null) => {
+    if (!id) return "someone";
+    const named = result.people[id];
+    if (!named) return id;
+    // People link to their profile; agents stay text.
+    return named.kind === "person" ? (
+      <PersonLink slug={named.slug} prose>
+        {named.name}
+      </PersonLink>
+    ) : (
+      named.name
+    );
+  };
   const refName = (ref: string) => ref.replace(/^refs\/(heads|tags)\//, "");
   const commit = chain.commit;
 
@@ -184,7 +297,17 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
                 <time title={fullDate(commit.authoredAt * 1000)}>
                   {timeAgo(commit.authoredAt * 1000)}
                 </time>{" "}
-                · <code className="mk-mono">{shortOid(commit.oid)}</code>
+                ·{" "}
+                <CommitLink
+                  className={`${link} mk-mono`}
+                  owner={owner}
+                  name={name}
+                  sha={commit.oid}
+                  onClick={onLeave}
+                  title={`Open commit ${shortOid(commit.oid)}`}
+                >
+                  {shortOid(commit.oid)}
+                </CommitLink>
               </span>
               <span className="flex flex-wrap gap-x-3">
                 <Link
@@ -331,7 +454,7 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
               {chain.approval.state === "pending"
                 ? "Waiting for approval"
                 : `${chain.approval.state[0]!.toUpperCase()}${chain.approval.state.slice(1)}`}
-              {chain.approval.by && ` by ${who(chain.approval.by)}`}
+              {chain.approval.by && <> by {who(chain.approval.by)}</>}
               {chain.approval.at && (
                 <>
                   {" "}
@@ -435,6 +558,17 @@ function Chain({ chain, result, path }: { chain: WhyChain; result: WhyResponse; 
                       : "No admitted source membership recorded."}
               </span>
             )}
+          </Step>
+        )}
+
+        {(chain.step || chain.timelines.length > 0) && (
+          <Step title="Step context">
+            <StepContext
+              chain={chain}
+              tracker={tracker}
+              repo={`${owner}/${name}`}
+              onLeave={onLeave}
+            />
           </Step>
         )}
 

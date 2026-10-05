@@ -2,7 +2,12 @@ import type { Snapshot, TrackerPreferences } from "../../../shared/tracker.ts";
 import { api } from "../../lib/api.ts";
 import { DEFAULT_QUERY, filterToken, VIEWS } from "./query.ts";
 
-export const VIEW_LABEL = { list: "List", board: "Board", graph: "Graph" } as const;
+export const VIEW_LABEL = {
+  list: "List",
+  board: "Board",
+  graph: "Graph",
+  chronicle: "Chronicle",
+} as const;
 export type View = keyof typeof VIEW_LABEL;
 
 export interface TrackerDefaults {

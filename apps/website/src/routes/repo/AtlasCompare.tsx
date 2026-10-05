@@ -12,6 +12,7 @@
 import { ArrowClockwiseIcon, XIcon } from "@phosphor-icons/react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
+import { useLiveSearchParams } from "../../lib/searchParams.ts";
 import {
   type AtlasChange,
   type AtlasChangeClass,
@@ -63,7 +64,7 @@ export function AtlasCompare({
   selected: AtlasEntitySummary | null;
   onPick: (entity: AtlasEntitySummary) => void;
 }) {
-  const [params, setParams] = useSearchParams();
+  const [params, setParams] = useLiveSearchParams();
   const url = readCompareUrl(params);
   const navigate = (patch: Partial<CompareUrlState>, extra?: { snapshot: string }) =>
     setParams(

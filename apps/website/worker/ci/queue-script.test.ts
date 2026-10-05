@@ -236,6 +236,8 @@ describe("trusted queue merge program", { timeout: 30_000 }, () => {
   });
 
   test("fails closed without replaying a paid resolution after its end-to-end deadline", async () => {
+    // The deadline covers starting Node and the merge before the request, so it
+    // leaves room for a slower host (CORE-257); the answer is held past it.
     const requested = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const t = await setup({

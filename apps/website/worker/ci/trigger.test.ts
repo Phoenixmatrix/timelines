@@ -4,9 +4,16 @@
 import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { jobPayload, loadJob } from "./jobs.ts";
-import { startRun, startWorkflow } from "./trigger.ts";
+import { recordStepRun } from "../steps/runs.ts";
+import { timelineQuietMs } from "../timelines/quiet.ts";
+import { onPush, releaseQuiet, startRun, startWorkflow } from "./trigger.ts";
 
 const files = vi.hoisted(() => ({ ciYml: "" }));
+const refs = vi.hoisted(() => ({
+  branches: [] as { shortName: string; oid: string }[],
+  headBranch: "main",
+}));
+vi.mock("../artifacts.ts", () => ({ listRefs: async () => refs }));
 vi.mock("../objects.ts", () => ({
   RepoReader: class {
     async commit(oid: string) {
@@ -305,5 +312,210 @@ describe("queue gates", () => {
     expect(payload.env.GITMATRIX_TRIGGER).toBe("landing");
     expect(payload.env.GITMATRIX_QUEUE_ID).toBe(oid(9));
     expect(payload.env.GITMATRIX_TIMELINE).toBeUndefined();
+  });
+});
+
+describe("step runs (CORE-235)", () => {
+  const STEPS = `
+on:
+  push: {}
+  step: {}
+jobs:
+  lint:
+    on: step
+    local: true
+    steps: [vp check]
+  unit:
+    on: [push, step]
+    needs: [lint]
+    steps: [vp test run]
+  build:
+    steps: [vp build]
+`;
+  const runs = (t: ReturnType<typeof setup>) =>
+    t.sqlite
+      .prepare("SELECT id, ref, trigger, step, commit_oid FROM ci_runs ORDER BY number")
+      .all() as { id: string; ref: string; trigger: string; step: number; commit_oid: string }[];
+
+  test("a timeline push starts its push run and a step run of only the step jobs", async () => {
+    files.ciYml = STEPS;
+    const t = setup();
+    // CI has seen the repository before; main and a timeline move.
+    t.sqlite.exec(`INSERT INTO ci_refs (repo_id, ref, oid) VALUES ('repo', 'main', '${oid(1)}')`);
+    refs.branches = [
+      { shortName: "main", oid: oid(2) },
+      { shortName: "timeline/search", oid: oid(3) },
+    ];
+    await onPush(
+      t.env,
+      { id: "repo", artifacts_name: "a", artifacts_remote: "https://a" },
+      { id: "ann" },
+      () => {},
+    );
+    const all = runs(t);
+    expect(all.map((r) => [r.ref, r.trigger, r.step])).toEqual([
+      ["main", "push", 0],
+      ["timeline/search", "push", 0],
+      ["timeline/search", "manual", 1],
+    ]);
+    const step = all[2]!;
+    expect(t.jobs(step.id).map((j) => [j.name, j.status])).toEqual([
+      ["build", "skipped"],
+      ["lint", "pending"],
+      ["unit", "pending"],
+    ]);
+    // The push run keeps its own jobs.
+    expect(t.jobs(all[1]!.id).map((j) => [j.name, j.status])).toEqual([
+      ["build", "pending"],
+      ["lint", "skipped"],
+      ["unit", "pending"],
+    ]);
+    const job = await loadJob(t.env.DB, t.jobs(step.id).find((j) => j.name === "lint")!.id);
+    const env = (await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" })).env;
+    expect(env).toMatchObject({ GITMATRIX_TRIGGER: "step", GITMATRIX_TIMELINE: "search" });
+    refs.branches = [];
+  });
+
+  test("a step run neither answers for nor is answered by the push run of its commit", async () => {
+    files.ciYml = STEPS;
+    const t = setup();
+    const push = await t.start({ trigger: "push", preview: undefined });
+    const step = await t.start({ trigger: "step", preview: undefined });
+    if (!("runId" in push) || !("runId" in step)) throw new Error("both should start");
+    expect(step.runId).not.toBe(push.runId);
+    // A second step run of the same commit while one is in flight is the same run.
+    const again = await t.start({ trigger: "step", preview: undefined });
+    expect("runId" in again && again.runId).toBe(step.runId);
+  });
+
+  test("repositories that don't opt in get no step run", async () => {
+    const t = setup();
+    expect(await t.start({ trigger: "step", preview: undefined })).toEqual({
+      skipped: `.gitmatrix/ci.yml at ${oid(9).slice(0, 12)} doesn't opt in to step runs (on: step).`,
+    });
+    files.ciYml = "on: step\njobs:\n  a:\n    steps: [x]";
+    expect(await t.start({ trigger: "step", preview: undefined })).toEqual({
+      skipped: "No job in .gitmatrix/ci.yml runs on step.",
+    });
+  });
+
+  test("a finished step run leaves a test summary on its step, once", async () => {
+    files.ciYml = STEPS;
+    const t = setup();
+    const push = await t.start({ trigger: "push", preview: undefined });
+    const step = await t.start({ trigger: "step", preview: undefined });
+    if (!("runId" in push) || !("runId" in step)) throw new Error("both should start");
+    t.sqlite.exec(`
+      UPDATE ci_jobs SET status = 'succeeded', exit_code = 0,
+        started_at = '2026-10-04T00:00:00.000Z', finished_at = '2026-10-04T00:00:02.500Z'
+        WHERE run_id = '${step.runId}' AND name = 'lint';
+      UPDATE ci_jobs SET status = 'failed', exit_code = 1,
+        started_at = '2026-10-04T00:00:03.000Z', finished_at = '2026-10-04T00:00:04.000Z'
+        WHERE run_id = '${step.runId}' AND name = 'unit';
+      UPDATE ci_runs SET status = 'failed' WHERE id = '${step.runId}';
+      UPDATE ci_runs SET status = 'succeeded' WHERE id = '${push.runId}';
+    `);
+    expect(await recordStepRun(t.env.DB, push.runId)).toBe(false);
+    expect(await recordStepRun(t.env.DB, step.runId)).toBe(true);
+    expect(await recordStepRun(t.env.DB, step.runId)).toBe(true);
+    const rows = t.sqlite.prepare("SELECT commit_oid, kind, data FROM step_artifacts").all() as {
+      commit_oid: string;
+      kind: string;
+      data: string;
+    }[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.commit_oid).toBe(oid(9));
+    expect(JSON.parse(rows[0]!.data)).toEqual({
+      status: "failed",
+      passed: 1,
+      failed: 1,
+      jobs: [
+        { name: "lint", status: "succeeded", exitCode: 0, durationMs: 2500 },
+        { name: "unit", status: "failed", exitCode: 1, durationMs: 1000 },
+      ],
+    });
+  });
+});
+
+describe("a timeline's quiet period (CORE-238)", () => {
+  const PIPE =
+    "on:\n  push: {}\n  step: {}\njobs:\n  lint:\n    on: step\n    steps: [x]\n  test:\n    steps: [y]\n";
+  const runs = (t: ReturnType<typeof setup>) =>
+    t.sqlite
+      .prepare(
+        "SELECT id, number, ref, step, status, quiet_until, covered_by FROM ci_runs ORDER BY number",
+      )
+      .all() as {
+      id: string;
+      number: number;
+      ref: string;
+      step: number;
+      status: string;
+      quiet_until: string | null;
+      covered_by: number | null;
+    }[];
+
+  test("a timeline's push run waits; its step run and main's runs don't", async () => {
+    files.ciYml = PIPE;
+    const t = setup();
+    const before = Date.now();
+    await t.start({ trigger: "push", preview: undefined });
+    await t.start({ trigger: "step", preview: undefined });
+    await t.start({ trigger: "push", preview: undefined, branch: "main", commit: oid(8) });
+    const [push, step, main] = runs(t);
+    const waits = Date.parse(push!.quiet_until!) - before;
+    expect(waits).toBeGreaterThanOrEqual(600_000);
+    expect(waits).toBeLessThan(610_000);
+    expect(step!.quiet_until).toBeNull();
+    expect(main!.quiet_until).toBeNull();
+    // The Workflow starts at once and does the waiting.
+    expect(t.created).toHaveLength(3);
+  });
+
+  test("a newer push covers the run still waiting; a checkpoint releases the newest", async () => {
+    files.ciYml = PIPE;
+    const t = setup();
+    const events: { id: string; type: string }[] = [];
+    Object.assign(t.env, {
+      CI_RUN: {
+        create: async ({ id }: { id: string }) => void t.created.push(id),
+        get: async (id: string) => ({
+          sendEvent: async ({ type }: { type: string }) => void events.push({ id, type }),
+        }),
+      },
+    });
+    await t.start({ trigger: "push", preview: undefined, commit: oid(1) });
+    await t.start({ trigger: "push", preview: undefined, commit: oid(2) });
+    const [first, second] = runs(t);
+    expect(first).toMatchObject({ status: "cancelled", covered_by: second!.number });
+    expect(second).toMatchObject({ status: "queued", covered_by: null });
+
+    expect(await releaseQuiet(t.env, "repo", "timeline/search", oid(2))).toBe(1);
+    expect(events).toEqual([{ id: second!.id, type: "quiet-release" }]);
+    // Nothing waits on another branch.
+    expect(await releaseQuiet(t.env, "repo", "timeline/other", oid(2))).toBe(0);
+  });
+
+  test("a checkpoint that beats its push's run still releases it", async () => {
+    files.ciYml = PIPE;
+    const t = setup();
+    // The bookmark CI already follows; the checkpoint of oid(3) comes first.
+    t.sqlite.exec(
+      `INSERT INTO ci_refs (repo_id, ref, oid) VALUES ('repo', 'timeline/search', '${oid(2)}')`,
+    );
+    expect(await releaseQuiet(t.env, "repo", "timeline/search", oid(3))).toBe(0);
+    await t.start({ trigger: "push", preview: undefined, commit: oid(3) });
+    await t.start({ trigger: "push", preview: undefined, commit: oid(4) });
+    const [released, later] = runs(t);
+    expect(released!.quiet_until).toBeNull();
+    // Only that commit: the next push waits again.
+    expect(later!.quiet_until).not.toBeNull();
+  });
+
+  test("the quiet period comes from the environment in development", () => {
+    expect(timelineQuietMs({} as Env)).toBe(600_000);
+    expect(timelineQuietMs({ TIMELINE_QUIET_SECONDS: "3" } as unknown as Env)).toBe(3_000);
+    expect(timelineQuietMs({ TIMELINE_QUIET_SECONDS: "0" } as unknown as Env)).toBe(0);
+    expect(timelineQuietMs({ TIMELINE_QUIET_SECONDS: "soon" } as unknown as Env)).toBe(600_000);
   });
 });

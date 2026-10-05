@@ -66,6 +66,135 @@ function fixture() {
   };
 }
 
+describe("durable tag definitions", () => {
+  test("registers exact labels, retaining unused definitions across restarts", () => {
+    const f = fixture();
+    const long = "x".repeat(100);
+    f.mutate({
+      kind: "issue.create",
+      id: "tagged",
+      data: { teamId: "team", title: "Tagged", labels: [" spaced ", long, "Bug"] },
+    });
+    f.mutate({
+      kind: "issue.update",
+      id: "tagged",
+      expectedVersion: 1,
+      data: { labels: ["new"] },
+    });
+    f.mutate({
+      kind: "issue.update",
+      id: "tagged",
+      expectedVersion: 2,
+      data: { labels: [] },
+    });
+    const saved = f.reopen().snapshot(f.access);
+    expect(saved.labels).toEqual([" spaced ", "Bug", "new", long]);
+    expect(saved.issues[0]!.labels).toEqual([]);
+  });
+
+  test("accepts tags as the name of labels, keeps labels working, and refuses both disagreeing (CORE-271)", () => {
+    const f = fixture();
+    f.mutate({
+      kind: "issue.create",
+      id: "tagged",
+      data: { teamId: "team", title: "Tagged", tags: ["ux", "data"] },
+    });
+    expect(f.store.snapshot(f.access).issues[0]!.labels).toEqual(["ux", "data"]);
+    f.mutate({ kind: "issue.update", id: "tagged", expectedVersion: 1, data: { labels: ["ux"] } });
+    f.mutate({
+      kind: "issue.update",
+      id: "tagged",
+      expectedVersion: 2,
+      data: { tags: ["frontend"], labels: ["frontend"] },
+    });
+    const issue = f.store.snapshot(f.access).issues[0]!;
+    expect(issue.labels).toEqual(["frontend"]);
+    // Stored under its old name, so replicas and older clients read it unchanged.
+    expect("tags" in issue).toBe(false);
+    expect(() =>
+      f.mutate({
+        kind: "issue.update",
+        id: "tagged",
+        expectedVersion: 3,
+        data: { tags: ["a"], labels: ["b"] },
+      }),
+    ).toThrow(/tags or labels/);
+  });
+
+  test("the tag catalog counts the issues and open issues carrying each tag", () => {
+    const f = fixture();
+    f.mutate(
+      { kind: "issue.create", id: "one", data: { teamId: "team", title: "One", tags: ["ux"] } },
+      {
+        kind: "issue.create",
+        id: "two",
+        data: { teamId: "team", title: "Two", tags: ["ux", "data"], status: "done" },
+      },
+      { kind: "issue.create", id: "old", data: { teamId: "team", title: "Old", tags: ["gone"] } },
+    );
+    f.mutate({ kind: "issue.update", id: "old", expectedVersion: 1, data: { tags: [] } });
+    expect(f.reopen().tagCatalog()).toEqual([
+      { name: "data", issues: 1, open: 0 },
+      { name: "gone", issues: 0, open: 0 },
+      { name: "ux", issues: 2, open: 1 },
+    ]);
+  });
+
+  test("rolls back definitions when a later batch mutation fails", () => {
+    const f = fixture();
+    expect(() =>
+      f.mutate(
+        {
+          kind: "issue.create",
+          id: "tagged",
+          data: { teamId: "team", title: "Tagged", labels: ["rollback"] },
+        },
+        { kind: "issue.create", id: "bad", data: { teamId: "missing", title: "Bad" } },
+      ),
+    ).toThrow();
+    expect(f.reopen().snapshot(f.access).labels).toEqual([]);
+    f.issue("existing");
+    expect(() =>
+      f.mutate({
+        kind: "issue.update",
+        id: "existing",
+        expectedVersion: 99,
+        data: { labels: ["conflict"] },
+      }),
+    ).toThrow();
+    expect(f.store.snapshot(f.access).labels).toEqual([]);
+    expect(() =>
+      f.mutate({
+        kind: "issue.update",
+        id: "existing",
+        expectedVersion: 1,
+        data: { labels: ["x".repeat(101)] },
+      }),
+    ).toThrow();
+    expect(f.store.snapshot(f.access).labels).toEqual([]);
+  });
+
+  test("backfills existing issue and historical definitions once without rewriting labels", () => {
+    const f = fixture();
+    f.mutate({
+      kind: "issue.create",
+      id: "tagged",
+      data: { teamId: "team", title: "Tagged", labels: ["Old", " spaced "] },
+    });
+    f.mutate({
+      kind: "issue.update",
+      id: "tagged",
+      expectedVersion: 1,
+      data: { labels: ["Current"] },
+    });
+    f.db.exec("DROP TABLE tracker_labels; DELETE FROM tracker_migrations WHERE name = 'labels-v1'");
+    const reopened = f.reopen();
+    expect(reopened.snapshot(f.access).labels).toEqual([" spaced ", "Current", "Old"]);
+    expect(reopened.snapshot(f.access).issues[0]!.labels).toEqual(["Current"]);
+    expect(f.reopen().snapshot(f.access).labels).toEqual([" spaced ", "Current", "Old"]);
+  });
+});
+
 describe("trusted queue remediation", () => {
   const failure: QueueFailure = {
     queueId: "a".repeat(40),

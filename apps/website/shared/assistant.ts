@@ -88,6 +88,29 @@ const shown = (value: unknown) =>
     ? String(value)
     : JSON.stringify(value);
 
+/** Field names on an update's approval card, where the key isn't the word people use. */
+const CHANGE_NAMES: Record<string, string> = {
+  tags: "Tags",
+  labels: "Tags",
+  label: "Tags",
+  requires: "Agent requirements",
+  releaseClaim: "Release the claim",
+};
+
+/**
+ * An issue's tags from an assistant call: `tags`, or its older names `labels`
+ * and `label` (CORE-271); a single string counts as one tag. Undefined when
+ * none is given.
+ */
+export function issueTagsInput(input: Record<string, unknown>): string[] | undefined {
+  for (const key of ["tags", "labels", "label"]) {
+    const value = input[key];
+    if (typeof value === "string") return value ? [value] : [];
+    if (Array.isArray(value)) return value.filter((v): v is string => typeof v === "string");
+  }
+  return undefined;
+}
+
 /**
  * What a write will do, in words, from the call itself rather than from the
  * model's own summary of it, so an approval card can't be talked into saying
@@ -101,8 +124,11 @@ export function describeWrite(tool: string, input: Record<string, unknown>): Wri
       if (input.priority !== undefined) fields.push(["Priority", `P${shown(input.priority)}`]);
       if (input.type) fields.push(["Type", str(input.type)]);
       if (input.parent) fields.push(["Parent", str(input.parent)]);
-      if (Array.isArray(input.labels) && input.labels.length)
-        fields.push(["Labels", input.labels.join(", ")]);
+      // `labels` and `label` are older names of `tags` (CORE-271).
+      const tags = issueTagsInput(input);
+      if (tags?.length) fields.push(["Tags", tags.join(", ")]);
+      if (typeof input.requires === "string" && input.requires.trim())
+        fields.push(["Agent requirements", input.requires.trim()]);
       return {
         title: `Create an issue in ${str(input.team) || "a team"}${owner ? ` (${owner})` : ""}`,
         fields,
@@ -114,7 +140,7 @@ export function describeWrite(tool: string, input: Record<string, unknown>): Wri
       const fields = Object.entries(changes)
         .filter(([key]) => key !== "description")
         .map(([key, value]): [string, string] => [
-          key[0]!.toUpperCase() + key.slice(1),
+          CHANGE_NAMES[key] ?? key[0]!.toUpperCase() + key.slice(1),
           value === null
             ? "(cleared)"
             : Array.isArray(value)

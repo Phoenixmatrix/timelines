@@ -15,6 +15,7 @@ import { accessFor } from "./access.ts";
 import type { TrackerReply } from "./object.ts";
 import { trackerObject } from "./stub.ts";
 import { CHRONICLE_PAGE, type LinkedWork } from "../../shared/chronicle.ts";
+import { agentWork, type AgentEligibility } from "../../shared/tracker-query.ts";
 import { linkedWork } from "./work.ts";
 import {
   clearPreferences,
@@ -184,6 +185,35 @@ tracker.get("/requests", async (c) => {
   }
   return c.json<OpenRequests>({ requests, names });
 });
+/**
+ * Which open issues each of your agents can take (CORE-32), in every tracker
+ * you're in: requirements it meets, and a few it doesn't with why. An agent
+ * signed in sees only itself.
+ */
+tracker.get("/agent-eligibility", async (c) => {
+  const actor = c.get("actor");
+  if (!actor) return c.json({ error: "Sign in to see your agents' work." }, 401);
+  const out: AgentEligibility = { trackers: [] };
+  for (const owner of await accessible(c.env.DB, actor)) {
+    const account = await findAccountBySlug(c.env.DB, owner.slug);
+    if (!account) continue;
+    const access = await accessFor(c.env.DB, account, actor.id, null, owner.canAdmin);
+    const result = await trackerObject(c.env, owner.id).snapshot(access);
+    if (!result.ok) return response(c, result);
+    const agents = result.value.agents.filter(
+      (agent) =>
+        agent.accountable.id === actor.id &&
+        agent.revokedAt === null &&
+        (!actor.agent || agent.id === actor.agent.id),
+    );
+    out.trackers.push({
+      tracker: { slug: owner.slug, displayName: owner.displayName },
+      agents: agents.map((agent) => agentWork(result.value, agent.id)),
+      tags: result.value.labels,
+    });
+  }
+  return c.json(out);
+});
 // A single authenticated browser request, without the repository list or a session preflight.
 tracker.get("/tracker/:owner/view", async (c) => {
   const actor = c.get("actor");
@@ -247,6 +277,15 @@ tracker.get("/tracker/:owner/snapshot", async (c) => {
       c.req.query("timelines") === "1",
     ),
   );
+});
+/**
+ * The tracker's tag catalog (CORE-271), with how many issues carry each tag:
+ * what issue tags, agent tags and requirement `tag:` values are chosen from.
+ */
+tracker.get("/tracker/:owner/tags", async (c) => {
+  const access = await authorize(c);
+  const catalog = await trackerObject(c.env, access.owner.id).tagCatalog();
+  return response(c, catalog.ok ? { ...catalog, value: { tags: catalog.value } } : catalog);
 });
 tracker.get("/tracker/:owner/changes", async (c) => {
   // Members and agents aren't events: a replica asks for them (directory=1) to

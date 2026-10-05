@@ -5,7 +5,8 @@
 // and when. A created ref has no old commit, a deleted one no new commit.
 //
 // Then it reads the commits each update made newly reachable and records the
-// refs every change (gm's `change-id` commit header) reached. The Artifacts
+// refs every change (gm's `change-id` commit header) reached, and the tracker
+// issues their messages mention (worker/mentions). The Artifacts
 // binding's readCommit drops that header, so the commits come from a protocol
 // v2 fetch without blobs, bounded in depth and in size.
 
@@ -13,6 +14,7 @@ import type { Actor } from "../db.ts";
 import { lsRefs, upstreamToken } from "../artifacts.ts";
 import { packCommits, type PackCommit } from "../git/pack.ts";
 import { DELIM, FLUSH, pkt } from "../git/pktline.ts";
+import { indexPushedMentions } from "../mentions/index.ts";
 import { readPktLines } from "../mirror/protocol.ts";
 import { batch, db, nowIso } from "../schema.ts";
 
@@ -67,7 +69,7 @@ export async function recordPush(
   for (const ref of await lsRefs(env, repo.artifacts_name, repo.artifacts_remote)) {
     if (ref.oid && isLogged(ref.name)) tips.set(ref.name, ref.oid);
   }
-  return recordRefs(
+  const logged = await recordRefs(
     env.DB,
     repo.id,
     tips,
@@ -75,6 +77,9 @@ export async function recordPush(
     (want, haves) => fetchNewCommits(env, repo, want, haves),
     repo.source_id ?? "canonical",
   );
+  // The issues their messages mention (CORE-22).
+  await indexPushedMentions(env, repo.id, logged);
+  return logged;
 }
 
 /**

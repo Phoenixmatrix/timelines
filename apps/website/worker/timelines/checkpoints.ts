@@ -247,6 +247,7 @@ export async function view(
           .where("repo_id", "=", repo.id)
           .where("source_id", "=", repo.source?.sourceId ?? "canonical")
           .where("commit_oid", "=", repo.commit)
+          .where("step", "=", 0)
           .orderBy("number", "desc")
           .limit(RUNS_PER_COMMIT)
           .execute(),

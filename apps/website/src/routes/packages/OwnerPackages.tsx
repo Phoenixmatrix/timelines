@@ -35,17 +35,18 @@ export function Activity({ spark, label }: { spark: number[]; label: string }) {
 }
 
 export function PackageRow({ pkg, owner }: { pkg: PackageSummary; owner: string }) {
+  // The name's link covers the row; source repositories are their own links on top.
   return (
     <li className="mk-enter-up">
-      <PrefetchLink
-        to={packagePath(owner, pkg.format, pkg.name)}
-        className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-1 px-4 py-3 text-ink no-underline transition-colors hover:bg-raised md:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)_7.5rem_6rem]"
-      >
+      <div className="relative grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-1 px-4 py-3 text-ink transition-colors hover:bg-raised md:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)_7.5rem_6rem]">
         <span className="min-w-0">
           <span className="flex flex-wrap items-center gap-2">
-            <span className="truncate font-semibold">
+            <PrefetchLink
+              to={packagePath(owner, pkg.format, pkg.name)}
+              className="truncate font-semibold text-ink no-underline after:absolute after:inset-0"
+            >
               <bdi>{pkg.name}</bdi>
-            </span>
+            </PrefetchLink>
             <span className="mk-chip mk-chip--tag">{formatLabel(pkg.format)}</span>
           </span>
           <span className="mt-0.5 block truncate text-body-sm text-ink-muted mk-tabular">
@@ -60,7 +61,19 @@ export function PackageRow({ pkg, owner }: { pkg: PackageSummary; owner: string 
           </span>
         </span>
         <span className="hidden min-w-0 truncate text-body-sm text-ink-muted md:block">
-          {pkg.sources.length ? pkg.sources.join(", ") : "Published by hand"}
+          {pkg.sources.length
+            ? pkg.sources.map((source, index) => (
+                <span key={source}>
+                  {index > 0 && ", "}
+                  <Link
+                    to={`/${source.split("/").map(encodeURIComponent).join("/")}`}
+                    className="relative z-10 text-ink-muted no-underline hover:text-ink"
+                  >
+                    {source}
+                  </Link>
+                </span>
+              ))
+            : "Published by hand"}
         </span>
         <span className="hidden items-center gap-2 md:flex">
           <Activity spark={pkg.spark} label={`${pkg.publishes24h} publishes in the last day`} />
@@ -72,7 +85,7 @@ export function PackageRow({ pkg, owner }: { pkg: PackageSummary; owner: string 
         >
           {pkg.lastPublishedAt ? timeAgo(pkg.lastPublishedAt) : ""}
         </span>
-      </PrefetchLink>
+      </div>
     </li>
   );
 }

@@ -425,6 +425,18 @@ pub fn commit(ctx: &Ctx, args: &cli::CommitArgs) -> Result<OpResult> {
         Some(arg) => Some(steps::parse_context(&steps::read_context_arg(arg)?)?),
         None => None,
     };
+    let missing = context.is_none();
+    commit_with(ctx, args, context, missing)
+}
+
+/// `gm commit` with an already-read context (`gm step` passes one carrying
+/// only tests). `no_context` says to warn that the step has no context.
+pub fn commit_with(
+    ctx: &Ctx,
+    args: &cli::CommitArgs,
+    context: Option<serde_json::Value>,
+    no_context: bool,
+) -> Result<OpResult> {
     let mut timeline = None;
     let mut result = mutate(ctx, |ws| {
         timeline = ws.timeline.clone();
@@ -474,7 +486,7 @@ pub fn commit(ctx: &Ctx, args: &cli::CommitArgs) -> Result<OpResult> {
         ))
     })?;
     // In a timeline, an agent's commit is a step: say when it has no context.
-    if context.is_none()
+    if no_context
         && crate::agent::detect().is_some()
         && let Some(slug) = timeline
     {

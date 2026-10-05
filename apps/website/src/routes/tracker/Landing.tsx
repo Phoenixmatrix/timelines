@@ -3,13 +3,14 @@
 // advanced), why it stopped, and a Land button that queues the head
 // checkpoint or says why it can't land yet.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import type { Landing, LandingRepo, LandResult, Timeline } from "../../../shared/timelines.ts";
 import { link } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { shortOid } from "../../lib/format.ts";
 import { repoPath, treeUrl } from "../../lib/refs.ts";
+import { commitPanelUrl } from "../../lib/commitPanel.ts";
 
 const STATE: Record<Landing["state"], string> = {
   merging: "Preparing the result on main",
@@ -45,6 +46,9 @@ export function LandingPanel({
   const [landing, setLanding] = useState<Landing | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Queuing hides the Land button: focus goes to where the landing stands.
+  const [queued, setQueued] = useState(false);
+  const status = useRef<HTMLParagraphElement>(null);
   const load = useCallback(async () => {
     try {
       setLanding((await api<{ landing: Landing | null }>(`${path}/landing`)).landing);
@@ -58,12 +62,19 @@ export function LandingPanel({
   const ended = timeline.status === "landed" || timeline.status === "abandoned";
   const active =
     landing?.state === "merging" || landing?.state === "testing" || landing?.state === "advancing";
+  useEffect(() => {
+    if (!queued) return;
+    setQueued(false);
+    const lost = !document.activeElement || document.activeElement === document.body;
+    if (active && lost) status.current?.focus();
+  }, [queued, active]);
   const land = async () => {
     setBusy(true);
     setError(null);
     try {
       const result = await api<LandResult>(`${path}/land`, { method: "POST", json: {} });
       setLanding(result.landing);
+      setQueued(true);
       onChange();
     } catch (failure) {
       setError(
@@ -87,9 +98,12 @@ export function LandingPanel({
           <button
             type="button"
             className="mk-btn mk-btn--sm"
-            disabled={busy}
+            // Not `disabled`: that would drop keyboard focus while it works.
+            aria-disabled={busy || undefined}
             aria-busy={busy || undefined}
-            onClick={() => void land()}
+            onClick={() => {
+              if (!busy) void land();
+            }}
           >
             {landing && landing.state !== "landed" ? "Land again" : "Land"}
           </button>
@@ -103,7 +117,7 @@ export function LandingPanel({
         </p>
       ) : (
         <>
-          <p className="m-0 text-body-sm">
+          <p ref={status} tabIndex={-1} className="m-0 text-body-sm">
             Checkpoint #{landing.checkpointNumber}: <strong>{STATE[landing.state]}</strong>
           </p>
           <ul className="m-0 mt-1 list-none p-0">
@@ -117,10 +131,7 @@ export function LandingPanel({
                 </span>
                 <span>{REPO_STATE[repo.state]}</span>
                 {repo.merge && (
-                  <Link
-                    className={link}
-                    to={treeUrl(repo.owner, repo.name, repo.merge, "", "canonical")}
-                  >
+                  <Link className={link} to={commitPanelUrl(repo.owner, repo.name, repo.merge)}>
                     {repo.source?.kind === "timeline-work"
                       ? repo.state === "advanced"
                         ? repo.noop

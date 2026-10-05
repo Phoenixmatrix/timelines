@@ -66,12 +66,20 @@ export const TABLE_GROUPS: TableGroup[] = [
     tables: { ref_updates: REPO, change_refs: REPO },
   },
   {
+    // CORE-22; no retention category: one small row per mention.
+    id: "issue-mentions",
+    database: "db",
+    scope: "account",
+    label: "Issue mentions in commit messages",
+    tables: { commit_issue_mentions: REPO, commit_mention_backfills: REPO },
+  },
+  {
     // CORE-231; its retention category arrives with CORE-244.
     id: "step-context",
     database: "db",
     scope: "account",
     label: "Step context (work context per commit)",
-    tables: { step_contexts: REPO },
+    tables: { step_contexts: REPO, step_artifacts: REPO },
   },
   {
     id: "ci-logs",
@@ -194,6 +202,8 @@ export const TABLE_GROUPS: TableGroup[] = [
     tables: {
       accounts: "id = ?1",
       account_settings: "account_id = ?1",
+      assistant_personal_skills: "user_id = ?1",
+      account_ai_log_bodies: "account_id = ?1",
       org_members: "org_id = ?1",
       agents: "accountable_id = ?1",
       access_tokens: "user_id = ?1",
@@ -256,7 +266,7 @@ export const TABLE_GROUPS: TableGroup[] = [
     database: "db",
     scope: "site",
     label: "Background job state",
-    tables: { job_cursors: null, retention_site_policies: null },
+    tables: { job_cursors: null, retention_site_policies: null, site_ai_log_bodies: null },
   },
   {
     id: "price-catalog",

@@ -231,6 +231,16 @@ export interface Database {
     query: Generated<string>;
     updated_at: Generated<string>;
   };
+  assistant_personal_skills: {
+    id: string;
+    user_id: string;
+    name: string;
+    description: Generated<string>;
+    body: string;
+    enabled: Generated<number>;
+    created_at: Generated<string>;
+    updated_at: Generated<string>;
+  };
   assistant_chats: {
     id: string;
     user_id: string;
@@ -276,6 +286,8 @@ export interface Database {
     input_tokens: Generated<number>;
     output_tokens: Generated<number>;
     total_tokens: Generated<number>;
+    /** Attempts that failed or were cut off (CORE-285); `calls` counts successes. */
+    failed_calls: Generated<number>;
   };
   /** usage_snapshots past their policy, rolled up by month (CORE-225, worker/usage/history.ts). */
   usage_monthly: {
@@ -302,6 +314,7 @@ export interface Database {
     input_tokens: Generated<number>;
     output_tokens: Generated<number>;
     total_tokens: Generated<number>;
+    failed_calls: Generated<number>;
     days: Generated<number>;
   };
   /** Where a bounded, resumable cron pass left off. */
@@ -379,6 +392,8 @@ export interface Database {
     finished_at: string | null;
     progress_at: string | null;
     ai_snapshot: Generated<string | null>;
+    /** Model calls by model (CORE-286): {"<model>": {calls, input, output, total}}. */
+    ai_usage: Generated<string | null>;
   };
   kg_changes: {
     repo_id: string;
@@ -393,6 +408,8 @@ export interface Database {
     indexed_at: string | null;
     last_build_id: string | null;
     graph_at: string | null;
+    /** The pipeline version the indexed Knowledge was built with (CORE-286). */
+    pipeline: Generated<string | null>;
   };
   kg_files: {
     repo_id: string;
@@ -776,6 +793,8 @@ export interface Database {
     repo_id: string;
     ref: string;
     oid: string;
+    /** The commit a checkpoint released from the quiet period, maybe before its run existed (CORE-238). */
+    quiet_released: Generated<string | null>;
   };
   repo_refs: {
     source_id: Generated<string>;
@@ -847,6 +866,10 @@ export interface Database {
     landing_id: Generated<string | null>;
     /** Independent default-branch merge queue identity, not a timeline landing. */
     queue_id: Generated<string | null>;
+    /** 1 for a step run (CORE-235): the light run for a timeline push, never full CI. */
+    step: Generated<number>;
+    /** A timeline push run waits until then for its quiet period (CORE-238); null starts now. */
+    quiet_until: Generated<string | null>;
   };
   ci_jobs: {
     source_id: Generated<string>;
@@ -943,6 +966,27 @@ export interface Database {
     teardown_unmanaged_at: Generated<string | null>;
   };
   /** Per-account settings; a missing row means the defaults. */
+  /** Issue keys commit messages name, resolved to tracker issues on push (CORE-22). */
+  commit_issue_mentions: {
+    repo_id: string;
+    commit_oid: string;
+    issue_key: string;
+    change_id: string | null;
+    resolution: "linked" | "ambiguous";
+    tracker_owner_id: string | null;
+    issue_id: string | null;
+    title: Generated<string>;
+    committed_at: string | null;
+    first_ref: string | null;
+    pushed_at: Generated<string>;
+  };
+  /** Repositories whose recent history was read for mentions (CORE-22). */
+  commit_mention_backfills: {
+    repo_id: string;
+    commits: Generated<number>;
+    note: string | null;
+    done_at: Generated<string>;
+  };
   /** The context attached to a step: a commit an agent made in a timeline (CORE-231). */
   step_contexts: {
     repo_id: string;
@@ -960,6 +1004,18 @@ export interface Database {
     deleted_at: string | null;
     deleted_by: string | null;
     created_at: Generated<string>;
+  };
+  /** What a step run produced, by commit (CORE-235). */
+  step_artifacts: {
+    id: string;
+    repo_id: string;
+    commit_oid: string;
+    run_id: string;
+    kind: "test-summary" | "screenshot" | "document";
+    /** JSON; for test-summary, StepTestSummary. */
+    data: string;
+    object_key: string | null;
+    created_at: string;
   };
   /** A person's one set of generated avatar options (CORE-116). */
   avatar_generations: {
@@ -985,6 +1041,23 @@ export interface Database {
     ai_task_model: Generated<GenerationModel>;
     ai_updated_by: Generated<string | null>;
     ai_updated_at: Generated<string | null>;
+    knowledge_quiet_minutes: Generated<number>;
+    knowledge_max_wait_minutes: Generated<number>;
+  };
+  /** The site's AI Gateway body logging per component (CORE-290); absent: the environment's default. */
+  site_ai_log_bodies: {
+    component: string;
+    keep: number;
+    updated_by: string | null;
+    updated_at: Generated<string>;
+  };
+  /** An account's override of site_ai_log_bodies for its own calls; absent follows the site. */
+  account_ai_log_bodies: {
+    account_id: string;
+    component: string;
+    keep: number;
+    updated_by: string | null;
+    updated_at: Generated<string>;
   };
   /** Retention policies (CORE-196): what an account changed; absent inherits. */
   retention_policies: {

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { data, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
 import type { CiCommitStatuses, HistoryPage, RepoDetail } from "../../../shared/api.ts";
 import { CiStatusIcon, ciLabel } from "../../components/CiStatus.tsx";
+import { CommitLink } from "../../components/CommitLink.tsx";
 import { DeploymentMark, useCommitDeployments } from "../../components/Deployments.tsx";
 import { Monogram } from "../../components/Monogram.tsx";
 import { repoData, requestSource, routeData } from "../../lib/repoData.ts";
@@ -123,13 +124,26 @@ function History({ repo, initial }: { repo: RepoDetail; initial: HistoryPage }) 
               </PrefetchLink>
             )}
             {deployed[commit.oid] && <DeploymentMark deployment={deployed[commit.oid]!} />}
-            <PrefetchLink
-              to={treeUrl(repo.owner.slug, repo.name, commit.oid, "", repo.source?.sourceId)}
-              className="mk-chip mk-chip--tag mk-mono hidden h-6 no-underline sm:inline-flex"
-              title="Browse files at this commit"
-            >
-              {shortOid(commit.oid)}
-            </PrefetchLink>
+            {/* The commit panel reads canonical history; a work source's commit opens in its own source. */}
+            {repo.source && repo.source.sourceId !== "canonical" ? (
+              <PrefetchLink
+                to={treeUrl(repo.owner.slug, repo.name, commit.oid, "", repo.source.sourceId)}
+                className="mk-chip mk-chip--tag mk-mono hidden h-6 no-underline sm:inline-flex"
+                title="Browse files at this commit"
+              >
+                {shortOid(commit.oid)}
+              </PrefetchLink>
+            ) : (
+              <CommitLink
+                owner={repo.owner.slug}
+                name={repo.name}
+                sha={commit.oid}
+                className="mk-chip mk-chip--tag mk-mono hidden h-6 no-underline sm:inline-flex"
+                title={`Open commit ${shortOid(commit.oid)}`}
+              >
+                {shortOid(commit.oid)}
+              </CommitLink>
+            )}
           </li>
         ))}
       </ol>

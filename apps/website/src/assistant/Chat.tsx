@@ -2,7 +2,7 @@
 // and the composer. Loaded lazily the first time the assistant opens.
 
 import { useAgentChat } from "@cloudflare/ai-chat/react";
-import { ArrowUpIcon, StopIcon, XIcon } from "@phosphor-icons/react";
+import { ArrowUpIcon, PlusIcon, StopIcon, XIcon } from "@phosphor-icons/react";
 import { useAgent } from "agents/react";
 import {
   isToolUIPart,
@@ -20,7 +20,9 @@ import {
   type ReactNode,
 } from "react";
 import { useNavigate, useRevalidator } from "react-router";
+import type { AssistantSkillInvocation } from "../../shared/assistant-skills.ts";
 import { WRITE_TOOLS, type PageContext } from "../../shared/assistant.ts";
+import { Tip } from "../components/ui.tsx";
 import { contextLabel } from "./page.ts";
 import {
   ApprovalCard,
@@ -31,11 +33,16 @@ import {
   type ToolPart,
 } from "./parts.tsx";
 import { useAssistant } from "./state.tsx";
+import { SkillReceipt, useSkillPicker } from "./skills.tsx";
 import { suggestionsFor } from "./suggestions.ts";
+import { waitingFor } from "./waiting.ts";
+
+const STALL_MS = 300;
 
 interface Part {
   type: string;
   text?: string;
+  data?: AssistantSkillInvocation;
 }
 interface Message {
   id: string;
@@ -51,10 +58,13 @@ function blocks(message: Message) {
     | { kind: "text"; text: string; key: string }
     | { kind: "tools"; parts: ToolPart[]; key: string }
     | { kind: "approval"; part: ToolPart; key: string }
+    | { kind: "skill"; skill: AssistantSkillInvocation; key: string }
   )[] = [];
   message.parts.forEach((part, i) => {
     if (part.type === "text" && part.text?.trim()) {
       out.push({ kind: "text", text: part.text, key: `${message.id}-${i}` });
+    } else if (part.type === "data-skill" && part.data) {
+      out.push({ kind: "skill", skill: part.data, key: `${message.id}-${i}` });
     } else if (isTool(part)) {
       const tool = part as unknown as ToolPart;
       if (tool.state === "approval-requested") {
@@ -98,6 +108,12 @@ export default function Chat({
   const pinned = useRef(true);
   const input = useRef<HTMLTextAreaElement>(null);
   const redirectedApprovals = useRef(new Set<string>());
+  const skills = useSkillPicker({
+    repo: withPage ? page.repo : undefined,
+    draft,
+    setDraft,
+    input,
+  });
 
   const agent = useAgent({ agent: "assistant", basePath: `api/assistant/chats/${chatId}/agent` });
   const chat = useAgentChat({
@@ -210,24 +226,37 @@ export default function Chat({
     else send(draft);
   };
   const onKey = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+    if (skills.onKeyDown(event)) return;
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.nativeEvent.isComposing &&
+      event.keyCode !== 229
+    ) {
       event.preventDefault();
       send(draft);
     }
   };
 
   const last = messages[messages.length - 1];
-  const waiting =
-    busy &&
-    (last?.role !== "assistant" ||
-      !last.parts.some((p) => (p.type === "text" && p.text?.trim()) || isTool(p)));
+  const wait = waitingFor(messages, busy);
+  // Between steps, a moment's pause (text ending before a tool call starts)
+  // shouldn't flash the line; a real wait shows it, at first in generic words.
+  const [stalled, setStalled] = useState(false);
+  useEffect(() => {
+    if (wait !== "step") return setStalled(false);
+    setStatus(null);
+    const timer = setTimeout(() => setStalled(true), STALL_MS);
+    return () => clearTimeout(timer);
+  }, [wait]);
+  const waiting = wait === "start" || (wait === "step" && stalled);
   const closeIfCompact = compact ? () => assistant.hide() : undefined;
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <div
         ref={scroller}
-        className="min-h-0 flex-1 overflow-y-auto px-4 py-4"
+        className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 [overflow-wrap:anywhere]"
         onScroll={(e) => {
           const el = e.currentTarget;
           pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
@@ -262,6 +291,8 @@ export default function Chat({
                       />
                     ) : block.kind === "tools" ? (
                       <Receipts key={block.key} parts={block.parts} onNavigate={closeIfCompact} />
+                    ) : block.kind === "skill" ? (
+                      <SkillReceipt key={block.key} skill={block.skill} />
                     ) : (
                       <ApprovalCard
                         key={block.key}
@@ -302,11 +333,12 @@ export default function Chat({
         withPage={withPage}
         onWithPage={setWithPage}
         onSubmit={submit}
+        popup={skills.popup}
         field={
           <textarea
             ref={input}
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            {...skills.field}
             onKeyDown={onKey}
             rows={1}
             placeholder={pending.length ? "Or say what to do instead…" : placeholder(page)}
@@ -322,7 +354,7 @@ export default function Chat({
 }
 
 const fieldClass =
-  "max-h-48 min-h-9 flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-body text-ink outline-none [field-sizing:content] placeholder:text-ink-faint";
+  "max-h-[min(12rem,25dvh)] min-h-9 min-w-0 flex-1 resize-none overflow-y-auto border-0 bg-transparent px-2 py-1.5 text-body text-ink outline-none [field-sizing:content] placeholder:text-ink-faint";
 
 /** The page-context chip and the message box, shared by the chat and its placeholder. */
 function Composer({
@@ -331,6 +363,7 @@ function Composer({
   onWithPage,
   onSubmit,
   field,
+  popup,
   stop,
   canSend,
 }: {
@@ -339,43 +372,51 @@ function Composer({
   onWithPage?: (next: boolean) => void;
   onSubmit?: (event: FormEvent) => void;
   field: ReactNode;
+  popup?: ReactNode;
   stop: boolean;
   canSend: boolean;
 }) {
   const pageLabel = contextLabel(page);
-  const label = withPage ? pageLabel : null;
+  const contextAction = withPage
+    ? `Remove ${pageLabel} from context for your next message. Earlier messages are unchanged.`
+    : `Include ${pageLabel} as context with your next message.`;
   return (
-    <form onSubmit={onSubmit} className="flex flex-col gap-2 px-3 pt-1 pb-3">
+    <form
+      onSubmit={onSubmit}
+      className="flex max-h-[50%] min-h-0 shrink-0 flex-col gap-2 overflow-y-auto overscroll-contain px-3 pt-1 pb-3"
+    >
       {pageLabel && (
-        <div className="flex items-center gap-2 text-micro text-ink-faint">
-          {label ? (
-            <span className="inline-flex h-6 max-w-full items-center gap-1 rounded-full bg-raised pr-1 pl-2.5 text-ink-muted">
-              <span className="truncate" title={page.path}>
-                {label}
-              </span>
+        <div className="flex shrink-0 items-center gap-2 text-micro text-ink-muted">
+          <span className="shrink-0">{withPage ? "In context:" : "Not in context:"}</span>
+          <span className="inline-flex min-w-0 items-center gap-1 rounded-full bg-raised pr-1 pl-2.5">
+            <span className="truncate" title={page.path}>
+              {pageLabel}
+            </span>
+            <Tip label={contextAction}>
               <button
                 type="button"
-                className="grid size-5 shrink-0 cursor-pointer place-items-center rounded-full border-0 bg-transparent text-ink-faint hover:bg-pressed hover:text-ink"
-                aria-label={`Don't send ${label} as context`}
+                className="grid size-6 shrink-0 cursor-pointer place-items-center rounded-full border-0 bg-transparent text-ink-muted hover:bg-pressed hover:text-ink max-sm:size-11"
+                aria-label={contextAction}
                 disabled={!onWithPage}
-                onClick={() => onWithPage?.(false)}
+                onClick={() => onWithPage?.(!withPage)}
               >
-                <XIcon className="size-3" weight="bold" aria-hidden />
+                {withPage ? (
+                  <XIcon className="size-3" weight="bold" aria-hidden />
+                ) : (
+                  <PlusIcon className="size-3" weight="bold" aria-hidden />
+                )}
               </button>
-            </span>
-          ) : (
-            <button
-              type="button"
-              className="inline-flex h-6 cursor-pointer items-center rounded-full border-0 bg-transparent px-2 text-ink-faint hover:bg-raised hover:text-ink-muted"
-              disabled={!onWithPage}
-              onClick={() => onWithPage?.(true)}
-            >
-              Include {pageLabel}
-            </button>
-          )}
+            </Tip>
+          </span>
+          <span className="sr-only" role="status">
+            {withPage
+              ? `${pageLabel} will be included as context with your next message.`
+              : `${pageLabel} will not be included as context with your next message. Earlier messages are unchanged.`}
+          </span>
         </div>
       )}
-      <div className="flex items-end gap-2 rounded-control bg-sunken p-1.5 shadow-[0_0_0_1px_var(--line-soft)] focus-within:bg-rail focus-within:shadow-[0_0_0_2px_var(--signal-line)]">
+      {popup}
+      <div className="flex shrink-0 items-end gap-2 rounded-control bg-sunken p-1.5 shadow-[0_0_0_1px_var(--line-soft)] focus-within:bg-rail focus-within:shadow-[0_0_0_2px_var(--signal-line)]">
         {field}
         <button
           type="submit"
@@ -400,7 +441,7 @@ function Composer({
  */
 export function ChatPlaceholder({ page }: { page: PageContext }) {
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <div className="min-h-0 flex-1" aria-busy="true" />
       <Composer
         page={page}

@@ -16,6 +16,8 @@ import {
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { timelineKnowledgeSource } from "../knowledge/sources.ts";
 import { findAccountBySlug } from "../db.ts";
+import { accessFor } from "../tracker/access.ts";
+import { trackerObject } from "../tracker/stub.ts";
 import { probeDurableObjects } from "../durable/probe.ts";
 import { durableAgent, instanceStorage } from "../durable/registry.ts";
 import { collectUsage } from "../usage/collect.ts";
@@ -95,6 +97,7 @@ dev.use("*", async (c, next) => {
       "/atlas",
       "/durable",
       "/usage",
+      "/ai-usage",
       "/retention",
       "/retention-cron",
       "/ci-age",
@@ -108,6 +111,7 @@ dev.use("*", async (c, next) => {
       "/source-auth",
       "/landing-fixtures",
       "/knowledge-fixtures",
+      "/chronicle",
     ].some((path) => c.req.path.endsWith(path))
   ) {
     const secret = Reflect.get(c.env, "AGENT_SECRET");
@@ -149,6 +153,23 @@ dev.post("/usage", async (c) => {
     .bind(found.id)
     .all();
   return c.json({ runs, figures: results });
+});
+
+// Raw AI call records since a day (CORE-285): the E2E reconciles them with
+// the owned AI Gateway's logs per account, feature and model.
+dev.get("/ai-usage", async (c) => {
+  const since = c.req.query("since") ?? new Date().toISOString().slice(0, 10);
+  const { results } = await c.env.DB.prepare(
+    `SELECT u.account_id, a.slug, u.feature, u.model, SUM(u.calls) AS calls,
+            SUM(u.failed_calls) AS failed, SUM(u.input_tokens) AS input,
+            SUM(u.output_tokens) AS output, SUM(u.total_tokens) AS total
+     FROM ai_usage u LEFT JOIN accounts a ON a.id = u.account_id
+     WHERE u.day >= ?1 GROUP BY u.account_id, u.feature, u.model
+     ORDER BY u.account_id, u.feature, u.model`,
+  )
+    .bind(since)
+    .all();
+  return c.json({ since, usage: results });
 });
 
 // Retention runs in the real runtime with a moment `daysAhead` days from now
@@ -442,6 +463,158 @@ dev.post("/tokens", async (c) => {
   const scope: TokenScope = body.scope === "read" ? "read" : "write";
   const name = body.name?.trim() || "dev";
   return c.json(await issueToken(c.env.DB, persona.id, name, scope), 201);
+});
+
+/**
+ * The Chronicle's history (CORE-251): `issues` issues of a new team `team`
+ * worked over `days` up to now, through real tracker mutations under a
+ * controlled clock (worker/tracker/chronicle-fixture.ts), by the account's
+ * people and a "builder" agent. With `link` (a readable repository and one of
+ * its real commits), the showcase issue's work links to it: a step context
+ * at that commit, and a release-note entry naming the issue and the commit,
+ * as the release-note generator would store them (it needs a model, which
+ * development lacks). Its CI runs are found by the commit, as in production.
+ */
+dev.post("/chronicle", async (c) => {
+  const body = await readJson<{
+    account: string;
+    team: string;
+    issues?: number;
+    days?: number;
+    seed?: number;
+    link?: { repo: string; commit: string };
+  }>(c);
+  const account = body.account;
+  const teamKey = body.team;
+  if (
+    typeof account !== "string" ||
+    typeof teamKey !== "string" ||
+    !/^[A-Z][A-Z0-9]{1,5}$/.test(teamKey)
+  )
+    return fail(c, 400, "account and a new team key (2–6 capitals) are required.");
+  const owner = await findAccountBySlug(c.env.DB, account);
+  if (!owner) return fail(c, 404, "No such account.");
+  const issues = Math.min(2000, Math.max(1, Math.trunc(body.issues ?? 300)));
+  const days = Math.min(365, Math.max(1, Math.trunc(body.days ?? 30)));
+  const k = db(c.env.DB);
+  const members =
+    owner.kind === "user"
+      ? [{ id: owner.id, admin: true }]
+      : (
+          await k
+            .selectFrom("org_members")
+            .select(["user_id", "role"])
+            .where("org_id", "=", owner.id)
+            .orderBy("role", "desc")
+            .orderBy("user_id")
+            .execute()
+        )
+          .map((m) => ({ id: m.user_id, admin: m.role === "owner" }))
+          .sort((a, b) => Number(b.admin) - Number(a.admin));
+  const lead = members[0];
+  if (!lead) return fail(c, 400, "The account has no members.");
+  const agentId = `agt_chronicle_${owner.id}`;
+  await k
+    .insertInto("agents")
+    .values({ id: agentId, name: "builder", accountable_id: lead.id })
+    .onConflict((oc) => oc.column("id").doNothing())
+    .execute();
+  const people = await Promise.all(
+    members.map((m) => accessFor(c.env.DB, owner, m.id, null, m.admin)),
+  );
+  const agents = [await accessFor(c.env.DB, owner, lead.id, agentId, lead.admin)];
+  const result = await trackerObject(c.env, owner.id).chronicleFixture(people, agents, {
+    issues,
+    days,
+    end: Date.now() - 10 * 60_000,
+    seed: Math.trunc(body.seed ?? 1),
+    team: teamKey,
+  });
+  let linked: { repo: string; commit: string; release: string } | null = null;
+  if (body.link) {
+    const [repoOwner, repoName] = body.link.repo.split("/");
+    const repo = await k
+      .selectFrom("repos as r")
+      .innerJoin("accounts as a", "a.id", "r.owner_id")
+      .select("r.id")
+      .where("a.slug", "=", repoOwner ?? "")
+      .where("r.name", "=", repoName ?? "")
+      .executeTakeFirst();
+    if (!repo || !/^[0-9a-f]{40}$/.test(body.link.commit))
+      return fail(c, 400, "link needs a repository owner/name and a 40-character commit.");
+    const show = result.showcase;
+    const committedAt = new Date(Date.parse(show.claimedAt) + 45 * 60_000).toISOString();
+    const release = `@day:${show.completedAt.slice(0, 10)}`;
+    const team = await trackerObject(c.env, owner.id).issuesByKey([show.key]);
+    const shipped = team.ok ? team.value[0] : undefined;
+    await batch(c.env.DB, [
+      k
+        .insertInto("step_contexts")
+        .values({
+          repo_id: repo.id,
+          change_id: `chronicle${show.key.toLowerCase().replace(/[^a-z0-9]/g, "")}`,
+          commit_oid: body.link.commit,
+          author_id: agentId,
+          accountable_id: lead.id,
+          timeline: null,
+          issue_key: show.key,
+          summary: `Index the docs for ${show.key}`,
+          context: JSON.stringify({
+            why: "The showcase issue's work, for the Chronicle's linked work.",
+            model: "fixture",
+          }),
+          committed_at: committedAt,
+          verified_at: committedAt,
+        })
+        .onConflict((oc) => oc.doNothing()),
+      k
+        .insertInto("release_note_state")
+        .values({
+          repo_id: repo.id,
+          status: "ready",
+          format_version: 1,
+          generated_at: show.completedAt,
+        })
+        .onConflict((oc) => oc.column("repo_id").doUpdateSet({ format_version: 1 })),
+      k
+        .insertInto("release_notes")
+        .values({
+          repo_id: repo.id,
+          release,
+          to_oid: body.link.commit,
+          format_version: 1,
+          released_at: show.completedAt,
+          updated_at: show.completedAt,
+        })
+        .onConflict((oc) => oc.doNothing()),
+      k
+        .insertInto("release_note_entries")
+        .values({
+          id: `chronicle-${repo.id}-${show.key}`,
+          repo_id: repo.id,
+          release,
+          subject: show.key,
+          kind: "issue",
+          category: "feature",
+          title: `${show.key} shipped`,
+          summary: "The showcase issue's release-note entry (development fixture).",
+          tracker_owner_id: owner.id,
+          issue_id: show.id,
+          issue_key: show.key,
+          team_id: shipped?.team.id ?? null,
+          team_key: shipped?.team.key ?? teamKey,
+          issue_type: "task",
+          commits: JSON.stringify([body.link.commit]),
+          shipped_at: show.completedAt,
+          model: null,
+          inputs_hash: "chronicle-fixture",
+          updated_at: show.completedAt,
+        })
+        .onConflict((oc) => oc.doNothing()),
+    ]);
+    linked = { repo: body.link.repo, commit: body.link.commit, release };
+  }
+  return c.json({ ...result, linked }, 201);
 });
 
 dev.post("/seed", async (c) => {

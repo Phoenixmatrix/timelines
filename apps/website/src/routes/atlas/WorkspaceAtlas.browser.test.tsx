@@ -194,6 +194,10 @@ test("the address keeps the member, lens and links; Back, Forward and copied lin
 
   // A copied link opens the same state in a fresh page.
   const copied = app.url();
+  // The address holds every part of the state (CORE-258: a quick second
+  // update once dropped the lens here).
+  expect(copied.searchParams.get("lens")).toBe("in");
+  expect(copied.searchParams.get("links")).toBe("related");
   app.unmount();
   renderApp(copied.pathname + copied.search);
   await expect.element(heading(shopMember.name)).toHaveFocus();

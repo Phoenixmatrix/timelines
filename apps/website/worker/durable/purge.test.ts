@@ -11,6 +11,7 @@ import { DURABLE_CLASSES } from "./classes.ts";
 import { isEmpty, storageReport, type Purgeable } from "./contract.ts";
 import { Tracker } from "../tracker/object.ts";
 import { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
+import { StepFeed } from "../steps/feed.ts";
 import { CiSandbox } from "../ci/sandbox.ts";
 import { RepoDO } from "../../registry/do/repo-do.ts";
 import { UploadDO } from "../../registry/do/upload-do.ts";
@@ -55,6 +56,24 @@ const CASES: Record<string, () => Promise<Built>> = {
     const { ctx } = fakeDurableState();
     const object = new KnowledgeCoordinator(ctx, env);
     await object.notify("repo_1");
+    return { object, ctx };
+  },
+  async StepFeed() {
+    const { ctx } = fakeDurableState();
+    const object = new StepFeed(ctx, env);
+    // A record arms the week's expiry alarm.
+    await object.publish({
+      repo: "orbit/app",
+      timeline: "search",
+      changeId: "change0001",
+      commitOid: "a".repeat(40),
+      summary: "Rank by recency",
+      issue: null,
+      author: { id: "agt_1", kind: "agent", name: "builder" },
+      tests: null,
+      why: "",
+      committedAt: new Date().toISOString(),
+    });
     return { object, ctx };
   },
   async CiSandbox() {

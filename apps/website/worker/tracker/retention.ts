@@ -586,10 +586,10 @@ export function removeActivity(
   let bytes = 0;
   const cursors = of("e").map(Number);
   if (cursors.length) {
-    const removed = rows<{ cursor: number; size: number }>(
+    const removed = rows<{ cursor: number; size: number; at: string | null }>(
       sql,
       `DELETE FROM events AS e WHERE e.cursor IN (SELECT value FROM json_each(?)) AND ${PRUNABLE_EVENT}
-       RETURNING cursor, length(data) AS size`,
+       RETURNING cursor, length(data) AS size, json_extract(data, '$.createdAt') AS at`,
       JSON.stringify(cursors),
       events,
     );
@@ -604,6 +604,14 @@ export function removeActivity(
          ON CONFLICT (key) DO UPDATE SET value = max(value, excluded.value)`,
         top,
       );
+      // And when: the Chronicle says history before then may be missing (CORE-250).
+      const latest = Math.max(...removed.map((row) => Date.parse(row.at ?? "") || 0));
+      if (latest > 0)
+        sql.exec(
+          `INSERT INTO retention_state (key, value) VALUES ('events_floor_at', ?)
+           ON CONFLICT (key) DO UPDATE SET value = max(value, excluded.value)`,
+          latest,
+        );
     }
     count += removed.length;
     bytes += removed.reduce((sum, row) => sum + row.size + ROW, 0);

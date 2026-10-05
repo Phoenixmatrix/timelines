@@ -183,6 +183,9 @@ pub struct IssueCreate {
     /// Required for canceled issues; forbidden for other statuses.
     #[arg(long, value_parser=["duplicate","not_planned","obsolete","cannot_reproduce","other"])]
     pub close_reason: Option<String>,
+    /// Who may pick up the issue: anyone (default), nobody yet, or people only.
+    #[arg(long, default_value="anyone", value_parser=["anyone","not_ready","human_only"])]
+    pub pickup: String,
     #[arg(long, default_value_t=2, value_parser=clap::value_parser!(u8).range(0..=4))]
     pub priority: u8,
     #[command(flatten)]
@@ -193,11 +196,26 @@ pub struct IssueCreate {
     pub assignee: Option<String>,
     #[arg(long)]
     pub workspace: Vec<String>,
-    /// Work-area label; repeat for each area (e.g. --label ux --label frontend).
-    /// Reuse team spelling; `gm cli guide` lists suggested defaults. Labels describe
-    /// the issue, not agent capabilities, and do not restrict claims.
-    #[arg(long)]
-    pub label: Vec<String>,
+    /// Work-area tag from the tracker's tag catalog; repeat for each area (e.g. --tag ux
+    /// --tag frontend). `gm issue tags` lists the catalog; a new name is added to it.
+    /// Tags describe the issue and do not restrict claims; --requires says which agents
+    /// may claim it. (`--label` is the old name of this flag.)
+    #[arg(long = "tag", alias = "label", value_name = "TAG")]
+    pub tags: Vec<String>,
+    #[command(flatten)]
+    pub requires: RequiresArgs,
+}
+/// What an agent must report (`gm agent setup`) to claim the issue (`requires`).
+#[derive(Args)]
+pub struct RequiresArgs {
+    /// Which agents may claim it, from what they report (`gm agent setup`):
+    /// space-separated terms like 'tag:ux skill:playwright model:claude-opus-*,gpt-5*
+    /// harness:claude-code os:linux arch:x86_64 runtime:host memory>=16GiB cpus>=8'.
+    /// Tags and skills: every one; the rest: any one; `*` is a wildcard. Agents that
+    /// don't meet them can't claim it and `gm issue next` skips it. People bypass
+    /// capability requirements, but not pickup policy.
+    #[arg(long, value_name = "TERMS")]
+    pub requires: Option<String>,
 }
 /// Whether an agent works the issue in a timeline (`timelineUse`, `timelinePolicy`).
 #[derive(Args)]
@@ -217,15 +235,41 @@ pub struct IssuePatch {
     pub id: String,
     /// JSON object of mutable fields; use '-' for stdin or '@path' for a file:
     /// title, description, acceptance, type, status, closeReason, timelineUse,
-    /// timelinePolicy, priority (0–4), assigneeId, parentId, workspaceIds and
-    /// labels. Relationships use canonical IDs; null clears assigneeId/parentId.
+    /// timelinePolicy, priority (0–4), assigneeId, parentId, workspaceIds, tags
+    /// (the whole list; `labels` is its old name), pickup and requires (an object,
+    /// or null; --requires writes it from terms).
+    /// Relationships use canonical IDs; null clears assigneeId/parentId.
     /// Setting status to canceled requires closeReason: duplicate, not_planned,
     /// obsolete, cannot_reproduce or other. Leaving canceled clears closeReason
     /// automatically, as leaving required clears timelinePolicy.
-    #[arg(long, required_unless_present_any=["timeline_use","timeline_policy"])]
+    #[arg(long, required_unless_present_any=["timeline_use","timeline_policy","requires","clear_requires","pickup","tags","drop_tags","require_issue_tags"])]
     pub data: Option<String>,
+    /// Pickup policy; only a person can change an existing restricted policy.
+    #[arg(long, value_parser=["anyone","not_ready","human_only"])]
+    pub pickup: Option<String>,
+    /// Add a tag from the tracker's tag catalog (repeat); keeps its other tags.
+    /// (`--label` is the old name of this flag.)
+    #[arg(long = "tag", alias = "label", value_name = "TAG")]
+    pub tags: Vec<String>,
+    /// Remove a tag (repeat).
+    #[arg(long = "drop-tag", value_name = "TAG")]
+    pub drop_tags: Vec<String>,
+    /// Require agents tagged with this issue's saved tags: adds a `tag:` term for
+    /// each to its requirements.
+    #[arg(long)]
+    pub require_issue_tags: bool,
+    /// When new requirements no longer allow the agent holding the issue, release
+    /// its claim instead of keeping it (tracker owners and the agent's person).
+    /// Either way gm prints who's affected and the issue records it.
+    #[arg(long)]
+    pub release_claim: bool,
     #[command(flatten)]
     pub timeline: TimelineRule,
+    #[command(flatten)]
+    pub requires: RequiresArgs,
+    /// Remove capability requirements (requires: null); does not change pickup policy.
+    #[arg(long, conflicts_with = "requires")]
+    pub clear_requires: bool,
 }
 #[derive(Args)]
 pub struct ListIssues {
@@ -279,7 +323,9 @@ pub enum IssueCommand {
     List(ListIssues),
     /// Find unblocked, unclaimed work; offline readiness is advisory only.
     Ready(ListIssues),
-    /// Inspect an issue and bounded ancestors, blockers, dependents and notes.
+    /// The tracker's tag catalog: every tag defined (kept after its last use), with how many issues carry it.
+    Tags,
+    /// Inspect an issue and bounded ancestors, blockers, dependents and notes, with its requirements and whether the acting agent meets them.
     Show {
         issue: String,
         #[arg(long, default_value_t=30, value_parser=clap::value_parser!(u16).range(1..=200))]
@@ -296,7 +342,8 @@ pub enum IssueCommand {
         limit: u16,
     },
     /// Apply a JSON patch with optimistic version checking; null clears nullable fields.
-    /// --timeline-use and --timeline-policy set the timeline rule without JSON.
+    /// --timeline-use and --timeline-policy set the timeline rule without JSON;
+    /// --requires and --clear-requires set which agents may claim it.
     Update(IssuePatch),
     /// Add a directed relation: FROM blocks TO (or related/duplicates).
     Link {
@@ -316,8 +363,8 @@ pub enum IssueCommand {
     /// Atomically acquire exclusive work online; returns the secret fencing token once.
     Claim {
         issue: String,
-        /// A label for your working session; defaults to this checkout's agent (`gm agent setup`).
-        #[arg(long)]
+        /// A session name for this piece of work; defaults to this checkout's agent (`gm agent setup`).
+        #[arg(long, value_name = "SESSION_NAME")]
         agent: Option<String>,
         /// Lease seconds; defaults to .gitmatrix/agents.yml's, else 900.
         #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
@@ -375,8 +422,8 @@ pub enum IssueCommand {
     /// Accept a handoff code: the lease moves to you with a fresh token; the giver's stops working.
     Accept {
         code: String,
-        /// A label for your working session (defaults to the giver's).
-        #[arg(long)]
+        /// A session name for this piece of work (defaults to the giver's).
+        #[arg(long, value_name = "SESSION_NAME")]
         agent: Option<String>,
         /// Lease seconds; defaults to .gitmatrix/agents.yml's, else 900.
         #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
@@ -389,10 +436,10 @@ pub enum IssueCommand {
         #[arg(long, env = "GM_UNDER_TOKEN", hide_env_values = true)]
         under_token: String,
     },
-    /// Pick and claim the next ready issue in one step: highest priority, then most unblocked work, then oldest. Returns its token once, with the issue's working context.
+    /// Pick and claim the next ready issue in one step: highest priority, then most unblocked work, then oldest. Returns its token once, with the issue's working context. An agent only gets issues whose requirements it meets; the result says how many it skipped.
     Next {
-        /// A label for your working session; defaults to this checkout's agent (`gm agent setup`).
-        #[arg(long)]
+        /// A session name for this piece of work; defaults to this checkout's agent (`gm agent setup`).
+        #[arg(long, value_name = "SESSION_NAME")]
         agent: Option<String>,
         /// Defaults to this checkout's scope, then the project's (.gitmatrix/agents.yml), then your default team (set on the web).
         #[arg(long, conflicts_with = "all_teams")]

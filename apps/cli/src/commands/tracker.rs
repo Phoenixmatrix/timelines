@@ -1,6 +1,6 @@
 //! Private offline tracker replicas. The outbox is durable before HTTP and immutable
 //! after its first send; an ambiguous acknowledgement is replayed with the same ID.
-use super::Ctx;
+use super::{Ctx, requirements};
 use crate::{
     output::{GmError, Render, Result},
     remote::{self, Config},
@@ -26,7 +26,13 @@ impl Render for Shown {
         if self.0.get("issueId").is_some() && self.0.get("events").is_some() {
             return history_text(&self.0);
         }
+        if let (Some(owner), Some(tags)) = (self.0["catalog"].as_str(), self.0["tags"].as_array()) {
+            return catalog_text(owner, tags);
+        }
         let mut body = serde_json::to_string_pretty(&self.0).unwrap_or_default();
+        if self.0["claimEffect"].is_object() {
+            body = format!("{}\n\n{body}", claim_effect_text(&self.0["claimEffect"]));
+        }
         // A claim leads with the issue's timeline rule, so the choice comes first.
         if let Some(rule) = self.0.get("timelineRule").filter(|r| r.is_object()) {
             body = format!(
@@ -48,17 +54,114 @@ impl Render for Shown {
         }
         if self.0.get("ancestors").is_some() && self.0.get("issue").is_some() {
             return format!(
-                "Created by: {}\n{}\n{body}",
+                "Created by: {}\n{}{}{}\n{body}",
                 self.0["issue"]["creatorDisplay"]
                     .as_str()
                     .unwrap_or("Unknown"),
-                done_in_text(&self.0["issue"])
+                tags_text(&self.0["issue"]),
+                done_in_text(&self.0["issue"]),
+                requirements_text(&self.0),
             );
         }
         body
     }
 }
 
+/// What tightened requirements did to the claim (CORE-272), as a sentence.
+fn claim_effect_text(effect: &Value) -> String {
+    let misses = effect["unmet"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|u| u["message"].as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let who = format!(
+        "{} (session {})",
+        effect["agent"].as_str().unwrap_or("its agent"),
+        effect["session"].as_str().unwrap_or("?")
+    );
+    if effect["released"] == true {
+        format!(
+            "Released the claim held by {who} and unassigned it: the new requirements no longer allow it. It {misses}."
+        )
+    } else {
+        format!(
+            "Kept the claim held by {who}, although the new requirements no longer allow it: it {misses}. Rerun with --release-claim to release it instead."
+        )
+    }
+}
+/// `gm issue tags`: one line per tag, "ux  4 issues, 2 open".
+fn catalog_text(owner: &str, tags: &[Value]) -> String {
+    if tags.is_empty() {
+        return format!(
+            "{owner}'s tag catalog is empty. Tag an issue (gm issue create --tag ux) to start it."
+        );
+    }
+    let width = tags
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .map(|n| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = format!("{owner}'s tag catalog\n");
+    for tag in tags {
+        let issues = tag["issues"].as_u64().unwrap_or(0);
+        out.push_str(&format!(
+            "  {:width$}  {issues} issue{}, {} open\n",
+            tag["name"].as_str().unwrap_or(""),
+            if issues == 1 { "" } else { "s" },
+            tag["open"].as_u64().unwrap_or(0),
+        ));
+    }
+    out
+}
+/// An issue's tags (stored as `labels`, CORE-271) as a line: "Tags: ux, frontend".
+fn tags_text(issue: &Value) -> String {
+    let tags: Vec<&str> = issue["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    format!(
+        "Tags: {}\n",
+        if tags.is_empty() {
+            "none".to_owned()
+        } else {
+            tags.join(", ")
+        }
+    )
+}
+/// An issue's requirements and the acting identity's eligibility (CORE-32), as lines.
+fn requirements_text(shown: &Value) -> String {
+    let mut out = String::new();
+    let policy = pickup(&shown["issue"]);
+    out.push_str(&format!("Pickup: {}\n", match policy {
+        "not_ready" => "Not ready — nobody may claim or start; ask a person to change the pickup policy.",
+        "human_only" => "Human only — agents cannot claim or start, even when assigned; ask a person to do the work or change the pickup policy.",
+        _ => "Anyone",
+    }));
+    if let Some(text) = shown["issue"]["requiresText"].as_str() {
+        out.push_str(&format!("Requires: {text}\n"));
+    }
+    if let Some(why) = shown["eligibility"]["why"].as_str() {
+        out.push_str(&format!("Eligibility: {why}\n"));
+    }
+    if let Some(assignee) = shown["assigneeMismatch"]["assignee"].as_str() {
+        out.push_str(&format!(
+            "Assigned to {assignee}, which doesn't meet: {}\n",
+            shown["assigneeMismatch"]["unmet"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|u| u["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    out
+}
 /// Where an issue is done while its timeline hasn't landed (CORE-74), as lines; else nothing.
 fn done_in_text(issue: &Value) -> String {
     let Some(slug) = issue["doneIn"]["slug"].as_str() else {
@@ -384,7 +487,8 @@ fn safe_owner(owner: &str) -> Result<()> {
 }
 // Version 1 includes creator backfill, which did not produce change-feed events.
 // Version 2 includes timelines and their events (asked for with `timelines=1`).
-const SNAPSHOT_SCHEMA: &str = "2";
+// Version 3 includes the durable tag catalog, backfilled without feed events.
+const SNAPSHOT_SCHEMA: &str = "3";
 
 struct Replica {
     db: Connection,
@@ -392,6 +496,9 @@ struct Replica {
     owner: String,
     /// The timeline whose view this works in (`--timeline`); None for main.
     timeline: Option<String>,
+    /// Each operation the server acknowledged in this run, with its per-mutation
+    /// results (a claim effect, CORE-272), for the command that sent it to report.
+    receipts: std::cell::RefCell<Vec<(String, Value)>>,
 }
 impl Replica {
     fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -634,9 +741,15 @@ impl Replica {
                         return Err(error);
                     }
                     self.db.execute_batch("COMMIT").map_err(db_err)?;
+                    self.receipts
+                        .borrow_mut()
+                        .push((operation.to_string(), reply["results"].clone()));
                 }
                 Err(error) => {
                     if error.code == "conflict"
+                        || error.code == "requirements_unmet"
+                        || error.code == "pickup_not_ready"
+                        || error.code == "pickup_human_only"
                         || error.code == "not_found"
                         || error.code == "forbidden"
                         || (error.code == "server_error" && error.message.starts_with("HTTP 4"))
@@ -684,7 +797,8 @@ impl Replica {
             .and_then(|t| t["key"].as_str())
             .map(str::to_owned))
     }
-    fn submit(&self, ctx: &Ctx, offline: bool, mutations: Vec<Value>) -> Result<Shown> {
+    fn submit(&self, ctx: &Ctx, offline: bool, mut mutations: Vec<Value>) -> Result<Shown> {
+        issue_tags_alias(&mut mutations)?;
         validate_batch(&mutations)?;
         let request = self.request(json!(mutations));
         let operation = request["operationId"].as_str().unwrap().to_string();
@@ -723,9 +837,20 @@ impl Replica {
                     .cloned()
             })
             .collect();
-        Ok(Shown(
-            json!({"operationId":operation,"queued":offline,"entities":entities,"cursor":view["cursor"]}),
-        ))
+        let mut shown = json!({"operationId":operation,"queued":offline,"entities":entities,"cursor":view["cursor"]});
+        // What the tracker said about a claim the change affected (CORE-272).
+        let effects: Vec<Value> = self
+            .receipts
+            .borrow()
+            .iter()
+            .filter(|(op, _)| *op == operation)
+            .flat_map(|(_, results)| results.as_array().cloned().unwrap_or_default())
+            .filter_map(|result| result.get("claimEffect").cloned())
+            .collect();
+        if let Some(effect) = effects.into_iter().next() {
+            shown["claimEffect"] = effect;
+        }
+        Ok(Shown(shown))
     }
 }
 fn conflict_error(operation: &str) -> GmError {
@@ -762,6 +887,7 @@ fn with_replica(
         config,
         owner,
         timeline: scope.timeline(),
+        receipts: Default::default(),
     };
     if !scope.offline && refresh && !ctx.dry_run {
         replica.sync()?;
@@ -815,6 +941,23 @@ fn timeline_collection(kind: &str) -> Option<&'static str> {
 }
 fn apply_event(snapshot: &mut Value, event: &Value) -> Result<()> {
     let kind = event["entityType"].as_str().unwrap_or("");
+    if kind == "issue" {
+        let labels = snapshot["labels"]
+            .as_array_mut()
+            .ok_or_else(|| GmError::new("protocol_error", "Missing tracker tag catalog."))?;
+        let mut added = false;
+        for entity in [&event["entity"], &event["view"]["entity"]] {
+            for label in entity["labels"].as_array().into_iter().flatten() {
+                if label.is_string() && !labels.contains(label) {
+                    labels.push(label.clone());
+                    added = true;
+                }
+            }
+        }
+        if added {
+            labels.sort_unstable_by(|a, b| a.as_str().cmp(&b.as_str()));
+        }
+    }
     let table = if let Some(table) = collection(kind) {
         table
     } else if let Some(table) = timeline_collection(kind) {
@@ -862,6 +1005,28 @@ fn id(snapshot: &Value, table: &str, reference: &str) -> Result<String> {
         .as_str()
         .unwrap()
         .to_owned())
+}
+/// An issue's tags are stored as `labels` (CORE-271): `tags` in `--data` or a batch is
+/// the same field under the name people see, so it's written as `labels`, which every
+/// server and replica knows. Both at once must agree.
+fn issue_tags_alias(mutations: &mut [Value]) -> Result<()> {
+    for m in mutations {
+        if !matches!(m["kind"].as_str(), Some("issue.create" | "issue.update")) {
+            continue;
+        }
+        let Some(data) = m["data"].as_object_mut() else {
+            continue;
+        };
+        if let Some(tags) = data.remove("tags") {
+            if data.get("labels").is_some_and(|labels| *labels != tags) {
+                return Err(GmError::usage(
+                    "Give tags or labels (its old name), not both.",
+                ));
+            }
+            data.insert("labels".into(), tags);
+        }
+    }
+    Ok(())
 }
 fn validate_batch(mutations: &[Value]) -> Result<()> {
     if mutations.is_empty() || mutations.len() > 100 {
@@ -931,13 +1096,26 @@ fn validate_issue_fields(data: &serde_json::Map<String, Value>, creating: bool) 
                 "parentId",
                 "workspaceIds",
                 "labels",
+                "requires",
+                "pickup",
             ]
             .contains(&key.as_str())
+            && !(!creating && key == "releaseClaim")
         {
             return Err(GmError::usage(format!(
                 "Server-owned or unknown issue field '{key}'."
             )));
         }
+    }
+    if let Some(pickup) = data.get("pickup")
+        && !matches!(pickup.as_str(), Some("anyone" | "not_ready" | "human_only"))
+    {
+        return Err(GmError::usage(
+            "pickup must be anyone, not_ready or human_only.",
+        ));
+    }
+    if let Some(requires) = data.get("requires") {
+        requirements::normalize(requires)?;
     }
     Ok(())
 }
@@ -1077,6 +1255,10 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
             if ["id", "key", "version", "createdAt", "claim", "teamId"].contains(&key.as_str()) {
                 return Err(GmError::usage(format!("Immutable field '{key}'.")));
             }
+            // An instruction about the claim (CORE-272), not a field of the issue.
+            if key == "releaseClaim" {
+                continue;
+            }
             row.insert(key.clone(), value.clone());
         }
         if entity == "issue" && row.get("status").and_then(Value::as_str) != Some("canceled") {
@@ -1088,6 +1270,11 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
             && data["timelineUse"] != "required"
         {
             row.insert("timelinePolicy".into(), Value::Null);
+        }
+        if entity == "issue"
+            && let Some(requires) = data.get("requires")
+        {
+            row.insert("requires".into(), requirements::normalize(requires)?);
         }
         row.insert(
             "version".into(),
@@ -1104,7 +1291,7 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
         }
         let mut row = match entity {
             "issue" => {
-                json!({"key":null,"description":"","acceptance":"","type":"task","status":"todo","closeReason":null,"timelineUse":"agent_decides","timelinePolicy":null,"priority":2,"assigneeId":null,"parentId":null,"workspaceIds":[],"labels":[],"claim":null})
+                json!({"key":null,"description":"","acceptance":"","type":"task","status":"todo","pickup":"anyone","closeReason":null,"timelineUse":"agent_decides","timelinePolicy":null,"priority":2,"assigneeId":null,"parentId":null,"workspaceIds":[],"labels":[],"claim":null})
             }
             "team" => json!({"description":"","memberIds":[],"archived":false}),
             "workspace" => json!({"description":"","archived":false}),
@@ -1112,6 +1299,11 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
         };
         for (key, value) in data {
             row[key] = value.clone();
+        }
+        if entity == "issue"
+            && let Some(requires) = data.get("requires")
+        {
+            row["requires"] = requirements::normalize(requires)?;
         }
         row["id"] = mutation["id"].clone();
         row["version"] = json!(1);
@@ -1153,7 +1345,70 @@ fn issue_patch(snapshot: &Value, p: &IssuePatch) -> Result<Value> {
         None => json!({}),
     };
     timeline_fields(&p.timeline, &mut data);
+    requires_field(&p.requires, p.clear_requires, &mut data)?;
+    if let Some(pickup) = &p.pickup {
+        data["pickup"] = json!(pickup);
+    }
+    // One click from the issue's tags to its requirements (CORE-272): only agents
+    // tagged with them may claim it. Kept with whatever else it requires.
+    if p.require_issue_tags {
+        let base = match data.get("requires") {
+            Some(requires) => requires.clone(),
+            None => row["requires"].clone(),
+        };
+        let mut tags = requirements::required_tags(&base);
+        for tag in row["labels"].as_array().into_iter().flatten() {
+            if let Some(tag) = tag.as_str() {
+                tags.push(tag.to_lowercase());
+            }
+        }
+        let mut merged = if base.is_object() { base } else { json!({}) };
+        merged["tags"] = json!(tags);
+        data["requires"] = requirements::normalize(&merged)?;
+    }
+    if p.release_claim {
+        if data.get("requires").is_none() {
+            return Err(GmError::usage(
+                "--release-claim goes with a requirements change (--requires, --clear-requires or --require-issue-tags).",
+            ));
+        }
+        data["releaseClaim"] = json!(true);
+    }
+    if !p.tags.is_empty() || !p.drop_tags.is_empty() {
+        if data.get("tags").is_some() || data.get("labels").is_some() {
+            return Err(GmError::usage(
+                "Use --tag/--drop-tag or tags in --data, not both.",
+            ));
+        }
+        data["labels"] = json!(edited_tags(&row["labels"], &p.tags, &p.drop_tags));
+    }
     Ok(json!({"kind":"issue.update","id":row["id"],"expectedVersion":row["version"],"data":data}))
+}
+/// An issue's tags with `add` appended (unless already there, ignoring case) and
+/// `drop` removed (ignoring case), in their original order.
+fn edited_tags(current: &Value, add: &[String], drop: &[String]) -> Vec<String> {
+    let mut tags: Vec<String> = current
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect();
+    for tag in add {
+        if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+            tags.push(tag.clone());
+        }
+    }
+    tags.retain(|t| !drop.iter().any(|d| d.eq_ignore_ascii_case(t)));
+    tags
+}
+/// `--requires TERMS` as the stored `requires` object; `--clear-requires` as null.
+fn requires_field(args: &RequiresArgs, clear: bool, data: &mut Value) -> Result<()> {
+    if clear {
+        data["requires"] = Value::Null;
+    } else if let Some(text) = &args.requires {
+        data["requires"] = requirements::parse(text)?;
+    }
+    Ok(())
 }
 /// `--timeline-use`/`--timeline-policy` as `timelineUse`/`timelinePolicy` (`none` clears).
 fn timeline_fields(rule: &TimelineRule, data: &mut Value) {
@@ -1629,6 +1884,25 @@ fn leased_ancestor<'a>(
 /// `done_in_timeline` (finished in a timeline that hasn't landed) is neither ready nor
 /// done: it keeps blocking, as on the server.
 fn ready(snapshot: &Value, issue: &Value, now: DateTime<Utc>) -> bool {
+    ready_for(snapshot, issue, now, false)
+}
+fn pickup(issue: &Value) -> &str {
+    issue["pickup"].as_str().unwrap_or("anyone")
+}
+fn pickup_refusal(issue: &Value, person: bool) -> Option<(&'static str, &'static str)> {
+    match pickup(issue) {
+        "not_ready" => Some((
+            "pickup_not_ready",
+            "Nobody may claim or start this issue yet. Ask a person to change its pickup policy.",
+        )),
+        "human_only" if !person => Some((
+            "pickup_human_only",
+            "Only a person may claim or start this issue. Assignment and capability overrides do not bypass pickup policy; ask a person to do the work or change the policy.",
+        )),
+        _ => None,
+    }
+}
+fn ready_for(snapshot: &Value, issue: &Value, now: DateTime<Utc>, person: bool) -> bool {
     // Waiting on a person is never ready, whatever the status says.
     if issue["waiting"].as_u64().unwrap_or(0) > 0 {
         return false;
@@ -1637,6 +1911,9 @@ fn ready(snapshot: &Value, issue: &Value, now: DateTime<Utc>) -> bool {
     if !(status == "todo" || (status == "in_progress" && !issue["claim"].is_null()))
         || active_claim(issue, now)
     {
+        return false;
+    }
+    if pickup_refusal(issue, person).is_some() {
         return false;
     }
     let blocked = snapshot["links"]
@@ -1679,6 +1956,7 @@ fn actor_name(snapshot: &Value, id: &str) -> String {
 /// The issue as stored, plus who holds its claim and who it's assigned to, by name.
 fn named(snapshot: &Value, issue: &Value) -> Value {
     let mut out = issue.clone();
+    out["pickup"] = json!(pickup(issue));
     let rule = timeline_rule(issue);
     out["timelineUse"] = rule["use"].clone();
     out["timelinePolicy"] = rule["policy"].clone();
@@ -1687,6 +1965,9 @@ fn named(snapshot: &Value, issue: &Value) -> Value {
     }
     if let Some(assignee) = issue["assigneeId"].as_str() {
         out["assignee"] = json!(actor_name(snapshot, assignee));
+    }
+    if requirements::has_requirements(&issue["requires"]) {
+        out["requiresText"] = json!(requirements::text(&issue["requires"]));
     }
     out["creatorDisplay"] = json!(if issue["createdBy"].is_null() {
         "Unknown".to_string()
@@ -1804,6 +2085,123 @@ fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Re
         json!({"issue":named(snapshot,issue),"ancestors":ancestors,"links":links.iter().take(limit).collect::<Vec<_>>(),"relatedIssues":related,"notes":notes.iter().rev().take(limit).collect::<Vec<_>>(),"limitPerSection":limit,"truncated":{"ancestors":parent.is_some(),"links":links.len()>limit,"notes":notes.len()>limit},"ready":ready(snapshot,issue,Utc::now()),"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"offline":offline,"timeline":snapshot["timeline"]}),
     ))
 }
+/// Who gm acts as here, for eligibility (CORE-32): a person, an agent (with its
+/// directory entry when the replica knows it), or unknown.
+enum Acting {
+    Person,
+    Agent { name: String, entry: Option<Value> },
+    Unknown,
+}
+fn acting(r: &Replica, snapshot: &Value, offline: bool) -> Acting {
+    let agents = snapshot["agents"].as_array().cloned().unwrap_or_default();
+    match r.config.identity() {
+        Ok(remote::Identity::Person) => Acting::Person,
+        Ok(remote::Identity::Agent { name }) => {
+            // Names are unique per person: prefer the agent of the person this replica belongs to.
+            let person = r.meta("actor").ok().flatten();
+            let named: Vec<&Value> = agents
+                .iter()
+                .filter(|a| a["name"] == name.as_str())
+                .collect();
+            let entry = named
+                .iter()
+                .find(|a| {
+                    person
+                        .as_deref()
+                        .is_some_and(|p| a["accountable"]["id"] == p)
+                })
+                .or(named.first())
+                .map(|a| (*a).clone());
+            Acting::Agent { name, entry }
+        }
+        // GM_TOKEN: ask the server who it is, when online.
+        _ if offline => Acting::Unknown,
+        _ => match remote::api(&r.config, "GET", "/session", None) {
+            Ok(session) if session["viewer"]["agent"].is_object() => {
+                let id = &session["viewer"]["agent"]["id"];
+                Acting::Agent {
+                    name: session["viewer"]["agent"]["name"]
+                        .as_str()
+                        .unwrap_or("this agent")
+                        .to_string(),
+                    entry: agents.iter().find(|a| a["id"] == *id).cloned(),
+                }
+            }
+            Ok(session) if session["viewer"]["id"].is_string() => Acting::Person,
+            _ => Acting::Unknown,
+        },
+    }
+}
+/// Pickup policy takes precedence over capability requirements and assignment.
+fn eligibility(issue: &Value, acting: &Acting) -> Value {
+    if let Some((code, why)) = pickup_refusal(issue, matches!(acting, Acting::Person)) {
+        return match acting {
+            Acting::Person => json!({"kind":"person","eligible":false,"code":code,"why":why}),
+            Acting::Agent { name, .. } => {
+                json!({"kind":"agent","agent":name,"eligible":false,"code":code,"why":why})
+            }
+            Acting::Unknown if pickup(issue) == "not_ready" => {
+                json!({"eligible":false,"code":code,"why":why})
+            }
+            Acting::Unknown => {
+                json!({"eligible":null,"why":"Human only: authenticate as a person to claim or start this issue."})
+            }
+        };
+    }
+    let requires = &issue["requires"];
+    match acting {
+        Acting::Unknown => Value::Null,
+        Acting::Person => {
+            json!({"kind":"person","eligible":true,"why":"Pickup policy permits people; capability requirements apply only to agents."})
+        }
+        Acting::Agent { name, entry: None } => json!({
+            "kind":"agent","agent":name,"eligible":Value::Null,
+            "why":"This agent isn't in the tracker's directory yet; run `gm tracker sync`, or `gm agent setup` to publish it.",
+        }),
+        Acting::Agent {
+            name,
+            entry: Some(agent),
+        } => {
+            let unmet = requirements::unmet(requires, &agent["capabilities"]);
+            let assigned = issue["assigneeId"] == agent["id"];
+            let why = if !requirements::has_requirements(requires) {
+                "No requirements: any agent may claim it.".to_string()
+            } else if unmet.is_empty() {
+                "It meets every requirement.".to_string()
+            } else if assigned {
+                "It doesn't meet every requirement, but the issue is assigned to it, so it may still claim it.".to_string()
+            } else {
+                format!(
+                    "It can't claim it: {}. Publish its capabilities with `gm agent setup` (e.g. --tag), or ask a person to claim it or assign it to this agent.",
+                    unmet
+                        .iter()
+                        .filter_map(|u| u["message"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            };
+            json!({
+                "kind":"agent","agent":name,"eligible":unmet.is_empty() || assigned,
+                "unmet":unmet,"why":why,
+            })
+        }
+    }
+}
+/// The assignee, when it's an agent that doesn't meet the issue's requirements:
+/// explicit assignment lets it claim anyway, and shows the mismatch.
+fn assignee_mismatch(snapshot: &Value, issue: &Value) -> Option<Value> {
+    let agent = snapshot["agents"]
+        .as_array()?
+        .iter()
+        .find(|a| a["id"] == issue["assigneeId"] && !a["id"].is_null())?;
+    let unmet = requirements::unmet(&issue["requires"], &agent["capabilities"]);
+    (!unmet.is_empty()).then(|| {
+        json!({
+            "assignee": actor_name(snapshot, agent["id"].as_str().unwrap_or("")),
+            "unmet": unmet,
+        })
+    })
+}
 /// Adds a delegation's underToken and forActorId (an agent resolved by name or id).
 fn delegate(snapshot: &Value, delegation: &Delegation, data: &mut Value) -> Result<()> {
     if let Some(token) = &delegation.under_token {
@@ -1846,11 +2244,30 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
             "message": "The claim response lacked a fencing token. Inspect the issue online; do not assume ownership.",
         }));
     }
+    // Ready issues passed over because this agent doesn't meet their requirements (CORE-32).
+    let skipped = result["skipped"].clone();
+    let skipped_count = skipped["requirements"].as_u64().unwrap_or(0);
     let Some(issue_id) = result["issueId"].as_str() else {
-        return Shown(json!({
+        let mut out = json!({
             "claimed": null,
             "message": "Nothing in scope is ready: everything is claimed, blocked, waiting, or done.",
-        }));
+        });
+        if skipped_count > 0 {
+            out["message"] = json!(format!(
+                "Nothing in scope is ready for this agent: it skipped {skipped_count} ready issue{} whose requirements it doesn't meet ({}).{} See what one needs with `gm issue show <key>`; `gm agent setup` (e.g. --tag ux) updates what this agent reports, or a person can claim or assign them.",
+                if skipped_count == 1 { "" } else { "s" },
+                skipped["keys"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                requirements::blocking_text(&skipped["blocking"]),
+            ));
+            out["skipped"] = skipped;
+        }
+        return Shown(out);
     };
     let context = context(snapshot, issue_id, 30, false)
         .map(|shown| shown.0)
@@ -1885,6 +2302,9 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
         "blockerEvidence": blocker_evidence,
         "next": "Work it, checkpoint as you go (gm issue checkpoint), renew before it expires (gm issue renew), then gm issue complete with evidence. gm kept the lease token for this identity, so those commands need no token.",
     });
+    if skipped_count > 0 {
+        out["skipped"] = skipped;
+    }
     if let Some(notice) = crate::profile::model_notice() {
         out["notice"] = json!(notice);
     }
@@ -1951,7 +2371,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             .clone()
             .or_else(|| defaults.agent.clone())
             .ok_or_else(|| {
-                GmError::usage("Pass --agent <label> for your working session.")
+                GmError::usage("Pass --agent <session name> for this piece of work.")
                     .hint("Or run `gm agent setup` once, and gm uses this checkout's agent.")
             })
     };
@@ -1981,8 +2401,8 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 );
             }
             IssueCommand::Show { issue, limit } => {
-                return context(&snapshot, issue, *limit as usize, args.scope.offline).map_err(
-                    |error| {
+                let mut shown = context(&snapshot, issue, *limit as usize, args.scope.offline)
+                    .map_err(|error| {
                         if error.code != "tracker_not_found" || args.scope.offline {
                             return error;
                         }
@@ -1996,10 +2416,23 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                             Err(removed) if removed.code == "removed_by_retention" => removed,
                             _ => error,
                         }
-                    },
-                );
+                    })?;
+                // Whether the acting identity may claim it, and whether its assignee could (CORE-32).
+                let acting = acting(r, &snapshot, args.scope.offline);
+                shown.0["eligibility"] = eligibility(&shown.0["issue"], &acting);
+                shown.0["ready"] = json!(ready_for(
+                    &snapshot,
+                    &shown.0["issue"],
+                    Utc::now(),
+                    matches!(acting, Acting::Person)
+                ));
+                if let Some(mismatch) = assignee_mismatch(&snapshot, &shown.0["issue"]) {
+                    shown.0["assigneeMismatch"] = mismatch;
+                }
+                return Ok(shown);
             }
             IssueCommand::History { .. } => unreachable!("handled before opening the replica"),
+            IssueCommand::Tags => return Ok(Shown(tag_catalog(&snapshot, &r.owner))),
             IssueCommand::Create(a) => {
                 if a.description_file.as_deref() == Some(Path::new("-"))
                     && a.acceptance_file.as_deref() == Some(Path::new("-"))
@@ -2024,9 +2457,11 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 }
                 let mut mutation = create(
                     "issue",
-                    json!({"teamId":team,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.label}),
+                    json!({"teamId":team,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.tags}),
                 );
                 timeline_fields(&a.timeline, &mut mutation["data"]);
+                requires_field(&a.requires, false, &mut mutation["data"])?;
+                mutation["data"]["pickup"] = json!(a.pickup);
                 mutation
             }
             IssueCommand::Update(p) => issue_patch(&snapshot, p)?,
@@ -2251,6 +2686,10 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                     {
                         drop_lease(&r.config, &target);
                     }
+                    // A definite refusal: the agent doesn't meet the issue's requirements.
+                    if e.code == "requirements_unmet" {
+                        return Err(e);
+                    }
                     return Err(e.hint("Lease outcome may be uncertain after transport failure. Inspect the issue online; do not assume ownership without the returned fencing token."));
                 }
             };
@@ -2364,12 +2803,87 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             return Ok(Shown(response));
         }
+        let notes = tag_notes(&snapshot, &mutation, &r.owner);
         let mut shown = r.submit(ctx, args.scope.offline, vec![mutation])?;
         if let Some(team) = picked {
             shown.0["team"] = team;
         }
+        if let Some(notes) = notes {
+            shown.0["tagCatalog"] = notes;
+        }
         Ok(shown)
     })
+}
+
+/// The tracker's tag catalog from a snapshot (CORE-271), as the server lists it
+/// (`GET /tracker/:owner/tags`): every defined tag with its issues and open issues.
+fn tag_catalog(snapshot: &Value, owner: &str) -> Value {
+    let issues = snapshot["issues"].as_array().cloned().unwrap_or_default();
+    let tags: Vec<Value> = snapshot["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|name| {
+            let tagged: Vec<&Value> = issues
+                .iter()
+                .filter(|i| {
+                    i["labels"]
+                        .as_array()
+                        .is_some_and(|l| l.iter().any(|t| t == name))
+                })
+                .collect();
+            let open = tagged
+                .iter()
+                .filter(|i| !matches!(i["status"].as_str(), Some("done" | "canceled")))
+                .count();
+            json!({ "name": name, "issues": tagged.len(), "open": open })
+        })
+        .collect();
+    json!({ "catalog": owner, "tags": tags })
+}
+/// What an issue edit means for the tracker's tag catalog (CORE-271): tags it adds
+/// to the catalog, and `tag:` requirements naming tags the catalog doesn't have
+/// (warned on stderr, never refused: an agent may still report that tag). None
+/// when there's nothing to say.
+fn tag_notes(snapshot: &Value, mutation: &Value, owner: &str) -> Option<Value> {
+    if !matches!(
+        mutation["kind"].as_str(),
+        Some("issue.create" | "issue.update")
+    ) {
+        return None;
+    }
+    let catalog: Vec<String> = snapshot["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect();
+    let data = &mutation["data"];
+    let tags: Vec<String> = data["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect();
+    let new: Vec<Value> = requirements::unknown_tags(&tags, &catalog)
+        .into_iter()
+        .map(|u| u["tag"].clone())
+        .collect();
+    // A tag this edit adds to the catalog is known to it.
+    let known = [catalog.as_slice(), tags.as_slice()].concat();
+    let unknown =
+        requirements::unknown_tags(&requirements::required_tags(&data["requires"]), &known);
+    for u in &unknown {
+        eprintln!(
+            "gm: warning: requires {}. Only agents that report it can claim the issue; `gm issue tags` lists the catalog.",
+            requirements::unknown_tag_warning(u, owner)
+        );
+    }
+    if new.is_empty() && unknown.is_empty() {
+        return None;
+    }
+    Some(json!({ "added": new, "unknownRequired": unknown }))
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -2548,7 +3062,46 @@ mod tests {
     }
 
     fn snapshot() -> Value {
-        json!({"owner":{"slug":"orbit"},"teams":[],"workspaces":[],"issues":[],"links":[],"comments":[],"subscriptions":[],"cursor":0,"serverTime":"2026-10-01T00:00:00Z"})
+        json!({"owner":{"slug":"orbit"},"teams":[],"workspaces":[],"labels":[],"issues":[],"links":[],"comments":[],"subscriptions":[],"cursor":0,"serverTime":"2026-10-01T00:00:00Z"})
+    }
+    #[test]
+    fn tag_catalog_retains_removed_and_timeline_only_definitions() {
+        let mut s = snapshot();
+        s["labels"] = json!(["existing"]);
+        apply_event(
+            &mut s,
+            &json!({
+                "entityType":"issue", "entityId":"a", "entity":null,
+                "view":{"entity":{"id":"a","labels":["new"]}}
+            }),
+        )
+        .unwrap();
+        apply_event(
+            &mut s,
+            &json!({
+                "entityType":"issue", "entityId":"a", "entity":null,
+                "view":{"entity":{"id":"a","labels":[]}}
+            }),
+        )
+        .unwrap();
+        assert_eq!(s["labels"], json!(["existing", "new"]));
+        assert_eq!(s["issues"], json!([]));
+        apply_event(
+            &mut s,
+            &json!({
+                "entityType":"issue", "entityId":"b", "entity":{"id":"b","labels":["main"]}
+            }),
+        )
+        .unwrap();
+        apply_event(
+            &mut s,
+            &json!({
+                "entityType":"issue", "entityId":"b", "entity":null
+            }),
+        )
+        .unwrap();
+        assert_eq!(s["labels"], json!(["existing", "main", "new"]));
+        assert_eq!(s["issues"], json!([]));
     }
     #[test]
     fn creator_is_unknown_offline_and_immutable_after_confirmation() {
@@ -2988,7 +3541,14 @@ mod tests {
             &IssuePatch {
                 id: "ENG-1".into(),
                 data: Some(r#"{"priority":1}"#.into()),
+                pickup: None,
                 timeline: flags(Some("required"), Some("approval")),
+                requires: RequiresArgs { requires: None },
+                clear_requires: false,
+                tags: vec![],
+                drop_tags: vec![],
+                require_issue_tags: false,
+                release_claim: false,
             },
         )
         .unwrap();
@@ -3001,11 +3561,126 @@ mod tests {
             &IssuePatch {
                 id: "a".into(),
                 data: None,
+                pickup: None,
                 timeline: flags(None, Some("none")),
+                requires: RequiresArgs { requires: None },
+                clear_requires: false,
+                tags: vec![],
+                drop_tags: vec![],
+                require_issue_tags: false,
+                release_claim: false,
             },
         )
         .unwrap();
         assert_eq!(cleared["data"], json!({"timelinePolicy":null}));
+    }
+    #[test]
+    fn requirements_patch_and_project_offline_in_their_stored_form() {
+        let mut s = snapshot();
+        s["issues"] = json!([{"id":"a","key":"ENG-1","version":4,"status":"todo"}]);
+        let patch = |requires: Option<&str>, clear: bool| {
+            issue_patch(
+                &s,
+                &IssuePatch {
+                    id: "ENG-1".into(),
+                    data: None,
+                    pickup: None,
+                    timeline: TimelineRule {
+                        timeline_use: None,
+                        timeline_policy: None,
+                    },
+                    requires: RequiresArgs {
+                        requires: requires.map(str::to_string),
+                    },
+                    clear_requires: clear,
+                    tags: vec![],
+                    drop_tags: vec![],
+                    require_issue_tags: false,
+                    release_claim: false,
+                },
+            )
+        };
+        let set = patch(Some("tag:UX memory>=8G"), false).unwrap();
+        assert_eq!(
+            set["data"],
+            json!({"requires":{"tags":["ux"],"minMemory":8u64<<30}})
+        );
+        assert_eq!(patch(None, true).unwrap()["data"], json!({"requires":null}));
+        assert!(patch(Some("gpu"), false).is_err());
+
+        // The replica keeps what the server will: normalized, and rejects bad values.
+        project(&mut s, &json!({"kind":"issue.update","id":"a","expectedVersion":4,"data":{"requires":{"tags":[" GPU ","gpu"],"os":[]}}})).unwrap();
+        assert_eq!(s["issues"][0]["requires"], json!({"tags":["gpu"]}));
+        project(&mut s, &json!({"kind":"issue.update","id":"a","expectedVersion":5,"data":{"requires":{"os":[]}}})).unwrap();
+        assert!(s["issues"][0]["requires"].is_null());
+        assert!(project(&mut s, &json!({"kind":"issue.update","id":"a","expectedVersion":6,"data":{"requires":{"disk":1}}})).is_err());
+        assert!(validate_batch(&[json!({"kind":"issue.create","id":"n","data":{"teamId":"t","title":"x","requires":{"minCpus":0}}})]).is_err());
+    }
+    #[test]
+    fn pickup_replica_rejects_invalid_values_without_changing_issue() {
+        let mut s = snapshot();
+        project(
+            &mut s,
+            &json!({"kind":"issue.create","id":"i","data":{"title":"Draft","pickup":"not_ready"}}),
+        )
+        .unwrap();
+        assert!(!ready(&s, &s["issues"][0], Utc::now()));
+        let before = s.clone();
+        for invalid in [Value::Null, json!("ready"), json!(true)] {
+            assert!(project(&mut s, &json!({"kind":"issue.update","id":"i","expectedVersion":1,"data":{"pickup":invalid}})).is_err());
+            assert_eq!(s, before);
+        }
+        project(
+            &mut s,
+            &json!({"kind":"issue.update","id":"i","expectedVersion":1,"data":{"pickup":"anyone"}}),
+        )
+        .unwrap();
+        assert!(ready(&s, &s["issues"][0], Utc::now()));
+    }
+    #[test]
+    fn pickup_restrictions_beat_assignment_and_capabilities() {
+        let agent = Acting::Agent {
+            name: "builder".into(),
+            entry: Some(json!({"id":"agt_1","capabilities":{"tags":["rust"]}})),
+        };
+        let mut issue = json!({"id":"i","assigneeId":"agt_1","requires":{"tags":["rust"]}});
+        assert_eq!(eligibility(&issue, &agent)["eligible"], true);
+        for policy in ["not_ready", "human_only"] {
+            issue["pickup"] = json!(policy);
+            assert_eq!(eligibility(&issue, &agent)["eligible"], false);
+            assert_eq!(
+                eligibility(&issue, &agent)["code"],
+                format!("pickup_{policy}")
+            );
+            assert_eq!(
+                eligibility(&issue, &Acting::Person)["eligible"],
+                policy == "human_only"
+            );
+        }
+        issue["pickup"] = json!("human_only");
+        assert!(eligibility(&issue, &Acting::Unknown)["eligible"].is_null());
+        issue["pickup"] = json!("not_ready");
+        assert_eq!(eligibility(&issue, &Acting::Unknown)["eligible"], false);
+    }
+    #[test]
+    fn pickup_readiness_preserves_graph_and_actor_boundaries() {
+        let now = DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut s = snapshot();
+        s["issues"] = json!([{"id":"i","status":"todo","claim":null,"parentId":null}]);
+        assert!(ready(&s, &s["issues"][0], now));
+        s["issues"][0]["pickup"] = json!("not_ready");
+        assert!(!ready_for(&s, &s["issues"][0], now, true));
+        assert!(!ready(&s, &s["issues"][0], now));
+        s["issues"][0]["pickup"] = json!("human_only");
+        assert!(!ready(&s, &s["issues"][0], now));
+        assert!(ready_for(&s, &s["issues"][0], now, true));
+        s["issues"][0]["waiting"] = json!(1);
+        assert!(!ready_for(&s, &s["issues"][0], now, true));
+        s["issues"][0]["waiting"] = json!(0);
+        s["links"] = json!([{"fromId":"missing","toId":"i","kind":"blocks"}]);
+        assert!(!ready_for(&s, &s["issues"][0], now, true));
     }
     #[test]
     fn agents_are_named_with_their_accountable_person() {
@@ -3146,6 +3821,7 @@ mod tests {
             config: Config::default(),
             owner: "orbit".into(),
             timeline: None,
+            receipts: Default::default(),
         };
         let snapshot =
             json!({"teams":[{"id":"t1","key":"CORE"},{"id":"t2","key":"OLD","archived":true}]});
@@ -3171,6 +3847,7 @@ mod tests {
             config: Config::default(),
             owner: "orbit".into(),
             timeline: None,
+            receipts: Default::default(),
         };
         r.set("snapshot", &snapshot().to_string()).unwrap();
         let first = json!({"operationId":"one","mutations":[{"kind":"issue.create","id":"stable","data":{"title":"Offline"}}]});
@@ -3202,6 +3879,7 @@ mod tests {
             config: Config::default(),
             owner: "orbit".into(),
             timeline: Some("search".into()),
+            receipts: Default::default(),
         };
         r.set("snapshot", &snapshot().to_string()).unwrap();
         assert_eq!(r.view().unwrap_err().code, "replica_uninitialized");

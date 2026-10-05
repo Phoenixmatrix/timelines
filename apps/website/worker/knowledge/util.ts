@@ -5,7 +5,12 @@ export async function sha256(text: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Run `work` over `items` with at most `limit` in flight, keeping order. */
+/**
+ * Run `work` over `items` with at most `limit` in flight, keeping order. Once
+ * one fails, nothing more starts; it rejects with that failure when the work
+ * in flight has settled, so a failed step leaves no model calls running
+ * beside its retry (CORE-285).
+ */
 export async function pool<T, R>(
   items: T[],
   limit: number,
@@ -13,13 +18,19 @@ export async function pool<T, R>(
 ): Promise<R[]> {
   const results: R[] = Array.from({ length: items.length });
   let next = 0;
+  let failure: { error: unknown } | null = null;
   const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
+    while (!failure && next < items.length) {
       const index = next++;
-      results[index] = await work(items[index] as T, index);
+      try {
+        results[index] = await work(items[index] as T, index);
+      } catch (error) {
+        failure ??= { error };
+      }
     }
   });
   await Promise.all(runners);
+  if (failure) throw (failure as { error: unknown }).error;
   return results;
 }
 

@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { RepoDetail, Viewer } from "../../shared/api.ts";
 import { matchFields, type SearchResponse } from "../../shared/search.ts";
-import { COMMAND_SOURCES, contextTracker, matchCommands, type PaletteContext } from "./commands.ts";
+import {
+  COMMAND_SOURCES,
+  contextTracker,
+  destinations,
+  matchCommands,
+  type PaletteContext,
+} from "./commands.ts";
 import { CREATE_INTENT, createIntentOf } from "./intents.ts";
 import { remoteSearch, type RemoteState } from "./remote.ts";
 import { edge, FRESH, move, reconcile } from "./selection.ts";
@@ -100,6 +106,87 @@ describe("commands", () => {
   });
 });
 
+describe("before anything's typed", () => {
+  const trackers = [
+    { id: "ann", slug: "ann", displayName: "Ann Lee", canAdmin: true },
+    { id: "orbit", slug: "orbit", displayName: "Orbit", canAdmin: false },
+  ];
+  const home = (context: Partial<PaletteContext>) =>
+    Object.fromEntries(
+      [...matchCommands(commands(context), "")].map(([group, list]) => [
+        group,
+        list.map((m) => m.command.id),
+      ]),
+    );
+
+  test("offers one Go to, then things to do, instead of every page", () => {
+    expect(home({ trackers })).toEqual({
+      pages: ["go"],
+      find: [
+        "knowledge:pick",
+        "find:repositories",
+        "find:issues",
+        "find:accounts",
+        "find:packages",
+        "find:conversations",
+      ],
+      actions: ["create:ann", "action:assistant"],
+    });
+    // On a repository: its code search, and its tracker for a new issue.
+    expect(home({ trackers, repo, pathname: "/orbit/engine" })).toEqual({
+      pages: ["go"],
+      repository: ["knowledge:here"],
+      actions: ["create:orbit", "action:assistant"],
+      find: [
+        "find:repositories",
+        "find:issues",
+        "find:accounts",
+        "find:packages",
+        "find:conversations",
+      ],
+    });
+    // Signed out there are only a few places, so they're listed directly.
+    expect(home({ viewer: null, repo })).toMatchObject({
+      pages: ["page:home", "page:signin"],
+      repository: expect.arrayContaining(["repo:code", "repo:ci"]),
+    });
+  });
+
+  test("typing still reaches every page and section directly", () => {
+    const matched = matchCommands(commands({ repo }), "tokens");
+    expect(matched.get("pages")?.map((m) => m.command.id)).toEqual(["page:tokens"]);
+    expect(matchCommands(commands({ repo }), "wiki").get("repository")?.[0]?.command.id).toBe(
+      "repo:wiki",
+    );
+    expect(matchCommands(commands(), "go to").get("pages")?.[0]?.command.id).toBe("go");
+  });
+
+  test("Go to lists every place, the repository's first, and filters without a cap", () => {
+    const go = commands().find((c) => c.id === "go")!;
+    expect(go.run).toEqual({ kind: "scope", scope: { kind: "go" } });
+    const context: PaletteContext = { viewer, pathname: "/", repo, trackers: null, query: "" };
+    const places = destinations(context);
+    expect(places.map((c) => c.id)).not.toContain("go");
+    expect(places[0]!.id).toBe("repo:code");
+    const all = matchCommands(places, "", { perGroup: Infinity, everything: true });
+    expect(all.get("repository")).toHaveLength(9);
+    expect(all.get("pages")?.length).toBeGreaterThan(10);
+    const settings = matchCommands(places, "s", { perGroup: Infinity, everything: true });
+    expect(settings.get("pages")?.length).toBeGreaterThan(6);
+  });
+
+  test("each Find narrows to one kind of result", () => {
+    const finds = commands().filter((c) => c.id.startsWith("find:"));
+    expect(finds.map((c) => c.run)).toEqual(
+      ["repositories", "issues", "accounts", "packages", "conversations"].map((category) => ({
+        kind: "scope",
+        scope: { kind: "find", category },
+      })),
+    );
+    expect(commands({ viewer: null }).some((c) => c.id.startsWith("find:"))).toBe(false);
+  });
+});
+
 describe("create issue", () => {
   const trackers = [
     { id: "ann", slug: "ann", displayName: "Ann Lee", canAdmin: true },
@@ -153,6 +240,15 @@ describe("create issue", () => {
       "Create",
       "create issue in orbit",
       "new issue ann",
+    ])
+      expect(creates({ query }).map((c) => c.id)).not.toContain("create-titled:ann");
+    // A reference is somewhere to go (the palette jumps to it), never a title (CORE-22).
+    for (const query of [
+      "3f9a2c1",
+      "3f9a2c1d0e4b5a6978877665544332211aabbccd",
+      "CORE-22",
+      "#12",
+      "kit@1.2.0",
     ])
       expect(creates({ query }).map((c) => c.id)).not.toContain("create-titled:ann");
     // It's offered for any text, ahead of other actions.

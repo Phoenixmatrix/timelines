@@ -6,7 +6,20 @@
 
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
-import type { Issue, Snapshot } from "../../shared/tracker.ts";
+import {
+  issuePickup,
+  type Issue,
+  type MutationResult,
+  type Snapshot,
+} from "../../shared/tracker.ts";
+import {
+  hasRequirements,
+  parseRequirements,
+  RequirementError,
+  requirementsText,
+  type IssueRequirements,
+} from "../../shared/requirements.ts";
+import { issueTagsInput } from "../../shared/assistant.ts";
 import type { CallApi } from "./internal.ts";
 import type { Group } from "./plan.ts";
 
@@ -83,6 +96,17 @@ function numbered(text: string, lines?: string): { text: string; total: number }
   };
 }
 
+/** Requirements in their text form: the stored object, null for none, or what's wrong. */
+function requirementsInput(text: string | undefined): IssueRequirements | null | string {
+  if (text === undefined) return null;
+  try {
+    return parseRequirements(text);
+  } catch (error) {
+    if (error instanceof RequirementError) return error.message;
+    throw error;
+  }
+}
+
 /** A tracker snapshot, loaded once per turn and reused by every tracker tool. */
 function snapshots(api: CallApi) {
   const cache = new Map<string, Promise<Snapshot | { error: string }>>();
@@ -104,11 +128,13 @@ function issueRow(issue: Issue, snapshot: Snapshot) {
     key: issue.key,
     title: issue.title,
     status: issue.status,
+    pickup: issuePickup(issue),
     ...(issue.doneIn ? { doneInTimeline: issue.doneIn.slug } : {}),
     type: issue.type,
     priority: `P${issue.priority}`,
     team: team?.key,
-    labels: issue.labels,
+    tags: issue.labels,
+    ...(hasRequirements(issue.requires) ? { requires: requirementsText(issue.requires) } : {}),
     ...(issue.claim ? { claimedBy: issue.claim.agent } : {}),
     ...(issue.assigneeId ? { assignee: issue.assigneeId } : {}),
     updatedAt: issue.updatedAt,
@@ -310,7 +336,7 @@ export function buildTools(context: ToolContext) {
   const tracker = {
     find_issues: tool({
       description:
-        'Find issues in a tracker (owner = the account or organization, e.g. "priya" for "priya\'s tracker"). Filters combine; with none, open issues by priority. Returns {total, issues: [{key, title, status, type, priority: "P2", team, labels, blocked, claimedBy?, assignee?, updatedAt}], teams: [key], url}, at most `limit` issues (default 25). Use this for any question about issues or teams.',
+        'Find issues in a tracker (owner = the account or organization, e.g. "priya" for "priya\'s tracker"). Filters combine; with none, open issues by priority. Returns {total, issues: [{key, title, status, type, priority: "P2", team, tags, requires? (what an agent must report to claim it), blocked, claimedBy?, assignee?, updatedAt}], teams: [key], url}, at most `limit` issues (default 25). Use this for any question about issues or teams.',
       inputSchema: z.object({
         owner: OWNER,
         query: z.string().optional().describe("Words to match in titles, descriptions and keys"),
@@ -328,14 +354,26 @@ export function buildTools(context: ToolContext) {
           .optional(),
         team: z.string().optional().describe("Team key, e.g. CORE"),
         type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
-        label: z.string().optional(),
+        tag: z.string().optional().describe("Only issues with this tag, e.g. ux"),
+        label: z.string().optional().describe("Old name of tag"),
         ready: z
           .boolean()
           .optional()
           .describe("Only issues ready to start: todo, unblocked, unclaimed"),
         limit: z.number().int().min(1).max(200).optional(),
       }),
-      execute: async ({ owner, query, status = "open", team, type, label, ready, limit = 25 }) => {
+      execute: async ({
+        owner,
+        query,
+        status = "open",
+        team,
+        type,
+        tag: tagged,
+        label,
+        ready,
+        limit = 25,
+      }) => {
+        const tag = (tagged ?? label)?.toLowerCase();
         const snap = await snapshot(owner);
         if ("error" in snap) return snap;
         const teamId = team
@@ -363,8 +401,15 @@ export function buildTools(context: ToolContext) {
           )
           .filter((i) => !teamId || i.teamId === teamId)
           .filter((i) => !type || i.type === type)
-          .filter((i) => !label || i.labels.includes(label))
-          .filter((i) => !ready || (i.status === "todo" && !blocked.has(i.id) && !i.claim))
+          .filter((i) => !tag || i.labels.some((l) => l.toLowerCase() === tag))
+          .filter(
+            (i) =>
+              !ready ||
+              (issuePickup(i) === "anyone" &&
+                i.status === "todo" &&
+                !blocked.has(i.id) &&
+                !i.claim),
+          )
           .filter((i) => {
             const text = `${i.key} ${i.title} ${i.description}`.toLowerCase();
             return words.every((w) => text.includes(w));
@@ -542,9 +587,21 @@ export function buildTools(context: ToolContext) {
         description: z.string().optional().describe("Markdown"),
         acceptance: z.string().optional().describe("Markdown acceptance criteria"),
         type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
+        pickup: z.enum(["anyone", "not_ready", "human_only"]).optional(),
         priority: z.number().int().min(0).max(4).optional().describe("0 is most urgent"),
         parent: KEY.optional(),
-        labels: z.array(z.string()).optional(),
+        tags: z
+          .array(z.string())
+          .optional()
+          .describe("Work-area tags from the tracker's tag catalog, e.g. ux, frontend"),
+        labels: z.array(z.string()).optional().describe("Old name of tags"),
+        requires: z
+          .string()
+          .max(1000)
+          .optional()
+          .describe(
+            'What an agent must report to claim it (people always can), e.g. "tag:ux model:claude-opus-* memory>=16GiB": tag:/skill: (all of), model:/harness:/os:/arch:/runtime: (any of, * wildcards), memory>=, cpus>=. Empty for any agent.',
+          ),
       }),
       needsApproval,
       execute: async ({
@@ -556,8 +613,14 @@ export function buildTools(context: ToolContext) {
         type,
         priority,
         parent,
+        tags: tagList,
         labels,
+        requires,
+        pickup,
       }) => {
+        const tags = issueTagsInput({ tags: tagList, labels });
+        const required = requirementsInput(requires);
+        if (typeof required === "string") return { error: required };
         const snap = await snapshot(owner);
         if ("error" in snap) return snap;
         const teamId = snap.teams.find((t) => t.key.toLowerCase() === team.toLowerCase())?.id;
@@ -582,7 +645,9 @@ export function buildTools(context: ToolContext) {
                 ...(type ? { type } : {}),
                 ...(priority === undefined ? {} : { priority }),
                 ...(parentId ? { parentId } : {}),
-                ...(labels ? { labels } : {}),
+                ...(tags ? { labels: tags } : {}),
+                ...(required ? { requires: required } : {}),
+                ...(pickup ? { pickup } : {}),
               },
             },
           ],
@@ -599,7 +664,7 @@ export function buildTools(context: ToolContext) {
     }),
     update_issue: tool({
       description:
-        "Change an issue's fields. Status changes on issues someone holds a lease on are refused by the tracker.",
+        "Change an issue's fields. Status changes on issues someone holds a lease on are refused by the tracker. When new requires no longer allow the agent holding the issue, the result's claimEffect says who and what it misses, and whether the claim was released (releaseClaim: true) or kept; tell the person.",
       inputSchema: z.object({
         owner: OWNER,
         key: KEY,
@@ -610,8 +675,26 @@ export function buildTools(context: ToolContext) {
             acceptance: z.string().optional(),
             status: z.enum(["backlog", "todo", "in_progress", "done", "canceled"]).optional(),
             priority: z.number().int().min(0).max(4).optional(),
+            pickup: z.enum(["anyone", "not_ready", "human_only"]).optional(),
             type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
-            labels: z.array(z.string()).optional(),
+            tags: z
+              .array(z.string())
+              .optional()
+              .describe("Replaces the issue's tags (from the tracker's tag catalog)"),
+            labels: z.array(z.string()).optional().describe("Old name of tags"),
+            releaseClaim: z
+              .boolean()
+              .optional()
+              .describe(
+                "With new requires on a claimed issue: true releases the claim of an agent the new requirements no longer allow; otherwise the claim is kept. Either way the result reports who is affected.",
+              ),
+            requires: z
+              .string()
+              .max(1000)
+              .optional()
+              .describe(
+                'What an agent must report to claim it (people always can), e.g. "tag:ux model:claude-opus-* memory>=16GiB": tag:/skill: (all of), model:/harness:/os:/arch:/runtime: (any of, * wildcards), memory>=, cpus>=. An empty string removes them.',
+              ),
           })
           .refine((c) => Object.keys(c).length > 0, "Change at least one field."),
       }),
@@ -621,15 +704,29 @@ export function buildTools(context: ToolContext) {
         if ("error" in snap) return snap;
         const issue = snap.issues.find((i) => i.key.toLowerCase() === key.toLowerCase());
         if (!issue) return { error: `No issue ${key}.` };
+        const { requires, tags: tagList, labels, ...rest } = changes;
+        const required = requirementsInput(requires);
+        if (typeof required === "string") return { error: required };
+        const tags = issueTagsInput({ tags: tagList, labels });
+        const fields = tags ? { ...rest, labels: tags } : rest;
+        const data = requires === undefined ? fields : { ...fields, requires: required ?? null };
         const r = await api("POST", `/tracker/${enc(owner)}/mutate`, {
           operationId: crypto.randomUUID(),
-          mutations: [
-            { kind: "issue.update", id: issue.id, expectedVersion: issue.version, data: changes },
-          ],
+          mutations: [{ kind: "issue.update", id: issue.id, expectedVersion: issue.version, data }],
         });
-        return r.ok
-          ? { updated: issue.key, url: `/tracker/${owner}/issues/${issue.key}` }
-          : failed(r);
+        if (!r.ok) return failed(r);
+        // Tightened requirements on a claimed issue (CORE-272): say who's affected.
+        const effect = (r.body as MutationResult).results?.[0]?.claimEffect;
+        return {
+          updated: issue.key,
+          url: `/tracker/${owner}/issues/${issue.key}`,
+          ...(effect
+            ? {
+                claimEffect: effect,
+                note: `${effect.released ? "Released" : "Kept"} the claim held by ${effect.agent}: it ${effect.unmet.map((u) => u.message).join("; ")}.${effect.released ? "" : " Pass releaseClaim: true to release it instead."}`,
+              }
+            : {}),
+        };
       },
     }),
     comment_on_issue: tool({

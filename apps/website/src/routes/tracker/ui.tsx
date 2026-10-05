@@ -2,24 +2,28 @@ import { memo, useId, useMemo, type ReactNode } from "react";
 import { Combobox } from "@base-ui/react/combobox";
 import { FlagIcon } from "@phosphor-icons/react";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { Link } from "react-router";
 import {
   actorName,
   claimAttribution,
   claimHolder,
   CLOSE_REASONS,
   hasActiveClaim,
+  ISSUE_PICKUPS,
+  issuePickup,
   leasedAncestor,
   readiness,
   readinessIndex,
   TIMELINE_USES,
   type Issue,
   type IssueCloseReason,
+  type IssuePickup,
   type IssueTimelineUse,
   type Snapshot,
 } from "../../../shared/tracker.ts";
 import { TIMELINE_POLICIES, type TimelinePolicy } from "../../../shared/timelines.ts";
 import { popMotion, SelectField } from "../../components/ui.tsx";
+import { useRefMarkdown } from "../../refs/remark.tsx";
 import type { IssueIndex } from "./query.ts";
 import { Actor } from "./Actor.tsx";
 
@@ -131,6 +135,35 @@ export function CloseReasonField({
     </Field>
   );
 }
+
+export function PickupField({
+  value,
+  onChange,
+}: {
+  value: IssuePickup | undefined;
+  onChange: (value: IssuePickup) => void;
+}) {
+  const hint = useId();
+  const current = value ?? "anyone";
+  return (
+    <Field label="Pickup">
+      <SelectField
+        ariaLabel="Issue pickup"
+        ariaDescribedBy={hint}
+        value={current}
+        options={Object.entries(ISSUE_PICKUPS).map(([value, label]) => ({ value, label }))}
+        onChange={(value) => onChange(value as IssuePickup)}
+      />
+      <p id={hint} className="mk-hint m-0 mt-1">
+        {current === "not_ready"
+          ? "No one can claim or start this issue until a person changes pickup."
+          : current === "human_only"
+            ? "People can pick this up. Agents cannot, even when assigned."
+            : "Agents and people can pick this up when it is ready."}
+      </p>
+    </Field>
+  );
+}
 /**
  * Whether an agent works the issue in a timeline and, when required, the policy
  * that timeline must use. Agents also read the description or PRD.
@@ -183,10 +216,32 @@ const MARKDOWN =
   "gm-prose [&_:is(h1,h2,h3,h4,h5,h6)]:text-body! [&_:is(h1,h2,h3,h4,h5,h6)]:leading-normal! " +
   "[&_.contains-task-list]:list-none! [&_.contains-task-list]:ps-0! [&_.task-list-item]:list-none " +
   "[&_.task-list-item_input]:me-2 [&_.task-list-item_input]:accent-signal";
+/** A bare URL as tracker Markdown links it: Link handles same-origin absolute URLs. */
+function trackerUrl(href: string, children: ReactNode) {
+  return <Link to={href}>{children}</Link>;
+}
 export const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
+  // Issue keys, tracker URLs, owner/repo and pkg@version link when they resolve (CORE-22).
+  const refs = useRefMarkdown(trackerUrl);
   return (
     <div className={MARKDOWN}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={refs.remarkPlugins}
+        components={{
+          ...refs.components,
+          a({ node: _node, href, ...props }) {
+            // Link handles same-origin absolute URLs and leaves external URLs
+            // and modified clicks to the browser. Keep relative/hash links native.
+            return href && /^(?:https?:)?\/\//i.test(href) ? (
+              <Link to={href} {...props} />
+            ) : (
+              <a href={href} {...props} />
+            );
+          },
+        }}
+      >
+        {text}
+      </ReactMarkdown>
     </div>
   );
 });
@@ -269,13 +324,23 @@ const STATE_DOT: Record<string, string> = {
   waiting: "bg-signal",
   ready: "bg-online",
   blocked: "bg-danger-text",
+  human_only: "bg-ink-muted",
+  not_ready: "bg-ink-faint",
 };
 function StateBadge({
   state,
   title,
   children,
 }: {
-  state?: "waiting" | "ready" | "claimed" | "leased" | "blocked" | "done_in_timeline";
+  state?:
+    | "waiting"
+    | "ready"
+    | "claimed"
+    | "leased"
+    | "blocked"
+    | "done_in_timeline"
+    | "human_only"
+    | "not_ready";
   title?: string;
   children: ReactNode;
 }) {
@@ -340,6 +405,20 @@ export function IssueState({
     );
   if (issue.status === "done" || issue.status === "canceled")
     return <StateBadge>{statusLabel(issue)}</StateBadge>;
+  const pickup = issuePickup(issue);
+  if (pickup !== "anyone")
+    return (
+      <StateBadge
+        state={pickup}
+        title={
+          pickup === "not_ready"
+            ? "Pickup is paused until a person enables it."
+            : "Only people can pick up this issue."
+        }
+      >
+        {ISSUE_PICKUPS[pickup]}
+      </StateBadge>
+    );
   if (blocked.length)
     return (
       <StateBadge state="blocked" title={blocked.map((item) => item.key).join(", ")}>

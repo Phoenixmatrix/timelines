@@ -28,6 +28,7 @@ export async function activeRun(
   commit: string,
   preview: { action: "create" | "teardown"; checkpoint: string | null } | null = null,
   sourceId = "canonical",
+  step = false,
 ) {
   let query = db(d1)
     .selectFrom("ci_runs")
@@ -36,7 +37,8 @@ export async function activeRun(
     .where("source_id", "=", sourceId)
     .where("ref", "=", ref)
     .where("commit_oid", "=", commit)
-    .where("status", "in", ["queued", "running"]);
+    .where("status", "in", ["queued", "running"])
+    .where("step", "=", step ? 1 : 0);
   query = preview
     ? query
         .where("preview_action", "=", preview.action)
@@ -64,6 +66,7 @@ export async function inFlight(
     .where("status", "in", ["queued", "running"])
     .where("held_at", "is", null)
     .where("preview_action", "is", null)
+    .where("step", "=", 0)
     .where("created_at", ">", since)
     .executeTakeFirst();
   return Number(row?.n ?? 0);

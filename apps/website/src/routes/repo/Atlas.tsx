@@ -26,6 +26,7 @@ import {
   type LoaderFunctionArgs,
   type ShouldRevalidateFunctionArgs,
 } from "react-router";
+import { useLiveSearchParams } from "../../lib/searchParams.ts";
 import type { KnowledgeOverlaySummary, KnowledgeStatus, WikiCatalog } from "../../../shared/api.ts";
 import type {
   AtlasEntitySummary,
@@ -42,6 +43,7 @@ import {
   atlasErrorOf,
   atlasNeedsRestart,
   onAtlasAccessLost,
+  repoReader,
   type AtlasRepo,
 } from "../../lib/atlas.ts";
 import { timeAgo } from "../../lib/format.ts";
@@ -78,6 +80,7 @@ import { AtlasTerritory } from "./AtlasTerritory.tsx";
 import { KnowledgeBar } from "./KnowledgeBar.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 import { buildTerritory, ChildLoader, type Load, type TerritoryCell } from "./territory.ts";
+import { useMapRoutes } from "./useMapRoutes.ts";
 
 export async function atlasLoader({ params, request }: LoaderFunctionArgs) {
   const repo = { owner: params.owner ?? "", name: params.repo ?? "" };
@@ -312,7 +315,7 @@ function Territory({
   // read once mounted, after the view this one replaces has said.
   const arrival = () =>
     landed && place.current?.scope === `${ref.owner}/${ref.name}` ? place.current : null;
-  const [params, setParams] = useSearchParams();
+  const [params, setParams] = useLiveSearchParams();
   const url = readAtlasUrl(params);
   const timeline = scopeOf(params);
   const navigationType = useNavigationType();
@@ -364,8 +367,8 @@ function Territory({
     return ready;
   }, [loads]);
   const territory = useMemo(
-    () => buildTerritory(overview.regions, expanded, snapshot.seq),
-    [overview.regions, expanded, snapshot.seq],
+    () => buildTerritory(overview.regions, expanded, snapshot.seq, overview.links),
+    [overview.regions, expanded, snapshot.seq, overview.links],
   );
   const territoryRef = useRef(territory);
   territoryRef.current = territory;
@@ -433,6 +436,10 @@ function Territory({
       if (territory.byId.has(a.id)) return a.id;
     return null;
   }, [focus, territory]);
+  const reader = useMemo(
+    () => repoReader({ owner: ref.owner, name: ref.name }),
+    [ref.owner, ref.name],
+  );
 
   // ---- a pinned snapshot that stopped being readable mid-view --------------------
   const [restart, setRestart] = useState<AtlasError | null>(null);
@@ -518,6 +525,11 @@ function Territory({
   const narrow = useMediaQuery(NARROW);
   narrowNow.current = narrow;
   const view: AtlasView = url.view ?? (narrow ? "outline" : "map");
+  const routes = useMapRoutes(
+    reader,
+    view === "map" && selected && mapFocus === selected.id ? selected : null,
+    snapshot.id,
+  );
   const tree = useRef<HTMLDivElement>(null);
   const root = useRef<HTMLDivElement>(null);
   const inspectorBox = useRef<HTMLDivElement>(null);
@@ -737,6 +749,7 @@ function Territory({
               selected={mapFocus}
               loading={loading}
               onSelect={(cell: TerritoryCell) => select(cell.entity)}
+              routes={routes}
               emphasis={timeline ? touched : undefined}
               emphasisNote={touchedNote}
               label={`Capability map: ${capabilities} capabilities${
@@ -1017,29 +1030,45 @@ function Legend() {
       <summary className="cursor-pointer text-ink-faint">Reading the map</summary>
       <ul className="m-0 mt-2 flex list-none flex-col gap-1.5 p-0">
         <li>
-          <strong className="text-ink">Area</strong> is how many files live there, in power-of-two
-          steps: not complexity, importance or quality.
+          <strong className="text-ink">Countries</strong> are capabilities. Their area is how many
+          files live there, in power-of-two steps: not complexity, importance or quality. Colours
+          only tell neighbours apart.
         </li>
         <li>
           <strong className="text-ink">Position</strong> is a stable landmark: a capability keeps
-          its place while it continues. Being near another doesn't mean they depend on each other.
+          its place while it continues, and a neighbour growing moves only the border they share.
+          Being next to another doesn't mean they depend on each other.
         </li>
         <li>
-          <strong className="text-ink">Boundaries</strong> are primary membership: each file lives
-          in exactly one capability; ties to others are listed as references, not drawn twice.
+          <strong className="text-ink">Borders</strong> are primary membership: each file lives in
+          exactly one capability. Opening a capability divides it into its areas, the fainter lines
+          inside it.
         </li>
         <li>
-          <strong className="text-ink">Dashed regions</strong> are structural groups (unclassified
-          files, concepts, dependencies, folders), not capabilities; the outline says “Structural
-          group”.
+          <strong className="text-ink">Islands</strong> offshore, with a dashed coast, are
+          structural groups (unclassified files, concepts, dependencies, folders), not capabilities;
+          the outline says “Structural group”.
+        </li>
+        <li>
+          <span
+            aria-hidden
+            className="mr-1 inline-block h-0.5 w-3 rounded-full bg-data-teal align-middle"
+          />
+          <span
+            aria-hidden
+            className="mr-1 inline-block h-0.5 w-3 rounded-full bg-data-violet align-middle"
+          />
+          <strong className="text-ink">Routes</strong>, with a capability selected: teal to what it
+          uses, violet from what uses it, thicker for more imports. Static imports only, one hop;
+          the inspector lists them.
         </li>
         <li>
           <span
             aria-hidden
             className="mr-1 inline-block size-2 rounded-full bg-data-berry align-middle"
           />
-          <strong className="text-ink">A dot in a region's corner</strong>: it changed in the build
-          this map shows; the outline says “changed in this build”.
+          <strong className="text-ink">A dot beside a name</strong>: it changed in the build this
+          map shows; the outline says “changed in this build”.
         </li>
         <li>
           <span

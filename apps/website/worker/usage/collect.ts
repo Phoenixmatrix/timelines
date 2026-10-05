@@ -494,11 +494,18 @@ const workersAi: Step = {
   async run(ctx) {
     const { results } = await ctx.env.DB.prepare(
       `SELECT model, SUM(calls) AS calls, SUM(input_tokens) AS input, SUM(output_tokens) AS output,
-              SUM(total_tokens) AS total
+              SUM(total_tokens) AS total, SUM(failed_calls) AS failed
        FROM ai_usage WHERE day = ?1 AND account_id = ?2 GROUP BY model`,
     )
       .bind(ctx.yesterday, ctx.account)
-      .all<{ model: string; calls: number; input: number; output: number; total: number }>();
+      .all<{
+        model: string;
+        calls: number;
+        input: number;
+        output: number;
+        total: number;
+        failed: number;
+      }>();
     const method = "calls and tokens recorded as each model call returned (ai_usage)";
     return {
       rows: results.flatMap((r) =>
@@ -508,6 +515,8 @@ const workersAi: Step = {
             ["input_tokens", r.input],
             ["output_tokens", r.output],
             ["total_tokens", r.total],
+            // Attempts that failed or were cut off (CORE-285), when there were any.
+            ...(r.failed ? ([["failed_calls", r.failed]] as const) : []),
           ] as const
         ).map(([metric, quantity]): UsageRow => ({
           construct: "workers_ai",

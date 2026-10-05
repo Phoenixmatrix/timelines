@@ -20,16 +20,21 @@ import {
   type ContextEntry,
   type ContextSource,
   type Step,
+  type StepArtifact,
   type StepAuthor,
   type StepContextBody,
+  type StepFeedRecord,
+  STEP_FEED_DAYS,
   type StepPage,
   type StepTest,
+  type StepTestSummary,
   type StepUpload,
   type StepVersions,
 } from "../../shared/steps.ts";
 import type { AppEnv } from "../auth.ts";
 import { fail, requireActor } from "../api/http.ts";
 import { loadRepo } from "../api/repos.ts";
+import { durableStub } from "../durable/registry.ts";
 import { avatarUrl } from "../avatars/api.ts";
 import { sqlNow } from "../db.ts";
 import { db, type Database } from "../schema.ts";
@@ -140,7 +145,10 @@ async function authorsOf(d1: D1Database, rows: Row[]): Promise<Map<string, StepA
   return authors;
 }
 
-function toStep(row: Row, authors: Map<string, StepAuthor>): Step {
+/** D1 bounds bound parameters per query: commits looked up at once. */
+const ROWS_PER_QUERY = 90;
+
+function toStep(row: Row, authors: Map<string, StepAuthor>): Omit<Step, "artifacts"> {
   let context = EMPTY_CONTEXT;
   try {
     context = { ...EMPTY_CONTEXT, ...(JSON.parse(row.context) as Partial<StepContextBody>) };
@@ -163,7 +171,102 @@ function toStep(row: Row, authors: Map<string, StepAuthor>): Step {
 
 async function present(c: Context<AppEnv>, rows: Row[]) {
   const authors = await authorsOf(c.env.DB, rows);
-  return rows.map((row) => toStep(row, authors));
+  const artifacts = await artifactsOf(c.env.DB, rows);
+  return rows.map((row) => ({
+    ...toStep(row, authors),
+    artifacts: artifacts.get(row.commit_oid) ?? [],
+  }));
+}
+
+/** Step runs' artifacts for these steps' commits, newest first (CORE-235). */
+async function artifactsOf(d1: D1Database, rows: Row[]): Promise<Map<string, StepArtifact[]>> {
+  const out = new Map<string, StepArtifact[]>();
+  const repoId = rows[0]?.repo_id;
+  if (!repoId) return out;
+  const commits = [...new Set(rows.map((r) => r.commit_oid))];
+  for (let i = 0; i < commits.length; i += ROWS_PER_QUERY) {
+    const found = await db(d1)
+      .selectFrom("step_artifacts as a")
+      .innerJoin("ci_runs as r", "r.id", "a.run_id")
+      .select(["a.id", "a.commit_oid", "a.run_id", "a.kind", "a.data", "a.created_at", "r.number"])
+      .where("a.repo_id", "=", repoId)
+      .where("a.commit_oid", "in", commits.slice(i, i + ROWS_PER_QUERY))
+      .orderBy("a.created_at", "desc")
+      .execute();
+    for (const row of found) {
+      let data: Record<string, unknown> = {};
+      try {
+        data = JSON.parse(row.data) as Record<string, unknown>;
+      } catch {
+        // Keep the artifact; its data is unreadable.
+      }
+      const base = {
+        id: row.id,
+        runId: row.run_id,
+        runNumber: row.number,
+        createdAt: row.created_at,
+      };
+      const artifact: StepArtifact =
+        row.kind === "test-summary"
+          ? { ...base, kind: "test-summary", data: data as unknown as StepTestSummary }
+          : { ...base, kind: row.kind, data, url: null };
+      out.set(row.commit_oid, [...(out.get(row.commit_oid) ?? []), artifact]);
+    }
+  }
+  return out;
+}
+
+/**
+ * The step context for each of these commits (CORE-243: why on a line): the
+ * commit's own step, else, for a commit a rebase or landing replaced, the
+ * newest step of its change. Deleted steps come back as tombstones.
+ */
+export async function stepsFor(
+  c: Context<AppEnv>,
+  repoId: string,
+  commits: { oid: string; changeId: string | null }[],
+): Promise<Map<string, Step>> {
+  const out = new Map<string, Step>();
+  if (!commits.length) return out;
+  const kdb = db(c.env.DB);
+  const exact: Row[] = [];
+  const oids = [...new Set(commits.map((x) => x.oid))];
+  for (let i = 0; i < oids.length; i += ROWS_PER_QUERY)
+    exact.push(
+      ...(await kdb
+        .selectFrom("step_contexts")
+        .selectAll()
+        .where("repo_id", "=", repoId)
+        .where("commit_oid", "in", oids.slice(i, i + ROWS_PER_QUERY))
+        .execute()),
+    );
+  const found = new Set(exact.map((r) => r.commit_oid));
+  const byChange = new Map<string, string[]>();
+  for (const { oid, changeId } of commits)
+    if (!found.has(oid) && changeId)
+      byChange.set(changeId, [...(byChange.get(changeId) ?? []), oid]);
+  const versions: Row[] = [];
+  const changes = [...byChange.keys()];
+  for (let i = 0; i < changes.length; i += ROWS_PER_QUERY)
+    versions.push(
+      ...(await kdb
+        .selectFrom("step_contexts")
+        .selectAll()
+        .where("repo_id", "=", repoId)
+        .where("change_id", "in", changes.slice(i, i + ROWS_PER_QUERY))
+        .orderBy("committed_at", "desc")
+        .execute()),
+    );
+  const newest = new Map<string, Row>();
+  for (const row of versions) if (!newest.has(row.change_id)) newest.set(row.change_id, row);
+  const rows = [...exact, ...newest.values()];
+  const steps = await present(c, rows);
+  rows.forEach((row, i) => {
+    const step = steps[i]!;
+    if (row.commit_oid && found.has(row.commit_oid)) out.set(row.commit_oid, step);
+    for (const oid of byChange.get(row.change_id) ?? []) if (!out.has(oid)) out.set(oid, step);
+  });
+  return out;
 }
 
 /** Whether a push has shown this commit as this change (worker/ref-log). */
@@ -278,7 +381,94 @@ steps.post("/", async (c) => {
     return fail(c, 409, "This step's context belongs to whoever made the commit.");
   if (row.deleted_at) return fail(c, 410, "This step's context was deleted.");
   const [step] = await present(c, [row]);
+  // A new step in a timeline goes out on its live feed (CORE-239), after the answer.
+  if (!existing && step!.timeline && Reflect.has(c.env, "STEP_FEED")) {
+    const work = publishStep(c.env, loaded.row, step!).catch((error) =>
+      console.error("Steps: publishing to the live feed failed", error),
+    );
+    try {
+      c.executionCtx.waitUntil(work);
+    } catch {
+      await work;
+    }
+  }
   return c.json(step, existing ? 200 : 201);
+});
+
+/**
+ * How long the repository's account keeps live feed records (retention
+ * category "step-feed", CORE-244): its stored days within 1–7, else 7.
+ */
+async function feedKeepMs(env: Env, repoId: string): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT p.thresholds FROM retention_policies p JOIN repos r ON r.owner_id = p.account_id
+     WHERE r.id = ? AND p.category = 'step-feed'`,
+  )
+    .bind(repoId)
+    .first<{ thresholds: string }>();
+  let days: unknown;
+  try {
+    days = row ? (JSON.parse(row.thresholds) as { days?: unknown }).days : undefined;
+  } catch {
+    days = undefined;
+  }
+  const kept =
+    typeof days === "number" && Number.isInteger(days) && days >= 1 && days <= STEP_FEED_DAYS
+      ? days
+      : STEP_FEED_DAYS;
+  return kept * 24 * 60 * 60_000;
+}
+
+/** The live feed of one repository's steps in one timeline. */
+function feed(env: Env, repoId: string, timeline: string) {
+  return durableStub(env, "StepFeed", `${repoId}:${timeline}`, { repo: repoId });
+}
+
+async function publishStep(
+  env: Env,
+  repo: { id: string; owner_slug: string; name: string },
+  step: Step,
+) {
+  const tests = step.context.tests;
+  const record: Omit<StepFeedRecord, "seq" | "at"> = {
+    repo: `${repo.owner_slug}/${repo.name}`,
+    timeline: step.timeline!,
+    changeId: step.changeId,
+    commitOid: step.commitOid,
+    summary: step.summary,
+    issue: step.issue,
+    author: { id: step.author.id, kind: step.author.kind, name: step.author.name },
+    tests: tests.length
+      ? {
+          passed: tests.filter((t) => t.exit === 0).length,
+          failed: tests.filter((t) => t.exit !== 0).length,
+        }
+      : null,
+    why: (step.context.why.split("\n").find((l) => l.trim()) ?? "").trim().slice(0, 200),
+    committedAt: step.committedAt,
+  };
+  await feed(env, repo.id, step.timeline!).publish(record, await feedKeepMs(env, repo.id));
+}
+
+/**
+ * GET /live?timeline=<slug>: the timeline's steps in this repository as
+ * Server-Sent Events, for anyone who can read it (CORE-239). Each connection
+ * is checked; a stream ends after ten minutes and reconnects with
+ * Last-Event-ID, checked again.
+ */
+steps.get("/live", async (c) => {
+  const loaded = await loadRepo(c, "read");
+  if (loaded instanceof Response) return loaded;
+  const timeline = c.req.query("timeline") ?? "";
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(timeline))
+    return fail(c, 400, "timeline is a timeline's slug.");
+  const headers = new Headers();
+  const last = c.req.header("last-event-id") ?? c.req.query("after");
+  if (last && /^\d+$/.test(last)) headers.set("last-event-id", last);
+  const response = await feed(c.env, loaded.row.id, timeline).fetch(
+    new Request("https://step-feed/subscribe", { headers }),
+  );
+  return new Response(response.body, response);
 });
 
 /** Opaque paging: the last step's (committedAt, changeId, commitOid). */

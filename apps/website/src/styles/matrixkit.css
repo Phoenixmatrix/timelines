@@ -46,8 +46,8 @@
 .mk-btn--primary:hover { background: var(--signal-hover); }
 .mk-btn--primary:disabled, .mk-btn--primary[aria-disabled="true"] { background: var(--raised); color: var(--ink-faint); }
 /* Busy is disabled for clicks but still the action in progress: keep it lit. */
-.mk-btn[aria-busy="true"]:disabled { color: var(--ink); cursor: progress; }
-.mk-btn--primary[aria-busy="true"]:disabled { background: var(--signal); color: var(--signal-ink); }
+.mk-btn[aria-busy="true"]:is(:disabled, [aria-disabled="true"]) { color: var(--ink); cursor: progress; }
+.mk-btn--primary[aria-busy="true"]:is(:disabled, [aria-disabled="true"]) { background: var(--signal); color: var(--signal-ink); }
 .mk-btn--ghost { background: transparent; color: var(--ink-muted); }
 .mk-btn--ghost:hover { background: var(--raised); color: var(--ink); }
 .mk-btn--ghost:active { translate: none; }

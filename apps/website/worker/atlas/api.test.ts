@@ -862,6 +862,10 @@ describe("Atlas read API", () => {
     expect(related.items).toEqual([
       expect.objectContaining({ dst: overview.regions[0]!.id, kind: "depends_on", weight: 1 }),
     ]);
+    // The overview carries the same imports between its regions, for the map to place them by.
+    expect(overview.links).toEqual([
+      { src: notifyCap.id, dst: overview.regions[0]!.id, weight: 1 },
+    ]);
     expect(overview.regions[3]?.id).toBe("group:unclassified");
     expect(overview.regions.map((r) => r.structural)).toEqual([false, false, false, true]);
     expect(overview.totalRegions).toBe(4);
@@ -875,6 +879,9 @@ describe("Atlas read API", () => {
       ["area", 4],
       ["area", 4],
     ]);
+    // The overview carries them already, for the map; regions without areas carry none.
+    expect(payments.areas?.map((a) => a.id)).toEqual(areas.items.map((a) => a.id));
+    expect(overview.regions.slice(1).every((r) => r.areas === undefined)).toBe(true);
     const files = await Promise.all(
       areas.items.map((a) =>
         s.get<AtlasPage<AtlasEntitySummary>>(`children?id=${encodeURIComponent(a.id)}`),

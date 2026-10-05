@@ -26,7 +26,9 @@ import type { Checkpoint, Landing, TimelineDetail } from "../../apps/website/sha
 import type { SourceSnapshot } from "../../apps/website/shared/code-source.ts";
 import type { UsageReport } from "../../apps/website/shared/usage.ts";
 import type { WhyResponse } from "../../apps/website/shared/why.ts";
+import type { StepFeedRecord, StepPage } from "../../apps/website/shared/steps.ts";
 import { atlasRevocationScenario, atlasSmokeScenario } from "./atlas-e2e.ts";
+import { chronicleScenario } from "./chronicle-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 import { runQueueE2E } from "./queue-e2e.ts";
 import { runSourceMigrationE2E } from "./source-migration-e2e.ts";
@@ -147,12 +149,15 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     let stdout = "",
       stderr = "",
       timedOut = false;
+    // A command that waits with its own --timeout gets that long, and a minute more.
+    const asked = Number(args[args.indexOf("--timeout") + 1]);
+    const limit = Math.max(180, args.includes("--timeout") && asked > 0 ? asked + 60 : 0);
     const timer = setTimeout(() => {
       timedOut = true;
       try {
         process.kill(-child.pid!, "SIGKILL");
       } catch {}
-    }, 180_000);
+    }, limit * 1000);
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
@@ -165,7 +170,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (timedOut) reject(new Error(`gm ${args[0]} exceeded 180 seconds`));
+      if (timedOut) reject(new Error(`gm ${args[0]} exceeded ${limit} seconds`));
       else resolve({ code, stdout, stderr });
     });
     const result = await promise;
@@ -866,9 +871,74 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       undefined,
       { ...agentEnv, GM_LEASE_TOKEN: lease },
     );
+
+    // Requirements (CORE-32): next passes over what the agent doesn't meet and
+    // says so, a claim names what's missing, and people can lift them.
+    const owner = fixtures.tracker.owner;
+    const key = `R${randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase()}`;
+    await json(`/api/tracker/${owner}/mutate`, ownerToken, "POST", {
+      operationId: randomUUID(),
+      mutations: [{ kind: "team.create", id: randomUUID(), data: { key, name: "Requirements" } }],
+    });
+    const create = async (title: string, priority: string, requires: string) =>
+      (
+        JSON.parse(
+          await gm([
+            "issue",
+            "create",
+            title,
+            "--team",
+            key,
+            "--priority",
+            priority,
+            "--requires",
+            requires,
+            "--owner",
+            owner,
+          ]),
+        ) as { entities: { id: string; key: string | null; requires?: unknown }[] }
+      ).entities[0]!;
+    const gpu = await create("Needs a GPU", "0", "tag:gpu memory>=1TiB");
+    const native = await create("Native work", "1", "tag:NATIVE-E2E model:fixture-*");
+    assert.deepEqual(native.requires, { tags: ["native-e2e"], models: ["fixture-*"] });
+    const asAgent = (args: string[], failure?: RegExp) =>
+      gm([...args, "--owner", owner], "marco", work, failure, agentEnv);
+    const picked = JSON.parse(await asAgent(["issue", "next", "--team", key, "--agent", name])) as {
+      claimed: { issueId: string; leaseToken: string } | null;
+      skipped: { requirements: number; keys: string[]; message: string };
+    };
+    assert.equal(picked.claimed?.issueId, native.id, "next takes the issue it meets");
+    secrets.add(picked.claimed!.leaseToken);
+    assert.equal(picked.skipped.requirements, 1);
+    assert.deepEqual(picked.skipped.keys, [`${key}-1`]);
+    await asAgent(["issue", "release", native.id]);
+    // Refused, naming each requirement it misses.
+    await asAgent(
+      ["issue", "claim", gpu.id, "--agent", name],
+      /requirements_unmet[\s\S]*needs tag gpu[\s\S]*needs at least 1TiB of memory/,
+    );
+    const eligibility = JSON.parse(await asAgent(["issue", "show", gpu.id])) as {
+      issue: { requiresText: string };
+      eligibility: { eligible: boolean; unmet: { wanted: string }[] };
+    };
+    assert.equal(eligibility.issue.requiresText, "tag:gpu memory>=1TiB");
+    assert.equal(eligibility.eligibility.eligible, false);
+    assert.deepEqual(
+      eligibility.eligibility.unmet.map((u) => u.wanted),
+      ["tag:gpu", "memory>=1TiB"],
+    );
+    await gm(["issue", "update", gpu.id, "--clear-requires", "--owner", owner]);
+    const lifted = JSON.parse(await asAgent(["issue", "claim", gpu.id, "--agent", name])) as {
+      results: { leaseToken: string }[];
+    };
+    secrets.add(lifted.results[0]!.leaseToken);
+    await asAgent(["issue", "release", gpu.id]);
+
     await gm(["agent", "revoke", other.agent.id]);
     await gm(["agent", "revoke", agent.id]);
     record({
+      requirementsSkipped: picked.skipped.requirements,
+      requirementsRefused: true,
       agent: name,
       model: capabilities.model,
       tags: capabilities.tags,
@@ -876,6 +946,225 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       trackerCapabilitiesVisible: true,
       claimIdentity: claimed.issue.claim.actorId,
     });
+  });
+
+  await scenario("tags-one-vocabulary-and-old-spellings", async () => {
+    // CORE-271: issue tags from the tracker's tag catalog through the real gm and
+    // API, with every old spelling kept: --label, `labels` in --data and the API,
+    // and label: in search.
+    const owner = fixtures.tracker.owner;
+    const key = `T${randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase()}`;
+    const suffix = randomUUID().slice(0, 6);
+    const [ux, data] = [`ux-${suffix}`, `data-${suffix}`];
+    await json(`/api/tracker/${owner}/mutate`, ownerToken, "POST", {
+      operationId: randomUUID(),
+      mutations: [{ kind: "team.create", id: randomUUID(), data: { key, name: "Tags" } }],
+    });
+    const create = async (title: string, flag: string, tag: string) =>
+      JSON.parse(
+        await gm(["issue", "create", title, "--team", key, flag, tag, "--owner", owner]),
+      ) as { entities: { id: string; labels: string[] }[]; tagCatalog?: { added: string[] } };
+    const tagged = await create("Tagged with --tag", "--tag", ux);
+    assert.deepEqual(tagged.entities[0]!.labels, [ux]);
+    assert.deepEqual(tagged.tagCatalog?.added, [ux]);
+    const old = await create("Tagged with --label", "--label", data);
+    assert.deepEqual(old.entities[0]!.labels, [data]);
+    const id = old.entities[0]!.id;
+    await gm(["issue", "update", id, "--tag", ux, "--owner", owner]);
+    await gm([
+      "issue",
+      "update",
+      id,
+      "--data",
+      JSON.stringify({ tags: [data, ux] }),
+      "--owner",
+      owner,
+    ]);
+    const shown = await gm(["issue", "show", id, "--owner", owner, "--output", "text"]);
+    assert.match(shown, new RegExp(`Tags: ${data}, ${ux}\n`));
+    // The API takes `tags` and still `labels`; the catalog lists both with counts.
+    const snapshot = await json<{ issues: { id: string; version: number; labels: string[] }[] }>(
+      `/api/tracker/${owner}/snapshot`,
+      ownerToken,
+    );
+    const issue = snapshot.issues.find((i) => i.id === id)!;
+    await json(`/api/tracker/${owner}/mutate`, ownerToken, "POST", {
+      operationId: randomUUID(),
+      mutations: [
+        { kind: "issue.update", id, expectedVersion: issue.version, data: { labels: [data] } },
+      ],
+    });
+    const catalog = await json<{ tags: { name: string; issues: number; open: number }[] }>(
+      `/api/tracker/${owner}/tags`,
+      ownerToken,
+    );
+    assert.deepEqual(
+      catalog.tags.filter((t) => t.name.endsWith(suffix)),
+      [
+        { name: data, issues: 1, open: 1 },
+        { name: ux, issues: 1, open: 1 },
+      ],
+    );
+    const listed = JSON.parse(await gm(["issue", "tags", "--owner", owner])) as {
+      tags: { name: string }[];
+    };
+    assert(listed.tags.some((t) => t.name === ux) && listed.tags.some((t) => t.name === data));
+    // An unknown tag: requirement warns and is still saved.
+    const required = JSON.parse(
+      await gm(["issue", "update", id, "--requires", `tag:${ux}x`, "--owner", owner]),
+    ) as { tagCatalog: { unknownRequired: { tag: string; suggestion: string | null }[] } };
+    assert.deepEqual(required.tagCatalog.unknownRequired, [{ tag: `${ux}x`, suggestion: ux }]);
+    record({ tags: [ux, data], aliases: ["--label", "labels", "tags"] });
+  });
+
+  await scenario("tightening-requirements-on-a-claimed-issue", async () => {
+    // CORE-272: a real agent claims; a person tightens the requirements. gm says
+    // who's affected and keeps the claim (recorded), --release-claim releases it,
+    // --require-issue-tags turns tags into requirements, and next names what blocked it.
+    const owner = fixtures.tracker.owner;
+    const key = `Q${randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase()}`;
+    const suffix = randomUUID().slice(0, 6);
+    const [ux, gpu] = [`ux-${suffix}`, `gpu-${suffix}`];
+    await json(`/api/tracker/${owner}/mutate`, ownerToken, "POST", {
+      operationId: randomUUID(),
+      mutations: [{ kind: "team.create", id: randomUUID(), data: { key, name: "Tighten" } }],
+    });
+    const { agent } = await json<{ agent: Agent }>(
+      "/api/agents",
+      ownerToken,
+      "POST",
+      { name: `tight-${suffix}` },
+      [201],
+    );
+    await json(`/api/agents/${agent.id}/capabilities`, ownerToken, "PUT", {
+      version: 1,
+      harness: "claude-code",
+      model: "fixture-model",
+      environment: {
+        os: "linux",
+        arch: "x86_64",
+        runtime: "host",
+        cpuCount: 4,
+        memoryBytes: 8 * 2 ** 30,
+      },
+      tags: [ux],
+      skills: [],
+    });
+    const token = await json<CreatedAccessToken>(
+      `/api/agents/${agent.id}/tokens`,
+      ownerToken,
+      "POST",
+      { scope: "write" },
+      [201],
+    );
+    secrets.add(token.secret);
+    const agentEnv = { GM_TOKEN: token.secret };
+    const created = JSON.parse(
+      await gm([
+        "issue",
+        "create",
+        "Tighten me",
+        "--team",
+        key,
+        "--tag",
+        ux,
+        "--tag",
+        gpu,
+        "--requires",
+        `tag:${ux}`,
+        "--owner",
+        owner,
+      ]),
+    ) as { entities: { id: string }[] };
+    const id = created.entities[0]!.id;
+    const claim = JSON.parse(
+      await gm(
+        ["issue", "claim", id, "--agent", "e2e-session", "--owner", owner],
+        "marco",
+        work,
+        undefined,
+        agentEnv,
+      ),
+    ) as { results: { leaseToken: string }[] };
+    secrets.add(claim.results[0]!.leaseToken);
+
+    type Effect = {
+      claimEffect?: {
+        agent: string;
+        session: string;
+        released: boolean;
+        unmet: { wanted: string }[];
+      };
+    };
+    // --require-issue-tags asks for tag:gpu-… too: the holder misses it, so the claim is kept and said.
+    const kept = JSON.parse(
+      await gm(["issue", "update", id, "--require-issue-tags", "--owner", owner]),
+    ) as Effect;
+    assert.equal(kept.claimEffect?.agent, agent.name);
+    assert.equal(kept.claimEffect?.session, "e2e-session");
+    assert.equal(kept.claimEffect?.released, false);
+    assert.deepEqual(
+      kept.claimEffect?.unmet.map((u) => u.wanted),
+      [`tag:${gpu}`],
+    );
+    const text = await gm([
+      "issue",
+      "update",
+      id,
+      "--requires",
+      `tag:${gpu} cpus>=64`,
+      "--owner",
+      owner,
+      "--output",
+      "text",
+    ]);
+    assert.match(
+      text,
+      new RegExp(`^Kept the claim held by ${agent.name} \\(session e2e-session\\)`),
+    );
+    // Releasing it: the claim ends, the work is back, and the issue records it.
+    const released = JSON.parse(
+      await gm([
+        "issue",
+        "update",
+        id,
+        "--requires",
+        `tag:${gpu} memory>=1TiB`,
+        "--release-claim",
+        "--owner",
+        owner,
+      ]),
+    ) as Effect;
+    assert.equal(released.claimEffect?.released, true);
+    const snapshot = await json<{
+      issues: { id: string; claim: unknown; requires?: unknown; status: string }[];
+      comments: { issueId: string; body: string }[];
+    }>(`/api/tracker/${owner}/snapshot`, ownerToken);
+    const issue = snapshot.issues.find((i) => i.id === id)!;
+    assert.equal(issue.claim, null);
+    assert.equal(issue.status, "todo");
+    const notes = snapshot.comments.filter((c) => c.issueId === id).map((c) => c.body);
+    assert(notes.some((n) => n.startsWith(`Kept the claim held by ${agent.name}`)));
+    assert(notes.some((n) => n.startsWith(`Released the claim held by ${agent.name}`)));
+    // next passes it over and says what kept it.
+    const next = JSON.parse(
+      await gm(
+        ["issue", "next", "--team", key, "--agent", "e2e-session", "--owner", owner],
+        "marco",
+        work,
+        undefined,
+        agentEnv,
+      ),
+    ) as {
+      claimed: unknown;
+      skipped: { blocking: { wanted: string; issues: number }[] };
+      message: string;
+    };
+    assert.equal(next.claimed, null, "next must pass over the released issue");
+    assert(next.skipped.blocking.some((b) => b.wanted === `tag:${gpu}` && b.issues === 1));
+    assert.match(next.message, new RegExp(`gm agent setup --tag ${gpu}`));
+    await gm(["agent", "revoke", agent.id]);
+    record({ agent: agent.name, kept: true, released: true, blocking: next.skipped.blocking });
   });
 
   await scenario("agent-durable-interventions-and-resume", async () => {
@@ -1979,7 +2268,17 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     );
     record({ archiveRetentionBeforeDeadline: retention.run });
     await gm(["timeline", "land", slug, "--owner", fixtures.tracker.owner], "jun", clone, /landed/);
-    const why = JSON.parse(await gm(["why", `${marker}:1`], "jun", clone)) as WhyResponse;
+    // Landing completion precedes the asynchronous push log's change index.
+    // Wait for that input, then assert the authoritative queue provenance below.
+    const why = await poll(
+      async () => JSON.parse(await gm(["why", `${marker}:1`], "jun", clone)) as WhyResponse,
+      (result) =>
+        result.chains.some(
+          (chain) =>
+            chain.oid === checkpointCommit && chain.refs.some((ref) => ref.kind === "main"),
+        ),
+      "the landed change's main ref to be indexed",
+    );
     record({ why, checkpoint });
     const provenance = why.chains.find((chain) => chain.oid === checkpointCommit)?.landing;
     assert.equal(provenance?.via, "compact", "gm why reads exact compact integration provenance");
@@ -2027,6 +2326,172 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       merge: mainAfter,
       checkpoint: checkpointCommit,
       gates: gates.number,
+    });
+  });
+
+  /** gm with a harness event on stdin, as Claude Code runs its hook (CORE-241). */
+  async function gmHook(clone: string, prompt: string) {
+    const env: NodeJS.ProcessEnv = {
+      ...ctx.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+    };
+    const { promise, resolve, reject } = Promise.withResolvers<string>();
+    const child = execFile(
+      ctx.gm,
+      ["hook", "claude-code"],
+      { cwd: clone, env, timeout: 30_000 },
+      (error, stdout) => (error ? reject(error) : resolve(stdout)),
+    );
+    child.stdin!.end(
+      JSON.stringify({
+        session_id: "steps-e2e",
+        hook_event_name: "UserPromptSubmit",
+        cwd: clone,
+        prompt,
+      }),
+    );
+    const stdout = await promise;
+    assert.equal(stdout, "", "A prompt hook never prints: its output would join the conversation");
+  }
+
+  /** `gm steps --follow --count 1` in the background: its first record, and when it came. */
+  function followOneStep(clone: string) {
+    const env: NodeJS.ProcessEnv = {
+      ...ctx.env,
+      GM_SERVER: ctx.origin,
+      GM_TOKEN: fixtures.tokens.jun,
+    };
+    for (const key of Object.keys(env))
+      if (key.startsWith("GIT_CONFIG_") || key === "SSH_AUTH_SOCK" || key === "GITMATRIX_TOKEN")
+        delete env[key];
+    env.GIT_CONFIG_NOSYSTEM = "1";
+    env.GIT_CONFIG_GLOBAL = "/dev/null";
+    const { promise, resolve, reject } = Promise.withResolvers<{ line: string; at: number }>();
+    const child = spawn(ctx.gm, ["--output", "json", "steps", "--follow", "--count", "1"], {
+      cwd: clone,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => child.kill("SIGKILL"), 120_000);
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0 && stdout.trim())
+        resolve({ line: stdout.trim().split("\n")[0]!, at: Date.now() });
+      else reject(new Error(`gm steps --follow exited ${code}: ${redact(stderr)}`));
+    });
+    return promise;
+  }
+
+  await scenario("steps-context-hook-live-run-landing-and-access", async () => {
+    // CORE-226 (S01, S02, S04, S06, S07, S09): an agent steps through a
+    // timeline: what the person said comes through the hook, the step carries
+    // its why and local tests, arrives on the live feed within seconds, gets
+    // its step run's summary, and after landing, gm why on its line shows it.
+    const slug = `steps-e2e-${randomUUID().slice(0, 8)}`;
+    const file = `steps-e2e/${slug}.txt`;
+    const clone = await landingTimeline(slug);
+    await mkdir(join(clone, "steps-e2e"), { recursive: true });
+    await writeFile(join(clone, file), `${slug}\n`);
+    await mkdir(join(clone, ".gitmatrix"), { recursive: true });
+    await writeFile(
+      join(clone, ".gitmatrix", "ci.yml"),
+      JSON.stringify({
+        on: { push: { branches: ["never-agent-auto"] }, step: {} },
+        jobs: {
+          "step-check": {
+            on: "step",
+            local: true,
+            steps: [{ run: `test -f ${file} && echo STEP_OK` }],
+          },
+          gate: { if: 'trigger == "landing"', steps: [{ run: "echo LANDING_GATE_OK" }] },
+        },
+      }),
+    );
+    // S02: the person's own words, through the Claude Code hook.
+    await gmHook(clone, "Mark the steps E2E file");
+    await gmHook(clone, "Keep it to one line");
+    const context = join(work, `${slug}-context.md`);
+    await writeFile(context, "## Why\nProve steps end to end.\n\n## Challenges\nNone so far.\n");
+
+    // S01: one command tests, commits with context and pushes; the live feed has it within seconds.
+    const following = followOneStep(clone);
+    await delay(1_500);
+    const stepped = JSON.parse(
+      await gm(["step", "-m", `Steps E2E ${slug}`, "--context", context], "jun", clone),
+    ) as { tests: { jobs: { name: string; status: string }[] }; push: { bookmark: string } };
+    const returnedAt = Date.now();
+    assert.deepEqual(
+      stepped.tests.jobs.map((job) => [job.name, job.status]),
+      [["step-check", "passed"]],
+      "gm step runs the repository's local step jobs",
+    );
+    assert.equal(stepped.push.bookmark, `timeline/${slug}`);
+    const followed = await following;
+    const live = JSON.parse(followed.line) as StepFeedRecord;
+    const latencyMs = Math.max(0, followed.at - returnedAt);
+    assert.equal(live.summary, `Steps E2E ${slug}`);
+    assert.equal(live.timeline, slug);
+    assert(latencyMs < 5_000, `The live feed took ${latencyMs} ms after gm step returned`);
+
+    // The stored step: verified by the push, with the hook's words, its why and tests.
+    const stepFor = () =>
+      json<StepPage>(`${api}/steps?commits=${live.commitOid}`, fixtures.tokens.sam).then(
+        (page) => page.steps[0],
+      );
+    // Verified once the push's ref log has shown the commit (it can trail the upload).
+    const step = await poll(stepFor, (s) => !!s?.verified, "the step verified by its push");
+    assert(step, "A reader of the repository reads the step");
+    assert.deepEqual(
+      step.context.instructions.map((e) => [e.text, e.source]),
+      [["Mark the steps E2E file", "hook"]],
+    );
+    assert.deepEqual(
+      step.context.steering.map((e) => [e.text, e.source]),
+      [["Keep it to one line", "hook"]],
+    );
+    assert.equal(step.context.coverage.steering, "hook:claude-code");
+    assert.equal(step.context.why, "Prove steps end to end.");
+    assert.deepEqual(
+      step.context.tests.map((t) => [t.command, t.exit, t.origin]),
+      [["gm test: step-check", 0, "local"]],
+    );
+    // S06: the push's step run attaches its summary to the step.
+    const withRun = await poll(
+      stepFor,
+      (s) => !!s && s.artifacts.length > 0,
+      "the step run's summary",
+    );
+    const summary = withRun!.artifacts[0]!;
+    assert.equal(summary.kind, "test-summary");
+    assert.equal(summary.kind === "test-summary" && summary.data.status, "succeeded");
+
+    // S04: an agent's commit without context warns and still commits.
+    await writeFile(join(clone, `${file}.more`), "more\n");
+    const quiet = JSON.parse(
+      await gm(["commit", "-m", "No context here"], "jun", clone, undefined, { GM_AGENT: "1" }),
+    ) as { warnings?: string[] };
+    assert.match(quiet.warnings?.[0] ?? "", /has no context/);
+
+    // S09: someone who can't read the repository sees neither steps nor the feed.
+    await request(`${api}/steps?timeline=${slug}`, null, "GET", undefined, [404]);
+    await request(`${api}/steps/live?timeline=${slug}`, null, "GET", undefined, [404]);
+
+    // S07: the timeline lands; gm why on the landed line still shows its step.
+    await writeFile(join(clone, `${file}.done`), "done\n");
+    await pushAndCheckpoint(clone, slug, `Steps E2E checkpoint ${slug}`);
+    const landing = await settledLanding(slug);
+    assert.equal(landing.state, "landed", `Landing stopped: ${landing.reason}`);
+    const why = JSON.parse(await gm(["why", `${file}:1`], "jun", clone)) as WhyResponse;
+    const chain = why.chains.find((c) => c.oid === live.commitOid);
+    assert(chain, "gm why leads the landed line to the step's commit");
+    assert.equal(chain.step?.context.why, "Prove steps end to end.");
+    record({
+      steps: { slug, commit: live.commitOid, latencyMs, artifact: summary.kind, landed: true },
     });
   });
 
@@ -2454,6 +2919,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       "RegistryLogin",
       "RegistryRepo",
       "RegistryUpload",
+      "StepFeed",
       "Tracker",
     ]);
     for (const result of results) {
@@ -2512,6 +2978,85 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     for (const figure of figures)
       assert(figure.method.length > 0, `${figure.construct}/${figure.item} says how it was made`);
     record({ usage: figures.map((f) => `${f.construct}/${f.item}/${f.metric}=${f.quantity}`) });
+  });
+
+  await scenario("ai-gateway-log-bodies-site-default-and-account-override", async () => {
+    // CORE-290: "Keep AI request and response bodies in gateway logs", per
+    // component. Agent environments keep them by default; site administrators
+    // set the site default and an account's administrators override it for
+    // the account, through the API and `gm settings ai`; both show the
+    // retention note; members, non-admins and agents are refused.
+    type Entry = {
+      component: string;
+      site: boolean;
+      siteFrom: string;
+      account?: boolean | null;
+      effective: boolean;
+    };
+    type View = { logBodies: { environmentDefault: boolean; note: string; components: Entry[] } };
+    const find = (view: View, component: string) =>
+      view.logBodies.components.find((e) => e.component === component)!;
+    const site = await json<View & { canManage: boolean }>("/api/admin/ai", fixtures.tokens.priya);
+    assert.equal(site.logBodies.environmentDefault, true, "Agent environments keep bodies");
+    assert(site.logBodies.components.every((e) => e.effective && e.siteFrom === "environment"));
+    assert.match(site.logBodies.note, /repository code and assistant conversations/);
+    await request("/api/admin/ai", fixtures.tokens.marco, "GET", undefined, [403]);
+    await request(
+      "/api/admin/ai",
+      fixtures.tokens.marco,
+      "PATCH",
+      { logBodies: { knowledge: false } },
+      [403],
+    );
+    await gm(
+      ["settings", "ai", "set", "--site", "--log-bodies", "off"],
+      "marco",
+      work,
+      /site administrators|403/i,
+    );
+
+    try {
+      // The site turns Knowledge bodies off; marco keeps them for his own account.
+      const shown = JSON.parse(await gm(["settings", "ai", "show", "--site"], "priya")) as View;
+      assert.equal(find(shown, "knowledge").effective, true);
+      const off = JSON.parse(
+        await gm(["settings", "ai", "set", "--site", "--log-bodies", "knowledge=off"], "priya"),
+      ) as View;
+      const knowledge = find(off, "knowledge");
+      assert.equal(knowledge.site, false);
+      assert.equal(knowledge.siteFrom, "site");
+      assert.equal(knowledge.effective, false);
+      const own = JSON.parse(
+        await gm(["settings", "ai", "set", "--owner", "marco", "--log-bodies", "knowledge=on"]),
+      ) as View;
+      assert.equal(find(own, "knowledge").account, true);
+      assert.equal(find(own, "knowledge").effective, true);
+      // Orbit follows the site; jun (a member) reads but can't change it.
+      const orbit = await json<View>("/api/accounts/orbit/settings/ai", fixtures.tokens.jun);
+      assert.equal(find(orbit, "knowledge").effective, false);
+      await gm(
+        ["settings", "ai", "set", "--owner", "orbit", "--log-bodies", "knowledge=on"],
+        "jun",
+        work,
+        /owner|site admin|403/i,
+      );
+      // --dry-run sends nothing.
+      const dry = JSON.parse(
+        await gm(["settings", "ai", "set", "--site", "--log-bodies", "on", "--dry-run"], "priya"),
+      ) as { dry_run: boolean; path: string; request: { logBodies: Record<string, boolean> } };
+      assert.equal(dry.path, "/admin/ai");
+      assert.equal(Object.keys(dry.request.logBodies).length, 6);
+      assert.equal(
+        find(await json<View>("/api/admin/ai", fixtures.tokens.priya), "knowledge").site,
+        false,
+      );
+      record({ site: "knowledge=off", marco: "knowledge=on", orbit: "follows site" });
+    } finally {
+      await gm(["settings", "ai", "set", "--owner", "marco", "--log-bodies", "default"]);
+      await gm(["settings", "ai", "set", "--site", "--log-bodies", "default"], "priya");
+    }
+    const reset = await json<View>("/api/admin/ai", fixtures.tokens.priya);
+    assert(reset.logBodies.components.every((e) => e.siteFrom === "environment" && e.effective));
   });
 
   await scenario("browser-usage-and-costs-account-and-site", async () => {
@@ -2615,6 +3160,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
           `${label}: CSV has one row per figure`,
         );
         await context.tracing.stop();
+        await context.close();
       }
 
       // A member who isn't an administrator is refused; the site page isn't theirs.
@@ -2630,6 +3176,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         await page.goto("/settings/site-usage");
         await page.waitForURL((url) => url.pathname === "/");
         await context.tracing.stop();
+        await context.close();
       }
 
       // The site administrator: every account and the site total, at both widths.
@@ -2654,6 +3201,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         );
         await expect(page.locator('[data-usage-report="account"]')).toBeVisible();
         await context.tracing.stop();
+        await context.close();
       }
       record({ lines: lines.length, accounts: site.accounts!.length, widths: [1280, 390] });
     } catch (error) {
@@ -2889,6 +3437,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         await row.getByRole("button", { name: "Save Assistant chats" }).click();
         await expect(row.getByText("Assistant chats: saved.")).toBeVisible();
         await context.tracing.stop();
+        await context.close();
       }
 
       // The schedule never runs a category that's off: a stale chat stays.
@@ -2909,6 +3458,9 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         ),
         "The explicitly enabled category is scheduled",
       );
+      for (const run of cron.scheduled)
+        if (run.account === null)
+          assert.deepEqual(run.categories, ["auth-hygiene"], "The site's only always-on category");
       assert(
         !cron.scheduled.some(
           (r) => r.categories.includes("assistant-chats") && r.account === owner,
@@ -2942,6 +3494,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         await expect(page.locator(`[data-cleanup-category="${category}"]`)).toBeChecked();
         await noSideways(page, "account 390px");
         await context.tracing.stop();
+        await context.close();
       }
 
       // A member who isn't an administrator is refused; the site page isn't theirs.
@@ -2957,6 +3510,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         await page.goto("/settings/site-retention");
         await page.waitForURL((url) => url.pathname === "/");
         await context.tracing.stop();
+        await context.close();
       }
 
       // The site administrator: site categories and site-wide defaults, a preview.
@@ -2975,6 +3529,11 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
           page.getByRole("heading", { name: "Defaults for every account" }),
         ).toBeVisible();
         await expect(page.locator('[data-retention-row="usage-history"]')).toContainText("months");
+        // Auth hygiene always runs: no switch, its days shown but not editable.
+        const hygiene = page.locator('[data-retention-row="auth-hygiene"]');
+        await expect(hygiene).toContainText("Always on");
+        await expect(hygiene.getByRole("switch")).toHaveCount(0);
+        await expect(hygiene.getByLabel("Days after expiry")).toBeDisabled();
         await expect(page.locator('[data-cleanup-category="auth-hygiene"]')).toBeChecked();
         await page.getByRole("button", { name: "Preview cleanup" }).click();
         await expect(page.locator("[data-cleanup-status]")).toContainText(/Preview #\d+ finished/, {
@@ -2982,6 +3541,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         });
         await noSideways(page, `site ${width}px`);
         await context.tracing.stop();
+        await context.close();
       }
       record({ deleted: idle.length, scheduled: cron.scheduled.length, widths: [1280, 390] });
     } catch (error) {
@@ -3337,7 +3897,14 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await gm(["pkg", "upload", artifact, `${granted}/1.0.0/artifact.txt`, "--owner", repo.owner]);
       await gm(["pkg", "grant", `generic/${granted}`, doomed, "--owner", repo.owner]);
 
-      const before = await inventory();
+      // The push log is written after the push answers (waitUntil), so wait for
+      // its row rather than racing it under load (CORE-258).
+      const before = await poll(
+        inventory,
+        (seen) => (seen.d1.ref_updates ?? 0) >= 1,
+        "the push log to record the fixture's push",
+        30_000,
+      );
       assert.equal(before.repo?.deletedAt, null);
       assert.equal(before.artifacts.exists, true, "Its Artifacts repository exists");
       assert.deepEqual(before.previews, { live: 1, teardownsOpen: 0 });
@@ -4482,4 +5049,16 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
   await scenario("source-retention-expiry-orphan-and-canonical-purge", () =>
     runSourceRetentionE2E(ctx, fixtures, gm, record),
   );
+
+  await scenario("browser-chronicle-scrub-range-span-and-links", async () => {
+    // CORE-251: a month of real tracker history read on a time axis, at
+    // desktop and phone widths (tools/agent/chronicle-e2e.ts).
+    await chronicleScenario({
+      ctx,
+      token: ownerToken,
+      secret: ctx.env.GITMATRIX_AGENT_SECRET ?? "",
+      json,
+      record,
+    });
+  });
 }

@@ -19,6 +19,9 @@ const R2 = { product: "r2", metric: "standard_storage" } as const;
 // Owned work Git has no measured reclaimable-byte estimate; leave its cost unknown.
 const CATEGORY_STORAGE: Partial<Record<CategoryId, { product: PriceProduct; metric: string }>> = {
   "ci-logs": D1,
+  "step-steering": D1,
+  "step-artifacts": D1,
+  "step-feed": DURABLE,
   "ci-runs": D1,
   "preview-records": D1,
   "knowledge-builds": D1,

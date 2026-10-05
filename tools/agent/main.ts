@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "@playwright/test";
 import {
+  aiEnabled,
   cleanupExpired,
   command,
   context,
@@ -26,16 +27,34 @@ import { installMaintenance, maintenanceStatus, uninstallMaintenance } from "./m
 import { pruneBrowsers } from "./browsers.ts";
 import { seed } from "./seed.ts";
 import { runE2E } from "./e2e.ts";
-import { runProviderE2E } from "./provider-e2e.ts";
+import { runProviderE2E, type AiRun } from "./provider-e2e.ts";
 import { ATLAS_PROVIDER_CONFIG } from "./atlas-provider-e2e.ts";
+import {
+  AI_STAGES,
+  appendHistory,
+  changedPaths,
+  fingerprints,
+  parseSetupOptions,
+  parseTestAiOptions,
+  readHistory,
+  refusal,
+  reusableStages,
+  selectStages,
+  type Reason,
+  type Selection,
+  type TestAiOptions,
+} from "./ai-stages.ts";
 
 const root = await realpath(join(dirname(fileURLToPath(import.meta.url)), "../.."));
 const args = process.argv.slice(2);
 const operation = args.shift() ?? "help";
 const website = join(root, "apps", "website");
 const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
-  vp run agent setup              Build gm, install Chromium's headless shell, provision/migrate/seed isolated dev environment
-  vp run agent up [--sandbox]     Run the scoped app; --sandbox exercises local Docker CI instead of host runners
+  vp run agent setup [--ai]       Build gm, install Chromium's headless shell, provision/migrate/seed isolated dev environment.
+                                  No paid AI unless --ai (knowledge, wiki, embeddings, AI Search, assistant,
+                                  release notes, avatars, Atlas descriptions); --ai needs a fresh environment
+  vp run agent up [--sandbox]     Run the scoped app and CI dispatcher in the foreground; --sandbox exercises
+                                  local Docker CI instead of host runners
   vp run agent status             List owned environments (no secrets)
   vp run agent seed               Reconcile deterministic fixtures against the live environment
   vp run agent gm -- <args>       Use this worktree's binary, server, credentials and replica
@@ -43,9 +62,12 @@ const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
   vp run agent inspect [db|registry] [SQL]  Read local data; defaults to table inventory
   vp run agent check              Uncached quality gates plus fresh non-AI CLI/API/browser/mirror E2E
   vp run agent test               Fresh non-AI E2E; no AI resources or inference
-  vp run agent test-ai            Explicit real knowledge/graph/wiki/search verification; paid isolated resources
+  vp run agent test-ai [--stage <id>[,<id>]] [--all] [--resume] [--force] [--dry-run] [--base <ref>]
+                                  Paid real-provider verification of the stages your changes (against
+                                  origin/main) map to; --dry-run shows the selection. Stages:
+                                  ${AI_STAGES.map((stage) => stage.id).join(", ")}
   vp run agent stop               Stop only the owned dev server and its runners
-  vp run agent reset              Destroy/recreate this environment; never touch canonical dev state
+  vp run agent reset [--ai]       Destroy/recreate this environment; never touch canonical dev state
   vp run agent destroy            Delete owned remote resources and local credentials/state
   vp run agent cleanup --expired  Sweep all expired owned environments, including removed worktrees
   vp run agent maintenance install|status|uninstall
@@ -217,6 +239,7 @@ async function start(
           event: "server.ready",
           id: env.id,
           origin: env.origin,
+          ai: aiEnabled(env),
           log: join(ctx.artifacts, "server.log"),
         }),
       );
@@ -259,9 +282,14 @@ function superviseEnvironment(env: Environment): EnvironmentSupervisor {
   };
 }
 
-async function setup(): Promise<void> {
+const AI_OFF =
+  "AI is off: no Workers AI, AI Gateway, Vectorize or AI Search, so Knowledge builds, wiki, " +
+  "search, the assistant, release notes, avatars and Atlas descriptions show their AI-off states " +
+  "and spend nothing. Only for changes to those: vp run agent destroy, then vp run agent setup --ai.";
+
+async function setup(options: { ai: boolean }): Promise<void> {
   await prepare();
-  const env = await createEnvironment(root);
+  const env = await createEnvironment(root, false, options.ai);
   const ctx = await context(env);
   const supervisor = superviseEnvironment(env);
   let owned = true;
@@ -276,6 +304,8 @@ async function setup(): Promise<void> {
         event: "environment.seeded",
         id: env.id,
         origin: env.origin,
+        ai: aiEnabled(env),
+        ...(aiEnabled(env) ? {} : { note: AI_OFF }),
         next: "vp run agent up",
       }),
     );
@@ -285,7 +315,74 @@ async function setup(): Promise<void> {
   }
 }
 
-async function liveTest(ai = false): Promise<void> {
+/** One line per stage: why it runs (changed paths, a flag, or a stage that needs it). */
+function describeReasons(reasons: Reason[]): string {
+  return reasons
+    .map((reason) =>
+      reason.kind === "changed"
+        ? `changed: ${reason.paths.slice(0, 3).join(", ")}${reason.paths.length > 3 ? ` (+${reason.paths.length - 3} more)` : ""}`
+        : reason.kind === "required"
+          ? `required by ${reason.by.join(", ")}`
+          : reason.kind === "all"
+            ? "--all"
+            : "--stage",
+    )
+    .join("; ");
+}
+
+/** The test-ai stages to run, or null when there is nothing to run (or a dry run). */
+async function selectAiStages(options: TestAiOptions): Promise<Selection | null> {
+  const { base, changed } = await changedPaths(root, options.base);
+  const prints = await fingerprints(root, base, changed);
+  const history = await readHistory(root);
+  const selection = selectStages({
+    changed,
+    requested: options.stages,
+    all: options.all,
+    reusable: options.resume ? reusableStages(history.at(-1), base, prints) : undefined,
+    base,
+    fingerprints: prints,
+  });
+  console.log(
+    JSON.stringify(
+      {
+        event: "test-ai.selection",
+        base,
+        changed: changed.length,
+        stages: Object.fromEntries(
+          selection.stages.map((id) => [id, describeReasons(selection.reasons[id]!)]),
+        ),
+        skipped: selection.skipped,
+      },
+      null,
+      2,
+    ),
+  );
+  if (options.dryRun) return null;
+  if (!selection.stages.length) {
+    console.log(
+      JSON.stringify({
+        event: "test-ai.nothing-to-run",
+        reason: options.resume
+          ? "Every selected stage passed in the previous run with the same inputs."
+          : "No changed path maps to an AI stage; nothing is provisioned or spent.",
+        next: "Name stages with --stage <id> or use --all when a change needs them anyway.",
+      }),
+    );
+    return null;
+  }
+  const refused = options.force ? null : refusal(history, selection);
+  if (refused) throw new Error(refused);
+  return selection;
+}
+
+async function liveTest(ai = false, options?: TestAiOptions): Promise<void> {
+  let run: AiRun | undefined;
+  if (ai) {
+    const selection = await selectAiStages(options ?? parseTestAiOptions([]));
+    if (!selection) return;
+    run = { selection, outcomes: {} };
+  }
   const started = Date.now();
   let artifacts = join(
     root,
@@ -328,7 +425,7 @@ async function liveTest(ai = false): Promise<void> {
       // Independent repositories and reports; neither failure tears down the other's server.
       const results = await Promise.allSettled(
         ai
-          ? [runProviderE2E(ctx, fixtures, "ai")]
+          ? [runProviderE2E(ctx, fixtures, "ai", run)]
           : [runE2E(ctx, fixtures), runProviderE2E(ctx, fixtures, "mirror")],
       );
       const errors = results.flatMap((result) =>
@@ -368,9 +465,34 @@ async function liveTest(ai = false): Promise<void> {
       failedStages: timings
         .filter((stage) => stage.outcome === "failed")
         .map((stage) => stage.stage),
+      ...(run
+        ? {
+            aiStages: run.selection.stages,
+            aiStageOutcomes: run.outcomes,
+            failedAiStages: Object.keys(run.outcomes).filter(
+              (id) => run!.outcomes[id] === "failed",
+            ),
+          }
+        : {}),
     };
     await privateJson(join(artifacts, "timings.json"), timings);
     await privateJson(join(artifacts, "completion.json"), completion);
+    if (run)
+      // For --resume and the failure cooldown (ai-stages.ts).
+      await appendHistory(root, {
+        startedAt: new Date(started).toISOString(),
+        finishedAt: new Date().toISOString(),
+        success: completion.success,
+        base: run.selection.base,
+        stages: run.selection.stages,
+        fingerprints: run.selection.fingerprints,
+        outcomes: run.outcomes,
+        failedStages: [
+          ...completion.failedStages,
+          ...Object.keys(run.outcomes).filter((id) => run!.outcomes[id] === "failed"),
+        ],
+        evidence: artifacts,
+      });
     await retainReports(artifacts);
     console.log(JSON.stringify({ event: "e2e.complete", ...completion, evidence: artifacts }));
   }
@@ -448,7 +570,7 @@ async function destroyCurrent(): Promise<void> {
 
 try {
   if (operation === "help" || operation === "--help") console.log(help);
-  else if (operation === "setup") await setup();
+  else if (operation === "setup") await setup(parseSetupOptions(args));
   else if (operation === "status") console.log(JSON.stringify(await listEnvironments(), null, 2));
   else if (operation === "cleanup") {
     if (args.length !== 1 || args[0] !== "--expired")
@@ -472,10 +594,11 @@ try {
     console.log(JSON.stringify({ event: "browsers.prune", ...report }, null, 2));
   } else if (operation === "destroy") await destroyCurrent();
   else if (operation === "reset") {
+    const options = parseSetupOptions(args);
     await destroyCurrent();
-    await setup();
+    await setup(options);
   } else if (operation === "test") await liveTest();
-  else if (operation === "test-ai") await liveTest(true);
+  else if (operation === "test-ai") await liveTest(true, parseTestAiOptions(args));
   else if (operation === "check") await gates();
   else {
     const env = await loadEnvironment(root);

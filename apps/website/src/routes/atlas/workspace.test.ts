@@ -50,7 +50,7 @@ const repo = (
       : null,
 });
 
-/** A capability of `repoId` in `slot`: two repositories use the same slots on purpose. */
+/** A capability of `repoId`: two repositories use the same slots on purpose. */
 const cap = (repoId: string, local: string, slot: number, files = 10): AtlasRegion => ({
   id: `${repoId}/${local}`,
   repoId,
@@ -138,12 +138,23 @@ describe("selection", () => {
 });
 
 describe("workspace layout", () => {
-  test("repositories sharing slot numbers never overlap; each stays in its band", () => {
+  test("repositories' maps never overlap; each stays in its band", () => {
     const t = layout(["api", "web", "docs"], [A, B, C]);
     const top = t.cells.filter((c) => c.depth === 0);
     expect(top).toHaveLength(allRegions.length);
-    for (const a of top)
-      for (const b of top) if (a !== b) expect(overlaps(a, b), `${a.id} / ${b.id}`).toBe(false);
+    const land = new Map<string, string>();
+    for (const tile of t.tiles) {
+      const at = `${Math.round(tile.x)},${Math.round(tile.y)}`;
+      expect(land.get(at), `${tile.region} / ${land.get(at)}`).toBeUndefined();
+      land.set(at, tile.region);
+    }
+    for (const c of top) {
+      expect(c.size).toBeGreaterThan(0);
+      expect(t.tiles.filter((tile) => tile.region === c.id)).toHaveLength(c.size);
+    }
+    for (const a of t.bands)
+      for (const b of t.bands)
+        if (a !== b) expect(overlaps(a, b), `${a.name} / ${b.name}`).toBe(false);
     for (const band of t.bands) {
       expect(band.repoId).not.toBeNull();
       for (const c of top.filter((cell) => cell.entity.repoId === band.repoId)) {
@@ -181,7 +192,9 @@ describe("workspace layout", () => {
       before.bands.find((b) => b.name === "docs")!.x;
     for (const region of regionsOf.r3) {
       const was = rect(before, region.id);
-      expect(rect(withoutMiddle, region.id)).toEqual({ ...was, x: was.x + shift });
+      const now = rect(withoutMiddle, region.id);
+      expect(now.x).toBeCloseTo(was.x + shift, 6);
+      expect({ ...now, x: 0 }).toEqual({ ...was, x: 0 });
     }
   });
 
@@ -194,7 +207,8 @@ describe("workspace layout", () => {
       grown.filter((r) => r.repoId !== "r3"),
       new Map(),
     );
-    for (const region of [...regionsOf.r1, ...regionsOf.r2])
+    // web's own map may rearrange around its new capabilities; api's doesn't move.
+    for (const region of regionsOf.r1)
       expect(rect(after, region.id)).toEqual(rect(before, region.id));
     expect(after.bands.map((b) => [b.name, b.coverage.state])).toEqual([
       ["api", "ready"],
@@ -264,6 +278,7 @@ const overview = (repos: AtlasWorkspaceRepo[], id = "ws1.tag.2.2"): AtlasWorkspa
     ...envelope,
     regions,
     totalRegions: regions.length,
+    links: [],
     catalogue: {
       ...envelope,
       items: [],

@@ -3,8 +3,8 @@ import { developmentEnvironment } from "./vite/environment.ts";
 import { previewResources } from "./vite/preview.ts";
 
 // Remote services have no local emulator, so dev talks to the real ones
-// (Artifacts, Workers AI, Vectorize, AI Search). D1, the Durable Object and
-// the Workflow run locally.
+// (Artifacts, and with GITMATRIX_DEV_AI=enabled Workers AI, Vectorize and AI
+// Search). D1, the Durable Object and the Workflow run locally.
 const remote = { dev: { remote: true } };
 
 // CI jobs run in Cloudflare Sandbox containers once deployed. In `vp dev` they
@@ -75,7 +75,9 @@ export default defineConfig(({ mode, isPreview }) => {
   // (producers and consumers), cron, email, AI, the domain and the Secrets
   // Store. PREVIEW_MODE turns on worker/preview.ts's guards behind that.
   const preview = isPreview ? previewResources(env) : null;
-  const ai = !preview && !(dev && local.agent && env.GITMATRIX_AGENT_AI === "disabled");
+  // Deployed Workers always bind AI; development only when opted in
+  // (GITMATRIX_DEV_AI=enabled, or an agent environment set up with --ai).
+  const ai = !preview && (!dev || local.ai);
   const runner = (env.GITMATRIX_CI_RUNNER ?? (dev ? "local" : "sandbox")) as Runner;
   const sandboxed = runner === "sandbox";
   // Declaring the container makes `vite build` build its image, which needs
@@ -152,6 +154,10 @@ export default defineConfig(({ mode, isPreview }) => {
             (dev ? (env.GITMATRIX_ARTIFACTS_NAMESPACE ?? "gitmatrix-dev") : PRODUCTION.artifacts),
           ...remote,
         }),
+        // Whether AI Gateway logs keep request and response bodies where the
+        // site hasn't chosen (CORE-290, worker/ai-gateway.ts): development and
+        // agent environments hold no real user data, so they do.
+        AI_LOG_BODIES: bindings.text(dev ? "on" : "off"),
         // Knowledge graph and wiki.
         ...(ai
           ? {
@@ -177,6 +183,8 @@ export default defineConfig(({ mode, isPreview }) => {
           worker: "gitmatrix",
           exportName: "KnowledgeCoordinator",
         }),
+        // A timeline's live feed of steps in one repository (CORE-239).
+        STEP_FEED: bindings.durableObject({ worker: "gitmatrix", exportName: "StepFeed" }),
         // Workflows are the account's, not a Preview's: a preview binds none.
         ...(preview
           ? {}
@@ -227,6 +235,20 @@ export default defineConfig(({ mode, isPreview }) => {
         // (worker/knowledge/budget.ts `atlasSettings`). `agent test-ai` runs its
         // disabled, refused and exhausted providers through it; deployed
         // Workers always use the built-in defaults.
+        // Development only: the quiet period before a timeline's heavy work
+        // (worker/timelines/quiet.ts); agent environments shorten it.
+        ...(dev && env.GITMATRIX_TIMELINE_QUIET_SECONDS
+          ? { TIMELINE_QUIET_SECONDS: bindings.text(env.GITMATRIX_TIMELINE_QUIET_SECONDS) }
+          : {}),
+        // Development only: how long main's pushes settle before one Knowledge
+        // update (worker/settings/ai.ts `knowledgeSchedule`, CORE-286);
+        // deployed Workers use each account's settings.
+        ...(dev && env.GITMATRIX_KNOWLEDGE_QUIET_SECONDS
+          ? { KNOWLEDGE_QUIET_SECONDS: bindings.text(env.GITMATRIX_KNOWLEDGE_QUIET_SECONDS) }
+          : {}),
+        ...(dev && env.GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS
+          ? { KNOWLEDGE_MAX_WAIT_SECONDS: bindings.text(env.GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS) }
+          : {}),
         ...(dev && env.GITMATRIX_ATLAS_CONFIG
           ? { ATLAS_CONFIG: bindings.text(env.GITMATRIX_ATLAS_CONFIG) }
           : {}),
@@ -335,6 +357,7 @@ export default defineConfig(({ mode, isPreview }) => {
         Tracker: exports.durableObject({ storage: "sqlite" }),
         Assistant: exports.durableObject({ storage: "sqlite" }),
         KnowledgeCoordinator: exports.durableObject({ storage: "sqlite" }),
+        StepFeed: exports.durableObject({ storage: "sqlite" }),
         // A Workflow's name is the account's: a preview declaring these would
         // redefine production's.
         ...(preview

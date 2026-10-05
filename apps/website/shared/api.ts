@@ -40,7 +40,13 @@ export interface AgentRef {
   name: string;
 }
 
-/** Self-reported advisory metadata, never an authorization or scheduling policy. */
+/**
+ * What an agent reports about itself (`gm agent setup`). Issues can require
+ * some of it (`Issue.requires`, CORE-32): that decides which agents are
+ * eligible to claim them, and `gm issue next` skips the rest. It is
+ * self-reported eligibility, never authorization: repository and tracker
+ * permissions are enforced as before, and people can always claim.
+ */
 export interface AgentCapabilities {
   version: 1;
   harness: string | null;
@@ -266,6 +272,14 @@ export interface KnowledgeStatus {
   indexedAt: string | null;
   /** The repository's current HEAD, to compare with `indexedCommit`. */
   head: string | null;
+  /**
+   * Pushes to main waiting for the next update (CORE-286): how many, since
+   * when, and when the update starts (null until scheduled). Null when the
+   * indexed commit is HEAD or an update is running.
+   */
+  pending: { pushes: number; since: string; dueAt: string | null } | null;
+  /** Whether the viewer may start the pending update now (repository admins). */
+  canUpdate: boolean;
   state: "empty" | "up-to-date" | "queued" | "building" | "failed";
   /** Changes whenever the stored graph does, including mid-build; the map is cached by it. */
   graphVersion: string;

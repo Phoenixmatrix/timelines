@@ -29,6 +29,8 @@ import { api, load } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { repoPath } from "../../lib/refs.ts";
 import { scopeOf } from "../../lib/timelineScope.ts";
+import { useRefContext } from "../../refs/context.ts";
+import { LinkedText } from "../../refs/RefLink.tsx";
 
 export async function trackerReleasesLoader({ request, params }: LoaderFunctionArgs) {
   const q = new URL(request.url).searchParams.get("q") ?? "";
@@ -57,11 +59,16 @@ function weekOf(iso: string): string {
   return day.toISOString();
 }
 
-/** Add `key:value` to the query, or take it out when it's there. */
+/** `label:` is the old spelling of `tag:` (CORE-271): compare tokens as `tag:`. */
+function canonical(token: string): string {
+  return token.replace(/^(-?)(labels?|tags):/i, "$1tag:").toLowerCase();
+}
+
+/** Add `key:value` to the query, or take it out when it's there (in any spelling). */
 function toggle(q: string, key: string, value: string): string {
   const token = `${key}:${/\s/.test(value) ? `"${value}"` : value}`;
   const tokens: string[] = q.match(/(-?[A-Za-z]+:)?"[^"]*"|\S+/g) ?? [];
-  const at = tokens.findIndex((t) => t.toLowerCase() === token.toLowerCase());
+  const at = tokens.findIndex((t) => canonical(t) === canonical(token));
   if (at === -1) tokens.push(token);
   else tokens.splice(at, 1);
   return tokens.join(" ");
@@ -85,13 +92,14 @@ function Facets({
   min?: number;
   label?: (facet: ReleaseFeedFacet) => string;
 }) {
-  if (facets.length < min && !new RegExp(`(^|\\s)${queryKey}:`, "i").test(q)) return null;
+  const tokens = (q.match(/(-?[A-Za-z]+:)?"[^"]*"|\S+/g) ?? []).map(canonical);
+  if (facets.length < min && !tokens.some((t) => t.startsWith(`${queryKey}:`))) return null;
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       <span className="mr-1 text-micro text-ink-faint">{title}</span>
       {facets.slice(0, 12).map((facet) => {
-        const token = `${queryKey}:${facet.value}`;
-        const pressed = q.toLowerCase().split(/\s+/).includes(token.toLowerCase());
+        const value = /\s/.test(facet.value) ? `"${facet.value}"` : facet.value;
+        const pressed = tokens.includes(canonical(`${queryKey}:${value}`));
         return (
           <button
             key={facet.value}
@@ -120,6 +128,9 @@ function Entry({
   expanded: boolean;
   onSelect: (id: string, trigger: HTMLButtonElement) => void;
 }) {
+  // Refs resolve in this tracker first, then in the entry's repository (CORE-22).
+  const { tracker } = useRefContext();
+  const context = { tracker, owner: entry.repo.owner, repo: entry.repo.name };
   return (
     <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -127,9 +138,15 @@ function Entry({
         {scope && landedTimelineSlug(entry.timeline) === scope && (
           <span className="mk-chip mk-chip--tag">This timeline</span>
         )}
-        <span className="text-body font-semibold text-ink">{entry.title}</span>
+        <span className="text-body font-semibold text-ink">
+          <LinkedText text={entry.title} context={context} />
+        </span>
       </div>
-      {entry.summary && <p className="m-0 text-body-sm text-ink-muted">{entry.summary}</p>}
+      {entry.summary && (
+        <p className="m-0 text-body-sm text-ink-muted">
+          <LinkedText text={entry.summary} context={context} />
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-micro text-ink-faint">
         {entry.repos.map((repo) => (
           <span key={`${repo.owner}/${repo.name}`}>
@@ -147,7 +164,7 @@ function Entry({
             {repo.releases
               .map(
                 (name) =>
-                  `${releaseKind(name) === "daily" ? "Daily update" : "Tag"} ${releaseLabel(name)}`,
+                  `${releaseKind(name) === "daily" ? "Daily update" : "Tagged release"} ${releaseLabel(name)}`,
               )
               .join(", ")}
           </span>
@@ -196,7 +213,12 @@ export function TrackerReleases() {
       : undefined;
   const selection: ReleaseNoteDetailsSelection | null =
     selected && selectedEntry
-      ? { entry: selectedEntry, repo: selectedEntry.repos[0] ?? null, trigger: selected.trigger }
+      ? {
+          entry: selectedEntry,
+          // Commits are the entry's own repository's, whichever groups list it.
+          repo: selectedEntry.repo,
+          trigger: selected.trigger,
+        }
       : null;
   const closeDetails = useCallback(() => setSelected(null), []);
   useEffect(() => {
@@ -234,8 +256,8 @@ export function TrackerReleases() {
         </button>
       </header>
       <p className="m-0 max-w-[52rem] text-body-sm text-ink-muted">
-        Daily updates group default-branch first-parent commits by UTC Git commit date. Named tags
-        are optional snapshots, not deployment records.
+        Daily updates group default-branch first-parent commits by UTC Git commit date. Tagged
+        releases are optional snapshots, not deployment records.
       </p>
       <Form method="get" className="relative flex max-w-[52rem] items-center" role="search">
         <MagnifyingGlassIcon
@@ -258,10 +280,10 @@ export function TrackerReleases() {
       </Form>
       <p id="release-query-help" className="m-0 -mt-2 text-micro text-ink-faint">
         {feed.query.unknown.length ? `Not understood: ${feed.query.unknown.join(" ")}. ` : ""}
-        Daily updates are shown by default. Use kind:tag for named snapshots or
-        release:day:YYYY-MM-DD for a UTC day. Filter by team, repo, ws, type, label, release, kind,
-        timeline, since and until; prefix with - to exclude. These are code updates, not
-        deployments.
+        Daily updates are shown by default. Use kind:tag for tagged releases or
+        release:day:YYYY-MM-DD for a UTC day. Filter by team, repo, ws, type, tag (issue tags),
+        release, kind, timeline, since and until; prefix with - to exclude. These are code updates,
+        not deployments.
       </p>
       <div className="flex max-w-[52rem] flex-col gap-2">
         <div className="flex flex-wrap items-center gap-1.5">
@@ -288,7 +310,7 @@ export function TrackerReleases() {
                 );
               }}
             >
-              {kind === "daily" ? "Daily updates" : "Tags"}
+              {kind === "daily" ? "Daily updates" : "Tagged releases"}
             </button>
           ))}
         </div>
@@ -317,10 +339,10 @@ export function TrackerReleases() {
           onQuery={onQuery}
         />
         <Facets
-          title="Labels"
-          facets={feed.facets.labels}
+          title="Tags"
+          facets={feed.facets.tags ?? feed.facets.labels}
           q={q}
-          queryKey="label"
+          queryKey="tag"
           onQuery={onQuery}
         />
         <Facets

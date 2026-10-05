@@ -139,6 +139,53 @@ function seedMain(sqlite: DatabaseSync) {
   addRun("run_live", "r_app", 27, null, "running");
   addRun("run_sam", "r_sam", 1, 300);
 
+  // ---- step-steering (days 365), step-artifacts (days 90), CORE-244: an old
+  // step's instructions and steering are trimmed; a recent step, one already
+  // trimmed, a deleted one, an old one without any and Sam's are kept. An old
+  // step-run summary goes; a recent one and Sam's stay. Artifacts hang off runs
+  // ci-runs keeps, so the two never meet here.
+  const stepRow = sqlite.prepare(`
+    INSERT INTO step_contexts (repo_id, change_id, commit_oid, author_id, accountable_id,
+      timeline, summary, context, committed_at, deleted_at)
+    VALUES (?, ?, ?, 'acc_ann', 'acc_ann', 'search', 'Step', ?, ?, ?)`);
+  const said = (why: string, extra: object = {}) =>
+    JSON.stringify({
+      why,
+      instructions: [{ text: "Rank by recency", source: "hook", at: ago(500) }],
+      steering: [{ text: "Keep score as the tie-breaker", source: "hook" }],
+      tests: [{ command: "vp test", exit: 0, summary: "ok", origin: "local" }],
+      coverage: { instructions: "hook:claude-code", steering: "hook:claude-code" },
+      ...extra,
+    });
+  for (let n = 0; n < 5; n++)
+    stepRow.run(
+      "r_app",
+      `old_steered_${n}`,
+      oid(910 + n),
+      said(`Old why ${n}`),
+      ago(400 + n),
+      null,
+    );
+  stepRow.run("r_app", "recent", oid(902), said("Recent why"), ago(10), null);
+  stepRow.run(
+    "r_app",
+    "old_trimmed",
+    oid(903),
+    said("Trimmed", { trimmedAt: ago(30) }),
+    ago(500),
+    null,
+  );
+  stepRow.run("r_app", "old_deleted", oid(904), "{}", ago(500), ago(450));
+  stepRow.run("r_app", "old_quiet", oid(905), JSON.stringify({ why: "No words" }), ago(500), null);
+  stepRow.run("r_sam", "sam_old", oid(906), said("Sam's"), ago(500), null);
+  const artifact = sqlite.prepare(`
+    INSERT INTO step_artifacts (id, repo_id, commit_oid, run_id, kind, data, created_at)
+    VALUES (?, ?, ?, ?, 'test-summary', '{"status":"succeeded","passed":1,"failed":0,"jobs":[]}', ?)`);
+  for (let n = 0; n < 5; n++)
+    artifact.run(`art_old_${n}`, "r_app", oid(10 + n), `run_${10 + n}`, ago(200 + n));
+  artifact.run("art_recent", "r_app", oid(26), "run_recent", ago(1));
+  artifact.run("art_sam", "r_sam", oid(1), "run_sam", ago(300));
+
   // ---- preview-records: expired records past 30 days (selected), and kept:
   // recent, live, failed, production, a run's, another account's.
   const deployment = sqlite.prepare(`
@@ -550,6 +597,20 @@ export const FIXTURES: Record<string, Fixture> = {
         t,
         "SELECT id AS k FROM ci_runs WHERE id NOT IN ('run_1', 'run_2', 'run_5', 'run_6', 'run_7')",
       ),
+  },
+  "step-steering": {
+    target: ORBIT,
+    touches: ["db:step_contexts"],
+    kept: (t) =>
+      db(
+        t,
+        "SELECT change_id || ' ' || context AS k FROM step_contexts WHERE change_id NOT LIKE 'old_steered_%'",
+      ),
+  },
+  "step-artifacts": {
+    target: ORBIT,
+    touches: ["db:step_artifacts"],
+    kept: (t) => db(t, "SELECT id AS k FROM step_artifacts WHERE id NOT LIKE 'art_old_%'"),
   },
   "preview-records": {
     target: ORBIT,

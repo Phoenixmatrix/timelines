@@ -21,6 +21,8 @@ export const ATLAS_OVERVIEW_MAX_BYTES = 256 * 1024;
 export const ATLAS_OVERVIEW_SUMMARY_CHARS = 2000;
 /** Summary characters a region catalogue entry carries. */
 export const ATLAS_CATALOGUE_SUMMARY_CHARS = 280;
+/** Areas an overview region carries for the map (three rings of hexagons); `children` has them all. */
+export const ATLAS_OVERVIEW_AREAS = 37;
 /** Repositories one workspace scope can select. */
 export const ATLAS_WORKSPACE_MAX_REPOS = 50;
 
@@ -141,6 +143,14 @@ export interface AtlasRegion extends AtlasEntitySummary {
   size: { files: number; members: number };
   /** The summary was cut (ATLAS_OVERVIEW_SUMMARY_CHARS, or ATLAS_CATALOGUE_SUMMARY_CHARS in the catalogue); `detail` has it whole. */
   summaryTruncated: boolean;
+  /**
+   * In an overview, a capability's first ATLAS_OVERVIEW_AREAS areas (its
+   * concepts), in `children` order with summaries cut to
+   * ATLAS_CATALOGUE_SUMMARY_CHARS: the map draws each as a hexagon without
+   * reading every region's children. Absent in the catalogue and for regions
+   * without areas.
+   */
+  areas?: AtlasEntitySummary[];
 }
 
 /** GET /overview */
@@ -156,11 +166,20 @@ export interface AtlasOverview extends AtlasEnvelope {
   catalogue: AtlasPage<AtlasRegion>;
   /** Top-level regions in all. */
   totalRegions: number;
+  /** Imports between two of `regions`, for placing them on the map. */
+  links: AtlasRegionLink[];
   /**
    * The newest build of this scope didn't fit its storage cap, so the current
    * snapshot is stale (older than the latest build); null when it isn't.
    */
   capacityFailure: AtlasCapacityFailure | null;
+}
+
+/** `weight` file imports from `src` into `dst`: a `depends_on` relation between two overview regions. */
+export interface AtlasRegionLink {
+  src: string;
+  dst: string;
+  weight: number;
 }
 
 /** A snapshot that failed to publish for want of projection storage (CORE-159). */
@@ -490,6 +509,8 @@ export interface AtlasWorkspaceOverview extends AtlasWorkspaceEnvelope {
   regions: AtlasRegion[];
   catalogue: AtlasWorkspacePage<AtlasRegion>;
   totalRegions: number;
+  /** Imports between two of `regions` in the same repository (ids qualified like theirs). */
+  links: AtlasRegionLink[];
 }
 
 export type AtlasWorkspaceDetail = InWorkspace<AtlasDetail>;

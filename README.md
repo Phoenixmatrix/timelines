@@ -69,13 +69,29 @@ Knowledge link opens the same view across the repositories you pick.
 
 ### AI usage in Cloudflare AI Gateway
 
-Open Cloudflare **AI Gateway → `gitmatrix`** for production usage; normal local
-development uses `gitmatrix-dev`. Application inference, including knowledge/wiki
+Open Cloudflare **AI Gateway → `gitmatrix`** for production usage; local
+development uses `gitmatrix-dev` when its AI is on. AI is **opt-in** in
+development: `vp dev` binds no Workers AI, AI Gateway, Vectorize or AI Search,
+and says so when it starts, unless started with `GITMATRIX_DEV_AI=enabled vp dev`
+(Knowledge builds of real repositories cost money; building this repository
+once cost about $44). Application inference, including knowledge/wiki
 generation, graph embeddings, routing, assistant streams/titles and avatars, goes
 through the configured Gateway. Filter logs by `metadata.component`: `knowledge`,
-`assistant`, `assistant-title` or `avatars`. Application calls disable raw
-prompt/response payload storage while retaining model, status, tokens, cost and
-latency metadata.
+`assistant`, `assistant-title`, `assistant-status`, `avatars`, `release-notes` or
+`merge-queue` (and `metadata.account`/`metadata.feature`, as in `ai_usage`).
+Logs always keep model, status, tokens, cost and latency. Whether they also keep
+request and response bodies is a setting per component, "Keep AI request and
+response bodies in gateway logs" (CORE-290): a site default (site admins,
+**Settings → Site AI settings** or `gm settings ai set --site --log-bodies on`),
+which an account's administrators can override for their own account's calls
+(**AI settings** or `gm settings ai set --log-bodies assistant=off`). Without a
+site choice deployed servers keep no bodies (`AI_LOG_BODIES=off`) and the dev
+server and agent environments keep them (`on`). Where the effective setting is
+off, a call sends `cf-aig-collect-log-payload: false`. Kept bodies, including
+repository code and assistant conversations, are readable by the Cloudflare
+account's dashboard users and deleted oldest-first with the gateway's logs
+(`cf ai-gateway logs get-request|get-response <id> --gateway-id gitmatrix`).
+Settings are read once a minute per isolate, not per call.
 
 The Worker reads the `AI_GATEWAY` text binding. Agent environments override it
 with their owned `GITMATRIX_AI_GATEWAY`; they never fall back to a shared Gateway.
@@ -89,7 +105,7 @@ AI Search usage, not Gateway logs or analytics. Those models remain unchanged;
 consult AI Search usage for that portion. Query rewriting/generation and
 external-provider model calls use its connected Gateway
 ([Cloudflare's coverage](https://developers.cloudflare.com/ai-search/configuration/models/ai-gateway/)).
-Application payload-suppression headers do not configure managed Search logging.
+The body logging setting does not configure managed Search logging.
 
 For a new deployment, create the Gateway before deploying the Worker, then connect
 the existing Search instance (use `gitmatrix-dev` and namespace `gitmatrix` for
@@ -110,14 +126,37 @@ the exact source revision. These links stay out of the reading view until opened
 Select another item's time to switch details, or use Close or Escape to dismiss
 the sidebar and return focus to the opener. On phones, details fill the screen.
 
+## Steps: work context for every commit
+
+In a timeline, agents commit at meaningful steps, and each step carries the
+context that produced it: the person's instructions and steering, why the
+work was done this way, what got in the way, and its test results (PRD
+CORE-226). People and agents read it live and long after:
+
+- **Writing:** `gm step -m '…' --context step.md` tests, commits and pushes;
+  harness hooks for Claude Code, Codex and Oh My Pi record what the person said
+  (`gm agent setup` installs them). Missing context warns, never blocks.
+- **Reading:** the timeline page's **Live now** and **Story**, a line's
+  **Why?** in the file view, and `gm steps --follow`, `gm context show`,
+  `gm log --context`, `gm why`.
+- **Checks:** `on: step` jobs in `.gitmatrix/ci.yml` run on every timeline push
+  (`gm test` runs the local ones); a timeline's full CI and knowledge overlays
+  wait for a quiet period or a checkpoint.
+- **Keeping it:** the why stays with the repository; instructions and steering,
+  step-run artifacts and the live feed follow the Data retention categories.
+
+Details: `apps/cli/README.md` ("Steps: context for every commit") and
+`apps/website/README.md` ("Steps: work context per commit", "Step runs").
+
 ## Data retention
 
 Most retention categories are opt-in. **Timeline work Git repositories** is
-enabled by default: 30 days after landing, 90 after abandonment. Account
-administrators can change both durations or disable that policy in
-**Settings → Data retention**. Site administrators set site categories
-(shared caches, the registry, sign-in state, usage records) and defaults for
-every account in **Settings → Site data retention**. Each category says what it never
+enabled by default: 30 days after landing, 90 after abandonment. Expired
+sign-in state (auth hygiene) is always cleaned up. Account administrators can
+change both durations or disable that policy in **Settings → Data retention**.
+Site administrators set site categories (shared caches, the registry, sign-in
+state, usage records) and defaults for every account in
+**Settings → Site data retention**. Each category says what it never
 deletes. **Clean up now** previews any categories (a dry run with counts,
 bytes and estimated storage cost) before deleting, and every run, scheduled
 or manual, is kept in the run history with who started it. The same from a
@@ -143,9 +182,14 @@ a feature worktree's `gm` over the shared binary.
 - Linux (including WSL2) with a running **user systemd** manager and `flock`.
 - Vite+, Node 24+, the Rust toolchain, Git and curl. `vp install` selects pinned
   pnpm 12.8.1; each worktree installs its own links into the shared global store.
+- A **system Node** (18+, in `/usr/bin` or `/usr/local/bin`; on Debian,
+  `sudo apt-get install nodejs`). The merge queue's trusted merge program runs
+  with the merge credential and only system tools, never `node_modules/.bin` or
+  version-manager shims, so a local runner needs one (CORE-257). Keep vp's Node
+  first on `PATH` for everything else; `vp env doctor` checks it.
 - `cf` installed outside the worktree, authenticated with `cf auth login`.
-  Automatic non-AI E2E needs Artifacts access. Interactive setup and explicit AI
-  verification also need Vectorize, AI Search, Workers AI and AI Gateway access.
+  Setup and automatic non-AI E2E need Artifacts access. `setup --ai` and explicit
+  AI verification also need Vectorize, AI Search, Workers AI and AI Gateway access.
   If login exposes multiple accounts, set `CLOUDFLARE_ACCOUNT_ID` explicitly.
 - Chromium's OS dependencies. Setup installs only the pinned Playwright version's
   Chromium **headless shell** (`playwright install --only-shell chromium`) and checks
@@ -168,7 +212,17 @@ vp run agent up
 
 `setup` builds this worktree's debug `gm`, generates Worker types, provisions
 uniquely named remote resources, migrates both local D1 databases and reconciles
-small deterministic fixtures. It starts the app while seeding and stops it afterward
+small deterministic fixtures.
+
+**AI is off unless you ask for it.** Plain `setup` provisions only Artifacts:
+no Workers AI, AI Gateway, Vectorize or AI Search, so seeding and your pushes
+start no paid Knowledge builds, and the UI shows its honest AI-off states.
+`vp run agent setup --ai` adds the AI resources; use it only for changes to
+knowledge, wiki, embeddings, AI Search, the assistant, release-note generation,
+avatars or Atlas descriptions that you must see working with real models (most
+changes, AI-adjacent UI included, don't). An existing environment keeps what it
+was created with: `destroy`, then `setup --ai` (or `reset --ai`). `status` and
+setup's output show each environment's `ai`. It starts the app while seeding and stops it afterward
 unless it was already running. `up` runs the app in the foreground; use its printed
 loopback origin, not a remembered port. CI runners start on demand from the same
 worktree's binary, with two runner slots.
@@ -222,7 +276,7 @@ development; harness dev endpoints additionally require an environment capabilit
 ```bash
 vp run ready                 # uncached quality gates + non-AI live E2E
 vp run agent test            # fresh non-AI live E2E only
-vp run agent test-ai         # explicit paid knowledge/wiki/search verification
+vp run agent test-ai         # explicit paid verification of the AI stages your change maps to
 ```
 
 `ready` runs formatting/lint checks, Rust format/clippy, all website and harness
@@ -233,19 +287,30 @@ or an unavailable browser fail the command. The website's `vp test` includes
 browser-mode tests in headless Chromium; UI behaviour belongs there, and E2E
 keeps a few real-stack journeys (apps/website/README.md, "Testing").
 
+The usage and retention browser journeys close each persona/viewport context after
+its assertions and trace finish, before opening the next. Keep that lifetime bounded:
+finished pages still consume renderer memory if left open until scenario teardown.
+
+The Chronicle journey compares the range summary with the same API issue population
+the browser loads. Ruler drags update the address before the inspector's close link
+necessarily rerenders: wait for that link's final range destination, then verify
+closing preserves it before comparing counts. The selected range must include the
+showcase issue's completion so the done-count check cannot pass without exercising it.
+
 The E2E command creates a **separate ephemeral environment**, seeds it twice,
 exercises it and destroys it on success or failure. It does not reset the interactive
 environment. Its checks include:
 
-| Boundary                       | Observable behavior                                                                                                                                                               |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Authentication and permissions | Anonymous/public access, invalid and revoked tokens, read/write roles, private-repo concealment                                                                                   |
-| CLI and Git transport          | Real clone/commit/push; denied push leaves remote refs unchanged                                                                                                                  |
-| Tracker                        | Blocked and contested claims, fencing, completion evidence and local replica synchronization                                                                                      |
-| Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance                                |
-| CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                                                              |
-| Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries; a scoped timeline round trip; an Atlas smoke down to the cited source |
-| Mirror                         | Authenticated Git mirror update/tag/prune, default branch and tags only, rejected credentials and recovery against a real local HTTP target                                       |
+| Boundary                       | Observable behavior                                                                                                                                                                                                                 |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Authentication and permissions | Anonymous/public access, invalid and revoked tokens, read/write roles, private-repo concealment                                                                                                                                     |
+| CLI and Git transport          | Real clone/commit/push; denied push leaves remote refs unchanged                                                                                                                                                                    |
+| Tracker                        | Blocked and contested claims, fencing, completion evidence and local replica synchronization                                                                                                                                        |
+| Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance                                                                                  |
+| CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                                                                                                                |
+| Steps                          | `gm step` with a hook-captured instruction and steering, local `gm test` results, the live feed within 5 s, the step run's summary, a no-context warning, anonymous readers refused, and `gm why` on a landed line showing its step |
+| Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries; a scoped timeline round trip; an Atlas smoke down to the cited source                                                   |
+| Mirror                         | Authenticated Git mirror update/tag/prune, default branch and tags only, rejected credentials and recovery against a real local HTTP target                                                                                         |
 
 Local runners keep deadline and cancellation supervision after stdout/stderr EOF.
 Silent running steps use a five-second cancellation heartbeat. The live cancellation
@@ -298,10 +363,46 @@ checkouts; concurrent jobs lease separate slots. Tests still run every time.
 ### AI capability verification
 
 Real AI checks are **not automatic CI requirements**. For changes to knowledge
-builds, graph extraction, generated wiki, embeddings, AI Search or AI-written
-release notes, follow the
+builds, graph extraction, generated wiki, embeddings, AI Search, the assistant,
+AI-written release notes, avatars or the Atlas, follow the
 [AI verification skill](.agents/skills/gitmatrix-ai-verification/SKILL.md) and run
-`vp run agent test-ai`. It provisions its own paid resources and verifies the exact
+`vp run agent test-ai`.
+
+It is **targeted**: it runs only the stages that the paths you changed against
+`origin/main` (commits, the working tree and untracked files) map to, plus the
+stages those build on. The mapping lives beside each stage, in
+`tools/agent/provider-e2e.ts` (`COPPER_FINCH_STAGES`) and
+`tools/agent/atlas-provider-e2e.ts` (`ATLAS_STAGES`); shared AI infrastructure
+(`tools/agent/ai-stages.ts` `SHARED_PATHS`: the bindings, the Worker entry, the
+Gateway and model layer, AI settings, dependency versions) runs every stage. A
+change that maps to no stage provisions nothing. `--dry-run` prints the
+selection and why; `--stage <id>` and `--all` add stages, never remove one whose
+code changed. `--resume` after a failure skips stages that passed in this
+worktree's previous run from the same merge base with the same changed content
+(their prerequisites still run in the new environment). Within 30 minutes of a
+failure it refuses a full run, and any rerun with nothing changed, unless
+`--force`: inspect the evidence and fix the cause instead of looping.
+`completion.json` and `ai-e2e.json` (`selection`, `stages`, `cost`) record which
+stages ran, why, their outcomes and the Gateway-logged spend.
+
+| Stage                                                | Verifies                                                                       |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `knowledge`                                          | AI settings admission, the build, graph and generated wiki overview            |
+| `search`                                             | Vectorize entity and AI Search passage visibility, isolation, palette search   |
+| `assistant`                                          | A real turn from the index, approval-gated writes, retry, status between steps |
+| `avatars`                                            | Real avatar generation within its ten-call budget                              |
+| `knowledge-edit`                                     | An edit's incremental rebuild, concept naming, successor build settings        |
+| `release-notes`                                      | Daily notes, rollover, a tag, a tracker issue's entry, the team feed           |
+| `overlays`                                           | A timeline bookmark's knowledge overlay, main untouched                        |
+| `timeline-pages`                                     | A checkpoint's wiki pages, main untouched                                      |
+| `repository-deletion`                                | Purging the fixture's vectors, search items and Artifacts; the orphan sweep    |
+| `queue`                                              | The merge queue's real conflict repair                                         |
+| `atlas-describe`                                     | The ledger's capabilities named and summarized with provenance; Knowledge tab  |
+| `atlas-workspace`                                    | A dependency resolved across repositories in the workspace Atlas               |
+| `atlas-reuse`                                        | Unchanged prose reused after a README push                                     |
+| `atlas-disabled`, `atlas-refused`, `atlas-exhausted` | The three degraded Atlas providers                                             |
+
+Every run provisions its own paid resources. Together, the stages verify the exact
 pushed commit, named graph relationships, generated wiki provenance/content, and
 matching Vectorize entities plus AI Search source passages. It also verifies
 daily release-note rollover by UTC committer date, retained commit provenance,
@@ -309,9 +410,10 @@ optional named tags and non-duplicated daily tracker feeds. It exercises real av
 generation and checks Gateway attempts within its ten-call budget, with successes matching the
 returned images (the API permits partial generation). It also checks successful
 Gateway records for knowledge, embeddings and assistant streaming/titles, including
-empty payloads and usage metadata. `ai-e2e.json` retains sanitized Gateway evidence. Assertions check source
+usage metadata, and that bodies are kept for knowledge and assistant streams (the agent
+environment's default) but not for titles and status lines, which the persona turns off. `ai-e2e.json` retains sanitized Gateway evidence. Assertions check source
 facts, not exact generated wording. Missing providers or an expired visibility
-deadline fail honestly. Normal interactive `agent setup` remains AI-enabled.
+deadline fail honestly. Interactive `agent setup` is AI-off unless `--ai`.
 
 Build completion acknowledges uploads, not search visibility. The AI gate observes
 the fixture item’s own AI Search indexing status before making at most six
@@ -344,7 +446,7 @@ not cold-install or provider-latency guarantees:
 | Full non-AI completion gate            | 157 seconds       |
 | Non-AI E2E including lifecycle         | 107 seconds       |
 
-These setup measurements include AI-enabled interactive resources. Use the current
+These setup measurements predate AI-off setup and include AI resources. Use the current
 run's `timings.json` for automatic-gate measurements; historical totals that included
 live AI generation/search are not comparable to the non-AI gate.
 The measured non-AI E2E spent 41 seconds exercising scenarios, with mirror work
@@ -354,7 +456,7 @@ overlapped. These are local verification measurements, not a new trunk CI run.
 
 ```bash
 vp run agent stop                # stop app/runners; keep data until expiry
-vp run agent reset               # destroy owned data/resources, then fresh setup
+vp run agent reset [--ai]        # destroy owned data/resources, then fresh setup
 vp run agent destroy             # delete this worktree's interactive environment
 vp run agent cleanup --expired   # sweep expired environments across worktrees
 vp run agent maintenance status
@@ -372,7 +474,7 @@ vp run agent maintenance status
   and Artifacts repositories/namespace independently. Failed deletions stay journaled and are
   retried; unrelated resources are never discovered and deleted by prefix alone.
   AI environments created before Gateway ownership was introduced must be destroyed
-  and recreated with `setup`; their legacy journals remain valid for cleanup.
+  and recreated with `setup --ai`; their legacy journals remain valid for cleanup.
 - Foreground apps stop at expiry. Process-group shutdown is PID-start-time fenced;
   kernel-backed locks release after crashes. A removed or redirected worktree
   cannot prevent remote resource deletion. Local credentials, state, disposable

@@ -2,9 +2,10 @@ import { describe, expect, test } from "vite-plus/test";
 import { describeWrite, toolLabel } from "../../shared/assistant.ts";
 import { allowedPath } from "./internal.ts";
 import { planFrom, questions } from "./plan.ts";
+import { cleanStatus, progressPrompt, stepFromMessage } from "./progress.ts";
 import { sentenceCase } from "./titles.ts";
 import { parseSkill } from "./skills.ts";
-import { clip, compact } from "./tools.ts";
+import { buildTools, clip, compact } from "./tools.ts";
 
 describe("clef routing", () => {
   test("one call asks every question, within clef's limit", () => {
@@ -95,7 +96,8 @@ describe("approvals say what the request does", () => {
         team: "CORE",
         title: "Ship search",
         priority: 1,
-        labels: ["search"],
+        tags: ["search"],
+        requires: "tag:search",
         description: "Body",
       }),
     ).toEqual({
@@ -103,10 +105,23 @@ describe("approvals say what the request does", () => {
       fields: [
         ["Title", "Ship search"],
         ["Priority", "P1"],
-        ["Labels", "search"],
+        ["Tags", "search"],
+        ["Agent requirements", "tag:search"],
       ],
       body: "Body",
     });
+    // The old spellings read the same way on the card (CORE-271).
+    for (const old of [{ labels: ["search"] }, { label: "search" }])
+      expect(
+        describeWrite("create_issue", { team: "CORE", title: "T", ...old }).fields,
+      ).toContainEqual(["Tags", "search"]);
+    expect(
+      describeWrite("update_issue", { key: "CORE-1", changes: { labels: ["a"], requires: "" } })
+        .fields,
+    ).toEqual([
+      ["Tags", "a"],
+      ["Agent requirements", ""],
+    ]);
     const raw = describeWrite("api_write", {
       summary: "Make it private",
       method: "PATCH",
@@ -118,6 +133,67 @@ describe("approvals say what the request does", () => {
     expect(toolLabel("navigate", { path: "/tracker/o/issues/A-1", label: "A-1" })).toBe(
       "Opened A-1",
     );
+  });
+});
+
+describe("status lines between steps", () => {
+  test("the small model reads the request and what the last step did, briefly", () => {
+    const prompt = progressPrompt("Why did run #44 fail?", {
+      text: "Let me check the run.",
+      toolCalls: [{ toolName: "ci_run", toolCallId: "a", input: { number: 44 } }],
+      toolResults: [{ toolCallId: "a", output: { status: "failed", log: "x".repeat(5000) } }],
+    });
+    expect(prompt).toContain("Request: Why did run #44 fail?");
+    expect(prompt).toContain("- Read CI run #44\n  Result: {");
+    expect(prompt).toContain("Just said: Let me check the run.");
+    expect(prompt.length).toBeLessThan(1200);
+  });
+
+  test("a continued reply's last step comes from its message", () => {
+    const step = stepFromMessage({
+      parts: [
+        { type: "step-start" },
+        { type: "tool-show_issue", toolCallId: "old", input: { key: "A-1" }, output: {} },
+        { type: "step-start" },
+        { type: "text", text: "Opening it." },
+        {
+          type: "tool-navigate",
+          toolCallId: "nav",
+          input: { path: "/tracker/o/issues/A-2", label: "A-2" },
+          output: { opened: "/tracker/o/issues/A-2" },
+        },
+      ],
+    });
+    expect(step).toEqual({
+      text: "Opening it.",
+      toolCalls: [
+        {
+          toolName: "navigate",
+          toolCallId: "nav",
+          input: { path: "/tracker/o/issues/A-2", label: "A-2" },
+        },
+      ],
+      toolResults: [{ toolCallId: "nav", output: { opened: "/tracker/o/issues/A-2" } }],
+    });
+    // An approved write that hasn't run, or a reply without tools: nothing to say yet.
+    expect(
+      stepFromMessage({
+        parts: [{ type: "tool-create_issue", toolCallId: "w", input: {} }],
+      }),
+    ).toBeNull();
+    expect(stepFromMessage({ parts: [{ type: "text", text: "Hi" }] })).toBeNull();
+    expect(stepFromMessage(undefined)).toBeNull();
+  });
+
+  test("replies become a short line, or nothing", () => {
+    expect(cleanStatus("“Comparing the failing jobs.”")).toBe("Comparing the failing jobs");
+    expect(cleanStatus("Status: checking who owns CORE-12…\nmore")).toBe(
+      "Checking who owns CORE-12",
+    );
+    expect(cleanStatus("")).toBeNull();
+    expect(
+      cleanStatus("I am now going to read every one of the issues and summarize them for you"),
+    ).toBeNull();
   });
 });
 
@@ -147,5 +223,154 @@ describe("skills and results", () => {
         text: "xxxx\n… (6 more characters)",
       },
     );
+  });
+});
+
+describe("issue requirements in the assistant's tools (CORE-32)", () => {
+  test("create and update take the text form; bad terms come back as errors", async () => {
+    const sent: unknown[] = [];
+    const issue = {
+      id: "i1",
+      key: "CORE-1",
+      version: 3,
+      teamId: "t",
+      title: "x",
+      labels: [],
+      requires: { tags: ["ux"] },
+    };
+    const api = async (method: string, _path: string, body?: unknown) => {
+      if (method === "GET")
+        return {
+          status: 200,
+          ok: true,
+          body: { teams: [{ id: "t", key: "CORE" }], issues: [issue] },
+        };
+      sent.push(body);
+      return {
+        status: 200,
+        ok: true,
+        body: {
+          events: [
+            {
+              entity: {
+                id: (body as { mutations: { id: string }[] }).mutations[0]!.id,
+                key: "CORE-2",
+              },
+            },
+          ],
+        },
+      };
+    };
+    const { writes } = buildTools({
+      api: api as never,
+      writes: true,
+      approve: false,
+      navigate: false,
+    });
+    const run = (name: string, input: unknown) =>
+      (writes[name]!.execute as (i: unknown, o: unknown) => Promise<unknown>)(input, {
+        toolCallId: "t",
+        messages: [],
+      });
+    await run("create_issue", {
+      owner: "o",
+      team: "CORE",
+      title: "Design",
+      requires: "tag:UX memory>=16GiB",
+    });
+    await run("update_issue", { owner: "o", key: "CORE-1", changes: { requires: "" } });
+    await run("update_issue", { owner: "o", key: "CORE-1", changes: { title: "y" } });
+    expect(
+      sent.map((b) => (b as { mutations: { data: Record<string, unknown> }[] }).mutations[0]!.data),
+    ).toEqual([
+      expect.objectContaining({ requires: { tags: ["ux"], minMemory: 16 * 2 ** 30 } }),
+      { requires: null },
+      { title: "y" },
+    ]);
+    expect(
+      await run("update_issue", { owner: "o", key: "CORE-1", changes: { requires: "gpu" } }),
+    ).toEqual({ error: expect.stringContaining('Unknown requirement "gpu"') });
+  });
+
+  test("tags are written as the tracker's labels field, from tags or the old labels (CORE-271)", async () => {
+    const sent: Record<string, unknown>[] = [];
+    const issue = { id: "i1", key: "CORE-1", version: 3, teamId: "t", title: "x", labels: ["UX"] };
+    const other = { ...issue, id: "i2", key: "CORE-2", labels: ["data"] };
+    const api = async (method: string, _path: string, body?: unknown) => {
+      if (method === "GET")
+        return {
+          status: 200,
+          ok: true,
+          body: { teams: [{ id: "t", key: "CORE" }], issues: [issue, other], links: [] },
+        };
+      sent.push((body as { mutations: { data: Record<string, unknown> }[] }).mutations[0]!.data);
+      return { status: 200, ok: true, body: { events: [] } };
+    };
+    const tools = buildTools({ api: api as never, writes: true, approve: false, navigate: false });
+    const run = (set: Record<string, unknown>, name: string, input: unknown) =>
+      (set[name] as { execute: (i: unknown, o: unknown) => Promise<unknown> }).execute(input, {
+        toolCallId: "t",
+        messages: [],
+      });
+    await run(tools.writes, "create_issue", { owner: "o", team: "CORE", title: "A", tags: ["ux"] });
+    await run(tools.writes, "create_issue", {
+      owner: "o",
+      team: "CORE",
+      title: "B",
+      labels: ["ux"],
+    });
+    await run(tools.writes, "update_issue", { owner: "o", key: "CORE-1", changes: { tags: [] } });
+    await run(tools.writes, "update_issue", {
+      owner: "o",
+      key: "CORE-1",
+      changes: { labels: ["data"] },
+    });
+    expect(sent.map((d) => d.labels)).toEqual([["ux"], ["ux"], [], ["data"]]);
+    expect(sent.every((d) => !("tags" in d))).toBe(true);
+    type Found = { issues: { key: string; tags: string[] }[] };
+    for (const filter of [{ tag: "ux" }, { label: "UX" }]) {
+      const found = (await run(tools.reads, "find_issues", { owner: "o", ...filter })) as Found;
+      expect(found.issues.map((i) => [i.key, i.tags])).toEqual([["CORE-1", ["UX"]]]);
+    }
+  });
+
+  test("tightening a claimed issue reports who's affected and can release the claim (CORE-272)", async () => {
+    const sent: Record<string, unknown>[] = [];
+    const issue = { id: "i1", key: "CORE-1", version: 3, teamId: "t", title: "x", labels: [] };
+    const effect = {
+      actorId: "agt",
+      agent: "builder",
+      session: "laptop",
+      unmet: [{ requirement: "tags", wanted: "tag:gpu", reported: null, message: "needs tag gpu" }],
+      released: true,
+    };
+    const api = async (method: string, _path: string, body?: unknown) => {
+      if (method === "GET")
+        return { status: 200, ok: true, body: { teams: [], issues: [issue], links: [] } };
+      sent.push((body as { mutations: { data: Record<string, unknown> }[] }).mutations[0]!.data);
+      return {
+        status: 200,
+        ok: true,
+        body: { events: [], results: [{ id: "i1", claimEffect: effect }] },
+      };
+    };
+    const { writes } = buildTools({
+      api: api as never,
+      writes: true,
+      approve: false,
+      navigate: false,
+    });
+    const result = await (
+      writes.update_issue!.execute as (i: unknown, o: unknown) => Promise<unknown>
+    )(
+      { owner: "o", key: "CORE-1", changes: { requires: "tag:gpu", releaseClaim: true } },
+      { toolCallId: "t", messages: [] },
+    );
+    expect(sent[0]).toEqual({ requires: { tags: ["gpu"] }, releaseClaim: true });
+    expect(result).toMatchObject({
+      updated: "CORE-1",
+      claimEffect: effect,
+      note: "Released the claim held by builder: it needs tag gpu.",
+    });
   });
 });

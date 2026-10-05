@@ -29,6 +29,7 @@ import { SelectField, Tip, link } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { commitsUrl, treeUrl } from "../../lib/refs.ts";
+import { commitPanelUrl } from "../../lib/commitPanel.ts";
 import { withScope } from "../../lib/timelineScope.ts";
 import {
   DEFAULT_FILTERS,
@@ -46,6 +47,9 @@ import { LaneDrawing, ROW_HEIGHT, RowText, eventRepo, graphWidth } from "./Timel
 import { DoneInTimelineIcon, statusLabel } from "./ui.tsx";
 import { PreviewLink, ReviveButton } from "./Checkpoint.tsx";
 import { LandingPanel } from "./Landing.tsx";
+import { useRememberPlace } from "../../lib/recentPlaces.ts";
+import { LiveNow } from "./LiveNow.tsx";
+import { PersonLink } from "../../components/PersonLink.tsx";
 
 export async function trackerTimelinesLoader({ request, params }: LoaderFunctionArgs) {
   try {
@@ -108,6 +112,16 @@ export function TrackerTimelines() {
   const slug = params.get("tl");
   const selected = slug ? (data.timelines.find((t) => t.slug === slug) ?? null) : null;
   const byId = useMemo(() => new Map(data.timelines.map((t) => [t.id, t])), [data.timelines]);
+  useRememberPlace(
+    selected
+      ? {
+          kind: "timeline",
+          title: selected.name,
+          detail: `timeline/${selected.slug} · ${owner}`,
+          to: `${base}?tl=${encodeURIComponent(selected.slug)}`,
+        }
+      : null,
+  );
 
   // Stalled: open, and no push for the account's idle period. The data's time
   // stands in for now, so a refresh moves it on.
@@ -174,13 +188,11 @@ export function TrackerTimelines() {
       merge && repo ? (
         <Link
           className="mk-mono text-micro text-ink-faint no-underline hover:underline max-sm:hidden"
-          to={commitsUrl(
-            repo.owner,
-            repo.name,
-            merge.commit,
-            "",
-            repo.source?.sourceId ?? "canonical",
-          )}
+          to={
+            repo.source && repo.source.sourceId !== "canonical"
+              ? commitsUrl(repo.owner, repo.name, merge.commit, "", repo.source.sourceId)
+              : commitPanelUrl(repo.owner, repo.name, merge.commit)
+          }
           title={`${repo.owner}/${repo.name} at ${merge.commit}`}
           onClick={(event) => event.stopPropagation()}
         >
@@ -611,12 +623,29 @@ function TimelineDetails({
   const lastCommits = abandoned?.kind === "abandon" ? abandoned.lastCommits : {};
   const parent = timeline.parentId ? (byId.get(timeline.parentId) ?? null) : null;
   const actor = (id: string) => data.actors[id]?.name ?? "someone outside the tracker";
+  /** The same, with a person linked to their profile; agents stay text. */
+  const actorLink = (id: string) => {
+    const known = data.actors[id];
+    return known?.slug && known.accountableId === null ? (
+      <PersonLink slug={known.slug} prose>
+        {known.name}
+      </PersonLink>
+    ) : (
+      actor(id)
+    );
+  };
   return (
     <>
       <div className="flex items-start gap-2">
         <h2 className="m-0 min-w-0 flex-1 text-title-lg [overflow-wrap:anywhere]">
           {timeline.name}
         </h2>
+        <Link
+          className="mk-btn mk-btn--ghost mk-btn--sm shrink-0 no-underline"
+          to={`/tracker/${encodeURIComponent(data.owner.slug)}/timelines/${encodeURIComponent(timeline.slug)}/story`}
+        >
+          Story
+        </Link>
         <Link className="mk-btn mk-btn--ghost mk-btn--sm shrink-0 no-underline" to={clear}>
           Back to main
         </Link>
@@ -635,10 +664,10 @@ function TimelineDetails({
         <dd className="m-0 min-w-0 truncate">{name(parent)}</dd>
         <dt className="text-ink-faint">Started</dt>
         <dd className="m-0" title={fullDate(timeline.createdAt)}>
-          {timeAgo(timeline.createdAt)} by {actor(timeline.startedBy)}
+          {timeAgo(timeline.createdAt)} by {actorLink(timeline.startedBy)}
         </dd>
         <dt className="text-ink-faint">Accountable</dt>
-        <dd className="m-0">{actor(timeline.accountableId)}</dd>
+        <dd className="m-0">{actorLink(timeline.accountableId)}</dd>
         {timeline.agentIds.length > 0 && (
           <>
             <dt className="text-ink-faint">Agents</dt>
@@ -675,13 +704,11 @@ function TimelineDetails({
                 last ? (
                   <Link
                     className={link}
-                    to={treeUrl(
-                      repo.owner,
-                      repo.name,
-                      last,
-                      "",
-                      repo.source?.sourceId ?? "canonical",
-                    )}
+                    to={
+                      repo.source && repo.source.sourceId !== "canonical"
+                        ? treeUrl(repo.owner, repo.name, last, "", repo.source.sourceId)
+                        : commitPanelUrl(repo.owner, repo.name, last)
+                    }
                   >
                     last commit <span className="mk-mono">{shortOid(last)}</span>
                   </Link>
@@ -716,6 +743,8 @@ function TimelineDetails({
         })}
       </ul>
 
+      <LiveNow owner={data.owner.slug} timeline={timeline} />
+
       <TimelineCheckpoints owner={data.owner.slug} timeline={timeline} />
 
       <LandingPanel owner={data.owner.slug} timeline={timeline} onChange={onChange} />
@@ -747,13 +776,17 @@ function TimelineDetails({
                       {" "}
                       <Link
                         className="mk-mono text-micro text-ink-faint no-underline hover:underline"
-                        to={commitsUrl(
-                          repo.owner,
-                          repo.name,
-                          event.commit,
-                          "",
-                          repo.source?.sourceId ?? "canonical",
-                        )}
+                        to={
+                          repo.source && repo.source.sourceId !== "canonical"
+                            ? commitsUrl(
+                                repo.owner,
+                                repo.name,
+                                event.commit,
+                                "",
+                                repo.source.sourceId,
+                              )
+                            : commitPanelUrl(repo.owner, repo.name, event.commit)
+                        }
                       >
                         {shortOid(event.commit)}
                       </Link>

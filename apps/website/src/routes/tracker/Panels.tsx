@@ -9,7 +9,7 @@ import { StateDot } from "./Log.tsx";
 import { DoneInTimelineIcon } from "./ui.tsx";
 import {
   filterToken,
-  tokenize,
+  queryTokenSet,
   withoutKeys,
   type Facets,
   type FacetValue,
@@ -17,6 +17,8 @@ import {
 } from "./query.ts";
 import { claimAttribution } from "../../../shared/tracker.ts";
 import { Actor } from "./Actor.tsx";
+import { RequiresMark } from "./Requirements.tsx";
+import { IssueTagsInline } from "../../components/Chips.tsx";
 
 const FACET_GROUPS: { key: keyof Facets; title: string }[] = [
   { key: "state", title: "State" },
@@ -24,7 +26,7 @@ const FACET_GROUPS: { key: keyof Facets; title: string }[] = [
   { key: "ws", title: "Workspace" },
   { key: "assignee", title: "Assignee" },
   { key: "type", title: "Type" },
-  { key: "label", title: "Label" },
+  { key: "tag", title: "Tag" },
 ];
 
 /** The team facet's default: which team key is it, and how to change it. */
@@ -49,7 +51,7 @@ function FacetGroup({
   const [all, setAll] = useState(false);
   if (values.length === 0) return null;
   const peak = Math.max(1, ...values.map((v) => v.count));
-  const tokens = new Set(tokenize(query).map((t) => t.toLowerCase()));
+  const tokens = queryTokenSet(query);
   const shown = all ? values : values.slice(0, 6);
   return (
     <section aria-label={title}>
@@ -228,7 +230,15 @@ function Lane({
                 )}
                 {state === "ready" && <span>Ready</span>}
               </span>
-              <span className="truncate text-body-sm font-semibold">{issue.title}</span>
+              <span className="flex min-w-0 items-center text-body-sm font-semibold">
+                <RequiresMark requires={issue.requires} />
+                <span className="min-w-0 truncate">{issue.title}</span>
+                <IssueTagsInline
+                  tags={issue.labels}
+                  max={1}
+                  className="ml-1.5 inline-flex font-normal"
+                />
+              </span>
             </Link>
           );
         })}
@@ -239,7 +249,7 @@ function Lane({
 
 // ── Backlog digest ─────────────────────────────────────────────────────────
 // A backlog of thousands is groomed, not read card by card: the lane shows
-// what it's made of (grouped by priority, team, label or age, with counts),
+// what it's made of (grouped by priority, team, tag or age, with counts),
 // how much of it has gone stale, and the most important issues of a group on
 // demand, with the full group one click away in the list.
 
@@ -250,11 +260,11 @@ const AGES = [
   { label: "1–3 months", max: 90, token: "since:90d until:30d" },
   { label: "Older", max: Infinity, token: "until:90d" },
 ] as const;
-type GroupBy = "priority" | "team" | "label" | "age";
+type GroupBy = "priority" | "team" | "tag" | "age";
 const GROUP_BY: { value: GroupBy; label: string }[] = [
   { value: "priority", label: "Priority" },
   { value: "team", label: "Team" },
-  { value: "label", label: "Label" },
+  { value: "tag", label: "Tag" },
   { value: "age", label: "Age" },
 ];
 const PRIORITY_NAME = ["Urgent", "High", "Medium", "Low", "Lowest"];
@@ -304,9 +314,10 @@ function BacklogLane({
       else if (by === "team") {
         const key = index.teamKey.get(issue.teamId) ?? "?";
         add(key, key, `team:${key.toLowerCase()}`, 0, issue);
-      } else if (by === "label") {
-        if (!issue.labels.length) add("", "No label", null, 1e9, issue);
-        for (const l of issue.labels) add(l.toLowerCase(), l, `label:${l.toLowerCase()}`, 0, issue);
+      } else if (by === "tag") {
+        if (!issue.labels.length) add("", "No tag", null, 1e9, issue);
+        for (const l of issue.labels)
+          add(l.toLowerCase(), l, filterToken("tag", l.toLowerCase()), 0, issue);
       } else {
         const days = ageDays(issue, now);
         const at = AGES.findIndex((a) => days < a.max);

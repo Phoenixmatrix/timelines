@@ -113,4 +113,24 @@ describe("Atlas states", () => {
     );
     expect(fileNote({ language: "typescript", membership: { capability: "cap:x" } })).toBeNull();
   });
+
+  test("pushes waiting for a batched update say how many, and that the map shows the indexed commit (CORE-286)", () => {
+    const notices = scopeNotices(
+      status({
+        state: "queued",
+        head: "cccccccccc",
+        pending: { pushes: 3, since: "2026-10-05T12:00:00Z", dueAt: "2026-10-05T12:20:00Z" },
+      }),
+      overview(),
+    );
+    expect(notices).toEqual([
+      expect.objectContaining({
+        id: "building",
+        tone: "info",
+        text: expect.stringMatching(
+          /^This map shows aaaaaaa\. 3 pushes are waiting for the next update, at about .+; the branch is at ccccccc\.$/,
+        ),
+      }),
+    ]);
+  });
 });

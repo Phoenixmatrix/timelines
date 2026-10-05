@@ -146,11 +146,12 @@ gm release notes day:2026-10-02 --internal -o json
 ```
 
 `gm release feed` reads a tracker account's daily code updates across repositories,
-latest commit first. Named tags are excluded by default to avoid counting the
-same changes twice; use `kind:tag` or a positive `release:v1.2.0` filter to select
-them. `release:day:2026-10-02` selects a UTC day. `--team KEY` narrows the feed to
-one team; other filters include `type:fix repo:engine since:30d`, `-label:docs`,
-and search words. The account comes from `--owner`, else `gm tracker use`.
+latest commit first. Tagged releases (Git tags) are excluded by default to avoid
+counting the same changes twice; use `kind:tag` or a positive `release:v1.2.0`
+filter to select them. `release:day:2026-10-02` selects a UTC day. `--team KEY`
+narrows the feed to one team; other filters include `type:fix repo:engine
+since:30d`, `-tag:docs` (issue tags; `label:` is the old spelling), and search
+words. The account comes from `--owner`, else `gm tracker use`.
 Internal entries are left out unless you pass `--internal` or a `type:` filter.
 
 ```sh
@@ -182,6 +183,15 @@ without authoritative queue evidence. A `push` means a recorded main ref
 update, not proof of a queue landing. Tracker-inaccessible readers get no
 tracker provenance. Failed or unfinished advances do not become landings;
 in a partially landed timeline, only repositories already advanced qualify.
+
+Each chain also carries the **step** behind its commit (CORE-243): the step
+context its agent recorded (why, challenges, instructions and steering with
+their coverage, tests), or, for a commit a rebase or landing replaced, the
+newest step of its change (`step.commitOid` then names the commit it was
+recorded on). Landing merges keep the timeline's commits, so a landed line
+still leads to its step. Steps are as readable as the repository; a timeline
+commit without one says "no context recorded". On the web, a selected line's
+**Why?** shows the same, with a link into the timeline's story.
 
 ## Deployments
 
@@ -222,11 +232,12 @@ gm tracker use orbit
 gm team create ENG --name Engineering
 gm workspace create launch --name Launch
 gm issue create 'Search redesign' --team ENG --type prd \
-  --description-file design.md --acceptance-file acceptance.md --workspace launch --label ux --label frontend
+  --description-file design.md --acceptance-file acceptance.md --workspace launch --tag ux --tag frontend
 gm issue ready --limit 10
 gm issue ready --type remediation --all-teams
 gm issue show ENG-1 --limit 20
-gm issue update ENG-1 --data '{"priority":1,"labels":["search"]}'
+gm issue update ENG-1 --data '{"priority":1}' --tag search
+gm issue tags                            # the tracker's tag catalog, with counts
 gm issue link ENG-1 ENG-2 --kind blocks  # FROM blocks TO
 gm issue checkpoint ENG-1 '@checkpoint.md'
 gm issue evidence ENG-1 'Verified search with the integration smoke'
@@ -242,14 +253,91 @@ accept `-` for stdin (one field at a time); patch and batch JSON accept `@file` 
 an authoritative permission, graph or lease validation. Tracker changes are **not**
 reversed by `gm undo`.
 
-Label issues by the expertise their scope requires, using repeated `--label`
-flags. Follow the team's vocabulary; otherwise use the defaults explained by
-`gm cli guide` and the installed graph-work skill: `ux`, `frontend`, `backend`,
-`data`, `architecture`, `api`, `security`, `testing`, `infrastructure` and
+Tag issues by the expertise their scope requires, using repeated `--tag` flags
+(`--label` is the old spelling and still works). Tags come from the tracker's
+**tag catalog**: every tag used in the tracker, kept after its last use, listed
+by `gm issue tags` and suggested on the web. Reuse its spelling; a new name joins
+it. In a new tracker, start from the defaults explained by `gm cli guide` and
+the installed graph-work skill: `ux`, `frontend`, `backend`, `data`,
+`architecture`, `api`, `security`, `testing`, `infrastructure` and
 `documentation`. Pick only relevant areas, not every area touched by routine
-verification. These are suggested free-form issue labels, not a registered
-catalog or claim restrictions. Agent profile tags and skills remain separate,
-self-reported capability hints. Updating `labels` replaces the whole list.
+verification. `gm issue update --tag NAME` adds one and `--drop-tag NAME`
+removes one; `tags` in `--data` replaces the whole list (`labels`, the stored
+field's name, still works). `gm issue show` prints a Tags line.
+
+The same catalog serves three roles: an **issue's tags** say what the work is
+about; an **agent's tags** (`gm agent setup --tag ux`) say what work it suits;
+a **requirement** `tag:ux` means only agents tagged ux may claim the issue.
+Tagging an issue never restricts claims by itself. gm warns, and never refuses,
+when an agent tag or a `tag:` requirement isn't in the catalog, and suggests the
+nearest name. To restrict which agents may claim an issue, use requirements
+(below).
+
+### Pickup: whether work may start
+
+Use `gm issue create|update --pickup anyone|not_ready|human_only`:
+
+- `anyone` (default, including legacy issues without the field): ordinary
+  dependency, claim and capability rules apply.
+- `not_ready`: nobody, including people, may claim or start it until a person
+  changes the policy. This is not a dependency or a status.
+- `human_only`: authenticated people may work it; agents cannot, including
+  assigned agents and delegated agents.
+
+`gm issue ready` is agent-oriented and excludes both restrictions. Agent `next`
+also skips them; a person's `next` may select human-only work. `gm issue show`
+prints the policy and acting identity's eligibility with an actionable reason.
+Pickup applies globally across timelines. Assignment, capability overrides,
+direct status changes and completion cannot bypass it. Only a person may change
+an existing restricted policy; agents can restrict `anyone`, never self-enable
+restricted work. Release an incompatible active claim before restricting pickup.
+Offline policy changes and readiness remain advisory until accepted by the server.
+
+### Requirements: which agents may claim an issue
+
+An issue can require capabilities of the agent that claims it (`requires`),
+matched against the profile each agent publishes with `gm agent setup` (harness,
+model, OS, architecture, runtime, CPUs, memory, tags and skills):
+
+```bash
+gm issue create 'Polish onboarding' --team ENG --requires 'tag:ux skill:playwright'
+gm issue update ENG-1 --requires 'model:claude-opus-*,gpt-5* os:linux memory>=16GiB cpus>=8'
+gm issue update ENG-1 --clear-requires          # remove capabilities, not pickup policy
+gm issue update ENG-1 --require-issue-tags      # only agents tagged with its tags
+gm issue update ENG-1 --requires 'tag:gpu' --release-claim
+```
+
+Terms are `tag:`, `skill:`, `model:`, `harness:`, `os:`, `arch:`, `runtime:`
+(comma-separated or repeated values), `memory>=` (B, KiB/MiB/GiB/TiB, the same
+as K/M/G/T, or KB/MB/GB/TB) and `cpus>=`. Tags and skills need every value; the
+other lists any one; values match case-insensitively and `*` is a wildcard. The
+issue stores them as `requires: {tags, skills, models, harnesses, os, arch,
+runtime, minMemory, minCpus}` (or null), recorded in its history like any field;
+`--data '{"requires":…}'` works too.
+
+- An agent that doesn't meet them can't `claim` or `accept` the issue, can't be
+  offered it, and `gm issue next` skips it, reporting how many ready issues it
+  skipped (`skipped: {requirements, keys, message}`). A refusal has code
+  `requirements_unmet` and names each unmet requirement.
+- Tightening requirements on a claimed issue is never silent. When the new ones
+  no longer allow the agent holding it, gm prints who it is, its session and
+  what it misses (`claimEffect`), keeps the claim and the issue records that;
+  `--release-claim` releases it instead (tracker owners and the agent's
+  accountable person). `--require-issue-tags` adds a `tag:` term for each of
+  the issue's tags.
+- `gm issue next` also names the requirements that kept the most ready issues
+  from the agent (`skipped.blocking`) and the `gm agent setup` flag that would
+  meet them, when the agent really fits that work.
+- An agent that never published capabilities meets no requirement: run
+  `gm agent setup` (with `--tag`, `--model`) in its checkout.
+- People bypass capability requirements, not pickup policy. A person who owns
+  the tracker, or the agent's accountable human, can assign despite a capability
+  mismatch; pickup still applies and the issue shows `assigneeMismatch`.
+- `gm issue show` prints the requirements (`requiresText`) and whether the
+  acting identity is eligible (`eligibility`).
+- This is eligibility, not authorization: capabilities are self-reported, and
+  repository and tracker permissions are enforced as before. Issues without
+  requirements behave as they always did.
 
 ### Creator and audit history
 
@@ -395,7 +483,7 @@ sections and advisory readiness; only an online claim grants exclusive work.
 
 The server automatically assigns an unassigned issue to the identity holding
 its claim, including `next` and delegated claims. For an authenticated agent,
-that is the agent—not its accountable person or the `--agent` session label.
+that is the agent—not its accountable person or the `--agent` session name.
 Existing assignees are preserved; ending a claim does not clear assignment.
 Automatic assignment follows the same membership rules as explicit assignment.
 Even a tracker admin cannot claim unassigned work in a restricted team unless
@@ -484,8 +572,10 @@ gm agent setup --check                           # exit 4 if instructions or ski
   (`gm auth status` shows `actingAs`); in your own terminal you stay yourself,
   and `GM_TOKEN` always wins. Run by the agent, it refreshes its own profile.
   `--no-identity` writes only the files.
-- **Defaults.** `gm issue next` and `claim` take the session label, scope and
+- **Defaults.** `gm issue next` and `claim` take the session name, scope and
   lease length from these files, and the tracker owner when none is selected.
+  `next` only picks issues whose requirements the agent's published profile
+  meets (see "Requirements").
 - **Your default team.** When neither a flag nor these files name a team,
   `gm issue next`, `create`, `list` and `ready` use the default team you set in
   the web tracker (the star beside a team), synced with the replica and cached
@@ -762,10 +852,27 @@ way and what got in the way (CORE-226). Everyone who can read the repository
 sees it beside the commit.
 
 ```bash
-gm commit -m "Rank by recency" --context step.md   # or --context - for stdin
+gm step -m "Rank by recency" --context step.md     # in a timeline: gm test, commit, push
+gm commit -m "Rank by recency" --context step.md   # or by hand; --context - reads stdin
 gm push                                             # uploads it for the pushed commits
 gm context sync                                     # retries uploads a push couldn't make
 ```
+
+- **`gm test`** runs the repository's fast checks: the jobs in
+  `.gitmatrix/ci.yml` that join step runs (`on: step`) and are marked
+  `local: true` (CORE-235). They run with bash in this checkout, in `needs`
+  order, with the pipeline's and job's `env:` plus `GITMATRIX_TRIGGER=step` and
+  `GITMATRIX_LOCAL=1`. Output streams to stderr; the result (each job's status,
+  exit code, duration and last line of output) goes to stdout, and the command
+  exits 1 when a job fails. A job that needs a failed job, or one that doesn't
+  run locally, is skipped. The results are kept for the working copy's tree, so
+  the next `gm commit --context` of exactly that tree carries them as the
+  step's tests.
+- **`gm step -m <summary> [--context <file|->] [--no-test]`** records a step of
+  a timeline in one command: `gm test`, then commit with the context and the
+  test results, then push to `timeline/<slug>`. Failing tests don't stop it:
+  the step records them, with a warning. Outside a timeline it refuses
+  (`not_in_timeline`); use `gm commit` and `gm push` there.
 
 - **`--context <file|->`** takes Markdown with `## Instructions`, `## Steering`,
   `## Why` and `## Challenges` sections (bullets become entries), or a JSON
@@ -784,6 +891,36 @@ gm context sync                                     # retries uploads a push cou
   leaves context pending locally for an admission retry or `gm context sync`.
 - **Missing context warns, never blocks.** An agent's commit in a timeline
   without `--context` succeeds with a warning saying what to add.
+
+- **`gm steps [--timeline <slug>] [-n N]`** lists a timeline's recent steps in
+  this repository (default: the timeline this checkout works in);
+  **`--follow`** streams new ones live as they're pushed (CORE-239): one JSON
+  object per line for agents (`StepFeedRecord`), a line of text at a terminal.
+  It reconnects from the last step it printed; `--count N` stops after N, and
+  a feed the reader can't see is an error rather than a retry.
+
+- **Harness hooks** capture what the person tells the agent (CORE-241). For
+  Claude Code, `gm agent setup` adds a `UserPromptSubmit` hook to
+  `.claude/settings.json` (`gm hook claude-code`, run only if gm is
+  installed). In a checkout working in a timeline it appends each prompt,
+  redacted, to the journal's `pending.json`: a session's first prompt as an
+  instruction, later ones as steering. The next `gm commit --context` or
+  `gm step` puts them first in its instructions and steering, marked `hook`,
+  sets coverage to `hook:claude-code` and clears them. The hook never prints
+  (Claude Code would add its output to the conversation) and never fails a
+  prompt. Without a hook, the agent records them itself (`agent`), and the
+  Story notes that some context may be missing.
+- **Codex and Oh My Pi** use the same contract (CORE-242), each under its own
+  harness id. For Codex (0.114+), `gm agent setup` adds the same
+  `UserPromptSubmit` hook to `.codex/hooks.json` (`gm hook codex`); Codex runs
+  a project hook only once the person trusts it (`/hooks` in Codex), and it
+  too adds hook output to the conversation, so the hook stays silent. For Oh
+  My Pi, setup writes `.omp/extensions/gitmatrix-steps.ts`, an extension whose
+  `input` handler (each submitted message, steering typed mid-turn included)
+  hands the text to `gm hook pi`. Oh My Pi raises `input` for the
+  interactive prompt and RPC sessions, not for one-shot print mode (`omp -p`),
+  so those prompts aren't captured. Coverage names the harness whose hook ran
+  (`hook:codex`, `hook:pi`); a harness whose hook didn't run is never claimed.
 
 Reading it back, for an agent picking up the work or a person investigating:
 
@@ -814,7 +951,26 @@ gm settings ai set --owner orbit --wiki on --atlas on --release-notes off
 gm settings ai set --owner orbit --classification clef \
   --fast gemma-4-26b-a4b-it --task glm-5.3-flash
 gm settings ai set --owner orbit --task gemma-4-26b-a4b-it --dry-run
+gm settings ai set --owner orbit --knowledge-quiet-minutes 15 --knowledge-max-wait-minutes 60
+gm settings ai set --owner orbit --log-bodies assistant=off --log-bodies avatars=default
+gm settings ai show --site
+gm settings ai set --site --log-bodies on
 ```
+
+**Gateway logs** (`--log-bodies`): AI Gateway always logs each model call's model,
+time and tokens; "Keep AI request and response bodies in gateway logs" also keeps
+what was sent and returned. It is set per component (`knowledge`, `assistant`,
+`assistant-titles`, `avatars`, `release-notes`, `merge-queue`): `--log-bodies
+on|off|default` sets every component, `COMPONENT=on|off|default` one (repeatable,
+later values win). An account's choice applies to that account's calls; `default`
+follows the site. `--site` (site administrators, people only) sets the site default
+and takes only `--log-bodies`; there `default` follows the environment (deployed:
+off; development and agent environments: on). `show` lists each component's site
+value, the account's override and the effective value, with this note: while on,
+prompts and replies, including repository code and assistant conversations, are
+kept in Cloudflare's AI Gateway logs, readable by the Cloudflare account's
+dashboard users, and deleted oldest-first. Changes reach new model calls within a
+minute.
 
 These are account-wide settings, not repository settings. Omit `--owner` to use
 the authenticated person's own account; the current repository's owner is never
@@ -822,7 +978,10 @@ inferred. `show` includes the curated catalog, prices, release dates, permission
 and save provenance. `set` requires at least one option and changes only supplied
 fields. Feature values are `on|off`; Classification accepts only `clef`; Fast and
 Task allow `glm-5.3-flash|gemma-4-26b-a4b-it`. Defaults are all features on, Clef,
-and GLM 5.3 Flash for both generation roles.
+and GLM 5.3 Flash for both generation roles. `--knowledge-quiet-minutes` and
+`--knowledge-max-wait-minutes` (0-1440, defaults 10 and 30) say when pushes to a
+repository's default branch update its Knowledge: once they pause that long, and
+never later than the longest wait after the first pending push.
 
 Only human account owners, organization owners and site admins can save; members
 can inspect and agent credentials cannot write. Knowledge off also prevents new

@@ -93,7 +93,12 @@ export function gitBackend(root: string, origin = "https://artifacts.test") {
       child.stdout.on("data", (chunk: Buffer) => out.push(chunk));
       child.on("error", reject);
       child.on("close", () => resolve(Buffer.concat(out)));
-      // An empty write can hit EPIPE after a GET backend exits; close without writing.
+      // http-backend may answer and exit before reading the whole body; the
+      // answer is on stdout, so a write to its closed stdin (EPIPE) is no error.
+      // An empty body closes stdin without writing at all; other errors fail.
+      child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+        if (error.code !== "EPIPE") reject(error);
+      });
       child.stdin.end(body.length ? Buffer.from(body) : undefined);
     });
     const split = result.indexOf("\r\n\r\n");

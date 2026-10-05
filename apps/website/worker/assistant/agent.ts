@@ -18,6 +18,7 @@ import {
   generateText,
   stepCountIs,
   streamText,
+  wrapLanguageModel,
   type ToolSet,
   type UIMessage,
 } from "ai";
@@ -35,10 +36,19 @@ import {
 } from "../durable/contract.ts";
 import { recordPurge } from "../durable/record.ts";
 import { credential, type AssistantCredential } from "./identity.ts";
+import { assistantCapacity } from "./capacity.ts";
 import { apiClient } from "./internal.ts";
 import { clefState, planFrom, questions, type TurnPlan } from "./plan.ts";
+import {
+  cleanStatus,
+  PROGRESS_INSTRUCTIONS,
+  progressPrompt,
+  stepFromMessage,
+  WORKING,
+  type ProgressStep,
+} from "./progress.ts";
 import { sentenceCase } from "./titles.ts";
-import { builtinSkills, preloaded, repositorySkills, SkillRegistry } from "./skills.ts";
+import { buildSkillRegistry, preloaded, resolveSkillInvocation, skillReceipt } from "./skills.ts";
 import { buildTools } from "./tools.ts";
 import { aiWork, recordAiCall, type AiTokens, type AiWork } from "../usage/ai.ts";
 
@@ -50,10 +60,14 @@ export const ASSISTANT_MODELS = {
   deep: "@cf/zai-org/glm-5.3",
   /** Chat titles: a few words, the cheapest capable model. */
   title: "@cf/ibm-granite/granite-4.0-h-micro",
+  /** Mid-turn status lines: a few words, as fast as possible (progress.ts). */
+  status: "@cf/ibm-granite/granite-4.0-h-micro",
 } as const;
 
 /** clef must answer fast or not at all: a turn never waits on routing. */
 const PLAN_DEADLINE_MS = 2500;
+/** A status that arrives later than this would describe a step already under way. */
+const STATUS_DEADLINE_MS = 4000;
 
 export interface CliTurn {
   write: boolean;
@@ -176,6 +190,29 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     }
   }
 
+  /** A few words on what the turn is doing now, or null if the small model can't say in time. */
+  private async progress(request: string, step: ProgressStep): Promise<string | null> {
+    try {
+      const { text: reply, usage } = await generateText({
+        model: createWorkersAI({ binding: this.env.AI })(
+          ASSISTANT_MODELS.status,
+          await aiGatewayOptions(this.env, "assistant-status", this.#aiWork()),
+        ),
+        instructions: PROGRESS_INSTRUCTIONS,
+        prompt: progressPrompt(request, step),
+        maxOutputTokens: 16,
+        abortSignal: AbortSignal.timeout(STATUS_DEADLINE_MS),
+      });
+      await recordAiCall(this.env, ASSISTANT_MODELS.status, usageTokens(usage), {
+        work: this.#aiWork(),
+      });
+      return cleanStatus(reply);
+    } catch (error) {
+      console.warn("assistant: no status line for this step", error);
+      return null;
+    }
+  }
+
   /** The directory row for this chat: created on its first turn, touched after each. */
   private async touch(source: "web" | "cli") {
     const { userId, chatId } = this.owner;
@@ -194,9 +231,11 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     const web = !cli;
     const body = options?.body ?? {};
     const page = web ? ((body.page as PageContext | undefined) ?? null) : null;
-    const repo = cli?.repo ?? page?.repo ?? null;
+    const currentRepo = cli?.repo ?? page?.repo ?? null;
     const lastUser = [...this.messages].reverse().find((m) => m.role === "user");
     const lastReply = [...this.messages].reverse().find((m) => m.role === "assistant");
+    const receipt = options?.continuation ? skillReceipt(lastReply) : null;
+    const repo = receipt?.source === "repository" ? (receipt.repo ?? null) : currentRepo;
     this.#turnAt = Date.now();
     await this.touch(web ? "web" : "cli");
 
@@ -212,14 +251,40 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     const stream = createUIMessageStream({
       originalMessages: history,
       execute: async ({ writer }) => {
+        // Establish the response identity before durable data parts reach the client.
+        // The outer stream assigns a new ID, or reuses the continued assistant ID.
+        writer.write({ type: "start" });
         const status = (value: string) => {
           writer.write({ type: "data-status", data: { text: value }, transient: true });
           void cli?.emit({ type: "status", text: value });
         };
         status("Thinking");
+        const api = apiClient(
+          app.fetch as never,
+          this.env,
+          (work) => this.ctx.waitUntil(work),
+          () => this.token(),
+        );
+        const registry = await buildSkillRegistry(this.env.DB, this.owner.userId, api, repo);
+        const invocation = resolveSkillInvocation(
+          registry,
+          text(lastUser),
+          Boolean(options?.continuation),
+          receipt,
+        );
+        if (invocation && !options?.continuation && lastUser) {
+          const { id, name, description, source, repo: skillRepo } = invocation;
+          writer.write({
+            type: "data-skill",
+            id: `skill-${lastUser.id}`,
+            data: { id, name, description, source, ...(skillRepo ? { repo: skillRepo } : {}) },
+          });
+        }
         const [{ plan, routedMs }, person] = await Promise.all([
           this.plan({
-            message: text(lastUser),
+            message: invocation
+              ? `${text(lastUser).replace(/^\/\S+\s*/, "")}\n\nSkill /${invocation.name}: ${invocation.description}\n${invocation.body}`
+              : text(lastUser),
             page: page ? { path: page.path, title: page.title } : null,
             previous: options?.continuation ? undefined : text(lastReply),
           }),
@@ -240,12 +305,6 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
           routedMs,
         });
 
-        const api = apiClient(
-          app.fetch as never,
-          this.env,
-          (work) => this.ctx.waitUntil(work),
-          () => this.token(),
-        );
         const tools = buildTools({
           api,
           writes: web || cli.write,
@@ -275,24 +334,55 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
             executor: new DynamicWorkerExecutor({ loader, globalOutbound: null, timeout: 30_000 }),
           });
 
-        const registry = new SkillRegistry([
-          builtinSkills(),
-          ...(repo ? [repositorySkills(api, repo)] : []),
-        ]);
-        await registry.load();
         const names = preloaded(groups, web && plan.intent === "navigate");
+        if (invocation && !names.includes(invocation.name)) names.push(invocation.name);
         const loaded = names.map((name) => registry.get(name)).filter((skill) => skill !== null);
         const skills = [
           registry.catalog(names),
           ...loaded.map((skill) => `## Skill: ${skill.name}\n\n${skill.body}`),
         ].join("\n\n");
 
+        // Between steps nothing streams while the model reads what its tools
+        // returned. The chat says so at once, then in the small model's words;
+        // a status that arrives after the step's first output is dropped.
+        let between: number | null = null;
+        const show = (value: string) => {
+          try {
+            writer.write({ type: "data-status", data: { text: value }, transient: true });
+          } catch {
+            // The turn ended before the status was ready.
+          }
+        };
+        const nextStep = web
+          ? ({ stepNumber, steps }: { stepNumber: number; steps: readonly ProgressStep[] }) => {
+              const previous =
+                stepNumber === 0
+                  ? options?.continuation
+                    ? stepFromMessage(lastReply)
+                    : null
+                  : steps.at(-1);
+              if (!previous) return;
+              between = stepNumber;
+              if (stepNumber > 0) show(WORKING);
+              void this.progress(text(lastUser), previous).then((line) => {
+                if (line && between === stepNumber) show(line);
+              });
+            }
+          : undefined;
+        const output = (type: string) => {
+          if (type === "text-delta" || type === "tool-input-start" || type === "tool-call")
+            between = null;
+        };
+
         const workersai = createWorkersAI({ binding: this.env.AI });
         const result = streamText({
-          model: workersai(model, {
-            ...aiGatewayOptions(this.env, "assistant"),
-            reasoning_effort: plan.reasoning,
-            sessionAffinity: this.name,
+          model: wrapLanguageModel({
+            model: workersai(model, {
+              ...(await aiGatewayOptions(this.env, "assistant", this.#aiWork())),
+              reasoning_effort: plan.reasoning,
+              sessionAffinity: this.name,
+            }),
+            middleware: assistantCapacity,
           }),
           instructions: instructions({
             person: person?.display_name ?? "the person",
@@ -306,26 +396,24 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
           tools: { ...active, ...registry.tools() },
           stopWhen: stepCountIs(plan.tier === "deep" ? 30 : 16),
           abortSignal: options?.abortSignal,
-          onChunk: cli
-            ? async ({ chunk }) => {
-                if (chunk.type === "text-delta")
-                  await cli.emit({ type: "text", delta: chunk.text });
-                else if (chunk.type === "tool-call")
-                  await cli.emit({
-                    type: "tool",
-                    name: chunk.toolName,
-                    label: toolLabel(
-                      chunk.toolName,
-                      (chunk.input ?? {}) as Record<string, unknown>,
-                    ),
-                  });
-              }
-            : undefined,
+          onStepStart: nextStep,
+          onChunk: async ({ chunk }) => {
+            output(chunk.type);
+            if (!cli) return;
+            if (chunk.type === "text-delta") await cli.emit({ type: "text", delta: chunk.text });
+            else if (chunk.type === "tool-call")
+              await cli.emit({
+                type: "tool",
+                name: chunk.toolName,
+                label: toolLabel(chunk.toolName, (chunk.input ?? {}) as Record<string, unknown>),
+              });
+          },
           // Metering (CORE-207): the turn's model steps and tokens.
           onFinish: (async (event: {
             steps?: unknown[];
             totalUsage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
           }) => {
+            between = null;
             await recordAiCall(this.env, model, usageTokens(event.totalUsage), {
               calls: event.steps?.length || 1,
               work: this.#aiWork(),
@@ -333,7 +421,7 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
             return (onFinish as unknown as (event: unknown) => unknown)(event);
           }) as never,
         });
-        writer.merge(result.toUIMessageStream({ sendReasoning: false, onError }));
+        writer.merge(result.toUIMessageStream({ sendStart: false, sendReasoning: false, onError }));
       },
       onError,
     });
@@ -356,7 +444,7 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
       const { text: title, usage } = await generateText({
         model: createWorkersAI({ binding: this.env.AI })(
           ASSISTANT_MODELS.title,
-          aiGatewayOptions(this.env, "assistant-title"),
+          await aiGatewayOptions(this.env, "assistant-title", this.#aiWork()),
         ),
         instructions:
           "Name this conversation in 2 to 6 words, sentence case, no quotes or trailing punctuation.",
@@ -466,7 +554,20 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
   async transcript() {
     return this.messages.map((m) => ({
       role: m.role,
-      text: text(m),
+      text: [
+        ...m.parts.flatMap((part) => {
+          if (part.type !== "data-skill") return [];
+          const receipt = skillReceipt({ ...m, parts: [part] });
+          return receipt
+            ? [
+                `Used /${receipt.name} (${receipt.source}${receipt.repo ? `: ${receipt.repo}` : ""})`,
+              ]
+            : [];
+        }),
+        text(m),
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
       tools: m.parts
         .filter((p) => p.type.startsWith("tool-"))
         .map((p) => {

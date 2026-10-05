@@ -10,6 +10,11 @@
 // tracker, and those its timelines touch) are searched, and of those only
 // what the viewer can read is returned: an unreadable repository's items are
 // left out without a trace. Every list is bounded (WORK_LIMIT).
+//
+// Mentions (CORE-22) are separate: commits whose message names the issue, as
+// the push-time index resolved them to this tracker's issue (worker/mentions),
+// in any repository the viewer can read, each with its own CI runs and
+// packages. They never feed the explicit lists.
 
 import {
   WORK_LIMIT,
@@ -17,6 +22,7 @@ import {
   type WorkCommit,
   type WorkCommitSource,
   type WorkDeployment,
+  type WorkMention,
   type WorkPackage,
   type WorkRepo,
   type WorkRun,
@@ -28,8 +34,8 @@ import type { FormatId } from "../../shared/packages.ts";
 import { releaseLabel, type ReleaseCategory } from "../../shared/release-notes.ts";
 import type { StepContextBody } from "../../shared/steps.ts";
 import type { AuditActor } from "../../shared/tracker.ts";
-import { roleFor, selectRepos, type Actor } from "../db.ts";
-import type { Selectable } from "kysely";
+import { readableRepo, roleFor, selectRepos, type Actor } from "../db.ts";
+import { sql, type Selectable } from "kysely";
 import { db, type Database } from "../schema.ts";
 import type { IssueWork } from "./store.ts";
 
@@ -39,7 +45,8 @@ const COMMITS = 60;
 const enc = encodeURIComponent;
 const repoHref = (repo: WorkRepo, ...rest: string[]) =>
   `/${repo.owner}/${repo.name}${rest.length ? `/${rest.join("/")}` : ""}`;
-const commitHref = (repo: WorkRepo, oid: string) => repoHref(repo, "commits", enc(oid));
+/** The commit panel (CORE-22): the repository's page with `?commit=<full sha>`. */
+const commitHref = (repo: WorkRepo, oid: string) => `${repoHref(repo)}?commit=${oid}`;
 
 function shorten(text: string, max = 280): string {
   const plain = text.trim().replace(/\s+/g, " ");
@@ -276,19 +283,7 @@ export async function linkedWork(
     byRepo.set(commit.repo.id, [...(byRepo.get(commit.repo.id) ?? []), commit.oid]);
 
   // CI runs of those commits, and the landings' own runs.
-  const runRows: Selectable<Database["ci_runs"]>[] = [];
-  for (const [repoId, oids] of byRepo)
-    for (const part of chunks(oids))
-      runRows.push(
-        ...(await k
-          .selectFrom("ci_runs")
-          .selectAll()
-          .where("repo_id", "=", repoId)
-          .where("commit_oid", "in", part)
-          .orderBy("number", "desc")
-          .limit(WORK_LIMIT + 1)
-          .execute()),
-      );
+  const runRows = await runsOf(k, byRepo);
   for (const { repoId, number } of landingRuns)
     if (!runRows.some((r) => r.repo_id === repoId && r.number === number)) {
       const row = await k
@@ -301,21 +296,7 @@ export async function linkedWork(
     }
   const runs: WorkRun[] = runRows
     .filter((row) => readable.has(row.repo_id))
-    .map((row) => {
-      const repo = readable.get(row.repo_id)!;
-      return {
-        repo,
-        number: row.number,
-        status: row.status,
-        commit: row.commit_oid,
-        ref: row.ref,
-        title: row.title,
-        kind: row.landing_id ? "landing" : row.preview_action ? "preview" : row.trigger,
-        createdAt: row.created_at,
-        finishedAt: row.finished_at,
-        href: repoHref(repo, "ci", String(row.number)),
-      } satisfies WorkRun;
-    })
+    .map((row) => workRun(row, readable.get(row.repo_id)!))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   if (runs.length > WORK_LIMIT) truncated = true;
 
@@ -370,8 +351,122 @@ export async function linkedWork(
   if (deployments.length > WORK_LIMIT) truncated = true;
 
   // Packages published from those commits.
-  const packages: WorkPackage[] = [];
-  const feedOwners = new Set<string>();
+  const packages = await packagesOf(env, byRepo, readable);
+  if (packages.length > WORK_LIMIT) truncated = true;
+
+  // Commits that mention it (CORE-22), apart from the evidence above.
+  const mentionRows = await k
+    .selectFrom("commit_issue_mentions as m")
+    .innerJoin("repos as r", "r.id", "m.repo_id")
+    .innerJoin("accounts as o", "o.id", "r.owner_id")
+    .select([
+      "m.repo_id",
+      "m.commit_oid",
+      "m.change_id",
+      "m.title",
+      "m.committed_at",
+      "m.first_ref",
+      "m.pushed_at",
+      "r.name",
+      "o.slug as owner_slug",
+    ])
+    .where("m.tracker_owner_id", "=", owner.id)
+    .where("m.issue_id", "=", issue.id)
+    .where("m.resolution", "=", "linked")
+    .where("r.deleted_at", "is", null)
+    .where(readableRepo(actor))
+    .orderBy(sql`coalesce(m.committed_at, m.pushed_at)`, "desc")
+    .orderBy("m.commit_oid")
+    .limit(WORK_LIMIT + 1)
+    .execute();
+  if (mentionRows.length > WORK_LIMIT) truncated = true;
+  const mentioned = new Map<string, WorkRepo>();
+  const mentionedOids = new Map<string, string[]>();
+  for (const row of mentionRows.slice(0, WORK_LIMIT)) {
+    mentioned.set(row.repo_id, { id: row.repo_id, owner: row.owner_slug, name: row.name });
+    mentionedOids.set(row.repo_id, [...(mentionedOids.get(row.repo_id) ?? []), row.commit_oid]);
+  }
+  const [mentionRuns, mentionPackages] = mentionRows.length
+    ? await Promise.all([runsOf(k, mentionedOids), packagesOf(env, mentionedOids, mentioned)])
+    : [[], []];
+  const mentions: WorkMention[] = mentionRows.slice(0, WORK_LIMIT).map((row) => {
+    const repo = mentioned.get(row.repo_id)!;
+    return {
+      repo,
+      oid: row.commit_oid,
+      changeId: row.change_id,
+      title: row.title,
+      committedAt: row.committed_at,
+      ref: row.first_ref,
+      pushedAt: row.pushed_at,
+      href: commitHref(repo, row.commit_oid),
+      runs: mentionRuns
+        .filter((r) => r.repo_id === row.repo_id && r.commit_oid === row.commit_oid)
+        .map((r) => workRun(r, repo))
+        .slice(0, 10),
+      packages: mentionPackages
+        .filter((p) => p.repo.id === row.repo_id && p.commit === row.commit_oid)
+        .slice(0, 10),
+    };
+  });
+
+  return {
+    issue,
+    commits: looked.slice(0, WORK_LIMIT),
+    steps,
+    runs: runs.slice(0, WORK_LIMIT),
+    deployments: deployments.slice(0, WORK_LIMIT),
+    packages: packages.slice(0, WORK_LIMIT),
+    timelines,
+    releaseNotes,
+    mentions,
+    truncated: truncated || looked.length > WORK_LIMIT,
+  };
+}
+
+/** The top-level CI runs of `byRepo`'s commits (repository id to commit ids). */
+async function runsOf(
+  k: ReturnType<typeof db>,
+  byRepo: Map<string, string[]>,
+): Promise<Selectable<Database["ci_runs"]>[]> {
+  const rows: Selectable<Database["ci_runs"]>[] = [];
+  for (const [repoId, oids] of byRepo)
+    for (const part of chunks(oids))
+      rows.push(
+        ...(await k
+          .selectFrom("ci_runs")
+          .selectAll()
+          .where("repo_id", "=", repoId)
+          .where("commit_oid", "in", part)
+          .where("step", "=", 0)
+          .orderBy("number", "desc")
+          .limit(WORK_LIMIT + 1)
+          .execute()),
+      );
+  return rows;
+}
+
+function workRun(row: Selectable<Database["ci_runs"]>, repo: WorkRepo): WorkRun {
+  return {
+    repo,
+    number: row.number,
+    status: row.status,
+    commit: row.commit_oid,
+    ref: row.ref,
+    title: row.title,
+    kind: row.landing_id ? "landing" : row.preview_action ? "preview" : row.trigger,
+    createdAt: row.created_at,
+    finishedAt: row.finished_at,
+    href: repoHref(repo, "ci", String(row.number)),
+  };
+}
+
+/** Packages published from `byRepo`'s commits, newest first, in `readable` repositories. */
+async function packagesOf(
+  env: Env,
+  byRepo: Map<string, string[]>,
+  readable: Map<string, WorkRepo>,
+): Promise<WorkPackage[]> {
   const publishRows: {
     format: string;
     name: string;
@@ -396,18 +491,19 @@ export async function linkedWork(
         .all<(typeof publishRows)[number]>();
       publishRows.push(...results);
     }
-  for (const row of publishRows) feedOwners.add(row.owner_id);
-  const ownerSlugs = feedOwners.size
+  const feedOwners = [...new Set(publishRows.map((row) => row.owner_id))];
+  const ownerSlugs = feedOwners.length
     ? new Map(
         (
-          await k
+          await db(env.DB)
             .selectFrom("accounts")
             .select(["id", "slug"])
-            .where("id", "in", [...feedOwners])
+            .where("id", "in", feedOwners)
             .execute()
         ).map((a) => [a.id, a.slug]),
       )
     : new Map<string, string>();
+  const packages: WorkPackage[] = [];
   for (const row of publishRows) {
     const slug = ownerSlugs.get(row.owner_id);
     const repo = readable.get(row.git_repo_id);
@@ -423,18 +519,5 @@ export async function linkedWork(
       href: packagePath(slug, row.format as FormatId, row.name),
     });
   }
-  packages.sort((a, b) => b.at.localeCompare(a.at));
-  if (packages.length > WORK_LIMIT) truncated = true;
-
-  return {
-    issue,
-    commits: looked.slice(0, WORK_LIMIT),
-    steps,
-    runs: runs.slice(0, WORK_LIMIT),
-    deployments: deployments.slice(0, WORK_LIMIT),
-    packages: packages.slice(0, WORK_LIMIT),
-    timelines,
-    releaseNotes,
-    truncated: truncated || looked.length > WORK_LIMIT,
-  };
+  return packages.sort((a, b) => b.at.localeCompare(a.at));
 }

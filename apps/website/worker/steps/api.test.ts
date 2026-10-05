@@ -5,9 +5,21 @@ import { STEP_LIMITS } from "../../shared/steps.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
+import { fakeDurableState } from "../testing/durable-state.ts";
+import { StepFeed } from "./feed.ts";
 import { steps } from "./api.ts";
 
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {}, WorkflowEntrypoint: class {} }));
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    ctx: unknown;
+    env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+  WorkflowEntrypoint: class {},
+}));
 
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
 const annsAgent: Actor = { ...ann, agent: { id: "agt_builder", name: "builder" } };
@@ -26,7 +38,18 @@ function setup(visibility: "public" | "private" = "private") {
       VALUES ('repo', 'ann', 'app', '${visibility}', 'a', 'https://a');
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('repo', 'ben', 'write');
   `);
-  const env = { DB: d1(sqlite) } as unknown as Env;
+  // Live feeds (CORE-239), real objects over fake storage, by name.
+  const feeds = new Map<string, StepFeed>();
+  const env = {
+    DB: d1(sqlite),
+    STEP_FEED: {
+      getByName: (name: string) => {
+        if (!feeds.has(name))
+          feeds.set(name, new StepFeed(fakeDurableState().ctx as never, {} as Env));
+        return feeds.get(name)!;
+      },
+    },
+  } as unknown as Env;
   let actor: Actor | null = annsAgent;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
@@ -38,6 +61,7 @@ function setup(visibility: "public" | "private" = "private") {
     app.request(`/api/repos/ann/app/steps${path}`, init, env);
   return {
     sqlite,
+    feeds,
     as: (next: Actor | null) => {
       actor = next;
     },
@@ -65,6 +89,89 @@ const step = (n: number, over: Partial<StepUpload> = {}): StepUpload => ({
 });
 
 describe("step context", () => {
+  test("a feed that fails never fails the upload or the reads (S11)", async () => {
+    const s = setup();
+    s.feeds.set("repo:search", {
+      publish: async () => {
+        throw new Error("feed down");
+      },
+    } as unknown as StepFeed);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const made = await s.upload(step(1));
+    expect(made.status).toBe(201);
+    expect(errors).toHaveBeenCalledWith(
+      "Steps: publishing to the live feed failed",
+      expect.anything(),
+    );
+    errors.mockRestore();
+    const page = (await (await s.call("?timeline=search")).json()) as StepPage;
+    expect(page.steps.map((x) => x.summary)).toEqual(["Step 1"]);
+  });
+
+  test("a new timeline step goes out on its live feed, read by whoever can read the repo (CORE-239)", async () => {
+    const s = setup();
+    await s.upload(step(1));
+    // A retry doesn't go out twice; a step outside a timeline doesn't at all.
+    await s.upload(step(1));
+    await s.upload(step(2, { timeline: undefined }));
+    const feed = s.feeds.get("repo:search")!;
+    const records = await feed.since(0);
+    expect(records.map((r) => [r.seq, r.summary, r.repo, r.timeline])).toEqual([
+      [1, "Step 1", "ann/app", "search"],
+    ]);
+    expect(records[0]).toMatchObject({
+      author: { id: "agt_builder", kind: "agent", name: "builder" },
+      tests: { passed: 1, failed: 0 },
+      why: "Recency matters more than score here.",
+    });
+
+    // Ben can read: the stream has the step.
+    s.as(ben);
+    const live = await s.call("/live?timeline=search");
+    expect(live.status).toBe(200);
+    expect(live.headers.get("content-type")).toContain("text/event-stream");
+    const reader = live.body!.getReader();
+    let text = "";
+    while (!text.includes("Step 1")) text += new TextDecoder().decode((await reader.read()).value);
+    await reader.cancel();
+    expect(text).toContain("id: 1\nevent: step\n");
+    // Cid can't read the private repository: nothing, not even that it exists.
+    s.as(cid);
+    expect((await s.call("/live?timeline=search")).status).toBe(404);
+    s.as(ben);
+    expect((await s.call("/live?timeline=Not%20a%20slug")).status).toBe(400);
+  });
+
+  test("a step carries its step runs' artifacts, newest first (CORE-235)", async () => {
+    const s = setup();
+    await s.upload(step(1));
+    const summary = (status: string) =>
+      JSON.stringify({
+        status,
+        passed: 1,
+        failed: 0,
+        jobs: [{ name: "lint", status: "succeeded", exitCode: 0, durationMs: 900 }],
+      });
+    s.sqlite.exec(`
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step)
+        VALUES ('run1', 'repo', 1, '${oid(1)}', 'timeline/search', 'manual', 'failed', 1),
+               ('run2', 'repo', 2, '${oid(1)}', 'timeline/search', 'manual', 'succeeded', 1);
+      INSERT INTO step_artifacts (id, repo_id, commit_oid, run_id, kind, data, created_at) VALUES
+        ('run1:test-summary', 'repo', '${oid(1)}', 'run1', 'test-summary', '${summary("failed")}', '2026-10-04T00:01:00.000Z'),
+        ('run2:test-summary', 'repo', '${oid(1)}', 'run2', 'test-summary', '${summary("succeeded")}', '2026-10-04T00:02:00.000Z');
+    `);
+    const page = (await (await s.call("")).json()) as StepPage;
+    expect(page.steps[0]!.artifacts.map((a) => [a.runNumber, a.kind, a.data.status])).toEqual([
+      [2, "test-summary", "succeeded"],
+      [1, "test-summary", "failed"],
+    ]);
+    const versions = (await (await s.call("/change0001")).json()) as StepVersions;
+    expect(versions.versions[0]!.artifacts).toHaveLength(2);
+    await s.upload(step(2));
+    const two = (await (await s.call("")).json()) as StepPage;
+    expect(two.steps.find((x) => x.commitOid === oid(2))!.artifacts).toEqual([]);
+  });
+
   test("an agent uploads a step; it reads back with its context and author", async () => {
     const s = setup();
     const made = await s.upload(step(1));

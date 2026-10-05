@@ -216,7 +216,7 @@ export function Wiki() {
               : "The first version is on its way."}
           </span>
         </div>
-        <KnowledgeStatusPill status={status} />
+        <KnowledgeStatusPill status={status} repo={{ owner: repo.owner.slug, name: repo.name }} />
       </div>
     );
   }
@@ -239,7 +239,10 @@ export function Wiki() {
                 Show on the map
               </Link>
             )}
-            <KnowledgeStatusPill status={status} />
+            <KnowledgeStatusPill
+              status={status}
+              repo={{ owner: repo.owner.slug, name: repo.name }}
+            />
           </div>
         </div>
         {timelinePage && (

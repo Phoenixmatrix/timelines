@@ -519,9 +519,82 @@ pub fn why_text(value: &Value) -> String {
                 value["repo"]["defaultBranch"].as_str().unwrap_or("main")
             );
         }
+        step_text(&mut out, chain);
         let _ = writeln!(out, "  discussion  {}", s(&chain["discussions"], "reason"));
     }
     out
+}
+
+/// The step behind a chain's commit (CORE-243): its why first.
+fn step_text(out: &mut String, chain: &Value) {
+    let step = &chain["step"];
+    if !step.is_object() {
+        // Only timeline work records steps: say so where one was expected.
+        if chain["timelines"].as_array().is_some_and(|t| !t.is_empty()) {
+            let _ = writeln!(out, "  step        no context recorded");
+        }
+        return;
+    }
+    let context = &step["context"];
+    let first = |key: &str| {
+        context[key]
+            .as_str()
+            .and_then(|t| t.lines().find(|l| !l.trim().is_empty()))
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
+    let author = &step["author"];
+    let by = match (
+        author["name"].as_str(),
+        author["accountable"]["displayName"].as_str(),
+    ) {
+        (Some(name), Some(person)) if author["kind"] == "agent" => format!("{name} for {person}"),
+        (Some(name), _) => name.to_string(),
+        _ => "someone".into(),
+    };
+    let elsewhere = s(step, "commitOid") != s(chain, "oid");
+    let _ = writeln!(
+        out,
+        "  step        {}{}",
+        if step["deleted"] == true {
+            "context removed by an admin".to_string()
+        } else {
+            format!("by {by}")
+        },
+        if elsewhere {
+            format!(
+                ", recorded on {} before a rebase",
+                s(step, "commitOid").get(..12).unwrap_or("")
+            )
+        } else {
+            String::new()
+        }
+    );
+    for (label, key) in [("why", "why"), ("challenges", "challenges")] {
+        let text = first(key);
+        if !text.is_empty() {
+            let _ = writeln!(out, "              {label}: {text}");
+        }
+    }
+    for (label, key) in [("instructions", "instructions"), ("steering", "steering")] {
+        if let Some(entries) = context[key].as_array().filter(|e| !e.is_empty()) {
+            let _ = writeln!(
+                out,
+                "              {label}: {} ({})",
+                entries.len(),
+                s(&context["coverage"], key)
+            );
+        }
+    }
+    if let Some(tests) = context["tests"].as_array().filter(|t| !t.is_empty()) {
+        let failed = tests.iter().filter(|t| t["exit"] != 0).count();
+        let _ = writeln!(
+            out,
+            "              tests: {} passed, {failed} failed",
+            tests.len() - failed
+        );
+    }
 }
 
 pub fn run(ctx: &Ctx, args: &WhyArgs) -> Result<Why> {
@@ -645,6 +718,49 @@ mod tests {
             .unwrap()
             .write(git2::ObjectType::Commit, text.as_bytes())
             .unwrap()
+    }
+
+    #[test]
+    fn a_chain_shows_the_step_behind_its_commit() {
+        let chain = json!({
+            "oid": "b".repeat(40),
+            "timelines": [{"slug": "search"}],
+            "step": {
+                "commitOid": "a".repeat(40),
+                "deleted": false,
+                "author": {"kind": "agent", "name": "bot", "accountable": {"displayName": "Ann"}},
+                "context": {
+                    "why": "Titles match what people type.\nMore detail.",
+                    "challenges": "",
+                    "instructions": [{"text": "Rank by title", "source": "hook"}],
+                    "steering": [],
+                    "tests": [{"command": "vp test", "exit": 0}, {"command": "cargo test", "exit": 1}],
+                    "coverage": {"instructions": "hook:claude-code", "steering": "hook:claude-code"}
+                }
+            }
+        });
+        let mut out = String::new();
+        step_text(&mut out, &chain);
+        assert_eq!(
+            out,
+            format!(
+                "  step        by bot for Ann, recorded on {} before a rebase\n              why: Titles match what people type.\n              instructions: 1 (hook:claude-code)\n              tests: 1 passed, 1 failed\n",
+                "a".repeat(12)
+            )
+        );
+        // A timeline commit with nothing recorded says so; main's says nothing.
+        let mut out = String::new();
+        step_text(
+            &mut out,
+            &json!({"oid": "c", "timelines": [{"slug": "x"}], "step": null}),
+        );
+        assert_eq!(out, "  step        no context recorded\n");
+        let mut out = String::new();
+        step_text(
+            &mut out,
+            &json!({"oid": "c", "timelines": [], "step": null}),
+        );
+        assert_eq!(out, "");
     }
 
     #[test]

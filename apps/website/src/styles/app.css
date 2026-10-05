@@ -303,6 +303,77 @@ body {
   background: transparent;
 }
 
+/* Chip roles (CORE-271). One tag vocabulary plays three roles, and a status
+   word is a fourth thing again, so each reads by shape and mark, never by hue:
+   - status word (`mk-chip--tag`): the plain raised pill;
+   - issue tag: the same fill in full ink with a faint hash mark;
+   - agent tag: outlined, transparent, with a robot mark (the agent's own words);
+   - requirement: a mono term on a recessed pill with a dashed edge (a gate).
+   `mk-chip--unknown` dashes a name no catalog has; `mk-chip--link` makes one a
+   link with a touch-sized hit area. */
+.mk-root .mk-chip--issue-tag {
+  gap: 3px;
+  padding: 0 8px 0 6px;
+  color: var(--ink);
+}
+.mk-root .mk-chip--issue-tag > svg {
+  color: var(--ink-faint);
+}
+.mk-root .mk-chip--agent-tag {
+  gap: 4px;
+  padding: 0 8px 0 6px;
+  background: transparent;
+  color: var(--ink-muted);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.mk-root .mk-chip--agent-tag:hover {
+  background: transparent;
+}
+.mk-root .mk-chip--requirement {
+  gap: 4px;
+  padding: 0 4px 0 8px;
+  border: 1px dashed var(--line);
+  background: var(--sunken);
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: -0.01em;
+}
+.mk-root .mk-chip--requirement:hover {
+  background: var(--sunken);
+}
+.mk-root .mk-chip--unknown {
+  box-shadow: none;
+  border: 1px dashed var(--ink-faint);
+}
+.mk-root .mk-chip--link {
+  position: relative;
+  cursor: pointer;
+  text-decoration: none;
+  transition:
+    background-color 150ms,
+    color 150ms,
+    box-shadow 150ms;
+}
+.mk-root .mk-chip--link::after {
+  content: "";
+  position: absolute;
+  inset: -12px -2px;
+}
+.mk-root .mk-chip--link:hover {
+  color: var(--ink);
+}
+.mk-root .mk-chip--agent-tag.mk-chip--link:hover {
+  box-shadow: inset 0 0 0 1px var(--ink-faint);
+}
+.mk-root .mk-chip--issue-tag.mk-chip--link:hover {
+  background: var(--pressed);
+}
+.mk-root .mk-chip--link:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+}
+
 /* The kit's phone rule lifts every chip to the 44px touch floor, and the
    vendored stylesheet can't tell tags (labels, not controls) apart. */
 @media (max-width: 639.98px) {
@@ -327,6 +398,38 @@ body {
   ::view-transition-new(*) {
     animation: none !important;
   }
+}
+
+/* The capability map (CORE-47): sea, coast and borders, and the land's
+   lightness and chroma. Each country takes its own hue at that lightness, so
+   countries tell apart without any of them shouting; selection lifts its
+   country, unrelated ones sink toward the sea. */
+:root,
+[data-theme="dark"] {
+  --map-sea: oklch(0.215 0.012 230);
+  --map-sea-far: oklch(0.17 0.006 70);
+  --map-shallows: oklch(0.75 0.06 210);
+  --map-coast: oklch(0.72 0.03 210 / 0.55);
+  --map-border: oklch(0.165 0.006 70);
+  --map-land: 0.355 0.05;
+  --map-land-lift: 0.075;
+  --map-land-dim: -0.07;
+  --map-land-step: 0.022;
+  --map-isle: 0.29 0.006;
+  --map-halo: 0.17 0.012;
+}
+[data-theme="light"] {
+  --map-sea: oklch(0.925 0.02 230);
+  --map-sea-far: oklch(0.955 0.006 75);
+  --map-shallows: oklch(0.6 0.06 220);
+  --map-coast: oklch(0.5 0.04 220 / 0.5);
+  --map-border: oklch(0.985 0.003 75);
+  --map-land: 0.85 0.05;
+  --map-land-lift: -0.05;
+  --map-land-dim: 0.06;
+  --map-land-step: 0.025;
+  --map-isle: 0.88 0.006;
+  --map-halo: 0.97 0.01;
 }
 
 /* The timeline banner (CORE-82) stays above the page from 640px while a

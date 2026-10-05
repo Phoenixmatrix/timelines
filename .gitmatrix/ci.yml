@@ -22,10 +22,17 @@
 # (`on: preview`, the preview and preview-teardown jobs below), the reference
 # implementation of the preview contract; apps/website/README.md, "Gitmatrix's
 # own previews". Preview runs run only those two jobs.
+#
+# Steps (CORE-237): every push to a timeline/<slug> bookmark also gets a step
+# run, the light check an agent's step deserves (CORE-235): only the step-*
+# jobs below. Lint and types, and the website's unit tests related to the
+# files the step changed; no E2E, builds or previews. `gm test` runs the same
+# jobs locally (local: true) before `gm step` commits.
 on:
   push:
     coalesce_after: 4
   preview: {}
+  step: {}
 
 # Four independent jobs must not each launch 24 compiler workers on this host.
 # Leave CPU capacity for JavaScript tests and the live server during cold builds.
@@ -33,6 +40,37 @@ env:
   CARGO_BUILD_JOBS: "4"
 
 jobs:
+  step-check:
+    on: step
+    local: true
+    instance: standard-4
+    timeout_minutes: 15
+    steps:
+      # Locally the checkout is already installed and typed.
+      - name: Install
+        run: '[ -n "${GITMATRIX_LOCAL:-}" ] || { pnpm install --frozen-lockfile && vp run website#cf-typegen; }'
+      - name: Format, lint, type check
+        run: vp check
+
+  step-unit:
+    on: step
+    local: true
+    instance: standard-2
+    timeout_minutes: 15
+    steps:
+      - name: Install
+        run: '[ -n "${GITMATRIX_LOCAL:-}" ] || { pnpm install --frozen-lockfile && vp run website#cf-typegen; }'
+      # The step's own changes: locally the working copy against its parent
+      # (git's HEAD in a gm checkout); in a step run the commit against its
+      # parent, or everything when a shallow clone lacks it.
+      - name: Unit tests related to the step's changes
+        run: |
+          cd apps/website
+          if [ -n "${GITMATRIX_LOCAL:-}" ]; then since=HEAD
+          elif git rev-parse -q --verify HEAD~1 >/dev/null; then since=HEAD~1
+          else since=""; fi
+          vp test run --project unit ${since:+--changed=$since} --passWithNoTests
+
   check:
     instance: standard-4
     steps:
@@ -57,11 +95,18 @@ jobs:
       - name: Generate Worker types
         run: vp run website#cf-typegen
       # apps/website's browser-mode tests (*.browser.test.tsx) run in Chromium's
-      # headless shell: fetch it, and its system libraries where the job may
-      # install them (the Sandbox runs as root; a local runner has them). ~20s.
+      # headless shell. The CI image bakes it, and its system libraries, for the
+      # Playwright version in ci/Dockerfile, so in a Sandbox this step has nothing
+      # to do. After a Playwright upgrade, until the image is redeployed, it
+      # installs the libraries (as root, when the image's marker names another
+      # version) and fetches the new revision (~20s). A local runner isn't root,
+      # already has the libraries, and uses the user's browser cache.
       - name: Chromium for browser-mode tests
         run: |
-          if [ "$(id -u)" = 0 ]; then pnpm --filter website exec playwright install-deps chromium; fi
+          version=$(pnpm --filter website exec playwright --version | awk '{print $2}')
+          if [ "$(id -u)" = 0 ] && [ ! -e "/usr/local/share/playwright-deps/$version" ]; then
+            pnpm --filter website exec playwright install-deps chromium
+          fi
           pnpm --filter website exec playwright install --only-shell chromium
       - name: Tests (everything but gm, which the cli job tests)
         run: vp run --filter '!cli' --concurrency-limit 1 --no-cache test

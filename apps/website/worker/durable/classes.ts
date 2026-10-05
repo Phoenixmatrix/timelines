@@ -42,6 +42,12 @@ export const DURABLE_CLASSES = {
     source: "worker/knowledge/coordinator.ts",
     owner: (name: string) => ({ account: null, repo: name }),
   },
+  /** One per repository and timeline, "<repoId>:<slug>": its live feed of steps (CORE-239). */
+  StepFeed: {
+    binding: "STEP_FEED",
+    source: "worker/steps/feed.ts",
+    owner: (name: string) => ({ account: null, repo: name.split(":")[0] || null }),
+  },
   /** One per CI job, named by job id; owns the job's container while it runs. */
   CiSandbox: {
     binding: "CI_SANDBOX",

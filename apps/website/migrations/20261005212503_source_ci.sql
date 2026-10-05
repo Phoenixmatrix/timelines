@@ -6,9 +6,11 @@ CREATE TABLE ci_refs_source (
   source_id TEXT NOT NULL DEFAULT 'canonical',
   ref TEXT NOT NULL,
   oid TEXT NOT NULL,
+  quiet_released TEXT,
   PRIMARY KEY(repo_id, source_id, ref)
 );
-INSERT INTO ci_refs_source(repo_id, source_id, ref, oid) SELECT repo_id, 'canonical', ref, oid FROM ci_refs;
+INSERT INTO ci_refs_source(repo_id, source_id, ref, oid, quiet_released)
+  SELECT repo_id, 'canonical', ref, oid, quiet_released FROM ci_refs;
 DROP TABLE ci_refs;
 ALTER TABLE ci_refs_source RENAME TO ci_refs;
 CREATE INDEX ci_runs_source_commit ON ci_runs(repo_id, source_id, commit_oid);

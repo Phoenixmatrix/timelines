@@ -15,6 +15,9 @@
 // /settings/previews) and Atlas snapshot retention ("active"; ATLAS_RETENTION,
 // which an account can tighten within ATLAS_RETENTION_BOUNDS; CORE-201).
 //
+// "fixed" categories always run with their defaults and can't be changed:
+// auth hygiene (CORE-249).
+//
 // Adding a category: append an entry (a new kebab-case id; ids are stored, so
 // never rename one), then implement its cleanup against the engine contract
 // (worker/retention/engine.ts) in the ticket that owns it.
@@ -22,6 +25,7 @@
 import type { RetentionCategory, RetentionThreshold } from "../../shared/retention.ts";
 import { ATLAS_RETENTION, ATLAS_RETENTION_BOUNDS } from "../atlas/retention.ts";
 import { DEFAULT_PREVIEW_SETTINGS } from "../../shared/deployments.ts";
+import { STEP_FEED_DAYS } from "../../shared/steps.ts";
 
 const TEN_YEARS = 3650;
 
@@ -66,7 +70,7 @@ export const CATEGORIES = [
       "Running or queued runs, and runs with a job still running",
       "Runs a deployment, a landing or a package publish refers to",
     ],
-    overlaps: ["ci-logs"],
+    overlaps: ["ci-logs", "step-artifacts"],
     thresholds: [days("days", "Days after the run", 180), keepLatest("Runs kept per ref", 20)],
   },
   {
@@ -99,6 +103,48 @@ export const CATEGORIES = [
       "Knowledge overlays, regroupings and page sets of timelines that ended more than the given days ago.",
     never: ["Data of open timelines", "Anything on the main line"],
     thresholds: [days("days", "Days after the timeline ended", 90)],
+  },
+  // Work context (CORE-244; PRD CORE-226, "Settings: retention"): a step's why,
+  // challenges, tests and coverage are kept as long as the repository; the
+  // people's own words, the step-run artifacts and the live feed are not.
+  {
+    id: "step-steering",
+    scope: "account",
+    control: "policy",
+    label: "Step instructions and steering",
+    description:
+      "The text of steps' instructions and steering (what people told their agents), the given days after the step's commit, trimmed to a placeholder.",
+    never: ["A step's why, challenges, tests or coverage", "The step itself and its commit"],
+    thresholds: [days("days", "Days after the step's commit", 365)],
+  },
+  {
+    id: "step-artifacts",
+    scope: "account",
+    control: "policy",
+    label: "Step run artifacts",
+    description: "What step runs produced (test summaries), the given days after the run.",
+    never: ["The step and its context", "The CI run that produced them"],
+    overlaps: ["ci-runs"],
+    thresholds: [days("days", "Days after the step run", 90)],
+  },
+  {
+    id: "step-feed",
+    scope: "account",
+    control: "active",
+    label: "Live step feed",
+    description:
+      "Each timeline's live feed keeps a step's small record for the given days, enough for readers to catch up; the step itself stays. An account can keep less, never more.",
+    never: ["Steps and their context"],
+    thresholds: [
+      {
+        key: "days",
+        label: "Days a feed record is kept",
+        unit: "days",
+        min: 1,
+        max: STEP_FEED_DAYS,
+        default: STEP_FEED_DAYS,
+      },
+    ],
   },
   {
     id: "timeline-work-sources",
@@ -302,10 +348,12 @@ export const CATEGORIES = [
   {
     id: "auth-hygiene",
     scope: "site",
-    control: "policy",
+    // Expired sign-in state is worth nothing to keep, so it isn't left to an
+    // administrator to find and enable (CORE-249).
+    control: "fixed",
     label: "Auth hygiene",
     description:
-      "Expired sign-in sessions, lockouts, SSH challenges, verification codes and expired or revoked tokens, the given days after they ended.",
+      "Expired sign-in sessions, sign-in and device codes, lockouts, SSH challenges and expired tokens, the given days after they ended.",
     never: ["Live sessions, valid tokens and active lockouts"],
     thresholds: [days("days", "Days after expiry", 7)],
   },

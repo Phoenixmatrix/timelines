@@ -3,6 +3,7 @@
 
 import { redirect, type RouteObject } from "react-router";
 import { AppShell } from "./components/AppShell.tsx";
+import { keepPageUnderPanel } from "./lib/commitPanel.ts";
 import { rootLoader } from "./lib/session.ts";
 import { scopeOf, timelineScopeMiddleware } from "./lib/timelineScope.ts";
 import { Account, accountLoader } from "./routes/Account.tsx";
@@ -29,6 +30,7 @@ import { PackageConsole, packageConsoleLoader } from "./routes/packages/PackageC
 import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
 import { Releases, releasesLoader } from "./routes/repo/Releases.tsx";
 import { TrackerReleases, trackerReleasesLoader } from "./routes/tracker/Releases.tsx";
+import { Story, storyLoader } from "./routes/tracker/Story.tsx";
 import { TrackerTimelines, trackerTimelinesLoader } from "./routes/tracker/Timelines.tsx";
 import { RepoLayout, repoLoader, repoShouldRevalidate } from "./routes/repo/RepoLayout.tsx";
 import { Settings, settingsAction, settingsLoader } from "./routes/repo/Settings.tsx";
@@ -39,6 +41,12 @@ import { Invites, invitesAction, invitesLoader } from "./routes/Invites.tsx";
 import { Profile, profileAction, profileLoader } from "./routes/Profile.tsx";
 import { Preferences, preferencesLoader } from "./routes/Preferences.tsx";
 import { AiSettings, aiSettingsLoader } from "./routes/AiSettings.tsx";
+import {
+  AssistantSkills,
+  assistantSkillsAction,
+  assistantSkillsLoader,
+} from "./routes/AssistantSkills.tsx";
+import { SiteAiSettings, siteAiSettingsLoader } from "./routes/SiteAiSettings.tsx";
 import { SiteUsage, siteUsageLoader, UsageCosts, usageLoader } from "./routes/UsageCosts.tsx";
 import {
   DataRetention,
@@ -57,6 +65,7 @@ import {
   trackerLoader,
 } from "./routes/tracker/loaders.ts";
 import { RepoTracker, repoTrackerLoader } from "./routes/repo/Tracker.tsx";
+import { GoPage, goLoader } from "./refs/GoPage.tsx";
 
 /** The app's routes. */
 export const routes: RouteObject[] = [
@@ -83,6 +92,8 @@ export const routes: RouteObject[] = [
           { path: "release-notes", loader: releaseNotesIndexLoader, Component: TrackerIndex },
           { path: "packages", loader: allPackagesLoader, Component: AllPackages },
           { path: "needs-you", loader: needsYouLoader, Component: NeedsYou },
+          // Whatever a ref names (CORE-22): redirects, or a chooser when it's ambiguous.
+          { path: "-/go/*", loader: goLoader, Component: GoPage },
           {
             path: "tracker/:owner/releases",
             loader: trackerReleasesLoader,
@@ -92,6 +103,11 @@ export const routes: RouteObject[] = [
             path: "tracker/:owner/timelines",
             loader: trackerTimelinesLoader,
             Component: TrackerTimelines,
+          },
+          {
+            path: "tracker/:owner/timelines/:slug/story",
+            loader: storyLoader,
+            Component: Story,
           },
           {
             path: "tracker/:owner",
@@ -133,6 +149,12 @@ export const routes: RouteObject[] = [
             Component: Profile,
           },
           {
+            path: "settings/skills",
+            loader: assistantSkillsLoader,
+            action: assistantSkillsAction,
+            Component: AssistantSkills,
+          },
+          {
             path: "settings/preferences",
             loader: preferencesLoader,
             Component: Preferences,
@@ -142,6 +164,7 @@ export const routes: RouteObject[] = [
             loader: aiSettingsLoader,
             Component: AiSettings,
           },
+          { path: "settings/site-ai", loader: siteAiSettingsLoader, Component: SiteAiSettings },
           { path: "settings/usage", loader: usageLoader, Component: UsageCosts },
           { path: "settings/site-usage", loader: siteUsageLoader, Component: SiteUsage },
           { path: "settings/retention", loader: retentionLoader, Component: DataRetention },
@@ -193,42 +216,45 @@ export const routes: RouteObject[] = [
             loader: repoLoader,
             shouldRevalidate: repoShouldRevalidate,
             Component: RepoLayout,
-            children: [
-              { index: true, loader: codeLoader, Component: Code },
-              { path: "tree/*", loader: codeLoader, Component: Code },
-              { path: "blob/*", loader: blobLoader, Component: Blob },
-              { path: "commits/*", loader: commitsLoader, Component: Commits },
-              { path: "changes", Component: SemanticChanges },
-              { path: "wiki/*", loader: wikiLoader, Component: Wiki },
-              { path: "releases/*", loader: releasesLoader, Component: Releases },
-              // Knowledge is the Semantic Code Atlas (CORE-174): bounded regions, never the whole graph.
-              {
-                path: "knowledge",
-                loader: atlasLoader,
-                shouldRevalidate: atlasShouldRevalidate,
-                Component: Atlas,
-              },
-              // Links from before the cutover keep their view.
-              {
-                path: "atlas",
-                loader: ({ request }) => {
-                  const url = new URL(request.url);
-                  return redirect(
-                    `${url.pathname.replace(/\/atlas\/?$/, "/knowledge")}${url.search}`,
-                  );
+            // ?commit= opens the commit panel over any of these (CORE-22) without reloading it.
+            children: (
+              [
+                { index: true, loader: codeLoader, Component: Code },
+                { path: "tree/*", loader: codeLoader, Component: Code },
+                { path: "blob/*", loader: blobLoader, Component: Blob },
+                { path: "commits/*", loader: commitsLoader, Component: Commits },
+                { path: "changes", Component: SemanticChanges },
+                { path: "wiki/*", loader: wikiLoader, Component: Wiki },
+                { path: "releases/*", loader: releasesLoader, Component: Releases },
+                // Knowledge is the Semantic Code Atlas (CORE-174): bounded regions, never the whole graph.
+                {
+                  path: "knowledge",
+                  loader: atlasLoader,
+                  shouldRevalidate: atlasShouldRevalidate,
+                  Component: Atlas,
                 },
-              },
-              { path: "tracker", loader: repoTrackerLoader, Component: RepoTracker },
-              { path: "ci", loader: ciLoader, action: ciAction, Component: CiRuns },
-              { path: "ci/:number", loader: ciRunLoader, Component: CiRun },
-              { path: "packages", loader: repoPackagesLoader, Component: RepoPackages },
-              {
-                path: "settings",
-                loader: settingsLoader,
-                action: settingsAction,
-                Component: Settings,
-              },
-            ],
+                // Links from before the cutover keep their view.
+                {
+                  path: "atlas",
+                  loader: ({ request }) => {
+                    const url = new URL(request.url);
+                    return redirect(
+                      `${url.pathname.replace(/\/atlas\/?$/, "/knowledge")}${url.search}`,
+                    );
+                  },
+                },
+                { path: "tracker", loader: repoTrackerLoader, Component: RepoTracker },
+                { path: "ci", loader: ciLoader, action: ciAction, Component: CiRuns },
+                { path: "ci/:number", loader: ciRunLoader, Component: CiRun },
+                { path: "packages", loader: repoPackagesLoader, Component: RepoPackages },
+                {
+                  path: "settings",
+                  loader: settingsLoader,
+                  action: settingsAction,
+                  Component: Settings,
+                },
+              ] satisfies RouteObject[]
+            ).map(keepPageUnderPanel),
           },
         ],
       },

@@ -270,7 +270,10 @@ function CategoryRow({
           {policy.description}
         </p>
         {policy.thresholds.length > 0 && (
-          <fieldset disabled={!canEdit || saving} className="m-0 min-w-0 border-0 p-0">
+          <fieldset
+            disabled={!canEdit || saving || policy.control === "fixed"}
+            className="m-0 min-w-0 border-0 p-0"
+          >
             <legend className="sr-only">{policy.label} thresholds</legend>
             <div className="flex flex-wrap gap-x-6 gap-y-3">
               {policy.thresholds.map((t) => {

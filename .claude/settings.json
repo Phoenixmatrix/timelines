@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "command -v gm >/dev/null 2>&1 && gm hook claude-code || true",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -401,7 +401,7 @@ describe("GET /why", () => {
       },
     });
     expect(body.people).toEqual({
-      ann: { name: "Ann", kind: "person" },
+      ann: { name: "Ann", kind: "person", slug: "ann" },
       agt_bot: { name: "bot", kind: "agent" },
     });
     expect(chain.discussions).toEqual({
@@ -419,6 +419,50 @@ describe("GET /why", () => {
       ["refs/heads/main", false],
       ["refs/heads/timeline/search", true],
     ]);
+  });
+
+  test("a landed line shows the step behind it, through its change after a rebase (CORE-243)", async () => {
+    const t = await setup();
+    const { x1, x2, landing } = t.commits;
+    const step = (oid: string, why: string, at: string) =>
+      t.sqlite
+        .prepare(
+          `INSERT INTO step_contexts (repo_id, change_id, commit_oid, author_id, accountable_id,
+             timeline, summary, context, committed_at, verified_at)
+           VALUES ('app', ?, ?, 'agt_bot', 'ann', 'search', 'Rank search by title', ?, ?, ?)`,
+        )
+        .run(
+          CHANGE,
+          oid,
+          JSON.stringify({ why, steering: [{ text: "Use titles", source: "hook" }] }),
+          at,
+          at,
+        );
+    // Only the step before the rebase was recorded: the landed line still finds it.
+    step(x1, "Titles match what people type.", "2026-10-03T01:00:00.000Z");
+    let { body } = await t.get("ann", `path=src/app.ts&line=2-3&rev=${landing}`);
+    expect(body.chains[0]!.step).toMatchObject({
+      changeId: CHANGE,
+      commitOid: x1,
+      timeline: "search",
+      author: { kind: "agent", name: "bot" },
+      context: {
+        why: "Titles match what people type.",
+        steering: [{ text: "Use titles", source: "hook" }],
+      },
+    });
+    // Main's own line has no step.
+    expect(body.chains[1]!.step).toBeNull();
+    // The landed commit's own step wins once there is one.
+    step(x2, "Rebased onto main.", "2026-10-03T02:00:00.000Z");
+    ({ body } = await t.get("ann", `path=src/app.ts&line=2&rev=${landing}`));
+    expect(body.chains[0]!.step).toMatchObject({
+      commitOid: x2,
+      context: { why: "Rebased onto main." },
+    });
+    // Steps are as readable as the repository: Bob reads this public one, step included.
+    const bob = await t.get("bob", `path=src/app.ts&line=2&rev=${landing}`);
+    expect(bob.body.chains[0]!.step?.commitOid).toBe(x2);
   });
 
   test("survives a rebase: a commit the server never saw resolves through its change id", async () => {

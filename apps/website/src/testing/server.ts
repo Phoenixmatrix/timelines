@@ -130,6 +130,24 @@ export class TestServer {
     return (served.body ? JSON.parse(served.body) : undefined) as T;
   }
 
+  /** Call the world's server as one of its agents (by id), as its token would. */
+  async callAsAgent<T>(agentId: string, method: string, path: string, body?: unknown): Promise<T> {
+    const served = await this.#serve(
+      method,
+      path,
+      [
+        ["x-browser-test-agent", agentId],
+        ...(body === undefined
+          ? []
+          : ([["content-type", "application/json"]] as [string, string][])),
+      ],
+      body === undefined ? null : JSON.stringify(body),
+    );
+    if (served.status >= 400)
+      throw new Error(`${method} ${path}: ${served.status} ${served.body.slice(0, 500)}`);
+    return (served.body ? JSON.parse(served.body) : undefined) as T;
+  }
+
   /** Act as someone else from now on (null: signed out). */
   async as(persona: Persona): Promise<void> {
     await browserCommands.gmWorld("as", { world: this.#world(), persona });
@@ -153,6 +171,31 @@ export class TestServer {
     sourceId?: string,
   ): Promise<void> {
     await browserCommands.gmWorld("push", { world: this.#world(), repo, branch, commit, sourceId });
+  }
+
+  /**
+   * Run SQL against the world's database, for rows only machinery the world
+   * lacks would write (CI runs, deployments, wiki page sets), as it would.
+   */
+  async sql<T = Record<string, unknown>>(statement: string, ...params: unknown[]): Promise<T[]> {
+    return (await browserCommands.gmWorld("sql", {
+      world: this.#world(),
+      statement,
+      params,
+    })) as T[];
+  }
+
+  /** server.sql() against the registry's database (REGISTRY_DB): feeds, packages, publishes. */
+  async registrySql<T = Record<string, unknown>>(
+    statement: string,
+    ...params: unknown[]
+  ): Promise<T[]> {
+    return (await browserCommands.gmWorld("sql", {
+      world: this.#world(),
+      statement,
+      params,
+      database: "registry",
+    })) as T[];
   }
 
   #world(): string {

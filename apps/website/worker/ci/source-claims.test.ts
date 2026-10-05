@@ -27,7 +27,7 @@ vi.mock("../artifacts.ts", async (original) => ({
   upstreamToken: async () => "sandbox-fixture-read-token",
 }));
 
-const migration = "20261004213100_ci_source_claims.sql";
+const migration = "20261005212506_ci_source_claims.sql";
 const directory = fileURLToPath(new URL("../../migrations/", import.meta.url).href);
 const oid = "a".repeat(40);
 

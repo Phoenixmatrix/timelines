@@ -35,6 +35,7 @@ import { db } from "../schema.ts";
 import {
   TIMELINE_POLICIES,
   isStalled,
+  timelineBookmark,
   type BookmarkResult,
   type Timeline,
   type TimelineChange,
@@ -56,7 +57,8 @@ import { TrackerError, fail, text } from "../tracker/store.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { timelineSlug, timelineStatus } from "../tracker/timelines.ts";
 import { measure, mayWriteAll, view, writableRepoIds } from "./checkpoints.ts";
-import { requestCheckpointPages } from "../knowledge/coordinator.ts";
+import { overlayNow, requestCheckpointPages } from "../knowledge/coordinator.ts";
+import { releaseQuiet } from "../ci/trigger.ts";
 import { maybeLand, requestLanding, settled, workerDeps } from "./landing.ts";
 import {
   canonicalSource,
@@ -409,6 +411,26 @@ timelines.post("/:slug/checkpoints", async (c) => {
   waitUntil(previewCheckpoint(c.env, state.checkpoint, timeline, actor, waitUntil));
   // The timeline's wiki pages (CORE-84), queued after the answer too.
   waitUntil(requestCheckpointPages(c.env, state.checkpoint, timeline.slug, actor.id));
+  // Its full CI and knowledge overlays now, not after the quiet period (CORE-238).
+  for (const repo of state.checkpoint.repos) {
+    const bookmark = timelineBookmark(timeline.slug);
+    // An owned work source runs its CI on its own `work` branch.
+    const work = repo.source?.kind === "timeline-work" ? repo.source : null;
+    waitUntil(
+      releaseQuiet(
+        c.env,
+        repo.id,
+        work ? work.ref.replace(/^refs\/heads\//, "") : bookmark,
+        repo.commit,
+        work?.sourceId,
+      ).catch((error) => console.error("CI: releasing the checkpoint's run failed", error)),
+    );
+    waitUntil(
+      overlayNow(c.env, repo.id, [`refs/heads/${bookmark}`]).catch((error) =>
+        console.error("Knowledge: the checkpoint's overlay failed to start", error),
+      ),
+    );
+  }
   // Green already? An auto timeline lands it (CORE-77).
   if (timeline.policy === "auto")
     waitUntil(

@@ -64,6 +64,7 @@ export function SettingsPage({
       context: null,
       links: [
         { label: "Profile", to: `/settings/profile${accountQuery}`, icon: UserCircleIcon },
+        { label: "Assistant skills", to: `/settings/skills${accountQuery}`, icon: RobotIcon },
         {
           label: "Preferences",
           to: `/settings/preferences${trackerQuery}`,
@@ -84,6 +85,11 @@ export function SettingsPage({
                 label: "Invitations",
                 to: `/settings/invites${accountQuery}`,
                 icon: EnvelopeSimpleIcon,
+              },
+              {
+                label: "Site AI settings",
+                to: `/settings/site-ai${accountQuery}`,
+                icon: GearSixIcon,
               },
               {
                 label: "Site usage & costs",

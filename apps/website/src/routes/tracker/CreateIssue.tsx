@@ -4,6 +4,7 @@ import {
   actorName,
   type Issue,
   type IssueCloseReason,
+  type IssuePickup,
   type IssueTimelineUse,
   type Mutation,
   type Snapshot,
@@ -16,11 +17,15 @@ import {
   TextField,
 } from "../../components/ui.tsx";
 import type { MutationOutcome } from "./IssueDetail.tsx";
+import { TagPicker } from "./Tags.tsx";
+import { RequirementsEditor } from "./Requirements.tsx";
+import { requirementsSentence, type IssueRequirements } from "../../../shared/requirements.ts";
 import type { TimelinePolicy } from "../../../shared/timelines.ts";
 import {
   CloseReasonField,
   Field,
   MultiCheck,
+  PickupField,
   statuses,
   TimelineFields,
   typeLabel,
@@ -31,6 +36,8 @@ import {
 export function CreateIssue({
   snapshot,
   initialTitle,
+  initialType,
+  initialLabels,
   initialTeam,
   initialWorkspaces,
   busy,
@@ -41,6 +48,8 @@ export function CreateIssue({
 }: {
   snapshot: Snapshot;
   initialTitle: string;
+  initialType: Issue["type"];
+  initialLabels: string[];
   initialTeam: string;
   initialWorkspaces: string[];
   busy: boolean;
@@ -52,14 +61,17 @@ export function CreateIssue({
   const [title, setTitle] = useState(initialTitle);
   const [teamId, setTeamId] = useState(initialTeam);
   const [description, setDescription] = useState("");
-  const [type, setType] = useState<Issue["type"]>("task");
+  const [type, setType] = useState<Issue["type"]>(initialType);
+  const [labels, setLabels] = useState(initialLabels);
   const [status, setStatus] = useState<Issue["status"]>("todo");
+  const [pickup, setPickup] = useState<IssuePickup>("anyone");
   const [closeReason, setCloseReason] = useState<IssueCloseReason | null>(null);
   const [priority, setPriority] = useState(2);
   const [timelineUse, setTimelineUse] = useState<IssueTimelineUse>("agent_decides");
   const [timelinePolicy, setTimelinePolicy] = useState<TimelinePolicy | null>(null);
   const [assigneeId, setAssigneeId] = useState("");
   const [workspaceIds, setWorkspaceIds] = useState(initialWorkspaces);
+  const [requires, setRequires] = useState<IssueRequirements | null>(null);
   const [error, setError] = useState("");
   const team = snapshot.teams.find((value) => value.id === teamId && !value.archived);
   const members = snapshot.members.filter(
@@ -81,8 +93,8 @@ export function CreateIssue({
           >
             <Dialog.Title className="mk-dialog-title">Create an issue</Dialog.Title>
             <Dialog.Description className="mk-dialog-desc text-body-sm">
-              Add context now. After creation, continue in the editor for acceptance criteria,
-              labels, and relationships.
+              Add context now. After creation, continue in the editor for acceptance criteria and
+              relationships.
             </Dialog.Description>
             <form
               className="mt-5"
@@ -100,12 +112,15 @@ export function CreateIssue({
                   description,
                   type,
                   status,
+                  pickup,
                   closeReason: status === "canceled" ? closeReason : null,
                   priority: priority as Issue["priority"],
                   timelineUse,
                   timelinePolicy,
                   assigneeId: assigneeId || null,
                   workspaceIds,
+                  labels,
+                  ...(requires ? { requires } : {}),
                 });
                 if (!result.ok) setError(result.error);
               }}
@@ -170,6 +185,7 @@ export function CreateIssue({
                       }}
                     />
                   </Field>
+                  <PickupField value={pickup} onChange={setPickup} />
                   {status === "canceled" && (
                     <CloseReasonField value={closeReason} onChange={setCloseReason} />
                   )}
@@ -201,6 +217,30 @@ export function CreateIssue({
                     }}
                   />
                 </div>
+                <TagPicker
+                  options={[...snapshot.labels, ...initialLabels]}
+                  values={labels}
+                  onChange={setLabels}
+                />
+                <section className="mk-field min-w-0" aria-label="Agent requirements">
+                  <span className="mk-label">Agent requirements</span>
+                  <span className="mk-hint m-0 mb-1">
+                    {requires
+                      ? `${requirementsSentence(requires)} can claim it, or get it from gm issue next. People always can.`
+                      : "Any agent can claim it. Add what an agent must report in its profile (gm agent setup), such as tag:ux."}
+                  </span>
+                  <RequirementsEditor
+                    value={requires}
+                    onChange={(next) => {
+                      setRequires(next);
+                      return true;
+                    }}
+                    snapshot={snapshot}
+                    issueTags={labels}
+                    disabled={busy || uncertain}
+                    id="create-requirements"
+                  />
+                </section>
                 <MultiCheck
                   label="Workspaces"
                   options={snapshot.workspaces.filter((workspace) => !workspace.archived)}

@@ -154,6 +154,7 @@ export function SelectField({
   options,
   onChange,
   ariaLabel,
+  ariaDescribedBy,
   className = "",
 }: {
   name?: string;
@@ -162,6 +163,7 @@ export function SelectField({
   options: SelectOption[];
   onChange?: (value: string) => void;
   ariaLabel?: string;
+  ariaDescribedBy?: string;
   className?: string;
 }) {
   return (
@@ -172,7 +174,11 @@ export function SelectField({
       items={options}
       onValueChange={(next) => next !== null && onChange?.(next)}
     >
-      <Select.Trigger className={`mk-input mk-select ${className}`} aria-label={ariaLabel}>
+      <Select.Trigger
+        className={`mk-input mk-select ${className}`}
+        aria-label={ariaLabel}
+        aria-describedby={ariaDescribedBy}
+      >
         <Select.Value className="truncate" />
         <Select.Icon render={<CaretUpDownIcon className="mk-icon" />} />
       </Select.Trigger>

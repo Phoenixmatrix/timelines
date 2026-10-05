@@ -294,6 +294,119 @@ fn summary_of(ws: &Workspace, oid: Oid) -> Result<String> {
         .collect())
 }
 
+// ---- harness hooks (CORE-241) --------------------------------------------------------
+
+/// Prompts a harness hook captured since the last step.
+fn pending_path(ws: &Workspace) -> PathBuf {
+    journal_dir(ws).join("pending.json")
+}
+
+/// Which harness's hook last ran here, and when (`hook.json`).
+fn hook_path(ws: &Workspace) -> PathBuf {
+    journal_dir(ws).join("hook.json")
+}
+
+/// A hook that ran within this long covers the next step.
+const HOOK_FRESH_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Appends a prompt a harness hook saw, in a checkout working in a timeline: a
+/// session's first prompt is an instruction, later ones steering. Redacted.
+pub fn capture_prompt(ws: &Workspace, harness: &str, session: &str, prompt: &str) -> Result<()> {
+    let dir = journal_dir(ws);
+    fs::create_dir_all(&dir)
+        .map_err(|e| GmError::new("io", format!("Couldn't create {}: {e}", dir.display())))?;
+    let now = chrono::Utc::now();
+    let mut hook = read_entry(&hook_path(ws)).unwrap_or_else(|| json!({}));
+    hook["harness"] = json!(harness);
+    hook["lastSeen"] = json!(now.timestamp_millis());
+    // Only a timeline's work becomes steps; the hook still counts as running.
+    if ws.timeline.is_none() {
+        let _ = fs::write(
+            hook_path(ws),
+            serde_json::to_vec_pretty(&hook).unwrap_or_default(),
+        );
+        return Ok(());
+    }
+    // A session's first prompt captured in a timeline is its instruction.
+    let sessions = hook["sessions"].as_array().cloned().unwrap_or_default();
+    let first = !sessions.iter().any(|s| s == session);
+    if first {
+        let mut kept: Vec<Value> = sessions.into_iter().rev().take(49).collect();
+        kept.reverse();
+        kept.push(json!(session));
+        hook["sessions"] = Value::Array(kept);
+    }
+    let _ = fs::write(
+        hook_path(ws),
+        serde_json::to_vec_pretty(&hook).unwrap_or_default(),
+    );
+    let mut pending = read_entry(&pending_path(ws)).unwrap_or_else(|| json!({"entries": []}));
+    let entry = json!({
+        "kind": if first { "instruction" } else { "steering" },
+        "text": redact(prompt.trim()).chars().take(4000).collect::<String>(),
+        "source": "hook",
+        "at": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    });
+    match pending["entries"].as_array_mut() {
+        Some(entries) => entries.push(entry),
+        None => pending = json!({"entries": [entry]}),
+    }
+    fs::write(
+        pending_path(ws),
+        serde_json::to_vec_pretty(&pending).unwrap_or_default(),
+    )
+    .map_err(|e| GmError::new("io", format!("Couldn't write the step journal: {e}")))
+}
+
+/// The harness whose hook ran here recently, if any.
+fn fresh_hook(ws: &Workspace) -> Option<String> {
+    let hook = read_entry(&hook_path(ws))?;
+    let seen = hook["lastSeen"].as_i64()?;
+    (chrono::Utc::now().timestamp_millis() - seen < HOOK_FRESH_MS)
+        .then(|| hook["harness"].as_str().map(str::to_string))
+        .flatten()
+}
+
+/// The hook's pending instructions and steering, as context entries.
+fn pending_entries(ws: &Workspace) -> (Vec<Value>, Vec<Value>) {
+    let pending = read_entry(&pending_path(ws)).unwrap_or(Value::Null);
+    let entries = pending["entries"].as_array().cloned().unwrap_or_default();
+    let pick = |kind: &str| {
+        entries
+            .iter()
+            .filter(|e| e["kind"] == kind)
+            .map(|e| json!({"text": e["text"], "source": "hook", "at": e["at"]}))
+            .collect::<Vec<_>>()
+    };
+    (pick("instruction"), pick("steering"))
+}
+
+/// Where `gm test` keeps its latest results, for the tree they ran on.
+fn tests_path(ws: &Workspace) -> PathBuf {
+    journal_dir(ws).join("tests.json")
+}
+
+/// Keeps `gm test`'s results for `tree`: a commit of exactly that tree carries
+/// them as its step's tests (CORE-236).
+pub fn record_tests(ws: &Workspace, tree: &str, tests: &[Value]) -> Result<()> {
+    let dir = journal_dir(ws);
+    fs::create_dir_all(&dir)
+        .map_err(|e| GmError::new("io", format!("Couldn't create {}: {e}", dir.display())))?;
+    let path = tests_path(ws);
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({"tree": tree, "tests": tests})).unwrap_or_default(),
+    )
+    .map_err(|e| GmError::new("io", format!("Couldn't write {}: {e}", path.display())))
+}
+
+/// `gm test`'s results, if they ran on this commit's tree.
+fn tests_for(ws: &Workspace, oid: Oid) -> Option<Value> {
+    let saved = read_entry(&tests_path(ws))?;
+    let tree = ws.commit(oid).ok()?.tree_id().to_string();
+    (saved["tree"].as_str() == Some(tree.as_str())).then(|| saved["tests"].clone())
+}
+
 /// Journals `context` for the commit `oid`: redacted, with the change ID,
 /// summary, time, timeline and harness filled in. Coverage defaults to what
 /// the context itself contains (`agent`) or `none`.
@@ -304,6 +417,39 @@ pub fn record(ws: &Workspace, oid: Oid, context: Value) -> Result<()> {
         Value::Object(map) => map,
         _ => Map::new(),
     };
+    // What the person said since the last step, as a harness hook captured it,
+    // comes first, marked `hook`; coverage says a hook was watching.
+    let (hook_instructions, hook_steering) = pending_entries(ws);
+    for (key, captured) in [
+        ("instructions", hook_instructions),
+        ("steering", hook_steering),
+    ] {
+        if captured.is_empty() {
+            continue;
+        }
+        let mut list = captured;
+        list.extend(
+            upload
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        upload.insert(key.into(), Value::Array(list));
+    }
+    if let (false, Some(harness)) = (upload.contains_key("coverage"), fresh_hook(ws)) {
+        let hook = format!("hook:{harness}");
+        upload.insert(
+            "coverage".into(),
+            json!({"instructions": hook, "steering": hook}),
+        );
+    }
+    // Tests `gm test` ran on exactly this commit's tree, unless the context has its own.
+    if !upload.contains_key("tests")
+        && let Some(tests) = tests_for(ws, oid)
+    {
+        upload.insert("tests".into(), tests);
+    }
     let has = |key: &str| {
         upload
             .get(key)
@@ -337,6 +483,8 @@ pub fn record(ws: &Workspace, oid: Oid, context: Value) -> Result<()> {
     let path = entry_path(ws, oid);
     fs::write(&path, serde_json::to_vec_pretty(&entry).unwrap_or_default())
         .map_err(|e| GmError::new("io", format!("Couldn't write {}: {e}", path.display())))?;
+    // The step has them now.
+    let _ = fs::remove_file(pending_path(ws));
     Ok(())
 }
 
@@ -353,6 +501,10 @@ fn entries_all(ws: &Workspace) -> Vec<(PathBuf, Value)> {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n != "tests.json" && n != "pending.json" && n != "hook.json")
+        })
         .filter_map(|p| read_entry(&p).map(|v| (p, v)))
         .collect();
     all.sort_by(|a, b| {
@@ -484,6 +636,180 @@ pub fn upload_pending(ctx: &Ctx, config: &Config, repo: &str, ws: &Workspace) ->
 /// The repository's owner/name on the server, from origin.
 pub fn repo_slug(ctx: &Ctx) -> Result<String> {
     super::server::current_repo(ctx)
+}
+
+// ---- gm steps: a timeline's steps, and its live feed (CORE-239) ---------------------
+
+#[derive(clap::Args)]
+pub struct StepsArgs {
+    /// The timeline (default: the one this checkout works in).
+    #[arg(long)]
+    pub timeline: Option<String>,
+    /// Stream new steps as they're pushed: one JSON object per line for agents,
+    /// a line of text at a terminal. Reconnects on its own; Ctrl-C stops.
+    #[arg(short, long)]
+    pub follow: bool,
+    /// With --follow: stop after this many steps.
+    #[arg(long, requires = "follow")]
+    pub count: Option<usize>,
+    /// Without --follow: how many recent steps.
+    #[arg(short = 'n', long, default_value_t = 20)]
+    pub limit: usize,
+}
+
+fn timeline_for(ws: &Workspace, arg: &Option<String>) -> Result<String> {
+    arg.clone().or_else(|| ws.timeline.clone()).ok_or_else(|| {
+        GmError::new(
+            "not_in_timeline",
+            "Which timeline? This checkout isn't working in one.",
+        )
+        .hint("Pass --timeline <slug>, or `gm timeline use <slug>`.")
+        .exit(crate::output::exit::USAGE)
+    })
+}
+
+/// One feed record as a line of text.
+fn record_line(record: &Value) -> String {
+    let tests = match (
+        record["tests"]["passed"].as_u64(),
+        record["tests"]["failed"].as_u64(),
+    ) {
+        (Some(p), Some(0)) => format!("  {}", crate::output::style::good(&format!("✓ {p} passed"))),
+        (Some(_), Some(f)) => format!("  {}", crate::output::style::bad(&format!("✗ {f} failed"))),
+        _ => String::new(),
+    };
+    let time = record["at"]
+        .as_str()
+        .and_then(|t| t.get(11..19))
+        .unwrap_or("");
+    let why = record["why"]
+        .as_str()
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("\n    {}", crate::output::style::dim(&format!("why: {w}"))));
+    format!(
+        "{time}  {}  {}  {}{tests}{}",
+        record["author"]["name"].as_str().unwrap_or("?"),
+        crate::output::style::commit(
+            record["commitOid"]
+                .as_str()
+                .and_then(|c| c.get(..12))
+                .unwrap_or("")
+        ),
+        record["summary"].as_str().unwrap_or(""),
+        why.unwrap_or_default()
+    )
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct StepList {
+    pub repo: String,
+    pub timeline: String,
+    /// Newest first (the steps API's Step).
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub steps: Vec<Value>,
+}
+
+impl crate::output::Render for StepList {
+    fn text(&self) -> String {
+        if self.steps.is_empty() {
+            return format!(
+                "No steps in timeline {} of {} yet.",
+                self.timeline, self.repo
+            );
+        }
+        self.steps
+            .iter()
+            .map(|s| {
+                let why = s["context"]["why"].as_str().unwrap_or("").lines().next().unwrap_or("");
+                record_line(&json!({
+                    "at": s["committedAt"], "author": s["author"], "commitOid": s["commitOid"],
+                    "summary": s["summary"], "why": why,
+                    "tests": {
+                        "passed": s["context"]["tests"].as_array().map(|t| t.iter().filter(|x| x["exit"] == 0).count()),
+                        "failed": s["context"]["tests"].as_array().map(|t| t.iter().filter(|x| x["exit"] != 0).count()),
+                    },
+                }))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// `gm steps`: the timeline's recent steps in this repository.
+pub fn list(ctx: &Ctx, args: &StepsArgs) -> Result<StepList> {
+    let ws = Workspace::open(&ctx.cwd)?;
+    let timeline = timeline_for(&ws, &args.timeline)?;
+    let repo = repo_slug(ctx)?;
+    let page = remote::api(
+        &Config::load(),
+        "GET",
+        &format!(
+            "/repos/{repo}/steps?timeline={timeline}&limit={}",
+            args.limit.clamp(1, 100)
+        ),
+        None,
+    )?;
+    Ok(StepList {
+        repo,
+        timeline,
+        steps: page["steps"].as_array().cloned().unwrap_or_default(),
+    })
+}
+
+/// `gm steps --follow`: print each record of the live feed as it arrives;
+/// reconnects from the last one seen until `--count` records or an error.
+pub fn follow(ctx: &Ctx, args: &StepsArgs) -> Result<()> {
+    let ws = Workspace::open(&ctx.cwd)?;
+    let timeline = timeline_for(&ws, &args.timeline)?;
+    let repo = repo_slug(ctx)?;
+    drop(ws);
+    let config = Config::load();
+    let json = !matches!(ctx.format, crate::output::Format::Text);
+    let mut last: Option<u64> = None;
+    let mut seen = 0usize;
+    let done = |seen: usize| args.count.is_some_and(|n| seen >= n);
+    while !done(seen) {
+        let after = last.map(|l| format!("&after={l}")).unwrap_or_default();
+        let path = format!("/repos/{repo}/steps/live?timeline={timeline}{after}");
+        let (mut id, mut data, mut kind) = (None::<u64>, String::new(), String::new());
+        let result = remote::stream_get(&config, &path, |line| {
+            if line.is_empty() {
+                if kind == "step" && !data.is_empty() && !done(seen) {
+                    let record: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+                    let out = if json {
+                        record.to_string()
+                    } else {
+                        record_line(&record)
+                    };
+                    let mut stdout = std::io::stdout().lock();
+                    let _ = std::io::Write::write_all(&mut stdout, format!("{out}\n").as_bytes());
+                    let _ = std::io::Write::flush(&mut stdout);
+                    last = id.or(last);
+                    seen += 1;
+                }
+                (id, data, kind) = (None, String::new(), String::new());
+                if done(seen) {
+                    return Err(GmError::new("done", ""));
+                }
+            } else if let Some(v) = line.strip_prefix("id: ") {
+                id = v.trim().parse().ok();
+            } else if let Some(v) = line.strip_prefix("event: ") {
+                kind = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("data: ") {
+                data.push_str(v);
+            }
+            Ok(())
+        });
+        match result {
+            Err(e) if e.code == "done" => break,
+            // A dropped connection reconnects; anything the server said stops.
+            Err(e) if e.code != "stream_interrupted" && e.code != "server_unreachable" => {
+                return Err(e);
+            }
+            _ => std::thread::sleep(std::time::Duration::from_secs(2)),
+        }
+    }
+    Ok(())
 }
 
 // ---- reading steps: gm context show, log --context, show --context ---------------

@@ -17,6 +17,7 @@ import { CiStatusIcon, ciLabel } from "../../components/CiStatus.tsx";
 import { PageSetSummary, pagesPending, useRefreshWhile } from "../../components/TimelinePages.tsx";
 import { api } from "../../lib/api.ts";
 import { fullDate, shortOid } from "../../lib/format.ts";
+import { commitPanelUrl } from "../../lib/commitPanel.ts";
 import { commitsUrl, repoPath, treeUrl } from "../../lib/refs.ts";
 import { MarkdownText } from "./ui.tsx";
 
@@ -109,14 +110,17 @@ export function ReviveButton({
       <button
         type="button"
         className="mk-btn mk-btn--ghost mk-btn--sm"
-        disabled={busy}
+        // Not `disabled`: that would drop keyboard focus while it works.
+        aria-disabled={busy || undefined}
         aria-busy={busy || undefined}
         title={
           live
             ? "A preview is up; reviving rebuilds it from this checkpoint's commits."
             : "Rebuild this checkpoint's preview from its commits (migrations plus seed)."
         }
-        onClick={() => void revive()}
+        onClick={() => {
+          if (!busy) void revive();
+        }}
       >
         {busy ? "Reviving…" : "Revive preview"}
       </button>
@@ -191,33 +195,38 @@ export function CheckpointPanel({
           const previews = view.previews.filter((preview) => preview.repoId === repo.id);
           const readableSource =
             repo.source || timeline.status === "landed" || timeline.status === "abandoned";
+          // The commit panel reads canonical history; a work source's commit opens in its own source.
+          const workSource =
+            repo.source && repo.source.sourceId !== "canonical" ? repo.source.sourceId : null;
           return (
             <li key={repo.id} className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <span className="font-semibold">
                 {repo.owner}/{repo.name}
               </span>
-              {readableSource ? (
+              {!readableSource ? (
+                <span className="text-ink-muted">Source migration required</span>
+              ) : workSource ? (
                 <Link
-                  to={treeUrl(
-                    repo.owner,
-                    repo.name,
-                    repo.commit,
-                    "",
-                    repo.source?.sourceId ?? "canonical",
-                  )}
+                  to={treeUrl(repo.owner, repo.name, repo.commit, "", workSource)}
                   className="mk-chip mk-chip--tag mk-mono no-underline"
                   title="Browse files at this commit"
                 >
                   {shortOid(repo.commit)}
                 </Link>
               ) : (
-                <span className="text-ink-muted">Source migration required</span>
+                <Link
+                  to={commitPanelUrl(repo.owner, repo.name, repo.commit)}
+                  className="mk-chip mk-chip--tag mk-mono no-underline"
+                  title={`Open commit ${shortOid(repo.commit)}`}
+                >
+                  {shortOid(repo.commit)}
+                </Link>
               )}
               {repo.base && (
                 <span className="text-ink-muted">
                   onto main{" "}
                   <Link
-                    to={treeUrl(repo.owner, repo.name, repo.base, "", "canonical")}
+                    to={commitPanelUrl(repo.owner, repo.name, repo.base)}
                     className="mk-mono"
                     title="Main when the checkpoint was made"
                   >
@@ -227,13 +236,11 @@ export function CheckpointPanel({
               )}
               {readableSource && (
                 <Link
-                  to={commitsUrl(
-                    repo.owner,
-                    repo.name,
-                    repo.commit,
-                    "",
-                    repo.source?.sourceId ?? "canonical",
-                  )}
+                  to={
+                    workSource
+                      ? commitsUrl(repo.owner, repo.name, repo.commit, "", workSource)
+                      : commitPanelUrl(repo.owner, repo.name, repo.commit)
+                  }
                   className="text-ink-muted"
                   title={repo.changes.map((c) => c.changeId).join("\n")}
                 >

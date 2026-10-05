@@ -7,7 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { command, validateEnvironment, redact, context, loadEnvironment } from "./environment.ts";
+import {
+  aiEnabled,
+  command,
+  validateEnvironment,
+  redact,
+  context,
+  loadEnvironment,
+} from "./environment.ts";
 import type { Environment } from "./environment.ts";
 import { developmentEnvironment } from "../../apps/website/vite/environment.ts";
 
@@ -41,6 +48,7 @@ function runtime(env: Environment): Record<string, string> {
     GITMATRIX_VECTORIZE_INDEX: env.id,
     GITMATRIX_SEARCH_NAMESPACE: env.id,
     GITMATRIX_AI_GATEWAY: env.id,
+    GITMATRIX_AGENT_AI: "enabled",
     GITMATRIX_AGENT_SECRET: env.secret,
     GITMATRIX_CI_DISPATCH_SECRET: env.dispatchSecret,
     GITMATRIX_CI_RUNNER: "local",
@@ -119,6 +127,103 @@ await test("runtime rejects cross-environment stores and credentials while accep
   );
 });
 
+await test("agent mode binds AI only when its environment provisioned it", () => {
+  const env = owned();
+  assert.equal(developmentEnvironment(runtime(env)).ai, true);
+  const off = { ...runtime(env), GITMATRIX_AGENT_AI: "disabled", GITMATRIX_AI_GATEWAY: undefined };
+  assert.equal(developmentEnvironment(off).ai, false);
+  for (const value of [undefined, "", "yes"])
+    assert.throws(
+      () => developmentEnvironment({ ...runtime(env), GITMATRIX_AGENT_AI: value }),
+      /GITMATRIX_AGENT_AI/,
+    );
+  // The canonical server: off unless GITMATRIX_DEV_AI=enabled.
+  assert.equal(developmentEnvironment({}).ai, false);
+  assert.equal(developmentEnvironment({ GITMATRIX_DEV_AI: "1" }).ai, false);
+  assert.equal(developmentEnvironment({ GITMATRIX_DEV_AI: "enabled" }).ai, true);
+});
+
+await test("setup provisions no AI resources unless --ai", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-setup-ai-"));
+  try {
+    const bin = join(home, "bin");
+    await mkdir(bin);
+    const calls = join(home, "calls");
+    await writeFile(calls, "");
+    await writeFile(
+      join(bin, "cf"),
+      `#!${process.execPath}\nconst args=process.argv.slice(2); if(args[0]==='auth'){console.log(JSON.stringify({authenticated:true,tokenValid:true,accounts:[{id:'${"a".repeat(32)}'}]}));process.exit(0)} require('node:fs').appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n'); console.log('{}');\n`,
+      { mode: 0o700 },
+    );
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const provision = async (root: string, ai: boolean | undefined) => {
+      await mkdir(root, { recursive: true });
+      await writeFile(calls, "");
+      const output = await command(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import {context, createEnvironment, listEnvironments} from ${JSON.stringify(module)}; const env = await createEnvironment(${JSON.stringify(root)}, false${ai === undefined ? "" : `, ${ai}`}); console.log(JSON.stringify({env, listed: await listEnvironments(), vars: (await context(env)).env}));`,
+        ],
+        { env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` } },
+      );
+      const { env, listed, vars } = JSON.parse(output.trim().split("\n").at(-1)!) as {
+        env: Environment;
+        listed: { id: string; ai: boolean }[];
+        vars: Record<string, string>;
+      };
+      const operations = (await readFile(calls, "utf8"))
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as string[]);
+      return { env, listed, vars, operations };
+    };
+    // The default: Artifacts only, and the environment says AI is off.
+    const plain = await provision(join(home, "plain"), undefined);
+    assert.deepEqual(
+      plain.operations.map((args) => args.slice(0, 3).join(" ")),
+      ["artifacts namespaces create"],
+    );
+    assert.deepEqual(plain.env.resources, {
+      artifacts: "created",
+      vectors: "deleted",
+      search: "deleted",
+      gateway: "deleted",
+    });
+    assert.equal(plain.env.ai, false);
+    assert.equal(aiEnabled(plain.env), false);
+    assert.equal(plain.listed.find((e) => e.id === plain.env.id)?.ai, false);
+    // The server it starts binds no AI.
+    assert.equal(plain.vars.GITMATRIX_AGENT_AI, "disabled");
+    assert.equal(developmentEnvironment(plain.vars).ai, false);
+    // Asking for AI on that environment refuses rather than silently staying off.
+    await assert.rejects(provision(join(home, "plain"), true), /setup --ai/);
+    // --ai: the Gateway, Vectorize and AI Search too.
+    const paid = await provision(join(home, "paid"), true);
+    assert.deepEqual(
+      paid.operations.map((args) => args.slice(0, 2).join(" ")),
+      [
+        "artifacts namespaces",
+        "ai-gateway gateways",
+        "vectorize create",
+        "vectorize metadata-index",
+        "vectorize metadata-index",
+        "vectorize metadata-index",
+        "ai-search namespace",
+        "ai-search create",
+      ],
+    );
+    assert.equal(paid.env.ai, true);
+    assert.equal(paid.listed.find((e) => e.id === paid.env.id)?.ai, true);
+    assert.equal(paid.vars.GITMATRIX_AGENT_AI, "enabled");
+    assert.equal(developmentEnvironment(paid.vars).ai, true);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 await test("nonzero subprocess is rejected even with valid success-shaped JSON", async () => {
   await assert.rejects(
     command(process.execPath, ["-e", "console.log(JSON.stringify({jobs:[]})); process.exit(7)"]),
@@ -154,6 +259,66 @@ await test("a timeout stays a failure when the subprocess handles termination wi
 await test("diagnostic redaction removes personal and CI bearer credentials", () => {
   const message = redact("gmx_ABC123 gmj_987zyx Authorization: Bearer capability-secret");
   assert.equal(message, "[REDACTED] [REDACTED] Authorization: Bearer [REDACTED]");
+});
+
+await test("a stuck expired environment doesn't block creating another (CORE-292)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-sweep-"));
+  try {
+    const root = join(home, "worktree");
+    const directory = join(home, ".local/state/gitmatrix-agent/environments");
+    const bin = join(home, "bin");
+    await mkdir(directory, { recursive: true });
+    await mkdir(root, { recursive: true });
+    await mkdir(bin);
+    const env = owned(root);
+    env.created -= 172_800_000;
+    env.expires -= 172_800_000;
+    const journal = join(directory, `${env.id}.json`);
+    await writeFile(journal, JSON.stringify(env));
+    // Cloudflare refuses to delete the namespace, as with a stuck Artifacts one.
+    await writeFile(
+      join(bin, "cf"),
+      `#!${process.execPath}\nconsole.error('409 [10202] Namespace is not empty'); process.exit(1);\n`,
+      { mode: 0o700 },
+    );
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const childEnv = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` };
+    // cleanupExpired itself still reports the failure...
+    await assert.rejects(
+      command(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`,
+        ],
+        { env: childEnv },
+      ),
+      /Cleanup incomplete/,
+    );
+    // ...but the sweep before a create warns and lets it go on.
+    const output = await command(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import {sweepBeforeCreate} from ${JSON.stringify(module)}; const errors = []; console.error = (...parts) => errors.push(parts.join(" ")); await sweepBeforeCreate(); console.log(JSON.stringify({ continued: true, errors }));`,
+      ],
+      { env: childEnv },
+    );
+    const result = JSON.parse(output.trim().split("\n").at(-1) ?? "{}") as {
+      continued: boolean;
+      errors: string[];
+    };
+    assert.equal(result.continued, true);
+    const deferred = result.errors.find((line) => line.includes("environment.cleanup_deferred"));
+    assert.ok(deferred, "the deferred cleanup is reported");
+    assert.match(deferred, new RegExp(env.id));
+    // The journal stays for the next sweep.
+    assert.equal((JSON.parse(await readFile(journal, "utf8")) as Environment).status, "deleting");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 for (const gateway of [undefined, "pending", "created"] as const)

@@ -2,7 +2,8 @@
 //
 // Per repository, under /api/repos/:owner/:name/ci:
 //   GET    /                       recent runs (?before=<number> pages back, ?ref=<branch>
-//                                   only that branch's: a timeline's bookmark, say)
+//                                   only that branch's: a timeline's bookmark, say;
+//                                   ?commit=<oid> only that commit's)
 //   POST   /runs                   start a run for {ref} (write)
 //   GET    /runs/:number           one run with jobs and steps
 //   POST   /runs/:number/cancel    cancel it (write)
@@ -102,6 +103,12 @@ ci.get("/", async (c) => {
     .where("r.source_id", "=", c.req.query("source") ?? "canonical")
     .where("r.number", "<", before);
   if (ref) query = query.where("r.ref", "=", ref);
+  // A commit's runs, for the commit panel (CORE-22).
+  const commit = c.req.query("commit")?.toLowerCase();
+  if (commit !== undefined) {
+    if (!/^[0-9a-f]{40}$/.test(commit)) return fail(c, 400, "commit is a full commit hash.");
+    query = query.where("r.commit_oid", "=", commit);
+  }
   const results = await query.orderBy("r.number", "desc").limit(PAGE).execute();
   return c.json<CiRunList>({ runs: results.map(toRun), runner: c.env.CI_RUNNER });
 });

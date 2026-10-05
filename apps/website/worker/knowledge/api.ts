@@ -39,7 +39,8 @@ import type {
 import { fail } from "../api/http.ts";
 import { loadRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
-import type { RepoRow } from "../db.ts";
+import { roleFor, type RepoRow } from "../db.ts";
+import { atLeast } from "../permissions.ts";
 import { RepoReader } from "../objects.ts";
 import { db, type Database } from "../schema.ts";
 import { repoAiSnapshot } from "../settings/ai.ts";
@@ -140,10 +141,28 @@ async function status(c: Context<AppEnv>, row: RepoRow): Promise<KnowledgeStatus
   ) {
     c.executionCtx.waitUntil(notifyKnowledge(c.env, row.id));
   }
+  const update = coordination.update;
+  // What waits for the next update (CORE-286): main's pushes since the
+  // indexed commit, and when the update will start.
+  // Null while the coordinator hasn't looked at the push yet, or schedules nothing.
+  const pending =
+    head && head !== indexed && !current && !coordination.running && update
+      ? {
+          pushes: update.pushes,
+          since: new Date(update.firstAt).toISOString(),
+          dueAt: update.now
+            ? new Date().toISOString()
+            : update.dueAt
+              ? new Date(update.dueAt).toISOString()
+              : null,
+        }
+      : null;
   return {
     indexedCommit: indexed,
     indexedAt: state?.indexed_at ?? null,
     head,
+    pending,
+    canUpdate: atLeast(roleFor(row, c.get("actor") ?? null), "admin"),
     state:
       current || coordination.running
         ? "building"
@@ -191,6 +210,23 @@ knowledge.get("/status", async (c) => {
   return c.json(await status(c, row));
 });
 
+/**
+ * Update Knowledge now (CORE-286): the pending update starts without waiting
+ * for its settle window. Repository admins only; an update, not a rebuild.
+ */
+knowledge.post("/update", async (c) => {
+  const row = await repoOrFail(c, "admin");
+  if (row instanceof Response) return row;
+  if (!c.env.AI)
+    return fail(c, 503, "Knowledge AI is disabled in this automatic test environment.");
+  if (!(await repoAiSnapshot(c.env.DB, row.id)).features.knowledge)
+    return fail(c, 409, "Knowledge generation is disabled in this account's AI settings.");
+  if (!(await notifyKnowledge(c.env, row.id, { now: true })))
+    return fail(c, 409, "Knowledge generation is disabled for this account or environment.");
+  return c.json(await status(c, row), 202);
+});
+
+/** A full rebuild: every phase over the whole repository (CORE-286), reusing only decisions whose inputs are unchanged. */
 knowledge.post("/rebuild", async (c) => {
   const row = await repoOrFail(c, "admin");
   if (row instanceof Response) return row;

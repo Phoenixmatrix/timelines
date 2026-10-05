@@ -9,19 +9,42 @@ import {
   ProhibitIcon,
   WarningCircleIcon,
 } from "@phosphor-icons/react";
-import { useState } from "react";
+import { useState, type MouseEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import { Link } from "react-router";
-import remarkGfm from "remark-gfm";
 import { describeWrite, toolLabel, WRITE_TOOLS } from "../../shared/assistant.ts";
+import { useRefMarkdown } from "../refs/remark.tsx";
+
+/** Following a linked ref in an answer navigates like any app link (it may collapse the dock). */
+function refClick(onNavigate: () => void) {
+  return (event: MouseEvent) => {
+    if ((event.target as HTMLElement).closest("a[data-ref-kind]")) onNavigate();
+  };
+}
+
+/** A bare URL in an answer: a new tab, like any other outside link. */
+function answerUrl(href: string, children: ReactNode) {
+  return (
+    <a href={href} target="_blank" rel="noreferrer">
+      {children}
+    </a>
+  );
+}
 
 /** Assistant prose: app paths open in place, everything else in a new tab. */
 export function ChatMarkdown({ text, onNavigate }: { text: string; onNavigate?: () => void }) {
+  // Refs link when they resolve for the page the dock sits on (CORE-22).
+  const refs = useRefMarkdown(answerUrl);
   return (
-    <div className="gm-prose gm-prose--chat" dir="auto">
+    <div
+      className="gm-prose gm-prose--chat"
+      dir="auto"
+      onClickCapture={onNavigate && refClick(onNavigate)}
+    >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={refs.remarkPlugins}
         components={{
+          ...refs.components,
           a({ href, children }) {
             if (href?.startsWith("/"))
               return (
@@ -196,12 +219,12 @@ export function ApprovalCard({
   const long = (body?.length ?? 0) > 400;
   return (
     <section
-      className="mk-enter-up flex flex-col gap-3 rounded-pane bg-raised p-3"
+      className="mk-enter-up flex min-w-0 shrink-0 flex-col gap-3 rounded-pane bg-raised p-3 [overflow-wrap:anywhere]"
       aria-label={`Approve: ${title}`}
     >
       <div className="flex items-start gap-2">
         <HandIcon className="mt-0.5 size-4 shrink-0 text-ink-muted" aria-hidden />
-        <h3 className="m-0 text-body font-semibold">{title}</h3>
+        <h3 className="m-0 min-w-0 text-body font-semibold">{title}</h3>
       </div>
       {fields.length > 0 && (
         <dl className="m-0 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-body-sm">
@@ -215,7 +238,7 @@ export function ApprovalCard({
       )}
       {body && (
         <div
-          className={`rounded-control bg-sunken px-3 py-2 ${long && !more ? "max-h-40 overflow-hidden" : ""}`}
+          className={`min-w-0 shrink-0 rounded-control bg-sunken px-3 py-2 ${long && !more ? "max-h-40 overflow-hidden" : "overflow-x-auto"}`}
         >
           <ChatMarkdown text={body} />
         </div>
@@ -230,7 +253,7 @@ export function ApprovalCard({
           {more ? "Show less" : "Show all"}
         </button>
       )}
-      <div className="flex items-center justify-end gap-2">
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
         <button
           type="button"
           className="mk-btn mk-btn--ghost mk-btn--sm max-sm:h-11"
@@ -250,7 +273,7 @@ export function ApprovalCard({
   );
 }
 
-/** What the assistant is doing before its first words arrive. */
+/** What the assistant is doing while nothing else shows it: before its first words, and between steps. */
 export function StatusLine({ text }: { text: string }) {
   return (
     <p className="m-0 flex items-center gap-2 text-body-sm text-ink-muted" role="status">

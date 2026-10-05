@@ -2,6 +2,8 @@ import { timingSafeEqual } from "node:crypto";
 import {
   CLOSE_REASONS,
   DEFAULT_ATTEMPT_LIMIT,
+  ISSUE_PICKUPS,
+  issuePickup,
   SETTABLE_STATUSES,
   TIMELINE_USES,
   hasActiveClaim,
@@ -18,6 +20,7 @@ import {
   type IssueClaim,
   type IssueCloseReason,
   type IssueTimelineUse,
+  type IssuePickup,
   type EntityType,
   type Issue,
   type Link,
@@ -26,6 +29,7 @@ import {
   type MutationResult,
   type Snapshot,
   type Subscription,
+  type TagCatalogEntry,
   type Team,
   type TrackerAgent,
   TIMELINE_FEED_TYPES,
@@ -33,8 +37,20 @@ import {
   type TrackerEvent,
   type TrackerIdentity,
   type Workspace,
+  type ClaimEffect,
 } from "../../shared/tracker.ts";
 import type { ShippedIssue } from "../../shared/release-notes.ts";
+import {
+  hasRequirements,
+  normalizeRequirements,
+  profileFix,
+  RequirementError,
+  unmetRequirements,
+  unmetText,
+  type IssueRequirements,
+  type UnmetRequirement,
+} from "../../shared/requirements.ts";
+import { tighteningEffect } from "../../shared/tracker-query.ts";
 import type { QueueFailure } from "../../shared/merge-queue.ts";
 import { sql as raw } from "kysely";
 import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
@@ -71,11 +87,17 @@ export type { SqlDatabase } from "./sql.ts";
 
 const closeReasons = Object.keys(CLOSE_REASONS) as IssueCloseReason[];
 const timelineUses = Object.keys(TIMELINE_USES) as IssueTimelineUse[];
+const pickups = Object.keys(ISSUE_PICKUPS) as IssuePickup[];
 
 export class TrackerError extends Error {
   public status: 400 | 401 | 403 | 404 | 409 | 410 | 413;
   public code: string;
-  public details: { currentVersion?: number; current?: Team | Workspace | Issue };
+  public details: {
+    currentVersion?: number;
+    current?: Team | Workspace | Issue;
+    /** For requirements_unmet (CORE-32): each requirement the agent doesn't meet. */
+    unmet?: UnmetRequirement[];
+  };
   constructor(
     status: TrackerError["status"],
     code: string,
@@ -127,6 +149,26 @@ function object(value: unknown): Record<string, unknown> {
 function keys(value: Record<string, unknown>, allowed: string[]) {
   for (const key of Object.keys(value))
     if (!allowed.includes(key)) fail("invalid_input", `Unknown field: ${key}.`);
+}
+/** A `requires` value from a mutation, or null when it isn't valid (fields() says why). */
+function requiresOf(value: unknown): IssueRequirements | null {
+  try {
+    return normalizeRequirements(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * An issue's tags are stored as `labels` (CORE-271): writers may send `tags`,
+ * the name people see, and the old `labels` keeps working. Both at once must agree.
+ */
+function issueTagsAlias(data: Record<string, unknown>) {
+  if (!("tags" in data)) return;
+  if ("labels" in data && JSON.stringify(data.labels) !== JSON.stringify(data.tags))
+    fail("invalid_input", "Give tags or labels (its old name), not both.");
+  data.labels = data.tags;
+  delete data.tags;
 }
 export function text(value: unknown, name: string, max = 200, empty = false): string {
   if (
@@ -249,6 +291,7 @@ export class TrackerStore {
     sql.exec(`CREATE TABLE IF NOT EXISTS teams (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS issues (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS tracker_labels (name TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS links (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -271,6 +314,27 @@ export class TrackerStore {
       CREATE INDEX IF NOT EXISTS event_timelines ON events(json_extract(data, '$.timelineId'));`);
     sql.exec(RETENTION_TABLES);
     initializeAudit(sql, transaction);
+    if (
+      !first(
+        this.sql,
+        tracker.selectFrom("tracker_migrations").select("name").where("name", "=", "labels-v1"),
+      )
+    ) {
+      transaction(() => {
+        // Timeline-only issues live in the event log. Include both views and
+        // history so an already-used definition does not disappear on upgrade.
+        sql.exec(`INSERT OR IGNORE INTO tracker_labels (name)
+          SELECT label.value FROM issues, json_each(issues.data, '$.labels') AS label
+          WHERE label.type = 'text'`);
+        sql.exec(`INSERT OR IGNORE INTO tracker_labels (name)
+          SELECT label.value FROM events, json_each(events.data, '$.entity.labels') AS label
+          WHERE json_extract(events.data, '$.entityType') = 'issue' AND label.type = 'text'`);
+        sql.exec(`INSERT OR IGNORE INTO tracker_labels (name)
+          SELECT label.value FROM events, json_each(events.data, '$.view.entity.labels') AS label
+          WHERE json_extract(events.data, '$.entityType') = 'issue' AND label.type = 'text';`);
+        run(sql, tracker.insertInto("tracker_migrations").values({ name: "labels-v1" }));
+      });
+    }
     this.timelines = new TimelineStore(sql, transaction, clock, (ids, reason, actorId) =>
       this.withdrawSuperseded(ids, reason, actorId),
     );
@@ -575,6 +639,18 @@ export class TrackerStore {
   }
   /** Append an event to the log, indexed for issue history. */
   private record(event: Omit<TrackerEvent, "cursor">): TrackerEvent {
+    if (event.entityType === "issue") {
+      for (const entity of [event.entity, event.view?.entity]) {
+        for (const name of (entity as Issue | null | undefined)?.labels ?? [])
+          run(
+            this.sql,
+            tracker
+              .insertInto("tracker_labels")
+              .values({ name })
+              .onConflict((oc) => oc.doNothing()),
+          );
+      }
+    }
     const cursor = one(
       this.sql,
       tracker
@@ -622,6 +698,9 @@ export class TrackerStore {
       agents: access.agents,
       teams: this.all("team"),
       workspaces: this.all("workspace"),
+      labels: all(this.sql, tracker.selectFrom("tracker_labels").select("name"))
+        .map((row) => row.name)
+        .sort(),
       issues: this.all("issue"),
       links: this.all("link"),
       comments: this.all("comment"),
@@ -644,6 +723,26 @@ export class TrackerStore {
         tracker.selectFrom("timeline_events").select(["seq", "data"]).orderBy("seq"),
       ).map((row) => ({ ...JSON.parse(row.data), seq: row.seq }) as TimelineEvent),
     };
+  }
+  /**
+   * The tracker's tag catalog (CORE-271): every tag defined here, kept after
+   * its last use, and how many of main's issues (and open ones) carry it now.
+   * Agents' tags and requirement `tag:` values are suggested from it.
+   */
+  tagCatalog(): TagCatalogEntry[] {
+    const counts = new Map<string, { issues: number; open: number }>();
+    for (const issue of this.all<Issue>("issue")) {
+      const open = issue.status !== "done" && issue.status !== "canceled";
+      for (const name of new Set(issue.labels)) {
+        const count = counts.get(name) ?? { issues: 0, open: 0 };
+        count.issues++;
+        if (open) count.open++;
+        counts.set(name, count);
+      }
+    }
+    return all(this.sql, tracker.selectFrom("tracker_labels").select("name"))
+      .map((row) => ({ name: row.name, ...(counts.get(row.name) ?? { issues: 0, open: 0 }) }))
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
   /** Open requests to people, with the issue each is about. */
   openRequests(): { request: HumanRequest; issue: Pick<Issue, "id" | "key" | "title"> }[] {
@@ -697,6 +796,25 @@ export class TrackerStore {
       this.sql,
       tracker.selectFrom("issues").select("data").where(json("data", "$.key"), "in", keys),
     ).map((row) => this.shipped(JSON.parse(row.data) as Issue));
+  }
+  /**
+   * Issues by key or id, as a reference in text names them (CORE-22,
+   * worker/refs): just enough to label a link. Unknown refs are skipped.
+   * Every member may read every issue, so the caller authorizes the tracker.
+   */
+  issueRefs(refs: string[]): Pick<Issue, "id" | "key" | "title" | "status">[] {
+    if (refs.length > 500) fail("invalid_input", "Look up at most 500 issues at once.");
+    if (!refs.length) return [];
+    return all(
+      this.sql,
+      tracker
+        .selectFrom("issues")
+        .select("data")
+        .where((eb) => eb.or([eb(json("data", "$.key"), "in", refs), eb("id", "in", refs)])),
+    ).map((row) => {
+      const { id, key, title, status } = JSON.parse(row.data) as Issue;
+      return { id, key, title, status };
+    });
   }
   /**
    * Issues matching a global search (worker/search), open and closed, best
@@ -915,6 +1033,9 @@ export class TrackerStore {
       agents: access.agents,
       teams: this.all<Team>("team"),
       workspaces: this.all<Workspace>("workspace"),
+      labels: all(this.sql, tracker.selectFrom("tracker_labels").select("name"))
+        .map((row) => row.name)
+        .sort(),
       issues: this.all<Issue>("issue"),
       links: this.all<Link>("link"),
       comments: [],
@@ -1543,6 +1664,170 @@ export class TrackerStore {
         fail("forbidden", "Claims can only be delegated to yourself or your own agents.", 403);
       return { actorId: agent.id, accountableId: agent.accountable.id };
     };
+    /** Pickup is authority, not a capability or assignment override. */
+    const pickupAllowed = (
+      issue: Issue,
+      holder = { actorId: access.actorId, accountableId: access.principalId },
+    ) => {
+      const pickup = issuePickup(issue);
+      if (pickup === "not_ready")
+        fail(
+          "pickup_not_ready",
+          `${issue.key} is not ready. A person must change its pickup policy before work can start.`,
+          409,
+        );
+      if (
+        pickup === "human_only" &&
+        (holder.actorId !== holder.accountableId || access.actorId !== access.principalId)
+      )
+        fail(
+          "pickup_human_only",
+          `${issue.key} is human only. A person must do this work or change its pickup policy.`,
+          409,
+        );
+    };
+    /**
+     * What `holder` misses of `issue`'s requirements (CORE-32): nothing for a
+     * person (people can always claim), nor for the agent it's assigned to (an
+     * explicit assignment stands, and shows the mismatch). An agent that never
+     * reported capabilities meets no requirement.
+     */
+    const unmetFor = (issue: Issue, holder: { actorId: string; accountableId: string }) => {
+      if (holder.actorId === holder.accountableId || !hasRequirements(issue.requires)) return [];
+      if (issue.assigneeId === holder.actorId) return [];
+      const agent = access.agents.find((a) => a.id === holder.actorId);
+      return unmetRequirements(issue.requires, agent?.capabilities ?? null);
+    };
+    const agentName = (actorId: string) =>
+      access.agents.find((a) => a.id === actorId)?.name ?? actorId;
+    /** Refuse an agent that doesn't meet `issue`'s requirements, saying which. */
+    const eligible = (issue: Issue, holder: { actorId: string; accountableId: string }) => {
+      pickupAllowed(issue, holder);
+      const unmet = unmetFor(issue, holder);
+      if (unmet.length)
+        throw new TrackerError(
+          409,
+          "requirements_unmet",
+          unmetText(agentName(holder.actorId), issue.key, unmet),
+          { unmet },
+        );
+    };
+    /**
+     * Assigning work to an agent that doesn't meet its requirements is a
+     * person's explicit call: a tracker owner's, or the agent's accountable
+     * person's. The issue then shows the mismatch.
+     */
+    const assignedAnyway = (issue: Issue) => {
+      const agent = access.agents.find((a) => a.id === issue.assigneeId);
+      if (!agent) return;
+      const unmet = unmetRequirements(issue.requires, agent.capabilities);
+      if (!unmet.length) return;
+      const person = access.actorId === access.principalId;
+      if (person && (access.canAdmin || agent.accountable.id === access.principalId)) return;
+      throw new TrackerError(
+        409,
+        "requirements_unmet",
+        `${unmetText(agent.name, issue.key, unmet)} ${
+          person
+            ? `Only a tracker owner or ${agent.accountable.displayName} can assign it anyway.`
+            : "An agent can't assign it to an agent that doesn't meet them; a person can."
+        }`,
+        { unmet },
+      );
+    };
+    /**
+     * Tightened requirements no longer allow the agent holding `issue`
+     * (CORE-272). Never silent: the edit either releases the claim (asked
+     * with `releaseClaim`, by a tracker owner or the agent's accountable
+     * person) or keeps it, and a comment records which and what it misses.
+     */
+    const claimEffect = (
+      issue: Issue,
+      effect: { agent: TrackerAgent; unmet: UnmetRequirement[] },
+      release: boolean,
+    ): ClaimEffect => {
+      const claim = issue.claim!;
+      const misses = effect.unmet.map((u) => u.message).join("; ");
+      if (release) {
+        const person = access.actorId === access.principalId;
+        if (!person || (!access.canAdmin && effect.agent.accountable.id !== access.principalId))
+          fail(
+            "forbidden",
+            `Only a tracker owner or ${effect.agent.accountable.displayName}, acting as themselves, can release ${effect.agent.name}'s claim. Save without releasing it to keep the claim.`,
+            403,
+          );
+        if (claim.retainedIn)
+          fail(
+            "lease_retained",
+            `${issue.key} is done in timeline ${claim.retainedIn.slug}, and its lease is held until that timeline lands or is abandoned.`,
+            409,
+          );
+        dropOffer(issue);
+        issue.claim = null;
+        run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", issue.id));
+        if (issue.status === "in_progress") issue.status = "todo";
+        // Its claim assigned it; left assigned, assignment would let it straight back in.
+        if (issue.assigneeId === effect.agent.id) issue.assigneeId = null;
+      }
+      const commentId = crypto.randomUUID();
+      emit(
+        "comment",
+        commentId,
+        {
+          id: commentId,
+          issueId: issue.id,
+          body: release
+            ? `Released the claim held by ${effect.agent.name} (session \`${claim.agent}\`) and unassigned it: the new requirements no longer allow it. It ${misses}.`
+            : `Kept the claim held by ${effect.agent.name} (session \`${claim.agent}\`) although the new requirements no longer allow it: it ${misses}.`,
+          kind: "comment",
+          actorId: access.actorId,
+          createdAt: now,
+        },
+        "comment.add",
+      );
+      return {
+        actorId: effect.agent.id,
+        agent: effect.agent.name,
+        session: claim.agent,
+        unmet: effect.unmet,
+        released: release,
+      };
+    };
+    /** What `issue.next` says about ready work it passed over for requirements. */
+    const skippedFor = (actorId: string, skipped: Issue[]) => {
+      const name = agentName(actorId);
+      const keys = skipped.slice(0, 10).map((issue) => issue.key);
+      const more = skipped.length > keys.length ? ` and ${skipped.length - keys.length} more` : "";
+      const reported = access.agents.find((a) => a.id === actorId)?.capabilities;
+      // Which requirements kept the most work from it (CORE-272), and how to change that.
+      const counts = new Map<string, number>();
+      if (reported)
+        for (const issue of skipped)
+          for (const u of unmetRequirements(issue.requires, reported))
+            counts.set(u.wanted, (counts.get(u.wanted) ?? 0) + 1);
+      const blocking = [...counts]
+        .map(([wanted, issues]) => ({ wanted, issues }))
+        .sort((a, b) => b.issues - a.issues || a.wanted.localeCompare(b.wanted))
+        .slice(0, 3);
+      const most = blocking
+        .map((b) => `${b.wanted} (${b.issues} issue${b.issues === 1 ? "" : "s"})`)
+        .join(", ");
+      const fix = blocking.map((b) => profileFix(b.wanted)).filter(Boolean);
+      return {
+        requirements: skipped.length,
+        keys,
+        ...(blocking.length ? { blocking } : {}),
+        message:
+          `Skipped ${skipped.length} ready issue${skipped.length === 1 ? "" : "s"} whose requirements ${name} doesn't meet: ${keys.join(", ")}${more}. ` +
+          (reported
+            ? `Most need ${most}. ` +
+              (fix.length
+                ? `If ${name} really fits that work, update its profile: ${[...new Set(fix)].join("; ")}. `
+                : "") +
+              "See what each needs with `gm issue show <key>`."
+            : `${name} hasn't reported its capabilities: run \`gm agent setup\` in its checkout to publish them.`),
+      };
+    };
     /** `issue`'s lease must match `token`; `covered` is the descendant being changed, if any. */
     const lease = (issue: Issue, token: unknown, covered?: Issue) => {
       if (covered && covered.id !== issue.id && typeof token !== "string")
@@ -1611,6 +1896,7 @@ export class TrackerStore {
       },
       delegatedFrom?: Issue | null,
     ) => {
+      pickupAllowed(issue, holder);
       const assigneeId = issue.assigneeId ?? holder.actorId;
       validateAssignee(assigneeId, issue.teamId);
       const leaseToken = token ?? crypto.randomUUID() + crypto.randomUUID();
@@ -1643,16 +1929,26 @@ export class TrackerStore {
      * the caller; first by priority, then by how much open work it unblocks
      * (critical path first), then by age.
      */
-    const pick = (scope: {
-      teamId?: string;
-      workspaceId?: string;
-      underId?: string;
-      /** The caller holds underId's lease: its own subtree is open to it. */
-      own?: Issue;
-    }) => {
+    const pick = (
+      scope: {
+        teamId?: string;
+        workspaceId?: string;
+        underId?: string;
+        /** The caller holds underId's lease: its own subtree is open to it. */
+        own?: Issue;
+      },
+      holder: { actorId: string; accountableId: string },
+    ) => {
       const index = graph();
       const takeable = (issue: Issue) => {
-        const why = readiness(issue, index, now);
+        const why = readiness(
+          issue,
+          index,
+          now,
+          holder.actorId === holder.accountableId && access.actorId === access.principalId
+            ? "person"
+            : "agent",
+        );
         return (
           why === "ready" ||
           (why === "leased_above" && leasedAncestor(issue, index, now)?.id === scope.own?.id)
@@ -1692,7 +1988,7 @@ export class TrackerStore {
             }
         return reached.size;
       };
-      const candidates = [...index.byId.values()].filter(
+      const ready = [...index.byId.values()].filter(
         (issue) =>
           takeable(issue) &&
           issue.type !== "prd" &&
@@ -1702,16 +1998,18 @@ export class TrackerStore {
           (!scope.underId || under(issue)) &&
           writable(issue),
       );
-      const weight = new Map(candidates.map((issue) => [issue.id, unblocks(issue)]));
-      return (
-        candidates.sort(
-          (a, b) =>
-            a.priority - b.priority ||
-            weight.get(b.id)! - weight.get(a.id)! ||
-            a.createdAt.localeCompare(b.createdAt) ||
-            a.id.localeCompare(b.id),
-        )[0] ?? null
-      );
+      // Ready work the agent doesn't meet the requirements of is passed over, and counted.
+      const candidates = ready.filter((issue) => !unmetFor(issue, holder).length);
+      const weight = new Map(ready.map((issue) => [issue.id, unblocks(issue)]));
+      const order = (a: Issue, b: Issue) =>
+        a.priority - b.priority ||
+        weight.get(b.id)! - weight.get(a.id)! ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id);
+      return {
+        issue: candidates.sort(order)[0] ?? null,
+        skipped: ready.filter((issue) => !candidates.includes(issue)).sort(order),
+      };
     };
     /**
      * Recount an issue's open requests. When none are left, a parked lease unparks
@@ -1791,6 +2089,42 @@ export class TrackerStore {
         );
     };
     const fields = (data: Record<string, unknown>, issue: Issue, creating: boolean) => {
+      const assignedBefore = issue.assigneeId;
+      if ("pickup" in data) {
+        const pickup = choice(data.pickup, pickups, "pickup");
+        const previous = issuePickup(issue);
+        if (
+          !creating &&
+          pickup !== previous &&
+          previous !== "anyone" &&
+          access.actorId !== access.principalId
+        )
+          fail("forbidden", "Only a person can change an existing restricted pickup policy.", 403);
+        if (pickup !== previous && pickup !== "anyone") {
+          const covering = hasActiveClaim(issue, now) ? issue : coveringLease(issue);
+          if (
+            covering &&
+            (pickup === "not_ready" || covering.claim!.actorId !== covering.claim!.accountableId)
+          )
+            fail(
+              "claim_busy",
+              `Release ${covering.key}'s active claim before restricting pickup. Retained timeline claims must land or be abandoned first.`,
+              409,
+            );
+        }
+        issue.pickup = pickup;
+      }
+      if ("requires" in data) {
+        try {
+          const requires = normalizeRequirements(data.requires);
+          // No requirements leaves the field off, as on issues from before it.
+          if (requires) issue.requires = requires;
+          else delete issue.requires;
+        } catch (error) {
+          if (error instanceof RequirementError) fail("invalid_input", error.message);
+          throw error;
+        }
+      }
       for (const key of ["title", "description", "acceptance"] as const)
         if (key in data)
           issue[key] = text(data[key], key, key === "title" ? 500 : 131072, key !== "title");
@@ -1818,6 +2152,7 @@ export class TrackerStore {
       if ("assigneeId" in data)
         issue.assigneeId = data.assigneeId === null ? null : id(data.assigneeId);
       validateAssignee(issue.assigneeId, issue.teamId);
+      if (issue.assigneeId && issue.assigneeId !== assignedBefore) assignedAnyway(issue);
       if ("parentId" in data) {
         issue.parentId = data.parentId === null ? null : id(data.parentId);
         if (issue.parentId) {
@@ -1985,6 +2320,7 @@ export class TrackerStore {
         case "issue.create":
         case "issue.update": {
           const creating = mutation.kind === "issue.create";
+          issueTagsAlias(data);
           keys(data, [
             "title",
             "description",
@@ -1992,6 +2328,7 @@ export class TrackerStore {
             "type",
             "status",
             "closeReason",
+            "pickup",
             "timelineUse",
             "timelinePolicy",
             "priority",
@@ -1999,8 +2336,11 @@ export class TrackerStore {
             "parentId",
             "workspaceIds",
             "labels",
-            ...(creating ? ["teamId"] : ["leaseToken"]),
+            "requires",
+            ...(creating ? ["teamId"] : ["leaseToken", "releaseClaim"]),
           ]);
+          if (data.releaseClaim !== undefined && typeof data.releaseClaim !== "boolean")
+            fail("invalid_input", "releaseClaim must be true or false.");
           let issue: Issue;
           if (creating) {
             unique("issue", entityId);
@@ -2027,6 +2367,7 @@ export class TrackerStore {
               acceptance: "",
               type: "task",
               status: "todo",
+              pickup: "anyone",
               closeReason: null,
               timelineUse: "agent_decides",
               timelinePolicy: null,
@@ -2058,7 +2399,18 @@ export class TrackerStore {
             }
           }
           const previous = issue.status;
+          // What new requirements do to the claim on it (CORE-272), judged
+          // against the old ones before the fields change.
+          const tightened =
+            !creating && "requires" in data
+              ? tighteningEffect(issue, requiresOf(data.requires), access.agents, now)
+              : null;
           fields(data, issue, creating);
+          if (tightened)
+            result = {
+              id: entityId,
+              claimEffect: claimEffect(issue, tightened, data.releaseClaim === true),
+            };
           if (issue.status === "canceled") {
             if (
               (creating || previous !== "canceled" || "closeReason" in data) &&
@@ -2075,6 +2427,7 @@ export class TrackerStore {
             (creating || issue.status !== previous) &&
             ["in_progress", "done"].includes(issue.status)
           ) {
+            pickupAllowed(issue);
             unblocked(issue);
             started.add(entityId);
           }
@@ -2230,14 +2583,19 @@ export class TrackerStore {
           } else if (data.underToken !== undefined)
             fail("invalid_input", "underToken needs underId: the issue whose lease it is.");
           const holder = holderFor(data.forActorId);
-          const issue = pick({ ...scope, ...(own ? { own } : {}) });
+          const { issue, skipped } = pick({ ...scope, ...(own ? { own } : {}) }, holder);
+          const passed = skipped.length ? { skipped: skippedFor(holder.actorId, skipped) } : {};
           // Nothing ready is an answer, not an error: the agent can stop or wait.
-          if (!issue) break;
+          if (!issue) {
+            result = { id: entityId, ...passed };
+            break;
+          }
           result = {
             id: entityId,
             issueId: issue.id,
             key: issue.key,
             ...grant(issue, agent, Number(ttl), undefined, holder, own),
+            ...passed,
           };
           issue.version++;
           issue.updatedAt = now;
@@ -2397,7 +2755,7 @@ export class TrackerStore {
               fail("invalid_input", "An offer lasts 30 to 3600 seconds.");
             // To a member or a member's agent; anyone with the code when unset.
             const to = data.toActorId === undefined ? null : id(data.toActorId);
-            if (to) answerable(to);
+            if (to) eligible(issue, { actorId: to, accountableId: answerable(to) });
             const random = () => crypto.randomUUID().replaceAll("-", "");
             const code = `${issue.key}.${random()}${random()}`;
             const expiresAt = new Date(Date.parse(now) + Number(ttl) * 1000).toISOString();
@@ -2454,6 +2812,7 @@ export class TrackerStore {
               "That handoff code is expired, used, withdrawn, or for someone else.",
               409,
             );
+          eligible(issue, { actorId: access.actorId, accountableId: access.principalId });
           const previous = issue.claim!;
           result = {
             id: entityId,
@@ -2610,6 +2969,7 @@ export class TrackerStore {
                   "invalid_input",
                   "forActorId delegates inside your leased subtree; pass that lease's underToken.",
                 );
+              eligible(issue, holderFor(data.forActorId));
             } else lease(issue, data.leaseToken);
             result = {
               id: entityId,
@@ -2659,6 +3019,7 @@ export class TrackerStore {
               );
             } else lease(issue, data.leaseToken);
             if (kind === "issue.complete") {
+              pickupAllowed(issue);
               unblocked(issue);
               childrenClosed(issue);
               const body = text(data.evidence, "evidence", 131072);

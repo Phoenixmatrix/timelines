@@ -392,6 +392,9 @@ pub fn upload(config: &Config, path: &str, bytes: Vec<u8>) -> Result<Value> {
     Err(match status {
         401 => GmError::new("unauthenticated", message).exit(exit::AUTH),
         403 => GmError::new("forbidden", message).exit(exit::AUTH),
+        409 if value.get("code").and_then(Value::as_str) == Some("requirements_unmet") => {
+            requirements_unmet(message)
+        }
         409 => GmError::new("conflict", message).exit(exit::CONFLICT),
         // A tracker change feed pruned past the replica's cursor: start over.
         410 if value.get("code").and_then(Value::as_str) == Some("cursor_expired") => {
@@ -399,6 +402,14 @@ pub fn upload(config: &Config, path: &str, bytes: Vec<u8>) -> Result<Value> {
         }
         _ => GmError::new("server_error", format!("HTTP {status}: {message}")),
     })
+}
+
+/// An agent refused an issue it doesn't meet the requirements of (CORE-32); the
+/// message lists each unmet requirement.
+fn requirements_unmet(message: String) -> GmError {
+    GmError::new("requirements_unmet", message)
+        .exit(exit::CONFLICT)
+        .hint("See what it needs with `gm issue show <key>`; publish this agent's capabilities with `gm agent setup` (e.g. --tag ux); or a person can claim it, or assign it to this agent.")
 }
 
 /// Fetch a registry artifact without following redirects or forwarding credentials.
@@ -702,6 +713,45 @@ pub fn stream_lines(
     Ok(())
 }
 
+/// GET a streamed API response and hand over every line as it arrives, blank
+/// ones included (Server-Sent Events separate events with them). Returns when
+/// the server ends the stream.
+pub fn stream_get(
+    config: &Config,
+    path: &str,
+    mut on_line: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    use std::io::BufRead;
+    let (token, _) = credential(config)?;
+    let url = format!("{}/api{}", config.server(), path);
+    let mut req = agent(&url, false)?
+        .get(&url)
+        .header("accept", "text/event-stream");
+    if let Some(t) = &token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let mut response = req.call().map_err(|e| {
+        GmError::new(
+            "server_unreachable",
+            format!("Could not reach {}: {e}", config.server()),
+        )
+    })?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        return Err(status_error(status, &value));
+    }
+    let reader = std::io::BufReader::new(response.body_mut().as_reader());
+    for line in reader.lines() {
+        let line = line.map_err(|e| {
+            GmError::new("stream_interrupted", format!("The response stopped: {e}"))
+        })?;
+        on_line(&line)?;
+    }
+    Ok(())
+}
+
 /// A non-2xx API response as an error carrying the server's message.
 fn status_error(status: u16, value: &Value) -> GmError {
     let message = value
@@ -728,6 +778,9 @@ fn status_error(status: u16, value: &Value) -> GmError {
             GmError::not_found("removed_by_retention", message)
         }
         404 => GmError::not_found("not_found", message),
+        409 if value.get("code").and_then(Value::as_str) == Some("requirements_unmet") => {
+            requirements_unmet(message)
+        }
         409 => GmError::new("conflict", message).exit(exit::CONFLICT),
         // A tracker change feed pruned past the replica's cursor: start over.
         410 if value.get("code").and_then(Value::as_str) == Some("cursor_expired") => {

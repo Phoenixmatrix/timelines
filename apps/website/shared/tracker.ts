@@ -1,6 +1,7 @@
 import type { AgentCapabilities } from "./api.ts";
 import type { CheckpointView, Timeline, TimelineEvent, TimelinePolicy } from "./timelines.ts";
 import type { QueueFailure } from "./merge-queue.ts";
+import type { IssueRequirements } from "./requirements.ts";
 
 export interface TrackerIdentity {
   id: string;
@@ -65,6 +66,16 @@ export interface Workspace extends TrackerEntity {
   archived: boolean;
 }
 export type IssueType = "task" | "bug" | "prd" | "chore" | "research" | "remediation";
+export type IssuePickup = "anyone" | "not_ready" | "human_only";
+export const ISSUE_PICKUPS: Record<IssuePickup, string> = {
+  anyone: "Anyone",
+  not_ready: "Not ready",
+  human_only: "Human only",
+};
+/** Pickup policy is global across timeline views; legacy issues allow anyone. */
+export function issuePickup(issue: Pick<Issue, "pickup">): IssuePickup {
+  return issue.pickup ?? "anyone";
+}
 /**
  * `done_in_timeline` (TIMELINES-RESEARCH.md, "Tracker"; CORE-74): finished
  * inside a timeline that hasn't landed. It is main's view of that work, and
@@ -129,7 +140,7 @@ export interface IssueClaim {
   actorId: string;
   /** The human answerable for the holder (the holder itself for a person). */
   accountableId?: string;
-  /** A label for the working session (from `gm issue claim --agent`). */
+  /** The working session's name (from `gm issue claim --agent <session name>`). */
   agent: string;
   expiresAt: string;
   /** For a delegated claim: the ancestor whose lease handed this one out. */
@@ -168,16 +179,27 @@ export interface Issue extends TrackerEntity {
   acceptance: string;
   type: IssueType;
   status: IssueStatus;
+  /** Who may start work; absent on legacy issues means anyone. */
+  pickup?: IssuePickup;
   /** Why it was canceled. Historical cancellations may have no recorded reason. */
   closeReason?: IssueCloseReason | null;
   /** Whether to work it in a timeline; absent on older issues (read as `agent_decides`). */
   timelineUse?: IssueTimelineUse;
   /** With `required`: the policy the agent's timeline must use, or null for either. */
   timelinePolicy?: TimelinePolicy | null;
+  /**
+   * What an agent must report to claim it (CORE-32, shared/requirements.ts);
+   * absent or null on issues any agent may take. People can always claim.
+   */
+  requires?: IssueRequirements | null;
   priority: 0 | 1 | 2 | 3 | 4;
   assigneeId: string | null;
   parentId: string | null;
   workspaceIds: string[];
+  /**
+   * The issue's tags, from the tracker's tag catalog. Stored and sent as
+   * `labels` (its name before CORE-271); writers may also send `tags`.
+   */
   labels: string[];
   claim: IssueClaim | null;
   /** Open requests to a person: while any is open the issue waits, whatever its status. */
@@ -300,6 +322,11 @@ export interface Snapshot {
   agents: TrackerAgent[];
   teams: Team[];
   workspaces: Workspace[];
+  /**
+   * The tag catalog: defined tags, shared across timelines and retained after
+   * their last use. Called `labels` on the wire, its name before CORE-271.
+   */
+  labels: string[];
   issues: Issue[];
   links: Link[];
   comments: Comment[];
@@ -316,6 +343,14 @@ export interface Snapshot {
   timelines?: Timeline[];
   timelineEvents?: TimelineEvent[];
 }
+/** One name in a tracker's tag catalog (`GET /api/tracker/:owner/tags`, CORE-271). */
+export interface TagCatalogEntry {
+  name: string;
+  /** Issues tagged with it on main. */
+  issues: number;
+  /** Of those, the ones not done or canceled. */
+  open: number;
+}
 /** Initial browser data; repository choices are loaded only in management. */
 export interface TrackerView {
   snapshot: Snapshot;
@@ -329,7 +364,7 @@ export interface TrackerList {
   /** The tracker whose defaults the viewer saved most recently: where /tracker opens. */
   defaultOwnerId: string | null;
 }
-export const TRACKER_LAYOUTS = ["list", "board", "graph"] as const;
+export const TRACKER_LAYOUTS = ["list", "board", "graph", "chronicle"] as const;
 /**
  * A person's defaults for one tracker (CORE-119), saved on the server so they
  * follow them everywhere. The team is also gm's default when nothing more
@@ -424,6 +459,7 @@ export type IssueFields = Pick<
   | "type"
   | "status"
   | "closeReason"
+  | "pickup"
   | "timelineUse"
   | "timelinePolicy"
   | "priority"
@@ -432,6 +468,17 @@ export type IssueFields = Pick<
   | "workspaceIds"
   | "labels"
 >;
+/** Fields a create or update may set beyond the inspector's draft fields. */
+export type IssueData = Partial<IssueFields> & {
+  requires?: IssueRequirements | null;
+  /**
+   * With new `requires` on a claimed issue (CORE-272): release the claim of an
+   * agent that no longer meets them, rather than keep it. Ignored otherwise.
+   */
+  releaseClaim?: boolean;
+  /** The issue's tags under the name people see; stored as `labels` (CORE-271). */
+  tags?: string[];
+};
 export type Mutation =
   | {
       kind: "team.create";
@@ -458,13 +505,13 @@ export type Mutation =
   | {
       kind: "issue.create";
       id: string;
-      data: { teamId: string; title: string } & Partial<Omit<IssueFields, "title">>;
+      data: { teamId: string; title: string } & Omit<IssueData, "title">;
     }
   | {
       kind: "issue.update";
       id: string;
       expectedVersion: number;
-      data: Partial<IssueFields> & { leaseToken?: string };
+      data: IssueData & { leaseToken?: string };
     }
   | { kind: "link.add"; id: string; data: Omit<Link, "id"> }
   | { kind: "link.remove"; id: string }
@@ -581,8 +628,40 @@ export interface MutationResult {
     key?: string;
     /** For issue.offer: the single-use code to hand over, shown once. */
     offerCode?: string;
+    /**
+     * For issue.next: ready issues it passed over because the agent doesn't
+     * meet their requirements (CORE-32), so it isn't silently starved.
+     */
+    skipped?: {
+      requirements: number;
+      keys: string[];
+      message: string;
+      /**
+       * The requirement terms that kept the most of them, most first (CORE-272):
+       * `{wanted: "tag:ux", issues: 3}`.
+       */
+      blocking?: { wanted: string; issues: number }[];
+    };
+    /**
+     * For issue.update: the claim its new requirements no longer allow (CORE-272),
+     * and whether the edit released it or kept it. Never silent: either way it's
+     * recorded on the issue.
+     */
+    claimEffect?: ClaimEffect;
   }[];
   serverTime: string;
+}
+/** An agent holding a claim that an issue's tightened requirements no longer allow. */
+export interface ClaimEffect {
+  /** The holder's agent id and name. */
+  actorId: string;
+  agent: string;
+  /** The claim's session name. */
+  session: string;
+  /** What it now misses, in the requirements' words. */
+  unmet: { requirement: string; wanted: string; reported: string | null; message: string }[];
+  /** Released by the edit (`releaseClaim: true`), or kept and recorded. */
+  released: boolean;
 }
 /**
  * A timeline record or timeline event, in the change feed for replicas that
@@ -628,12 +707,12 @@ export function actorName(snapshot: Pick<Snapshot, "members" | "agents">, id: st
   return agent ? `${name} for ${agent.accountable.displayName}` : name;
 }
 
-/** Who holds a claim: an agent identity by name and human, else the session label. */
+/** Who holds a claim: an agent identity by name and human, else the session name. */
 /** Who's behind an actor or a claim, so the accountable person is visible at a glance. */
 export interface Attribution {
-  /** What to call it: an agent's name, a person's display name, or a session's label. */
+  /** What to call it: an agent's name, a person's display name, or a session's name. */
   name: string;
-  /** An agent identity, a person, or a person's own labeled working session (`--agent`). */
+  /** An agent identity, a person, or a person's own named working session (`--agent`). */
   kind: "agent" | "person" | "session";
   /** The human accountable: the agent's person, or the person themself. */
   person: TrackerIdentity | null;
@@ -647,7 +726,7 @@ export function attribution(
   const person = snapshot.members.find((m) => m.id === id) ?? null;
   return { name: person?.displayName ?? id, kind: "person", person };
 }
-/** A claim's holder: its agent, or the person with their session label when they gave one. */
+/** A claim's holder: its agent, or the person with their session name when they gave one. */
 export function claimAttribution(
   snapshot: Pick<Snapshot, "members" | "agents">,
   claim: IssueClaim,
@@ -742,6 +821,8 @@ export function leasedAncestor(issue: Issue, index: ReadinessIndex, now: string)
  * - `claimed`: it has an active lease;
  * - `unavailable`: backlog, done, done in a timeline (not in this view),
  *   canceled, or in progress without a claim;
+ * - `not_ready`: pickup is disabled for everyone;
+ * - `human_only`: pickup is disabled for the default agent actor, not a person;
  * - `blocked`: a `blocks` predecessor isn't done in this view (a missing one,
  *   or one only done in another timeline, still blocks);
  * - `container`: it has open sub-issues, so the work is in those;
@@ -751,17 +832,27 @@ export function leasedAncestor(issue: Issue, index: ReadinessIndex, now: string)
 export type Readiness =
   | "ready"
   | "waiting"
+  | "not_ready"
+  | "human_only"
   | "claimed"
   | "unavailable"
   | "blocked"
   | "container"
   | "leased_above";
 
-export function readiness(issue: Issue, index: ReadinessIndex, now: string): Readiness {
+export function readiness(
+  issue: Issue,
+  index: ReadinessIndex,
+  now: string,
+  actor: "agent" | "person" = "agent",
+): Readiness {
   if (issue.waiting) return "waiting";
   if (hasActiveClaim(issue, now)) return "claimed";
   if (!(issue.status === "todo" || (issue.status === "in_progress" && issue.claim !== null)))
     return "unavailable";
+  const pickup = issuePickup(issue);
+  if (pickup === "not_ready") return "not_ready";
+  if (pickup === "human_only" && actor === "agent") return "human_only";
   if ((index.blockers.get(issue.id) ?? []).some((id) => index.byId.get(id)?.status !== "done"))
     return "blocked";
   if ((index.children.get(issue.id) ?? []).some(isOpen)) return "container";

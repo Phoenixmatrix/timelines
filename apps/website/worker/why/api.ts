@@ -12,6 +12,7 @@
 // copy, a local rebase) and because the change id it reads is what makes the
 // chain survive rewrites. Both meet at the same resolver (why/chain.ts).
 
+import { stepsFor } from "../steps/api.ts";
 import { Hono, type Context } from "hono";
 import type { ChangeRef } from "../../shared/api.ts";
 import type { TimelineEvent, TimelineIssue } from "../../shared/timelines.ts";
@@ -227,7 +228,8 @@ async function names(d1: D1Database, ids: string[]): Promise<WhyResponse["people
         .execute(),
       kdb.selectFrom("agents").select(["id", "name"]).where("id", "in", slice).execute(),
     ]);
-    for (const a of accounts) people[a.id] = { name: a.display_name || a.slug, kind: "person" };
+    for (const a of accounts)
+      people[a.id] = { name: a.display_name || a.slug, kind: "person", slug: a.slug };
     for (const a of agents) people[a.id] = { name: a.name, kind: "agent" };
   }
   return people;
@@ -390,6 +392,13 @@ why.get("/why", async (c) => {
       }
       chains.push(chain);
     }
+    // The step context behind each commit, readable like the repository (CORE-243).
+    const steps = await stepsFor(
+      c,
+      row.id,
+      chains.map((chain) => ({ oid: chain.oid, changeId: chain.changeId })),
+    );
+    for (const chain of chains) chain.step = steps.get(chain.oid) ?? null;
     return c.json<WhyResponse>({
       source: loaded.source,
       repo: { owner: row.owner_slug, name: row.name, defaultBranch: row.default_branch },

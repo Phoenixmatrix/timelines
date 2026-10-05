@@ -1,4 +1,6 @@
 //! Account-wide policy for automatic AI work; never inferred from a repository.
+//! With `--site`, the site's defaults (site administrators): today, whether AI
+//! Gateway logs keep request and response bodies (CORE-290).
 
 use super::Ctx;
 use crate::model::Json;
@@ -16,25 +18,35 @@ pub enum SettingsCommand {
 
 #[derive(Subcommand)]
 pub enum AiCommand {
-    /// Show policy, published model catalog and your management permission
+    /// Show policy, published model catalog, gateway body logging and your management permission
     Show {
         /// Account slug; defaults to the signed-in person, never the repository owner.
-        #[arg(long, value_parser = account_slug)]
+        #[arg(long, value_parser = account_slug, conflicts_with = "site")]
         owner: Option<String>,
+        /// The site's defaults instead (site administrators).
+        #[arg(long)]
+        site: bool,
     },
     /// Change future jobs only; human account/org owner or site admin required
-    Set(AiSetArgs),
+    Set(Box<AiSetArgs>),
 }
 
 #[derive(Args)]
 #[group(skip)]
 #[command(group(clap::ArgGroup::new("ai_changes").required(true).multiple(true).args([
-    "knowledge", "wiki", "atlas", "release_notes", "classification", "fast", "task"
+    "knowledge", "wiki", "atlas", "release_notes", "classification", "fast", "task",
+    "knowledge_quiet_minutes", "knowledge_max_wait_minutes", "log_bodies"
 ])))]
 pub struct AiSetArgs {
     /// Account slug; defaults to the signed-in person, never the repository owner.
-    #[arg(long, value_parser = account_slug)]
+    #[arg(long, value_parser = account_slug, conflicts_with = "site")]
     owner: Option<String>,
+    /// Set the site's defaults (site administrators); only --log-bodies applies.
+    #[arg(long, conflicts_with_all = [
+        "knowledge", "wiki", "atlas", "release_notes", "classification", "fast", "task",
+        "knowledge_quiet_minutes", "knowledge_max_wait_minutes"
+    ])]
+    site: bool,
     /// Knowledge ingestion and embeddings; off also prevents new wiki and Atlas AI work.
     #[arg(long, value_parser = ["on", "off"])]
     knowledge: Option<String>,
@@ -56,6 +68,52 @@ pub struct AiSetArgs {
     /// Task generation model; does not change running jobs or regenerate cached output.
     #[arg(long, value_parser = ["glm-5.3-flash", "gemma-4-26b-a4b-it"])]
     task: Option<String>,
+    /// Knowledge updates start once pushes to main pause this long (0-1440 minutes; 0 = no wait).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=1440))]
+    knowledge_quiet_minutes: Option<u32>,
+    /// …and never later than this after the first pending push (0-1440 minutes).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=1440))]
+    knowledge_max_wait_minutes: Option<u32>,
+    /// Keep AI request and response bodies in gateway logs: on|off|default for every
+    /// component, or COMPONENT=on|off|default (repeatable). default follows the site
+    /// (with --site: the environment). While on, prompts and replies, including
+    /// repository code and assistant conversations, are kept in Cloudflare's AI Gateway
+    /// logs, readable in the Cloudflare dashboard, and deleted oldest-first.
+    #[arg(long = "log-bodies", value_name = "[COMPONENT=]on|off|default", value_parser = log_bodies_choice)]
+    log_bodies: Vec<(Option<String>, Option<bool>)>,
+}
+
+/// Components with their own body logging setting (shared/ai.ts AI_LOG_COMPONENTS).
+const LOG_COMPONENTS: [&str; 6] = [
+    "knowledge",
+    "assistant",
+    "assistant-titles",
+    "avatars",
+    "release-notes",
+    "merge-queue",
+];
+
+/// `on`, `off` or `default`, for every component or (`COMPONENT=…`) one.
+fn log_bodies_choice(value: &str) -> std::result::Result<(Option<String>, Option<bool>), String> {
+    let (component, choice) = match value.split_once('=') {
+        Some((component, choice)) => {
+            if !LOG_COMPONENTS.contains(&component) {
+                return Err(format!(
+                    "Unknown component {component}; use one of: {}.",
+                    LOG_COMPONENTS.join(", ")
+                ));
+            }
+            (Some(component.to_string()), choice)
+        }
+        None => (None, value),
+    };
+    let choice = match choice {
+        "on" => Some(true),
+        "off" => Some(false),
+        "default" => None,
+        _ => return Err("Use on, off or default (optionally COMPONENT=on|off|default).".into()),
+    };
+    Ok((component, choice))
 }
 
 fn account_slug(value: &str) -> std::result::Result<String, String> {
@@ -99,6 +157,36 @@ impl AiSetArgs {
         if !models.is_empty() {
             patch.insert("models".into(), Value::Object(models));
         }
+        let mut updates = Map::new();
+        for (key, value) in [
+            ("quietMinutes", self.knowledge_quiet_minutes),
+            ("maxWaitMinutes", self.knowledge_max_wait_minutes),
+        ] {
+            if let Some(value) = value {
+                updates.insert(key.into(), json!(value));
+            }
+        }
+        if !updates.is_empty() {
+            patch.insert("knowledgeUpdates".into(), Value::Object(updates));
+        }
+        // Later values win, so `--log-bodies on --log-bodies avatars=off` reads naturally.
+        let mut log_bodies = Map::new();
+        for (component, choice) in &self.log_bodies {
+            let value = choice.map_or(Value::Null, Value::Bool);
+            match component {
+                Some(component) => {
+                    log_bodies.insert(component.clone(), value);
+                }
+                None => {
+                    for component in LOG_COMPONENTS {
+                        log_bodies.insert(component.into(), value.clone());
+                    }
+                }
+            }
+        }
+        if !log_bodies.is_empty() {
+            patch.insert("logBodies".into(), Value::Object(log_bodies));
+        }
         Value::Object(patch)
     }
 }
@@ -109,10 +197,27 @@ pub fn run(ctx: &Ctx, command: &SettingsCommand) -> Result<Json> {
     let mut config = Config::load();
     config.acting = Acting::Person;
     let SettingsCommand::Ai(command) = command;
-    let (explicit, patch) = match command {
-        AiCommand::Show { owner } => (owner, None),
-        AiCommand::Set(args) => (&args.owner, Some(args.patch())),
+    let (explicit, site, patch) = match command {
+        AiCommand::Show { owner, site } => (owner, *site, None),
+        AiCommand::Set(args) => (&args.owner, args.site, Some(args.patch())),
     };
+    if site {
+        let path = "/admin/ai";
+        if ctx.dry_run
+            && let Some(patch) = &patch
+        {
+            return Ok(Json(json!({
+                "dry_run": true, "site": true, "method": "PATCH", "path": path,
+                "request": patch
+            })));
+        }
+        return Ok(Json(remote::api(
+            &config,
+            if patch.is_some() { "PATCH" } else { "GET" },
+            path,
+            patch.as_ref(),
+        )?));
+    }
     let owner = match explicit {
         Some(owner) => owner.clone(),
         None => {
@@ -159,7 +264,7 @@ mod tests {
         else {
             panic!("expected settings ai set");
         };
-        args
+        *args
     }
 
     #[test]
@@ -182,6 +287,87 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_update_windows_are_minutes() {
+        let args = parse_set(&["--knowledge-quiet-minutes", "0"]);
+        assert_eq!(
+            args.patch(),
+            json!({"knowledgeUpdates": {"quietMinutes": 0}})
+        );
+        let args = parse_set(&[
+            "--knowledge-quiet-minutes",
+            "15",
+            "--knowledge-max-wait-minutes",
+            "60",
+        ]);
+        assert_eq!(
+            args.patch(),
+            json!({"knowledgeUpdates": {"quietMinutes": 15, "maxWaitMinutes": 60}})
+        );
+    }
+
+    #[test]
+    fn log_bodies_for_every_component_or_one() {
+        let args = parse_set(&["--log-bodies", "on"]);
+        let all: Map<String, Value> = LOG_COMPONENTS
+            .iter()
+            .map(|c| (c.to_string(), json!(true)))
+            .collect();
+        assert_eq!(args.patch(), json!({"logBodies": all}));
+        let args = parse_set(&[
+            "--log-bodies",
+            "off",
+            "--log-bodies",
+            "assistant=on",
+            "--log-bodies",
+            "avatars=default",
+        ]);
+        let patch = args.patch();
+        assert_eq!(patch["logBodies"]["knowledge"], json!(false));
+        assert_eq!(patch["logBodies"]["assistant"], json!(true));
+        assert_eq!(patch["logBodies"]["avatars"], Value::Null);
+        assert_eq!(patch["logBodies"].as_object().unwrap().len(), 6);
+        let args = parse_set(&["--log-bodies", "merge-queue=off", "--release-notes", "on"]);
+        assert_eq!(
+            args.patch(),
+            json!({"features": {"releaseNotes": true}, "logBodies": {"merge-queue": false}})
+        );
+    }
+
+    #[test]
+    fn site_defaults_take_only_log_bodies() {
+        let args = parse_set(&["--site", "--log-bodies", "on"]);
+        assert!(args.site);
+        assert_eq!(args.patch()["logBodies"]["release-notes"], json!(true));
+        let parsed = Cli::try_parse_from(["gm", "settings", "ai", "show", "--site"]).unwrap();
+        let Some(Command::Settings(SettingsCommand::Ai(AiCommand::Show { site, owner }))) =
+            parsed.command
+        else {
+            panic!("expected settings ai show");
+        };
+        assert!(site && owner.is_none());
+        for flags in [
+            vec!["--site"],
+            vec!["--site", "--knowledge", "off"],
+            vec!["--site", "--log-bodies", "on", "--owner", "orbit"],
+            vec![
+                "--site",
+                "--log-bodies",
+                "on",
+                "--task",
+                "gemma-4-26b-a4b-it",
+            ],
+        ] {
+            let mut argv = vec!["gm", "settings", "ai", "set"];
+            argv.extend(flags);
+            assert!(Cli::try_parse_from(&argv).is_err(), "accepted {argv:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["gm", "settings", "ai", "show", "--site", "--owner", "x"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn invalid_or_empty_updates_fail_at_parse_time() {
         for flags in [
             vec![],
@@ -196,6 +382,15 @@ mod tests {
             vec!["--release-notes", "off", "--owner", "orbit/repo"],
             vec!["--wiki", "on", "--owner", ""],
             vec!["--indexing", "off"],
+            vec!["--knowledge-quiet-minutes", "1441"],
+            vec!["--knowledge-max-wait-minutes", "-1"],
+            vec!["--knowledge-quiet-minutes", "soon"],
+            vec!["--log-bodies"],
+            vec!["--log-bodies", "true"],
+            vec!["--log-bodies", "ON"],
+            vec!["--log-bodies", "atlas=on"],
+            vec!["--log-bodies", "assistant-title=on"],
+            vec!["--log-bodies", "knowledge="],
         ] {
             let mut argv = vec!["gm", "settings", "ai", "set"];
             argv.extend(flags);

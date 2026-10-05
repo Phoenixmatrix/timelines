@@ -20,7 +20,11 @@ function setup(actor: Actor | null = ann) {
     ok: true,
     value: { owner: access.owner, canAdmin: access.canAdmin, members: access.members, issues: [] },
   }));
-  const getByName = vi.fn(() => ({ snapshot }));
+  const tagCatalog = vi.fn(async () => ({
+    ok: true,
+    value: [{ name: "ux", issues: 2, open: 1 }],
+  }));
+  const getByName = vi.fn(() => ({ snapshot, tagCatalog }));
   const env = { DB: d1(sqlite), TRACKER: { getByName } } as unknown as Env;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
@@ -88,6 +92,17 @@ describe("tracker browser data", () => {
       canAdmin: true,
       issues: [],
     });
+  });
+});
+
+describe("tag catalog", () => {
+  test("lists a tracker's tags with counts for members, never for others (CORE-271)", async () => {
+    const { call } = setup();
+    const result = await call("/tracker/orbit/tags");
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ tags: [{ name: "ux", issues: 2, open: 1 }] });
+    expect((await call("/tracker/private/tags")).status).toBe(403);
+    expect((await setup(null).call("/tracker/orbit/tags")).status).toBe(401);
   });
 });
 

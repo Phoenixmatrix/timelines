@@ -612,6 +612,8 @@ test("overlays start for bookmarks whose tip or main's graph moved", () => {
       ["refs/heads/timeline/new", "n1"],
     ],
     deferred: false,
+    seen: [],
+    wakeAt: null,
   });
 });
 
@@ -631,6 +633,53 @@ test("one overlay per timeline, a few per repository, and none before main has a
     gone: ["refs/heads/timeline/gone"],
     start: [["refs/heads/timeline/b", "b1"]],
     deferred: true,
+    seen: [],
+    wakeAt: null,
   });
-  expect(scanOverlays({}, tips, null)).toEqual({ gone: [], start: [], deferred: false });
+  expect(scanOverlays({}, tips, null)).toEqual({
+    gone: [],
+    start: [],
+    deferred: false,
+    seen: [],
+    wakeAt: null,
+  });
+});
+
+test("a pushed timeline waits for its pushes to pause, unless a checkpoint wants it now (CORE-238)", () => {
+  const quiet = (now: number, now_refs?: Set<string>) => ({ now, ms: 600_000, now_refs });
+  const tips = new Map([
+    ["refs/heads/timeline/busy", "b2"],
+    ["refs/heads/timeline/rebased", "r1"],
+  ]);
+  const overlays: Record<string, OverlayState> = {
+    "refs/heads/timeline/busy": idle("b1", "m1"),
+    // Only main moved under it: no step to wait for.
+    "refs/heads/timeline/rebased": idle("r1", "m0"),
+  };
+  // A new tip is remembered and waited for.
+  expect(scanOverlays(overlays, tips, "m1", 3, quiet(1_000))).toEqual({
+    gone: [],
+    start: [["refs/heads/timeline/rebased", "r1"]],
+    deferred: false,
+    seen: [["refs/heads/timeline/busy", "b2"]],
+    wakeAt: 601_000,
+  });
+  overlays["refs/heads/timeline/busy"]!.seen = { commit: "b2", at: 1_000 };
+  // Still quiet: nothing new to remember, the same wake time.
+  expect(scanOverlays(overlays, tips, "m1", 3, quiet(300_000)).wakeAt).toBe(601_000);
+  // A checkpoint wants it now.
+  expect(
+    scanOverlays(overlays, tips, "m1", 3, quiet(300_000, new Set(["refs/heads/timeline/busy"])))
+      .start,
+  ).toContainEqual(["refs/heads/timeline/busy", "b2"]);
+  // The quiet period passed with no newer push: it starts.
+  const due = scanOverlays(overlays, tips, "m1", 3, quiet(601_000));
+  expect(due.start).toContainEqual(["refs/heads/timeline/busy", "b2"]);
+  expect(due.wakeAt).toBeNull();
+  // A newer push restarts the wait.
+  tips.set("refs/heads/timeline/busy", "b3");
+  expect(scanOverlays(overlays, tips, "m1", 3, quiet(601_000))).toMatchObject({
+    seen: [["refs/heads/timeline/busy", "b3"]],
+    wakeAt: 1_201_000,
+  });
 });

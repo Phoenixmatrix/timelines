@@ -1,7 +1,8 @@
 // The Atlas read API (CORE-160), mounted at /api/repos/:owner/:name/atlas.
 //
 //   GET /overview[?snapshot=]                      the root and the ≤12 largest top-level
-//                                                  regions, plus the first catalogue page
+//                                                  regions, the imports between them,
+//                                                  plus the first catalogue page
 //   GET /regions?cursor=                           more of that catalogue
 //   GET /children?id=[&cursor=&limit=]             an entity's children, by name
 //   GET /detail?id=                                an entity, its ancestors and counts
@@ -33,6 +34,7 @@ import { Hono, type Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import {
   ATLAS_CATALOGUE_SUMMARY_CHARS,
+  ATLAS_OVERVIEW_AREAS,
   ATLAS_OVERVIEW_REGIONS,
   ATLAS_OVERVIEW_SUMMARY_CHARS,
   ATLAS_PAGE_DEFAULT,
@@ -81,7 +83,9 @@ import {
   edgeCountsAt,
   entityAt,
   evidenceCountAt,
+  areasAt,
   evidenceFilesAt,
+  regionLinksAt,
   regionsAt,
   relationsAt,
   repoScope,
@@ -187,6 +191,21 @@ export function region(
     summary: summary.text,
     summaryTruncated: summary.truncated,
     size: { files: entity.files, members: entity.members },
+  };
+}
+
+/** A region as an overview shows it: with its first areas, when it has any, for the map. */
+export function overviewRegion(
+  entity: ProjectedEntity & { files: number; members: number },
+  areas: readonly ProjectedEntity[] | undefined,
+): AtlasRegion {
+  const shaped = region(entity, ATLAS_OVERVIEW_SUMMARY_CHARS);
+  if (!areas?.length) return shaped;
+  return {
+    ...shaped,
+    areas: areas.map((a) =>
+      lean({ ...a, summary: cut(a.summary, ATLAS_CATALOGUE_SUMMARY_CHARS).text }),
+    ),
   };
 }
 
@@ -385,9 +404,14 @@ atlas.get("/overview", async (c) => {
     childCountAt(d1, ctx.scope, seq, ROOT),
     capacityFailure(d1, ctx.scope),
   ]);
-  const rest = top.next
-    ? await regionsAt(d1, ctx.scope, seq, top.next, ATLAS_PAGE_DEFAULT)
-    : { regions: [], next: null };
+  const ids = top.regions.map((r) => r.id);
+  const [rest, links, areas] = await Promise.all([
+    top.next
+      ? regionsAt(d1, ctx.scope, seq, top.next, ATLAS_PAGE_DEFAULT)
+      : { regions: [], next: null },
+    regionLinksAt(d1, ctx.scope, seq, ids),
+    areasAt(d1, ctx.scope, seq, ids, ATLAS_OVERVIEW_AREAS),
+  ]);
   // The overview always starts the catalogue; /regions continues it.
   const catalogue = await page(
     { ...ctx, cursor: null },
@@ -401,9 +425,10 @@ atlas.get("/overview", async (c) => {
     root: root
       ? lean({ ...root, summary: cut(root.summary, ATLAS_OVERVIEW_SUMMARY_CHARS).text })
       : null,
-    regions: top.regions.map((r) => region(r, ATLAS_OVERVIEW_SUMMARY_CHARS)),
+    regions: top.regions.map((r) => overviewRegion(r, areas.get(r.id))),
     catalogue,
     totalRegions,
+    links,
     capacityFailure: capacity,
   };
   return c.json(body);

@@ -19,12 +19,15 @@ import { registryAudit, registryProxyCache } from "./registry.ts";
 import { authHygiene } from "./auth-hygiene.ts";
 import { releaseNotes } from "./release-notes.ts";
 import { pushLog } from "./push-log.ts";
+import { stepArtifacts, stepSteering } from "./steps.ts";
 import { timelineWorkSources } from "./work-sources.ts";
 
 // Items are opaque to the engine: each cleanup gets back what it selected.
 // oxlint-disable-next-line typescript/no-explicit-any
 const CLEANUPS: Partial<Record<CategoryId, CategoryCleanup<any>>> = {
   "ci-logs": ciLogs,
+  "step-steering": stepSteering,
+  "step-artifacts": stepArtifacts,
   "ci-runs": ciRuns,
   "preview-records": previewRecords,
   "usage-history": usageHistory,
