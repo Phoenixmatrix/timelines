@@ -351,9 +351,13 @@ export async function overlayGraphs(
     loadConceptModel(d1, repo.id),
     storedSyntheses(d1, repo.id),
   ]);
+  const mainGraph = buildGraph(repo.full_name, main, analyses, syntheses, concepts);
   return {
-    main: buildGraph(repo.full_name, main, analyses, syntheses, concepts),
-    timeline: buildGraph(repo.full_name, files, analyses, syntheses, concepts),
+    main: mainGraph,
+    // Main's topic labels: a timeline's spelling only names topics main lacks.
+    timeline: buildGraph(repo.full_name, files, analyses, syntheses, concepts, {
+      topicNames: mainGraph.topicNames,
+    }),
     files,
     analyses,
     syntheses,

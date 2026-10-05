@@ -130,6 +130,8 @@ export interface BuiltGraph {
   componentDeps: Map<string, Map<string, number>>;
   /** concept key (canonical) -> files that mention it. */
   conceptFiles: Map<string, string[]>;
+  /** Trimmed concept key (canonical) -> the topic label its files carry. */
+  topicNames: Map<string, string>;
 }
 
 export function buildGraph(
@@ -138,6 +140,14 @@ export function buildGraph(
   analyses: Map<string, FileAnalysis>,
   syntheses: Syntheses,
   concepts: ConceptModel = EMPTY_CONCEPT_MODEL,
+  options: {
+    /**
+     * Labels to keep for topics another graph already named. A topic's label
+     * is its most used spelling, so an overlay passes main's: a timeline file
+     * spelling it differently must not relabel main's unchanged files.
+     */
+    topicNames?: Map<string, string>;
+  } = {},
 ): BuiltGraph {
   const nodes = new Map<string, GraphNode>();
   const edges = new Map<string, GraphEdge>();
@@ -246,12 +256,15 @@ export function buildGraph(
     groups.set(lead, target);
   }
   const conceptFiles = new Map<string, string[]>();
+  const topicNames = new Map<string, string>();
   for (const [key, group] of groups) {
     const name = displayName(group.names, key);
     if (concepts.trimmed.has(key)) {
+      const label = options.topicNames?.get(key) ?? name;
+      topicNames.set(key, label);
       for (const path of group.files) {
         const node = nodes.get(`file:${path}`);
-        if (node) node.data.topics = [...((node.data.topics as string[] | undefined) ?? []), name];
+        if (node) node.data.topics = [...((node.data.topics as string[] | undefined) ?? []), label];
       }
       continue;
     }
@@ -334,6 +347,7 @@ export function buildGraph(
     components,
     componentDeps,
     conceptFiles,
+    topicNames,
   };
 }
 

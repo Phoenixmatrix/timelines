@@ -215,6 +215,7 @@ function storedGraph(sqlite: ReturnType<typeof migratedDatabase>): BuiltGraph {
     components: [],
     componentDeps: new Map(),
     conceptFiles: new Map(),
+    topicNames: new Map(),
   };
 }
 

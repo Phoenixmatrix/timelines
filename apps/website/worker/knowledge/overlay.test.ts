@@ -308,6 +308,39 @@ describe("diffGraphs", () => {
       "topics",
     );
   });
+
+  test("a work file's spelling of a topic cannot relabel an unchanged canonical file", () => {
+    const main = [{ path: "verify-all.ts", blob: "verify", mode: "100644" }];
+    const model = {
+      canonical: new Map<string, string>(),
+      salient: new Set<string>(),
+      trimmed: new Set(["batch-processing"]),
+      partOf: [] as [string, string][],
+    };
+    // Tied counts: on its own the lower-case spelling would win the label.
+    const cards = new Map([
+      ["verify", analysis({ concepts: ["Batch Processing"] })],
+      ["limits", analysis({ concepts: ["batch processing"] })],
+    ]);
+    const base = buildGraph("org/app", main, cards, empty, model);
+    const added = applyChanges(main, [
+      { path: "limits.ts", blob: "limits", before: null, mode: "100644" },
+    ]);
+    const projected = diffGraphs(
+      base,
+      buildGraph("org/app", added, cards, empty, model, { topicNames: base.topicNames }),
+    );
+    expect(
+      projected
+        .filter((change) => change.kind === "file")
+        .map(({ id, change }) => ({ id, change })),
+    ).toEqual([{ id: "file:limits.ts", change: "added" }]);
+    // Without main's labels, the tie relabels it: the overlay must pass them.
+    const unpinned = diffGraphs(base, buildGraph("org/app", added, cards, empty, model));
+    expect(unpinned.find((change) => change.id === "file:verify-all.ts")?.fields).toEqual([
+      "topics",
+    ]);
+  });
 });
 
 describe("stored overlays", () => {

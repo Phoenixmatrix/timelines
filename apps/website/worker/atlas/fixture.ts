@@ -245,7 +245,14 @@ async function fixtureGraph(files: AtlasFixtureFile[]): Promise<BuiltGraph> {
       summary: "",
       data: {},
     });
-  return { nodes, edges, components: [], componentDeps: new Map(), conceptFiles: new Map() };
+  return {
+    nodes,
+    edges,
+    components: [],
+    componentDeps: new Map(),
+    conceptFiles: new Map(),
+    topicNames: new Map(),
+  };
 }
 
 /**
