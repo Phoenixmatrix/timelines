@@ -581,9 +581,12 @@ export async function onPush(
   for (const result of moved) {
     const row = (result.results as InferResult<(typeof upserts)[number]>)[0];
     if (!row) continue;
-    // The first time CI sees a repository, every branch looks new; only the
-    // default branch gets a run then.
-    if (known.size === 0 && row.ref !== refs.headBranch) continue;
+    // A work source runs CI only for its `work` branch: its other refs are the
+    // fork's copies of canonical. Its first push to `work` is real work, so the
+    // first-sight rule below (every branch looks new) is canonical's alone.
+    if (repo.source_id && repo.source_id !== "canonical") {
+      if (row.ref !== "work") continue;
+    } else if (known.size === 0 && row.ref !== refs.headBranch) continue;
     // A landing's merge is tested by the landing itself (timelines/landing.ts).
     if (landingSlugOf(row.ref) || isQueueSourceBranch(row.ref)) continue;
     // A push to a timeline also gets its light step run (CORE-235), when the

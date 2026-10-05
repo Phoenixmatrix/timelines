@@ -2268,16 +2268,15 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     );
     record({ archiveRetentionBeforeDeadline: retention.run });
     await gm(["timeline", "land", slug, "--owner", fixtures.tracker.owner], "jun", clone, /landed/);
-    // Landing completion precedes the asynchronous push log's change index.
-    // Wait for that input, then assert the authoritative queue provenance below.
+    // The work commit never reaches canonical refs: its main provenance is the
+    // source's integration receipt. Wait for that, then assert it exactly below.
     const why = await poll(
       async () => JSON.parse(await gm(["why", `${marker}:1`], "jun", clone)) as WhyResponse,
       (result) =>
         result.chains.some(
-          (chain) =>
-            chain.oid === checkpointCommit && chain.refs.some((ref) => ref.kind === "main"),
+          (chain) => chain.oid === checkpointCommit && chain.landing?.via === "compact",
         ),
-      "the landed change's main ref to be indexed",
+      "the landed work commit's compact integration provenance",
     );
     record({ why, checkpoint });
     const provenance = why.chains.find((chain) => chain.oid === checkpointCommit)?.landing;
