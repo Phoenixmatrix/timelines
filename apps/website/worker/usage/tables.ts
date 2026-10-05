@@ -50,6 +50,7 @@ export const TABLE_GROUPS: TableGroup[] = [
       timeline_work_sources: REPO,
       source_operations: REPO,
       source_progress_members: REPO,
+      source_revision_origins: REPO,
       source_integration_receipts: REPO,
       source_integration_members: REPO,
       source_integration_inputs: REPO,

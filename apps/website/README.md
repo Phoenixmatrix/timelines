@@ -2581,6 +2581,7 @@ unmanaged previews have no invented teardown job. Unknown Workflow state or a
 failed stop keeps its claim. Completed output metadata does not pin Git forever.
 Revision origins and integration receipts survive source Git expiry; canonical
 repository deletion removes them with the rest of its provenance.
+Usage meters this retained evidence to its canonical repository's owner.
 Retained child dependencies protect required bases and exact ancestry evidence.
 Once eligible sources enter purge, reads return `source_expired` (410), never
 canonical fallback. Canonical deletion tombstones immediately block all work

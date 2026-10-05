@@ -13,7 +13,8 @@
 - Same-source WIP branch merges compact normally, including a first merged push.
   Immutable first-observation provenance prevents later copies or source expiry
   from disguising known foreign work. Legacy conversion attributes historical
-  timeline WIP to its owned source.
+  timeline WIP to its owned source. Revision-origin storage is metered to the
+  canonical repository's owner.
 - Work push fences settle only on complete negotiated Git status consistent with
   the observed ref. HTTP failures and malformed or contradictory reports stay
   ambiguous; seeing the old tip alone cannot release the fence.
