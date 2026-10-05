@@ -190,6 +190,27 @@ describe("generated options", () => {
     expect(image.headers.get("cache-control")).toMatch(/^private/);
   });
 
+  test("gateway logs keep the pictures' prompts only where the person's account says so (CORE-290)", async () => {
+    const s = setup();
+    s.sqlite.exec(
+      "INSERT INTO account_ai_log_bodies (account_id, component, keep) VALUES ('ann', 'avatars', 1)",
+    );
+    expect((await s.call("/account/avatar/options", { method: "POST" })).status).toBe(201);
+    s.as(ben);
+    expect((await s.call("/account/avatar/options", { method: "POST" })).status).toBe(201);
+    const options = s.run.mock.calls.map((call) => (call as unknown[])[2] as AiOptions);
+    expect(options.map((o) => [o.gateway?.metadata, o.extraHeaders ?? null])).toEqual([
+      ...[0, 1, 2, 3].map(() => [
+        { component: "avatars", account: "ann", feature: "avatars" },
+        null,
+      ]),
+      ...[0, 1, 2, 3].map(() => [
+        { component: "avatars", account: "ben", feature: "avatars" },
+        { "cf-aig-collect-log-payload": "false" },
+      ]),
+    ]);
+  });
+
   test("a double click pays once", async () => {
     const s = setup();
     const [a, b] = await Promise.all([

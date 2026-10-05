@@ -64,9 +64,21 @@ and says so when it starts, unless started with `GITMATRIX_DEV_AI=enabled vp dev
 once cost about $44). Application inference, including knowledge/wiki
 generation, graph embeddings, routing, assistant streams/titles and avatars, goes
 through the configured Gateway. Filter logs by `metadata.component`: `knowledge`,
-`assistant`, `assistant-title` or `avatars`. Application calls disable raw
-prompt/response payload storage while retaining model, status, tokens, cost and
-latency metadata.
+`assistant`, `assistant-title`, `assistant-status`, `avatars`, `release-notes` or
+`merge-queue` (and `metadata.account`/`metadata.feature`, as in `ai_usage`).
+Logs always keep model, status, tokens, cost and latency. Whether they also keep
+request and response bodies is a setting per component, "Keep AI request and
+response bodies in gateway logs" (CORE-290): a site default (site admins,
+**Settings → Site AI settings** or `gm settings ai set --site --log-bodies on`),
+which an account's administrators can override for their own account's calls
+(**AI settings** or `gm settings ai set --log-bodies assistant=off`). Without a
+site choice deployed servers keep no bodies (`AI_LOG_BODIES=off`) and the dev
+server and agent environments keep them (`on`). Where the effective setting is
+off, a call sends `cf-aig-collect-log-payload: false`. Kept bodies, including
+repository code and assistant conversations, are readable by the Cloudflare
+account's dashboard users and deleted oldest-first with the gateway's logs
+(`cf ai-gateway logs get-request|get-response <id> --gateway-id gitmatrix`).
+Settings are read once a minute per isolate, not per call.
 
 The Worker reads the `AI_GATEWAY` text binding. Agent environments override it
 with their owned `GITMATRIX_AI_GATEWAY`; they never fall back to a shared Gateway.
@@ -80,7 +92,7 @@ AI Search usage, not Gateway logs or analytics. Those models remain unchanged;
 consult AI Search usage for that portion. Query rewriting/generation and
 external-provider model calls use its connected Gateway
 ([Cloudflare's coverage](https://developers.cloudflare.com/ai-search/configuration/models/ai-gateway/)).
-Application payload-suppression headers do not configure managed Search logging.
+The body logging setting does not configure managed Search logging.
 
 For a new deployment, create the Gateway before deploying the Worker, then connect
 the existing Search instance (use `gitmatrix-dev` and namespace `gitmatrix` for
@@ -378,7 +390,8 @@ optional named tags and non-duplicated daily tracker feeds. It exercises real av
 generation and checks Gateway attempts within its ten-call budget, with successes matching the
 returned images (the API permits partial generation). It also checks successful
 Gateway records for knowledge, embeddings and assistant streaming/titles, including
-empty payloads and usage metadata. `ai-e2e.json` retains sanitized Gateway evidence. Assertions check source
+usage metadata, and that bodies are kept for knowledge and assistant streams (the agent
+environment's default) but not for titles and status lines, which the persona turns off. `ai-e2e.json` retains sanitized Gateway evidence. Assertions check source
 facts, not exact generated wording. Missing providers or an expired visibility
 deadline fail honestly. Interactive `agent setup` is AI-off unless `--ai`.
 

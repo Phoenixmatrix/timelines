@@ -46,6 +46,7 @@ import {
   assistantSkillsAction,
   assistantSkillsLoader,
 } from "./routes/AssistantSkills.tsx";
+import { SiteAiSettings, siteAiSettingsLoader } from "./routes/SiteAiSettings.tsx";
 import { SiteUsage, siteUsageLoader, UsageCosts, usageLoader } from "./routes/UsageCosts.tsx";
 import {
   DataRetention,
@@ -163,6 +164,7 @@ export const routes: RouteObject[] = [
             loader: aiSettingsLoader,
             Component: AiSettings,
           },
+          { path: "settings/site-ai", loader: siteAiSettingsLoader, Component: SiteAiSettings },
           { path: "settings/usage", loader: usageLoader, Component: UsageCosts },
           { path: "settings/site-usage", loader: siteUsageLoader, Component: SiteUsage },
           { path: "settings/retention", loader: retentionLoader, Component: DataRetention },

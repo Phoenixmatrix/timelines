@@ -186,6 +186,7 @@ export const TABLE_GROUPS: TableGroup[] = [
       accounts: "id = ?1",
       account_settings: "account_id = ?1",
       assistant_personal_skills: "user_id = ?1",
+      account_ai_log_bodies: "account_id = ?1",
       org_members: "org_id = ?1",
       agents: "accountable_id = ?1",
       access_tokens: "user_id = ?1",
@@ -248,7 +249,7 @@ export const TABLE_GROUPS: TableGroup[] = [
     database: "db",
     scope: "site",
     label: "Background job state",
-    tables: { job_cursors: null, retention_site_policies: null },
+    tables: { job_cursors: null, retention_site_policies: null, site_ai_log_bodies: null },
   },
   {
     id: "price-catalog",

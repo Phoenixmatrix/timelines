@@ -219,7 +219,7 @@ interface GatewayLogSummary {
   feature?: string;
 }
 
-// List metadata only: never fetch request/response bodies or persist raw cf output.
+// List metadata only: never persist request/response bodies or raw cf output.
 async function gatewayLogs(
   owned: Environment,
   since: string,
@@ -282,10 +282,6 @@ async function gatewayLogs(
       (model && log.model !== model)
     )
       return [];
-    assert(
-      log.request === "" && log.response === "",
-      "Application Gateway logs must not retain prompt or response payloads",
-    );
     return [
       {
         id: log.id,
@@ -305,6 +301,36 @@ async function gatewayLogs(
     ];
   });
   return { logs: selected, rawCount: logs.length };
+}
+
+/**
+ * Whether one log kept its request and response bodies (CORE-290): their
+ * sizes in bytes, or null where the gateway has none. Never their content.
+ */
+async function gatewayBodies(owned: Environment, id: string) {
+  const size = async (which: "get-request" | "get-response") => {
+    try {
+      const output = await command(
+        "cf",
+        [
+          "ai-gateway",
+          "logs",
+          which,
+          id,
+          "--gateway-id",
+          owned.id,
+          ...(owned.profile ? ["--profile", owned.profile] : []),
+        ],
+        { env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: owned.account }, timeout: 30_000 },
+      );
+      return Buffer.byteLength(output);
+    } catch (error) {
+      // "[7002] Request body not available" (or response): nothing was kept.
+      if (/\b7002\b|not available/i.test(String(error))) return null;
+      throw new Error(`Gateway ${which} lookup failed for ${id}`);
+    }
+  };
+  return { request: await size("get-request"), response: await size("get-response") };
 }
 
 /**
@@ -1059,6 +1085,12 @@ export async function runProviderE2E(
       if (want("assistant")) {
         begin("assistant");
         enter("assistant");
+        // CORE-290: the persona keeps its conversations' bodies (the agent
+        // environment's default) but not its titles' and status lines', so the
+        // gateway evidence below sees both sides of the header.
+        await api(`/accounts/${persona}/settings/ai`, "PATCH", {
+          logBodies: { assistant: null, "assistant-titles": false },
+        });
         // The assistant (CORE-25/26): one real turn through clef routing, the
         // orchestrator model and its tools, answered from the indexed fixture.
         const asked = await fetch(`${ctx.origin}/api/assistant/ask`, {
@@ -2145,12 +2177,15 @@ export async function runProviderE2E(
         }
       }
       // Each stage that calls models through the Gateway passes only once its records do.
+      // CORE-290: agent environments keep bodies by default, and the persona
+      // turned them off for its own assistant titles and status lines.
       const requirements: {
         stage: CopperFinchStage;
         key: string;
         component: string;
         model?: string;
         minimum: number;
+        bodies?: boolean;
       }[] = [
         ...(want("knowledge")
           ? [
@@ -2160,6 +2195,7 @@ export async function runProviderE2E(
                 component: "knowledge",
                 model: capturedAi!.models.task,
                 minimum: 1,
+                bodies: true,
               },
               {
                 stage: "knowledge" as const,
@@ -2172,18 +2208,26 @@ export async function runProviderE2E(
           : []),
         ...(want("assistant")
           ? [
-              { stage: "assistant" as const, key: "assistant", component: "assistant", minimum: 1 },
+              {
+                stage: "assistant" as const,
+                key: "assistant",
+                component: "assistant",
+                minimum: 1,
+                bodies: true,
+              },
               {
                 stage: "assistant" as const,
                 key: "assistant-title",
                 component: "assistant-title",
                 minimum: 1,
+                bodies: false,
               },
               {
                 stage: "assistant" as const,
                 key: "assistant-status",
                 component: "assistant-status",
                 minimum: 1,
+                bodies: false,
               },
             ]
           : []),
@@ -2244,6 +2288,42 @@ export async function runProviderE2E(
             }
             return successful.length >= requirement.minimum;
           });
+          if (requirement.bodies !== undefined) {
+            // A few successful calls' bodies: kept, or not, as their settings
+            // say. Bodies can land a while after a log's metadata, so a kept
+            // one is waited for (any of the first few; a very large request
+            // may not be stored whole), and none may appear where they're off.
+            const { logs } = await gatewayLogs(
+              owned,
+              String(evidence.startedAt),
+              requirement.component,
+              requirement.model,
+            );
+            const inspected = logs.filter((entry) => entry.success && !entry.cached).slice(0, 3);
+            assert(inspected.length, `${requirement.key}: no successful Gateway log to inspect`);
+            const seen: Record<string, Awaited<ReturnType<typeof gatewayBodies>>> = {};
+            const deadline = Date.now() + 180_000;
+            for (;;) {
+              for (const log of inspected) seen[log.id] = await gatewayBodies(owned, log.id);
+              const kept = Object.values(seen).some((b) => b.request && b.response);
+              if (!requirement.bodies || kept || Date.now() > deadline) break;
+              await delay(10_000);
+            }
+            (gatewayEvidence[requirement.key] as Record<string, unknown>).bodies = {
+              expected: requirement.bodies,
+              logs: seen,
+            };
+            if (requirement.bodies)
+              assert(
+                Object.values(seen).some((b) => b.request && b.response),
+                `${requirement.key}: the Gateway logs must keep request and response bodies`,
+              );
+            else
+              assert(
+                Object.values(seen).every((b) => b.request === null && b.response === null),
+                `${requirement.key}: the Gateway logs must not keep request or response bodies`,
+              );
+          }
         }
         for (const requirement of requirements) passed(requirement.stage);
       }

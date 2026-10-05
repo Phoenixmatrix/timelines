@@ -149,6 +149,7 @@ const pages: CommandSource = ({ viewer, pathname }) => {
     ...(viewer.isSiteAdmin
       ? [
           page("invites", "Invitations", "/settings/invites", ["invite", "admin"]),
+          page("site-ai", "Site AI settings", "/settings/site-ai", ["gateway", "logs", "admin"]),
           page("site-usage", "Site usage & costs", "/settings/site-usage", [
             "billing",
             "storage",

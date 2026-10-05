@@ -196,7 +196,7 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
       const { text: reply, usage } = await generateText({
         model: createWorkersAI({ binding: this.env.AI })(
           ASSISTANT_MODELS.status,
-          aiGatewayOptions(this.env, "assistant-status"),
+          await aiGatewayOptions(this.env, "assistant-status", this.#aiWork()),
         ),
         instructions: PROGRESS_INSTRUCTIONS,
         prompt: progressPrompt(request, step),
@@ -378,7 +378,7 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
         const result = streamText({
           model: wrapLanguageModel({
             model: workersai(model, {
-              ...aiGatewayOptions(this.env, "assistant"),
+              ...(await aiGatewayOptions(this.env, "assistant", this.#aiWork())),
               reasoning_effort: plan.reasoning,
               sessionAffinity: this.name,
             }),
@@ -444,7 +444,7 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
       const { text: title, usage } = await generateText({
         model: createWorkersAI({ binding: this.env.AI })(
           ASSISTANT_MODELS.title,
-          aiGatewayOptions(this.env, "assistant-title"),
+          await aiGatewayOptions(this.env, "assistant-title", this.#aiWork()),
         ),
         instructions:
           "Name this conversation in 2 to 6 words, sentence case, no quotes or trailing punctuation.",

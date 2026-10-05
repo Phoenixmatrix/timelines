@@ -2633,6 +2633,85 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     record({ usage: figures.map((f) => `${f.construct}/${f.item}/${f.metric}=${f.quantity}`) });
   });
 
+  await scenario("ai-gateway-log-bodies-site-default-and-account-override", async () => {
+    // CORE-290: "Keep AI request and response bodies in gateway logs", per
+    // component. Agent environments keep them by default; site administrators
+    // set the site default and an account's administrators override it for
+    // the account, through the API and `gm settings ai`; both show the
+    // retention note; members, non-admins and agents are refused.
+    type Entry = {
+      component: string;
+      site: boolean;
+      siteFrom: string;
+      account?: boolean | null;
+      effective: boolean;
+    };
+    type View = { logBodies: { environmentDefault: boolean; note: string; components: Entry[] } };
+    const find = (view: View, component: string) =>
+      view.logBodies.components.find((e) => e.component === component)!;
+    const site = await json<View & { canManage: boolean }>("/api/admin/ai", fixtures.tokens.priya);
+    assert.equal(site.logBodies.environmentDefault, true, "Agent environments keep bodies");
+    assert(site.logBodies.components.every((e) => e.effective && e.siteFrom === "environment"));
+    assert.match(site.logBodies.note, /repository code and assistant conversations/);
+    await request("/api/admin/ai", fixtures.tokens.marco, "GET", undefined, [403]);
+    await request(
+      "/api/admin/ai",
+      fixtures.tokens.marco,
+      "PATCH",
+      { logBodies: { knowledge: false } },
+      [403],
+    );
+    await gm(
+      ["settings", "ai", "set", "--site", "--log-bodies", "off"],
+      "marco",
+      work,
+      /site administrators|403/i,
+    );
+
+    try {
+      // The site turns Knowledge bodies off; marco keeps them for his own account.
+      const shown = JSON.parse(await gm(["settings", "ai", "show", "--site"], "priya")) as View;
+      assert.equal(find(shown, "knowledge").effective, true);
+      const off = JSON.parse(
+        await gm(["settings", "ai", "set", "--site", "--log-bodies", "knowledge=off"], "priya"),
+      ) as View;
+      const knowledge = find(off, "knowledge");
+      assert.equal(knowledge.site, false);
+      assert.equal(knowledge.siteFrom, "site");
+      assert.equal(knowledge.effective, false);
+      const own = JSON.parse(
+        await gm(["settings", "ai", "set", "--owner", "marco", "--log-bodies", "knowledge=on"]),
+      ) as View;
+      assert.equal(find(own, "knowledge").account, true);
+      assert.equal(find(own, "knowledge").effective, true);
+      // Orbit follows the site; jun (a member) reads but can't change it.
+      const orbit = await json<View>("/api/accounts/orbit/settings/ai", fixtures.tokens.jun);
+      assert.equal(find(orbit, "knowledge").effective, false);
+      await gm(
+        ["settings", "ai", "set", "--owner", "orbit", "--log-bodies", "knowledge=on"],
+        "jun",
+        work,
+        /owner|site admin|403/i,
+      );
+      // --dry-run sends nothing.
+      const dry = JSON.parse(
+        await gm(["settings", "ai", "set", "--site", "--log-bodies", "on", "--dry-run"], "priya"),
+      ) as { dry_run: boolean; path: string; request: { logBodies: Record<string, boolean> } };
+      assert.equal(dry.path, "/admin/ai");
+      assert.equal(Object.keys(dry.request.logBodies).length, 6);
+      assert.equal(
+        find(await json<View>("/api/admin/ai", fixtures.tokens.priya), "knowledge").site,
+        false,
+      );
+      record({ site: "knowledge=off", marco: "knowledge=on", orbit: "follows site" });
+    } finally {
+      await gm(["settings", "ai", "set", "--owner", "marco", "--log-bodies", "default"]);
+      await gm(["settings", "ai", "set", "--site", "--log-bodies", "default"], "priya");
+    }
+    const reset = await json<View>("/api/admin/ai", fixtures.tokens.priya);
+    assert(reset.logBodies.components.every((e) => e.siteFrom === "environment" && e.effective));
+  });
+
   await scenario("browser-usage-and-costs-account-and-site", async () => {
     // CORE-209: the account's Usage & costs page (its administrators) and the
     // site's (site administrators), from the collection the scenario above ran,

@@ -87,6 +87,11 @@ export function SettingsPage({
                 icon: EnvelopeSimpleIcon,
               },
               {
+                label: "Site AI settings",
+                to: `/settings/site-ai${accountQuery}`,
+                icon: GearSixIcon,
+              },
+              {
                 label: "Site usage & costs",
                 to: `/settings/site-usage${accountQuery}`,
                 icon: ChartBarIcon,

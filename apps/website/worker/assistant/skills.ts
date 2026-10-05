@@ -156,7 +156,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 - Repository /<owner>/<repo> ; folder /<owner>/<repo>/tree/<ref>/<path> ; file /<owner>/<repo>/blob/<ref>/<path>#L10-L20 ; commits /<owner>/<repo>/commits/<ref> ; changes /<owner>/<repo>/changes ; CI /<owner>/<repo>/ci and /<owner>/<repo>/ci/<number> ; wiki /<owner>/<repo>/wiki/<slug> ; knowledge map /<owner>/<repo>/knowledge ; settings /<owner>/<repo>/settings
 - Repository release notes /<owner>/<repo>/releases ; a daily update or tag /<owner>/<repo>/releases/<name> (URL-encode the exact name returned by the release-notes API, including @day: for a daily update)
 - Tracker-wide release notes /tracker/<owner>/releases ; preserve feed filters with ?q=<URL-encoded query>. Do not use /release-notes in browser links: that suffix belongs to the JSON API.
-- Account settings: /settings/profile, /settings/tokens, /settings/ssh-keys, /settings/agents, /settings/invites, /settings/usage?owner=<account> (usage & costs), /settings/site-usage (site admins) ; new repository /new
+- Account settings: /settings/profile, /settings/tokens, /settings/ssh-keys, /settings/agents, /settings/invites, /settings/usage?owner=<account> (usage & costs), /settings/site-usage (site admins), /settings/ai?owner=<account> (AI settings), /settings/site-ai (site AI settings, site admins) ; new repository /new
 
 Use navigate when the person asks to go somewhere or see something, or to show what you just made or found; it opens beside the chat. Otherwise just link.`,
   },

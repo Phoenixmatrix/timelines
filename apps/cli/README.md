@@ -908,7 +908,25 @@ gm settings ai set --owner orbit --classification clef \
   --fast gemma-4-26b-a4b-it --task glm-5.3-flash
 gm settings ai set --owner orbit --task gemma-4-26b-a4b-it --dry-run
 gm settings ai set --owner orbit --knowledge-quiet-minutes 15 --knowledge-max-wait-minutes 60
+gm settings ai set --owner orbit --log-bodies assistant=off --log-bodies avatars=default
+gm settings ai show --site
+gm settings ai set --site --log-bodies on
 ```
+
+**Gateway logs** (`--log-bodies`): AI Gateway always logs each model call's model,
+time and tokens; "Keep AI request and response bodies in gateway logs" also keeps
+what was sent and returned. It is set per component (`knowledge`, `assistant`,
+`assistant-titles`, `avatars`, `release-notes`, `merge-queue`): `--log-bodies
+on|off|default` sets every component, `COMPONENT=on|off|default` one (repeatable,
+later values win). An account's choice applies to that account's calls; `default`
+follows the site. `--site` (site administrators, people only) sets the site default
+and takes only `--log-bodies`; there `default` follows the environment (deployed:
+off; development and agent environments: on). `show` lists each component's site
+value, the account's override and the effective value, with this note: while on,
+prompts and replies, including repository code and assistant conversations, are
+kept in Cloudflare's AI Gateway logs, readable by the Cloudflare account's
+dashboard users, and deleted oldest-first. Changes reach new model calls within a
+minute.
 
 These are account-wide settings, not repository settings. Omit `--owner` to use
 the authenticated person's own account; the current repository's owner is never

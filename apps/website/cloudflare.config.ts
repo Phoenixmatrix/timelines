@@ -154,6 +154,10 @@ export default defineConfig(({ mode, isPreview }) => {
             (dev ? (env.GITMATRIX_ARTIFACTS_NAMESPACE ?? "gitmatrix-dev") : PRODUCTION.artifacts),
           ...remote,
         }),
+        // Whether AI Gateway logs keep request and response bodies where the
+        // site hasn't chosen (CORE-290, worker/ai-gateway.ts): development and
+        // agent environments hold no real user data, so they do.
+        AI_LOG_BODIES: bindings.text(dev ? "on" : "off"),
         // Knowledge graph and wiki.
         ...(ai
           ? {

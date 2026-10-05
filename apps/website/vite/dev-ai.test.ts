@@ -41,6 +41,18 @@ describe("AI bindings in development", () => {
     );
   });
 
+  test("gateway logs keep bodies by default in development, never once deployed (CORE-290)", async () => {
+    vi.stubEnv("GITMATRIX_CONTAINER_IMAGES", "skip");
+    const factory = config as unknown as (context: {
+      mode: string;
+      isPreview: boolean;
+    }) => Promise<{ worker: { env: Record<string, unknown> } }>;
+    const value = async (mode: string) =>
+      JSON.stringify((await factory({ mode, isPreview: false })).worker.env.AI_LOG_BODIES);
+    expect(await value("development")).toMatch(/"on"/);
+    expect(await value("production")).toMatch(/"off"/);
+  });
+
   test("a deployed Worker always binds them", async () => {
     vi.stubEnv("GITMATRIX_CONTAINER_IMAGES", "skip");
     expect(await bindings("production")).toEqual(expect.arrayContaining(AI_BINDINGS));

@@ -6,7 +6,7 @@
 //             cosmetic?", "is this page out of date?")
 //   embed     vectors for graph nodes (Vectorize)
 
-import { aiGatewayOptions } from "../ai-gateway.ts";
+import { aiGatewayOptions, componentOf } from "../ai-gateway.ts";
 import { attribution, recordAiCall, tokensOf } from "../usage/ai.ts";
 import { paidWorkGuard } from "./paid-work.ts";
 
@@ -128,10 +128,11 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
     });
   });
   try {
+    const gateway = await aiGatewayOptions(env, componentOf(work.feature), work);
     // The race: a binding that ignores the signal still can't hold the caller.
     const result = await Promise.race([
       (env.AI as unknown as LooseAi).run(model, inputs, {
-        ...aiGatewayOptions(env, "knowledge", work),
+        ...gateway,
         signal: controller.signal,
       }),
       aborted,

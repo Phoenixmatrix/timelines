@@ -1,17 +1,24 @@
 import { Hono, type Context } from "hono";
 import type { Insertable } from "kysely";
 import {
+  AI_LOG_BODIES_NOTE,
+  AI_LOG_COMPONENTS,
   AI_MODEL_CATALOG,
   DEFAULT_AI_CONFIGURATION,
   DEFAULT_KNOWLEDGE_SCHEDULE,
   MAX_KNOWLEDGE_WAIT_MINUTES,
+  type AiLogBodiesPatch,
+  type AiLogBodiesView,
   type AiRole,
   type AiSettings,
   type AiSettingsPatch,
   type AiSettingsView,
   type AiSnapshot,
   type KnowledgeUpdateSchedule,
+  type SiteAiSettingsPatch,
+  type SiteAiSettingsView,
 } from "../../shared/ai.ts";
+import { environmentKeepsBodies, forgetLogBodySettings } from "../ai-gateway.ts";
 import { fail, requireActor, requirePerson } from "../api/http.ts";
 import type { AppEnv } from "../auth.ts";
 import { findAccountBySlug, type AccountRow, type Actor } from "../db.ts";
@@ -118,6 +125,101 @@ export async function knowledgeSchedule(
   };
 }
 
+/**
+ * Gateway body logging (CORE-290) as the site sets it, and with `accountId`
+ * that account's overrides and what its calls get. Read fresh, not from the
+ * per-call cache in worker/ai-gateway.ts.
+ */
+export async function logBodiesView(env: Env, accountId: string | null): Promise<AiLogBodiesView> {
+  const [site, account] = await Promise.all([
+    db(env.DB).selectFrom("site_ai_log_bodies").select(["component", "keep"]).execute(),
+    accountId
+      ? db(env.DB)
+          .selectFrom("account_ai_log_bodies")
+          .select(["component", "keep"])
+          .where("account_id", "=", accountId)
+          .execute()
+      : Promise.resolve([]),
+  ]);
+  const environmentDefault = environmentKeepsBodies(env);
+  const stored = (rows: { component: string; keep: number }[], id: string) => {
+    const row = rows.find((r) => r.component === id);
+    return row ? row.keep === 1 : null;
+  };
+  return {
+    environmentDefault,
+    note: AI_LOG_BODIES_NOTE,
+    components: AI_LOG_COMPONENTS.map(({ id, label, description }) => {
+      const siteChoice = stored(site, id);
+      const siteValue = siteChoice ?? environmentDefault;
+      const accountChoice = accountId ? stored(account, id) : null;
+      return {
+        component: id,
+        label,
+        description,
+        site: siteValue,
+        siteFrom: siteChoice === null ? "environment" : "site",
+        ...(accountId ? { account: accountChoice } : {}),
+        effective: accountChoice ?? siteValue,
+      };
+    }),
+  };
+}
+
+function validateLogBodies(value: unknown, field: string): AiLogBodiesPatch | string {
+  if (!object(value)) return `${field} must be an object of components, each true, false or null.`;
+  for (const [key, choice] of Object.entries(value)) {
+    if (!AI_LOG_COMPONENTS.some((component) => component.id === key))
+      return `Unknown component: ${field}.${key}. Components: ${AI_LOG_COMPONENTS.map((c) => c.id).join(", ")}.`;
+    if (choice !== null && typeof choice !== "boolean")
+      return `${field}.${key} must be true, false or null (inherit).`;
+  }
+  return value as AiLogBodiesPatch;
+}
+
+/** Store a level's choices: true/false sets, null removes (inherit). */
+async function saveLogBodies(
+  d1: D1Database,
+  accountId: string | null,
+  patch: AiLogBodiesPatch,
+  actorId: string,
+) {
+  const statements: D1PreparedStatement[] = [];
+  const now = nowIso();
+  for (const [component, choice] of Object.entries(patch)) {
+    if (accountId === null)
+      statements.push(
+        choice === null
+          ? d1.prepare("DELETE FROM site_ai_log_bodies WHERE component = ?1").bind(component)
+          : d1
+              .prepare(
+                `INSERT INTO site_ai_log_bodies (component, keep, updated_by, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (component) DO UPDATE SET
+                   keep = excluded.keep, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+              )
+              .bind(component, Number(choice), actorId, now),
+      );
+    else
+      statements.push(
+        choice === null
+          ? d1
+              .prepare("DELETE FROM account_ai_log_bodies WHERE account_id = ?1 AND component = ?2")
+              .bind(accountId, component)
+          : d1
+              .prepare(
+                `INSERT INTO account_ai_log_bodies (account_id, component, keep, updated_by, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (account_id, component) DO UPDATE SET
+                   keep = excluded.keep, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+              )
+              .bind(accountId, component, Number(choice), actorId, now),
+      );
+  }
+  if (statements.length) await d1.batch(statements);
+  forgetLogBodySettings(d1);
+}
+
 async function standing(d1: D1Database, account: AccountRow, actor: Actor) {
   if (actor.isSiteAdmin) return "admin";
   if (account.kind === "user") return account.id === actor.id ? "admin" : "none";
@@ -144,7 +246,7 @@ function object(value: unknown): value is Record<string, unknown> {
 function validate(body: unknown): AiSettingsPatch | string {
   if (!object(body)) return "AI settings must be a JSON object.";
   for (const key of Object.keys(body))
-    if (key !== "features" && key !== "models" && key !== "knowledgeUpdates")
+    if (key !== "features" && key !== "models" && key !== "knowledgeUpdates" && key !== "logBodies")
       return `Unknown field: ${key}.`;
   if (body.features !== undefined) {
     if (!object(body.features)) return "features must be an object of boolean toggles.";
@@ -178,6 +280,10 @@ function validate(body: unknown): AiSettingsPatch | string {
         return `knowledgeUpdates.${key} must be a whole number of minutes from 0 to ${MAX_KNOWLEDGE_WAIT_MINUTES}.`;
     }
   }
+  if (body.logBodies !== undefined) {
+    const logBodies = validateLogBodies(body.logBodies, "logBodies");
+    if (typeof logBodies === "string") return logBodies;
+  }
   return body as AiSettingsPatch;
 }
 
@@ -192,6 +298,7 @@ aiSettingsApi.get("/", async (c) => {
     ...(await aiSettings(c.env.DB, found.account.id)),
     canManage: found.role === "admin" && !actor.agent,
     catalog: AI_MODEL_CATALOG,
+    logBodies: await logBodiesView(c.env, found.account.id),
   });
 });
 
@@ -240,9 +347,52 @@ aiSettingsApi.patch("/", async (c) => {
       .onConflict((oc) => oc.column("account_id").doUpdateSet(values))
       .execute();
   }
+  if (patch.logBodies) await saveLogBodies(c.env.DB, found.account.id, patch.logBodies, actor.id);
   return c.json<AiSettingsView>({
     ...(await aiSettings(c.env.DB, found.account.id)),
     canManage: true,
     catalog: AI_MODEL_CATALOG,
+    logBodies: await logBodiesView(c.env, found.account.id),
+  });
+});
+
+/**
+ * GET/PATCH /api/admin/ai: the site's defaults (CORE-290: gateway body
+ * logging), for site administrators; changing them takes a person.
+ */
+export const siteAiSettingsApi = new Hono<AppEnv>();
+
+siteAiSettingsApi.get("/", async (c) => {
+  const actor = requireActor(c);
+  if (actor instanceof Response) return actor;
+  if (!actor.isSiteAdmin) return fail(c, 403, "Only site administrators manage site AI settings.");
+  return c.json<SiteAiSettingsView>({
+    logBodies: await logBodiesView(c.env, null),
+    canManage: !actor.agent,
+  });
+});
+
+siteAiSettingsApi.patch("/", async (c) => {
+  const actor = requirePerson(c);
+  if (actor instanceof Response) return actor;
+  if (!actor.isSiteAdmin) return fail(c, 403, "Only site administrators manage site AI settings.");
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return fail(c, 400, "Site AI settings must be valid JSON.");
+  }
+  if (!object(body)) return fail(c, 400, "Site AI settings must be a JSON object.");
+  for (const key of Object.keys(body))
+    if (key !== "logBodies") return fail(c, 400, `Unknown field: ${key}.`);
+  const patch = body as SiteAiSettingsPatch;
+  if (patch.logBodies !== undefined) {
+    const logBodies = validateLogBodies(patch.logBodies, "logBodies");
+    if (typeof logBodies === "string") return fail(c, 400, logBodies);
+    await saveLogBodies(c.env.DB, null, logBodies, actor.id);
+  }
+  return c.json<SiteAiSettingsView>({
+    logBodies: await logBodiesView(c.env, null),
+    canManage: true,
   });
 });

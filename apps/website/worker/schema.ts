@@ -941,6 +941,21 @@ export interface Database {
     knowledge_quiet_minutes: Generated<number>;
     knowledge_max_wait_minutes: Generated<number>;
   };
+  /** The site's AI Gateway body logging per component (CORE-290); absent: the environment's default. */
+  site_ai_log_bodies: {
+    component: string;
+    keep: number;
+    updated_by: string | null;
+    updated_at: Generated<string>;
+  };
+  /** An account's override of site_ai_log_bodies for its own calls; absent follows the site. */
+  account_ai_log_bodies: {
+    account_id: string;
+    component: string;
+    keep: number;
+    updated_by: string | null;
+    updated_at: Generated<string>;
+  };
   /** Retention policies (CORE-196): what an account changed; absent inherits. */
   retention_policies: {
     account_id: string;

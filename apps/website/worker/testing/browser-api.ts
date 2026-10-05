@@ -33,6 +33,7 @@ import { invalidateRefs } from "../objects.ts";
 import { refs } from "../refs/api.ts";
 import { trackerReleaseNotes } from "../release-notes/api.ts";
 import { search } from "../search/api.ts";
+import { aiSettingsApi, siteAiSettingsApi } from "../settings/ai.ts";
 import { steps } from "../steps/api.ts";
 import { timelines } from "../timelines/api.ts";
 import { timelineGraph } from "../timelines/graph.ts";
@@ -195,6 +196,8 @@ app.use(async (c, next) => {
 });
 app.route("/api/accounts/:owner/atlas", workspaceAtlas);
 app.route("/api/agents", agents);
+app.route("/api/accounts/:slug/settings/ai", aiSettingsApi);
+app.route("/api/admin/ai", siteAiSettingsApi);
 app.route("/api", accounts);
 app.route("/api/account/skills", personalSkillsApi);
 app.route("/api/assistant", assistant);

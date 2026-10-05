@@ -11,6 +11,8 @@ import type { AccountSummary } from "../../shared/api.ts";
 import {
   MAX_KNOWLEDGE_WAIT_MINUTES,
   type AiFeatures,
+  type AiLogBodiesPatch,
+  type AiLogComponent,
   type AiModelSelection,
   type AiRole,
   type AiSettingsPatch,
@@ -188,6 +190,12 @@ function AiSettingsForm({
     maxWaitMinutes: String(v.knowledgeUpdates.maxWaitMinutes),
   });
   const [schedule, setSchedule] = useState(scheduleText(initial));
+  // Gateway body logging overrides (CORE-290): null follows the site default.
+  const overrides = (v: AiSettingsView) =>
+    Object.fromEntries(
+      v.logBodies.components.map((e) => [e.component, e.account ?? null]),
+    ) as Record<AiLogComponent, boolean | null>;
+  const [logBodies, setLogBodies] = useState(overrides(initial));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -215,7 +223,12 @@ function AiSettingsForm({
     if (value !== null && value !== saved.knowledgeUpdates[key])
       (patch.knowledgeUpdates ??= {})[key] = value;
   }
-  const dirty = !!(patch.features || patch.models || patch.knowledgeUpdates);
+  for (const entry of saved.logBodies.components) {
+    const choice = logBodies[entry.component];
+    if (choice !== (entry.account ?? null))
+      (patch.logBodies ??= {} as AiLogBodiesPatch)[entry.component] = choice;
+  }
+  const dirty = !!(patch.features || patch.models || patch.knowledgeUpdates || patch.logBodies);
   const changed = () => {
     setNotice("");
     setError("");
@@ -240,6 +253,7 @@ function AiSettingsForm({
           setFeatures(persisted.features);
           setModels(persisted.models);
           setSchedule(scheduleText(persisted));
+          setLogBodies(overrides(persisted));
           setNotice(`AI settings saved for @${owner}. New jobs will use these settings.`);
         } catch (cause) {
           if (active.current)
@@ -396,6 +410,76 @@ function AiSettingsForm({
           ))}
         </div>
       </fieldset>
+      <fieldset
+        disabled={busy || !saved.canManage}
+        className="m-0 min-w-0 border-0 p-0"
+        data-log-bodies="account"
+      >
+        <legend className="mb-2 text-title">
+          Keep AI request and response bodies in gateway logs
+        </legend>
+        <p className="mt-0 mb-2 max-w-[65ch] text-body-sm text-ink-muted">
+          AI Gateway always logs each model call’s model, time and tokens. Choose, for this
+          account’s calls, whether it also keeps what was sent and returned. By default each part
+          follows the site’s setting. Changes reach new model calls within a minute, including
+          running work.
+        </p>
+        <p
+          className="mt-0 mb-4 max-w-[65ch] text-body-sm font-semibold text-ink"
+          data-log-bodies-note
+        >
+          {saved.logBodies.note}
+        </p>
+        <div className="flex flex-col gap-5">
+          {saved.logBodies.components.map((entry) => {
+            const choice = logBodies[entry.component];
+            const effective = choice ?? entry.site;
+            const helpId = `log-bodies-${entry.component}-help`;
+            return (
+              <div
+                key={entry.component}
+                className="min-w-0"
+                data-log-bodies-component={entry.component}
+              >
+                <h3 className="m-0 text-field-label">{entry.label}</h3>
+                <p id={helpId} className="mt-1 mb-2 max-w-[65ch] text-body-sm text-ink-muted">
+                  {entry.description} Now: {effective ? "kept" : "not kept"}
+                  {choice === null ? " (site default)" : ""}.
+                </p>
+                {saved.canManage ? (
+                  <SelectField
+                    ariaLabel={`${entry.label}: keep request and response bodies`}
+                    ariaDescribedBy={helpId}
+                    value={choice === null ? "site" : choice ? "on" : "off"}
+                    options={[
+                      { value: "site", label: `Site default (${entry.site ? "on" : "off"})` },
+                      { value: "on", label: "On: keep bodies" },
+                      { value: "off", label: "Off: metadata only" },
+                    ]}
+                    className="w-full max-w-md"
+                    onChange={(value) => {
+                      if (busy) return;
+                      setLogBodies({
+                        ...logBodies,
+                        [entry.component]: value === "site" ? null : value === "on",
+                      });
+                      changed();
+                    }}
+                  />
+                ) : (
+                  <p className="m-0 font-semibold">
+                    {choice === null
+                      ? `Site default (${entry.site ? "on" : "off"})`
+                      : choice
+                        ? "On"
+                        : "Off"}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </fieldset>
       <div className="flex flex-col items-start gap-3 border-t border-line pt-5">
         <p className="m-0 text-body-sm text-ink-muted">
           {saved.updatedAt
@@ -425,6 +509,7 @@ function AiSettingsForm({
                 setFeatures(saved.features);
                 setModels(saved.models);
                 setSchedule(scheduleText(saved));
+                setLogBodies(overrides(saved));
                 changed();
               }}
             >

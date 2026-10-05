@@ -98,6 +98,91 @@ export const DEFAULT_KNOWLEDGE_SCHEDULE: KnowledgeUpdateSchedule = {
 /** The longest either wait may be: one day. */
 export const MAX_KNOWLEDGE_WAIT_MINUTES = 1440;
 
+/**
+ * What AI Gateway logs keep (CORE-290): every model call's metadata (model,
+ * time, tokens) always; its request and response bodies only where this is on
+ * for the call's component and account. One entry per kind of AI work.
+ */
+export type AiLogComponent =
+  | "knowledge"
+  | "assistant"
+  | "assistant-titles"
+  | "avatars"
+  | "release-notes"
+  | "merge-queue";
+
+export const AI_LOG_COMPONENTS: readonly {
+  id: AiLogComponent;
+  label: string;
+  description: string;
+}[] = [
+  {
+    id: "knowledge",
+    label: "Knowledge",
+    description:
+      "Repository analysis, concepts, wiki pages, Atlas descriptions, embeddings and search.",
+  },
+  {
+    id: "assistant",
+    label: "Assistant",
+    description: "Assistant conversations, including their routing.",
+  },
+  {
+    id: "assistant-titles",
+    label: "Assistant titles and status lines",
+    description: "The short titles and progress lines written for assistant conversations.",
+  },
+  { id: "avatars", label: "Generated pictures", description: "Profile picture generation." },
+  {
+    id: "release-notes",
+    label: "Release notes",
+    description: "Automatically generated release notes.",
+  },
+  {
+    id: "merge-queue",
+    label: "Merge queue",
+    description: "Merge queue decisions on batching changes and repairing simple conflicts.",
+  },
+];
+
+/** The plain retention note shown wherever this setting is. */
+export const AI_LOG_BODIES_NOTE =
+  "While this is on, prompts and replies, including repository code and assistant conversations, are kept in Cloudflare's AI Gateway logs. Anyone with access to the Cloudflare account's dashboard can read them, and the gateway deletes the oldest logs first once it reaches its log limit.";
+
+/** One component's body logging: the site default, and an account's override. */
+export interface AiLogBodiesEntry {
+  component: AiLogComponent;
+  label: string;
+  description: string;
+  /** The site default: its stored choice, else the environment's default. */
+  site: boolean;
+  siteFrom: "site" | "environment";
+  /** The account's override (account views only); null follows the site. */
+  account?: boolean | null;
+  /** What this account's calls (the site's, on the site view) get. */
+  effective: boolean;
+}
+
+export interface AiLogBodiesView {
+  /** This environment's default: off once deployed, on in development. */
+  environmentDefault: boolean;
+  components: AiLogBodiesEntry[];
+  note: string;
+}
+
+/** Per component: true or false sets it, null removes the choice (inherit). */
+export type AiLogBodiesPatch = Partial<Record<AiLogComponent, boolean | null>>;
+
+/** GET/PATCH /api/admin/ai: site defaults, for site administrators. */
+export interface SiteAiSettingsView {
+  logBodies: AiLogBodiesView;
+  canManage: boolean;
+}
+
+export interface SiteAiSettingsPatch {
+  logBodies?: AiLogBodiesPatch;
+}
+
 export interface AiSettings extends AiConfiguration {
   knowledgeUpdates: KnowledgeUpdateSchedule;
   updatedAt: string | null;
@@ -108,12 +193,15 @@ export interface AiSettings extends AiConfiguration {
 export interface AiSettingsView extends AiSettings {
   canManage: boolean;
   catalog: typeof AI_MODEL_CATALOG;
+  /** Gateway body logging for this account's calls: site defaults and its overrides. */
+  logBodies: AiLogBodiesView;
 }
 
 export interface AiSettingsPatch {
   features?: Partial<AiFeatures>;
   models?: Partial<AiModelSelection>;
   knowledgeUpdates?: Partial<KnowledgeUpdateSchedule>;
+  logBodies?: AiLogBodiesPatch;
 }
 
 /** Frozen when work starts; retries and continuations keep this exact policy. */

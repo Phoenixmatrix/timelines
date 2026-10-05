@@ -300,7 +300,7 @@ async function generateOptions(c: Context<AppEnv>, target: Target) {
     const result = (await c.env.AI!.run(
       AVATAR_MODEL,
       { prompt, steps: 4 },
-      aiGatewayOptions(c.env, "avatars"),
+      await aiGatewayOptions(c.env, "avatars", { account: target.id, feature: "avatars" }),
     )) as { image?: string };
     // Metering (CORE-207): an image call, no tokens.
     c.executionCtx.waitUntil(

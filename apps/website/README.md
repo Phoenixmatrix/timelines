@@ -1730,6 +1730,15 @@ the catalog, save provenance and `canManage`. PATCH accepts partial nested
 `features`, `models` and `knowledgeUpdates` (`quietMinutes`, `maxWaitMinutes`,
 whole minutes 0–1440) objects; unknown keys, out-of-role model IDs and other
 waits are rejected.
+PATCH also accepts `logBodies` (`{<component>: true|false|null}`, null removes the
+account's override): whether AI Gateway logs keep request and response bodies for
+the account's calls (CORE-290). The view's `logBodies` lists each component's site
+value, the account's override and the effective value, with the retention note.
+The site default is `GET/PATCH /api/admin/ai` (`{logBodies}`; site administrators,
+people only to change; null returns a component to the environment's default) and
+the **Site AI settings** page (`/settings/site-ai`). Tables: `site_ai_log_bodies`,
+`account_ai_log_bodies`; `worker/ai-gateway.ts` resolves them per call from a
+once-a-minute isolate cache.
 The [CLI equivalent](../cli/README.md#automatic-ai-settings) is `gm settings ai`.
 
 Policy is frozen when a Workflow is admitted or a release generation captures its
