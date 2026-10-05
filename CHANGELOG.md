@@ -39,6 +39,8 @@
   versioned resolution before conversion.
 - `vp run agent up --sandbox` exercises actual Docker-backed Sandbox CI in the
   isolated development environment. Default readiness remains local Linux CI.
+- Real-Git HTTP checks close bodyless request streams without an empty pipe write,
+  avoiding an `EPIPE` race when the backend exits before the parent sends input.
 
 See the [server contract](apps/website/README.md#timelines),
 [CLI cutover](apps/cli/README.md#timelines), and

@@ -93,7 +93,8 @@ export function gitBackend(root: string, origin = "https://artifacts.test") {
       child.stdout.on("data", (chunk: Buffer) => out.push(chunk));
       child.on("error", reject);
       child.on("close", () => resolve(Buffer.concat(out)));
-      child.stdin.end(Buffer.from(body));
+      // An empty write can hit EPIPE after a GET backend exits; close without writing.
+      child.stdin.end(body.length ? Buffer.from(body) : undefined);
     });
     const split = result.indexOf("\r\n\r\n");
     const headers = new Headers();
