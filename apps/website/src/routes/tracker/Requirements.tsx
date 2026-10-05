@@ -3,7 +3,7 @@
 // tracker's agents meet them. Pickup policy still applies to both people
 // and explicit assignments.
 
-import { useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { CheckIcon, XIcon } from "@phosphor-icons/react";
 import {
   hasRequirements,
@@ -24,6 +24,7 @@ import {
 } from "../../../shared/tracker.ts";
 import { agentEligible } from "../../../shared/tracker-query.ts";
 import { FormError } from "../../components/ui.tsx";
+import { RequirementChip } from "../../components/Chips.tsx";
 import { Actor } from "./Actor.tsx";
 import type { Mutate } from "./IssueDetail.tsx";
 
@@ -33,13 +34,38 @@ export function RequiresMark({ requires }: { requires: IssueRequirements | null 
   const text = requirementsText(requires);
   return (
     <span
-      className="mk-chip mk-chip--tag mr-1.5 align-[1px]"
+      className="mk-chip mk-chip--tag mk-chip--requirement mr-1.5 align-[1px]"
       title={`Agents need: ${text}`}
       aria-label={`Requires ${text}`}
     >
-      Requires
+      requires
     </span>
   );
+}
+
+const REQUIREMENT_VALUE = /^[a-z0-9*][a-z0-9*._+/@-]*$/;
+
+/**
+ * The tracker's tag catalog as requirement values (CORE-271): lowercase, usable
+ * in a `tag:` term, most used by open issues first.
+ */
+export function catalogTags(snapshot: Pick<Snapshot, "labels" | "issues">): string[] {
+  const open = new Map<string, number>();
+  for (const issue of snapshot.issues)
+    if (issue.status !== "done" && issue.status !== "canceled")
+      for (const tag of issue.labels)
+        open.set(tag.toLowerCase(), (open.get(tag.toLowerCase()) ?? 0) + 1);
+  const names = [...new Set(snapshot.labels.map((name) => name.toLowerCase()))].filter(
+    (name) => name.length <= 100 && REQUIREMENT_VALUE.test(name),
+  );
+  return names.sort((a, b) => (open.get(b) ?? 0) - (open.get(a) ?? 0) || a.localeCompare(b));
+}
+
+/** Whether a term is a `tag:` the catalog doesn't have (wildcards never are). */
+export function unknownTagTerm(term: string, catalog: readonly string[]): boolean {
+  if (!term.toLowerCase().startsWith("tag:")) return false;
+  const value = term.slice(4).toLowerCase();
+  return !!value && !value.includes("*") && !catalog.includes(value);
 }
 
 /** "needs tag ux; needs …": an agent's unmet requirements, if any. */
@@ -64,7 +90,39 @@ export function Requirements({
   const [adding, setAdding] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const input = useRef<HTMLInputElement>(null);
   const terms = requirementTerms(issue.requires);
+  const catalog = useMemo(() => catalogTags(snapshot), [snapshot]);
+  // The word being typed: `tag:fr` narrows the catalog suggestions to matches.
+  const partial = /(?:^|\s)(tag:([^\s]*))$/i.exec(adding);
+  const typed = adding.split(/\s+/).filter(Boolean);
+  const suggestions = catalog
+    .filter((tag) => !terms.includes(`tag:${tag}`) && !typed.includes(`tag:${tag}`))
+    .filter((tag) => !partial || tag.includes(partial[2]!.toLowerCase()))
+    .slice(0, 8);
+  const unknownTyped = typed
+    .flatMap((word) =>
+      /^tags?:/i.test(word)
+        ? word
+            .slice(word.indexOf(":") + 1)
+            .split(",")
+            .filter(Boolean)
+            .map((value) => `tag:${value.toLowerCase()}`)
+        : [],
+    )
+    .filter((term) => unknownTagTerm(term, catalog))
+    // The word still being typed isn't flagged while the catalog has a match for it.
+    .filter(
+      (term) => !(partial && suggestions.length && term === `tag:${partial[2]!.toLowerCase()}`),
+    );
+  const suggest = (tag: string) => {
+    const next = partial
+      ? `${adding.slice(0, adding.length - partial[1]!.length)}tag:${tag} `
+      : `${adding.trimEnd()}${adding.trim() ? " " : ""}tag:${tag} `;
+    setAdding(next);
+    setError("");
+    input.current?.focus();
+  };
   const save = async (requires: IssueRequirements | null) => {
     setSaving(true);
     setError("");
@@ -103,18 +161,17 @@ export function Requirements({
       {terms.length > 0 && (
         <ul className="m-0 mb-2 flex list-none flex-wrap gap-1 p-0" aria-label="Requirements">
           {terms.map((term) => (
-            <li key={term} className="mk-chip mk-chip--tag gap-1 font-mono text-mono">
-              {term}
+            <RequirementChip key={term} term={term} unknown={unknownTagTerm(term, catalog)}>
               <button
                 type="button"
-                className="inline-flex cursor-pointer items-center border-0 bg-transparent p-0 text-ink-faint hover:text-ink disabled:cursor-default"
+                className="relative inline-flex size-4 cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 text-ink-faint after:absolute after:-inset-3 after:content-[''] hover:bg-pressed hover:text-ink disabled:cursor-default"
                 aria-label={`Remove ${term}`}
                 disabled={disabled}
                 onClick={() => void save(withoutTerm(issue.requires, term))}
               >
-                <XIcon className="size-3" weight="bold" aria-hidden />
+                <XIcon className="size-2.5" weight="bold" aria-hidden />
               </button>
-            </li>
+            </RequirementChip>
           ))}
         </ul>
       )}
@@ -126,8 +183,10 @@ export function Requirements({
         }}
       >
         <input
+          ref={input}
           className="mk-input min-w-0 flex-1 font-mono text-mono"
           aria-label="Add requirements"
+          aria-describedby={suggestions.length ? "requirement-suggestions" : undefined}
           placeholder="tag:ux model:claude-* memory>=16GiB"
           value={adding}
           disabled={disabled}
@@ -142,6 +201,35 @@ export function Requirements({
           Add
         </button>
       </form>
+      {suggestions.length > 0 && (
+        <div
+          id="requirement-suggestions"
+          className="mt-2 flex flex-wrap items-center gap-1.5"
+          role="group"
+          aria-label="Tags from this tracker's catalog"
+        >
+          <span className="text-micro text-ink-faint">From the tag catalog</span>
+          {suggestions.map((tag) => (
+            <button
+              key={tag}
+              type="button"
+              className="mk-chip h-6 px-2 font-mono text-micro"
+              disabled={disabled}
+              onClick={() => suggest(tag)}
+            >
+              tag:{tag}
+            </button>
+          ))}
+        </div>
+      )}
+      {unknownTyped.length > 0 && (
+        <p className="mt-2 mb-0 text-body-sm text-ink-muted" role="status">
+          {unknownTyped.join(", ")} {unknownTyped.length === 1 ? "isn't" : "aren't"} in this
+          tracker's tag catalog. You can still add {unknownTyped.length === 1 ? "it" : "them"}: only
+          agents that report {unknownTyped.length === 1 ? "that tag" : "those tags"} can claim the
+          issue.
+        </p>
+      )}
       <FormError message={error} />
       {assigned && (
         <p className="mt-3 mb-0 rounded-control bg-sunken px-3 py-2 text-body-sm" role="note">

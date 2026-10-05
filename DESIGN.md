@@ -363,7 +363,14 @@ The kit's classes (`mk-btn`, `mk-input`, `mk-chip`, `mk-card`, `mk-popup`…) ar
 ### Chips
 
 - **Filter chip:** 28px pill, raised fill, muted body-small text; pressed state (`aria-pressed`) turns amber with signal-ink semibold text. Saved views and format filters are rows of these.
-- **Tag:** a 20px non-interactive pill in micro text for labels: visibility, role, package format, status, short commit hashes (with mono). Tags stay 20px on phones (the one override `app.css` makes to the kit). Tags are read-only: at most three, then a faint "+N" (dist-tags in the version table). To filter by a tag, the package header shows each tag as a filter chip.
+- **Status word** (`mk-chip--tag`): a 20px non-interactive pill in micro text for metadata words: visibility, role, package format, status, short commit hashes (with mono). These pills stay 20px on phones (the one override `app.css` makes to the kit). They are read-only: at most three, then a faint "+N" (dist-tags in the version table). To filter by one, the package header shows each dist-tag as a filter chip.
+- **The tag vocabulary's three roles** (CORE-271, `src/components/Chips.tsx`) share the 20px pill and are told apart by shape and mark, never by hue alone:
+  - **Issue tag** (`mk-chip--issue-tag`): the raised fill in full ink with a faint hash mark. What the work is about; inert in the inspector and capture.
+  - **Agent tag** (`mk-chip--agent-tag`): transparent with a 1px `line` ring and a robot mark. What an agent says it suits; on Settings > Agents it links to the open issues with that tag.
+  - **Requirement** (`mk-chip--requirement`): a mono term (`tag:ux`, `memory>=16GiB`) on a recessed `sunken` pill with a dashed edge, a gate rather than a description; the list and board mark reads `requires` the same way.
+  - **Unknown** (`mk-chip--unknown`): a name no tag catalog has gets a dashed `ink-faint` edge and a warning-circle mark, plus words for screen readers. Unknown names warn and are kept, never refused.
+  - **Link** (`mk-chip--link`): a chip that navigates keeps its 20px look but gains a touch-sized hit area, a hover step and the amber focus ring.
+- **Catalog suggestions:** under the requirement editor, up to eight catalog tags as small mono filter chips (`tag:ux`), most used by open issues first, narrowing as `tag:` is typed; a typed `tag:` value the catalog lacks gets a plain sentence below, not an error.
 
 ### Cards / Containers
 
@@ -416,7 +423,7 @@ Signing in and approving `gm auth login` (`/signin`, `/device`) are their own pa
 
 ### Board and the backlog digest
 
-The board keeps one lane per status, each virtualized; Done and Canceled fold to a vertical count until opened. A backlog of thousands is groomed, not read, so the Backlog lane is a digest rather than a card stack: its total, one line on staleness ("N% untouched for 90+ days"), a group-by segmented control (priority, team, label, age), and count rows with a thin bar each. One group opens at a time to show its twelve most important issues (priority, then longest waiting) as one-line rows with their age, and "All N in the list" opens the same filter in the event log. To do stays a queue: its header splits ready from blocked, and ready work leads.
+The board keeps one lane per status, each virtualized; Done and Canceled fold to a vertical count until opened. A backlog of thousands is groomed, not read, so the Backlog lane is a digest rather than a card stack: its total, one line on staleness ("N% untouched for 90+ days"), a group-by segmented control (priority, team, tag, age), and count rows with a thin bar each. One group opens at a time to show its twelve most important issues (priority, then longest waiting) as one-line rows with their age, and "All N in the list" opens the same filter in the event log. To do stays a queue: its header splits ready from blocked, and ready work leads.
 
 ### Relationship lens
 

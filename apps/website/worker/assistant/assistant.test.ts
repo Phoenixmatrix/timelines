@@ -96,7 +96,8 @@ describe("approvals say what the request does", () => {
         team: "CORE",
         title: "Ship search",
         priority: 1,
-        labels: ["search"],
+        tags: ["search"],
+        requires: "tag:search",
         description: "Body",
       }),
     ).toEqual({
@@ -104,10 +105,23 @@ describe("approvals say what the request does", () => {
       fields: [
         ["Title", "Ship search"],
         ["Priority", "P1"],
-        ["Labels", "search"],
+        ["Tags", "search"],
+        ["Agent requirements", "tag:search"],
       ],
       body: "Body",
     });
+    // The old spellings read the same way on the card (CORE-271).
+    for (const old of [{ labels: ["search"] }, { label: "search" }])
+      expect(
+        describeWrite("create_issue", { team: "CORE", title: "T", ...old }).fields,
+      ).toContainEqual(["Tags", "search"]);
+    expect(
+      describeWrite("update_issue", { key: "CORE-1", changes: { labels: ["a"], requires: "" } })
+        .fields,
+    ).toEqual([
+      ["Tags", "a"],
+      ["Agent requirements", ""],
+    ]);
     const raw = describeWrite("api_write", {
       summary: "Make it private",
       method: "PATCH",
@@ -276,5 +290,47 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
     expect(
       await run("update_issue", { owner: "o", key: "CORE-1", changes: { requires: "gpu" } }),
     ).toEqual({ error: expect.stringContaining('Unknown requirement "gpu"') });
+  });
+
+  test("tags are written as the tracker's labels field, from tags or the old labels (CORE-271)", async () => {
+    const sent: Record<string, unknown>[] = [];
+    const issue = { id: "i1", key: "CORE-1", version: 3, teamId: "t", title: "x", labels: ["UX"] };
+    const other = { ...issue, id: "i2", key: "CORE-2", labels: ["data"] };
+    const api = async (method: string, _path: string, body?: unknown) => {
+      if (method === "GET")
+        return {
+          status: 200,
+          ok: true,
+          body: { teams: [{ id: "t", key: "CORE" }], issues: [issue, other], links: [] },
+        };
+      sent.push((body as { mutations: { data: Record<string, unknown> }[] }).mutations[0]!.data);
+      return { status: 200, ok: true, body: { events: [] } };
+    };
+    const tools = buildTools({ api: api as never, writes: true, approve: false, navigate: false });
+    const run = (set: Record<string, unknown>, name: string, input: unknown) =>
+      (set[name] as { execute: (i: unknown, o: unknown) => Promise<unknown> }).execute(input, {
+        toolCallId: "t",
+        messages: [],
+      });
+    await run(tools.writes, "create_issue", { owner: "o", team: "CORE", title: "A", tags: ["ux"] });
+    await run(tools.writes, "create_issue", {
+      owner: "o",
+      team: "CORE",
+      title: "B",
+      labels: ["ux"],
+    });
+    await run(tools.writes, "update_issue", { owner: "o", key: "CORE-1", changes: { tags: [] } });
+    await run(tools.writes, "update_issue", {
+      owner: "o",
+      key: "CORE-1",
+      changes: { labels: ["data"] },
+    });
+    expect(sent.map((d) => d.labels)).toEqual([["ux"], ["ux"], [], ["data"]]);
+    expect(sent.every((d) => !("tags" in d))).toBe(true);
+    type Found = { issues: { key: string; tags: string[] }[] };
+    for (const filter of [{ tag: "ux" }, { label: "UX" }]) {
+      const found = (await run(tools.reads, "find_issues", { owner: "o", ...filter })) as Found;
+      expect(found.issues.map((i) => [i.key, i.tags])).toEqual([["CORE-1", ["UX"]]]);
+    }
   });
 });

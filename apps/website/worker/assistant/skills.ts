@@ -41,7 +41,7 @@ Paths are under /api; pass them to api_get (GET) or api_write (everything else) 
 - GET /wiki — table of contents. GET /wiki/page?slug= — a page.
 - GET /repos/:o/:n/release-notes/range?from=&to= — release notes between two refs.
 - GET /repos/:o/:n/release-notes — daily UTC committer-date code updates and optional tag snapshots. GET /repos/:o/:n/release-notes/release?name=day:YYYY-MM-DD (or a tag) — entries and introduction. Commits and tags are not deployment evidence.
-- GET /tracker/:owner/release-notes?q= — daily updates by default; kind:tag or release:<tag> selects named snapshots. Filters include kind, team, repo, ws, type, label, release, since and until. lastCommitAt is Git committer time, not tracker completion or deployment time.
+- GET /tracker/:owner/release-notes?q= — daily updates by default; kind:tag or release:<tag> selects tagged releases. Filters include kind, team, repo, ws, type, tag (issue tags; label: is its old name), release, since and until. lastCommitAt is Git committer time, not tracker completion or deployment time.
 
 These are JSON API endpoints, not browser pages. Link people to the Releases pages in the navigation skill: browser routes use /releases, never /release-notes.
 
@@ -58,7 +58,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 - POST|PATCH|DELETE /packages/:owner/feeds[/:format/:key] — feeds and upstream proxies.
 
 ## Tracker (/tracker)
-- GET /tracker — trackers you can use. GET /tracker/:owner/snapshot — everything (teams, workspaces, issues, links, comments, requests, members, agents). GET /tracker/:owner/view — a lighter view.
+- GET /tracker — trackers you can use. GET /tracker/:owner/snapshot — everything (teams, workspaces, issues, links, comments, requests, members, agents). GET /tracker/:owner/view — a lighter view. GET /tracker/:owner/tags — the tag catalog with counts {tags: [{name, issues, open}]}; issue tags (the issue field is "labels", its old name; writes accept "tags" too), agent tags and requirement tag: values come from it.
 - POST /tracker/:owner/mutate {operationId: uuid, mutations: [...]}: kinds team.create|update, workspace.create|update, issue.create {id: uuid, data: {teamId, title, ...}} | issue.update {id, expectedVersion, data} , link.add {id, data: {fromId, toId, kind}} | link.remove, comment.add {id, data: {issueId, body, kind}}, subscription.add|remove, request.answer|cancel. Prefer the dedicated issue tools; use this for teams, workspaces and bulk changes.
 - GET /requests — open requests waiting on the person ("Needs you").
 - Claims, leases and handoffs (issue.claim, renew, complete…) belong to agents doing the work with gm, not to this chat.

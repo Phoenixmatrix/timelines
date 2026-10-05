@@ -14,6 +14,7 @@ import {
   requirementsText,
   type IssueRequirements,
 } from "../../shared/requirements.ts";
+import { issueTagsInput } from "../../shared/assistant.ts";
 import type { CallApi } from "./internal.ts";
 import type { Group } from "./plan.ts";
 
@@ -121,7 +122,7 @@ function issueRow(issue: Issue, snapshot: Snapshot) {
     type: issue.type,
     priority: `P${issue.priority}`,
     team: team?.key,
-    labels: issue.labels,
+    tags: issue.labels,
     ...(hasRequirements(issue.requires) ? { requires: requirementsText(issue.requires) } : {}),
     ...(issue.claim ? { claimedBy: issue.claim.agent } : {}),
     ...(issue.assigneeId ? { assignee: issue.assigneeId } : {}),
@@ -312,7 +313,7 @@ export function buildTools(context: ToolContext) {
   const tracker = {
     find_issues: tool({
       description:
-        'Find issues in a tracker (owner = the account or organization, e.g. "priya" for "priya\'s tracker"). Filters combine; with none, open issues by priority. Returns {total, issues: [{key, title, status, type, priority: "P2", team, labels, requires? (what an agent must report to claim it), blocked, claimedBy?, assignee?, updatedAt}], teams: [key], url}, at most `limit` issues (default 25). Use this for any question about issues or teams.',
+        'Find issues in a tracker (owner = the account or organization, e.g. "priya" for "priya\'s tracker"). Filters combine; with none, open issues by priority. Returns {total, issues: [{key, title, status, type, priority: "P2", team, tags, requires? (what an agent must report to claim it), blocked, claimedBy?, assignee?, updatedAt}], teams: [key], url}, at most `limit` issues (default 25). Use this for any question about issues or teams.',
       inputSchema: z.object({
         owner: OWNER,
         query: z.string().optional().describe("Words to match in titles, descriptions and keys"),
@@ -330,14 +331,26 @@ export function buildTools(context: ToolContext) {
           .optional(),
         team: z.string().optional().describe("Team key, e.g. CORE"),
         type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
-        label: z.string().optional(),
+        tag: z.string().optional().describe("Only issues with this tag, e.g. ux"),
+        label: z.string().optional().describe("Old name of tag"),
         ready: z
           .boolean()
           .optional()
           .describe("Only issues ready to start: todo, unblocked, unclaimed"),
         limit: z.number().int().min(1).max(200).optional(),
       }),
-      execute: async ({ owner, query, status = "open", team, type, label, ready, limit = 25 }) => {
+      execute: async ({
+        owner,
+        query,
+        status = "open",
+        team,
+        type,
+        tag: tagged,
+        label,
+        ready,
+        limit = 25,
+      }) => {
+        const tag = (tagged ?? label)?.toLowerCase();
         const snap = await snapshot(owner);
         if ("error" in snap) return snap;
         const teamId = team
@@ -365,7 +378,7 @@ export function buildTools(context: ToolContext) {
           )
           .filter((i) => !teamId || i.teamId === teamId)
           .filter((i) => !type || i.type === type)
-          .filter((i) => !label || i.labels.includes(label))
+          .filter((i) => !tag || i.labels.some((l) => l.toLowerCase() === tag))
           .filter(
             (i) =>
               !ready ||
@@ -554,7 +567,11 @@ export function buildTools(context: ToolContext) {
         pickup: z.enum(["anyone", "not_ready", "human_only"]).optional(),
         priority: z.number().int().min(0).max(4).optional().describe("0 is most urgent"),
         parent: KEY.optional(),
-        labels: z.array(z.string()).optional(),
+        tags: z
+          .array(z.string())
+          .optional()
+          .describe("Work-area tags from the tracker's tag catalog, e.g. ux, frontend"),
+        labels: z.array(z.string()).optional().describe("Old name of tags"),
         requires: z
           .string()
           .max(1000)
@@ -573,10 +590,12 @@ export function buildTools(context: ToolContext) {
         type,
         priority,
         parent,
+        tags: tagList,
         labels,
         requires,
         pickup,
       }) => {
+        const tags = issueTagsInput({ tags: tagList, labels });
         const required = requirementsInput(requires);
         if (typeof required === "string") return { error: required };
         const snap = await snapshot(owner);
@@ -603,7 +622,7 @@ export function buildTools(context: ToolContext) {
                 ...(type ? { type } : {}),
                 ...(priority === undefined ? {} : { priority }),
                 ...(parentId ? { parentId } : {}),
-                ...(labels ? { labels } : {}),
+                ...(tags ? { labels: tags } : {}),
                 ...(required ? { requires: required } : {}),
                 ...(pickup ? { pickup } : {}),
               },
@@ -635,7 +654,11 @@ export function buildTools(context: ToolContext) {
             priority: z.number().int().min(0).max(4).optional(),
             pickup: z.enum(["anyone", "not_ready", "human_only"]).optional(),
             type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
-            labels: z.array(z.string()).optional(),
+            tags: z
+              .array(z.string())
+              .optional()
+              .describe("Replaces the issue's tags (from the tracker's tag catalog)"),
+            labels: z.array(z.string()).optional().describe("Old name of tags"),
             requires: z
               .string()
               .max(1000)
@@ -652,9 +675,11 @@ export function buildTools(context: ToolContext) {
         if ("error" in snap) return snap;
         const issue = snap.issues.find((i) => i.key.toLowerCase() === key.toLowerCase());
         if (!issue) return { error: `No issue ${key}.` };
-        const { requires, ...fields } = changes;
+        const { requires, tags: tagList, labels, ...rest } = changes;
         const required = requirementsInput(requires);
         if (typeof required === "string") return { error: required };
+        const tags = issueTagsInput({ tags: tagList, labels });
+        const fields = tags ? { ...rest, labels: tags } : rest;
         const data = requires === undefined ? fields : { ...fields, requires: required ?? null };
         const r = await api("POST", `/tracker/${enc(owner)}/mutate`, {
           operationId: crypto.randomUUID(),

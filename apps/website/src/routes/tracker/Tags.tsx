@@ -5,7 +5,7 @@ import { popMotion } from "../../components/ui.tsx";
 
 type TagOption = { value: string; label: string };
 
-export function LabelPicker({
+export function TagPicker({
   options,
   values,
   onChange,

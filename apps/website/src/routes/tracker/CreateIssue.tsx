@@ -17,7 +17,7 @@ import {
   TextField,
 } from "../../components/ui.tsx";
 import type { MutationOutcome } from "./IssueDetail.tsx";
-import { LabelPicker } from "./Labels.tsx";
+import { TagPicker } from "./Tags.tsx";
 import type { TimelinePolicy } from "../../../shared/timelines.ts";
 import {
   CloseReasonField,
@@ -213,7 +213,7 @@ export function CreateIssue({
                     }}
                   />
                 </div>
-                <LabelPicker
+                <TagPicker
                   options={[...snapshot.labels, ...initialLabels]}
                   values={labels}
                   onChange={setLabels}

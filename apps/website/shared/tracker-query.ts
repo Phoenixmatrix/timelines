@@ -5,12 +5,13 @@
 //
 //   is:ready is:waiting is:not_ready is:human_only is:blocked is:claimed is:leased is:open is:closed
 //   status:backlog|todo|in_progress|done|done_in_timeline|canceled
-//   team:CORE  ws:packages  assignee:jun|me|none  label:perf  type:bug  p:1
+//   team:CORE  ws:packages  assignee:jun|me|none  tag:perf  type:bug  p:1
+//   (tag: is the issue's tags from the tracker's tag catalog; label: still works)
 //   since:7d until:2026-09-01   (last activity: updatedAt)
 //   parent:CORE-12   numbers/full keys match tickets exactly (case-insensitive);
 //   requires:ux|tag:ux|memory>=16GiB|none   eligible:builder|me (CORE-32: which
 //   agents meet an issue's requirements and pickup policy);
-//   other words match key, title and labels; - excludes.
+//   other words match key, title and tags; - excludes.
 
 import { hasRequirements, requirementTerms, unmetRequirements } from "./requirements.ts";
 import {
@@ -174,7 +175,7 @@ export const QUERY_KEYS = [
   "team",
   "ws",
   "assignee",
-  "label",
+  "tag",
   "type",
   "p",
   "since",
@@ -184,12 +185,23 @@ export const QUERY_KEYS = [
   "eligible",
 ] as const;
 export type QueryKey = (typeof QUERY_KEYS)[number];
-const ALIASES: Record<string, QueryKey> = {
+/** Other spellings of a key; `label:` is the old name of `tag:` (CORE-271). */
+export const QUERY_ALIASES: Record<string, QueryKey> = {
   workspace: "ws",
   priority: "p",
   state: "is",
   owner: "assignee",
+  label: "tag",
+  labels: "tag",
+  tags: "tag",
 };
+/** The key a written key means, aliases included; undefined when it isn't one. */
+export function queryKey(name: string): QueryKey | undefined {
+  const lower = name.toLowerCase();
+  return (QUERY_KEYS as readonly string[]).includes(lower)
+    ? (lower as QueryKey)
+    : QUERY_ALIASES[lower];
+}
 
 export interface Filter {
   key: QueryKey;
@@ -219,10 +231,7 @@ export function parseQuery(query: string): ParsedQuery {
       parsed.words.push({ text: (negated ? token.slice(1) : token).toLowerCase(), negated });
       continue;
     }
-    const name = match[2]!.toLowerCase();
-    const key = (QUERY_KEYS as readonly string[]).includes(name)
-      ? (name as QueryKey)
-      : ALIASES[name];
+    const key = queryKey(match[2]!);
     if (!key || !match[3]) {
       parsed.unknown.push(token);
       continue;
@@ -236,20 +245,42 @@ export function filterToken(key: QueryKey, value: string, negated = false): stri
   return `${negated ? "-" : ""}${key}:${/\s/.test(value) ? `"${value}"` : value}`;
 }
 
-/** Add `key:value` to the query, or remove it when present. */
+/** A token with its key in the canonical spelling: `label:ux` reads `tag:ux`. */
+export function canonicalToken(token: string): string {
+  const match = /^(-?)([A-Za-z]+):(.*)$/.exec(token);
+  const key = match && queryKey(match[2]!);
+  return key ? `${match[1]}${key}:${match[3]}` : token;
+}
+
+/** Add `key:value` to the query, or remove it when present (in any spelling). */
 export function toggleToken(query: string, key: QueryKey, value: string): string {
   const tokens = tokenize(query);
   const token = filterToken(key, value);
-  const at = tokens.findIndex((t) => t.toLowerCase() === token.toLowerCase());
+  const at = tokens.findIndex(
+    (t) => canonicalToken(filterTokenOf(t)).toLowerCase() === token.toLowerCase(),
+  );
   if (at !== -1) tokens.splice(at, 1);
   else tokens.push(token);
   return tokens.join(" ");
 }
+/** The query's filters as filterToken writes them, lowercase: what a facet shows as pressed. */
+export function queryTokenSet(query: string): Set<string> {
+  return new Set(tokenize(query).map((t) => canonicalToken(filterTokenOf(t)).toLowerCase()));
+}
+/** A tokenized `key:value` written back the way filterToken writes it (quotes kept). */
+function filterTokenOf(token: string): string {
+  const match = /^(-?[A-Za-z]+:)(.*)$/.exec(token);
+  return match && /\s/.test(match[2]!) ? `${match[1]}"${match[2]}"` : token;
+}
 
-/** Replace every token of these keys. */
+/** Replace every token of these keys, whatever spelling they were written in. */
 export function withoutKeys(query: string, keys: QueryKey[]): string {
   return tokenize(query)
-    .filter((t) => !keys.some((k) => new RegExp(`^-?${k}:`, "i").test(t)))
+    .filter((t) => {
+      const match = /^-?([A-Za-z]+):/.exec(t);
+      const key = match && queryKey(match[1]!);
+      return !key || !keys.includes(key);
+    })
     .join(" ");
 }
 
@@ -284,7 +315,7 @@ function predicate(filter: Filter, index: IssueIndex, viewerId: string, now: num
       if (v === "me") return (i) => i.assigneeId === viewerId;
       return (i) =>
         !!i.assigneeId && (index.memberSlug.get(i.assigneeId) ?? i.assigneeId).toLowerCase() === v;
-    case "label":
+    case "tag":
       return (i) => i.labels.some((l) => l.toLowerCase() === v);
     case "type":
       return (i) => i.type === v;
@@ -335,7 +366,12 @@ export interface AgentWork {
   missing: { key: string; title: string; unmet: string[] }[];
 }
 export interface AgentEligibility {
-  trackers: { tracker: { slug: string; displayName: string }; agents: AgentWork[] }[];
+  trackers: {
+    tracker: { slug: string; displayName: string };
+    agents: AgentWork[];
+    /** The tracker's tag catalog (CORE-271), which agents' tags are chosen from. */
+    tags?: string[];
+  }[];
 }
 
 /** An agent's open work in a snapshot: how much of it asks for what it doesn't report. */
@@ -459,7 +495,7 @@ export interface Facets {
   ws: FacetValue[];
   assignee: FacetValue[];
   type: FacetValue[];
-  label: FacetValue[];
+  tag: FacetValue[];
 }
 
 const STATE_TOKEN: Record<IssueState, { key: QueryKey; value: string }> = {
@@ -497,7 +533,7 @@ export function facetsOf(
   const wss = count<string>(["ws"], (i) => i.workspaceIds);
   const people = count<string>(["assignee"], (i) => [i.assigneeId ?? ""]);
   const kinds = count<string>(["type"], (i) => [i.type]);
-  const labels = count<string>(["label"], (i) => i.labels);
+  const tags = count<string>(["tag"], (i) => i.labels);
   const sorted = (values: FacetValue[]) => values.sort((a, b) => b.count - a.count);
   return {
     state: (Object.keys(STATE_RANK) as IssueState[])
@@ -532,9 +568,9 @@ export function facetsOf(
         count: n,
       })),
     ),
-    label: sorted(
-      [...labels].map(([l, n]) => ({
-        token: { key: "label" as const, value: l.toLowerCase() },
+    tag: sorted(
+      [...tags].map(([l, n]) => ({
+        token: { key: "tag" as const, value: l.toLowerCase() },
         label: l,
         count: n,
       })),

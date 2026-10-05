@@ -51,7 +51,8 @@ import { Actor } from "./Actor.tsx";
 import { repoPath } from "../../lib/refs.ts";
 import { useRememberPlace } from "../../lib/recentPlaces.ts";
 import { AuditHistory, AuditIdentity } from "./AuditHistory.tsx";
-import { LabelPicker } from "./Labels.tsx";
+import { TagPicker } from "./Tags.tsx";
+import { IssueTagChip } from "../../components/Chips.tsx";
 import { LinkedWorkPanel } from "./LinkedWork.tsx";
 import { Requirements } from "./Requirements.tsx";
 
@@ -910,7 +911,7 @@ export function IssueDetail({
               allowNone
               onChange={(value) => change("parentId", value || null)}
             />
-            <LabelPicker
+            <TagPicker
               options={snapshot.labels}
               values={draft.fields.labels}
               onChange={(values) => change("labels", values)}
@@ -1084,9 +1085,7 @@ export function IssueDetail({
               <dt className="text-ink-faint">Tags</dt>
               <dd className="m-0 flex min-w-0 flex-wrap items-center gap-1">
                 {issue.labels.map((label) => (
-                  <span className="mk-chip mk-chip--tag" key={label}>
-                    {label}
-                  </span>
+                  <IssueTagChip name={label} key={label} />
                 ))}
               </dd>
             </>

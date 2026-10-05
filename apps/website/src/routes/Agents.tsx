@@ -4,7 +4,8 @@ import { KeyIcon, RobotIcon } from "@phosphor-icons/react";
 import { useEffect, useRef } from "react";
 import { Form, Link, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
 import type { Agent, AgentCapabilities, CreatedAccessToken } from "../../shared/api.ts";
-import type { AgentEligibility } from "../../shared/tracker-query.ts";
+import { filterToken, type AgentEligibility } from "../../shared/tracker-query.ts";
+import { AgentTagChip } from "../components/Chips.tsx";
 import { SettingsPage } from "../components/SettingsPage.tsx";
 import { Card, ConfirmDialog, CopyField, FormError, TextField } from "../components/ui.tsx";
 import { api, attempt, field, load } from "../lib/api.ts";
@@ -85,7 +86,8 @@ export function Agents() {
             <CopyField value="gm agent setup" label="Command" />
             <span className="mk-hint">
               Add <code className="mk-mono">--model</code> or <code className="mk-mono">--tag</code>{" "}
-              to describe it, and <code className="mk-mono">--under CORE-4</code> to point it at a
+              to describe it (tags come from the tracker's tag catalog, the same names issues are
+              tagged with), and <code className="mk-mono">--under CORE-4</code> to point it at a
               project.
             </span>
           </div>
@@ -193,7 +195,7 @@ function AgentRow({ agent, eligibility }: { agent: Agent; eligibility: AgentElig
               </span>
             )}
           </div>
-          {agent.capabilities && <Profile profile={agent.capabilities} />}
+          {agent.capabilities && <Profile profile={agent.capabilities} eligibility={eligibility} />}
           {!revoked && <TrackerWork agent={agent} eligibility={eligibility} />}
         </div>
         {!revoked && (
@@ -318,8 +320,31 @@ const HARNESSES: Record<string, string> = {
   "vscode-copilot-agent": "GitHub Copilot",
 };
 
+/**
+ * Where an agent tag leads (CORE-271): the open issues tagged with it in the
+ * first of your trackers whose tag catalog has it. Null when none has it.
+ */
+function tagHome(tag: string, eligibility: AgentEligibility): string | null {
+  const name = tag.toLowerCase();
+  const home = eligibility.trackers.find(({ tags }) =>
+    tags?.some((known) => known.toLowerCase() === name),
+  );
+  return home
+    ? `/tracker/${home.tracker.slug}?q=${encodeURIComponent(`is:open ${filterToken("tag", name)}`)}`
+    : null;
+}
+
 /** What the agent reported about itself: advice for choosing whom to delegate to. */
-function Profile({ profile }: { profile: AgentCapabilities }) {
+function Profile({
+  profile,
+  eligibility,
+}: {
+  profile: AgentCapabilities;
+  eligibility: AgentEligibility;
+}) {
+  // Catalogs are only known from servers that send them; without one, nothing is flagged.
+  const catalogs = eligibility.trackers.some(({ tags }) => tags !== undefined);
+  const strays = catalogs ? profile.tags.filter((tag) => !tagHome(tag, eligibility)) : [];
   const { environment: env } = profile;
   const memory = env.memoryBytes ? `${Math.round(env.memoryBytes / 2 ** 30)} GB` : null;
   const runs = [
@@ -334,11 +359,18 @@ function Profile({ profile }: { profile: AgentCapabilities }) {
       <span>{runs.join(" · ")}</span>
       {(profile.tags.length > 0 || profile.skills.length > 0) && (
         <div className="flex flex-wrap items-center gap-1.5">
-          {profile.tags.map((tag) => (
-            <span key={tag} className="mk-chip mk-chip--tag">
-              {tag}
-            </span>
-          ))}
+          {profile.tags.length > 0 && (
+            <ul className="m-0 flex list-none flex-wrap gap-1.5 p-0" aria-label="Agent tags">
+              {profile.tags.map((tag) => {
+                const to = tagHome(tag, eligibility);
+                return (
+                  <li key={tag} className="flex min-w-0">
+                    <AgentTagChip name={tag} to={to ?? undefined} unknown={catalogs && !to} />
+                  </li>
+                );
+              })}
+            </ul>
+          )}
           {profile.skills.length > 0 && (
             <span
               className="text-ink-faint"
@@ -348,6 +380,14 @@ function Profile({ profile }: { profile: AgentCapabilities }) {
             </span>
           )}
         </div>
+      )}
+      {strays.length > 0 && (
+        <span className="text-ink-faint">
+          {strays.join(", ")} {strays.length === 1 ? "isn't" : "aren't"} in any of your trackers'
+          tag catalogs, so no issue is tagged {strays.length === 1 ? "with it" : "with them"}.
+          Rename with <code className="mk-mono">gm agent setup --drop-tag</code> and{" "}
+          <code className="mk-mono">--tag</code>.
+        </span>
       )}
     </div>
   );

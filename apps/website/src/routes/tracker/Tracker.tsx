@@ -24,6 +24,7 @@
  *              raster carrying its provenance
  */
 
+import { IssueTagChip } from "../../components/Chips.tsx";
 import { Menu } from "@base-ui/react/menu";
 import {
   ArrowClockwiseIcon,
@@ -707,12 +708,7 @@ function Workbench({ data }: { data: TrackerView }) {
           >
             <span className="text-micro text-ink-muted">Tags</span>
             {captured.labels.map((label) => (
-              <span
-                key={label}
-                className="mk-chip mk-chip--tag max-w-full whitespace-normal [overflow-wrap:anywhere]"
-              >
-                {label}
-              </span>
+              <IssueTagChip key={label} name={label} />
             ))}
             {captured.unknown.map((label) => (
               <button
@@ -1022,8 +1018,8 @@ function Workbench({ data }: { data: TrackerView }) {
               className={`m-0 text-micro ${parsedUnknown.length ? "text-danger-text" : queryFocused ? "text-ink-faint" : "sr-only"}`}
             >
               {parsedUnknown.length
-                ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, ws:, assignee:, label:, type:, p:, since:, until:, parent:, requires:, eligible:.`
-                : "is:ready is:blocked · status: · team: · ws: · assignee:me · label: · type: · p:1 · since:7d · parent:KEY · requires:ux · eligible:me · words match key and title; - excludes"}
+                ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, ws:, assignee:, tag:, type:, p:, since:, until:, parent:, requires:, eligible:.`
+                : "is:ready is:blocked · status: · team: · ws: · assignee:me · tag: · type: · p:1 · since:7d · parent:KEY · requires:ux · eligible:me · words match key, title and tags; - excludes"}
             </p>
             {defaultTeamEntry && (
               <DefaultTeamNote

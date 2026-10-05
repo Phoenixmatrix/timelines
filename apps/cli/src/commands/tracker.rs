@@ -26,6 +26,9 @@ impl Render for Shown {
         if self.0.get("issueId").is_some() && self.0.get("events").is_some() {
             return history_text(&self.0);
         }
+        if let (Some(owner), Some(tags)) = (self.0["catalog"].as_str(), self.0["tags"].as_array()) {
+            return catalog_text(owner, tags);
+        }
         let mut body = serde_json::to_string_pretty(&self.0).unwrap_or_default();
         // A claim leads with the issue's timeline rule, so the choice comes first.
         if let Some(rule) = self.0.get("timelineRule").filter(|r| r.is_object()) {
@@ -48,10 +51,11 @@ impl Render for Shown {
         }
         if self.0.get("ancestors").is_some() && self.0.get("issue").is_some() {
             return format!(
-                "Created by: {}\n{}{}\n{body}",
+                "Created by: {}\n{}{}{}\n{body}",
                 self.0["issue"]["creatorDisplay"]
                     .as_str()
                     .unwrap_or("Unknown"),
+                tags_text(&self.0["issue"]),
                 done_in_text(&self.0["issue"]),
                 requirements_text(&self.0),
             );
@@ -60,6 +64,48 @@ impl Render for Shown {
     }
 }
 
+/// `gm issue tags`: one line per tag, "ux  4 issues, 2 open".
+fn catalog_text(owner: &str, tags: &[Value]) -> String {
+    if tags.is_empty() {
+        return format!(
+            "{owner}'s tag catalog is empty. Tag an issue (gm issue create --tag ux) to start it."
+        );
+    }
+    let width = tags
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .map(|n| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = format!("{owner}'s tag catalog\n");
+    for tag in tags {
+        let issues = tag["issues"].as_u64().unwrap_or(0);
+        out.push_str(&format!(
+            "  {:width$}  {issues} issue{}, {} open\n",
+            tag["name"].as_str().unwrap_or(""),
+            if issues == 1 { "" } else { "s" },
+            tag["open"].as_u64().unwrap_or(0),
+        ));
+    }
+    out
+}
+/// An issue's tags (stored as `labels`, CORE-271) as a line: "Tags: ux, frontend".
+fn tags_text(issue: &Value) -> String {
+    let tags: Vec<&str> = issue["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    format!(
+        "Tags: {}\n",
+        if tags.is_empty() {
+            "none".to_owned()
+        } else {
+            tags.join(", ")
+        }
+    )
+}
 /// An issue's requirements and the acting identity's eligibility (CORE-32), as lines.
 fn requirements_text(shown: &Value) -> String {
     let mut out = String::new();
@@ -718,7 +764,8 @@ impl Replica {
             .and_then(|t| t["key"].as_str())
             .map(str::to_owned))
     }
-    fn submit(&self, ctx: &Ctx, offline: bool, mutations: Vec<Value>) -> Result<Shown> {
+    fn submit(&self, ctx: &Ctx, offline: bool, mut mutations: Vec<Value>) -> Result<Shown> {
+        issue_tags_alias(&mut mutations)?;
         validate_batch(&mutations)?;
         let request = self.request(json!(mutations));
         let operation = request["operationId"].as_str().unwrap().to_string();
@@ -852,7 +899,7 @@ fn apply_event(snapshot: &mut Value, event: &Value) -> Result<()> {
     if kind == "issue" {
         let labels = snapshot["labels"]
             .as_array_mut()
-            .ok_or_else(|| GmError::new("protocol_error", "Missing tracker label catalog."))?;
+            .ok_or_else(|| GmError::new("protocol_error", "Missing tracker tag catalog."))?;
         let mut added = false;
         for entity in [&event["entity"], &event["view"]["entity"]] {
             for label in entity["labels"].as_array().into_iter().flatten() {
@@ -913,6 +960,28 @@ fn id(snapshot: &Value, table: &str, reference: &str) -> Result<String> {
         .as_str()
         .unwrap()
         .to_owned())
+}
+/// An issue's tags are stored as `labels` (CORE-271): `tags` in `--data` or a batch is
+/// the same field under the name people see, so it's written as `labels`, which every
+/// server and replica knows. Both at once must agree.
+fn issue_tags_alias(mutations: &mut [Value]) -> Result<()> {
+    for m in mutations {
+        if !matches!(m["kind"].as_str(), Some("issue.create" | "issue.update")) {
+            continue;
+        }
+        let Some(data) = m["data"].as_object_mut() else {
+            continue;
+        };
+        if let Some(tags) = data.remove("tags") {
+            if data.get("labels").is_some_and(|labels| *labels != tags) {
+                return Err(GmError::usage(
+                    "Give tags or labels (its old name), not both.",
+                ));
+            }
+            data.insert("labels".into(), tags);
+        }
+    }
+    Ok(())
 }
 fn validate_batch(mutations: &[Value]) -> Result<()> {
     if mutations.is_empty() || mutations.len() > 100 {
@@ -1230,7 +1299,32 @@ fn issue_patch(snapshot: &Value, p: &IssuePatch) -> Result<Value> {
     if let Some(pickup) = &p.pickup {
         data["pickup"] = json!(pickup);
     }
+    if !p.tags.is_empty() || !p.drop_tags.is_empty() {
+        if data.get("tags").is_some() || data.get("labels").is_some() {
+            return Err(GmError::usage(
+                "Use --tag/--drop-tag or tags in --data, not both.",
+            ));
+        }
+        data["labels"] = json!(edited_tags(&row["labels"], &p.tags, &p.drop_tags));
+    }
     Ok(json!({"kind":"issue.update","id":row["id"],"expectedVersion":row["version"],"data":data}))
+}
+/// An issue's tags with `add` appended (unless already there, ignoring case) and
+/// `drop` removed (ignoring case), in their original order.
+fn edited_tags(current: &Value, add: &[String], drop: &[String]) -> Vec<String> {
+    let mut tags: Vec<String> = current
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect();
+    for tag in add {
+        if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+            tags.push(tag.clone());
+        }
+    }
+    tags.retain(|t| !drop.iter().any(|d| d.eq_ignore_ascii_case(t)));
+    tags
 }
 /// `--requires TERMS` as the stored `requires` object; `--clear-requires` as null.
 fn requires_field(args: &RequiresArgs, clear: bool, data: &mut Value) -> Result<()> {
@@ -2201,7 +2295,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             .clone()
             .or_else(|| defaults.agent.clone())
             .ok_or_else(|| {
-                GmError::usage("Pass --agent <label> for your working session.")
+                GmError::usage("Pass --agent <session name> for this piece of work.")
                     .hint("Or run `gm agent setup` once, and gm uses this checkout's agent.")
             })
     };
@@ -2262,6 +2356,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 return Ok(shown);
             }
             IssueCommand::History { .. } => unreachable!("handled before opening the replica"),
+            IssueCommand::Tags => return Ok(Shown(tag_catalog(&snapshot, &r.owner))),
             IssueCommand::Create(a) => {
                 if a.description_file.as_deref() == Some(Path::new("-"))
                     && a.acceptance_file.as_deref() == Some(Path::new("-"))
@@ -2286,7 +2381,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 }
                 let mut mutation = create(
                     "issue",
-                    json!({"teamId":team,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.label}),
+                    json!({"teamId":team,"title":a.title,"description":markdown(&a.description,&a.description_file)?,"acceptance":markdown(&a.acceptance,&a.acceptance_file)?,"type":a.r#type,"status":a.status,"closeReason":a.close_reason,"priority":a.priority,"assigneeId":a.assignee,"parentId":a.parent.as_deref().map(|p|id(&snapshot,"issues",p)).transpose()?,"workspaceIds":a.workspace.iter().map(|w|id(&snapshot,"workspaces",w)).collect::<Result<Vec<_>>>()?,"labels":a.tags}),
                 );
                 timeline_fields(&a.timeline, &mut mutation["data"]);
                 requires_field(&a.requires, false, &mut mutation["data"])?;
@@ -2632,12 +2727,87 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             return Ok(Shown(response));
         }
+        let notes = tag_notes(&snapshot, &mutation, &r.owner);
         let mut shown = r.submit(ctx, args.scope.offline, vec![mutation])?;
         if let Some(team) = picked {
             shown.0["team"] = team;
         }
+        if let Some(notes) = notes {
+            shown.0["tagCatalog"] = notes;
+        }
         Ok(shown)
     })
+}
+
+/// The tracker's tag catalog from a snapshot (CORE-271), as the server lists it
+/// (`GET /tracker/:owner/tags`): every defined tag with its issues and open issues.
+fn tag_catalog(snapshot: &Value, owner: &str) -> Value {
+    let issues = snapshot["issues"].as_array().cloned().unwrap_or_default();
+    let tags: Vec<Value> = snapshot["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|name| {
+            let tagged: Vec<&Value> = issues
+                .iter()
+                .filter(|i| {
+                    i["labels"]
+                        .as_array()
+                        .is_some_and(|l| l.iter().any(|t| t == name))
+                })
+                .collect();
+            let open = tagged
+                .iter()
+                .filter(|i| !matches!(i["status"].as_str(), Some("done" | "canceled")))
+                .count();
+            json!({ "name": name, "issues": tagged.len(), "open": open })
+        })
+        .collect();
+    json!({ "catalog": owner, "tags": tags })
+}
+/// What an issue edit means for the tracker's tag catalog (CORE-271): tags it adds
+/// to the catalog, and `tag:` requirements naming tags the catalog doesn't have
+/// (warned on stderr, never refused: an agent may still report that tag). None
+/// when there's nothing to say.
+fn tag_notes(snapshot: &Value, mutation: &Value, owner: &str) -> Option<Value> {
+    if !matches!(
+        mutation["kind"].as_str(),
+        Some("issue.create" | "issue.update")
+    ) {
+        return None;
+    }
+    let catalog: Vec<String> = snapshot["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect();
+    let data = &mutation["data"];
+    let tags: Vec<String> = data["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect();
+    let new: Vec<Value> = requirements::unknown_tags(&tags, &catalog)
+        .into_iter()
+        .map(|u| u["tag"].clone())
+        .collect();
+    // A tag this edit adds to the catalog is known to it.
+    let known = [catalog.as_slice(), tags.as_slice()].concat();
+    let unknown =
+        requirements::unknown_tags(&requirements::required_tags(&data["requires"]), &known);
+    for u in &unknown {
+        eprintln!(
+            "gm: warning: requires {}. Only agents that report it can claim the issue; `gm issue tags` lists the catalog.",
+            requirements::unknown_tag_warning(u, owner)
+        );
+    }
+    if new.is_empty() && unknown.is_empty() {
+        return None;
+    }
+    Some(json!({ "added": new, "unknownRequired": unknown }))
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -3299,6 +3469,8 @@ mod tests {
                 timeline: flags(Some("required"), Some("approval")),
                 requires: RequiresArgs { requires: None },
                 clear_requires: false,
+                tags: vec![],
+                drop_tags: vec![],
             },
         )
         .unwrap();
@@ -3315,6 +3487,8 @@ mod tests {
                 timeline: flags(None, Some("none")),
                 requires: RequiresArgs { requires: None },
                 clear_requires: false,
+                tags: vec![],
+                drop_tags: vec![],
             },
         )
         .unwrap();
@@ -3339,6 +3513,8 @@ mod tests {
                         requires: requires.map(str::to_string),
                     },
                     clear_requires: clear,
+                    tags: vec![],
+                    drop_tags: vec![],
                 },
             )
         };

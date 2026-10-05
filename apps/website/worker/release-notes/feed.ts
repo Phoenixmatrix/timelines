@@ -38,7 +38,11 @@ const SCAN_LIMIT = 5000;
 
 /** Filter, merge and count rows already scoped to one tracker account. */
 export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFeed, "owner"> {
-  const query: ParsedReleaseQuery = { ...context.query, unknown: [...context.query.unknown] };
+  const query: ParsedReleaseQuery = {
+    ...context.query,
+    filters: oldTagSpelling(rows, context.query.filters),
+    unknown: [...context.query.unknown],
+  };
   const bounds: { key: "since" | "until"; at: string; negated: boolean }[] = [];
   const facetFilters = query.filters.filter((filter) => {
     if (filter.key !== "since" && filter.key !== "until") return true;
@@ -72,7 +76,7 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
           return slugs.some((slug) => slug.toLowerCase() === value);
         case "type":
           return entry.category === value;
-        case "label":
+        case "tag":
           return entry.labels.some((label) => label.toLowerCase() === value);
         case "kind":
           return entry.releaseKind === value;
@@ -116,6 +120,7 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
       }
     return [...counts.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
   };
+  const tags = facet((e) => e.labels.map((l) => [l.toLowerCase(), l] as [string, string]));
   return {
     query,
     entries: all.slice(0, context.limit),
@@ -132,7 +137,8 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
         }),
       ),
       categories: facet((e) => [[e.category, e.category]]),
-      labels: facet((e) => e.labels.map((l) => [l.toLowerCase(), l] as [string, string])),
+      tags,
+      labels: tags,
       timelines: facet((e) => {
         const slug = landedTimelineSlug(e.timeline);
         return slug ? [[slug, e.timeline!.branch!]] : [];
@@ -144,6 +150,24 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
       ),
     },
   };
+}
+
+/**
+ * Before CORE-271 `tag:` meant `release:` here; it now means an issue tag. A
+ * `tag:` naming a release these rows have, and no issue tag, keeps its old
+ * meaning, so saved queries such as `tag:v1.2` still select that release.
+ */
+function oldTagSpelling(rows: FeedRow[], filters: ParsedReleaseQuery["filters"]) {
+  if (!filters.some((f) => f.key === "tag")) return filters;
+  const releases = new Set(rows.map((row) => row.release.toLowerCase()));
+  const tags = new Set(
+    rows.flatMap((row) => (JSON.parse(row.labels) as string[]).map((l) => l.toLowerCase())),
+  );
+  return filters.map((filter) =>
+    filter.key === "tag" && releases.has(filter.value) && !tags.has(filter.value)
+      ? { ...filter, key: "release" as const }
+      : filter,
+  );
 }
 
 export class FeedError extends Error {
@@ -208,7 +232,12 @@ export async function releaseFeed(
     .where((eb) =>
       eb.or([eb("e.tracker_owner_id", "=", owner.id), eb("r.owner_id", "=", owner.id)]),
     );
-  if (!query.filters.some((f) => f.key === "kind" || (f.key === "release" && !f.negated)))
+  // A positive `tag:` may be the old spelling of a tagged release (oldTagSpelling).
+  if (
+    !query.filters.some(
+      (f) => f.key === "kind" || ((f.key === "release" || f.key === "tag") && !f.negated),
+    )
+  )
     select = select.where("e.release", "like", `${DAILY_RELEASE_PREFIX}%`);
   for (const filter of query.filters) {
     if (filter.key === "kind" && (filter.value === "daily" || filter.value === "tag")) {

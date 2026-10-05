@@ -122,6 +122,77 @@ fn summary(profile: &Value) -> String {
     )
 }
 
+/// Agent tags checked against the tracker's tag catalog (CORE-271): the same
+/// vocabulary issues are tagged with, so `requires tag:ux` finds agents tagged ux.
+/// Unknown names warn on stderr and are kept, never refused. Null when no tracker is
+/// known or its catalog can't be read (an older server, offline, no access).
+pub fn tag_check(config: &Config, owner: Option<&str>, tags: &[String]) -> Value {
+    let Some(owner) = owner.filter(|o| {
+        !o.is_empty()
+            && o.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }) else {
+        return Value::Null;
+    };
+    let Ok(response) = remote::api(config, "GET", &format!("/tracker/{owner}/tags"), None) else {
+        return Value::Null;
+    };
+    let Some(entries) = response["tags"].as_array() else {
+        return Value::Null;
+    };
+    let catalog: Vec<String> = entries
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_owned))
+        .collect();
+    let unknown = super::requirements::unknown_tags(tags, &catalog);
+    for u in &unknown {
+        eprintln!(
+            "gm: warning: {}; the agent keeps it, and issues that require tag:{} match it.",
+            super::requirements::unknown_tag_warning(u, owner),
+            u["tag"].as_str().unwrap_or("")
+        );
+    }
+    // Most used first: what the tracker's work is most often about.
+    let mut ranked: Vec<&Value> = entries.iter().collect();
+    ranked.sort_by_key(|t| std::cmp::Reverse(t["open"].as_u64().unwrap_or(0)));
+    let suggestions: Vec<&str> = ranked
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .filter(|name| name.encode_utf16().count() <= 64)
+        .filter(|name| !tags.iter().any(|tag| tag.eq_ignore_ascii_case(name)))
+        .take(12)
+        .collect();
+    json!({ "owner": owner, "unknown": unknown, "suggestions": suggestions })
+}
+
+/// The catalog check as text lines, or nothing without one.
+pub fn tag_check_text(check: &Value) -> String {
+    let Some(owner) = check["owner"].as_str() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for u in check["unknown"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "  warning: {}\n",
+            terminal(&super::requirements::unknown_tag_warning(u, owner))
+        ));
+    }
+    let suggestions: Vec<String> = check["suggestions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(terminal)
+        .collect();
+    if !suggestions.is_empty() {
+        out.push_str(&format!(
+            "  {owner}'s tag catalog: {} (add one with --tag NAME)\n",
+            suggestions.join(", ")
+        ));
+    }
+    out
+}
+
 fn shown_agent(value: Value) -> Shown {
     Shown {
         text: line(&value["agent"]),
@@ -271,7 +342,17 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
                     value: json!({ "dry_run": true, "method": method, "path": path, "request": body }),
                 });
             }
-            let shown = shown_agent(remote::api(&config, method, &path, Some(&body))?);
+            let mut shown = shown_agent(remote::api(&config, method, &path, Some(&body))?);
+            // Tags given now are checked against the tracker's tag catalog (CORE-271).
+            if !args.tags.is_empty() {
+                let owner = super::tracker::selected_owner(&config, None).ok();
+                let check = tag_check(&config, owner.as_deref(), &args.tags);
+                if !check.is_null() {
+                    shown.text.push('\n');
+                    shown.text.push_str(tag_check_text(&check).trim_end());
+                    shown.value["tagCatalog"] = check;
+                }
+            }
             // This checkout's agent keeps its declared model, so setup reruns keep it too.
             if (args.model.is_some() || args.clear_model)
                 && let Some(root) = crate::profile::root_from(&ctx.cwd)

@@ -6,6 +6,7 @@ import {
   compile,
   facetsOf,
   parseQuery,
+  queryTokenSet,
   sortIssues,
   toggleToken,
   tokenize,
@@ -259,7 +260,7 @@ describe("query language", () => {
       return issues.filter((i) => c.matches(i)).map((i) => i.key);
     };
     expect(keys("team:core team:web is:open")).toEqual(["CORE-1", "WEB-1", "CORE-3"]);
-    expect(keys("team:core -label:perf")).toEqual(["CORE-2", "CORE-3"]);
+    expect(keys("team:core -tag:perf")).toEqual(["CORE-2", "CORE-3"]);
     expect(keys("assignee:jun ws:packages")).toEqual(["CORE-3"]);
     expect(keys("assignee:none is:closed")).toEqual(["CORE-2"]);
     expect(keys("web-1")).toEqual(["WEB-1"]);
@@ -286,15 +287,51 @@ describe("query language", () => {
     expect(keys("uI2-98")).toEqual(["UI2-98"]);
     expect(keys("99")).toEqual([]);
     expect(keys("CORE-99")).toEqual([]);
-    expect(keys("98 team:core is:open search label:perf")).toEqual(["CORE-98"]);
+    expect(keys("98 team:core is:open search tag:perf")).toEqual(["CORE-98"]);
     expect(keys("98 team:web is:open")).toEqual([]);
     expect(keys("98 -core-98")).toEqual(["WEB-98", "UI2-98"]);
     expect(keys("-98")).toEqual(["CORE-198", "CORE-980", "CORE-7"]);
     expect(keys("search -98")).toEqual([]);
     expect(keys("mention")).toEqual(["CORE-7"]);
     expect(keys('"mention core-98"')).toEqual(["CORE-7"]);
-    expect(keys("label:98")).toEqual(["CORE-7"]);
+    expect(keys("tag:98")).toEqual(["CORE-7"]);
     expect(keys("core")).toEqual(["CORE-98", "CORE-198", "CORE-980", "CORE-7"]);
+  });
+
+  it("filters by tag, with label: kept as an alias for the old spelling (CORE-271)", () => {
+    const issues = [
+      issue("CORE-1", { labels: ["UX", "frontend"] }),
+      issue("CORE-2", { labels: ["data"] }),
+      issue("CORE-3", { labels: ["needs design"] }),
+      issue("CORE-4"),
+    ];
+    const snap = snapshot(issues);
+    const index = buildIndex(snap, snap.serverTime);
+    const keys = (q: string) => {
+      const c = compile(q, index, "", NOW);
+      expect(c.parsed.unknown).toEqual([]);
+      return issues.filter((i) => c.matches(i)).map((i) => i.key);
+    };
+    for (const spelling of ["tag", "label", "Label", "tags", "labels"]) {
+      expect(keys(`${spelling}:ux`)).toEqual(["CORE-1"]);
+      expect(keys(`-${spelling}:ux`)).toEqual(["CORE-2", "CORE-3", "CORE-4"]);
+    }
+    expect(keys('tag:"needs design"')).toEqual(["CORE-3"]);
+    expect(keys("tag:ux label:data")).toEqual(["CORE-1", "CORE-2"]);
+    expect(parseQuery("label:ux").filters).toEqual([{ key: "tag", value: "ux", negated: false }]);
+    // A facet toggles the filter off whichever spelling put it there.
+    expect(toggleToken("is:open label:ux", "tag", "ux")).toBe("is:open");
+    expect(toggleToken("is:open", "tag", "ux")).toBe("is:open tag:ux");
+    expect(toggleToken('label:"needs design"', "tag", "needs design")).toBe("");
+    expect(queryTokenSet("label:UX -labels:data").has("tag:ux")).toBe(true);
+    expect(withoutKeys("label:ux tag:data team:core", ["tag"])).toBe("team:core");
+    const facets = facetsOf(issues, compile("label:ux", index, "", NOW), index, snap);
+    expect(facets.tag.map((f) => [f.token.key, f.token.value, f.count])).toEqual([
+      ["tag", "ux", 1],
+      ["tag", "frontend", 1],
+      ["tag", "data", 1],
+      ["tag", "needs design", 1],
+    ]);
   });
 
   it("filters by last activity with durations and dates", () => {

@@ -209,6 +209,7 @@ tracker.get("/agent-eligibility", async (c) => {
     out.trackers.push({
       tracker: { slug: owner.slug, displayName: owner.displayName },
       agents: agents.map((agent) => agentWork(result.value, agent.id)),
+      tags: result.value.labels,
     });
   }
   return c.json(out);
@@ -276,6 +277,15 @@ tracker.get("/tracker/:owner/snapshot", async (c) => {
       c.req.query("timelines") === "1",
     ),
   );
+});
+/**
+ * The tracker's tag catalog (CORE-271), with how many issues carry each tag:
+ * what issue tags, agent tags and requirement `tag:` values are chosen from.
+ */
+tracker.get("/tracker/:owner/tags", async (c) => {
+  const access = await authorize(c);
+  const catalog = await trackerObject(c.env, access.owner.id).tagCatalog();
+  return response(c, catalog.ok ? { ...catalog, value: { tags: catalog.value } } : catalog);
 });
 tracker.get("/tracker/:owner/changes", async (c) => {
   // Members and agents aren't events: a replica asks for them (directory=1) to

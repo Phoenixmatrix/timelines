@@ -917,13 +917,33 @@ including from the blocker graph. Rejected submissions keep the draft; an
 unconfirmed submission stays open with an idempotent retry rather than creating
 another issue.
 
-The **Tags** picker searches the tracker's shared catalog and offers **Create tag**
+The **Tags** picker searches the tracker's **tag catalog** and offers **Create tag**
 for a new name. Selecting or removing a tag in the issue editor saves immediately;
 in the creation dialog it remains part of the unsaved draft. Names are 1–100
 characters without NUL. Definitions persist after their last issue assignment is
-removed, and include tags used in timelines. Existing issue labels are migrated
-into this catalog. The API and CLI continue to call issue tags `labels`; CLI
-replicas refresh their snapshot once to pick up the backfilled catalog.
+removed, and include tags used in timelines.
+
+**One vocabulary, three roles (CORE-271).** The catalog is the tracker's
+work-area vocabulary (`ux`, `data`, `frontend`…). An _issue's tags_ say what the
+work is about; an _agent's tags_ (`gm agent setup --tag ux`) say what work it
+suits and are chosen from the same catalog; a _requirement_ `tag:ux` means only
+agents tagged ux may claim the issue. In search, `tag:ux` means issues tagged ux,
+so `tag:ux` always reads "has tag ux" for whatever is filtered or claimed.
+Tagging an issue never restricts it by itself. Unknown names in agent tags or
+`tag:` requirements warn (gm, the inspector) and are kept, never refused. Git
+tags keep their own word on release pages ("Tagged releases"), and package
+dist-tags keep "tag" inside package screens.
+
+Old spellings keep working: the stored field and the snapshot catalog are still
+`labels` (the `tracker_labels` table is unchanged, so replicas sync as before);
+writes accept `tags` as well as `labels` (both at once must agree); the query
+term `label:` is an alias of `tag:` (also `labels:`/`tags:`), in the tracker and
+the release feed; `gm issue create|update --label` is an alias of `--tag`; the
+assistant's `labels`/`label` parameters are aliases of `tags`/`tag`; the release
+feed's `facets.labels` repeats `facets.tags`. Before CORE-271 the release feed
+read `tag:` as `release:`; `tag:day:…`, and a `tag:` naming a release the feed
+has, still do. `GET /api/tracker/:owner/tags` lists the catalog with counts
+(`{tags: [{name, issues, open}]}`) and `gm issue tags` prints it from the replica.
 
 The workbench keeps the list, board or blocker graph beside the selected issue;
 phones navigate from the list into detail. Expand a ticket into a Markdown PRD,
@@ -938,7 +958,7 @@ The button disappears when both the input and applied query are empty.
 Bare ticket numbers match the exact issue number across teams (`223` does not
 match `2230` or a title mentioning 223); full keys such as `CORE-223` match only
 that key, case-insensitively. Other words and quoted phrases such as
-`"release notes"` search keys, titles and labels. Quoting a number or full key
+`"release notes"` search keys, titles and tags. Quoting a number or full key
 does not turn off exact ticket matching. Existing filters still apply, and a
 leading `-` excludes a match.
 
@@ -1003,7 +1023,7 @@ read as `agent_decides`.
   Tokens never appear in public snapshots or event feeds.
   Granting a lease also assigns an unassigned issue to its holder's identity in
   the same transaction and audit event. Delegated claims use the receiving
-  agent, not the delegator or session label. Existing assignees are preserved,
+  agent, not the delegator or session name. Existing assignees are preserved,
   including on renewal, handoff and takeover; ending a lease does not clear assignment.
   Lease grants use the same assignee validation as issue edits: the assignee
   (or an agent's accountable person) must be an account member and belong to any
@@ -1195,7 +1215,7 @@ read as `agent_decides`.
   status and parent relationships still resolve and enforce covering leases.
 - **Browser conflicts:** drafts persist for the tab session. Review named fields,
   choose individual remote values, then explicitly rebase; untouched remote
-  fields are retained. Labels and workspace membership compare as sets, so
+  fields are retained. Tags and workspace membership compare as sets, so
   reordering does not overwrite another person's changes. Errors remain beside
   the failed action. A known conflict is reported immediately, without waiting
   for the background refresh that supplies newer comparison fields.
@@ -1431,7 +1451,7 @@ shared fields (version, claim, assignee, waiting), and something only a
 timeline has is absent (`entity: null`). A timeline's view
 (`GET …/snapshot?timeline=<slug>`, `?tl=<slug>` in the web app, `--timeline`
 or `GM_TIMELINE` in gm) is main's with the scoped fields (title, description,
-acceptance, type, status, close reason, priority, parent, workspaces, labels)
+acceptance, type, status, close reason, priority, parent, workspaces, tags)
 and the links and comments of the timeline, its ancestors and the timelines
 merged into them replayed on top in event order. `issue.next` in a timeline
 picks from its view. Landing folds a timeline into main's tables as
@@ -1599,12 +1619,13 @@ shown only to viewers who can read every tracker that shaped it.
 **Team and organization views** (`worker/release-notes/feed.ts`): a tracker
 account's **Release notes** page (`/tracker/:owner/releases`, a place in the
 navigation rail; `/release-notes` opens your default tracker's) defaults to daily changes in its repositories and changes citing
-its teams' issues, ordered by `lastCommitAt` and grouped into UTC weeks. Named
-tags do not duplicate entries in the default feed. An explicit `kind:tag` or
-positive `release:` filter selects named snapshots when requested; `kind:daily`
+its teams' issues, ordered by `lastCommitAt` and grouped into UTC weeks. Tagged
+releases do not duplicate entries in the default feed. An explicit `kind:tag` or
+positive `release:` filter selects tagged releases (the "Tagged releases" chip) when requested; `kind:daily`
 selects daily history. An issue may have distinct updates on several days.
 A team's notes use `team:KEY`. Other filters are `repo:` (name or owner/name),
-`ws:`, `type:` (feature, fix, improvement, internal), `label:`,
+`ws:`, `type:` (feature, fix, improvement, internal), `tag:` (issue tags;
+`label:` is the old spelling),
 `release:` (a literal tag or `day:YYYY-MM-DD`), `timeline:` (what landed with
 `timeline/<slug>`), `since:`/`until:` (a date or `30d`,
 `2w`, `12h`), search words, and `-` to exclude; unknown tokens are reported back.

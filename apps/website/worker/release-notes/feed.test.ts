@@ -97,7 +97,7 @@ describe("release feed query", () => {
         { key: "team", value: "core", negated: false },
         { key: "type", value: "internal", negated: true },
         { key: "release", value: "@day:2026-09-21", negated: false },
-        { key: "label", value: "needs docs", negated: false },
+        { key: "tag", value: "needs docs", negated: false },
       ],
       words: [
         { text: "fast", negated: false },
@@ -177,7 +177,7 @@ describe("release feed", () => {
     expect(all.facets.workspaces).toEqual([{ value: "platform", label: "platform", count: 2 }]);
   });
 
-  test("filters by team, repository, workspace, type, label, release, dates and words", () => {
+  test("filters by team, repository, workspace, type, tag, release, dates and words", () => {
     const titles = (q: string) => feed(q).entries.map((e) => e.title);
     expect(titles("team:ops")).toEqual(["Fix deploy rollback"]);
     expect(titles("-team:eng type:fix")).toEqual(["Fix deploy rollback"]);
@@ -187,7 +187,11 @@ describe("release feed", () => {
       "Fix deploy rollback",
       "Faster search",
     ]);
+    expect(titles("ws:platform tag:web")).toEqual(["Faster search", "Faster search (draft)"]);
+    // label: is the old spelling of tag: (CORE-271), and the facet keeps its old name too.
     expect(titles("ws:platform label:web")).toEqual(["Faster search", "Faster search (draft)"]);
+    expect(titles("-label:web")).toEqual(titles("-tag:web"));
+    expect(feed("").facets.labels).toEqual(feed("").facets.tags);
     expect(titles("release:day:2026-09-21")).toEqual(["Faster search (draft)"]);
     expect(titles("since:2026-09-21")).toEqual(["Fix deploy rollback"]);
     expect(titles("until:30d")).toEqual(["Bump deps"]);
@@ -238,6 +242,9 @@ describe("release feed", () => {
     expect(selected("release:v1")).toEqual(["tagged"]);
     expect(selected("release:v1 -kind:tag")).toEqual([]);
     expect(selected("release:day:2026-09-20")).toEqual([daily.id]);
+    // Before CORE-271 tag: meant release:; a tag: naming a release still selects it.
+    expect(selected("tag:v1")).toEqual(["tagged"]);
+    expect(selected("tag:day:2026-09-20")).toEqual([daily.id]);
   });
   test("tracker reads lazily upgrade only accessible related repositories and conceal stale rows", async () => {
     const sqlite = migratedDatabase();

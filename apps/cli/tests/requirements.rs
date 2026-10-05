@@ -31,11 +31,11 @@ fn snapshot() -> Value {
              "capabilities": null, "capabilitiesUpdatedAt": null, "revokedAt": null}
         ],
         "teams": [{"id": "team-e", "key": "ENG", "name": "Engineering", "description": "", "memberIds": [], "archived": false, "version": 1}],
-        "workspaces": [], "labels": [], "links": [], "comments": [], "requests": [], "subscriptions": [],
+        "workspaces": [], "labels": ["data", "frontend", "ux"], "links": [], "comments": [], "requests": [], "subscriptions": [],
         "issues": [
             {"id": "i1", "key": "ENG-1", "teamId": "team-e", "title": "Polish onboarding", "description": "", "acceptance": "",
              "type": "task", "status": "todo", "priority": 2, "assigneeId": null, "parentId": null, "workspaceIds": [],
-             "labels": [], "claim": null, "version": 3, "createdAt": "2026-10-01T00:00:00Z", "updatedAt": "2026-10-01T00:00:00Z",
+             "labels": ["ux", "frontend"], "claim": null, "version": 3, "createdAt": "2026-10-01T00:00:00Z", "updatedAt": "2026-10-01T00:00:00Z",
              "requires": {"tags": ["ux"], "minMemory": 16 * GIB}},
             {"id": "i2", "key": "ENG-2", "teamId": "team-e", "title": "Anyone", "description": "", "acceptance": "",
              "type": "task", "status": "todo", "priority": 2, "assigneeId": "agt_b", "parentId": null, "workspaceIds": [],
@@ -114,6 +114,18 @@ impl Api {
                         (200, json!({"preferences": null}))
                     }
                     ("POST", "/api/tracker/orbit/mutate") => mutate(&body),
+                    ("GET", "/api/tracker/orbit/tags") => (
+                        200,
+                        json!({"tags": [
+                            {"name": "data", "issues": 0, "open": 0},
+                            {"name": "frontend", "issues": 1, "open": 1},
+                            {"name": "ux", "issues": 1, "open": 1}
+                        ]}),
+                    ),
+                    ("GET", "/api/agents/self") => (200, json!({"agent": agent_record(None)})),
+                    ("PUT", "/api/agents/self/capabilities") => {
+                        (200, json!({"agent": agent_record(Some(body.clone()))}))
+                    }
                     _ => (404, json!({"error": "Not found"})),
                 };
                 let reply = reply.to_string();
@@ -142,6 +154,14 @@ impl Api {
             .map(|(_, _, body)| body["mutations"][0].clone())
             .collect()
     }
+}
+
+/// Ann's agent builder, with the profile it just published when there is one.
+fn agent_record(capabilities: Option<Value>) -> Value {
+    json!({"id": "agt_b", "name": "builder", "description": null,
+           "accountable": {"id": "person-a", "slug": "ann", "displayName": "Ann"},
+           "createdAt": "2026-10-01T00:00:00Z", "revokedAt": null, "tokens": [],
+           "capabilities": capabilities, "capabilitiesUpdatedAt": null})
 }
 
 /// Mutation replies: creates and updates echo the entity, a claim of ENG-1 is
@@ -208,10 +228,16 @@ impl Env {
     }
 
     fn gm(&self, args: &[&str]) -> (i32, Value) {
+        let (code, value, _) = self.gm_with(args, &["--owner", "orbit", "--output", "json"]);
+        (code, value)
+    }
+
+    /// gm with these trailing flags: its exit code, JSON (or text) output and stderr.
+    fn gm_with(&self, args: &[&str], flags: &[&str]) -> (i32, Value, String) {
         let output = Command::new(env!("CARGO_BIN_EXE_gm"))
             .current_dir(&self.root)
             .args(args)
-            .args(["--owner", "orbit", "--output", "json"])
+            .args(flags)
             .env("GM_AGENT", "0")
             .env("GM_SERVER", format!("http://{}", self.api.address))
             .env("GM_TOKEN", "test-token")
@@ -225,7 +251,7 @@ impl Env {
         let value = serde_json::from_str(&stdout)
             .or_else(|_| serde_json::from_str(&stderr))
             .unwrap_or(Value::String(format!("{stdout}{stderr}")));
-        (output.status.code().unwrap_or(-1), value)
+        (output.status.code().unwrap_or(-1), value, stderr)
     }
 }
 
@@ -364,5 +390,170 @@ fn next_reports_skipped_issues_and_a_refused_claim_names_what_is_missing() {
             .as_str()
             .unwrap()
             .contains("gm agent setup")
+    );
+}
+
+/// CORE-271: issue tags are `--tag` (with `--label` kept), `tags` in --data (with
+/// `labels` kept), always sent as the stored `labels` field; `issue show` prints them.
+#[test]
+fn issue_tags_take_new_and_old_spellings() {
+    let env = Env::new();
+    let (code, text, _) = env.gm_with(
+        &["issue", "show", "ENG-1"],
+        &["--owner", "orbit", "--output", "text"],
+    );
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.as_str().unwrap().contains("Tags: ux, frontend\n"),
+        "{text}"
+    );
+
+    let (code, catalog) = env.gm(&["issue", "tags"]);
+    assert_eq!(code, 0, "{catalog}");
+    assert_eq!(
+        catalog["tags"],
+        json!([
+            {"name": "data", "issues": 0, "open": 0},
+            {"name": "frontend", "issues": 1, "open": 1},
+            {"name": "ux", "issues": 1, "open": 1}
+        ])
+    );
+    let (_, text, _) = env.gm_with(
+        &["issue", "tags"],
+        &["--owner", "orbit", "--output", "text"],
+    );
+    assert!(
+        text.as_str().unwrap().contains("ux        1 issue, 1 open"),
+        "{text}"
+    );
+
+    for (flag, new) in [("--tag", "api"), ("--label", "web")] {
+        let (code, created) = env.gm(&[
+            "issue", "create", "Tagged", "--team", "ENG", flag, "ux", flag, new,
+        ]);
+        assert_eq!(code, 0, "{created}");
+        let sent = env.api.mutations().pop().unwrap();
+        assert_eq!(sent["data"]["labels"], json!(["ux", new]), "{flag}");
+        assert!(sent["data"].get("tags").is_none());
+        // A new name joins the catalog, and the result says so.
+        assert_eq!(created["tagCatalog"]["added"], json!([new]), "{created}");
+    }
+
+    // --tag adds and --drop-tag removes, keeping the issue's other tags.
+    let (code, edited) = env.gm(&[
+        "issue",
+        "update",
+        "ENG-1",
+        "--tag",
+        "data",
+        "--drop-tag",
+        "FRONTEND",
+    ]);
+    assert_eq!(code, 0, "{edited}");
+    assert_eq!(
+        env.api.mutations().pop().unwrap()["data"],
+        json!({"labels": ["ux", "data"]})
+    );
+    // The replica took the server's reply, so the next edit starts from it.
+    let (code, _) = env.gm(&["issue", "update", "ENG-1", "--label", "api"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        env.api.mutations().pop().unwrap()["data"],
+        json!({"labels": ["ux", "data", "api"]})
+    );
+
+    for data in [
+        r#"{"tags":["data"]}"#,
+        r#"{"labels":["data"]}"#,
+        r#"{"tags":["data"],"labels":["data"]}"#,
+    ] {
+        let (code, out) = env.gm(&["issue", "update", "ENG-1", "--data", data]);
+        assert_eq!(code, 0, "{data}: {out}");
+        assert_eq!(
+            env.api.mutations().pop().unwrap()["data"],
+            json!({"labels": ["data"]})
+        );
+    }
+    let before = env.api.mutations().len();
+    let (code, both) = env.gm(&[
+        "issue",
+        "update",
+        "ENG-1",
+        "--data",
+        r#"{"tags":["a"],"labels":["b"]}"#,
+    ]);
+    assert_eq!(code, 2, "{both}");
+    assert!(
+        both["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tags or labels"),
+        "{both}"
+    );
+    let (code, mixed) = env.gm(&[
+        "issue",
+        "update",
+        "ENG-1",
+        "--tag",
+        "a",
+        "--data",
+        r#"{"tags":["b"]}"#,
+    ]);
+    assert_eq!(code, 2, "{mixed}");
+    assert_eq!(env.api.mutations().len(), before);
+}
+
+/// CORE-271: `tag:` requirements and agent tags come from the tracker's tag catalog;
+/// a name it lacks warns with the nearest one and is still sent, never refused.
+#[test]
+fn unknown_catalog_tags_warn_and_never_fail() {
+    let env = Env::new();
+    let (code, out, stderr) = env.gm_with(
+        &["issue", "update", "ENG-1", "--requires", "tag:uxx tag:data"],
+        &["--owner", "orbit", "--output", "json"],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        stderr.contains(r#"tag "uxx" isn't in orbit's tag catalog (did you mean "ux"?)"#),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(r#"tag "data""#), "{stderr}");
+    assert_eq!(
+        out["tagCatalog"]["unknownRequired"],
+        json!([{"tag": "uxx", "suggestion": "ux"}])
+    );
+    assert_eq!(
+        env.api.mutations().pop().unwrap()["data"]["requires"],
+        json!({"tags": ["uxx", "data"]})
+    );
+
+    // An agent's tags: the catalog suggests names, and an unknown one is kept with a warning.
+    let (code, used, _) = env.gm_with(&["tracker", "use", "orbit"], &["--output", "json"]);
+    assert_eq!(code, 0, "{used}");
+    let (code, configured, stderr) = env.gm_with(
+        &[
+            "agent",
+            "configure",
+            "--tag",
+            "frontnd",
+            "--tag",
+            "ux",
+            "--runtime",
+            "host",
+        ],
+        &["--output", "json"],
+    );
+    assert_eq!(code, 0, "{configured} {stderr}");
+    assert!(
+        stderr.contains(r#"tag "frontnd" isn't in orbit's tag catalog (did you mean "frontend"?)"#),
+        "{stderr}"
+    );
+    assert_eq!(
+        configured["agent"]["capabilities"]["tags"],
+        json!(["frontnd", "ux"])
+    );
+    assert_eq!(
+        configured["tagCatalog"]["suggestions"],
+        json!(["frontend", "data"])
     );
 }

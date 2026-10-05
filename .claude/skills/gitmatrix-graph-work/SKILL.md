@@ -21,6 +21,20 @@ do is attributed to the agent and names your person as accountable.
 notes it doesn't, or `gm agent show` lists another model than the one you run,
 record yours with `gm agent configure --model <model-id>`.
 
+## Pickup policy
+
+Read `pickup` in `gm issue show` before work. `anyone` is the default, including
+older issues. `not_ready` means nobody may claim or start yet; `human_only`
+means an authenticated person must do the work, never an agent. Agent `ready`
+and `next` exclude both. Assignment, delegation, capability overrides, direct
+status updates and completion do not bypass this policy.
+
+Use `gm issue create|update --pickup anyone|not_ready|human_only` to record it.
+An agent may restrict `anyone` but only a person can change an existing
+restricted policy. Ask the person to do the work or change the policy; never
+switch credentials to evade it. Release an incompatible active claim before
+restricting pickup. Policy is global across timelines, not a branch-local override.
+
 ## The loop
 
 1. **Take work.** `gm issue next` picks the best ready issue in scope and claims
@@ -100,11 +114,12 @@ person approval for the exact current checkpoint when policy is `approval`.
 
 ## Creating properly tagged issues
 
-When creating an issue, read its scope and acceptance criteria and label the
+When creating an issue, read its scope and acceptance criteria and tag the
 expertise needed to implement and verify it, not the agent you hope will take it.
-Use a small, relevant set of work-area labels; do not copy every label from its
-parent onto each child. Reuse the team's established spelling. Where the team
-has no convention, use these lowercase defaults:
+Use a small, relevant set of work-area tags; do not copy every tag from its
+parent onto each child. Tags come from the tracker's tag catalog, which keeps
+every tag ever used: `gm issue tags` lists it with counts. Reuse its spelling.
+Where the tracker has no convention yet, use these lowercase defaults:
 
 - `ux`: user research, interaction design and usability.
 - `frontend`: browser UI, styling and client-side behavior.
@@ -117,28 +132,29 @@ has no convention, use these lowercase defaults:
 - `infrastructure`: deployment, CI/CD, networking and runtime operations.
 - `documentation`: user or developer documentation.
 
-These are suggested values for the existing issue `labels` field, not a
-registered catalog or an enforced list. Use an established project-specific
-label when needed; avoid synonyms, case variants and speculative areas. For
-example, a keyboard-navigation fix needs `ux` and `frontend`; a service schema
-migration needs `backend` and `data`. Do not add `architecture` to every code
-change or `testing` merely because every issue should be verified.
+A new name joins the catalog; avoid synonyms, case variants and speculative
+areas. For example, a keyboard-navigation fix needs `ux` and `frontend`; a
+service schema migration needs `backend` and `data`. Do not add `architecture`
+to every code change or `testing` merely because every issue should be verified.
 
-Repeat `--label` when creating an issue (it is not `--tag`):
+Repeat `--tag` when creating an issue:
 
-    gm issue create 'Fix keyboard navigation in search' --team ENG --type bug --label ux --label frontend
-    gm issue show ENG-1 --json
+    gm issue create 'Fix keyboard navigation in search' --team ENG --type bug --tag ux --tag frontend
+    gm issue show ENG-1
 
 Replace `ENG` with the actual team, and `ENG-1` with the returned issue key;
-check the returned `labels` before handing off. For existing issues,
-`gm issue update ENG-1 --data '{"labels":["ux","frontend"]}'` replaces the whole
-label list, so preserve unrelated labels you still need.
+check its Tags line before handing off. For existing issues, `gm issue update
+ENG-1 --tag data --drop-tag backend` adds and removes one tag, and
+`--data '{"tags":["ux","frontend"]}'` replaces the whole list. (`--label` and
+`labels` are the old spellings and still work; the JSON field is `labels`.)
 
-Issue labels describe work. Agent profile tags and skills describe self-reported
-capabilities: they are separate, advisory hints for delegation, not verified
-expertise or claim restrictions. Compare the required work with the agent's
-profile and available evidence; never infer or publish an agent capability just
-because it created or claimed a labeled issue.
+One vocabulary, three roles. An issue's tags describe the work. An agent's tags
+(`gm agent setup --tag ux`, from the same catalog) say what work it suits. A
+requirement `tag:ux` (`--requires`) means only agents tagged ux may claim the
+issue; tagging an issue never restricts claims by itself. Agent profiles are
+self-reported, advisory hints for delegation, not verified expertise. Compare
+the required work with the agent's profile and available evidence; never infer
+or publish an agent's tags just because it created or claimed a tagged issue.
 
 ## Human intervention
 

@@ -388,12 +388,20 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
 
     let report = report(&files);
     let intervention = profile::intervention(&project, &local);
+    // Agent tags come from the tracker's tag catalog (CORE-271): warn, never refuse.
+    let tag_check = if o.no_identity {
+        Value::Null
+    } else {
+        let owner = local.scope.owner.clone().or(project.tracker.owner.clone());
+        super::agents::tag_check(&Config::load(), owner.as_deref(), &local.tags)
+    };
     let value = json!({
         "dryRun": ctx.dry_run,
         "agent": name,
         "harness": harness,
         "model": local.model,
         "tags": local.tags,
+        "tagCatalog": tag_check,
         "scope": scope(&project, &local),
         "intervention": intervention,
         "identity": identity,
@@ -414,6 +422,10 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
     if let Some(profile) = identity["profile"].as_str() {
         text.push_str(&format!("  profile: {profile}\n"));
     }
+    if !local.tags.is_empty() {
+        text.push_str(&format!("  tags: {}\n", local.tags.join(", ")));
+    }
+    text.push_str(&super::agents::tag_check_text(&tag_check));
     if let Some(skills) = identity["skills"].as_array() {
         let names: Vec<&str> = skills.iter().filter_map(Value::as_str).collect();
         text.push_str(&format!(

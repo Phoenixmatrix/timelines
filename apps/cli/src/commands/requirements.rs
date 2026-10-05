@@ -455,9 +455,96 @@ pub fn unmet(requires: &Value, capabilities: &Value) -> Vec<Value> {
     out
 }
 
+/// Tags checked against a tracker's tag catalog (CORE-271): each tag the catalog
+/// doesn't have (ignoring case), with the closest catalog name when one is near.
+/// Unknown tags are warned about, never refused.
+pub fn unknown_tags(tags: &[String], catalog: &[String]) -> Vec<Value> {
+    tags.iter()
+        .filter(|tag| !catalog.iter().any(|name| name.eq_ignore_ascii_case(tag)))
+        .map(|tag| json!({ "tag": tag, "suggestion": closest(tag, catalog) }))
+        .collect()
+}
+
+/// The catalog name nearest `tag` by edit distance, when it's close enough to be a
+/// likely typo or variant (at most a third of the longer name, and at least 1).
+pub fn closest<'a>(tag: &str, catalog: &'a [String]) -> Option<&'a str> {
+    let tag = tag.to_lowercase();
+    catalog
+        .iter()
+        .map(|name| (edit_distance(&tag, &name.to_lowercase()), name))
+        .filter(|(d, name)| *d <= (tag.chars().count().max(name.chars().count()) / 3).max(1))
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, name)| name.as_str())
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let current = row[j + 1];
+            row[j + 1] = (previous + usize::from(ca != *cb))
+                .min(row[j] + 1)
+                .min(current + 1);
+            previous = current;
+        }
+    }
+    row[b.len()]
+}
+
+/// "tag \"uxx\" isn't in orbit's tag catalog (did you mean \"ux\"?)": one warning line.
+pub fn unknown_tag_warning(unknown: &Value, owner: &str) -> String {
+    let tag = unknown["tag"].as_str().unwrap_or("");
+    match unknown["suggestion"].as_str() {
+        Some(near) => {
+            format!("tag \"{tag}\" isn't in {owner}'s tag catalog (did you mean \"{near}\"?)")
+        }
+        None => format!("tag \"{tag}\" isn't in {owner}'s tag catalog"),
+    }
+}
+
+/// The `tag:` values of stored requirements.
+pub fn required_tags(requires: &Value) -> Vec<String> {
+    requires["tags"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_tags_warn_with_the_closest_catalog_name() {
+        let catalog: Vec<String> = ["ux", "frontend", "data", "Security"]
+            .map(String::from)
+            .to_vec();
+        let tags: Vec<String> = ["UX", "frontned", "security", "gpu", "uxx"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            unknown_tags(&tags, &catalog),
+            vec![
+                json!({"tag": "frontned", "suggestion": "frontend"}),
+                json!({"tag": "gpu", "suggestion": null}),
+                json!({"tag": "uxx", "suggestion": "ux"}),
+            ]
+        );
+        assert_eq!(
+            unknown_tag_warning(&unknown_tags(&tags, &catalog)[0], "orbit"),
+            "tag \"frontned\" isn't in orbit's tag catalog (did you mean \"frontend\"?)"
+        );
+        assert!(unknown_tags(&tags, &[]).len() == 5);
+        assert_eq!(
+            required_tags(&json!({"tags": ["ux"], "models": ["x"]})),
+            ["ux"]
+        );
+    }
 
     fn caps() -> Value {
         json!({

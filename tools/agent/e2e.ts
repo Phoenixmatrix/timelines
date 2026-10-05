@@ -868,6 +868,75 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     });
   });
 
+  await scenario("tags-one-vocabulary-and-old-spellings", async () => {
+    // CORE-271: issue tags from the tracker's tag catalog through the real gm and
+    // API, with every old spelling kept: --label, `labels` in --data and the API,
+    // and label: in search.
+    const owner = fixtures.tracker.owner;
+    const key = `T${randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase()}`;
+    const suffix = randomUUID().slice(0, 6);
+    const [ux, data] = [`ux-${suffix}`, `data-${suffix}`];
+    await json(`/api/tracker/${owner}/mutate`, ownerToken, "POST", {
+      operationId: randomUUID(),
+      mutations: [{ kind: "team.create", id: randomUUID(), data: { key, name: "Tags" } }],
+    });
+    const create = async (title: string, flag: string, tag: string) =>
+      JSON.parse(
+        await gm(["issue", "create", title, "--team", key, flag, tag, "--owner", owner]),
+      ) as { entities: { id: string; labels: string[] }[]; tagCatalog?: { added: string[] } };
+    const tagged = await create("Tagged with --tag", "--tag", ux);
+    assert.deepEqual(tagged.entities[0]!.labels, [ux]);
+    assert.deepEqual(tagged.tagCatalog?.added, [ux]);
+    const old = await create("Tagged with --label", "--label", data);
+    assert.deepEqual(old.entities[0]!.labels, [data]);
+    const id = old.entities[0]!.id;
+    await gm(["issue", "update", id, "--tag", ux, "--owner", owner]);
+    await gm([
+      "issue",
+      "update",
+      id,
+      "--data",
+      JSON.stringify({ tags: [data, ux] }),
+      "--owner",
+      owner,
+    ]);
+    const shown = await gm(["issue", "show", id, "--owner", owner, "--output", "text"]);
+    assert.match(shown, new RegExp(`Tags: ${data}, ${ux}\n`));
+    // The API takes `tags` and still `labels`; the catalog lists both with counts.
+    const snapshot = await json<{ issues: { id: string; version: number; labels: string[] }[] }>(
+      `/api/tracker/${owner}/snapshot`,
+      ownerToken,
+    );
+    const issue = snapshot.issues.find((i) => i.id === id)!;
+    await json(`/api/tracker/${owner}/mutate`, ownerToken, "POST", {
+      operationId: randomUUID(),
+      mutations: [
+        { kind: "issue.update", id, expectedVersion: issue.version, data: { labels: [data] } },
+      ],
+    });
+    const catalog = await json<{ tags: { name: string; issues: number; open: number }[] }>(
+      `/api/tracker/${owner}/tags`,
+      ownerToken,
+    );
+    assert.deepEqual(
+      catalog.tags.filter((t) => t.name.endsWith(suffix)),
+      [
+        { name: data, issues: 1, open: 1 },
+        { name: ux, issues: 1, open: 1 },
+      ],
+    );
+    const listed = JSON.parse(await gm(["issue", "tags", "--owner", owner])) as {
+      tags: { name: string }[];
+    };
+    assert(listed.tags.some((t) => t.name === ux) && listed.tags.some((t) => t.name === data));
+    // An unknown tag: requirement warns and is still saved.
+    const required = JSON.parse(
+      await gm(["issue", "update", id, "--requires", `tag:${ux}x`, "--owner", owner]),
+    ) as { tagCatalog: { unknownRequired: { tag: string; suggestion: string | null }[] } };
+    assert.deepEqual(required.tagCatalog.unknownRequired, [{ tag: `${ux}x`, suggestion: ux }]);
+    record({ tags: [ux, data], aliases: ["--label", "labels", "tags"] });
+  });
+
   await scenario("agent-durable-interventions-and-resume", async () => {
     const owner = fixtures.tracker.owner;
     const directory = join(work, "autonomous-agent");

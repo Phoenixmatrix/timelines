@@ -115,7 +115,7 @@ function Sidebar({
       {(["daily", "tag"] as const).map((kind) => (
         <section key={kind} className="mb-5">
           <h2 className="mx-2.5 mt-0 mb-2 text-body-sm font-semibold">
-            {kind === "daily" ? "Daily updates" : "Tags"}
+            {kind === "daily" ? "Daily updates" : "Tagged releases"}
           </h2>
           <ul className="m-0 flex list-none flex-col gap-0.5 p-0">
             {index.releases
@@ -345,8 +345,8 @@ export function Releases() {
           )}
           <RailSection title="Code update history">
             <p className="m-0 text-body-sm text-ink-muted">
-              Daily updates group default-branch first-parent commits by UTC Git commit date. Tags
-              are optional named snapshots. Neither records a deployment.
+              Daily updates group default-branch first-parent commits by UTC Git commit date. Tagged
+              releases are optional named snapshots, one per Git tag. Neither records a deployment.
             </p>
           </RailSection>
           <p className="m-0 border-t border-line-soft pt-3 text-micro text-ink-faint">

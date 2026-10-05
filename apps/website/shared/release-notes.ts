@@ -189,6 +189,9 @@ export interface ReleaseFeed {
     repos: ReleaseFeedFacet[];
     workspaces: ReleaseFeedFacet[];
     categories: ReleaseFeedFacet[];
+    /** The entries' issue tags (absent from servers before CORE-271: read `labels`). */
+    tags?: ReleaseFeedFacet[];
+    /** The same as `tags`, under its old name (CORE-271): kept for older clients. */
     labels: ReleaseFeedFacet[];
     releases: ReleaseFeedFacet[];
     /** Timelines the entries landed with, by slug. */
@@ -201,7 +204,7 @@ export const RELEASE_QUERY_KEYS = [
   "repo",
   "ws",
   "type",
-  "label",
+  "tag",
   "release",
   "kind",
   "timeline",
@@ -212,7 +215,10 @@ export type ReleaseQueryKey = (typeof RELEASE_QUERY_KEYS)[number];
 const RELEASE_QUERY_ALIASES: Record<string, ReleaseQueryKey> = {
   workspace: "ws",
   category: "type",
-  tag: "release",
+  // `label:` is the old name of `tag:` (CORE-271).
+  label: "tag",
+  labels: "tag",
+  tags: "tag",
 };
 
 export interface ParsedReleaseQuery {
@@ -223,9 +229,12 @@ export interface ParsedReleaseQuery {
 
 /**
  * The release feed's query language, like the tracker's: `team:core repo:engine
- * ws:platform type:fix label:web release:v1.2 since:2026-09-01 until:30d search
+ * ws:platform type:fix tag:web release:v1.2 since:2026-09-01 until:30d search
  * words`, any filter negated with a leading `-`, values quoted when they contain
- * spaces. `release:day:2026-10-02` selects a UTC day; `kind:tag` selects named tags;
+ * spaces. `tag:` is an issue tag (`label:` still works). `release:day:2026-10-02`
+ * selects a UTC day; `kind:tag` selects tagged releases. Before CORE-271 `tag:`
+ * meant `release:`; `tag:day:…` still does, and so does a `tag:` naming a
+ * release the feed has (buildFeed);
  * `timeline:search` what landed with the timeline whose bookmark is `timeline/search`.
  */
 export function parseReleaseQuery(query: string): ParsedReleaseQuery {
@@ -247,8 +256,11 @@ export function parseReleaseQuery(query: string): ParsedReleaseQuery {
       continue;
     }
     let value = filter[3].toLowerCase();
-    if (key === "release") value = releaseName(value);
-    parsed.filters.push({ key, value, negated: filter[1] === "-" });
+    let resolved = key;
+    // The old spelling of a daily release: `tag:day:2026-09-21`.
+    if (key === "tag" && name === "tag" && /^@?day:/.test(value)) resolved = "release";
+    if (resolved === "release") value = releaseName(value);
+    parsed.filters.push({ key: resolved, value, negated: filter[1] === "-" });
   }
   return parsed;
 }

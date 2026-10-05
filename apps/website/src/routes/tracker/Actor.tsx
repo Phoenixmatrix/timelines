@@ -10,13 +10,13 @@ function described(who: Attribution): string {
     return `${who.name} · Agent${who.person ? ` · Accountable: ${who.person.displayName}` : ""}`;
   }
   if (!who.person || who.kind === "person") return who.name;
-  return `${who.person.displayName} · ${who.name}`;
+  return `${who.person.displayName} · Session ${who.name}`;
 }
 
 /**
  * The person's monogram, an agent robot badge, and one primary name. Ownership
  * stays in the monogram, tooltip and accessible text instead of repeated prose.
- * `compact` hides session labels; `face` keeps only the identity icons.
+ * `compact` hides session names; `face` keeps only the identity icons.
  * `link` makes a person (or their own session) a link to their profile; an
  * agent never is. Only pass it where the actor isn't inside another link or
  * button.

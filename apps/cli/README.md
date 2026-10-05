@@ -146,11 +146,12 @@ gm release notes day:2026-10-02 --internal -o json
 ```
 
 `gm release feed` reads a tracker account's daily code updates across repositories,
-latest commit first. Named tags are excluded by default to avoid counting the
-same changes twice; use `kind:tag` or a positive `release:v1.2.0` filter to select
-them. `release:day:2026-10-02` selects a UTC day. `--team KEY` narrows the feed to
-one team; other filters include `type:fix repo:engine since:30d`, `-label:docs`,
-and search words. The account comes from `--owner`, else `gm tracker use`.
+latest commit first. Tagged releases (Git tags) are excluded by default to avoid
+counting the same changes twice; use `kind:tag` or a positive `release:v1.2.0`
+filter to select them. `release:day:2026-10-02` selects a UTC day. `--team KEY`
+narrows the feed to one team; other filters include `type:fix repo:engine
+since:30d`, `-tag:docs` (issue tags; `label:` is the old spelling), and search
+words. The account comes from `--owner`, else `gm tracker use`.
 Internal entries are left out unless you pass `--internal` or a `type:` filter.
 
 ```sh
@@ -231,11 +232,12 @@ gm tracker use orbit
 gm team create ENG --name Engineering
 gm workspace create launch --name Launch
 gm issue create 'Search redesign' --team ENG --type prd \
-  --description-file design.md --acceptance-file acceptance.md --workspace launch --label ux --label frontend
+  --description-file design.md --acceptance-file acceptance.md --workspace launch --tag ux --tag frontend
 gm issue ready --limit 10
 gm issue ready --type remediation --all-teams
 gm issue show ENG-1 --limit 20
-gm issue update ENG-1 --data '{"priority":1,"labels":["search"]}'
+gm issue update ENG-1 --data '{"priority":1}' --tag search
+gm issue tags                            # the tracker's tag catalog, with counts
 gm issue link ENG-1 ENG-2 --kind blocks  # FROM blocks TO
 gm issue checkpoint ENG-1 '@checkpoint.md'
 gm issue evidence ENG-1 'Verified search with the integration smoke'
@@ -251,14 +253,25 @@ accept `-` for stdin (one field at a time); patch and batch JSON accept `@file` 
 an authoritative permission, graph or lease validation. Tracker changes are **not**
 reversed by `gm undo`.
 
-Label issues by the expertise their scope requires, using repeated `--label`
-flags. Follow the team's vocabulary; otherwise use the defaults explained by
-`gm cli guide` and the installed graph-work skill: `ux`, `frontend`, `backend`,
-`data`, `architecture`, `api`, `security`, `testing`, `infrastructure` and
+Tag issues by the expertise their scope requires, using repeated `--tag` flags
+(`--label` is the old spelling and still works). Tags come from the tracker's
+**tag catalog**: every tag used in the tracker, kept after its last use, listed
+by `gm issue tags` and suggested on the web. Reuse its spelling; a new name joins
+it. In a new tracker, start from the defaults explained by `gm cli guide` and
+the installed graph-work skill: `ux`, `frontend`, `backend`, `data`,
+`architecture`, `api`, `security`, `testing`, `infrastructure` and
 `documentation`. Pick only relevant areas, not every area touched by routine
-verification. These are suggested free-form issue labels, not a registered
-catalog or claim restrictions. Updating `labels` replaces the whole list. To
-restrict which agents may claim an issue, use requirements (below).
+verification. `gm issue update --tag NAME` adds one and `--drop-tag NAME`
+removes one; `tags` in `--data` replaces the whole list (`labels`, the stored
+field's name, still works). `gm issue show` prints a Tags line.
+
+The same catalog serves three roles: an **issue's tags** say what the work is
+about; an **agent's tags** (`gm agent setup --tag ux`) say what work it suits;
+a **requirement** `tag:ux` means only agents tagged ux may claim the issue.
+Tagging an issue never restricts claims by itself. gm warns, and never refuses,
+when an agent tag or a `tag:` requirement isn't in the catalog, and suggests the
+nearest name. To restrict which agents may claim an issue, use requirements
+(below).
 
 ### Pickup: whether work may start
 
@@ -459,7 +472,7 @@ sections and advisory readiness; only an online claim grants exclusive work.
 
 The server automatically assigns an unassigned issue to the identity holding
 its claim, including `next` and delegated claims. For an authenticated agent,
-that is the agent—not its accountable person or the `--agent` session label.
+that is the agent—not its accountable person or the `--agent` session name.
 Existing assignees are preserved; ending a claim does not clear assignment.
 Automatic assignment follows the same membership rules as explicit assignment.
 Even a tracker admin cannot claim unassigned work in a restricted team unless
@@ -548,7 +561,7 @@ gm agent setup --check                           # exit 4 if instructions or ski
   (`gm auth status` shows `actingAs`); in your own terminal you stay yourself,
   and `GM_TOKEN` always wins. Run by the agent, it refreshes its own profile.
   `--no-identity` writes only the files.
-- **Defaults.** `gm issue next` and `claim` take the session label, scope and
+- **Defaults.** `gm issue next` and `claim` take the session name, scope and
   lease length from these files, and the tracker owner when none is selected.
   `next` only picks issues whose requirements the agent's published profile
   meets (see "Requirements").

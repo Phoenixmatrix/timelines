@@ -52,7 +52,7 @@ const labels: Record<string, string> = {
   assigneeId: "Assignee",
   parentId: "Parent issue",
   workspaceIds: "Workspaces",
-  labels: "Labels",
+  labels: "Tags",
   requires: "Agent requirements",
   body: "Body",
   fromId: "From issue",

@@ -16,7 +16,11 @@ test("requirements: edit them in the inspector and see eligibility per agent", a
     operationId: crypto.randomUUID(),
     mutations: [
       { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } },
-      { kind: "issue.create", id: "board", data: { teamId: "team", title: "Redesign the board" } },
+      {
+        kind: "issue.create",
+        id: "board",
+        data: { teamId: "team", title: "Redesign the board", labels: ["ux"] },
+      },
       { kind: "issue.create", id: "plain", data: { teamId: "team", title: "Fix the typo" } },
     ],
   });
@@ -97,4 +101,98 @@ test("requirements: edit them in the inspector and see eligibility per agent", a
   await expect
     .element(work.getByRole("link"))
     .toHaveAttribute("href", `/tracker/orbit?q=${encodeURIComponent("is:open eligible:designer")}`);
+});
+
+test("tags: one catalog for issues, agents and requirements, with label: as an alias (CORE-271)", async () => {
+  const server = await TestServer.start({ world: true });
+  await server.call("POST", "/api/tracker/orbit/mutate", {
+    operationId: crypto.randomUUID(),
+    mutations: [
+      { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } },
+      // `tags` is the name people see; `labels`, the stored field, still works.
+      {
+        kind: "issue.create",
+        id: "board",
+        data: { teamId: "team", title: "Redesign the board", tags: ["ux", "frontend"] },
+      },
+      {
+        kind: "issue.create",
+        id: "rollup",
+        data: { teamId: "team", title: "Roll up", labels: ["data"] },
+      },
+    ],
+  });
+  await server.call("POST", "/api/agents", {
+    name: "designer",
+    capabilities: {
+      version: 1,
+      harness: "claude-code",
+      model: "claude-opus-4-5",
+      environment: {
+        os: "linux",
+        arch: "x86_64",
+        runtime: "host",
+        cpuCount: 8,
+        memoryBytes: 8 * GiB,
+      },
+      tags: ["ux", "desgin"],
+      skills: [],
+    },
+  });
+  const catalog = await server.call<{ tags: { name: string; open: number }[] }>(
+    "GET",
+    "/api/tracker/orbit/tags",
+  );
+  expect(catalog.tags.map((t) => [t.name, t.open])).toEqual([
+    ["data", 1],
+    ["frontend", 1],
+    ["ux", 1],
+  ]);
+
+  const app = renderApp("/tracker/orbit/issues/board");
+  // The inspector shows the issue's tags as issue-tag chips.
+  await expect.element(page.getByLabelText("Tag frontend")).toBeVisible();
+  const section = page.getByRole("region", { name: "Agent requirements" });
+  const input = page.getByRole("textbox", { name: "Add requirements" });
+  const suggestions = page.getByRole("group", { name: "Tags from this tracker's catalog" });
+  await expect.element(suggestions).toMatchTextContent(/tag:data.*tag:frontend.*tag:ux/);
+  // Typing narrows the catalog, and choosing one completes the term.
+  await userEvent.fill(input, "model:claude-* tag:fr");
+  await expect.element(suggestions).toMatchTextContent(/^From the tag catalogtag:frontend$/);
+  await expect.element(section).not.toMatchTextContent(/isn't in this tracker's tag catalog/);
+  await userEvent.click(suggestions.getByRole("button", { name: "tag:frontend" }));
+  await expect.element(input).toHaveValue("model:claude-* tag:frontend ");
+  // A name the catalog lacks warns, and can still be added.
+  await userEvent.fill(input, "tag:desgin");
+  await expect
+    .element(section)
+    .toMatchTextContent(/tag:desgin isn't in this tracker's tag catalog\. You can still add it/);
+  await userEvent.click(section.getByRole("button", { name: "Add" }));
+  const chips = page.getByRole("list", { name: "Requirements" });
+  await expect.element(chips).toMatchTextContent(/tag:desgin, not in this tracker's tag catalog/);
+
+  // Search: tag: and its old spelling label: find the same issues.
+  for (const spelling of ["tag", "label"]) {
+    await app.navigate(`/tracker/orbit?q=${encodeURIComponent(`is:open ${spelling}:ux`)}`);
+    const rows = page.getByRole("table", { name: "Issues" });
+    await expect.element(rows.getByRole("row", { name: /ENG-1/ })).toBeVisible();
+    await expect.poll(() => rows.getByRole("row", { name: /ENG-2/ }).elements()).toHaveLength(0);
+    await expect
+      .element(page.getByRole("region", { name: "Tag" }).getByRole("button", { name: /^ux/ }))
+      .toHaveAttribute("aria-pressed", "true");
+  }
+
+  // Settings > Agents: agent tags link to the tracker's issues with that tag; a
+  // name no catalog has is flagged, not refused.
+  await app.navigate("/settings/agents");
+  const tags = page.getByRole("list", { name: "Agent tags" });
+  await expect
+    .element(tags.getByRole("link", { name: /Agent tag ux/ }))
+    .toHaveAttribute("href", `/tracker/orbit?q=${encodeURIComponent("is:open tag:ux")}`);
+  await expect
+    .element(tags.getByLabelText("Agent tag desgin, not in any tracker's tag catalog"))
+    .toBeVisible();
+  await expect
+    .element(page.getByText(/desgin isn't in any of your trackers' tag catalogs/))
+    .toBeVisible();
 });

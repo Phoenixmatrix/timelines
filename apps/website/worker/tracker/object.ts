@@ -108,6 +108,10 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   openRequests() {
     return this.reply(() => this.store.openRequests());
   }
+  /** The tag catalog with usage counts (CORE-271). */
+  tagCatalog() {
+    return this.reply(() => this.store.tagCatalog());
+  }
   subscribedWorkspaces(repoId: string) {
     return this.reply(() => this.store.subscribedWorkspaces(repoId));
   }

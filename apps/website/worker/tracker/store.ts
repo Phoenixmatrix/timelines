@@ -29,6 +29,7 @@ import {
   type MutationResult,
   type Snapshot,
   type Subscription,
+  type TagCatalogEntry,
   type Team,
   type TrackerAgent,
   TIMELINE_FEED_TYPES,
@@ -144,6 +145,17 @@ function object(value: unknown): Record<string, unknown> {
 function keys(value: Record<string, unknown>, allowed: string[]) {
   for (const key of Object.keys(value))
     if (!allowed.includes(key)) fail("invalid_input", `Unknown field: ${key}.`);
+}
+/**
+ * An issue's tags are stored as `labels` (CORE-271): writers may send `tags`,
+ * the name people see, and the old `labels` keeps working. Both at once must agree.
+ */
+function issueTagsAlias(data: Record<string, unknown>) {
+  if (!("tags" in data)) return;
+  if ("labels" in data && JSON.stringify(data.labels) !== JSON.stringify(data.tags))
+    fail("invalid_input", "Give tags or labels (its old name), not both.");
+  data.labels = data.tags;
+  delete data.tags;
 }
 export function text(value: unknown, name: string, max = 200, empty = false): string {
   if (
@@ -698,6 +710,26 @@ export class TrackerStore {
         tracker.selectFrom("timeline_events").select(["seq", "data"]).orderBy("seq"),
       ).map((row) => ({ ...JSON.parse(row.data), seq: row.seq }) as TimelineEvent),
     };
+  }
+  /**
+   * The tracker's tag catalog (CORE-271): every tag defined here, kept after
+   * its last use, and how many of main's issues (and open ones) carry it now.
+   * Agents' tags and requirement `tag:` values are suggested from it.
+   */
+  tagCatalog(): TagCatalogEntry[] {
+    const counts = new Map<string, { issues: number; open: number }>();
+    for (const issue of this.all<Issue>("issue")) {
+      const open = issue.status !== "done" && issue.status !== "canceled";
+      for (const name of new Set(issue.labels)) {
+        const count = counts.get(name) ?? { issues: 0, open: 0 };
+        count.issues++;
+        if (open) count.open++;
+        counts.set(name, count);
+      }
+    }
+    return all(this.sql, tracker.selectFrom("tracker_labels").select("name"))
+      .map((row) => ({ name: row.name, ...(counts.get(row.name) ?? { issues: 0, open: 0 }) }))
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
   /** Open requests to people, with the issue each is about. */
   openRequests(): { request: HumanRequest; issue: Pick<Issue, "id" | "key" | "title"> }[] {
@@ -2198,6 +2230,7 @@ export class TrackerStore {
         case "issue.create":
         case "issue.update": {
           const creating = mutation.kind === "issue.create";
+          issueTagsAlias(data);
           keys(data, [
             "title",
             "description",

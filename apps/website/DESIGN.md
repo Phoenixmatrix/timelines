@@ -170,9 +170,9 @@ The assistant composer starts at one row for short prompts, grows to a capped he
 
 ### Navigation and metadata
 
-Navigation uses links; view toggles use pressed buttons. Workspace names are underlined links in labelled metadata, while labels remain inert tags. Repeated actions name their issue, repository or workspace in accessible labels.
+Navigation uses links; view toggles use pressed buttons. Workspace names are underlined links in labelled metadata, while issue tags stay inert chips. Repeated actions name their issue, repository or workspace in accessible labels.
 
-Same-origin absolute links in tracker Markdown use client-side navigation; external links, modified clicks, relative links and fragments retain browser behavior. Tracker search treats bare numbers and full issue keys as exact ticket lookups, even when quoted; other words and quoted phrases search keys, titles and labels. Keep filter and exclusion semantics intact.
+Same-origin absolute links in tracker Markdown use client-side navigation; external links, modified clicks, relative links and fragments retain browser behavior. Tracker search treats bare numbers and full issue keys as exact ticket lookups, even when quoted; other words and quoted phrases search keys, titles and tags. Keep filter and exclusion semantics intact.
 
 ### Issue selection and handoff
 
@@ -180,7 +180,7 @@ A selected issue row uses a subtle amber wash. Readiness combines a text label a
 
 ### Conflict comparison
 
-Attention styling distinguishes conflicts from selection. Compare only differing fields, with readable names and Markdown, explicit per-field choices and an explicit rebase action. Group untouched remote differences under “Changed by others” without misleading choice buttons. Labels and workspace membership compare as normalized sets. The visual affordance must match data preservation: untouched remote fields remain remote, and failed saves keep the draft.
+Attention styling distinguishes conflicts from selection. Compare only differing fields, with readable names and Markdown, explicit per-field choices and an explicit rebase action. Group untouched remote differences under “Changed by others” without misleading choice buttons. Tags and workspace membership compare as normalized sets. The visual affordance must match data preservation: untouched remote fields remain remote, and failed saves keep the draft.
 
 ## Do's and Don'ts
 

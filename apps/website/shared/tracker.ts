@@ -140,7 +140,7 @@ export interface IssueClaim {
   actorId: string;
   /** The human answerable for the holder (the holder itself for a person). */
   accountableId?: string;
-  /** A label for the working session (from `gm issue claim --agent`). */
+  /** The working session's name (from `gm issue claim --agent <session name>`). */
   agent: string;
   expiresAt: string;
   /** For a delegated claim: the ancestor whose lease handed this one out. */
@@ -196,6 +196,10 @@ export interface Issue extends TrackerEntity {
   assigneeId: string | null;
   parentId: string | null;
   workspaceIds: string[];
+  /**
+   * The issue's tags, from the tracker's tag catalog. Stored and sent as
+   * `labels` (its name before CORE-271); writers may also send `tags`.
+   */
   labels: string[];
   claim: IssueClaim | null;
   /** Open requests to a person: while any is open the issue waits, whatever its status. */
@@ -318,7 +322,10 @@ export interface Snapshot {
   agents: TrackerAgent[];
   teams: Team[];
   workspaces: Workspace[];
-  /** Defined tags, shared across timelines and retained after their last use. */
+  /**
+   * The tag catalog: defined tags, shared across timelines and retained after
+   * their last use. Called `labels` on the wire, its name before CORE-271.
+   */
   labels: string[];
   issues: Issue[];
   links: Link[];
@@ -335,6 +342,14 @@ export interface Snapshot {
   /** With `timelines=1`: every timeline, and every timeline event (by `seq`). */
   timelines?: Timeline[];
   timelineEvents?: TimelineEvent[];
+}
+/** One name in a tracker's tag catalog (`GET /api/tracker/:owner/tags`, CORE-271). */
+export interface TagCatalogEntry {
+  name: string;
+  /** Issues tagged with it on main. */
+  issues: number;
+  /** Of those, the ones not done or canceled. */
+  open: number;
 }
 /** Initial browser data; repository choices are loaded only in management. */
 export interface TrackerView {
@@ -454,7 +469,11 @@ export type IssueFields = Pick<
   | "labels"
 >;
 /** Fields a create or update may set beyond the inspector's draft fields. */
-export type IssueData = Partial<IssueFields> & { requires?: IssueRequirements | null };
+export type IssueData = Partial<IssueFields> & {
+  requires?: IssueRequirements | null;
+  /** The issue's tags under the name people see; stored as `labels` (CORE-271). */
+  tags?: string[];
+};
 export type Mutation =
   | {
       kind: "team.create";
@@ -656,12 +675,12 @@ export function actorName(snapshot: Pick<Snapshot, "members" | "agents">, id: st
   return agent ? `${name} for ${agent.accountable.displayName}` : name;
 }
 
-/** Who holds a claim: an agent identity by name and human, else the session label. */
+/** Who holds a claim: an agent identity by name and human, else the session name. */
 /** Who's behind an actor or a claim, so the accountable person is visible at a glance. */
 export interface Attribution {
-  /** What to call it: an agent's name, a person's display name, or a session's label. */
+  /** What to call it: an agent's name, a person's display name, or a session's name. */
   name: string;
-  /** An agent identity, a person, or a person's own labeled working session (`--agent`). */
+  /** An agent identity, a person, or a person's own named working session (`--agent`). */
   kind: "agent" | "person" | "session";
   /** The human accountable: the agent's person, or the person themself. */
   person: TrackerIdentity | null;
@@ -675,7 +694,7 @@ export function attribution(
   const person = snapshot.members.find((m) => m.id === id) ?? null;
   return { name: person?.displayName ?? id, kind: "person", person };
 }
-/** A claim's holder: its agent, or the person with their session label when they gave one. */
+/** A claim's holder: its agent, or the person with their session name when they gave one. */
 export function claimAttribution(
   snapshot: Pick<Snapshot, "members" | "agents">,
   claim: IssueClaim,
