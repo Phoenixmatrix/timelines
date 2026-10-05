@@ -86,6 +86,7 @@ export async function chronicleScenario(t: ChronicleE2E): Promise<void> {
   t.record({ seeded: { applied: seeded.applied, showcase: show.key, run: run.number } });
 
   // The API's answer for a day around the showcase span: what the page must show.
+  // Match the page's default population: omit closed, untouched ("quiet") issues.
   const claimed = Date.parse(show.claimedAt);
   const completed = Date.parse(show.completedAt);
   const from = claimed - 10 * HOUR;
@@ -100,7 +101,6 @@ export async function chronicleScenario(t: ChronicleE2E): Promise<void> {
       to: iso(to),
       q: query,
       limit: "200",
-      quiet: "1",
     });
     if (cursor) params.set("cursor", cursor);
     const page: Chronicle = await t.json<Chronicle>(
@@ -272,8 +272,27 @@ export async function chronicleScenario(t: ChronicleE2E): Promise<void> {
           from: Date.parse(url.searchParams.get("rs")!),
           to: Date.parse(url.searchParams.get("re")!),
         };
-        await page.getByRole("link", { name: "Close the inspector" }).click();
+        assert(
+          range.from < claimed && range.to > completed,
+          "The dragged range surrounds the showcase claim and completion",
+        );
+        // The address can update before the inspector's link renders the final drag.
+        // Wait for that exact destination, rather than following an intermediate range.
+        const summaryUrl = new URL(url);
+        summaryUrl.pathname = base;
+        summaryUrl.searchParams.delete("span");
+        const closeInspector = page.getByRole("link", { name: "Close the inspector" });
+        await expect(closeInspector).toHaveAttribute(
+          "href",
+          `${summaryUrl.pathname}${summaryUrl.search}`,
+        );
+        await closeInspector.click();
+        await expect(page).toHaveURL(summaryUrl.href);
         const summary = summarize(issues, range.from, range.to, Date.parse(truth!.serverTime));
+        assert(
+          summary.completed.includes(show.id),
+          "The selected range completes the showcase issue, exercising a nonzero done count",
+        );
         const counts = page.locator("[data-chronicle-counts]");
         await expect(counts).toBeVisible();
         for (const [status, n] of Object.entries(summary.endCounts))

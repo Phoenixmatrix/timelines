@@ -48,7 +48,71 @@ import type {
   AtlasWorkspaceComposition,
 } from "../../apps/website/shared/atlas.ts";
 import { command } from "./environment.ts";
+import type { StageDefinition } from "./ai-stages.ts";
+import type { AiRun } from "./provider-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
+
+const WORKER = "apps/website/worker";
+const SRC = "apps/website/src";
+const HARNESS = "tools/agent/atlas-provider-e2e.ts";
+/** The Atlas is projected and described inside the Knowledge build. */
+const ATLAS_CORE = [
+  HARNESS,
+  `${WORKER}/atlas/**`,
+  `${WORKER}/knowledge/**`,
+  "apps/website/shared/atlas.ts",
+  `${SRC}/lib/atlas.ts`,
+  `${SRC}/routes/repo/Atlas*.tsx`,
+  `${SRC}/routes/repo/atlas*.ts`,
+];
+
+/**
+ * The Atlas stages of `vp run agent test-ai`, in execution order, and the
+ * changed paths that run each (ai-stages.ts selects them). Every stage builds
+ * on the ledger's described build, so each requires atlas-describe.
+ */
+export const ATLAS_STAGES = [
+  {
+    id: "atlas-describe",
+    covers:
+      "The ledger's two capabilities named and summarized by the default model with provenance and citations; Knowledge tab drill-through with no model call or build; per-call usage",
+    requires: [],
+    paths: ATLAS_CORE,
+  },
+  {
+    id: "atlas-workspace",
+    covers:
+      "A shop importing the ledger's published package resolves to it in the workspace Atlas, citing each repository at its own commit",
+    requires: ["atlas-describe"],
+    paths: [...ATLAS_CORE, `${SRC}/routes/atlas/**`],
+  },
+  {
+    id: "atlas-reuse",
+    covers: "A README push reuses unchanged prose and publishes within 30 s of the graph",
+    requires: ["atlas-describe"],
+    paths: ATLAS_CORE,
+  },
+  {
+    id: "atlas-disabled",
+    covers: "No priced model: summaries off, no call, structure and sources kept, honest notices",
+    requires: ["atlas-describe"],
+    paths: ATLAS_CORE,
+  },
+  {
+    id: "atlas-refused",
+    covers: "A model the provider refuses: failed calls charged once, never retried",
+    requires: ["atlas-describe"],
+    paths: ATLAS_CORE,
+  },
+  {
+    id: "atlas-exhausted",
+    covers: "A one-call build cap: one current summary, the rest budget_exhausted",
+    requires: ["atlas-describe"],
+    paths: ATLAS_CORE,
+  },
+] as const satisfies readonly StageDefinition[];
+
+type AtlasStage = (typeof ATLAS_STAGES)[number]["id"];
 
 /** A model id Workers AI does not serve: the provider refuses every call to it. */
 export const ATLAS_REFUSED_MODEL = "@cf/gitmatrix/atlas-unserved-model";
@@ -348,8 +412,13 @@ export async function runAtlasProviderE2E(
   fixtures: SeedManifest,
   evidence: Record<string, unknown>,
   /** Resolves when the Copper Finch search and assistant turns are done: they share the model rate limits. */
-  after: Promise<void> = Promise.resolve(),
+  after: Promise<void>,
+  run: AiRun,
 ): Promise<void> {
+  const want = (id: AtlasStage) => run.selection.stages.includes(id);
+  const degradedModes = (["disabled", "refused", "exhausted"] as const).filter((mode) =>
+    want(`atlas-${mode}`),
+  );
   const timings: { stage: string; elapsedMs: number; outcome: string }[] = [];
   evidence.timings = timings;
   await after;
@@ -366,15 +435,23 @@ export async function runAtlasProviderE2E(
   for (const key of Object.keys(env))
     if (/^GIT_CONFIG_(?:COUNT|KEY_|VALUE_)/.test(key)) delete env[key];
   let stage = "setup";
-  const step = async <T>(name: string, work: () => Promise<T>): Promise<T> => {
+  // `owners`: the test-ai stages a failure here is recorded against.
+  const step = async <T>(
+    name: string,
+    owners: readonly AtlasStage[],
+    work: () => Promise<T>,
+  ): Promise<T> => {
     stage = name;
     const started = Date.now();
     try {
       const result = await work();
       timings.push({ stage: name, elapsedMs: Date.now() - started, outcome: "passed" });
+      // A step named for its test-ai stage is that whole stage.
+      for (const owner of owners) if (owner === name) run.outcomes[owner] = "passed";
       return result;
     } catch (error) {
       timings.push({ stage: name, elapsedMs: Date.now() - started, outcome: "failed" });
+      for (const owner of owners) run.outcomes[owner] = "failed";
       evidence.failedStage = name;
       evidence.error = error instanceof Error ? error.message : String(error);
       throw error;
@@ -663,9 +740,12 @@ export async function runAtlasProviderE2E(
 
   try {
     // ---- 1. Repositories, the published package, and the pushes ---------------------
-    await step("atlas-setup", async () => {
+    await step("atlas-setup", ["atlas-describe"], async () => {
       const ledger = await createRepo("enabled", "priya", "lumen-ledger");
-      const shop = await createRepo("consumer", "priya", "lumen-shop");
+      // Only the selected stages' repositories: each one's build costs calls.
+      const shop = want("atlas-workspace")
+        ? await createRepo("consumer", "priya", "lumen-shop")
+        : undefined;
       // The registry names the ledger the source of `lumen-ledger` before its
       // first build, which freezes what it publishes into the snapshot.
       const tarball = join(root, "package");
@@ -710,19 +790,17 @@ export async function runAtlasProviderE2E(
         { method: "POST", body: JSON.stringify({ repo: `priya/${ledger.name}` }) },
       )) as { sources: unknown[] };
       evidence.packageSources = granted.sources;
-      await createRepo("disabled", "marco", "atlas-disabled");
-      await createRepo("refused", "jun", "atlas-refused");
-      await createRepo("exhausted", "sam", "atlas-exhausted");
+      const owners = { disabled: "marco", refused: "jun", exhausted: "sam" } as const;
+      for (const mode of degradedModes) await createRepo(mode, owners[mode], `atlas-${mode}`);
       await Promise.all([
         pushFiles(ledger, LEDGER, "Lumen Ledger: journal, accounts, rates and money"),
-        pushFiles(shop, SHOP, "Lumen Shop: checkout and receipts on the ledger"),
+        ...(shop ? [pushFiles(shop, SHOP, "Lumen Shop: checkout and receipts on the ledger")] : []),
       ]);
     });
 
     // ---- 2. The real provider, enabled ------------------------------------------------
     const ledger = repos.get("enabled")!;
-    const shop = repos.get("consumer")!;
-    const enabled = await step("atlas-enabled-build", async () => {
+    const enabled = await step("atlas-enabled-build", ["atlas-describe"], async () => {
       const build = await built(ledger);
       const stats = build.stats as {
         atlasSnapshot?: string;
@@ -750,6 +828,7 @@ export async function runAtlasProviderE2E(
       evidence.enabledBuild = {
         id: build.id,
         commit: build.toCommit,
+        knowledgeStats: build.stats,
         atlasSnapshot: stats.atlasSnapshot,
         atlasSeq: stats.atlasSeq,
         atlasTimings: stats.atlasTimings,
@@ -757,6 +836,11 @@ export async function runAtlasProviderE2E(
         atlasSpend: stats.atlasSpend,
         atlasError: stats.atlasError ?? null,
       };
+      // Retain the structural inputs before teardown, even if membership fails.
+      evidence.enabledGraph = await api(
+        `/repos/${ledger.owner}/${ledger.name}/knowledge/graph/export`,
+        tokenOf(ledger),
+      );
       assert.equal(stats.atlasError, undefined, `Atlas projection failed: ${stats.atlasError}`);
       assert(stats.atlasSnapshot && stats.atlasDescribed && stats.atlasSpend && stats.atlasTimings);
       const described = stats.atlasDescribed;
@@ -811,12 +895,17 @@ export async function runAtlasProviderE2E(
           `${entity.name}: ${entity.summary}`,
         );
         assert(inferred.sources.length > 0, "Prose rests on source files");
+        const sourceMembership = await capabilityOfFiles(
+          ledger,
+          inferred.sources.map((source) => source.path),
+        );
         for (const source of inferred.sources) {
           assert.equal(source.commit, ledger.head, "Citations are at the snapshot's commit");
           assert.equal(source.repoId, ledger.id);
-          assert(
-            paths.includes(source.path) || source.path === "index.ts",
-            `${source.path} isn't a member`,
+          assert.equal(
+            sourceMembership.get(source.path),
+            entity.id,
+            `${source.path} must be a primary member of the described capability`,
           );
           assert.match(source.blob ?? "", /^[0-9a-f]{40}$/, "Citations name the immutable blob");
         }
@@ -883,23 +972,25 @@ export async function runAtlasProviderE2E(
 
     // The degraded accounts push the same source now: its file analyses are
     // reused, so they add no analysis load, and only their Atlas step differs.
-    await step("atlas-degraded-push", async () => {
-      await Promise.all(
-        (["disabled", "refused", "exhausted"] as const).map((mode) =>
-          pushFiles(repos.get(mode)!, LEDGER, "Lumen Ledger source"),
-        ),
-      );
-      evidence.repos = Object.fromEntries(
-        [...repos].map(([mode, r]) => [
-          mode,
-          { repo: `${r.owner}/${r.name}`, id: r.id, head: r.head },
-        ]),
-      );
-    });
+    await step(
+      "atlas-degraded-push",
+      degradedModes.map((mode) => `atlas-${mode}` as const),
+      async () => {
+        await Promise.all(
+          degradedModes.map((mode) => pushFiles(repos.get(mode)!, LEDGER, "Lumen Ledger source")),
+        );
+        evidence.repos = Object.fromEntries(
+          [...repos].map(([mode, r]) => [
+            mode,
+            { repo: `${r.owner}/${r.name}`, id: r.id, head: r.head },
+          ]),
+        );
+      },
+    );
 
     // The Knowledge tab: capability → area/file → source at the snapshot's commit,
     // and browsing it makes no model call and starts no build.
-    await step("atlas-enabled-ui", async () => {
+    await step("atlas-enabled-ui", ["atlas-describe"], async () => {
       const before = await spendRows([ledger.id]);
       const buildsBefore = await sql(
         `SELECT COUNT(*) AS n FROM kg_builds WHERE repo_id = '${ledger.id}'`,
@@ -931,181 +1022,196 @@ export async function runAtlasProviderE2E(
       assert.deepEqual(buildsAfter, buildsBefore, "Browsing the Atlas started a build");
       evidence.enabledUi = { ...drilled, atlasCallsWhileBrowsing: after.length - before.length };
     });
+    run.outcomes["atlas-describe"] = "passed";
 
     // ---- 3. The workspace: both repositories, a resolved dependency ---------------------
-    await step("atlas-workspace", async () => {
-      const shopBuild = await built(shop);
-      const shopCap = await sharedCapability(shop, SHOP_CAPABILITY);
-      assert.deepEqual(shopCap.entity.summaryState, { status: "current" });
-      const names = `${ledger.name},${shop.name}`;
-      const ws = `/accounts/priya/atlas`;
-      const scoped = (id: string) => `${shop.id}/${id}`;
-      const links = await api<AtlasPage<AtlasCrossLink>>(
-        `${ws}/links?repos=${names}&id=${encodeURIComponent(scoped(shopCap.entity.id))}&state=resolved`,
-      );
-      const resolved = links.items.find((l) => l.package?.name === PACKAGE);
-      assert(resolved?.evidence, "The shop's capability must resolve its lumen-ledger dependency");
-      assert.equal(resolved.state, "resolved");
-      assert.equal(
-        resolved.evidence.publisher.repoId,
-        ledger.id,
-        "Resolved to the ledger repository",
-      );
-      assert.equal(resolved.evidence.publisher.registry.name, PACKAGE);
-      for (const f of resolved.evidence.importers.files) {
-        assert.equal(f.repoId, shop.id);
-        assert.equal(f.commit, shop.head, "Importers are cited at the shop's own commit");
-        assert(SHOP_CAPABILITY.includes(f.path), f.path);
-      }
-      const composition = await api<AtlasWorkspaceComposition>(`${ws}/composition?repos=${names}`);
-      const composite = composition.items.find(
-        (c) => c.repos.includes(ledger.id) && c.repos.includes(shop.id),
-      );
-      const repoVectors = composition.snapshot.repos.map((r) => ({
-        repo: `${r.owner}/${r.name}`,
-        state: r.state,
-        vector: r.snapshot?.vector ?? null,
-      }));
-      assert.deepEqual(
-        repoVectors.map((r) => r.vector?.[0]?.commit ?? "").sort((a, b) => a.localeCompare(b)),
-        [ledger.head, shop.head].sort((a, b) => a.localeCompare(b)),
-        "Each repository at its own commit: no common head",
-      );
-      evidence.workspace = {
-        repos: repoVectors,
-        shopBuild: {
-          id: shopBuild.id,
-          atlasDescribed: shopBuild.stats.atlasDescribed,
-          atlasSpend: shopBuild.stats.atlasSpend,
-        },
-        shopCapability: {
-          id: shopCap.entity.id,
-          name: shopCap.entity.name,
-          summary: shopCap.entity.summary,
-        },
-        resolved: {
-          package: resolved.package,
-          publisher: resolved.evidence.publisher,
-          importers: resolved.evidence.importers,
-          manifest: resolved.evidence.manifest,
-        },
-        // Composites need a canonical concept both sides share (model-derived), so it's recorded, not required.
-        composite: composite
-          ? {
-              id: composite.id,
-              name: composite.name,
-              members: composite.members.map((m) => m.name),
-              concepts: composite.concepts,
-              counts: composite.counts,
-            }
-          : null,
-      };
-      const citations = await browse("priya", "workspace", async (page) => {
-        const base = `/priya/-/atlas?repos=${names}`;
-        const out: Record<string, unknown> = {};
-        await page.goto(`${base}&select=${encodeURIComponent(scoped(shopCap.entity.id))}`);
-        const coverage = page.getByRole("region", { name: "Coverage" });
-        await expect(coverage.getByText(short(ledger.head), { exact: true })).toBeVisible();
-        await expect(coverage.getByText(short(shop.head), { exact: true })).toBeVisible();
-        await expect(heading(page, shopCap.entity.name)).toBeVisible();
-        const across = page.getByRole("region", { name: "Across repositories" });
-        await expect(
-          across
-            .getByText(
-              new RegExp(`Depends on ${escape(ledger.name)} through npm:${escape(PACKAGE)}`),
-            )
-            .first(),
-        ).toBeVisible();
-        out.shop = await drillToSource(page, page.locator("body"), shopCap.entity.name, shop);
-        await page.goto(
-          `${base}&select=${encodeURIComponent(`${ledger.id}/${enabled.ledgerCap.id}`)}`,
+    if (want("atlas-workspace"))
+      await step("atlas-workspace", ["atlas-workspace"], async () => {
+        const shop = repos.get("consumer")!;
+        const shopBuild = await built(shop);
+        const shopCap = await sharedCapability(shop, SHOP_CAPABILITY);
+        assert.deepEqual(shopCap.entity.summaryState, { status: "current" });
+        const names = `${ledger.name},${shop.name}`;
+        const ws = `/accounts/priya/atlas`;
+        const scoped = (id: string) => `${shop.id}/${id}`;
+        const links = await api<AtlasPage<AtlasCrossLink>>(
+          `${ws}/links?repos=${names}&id=${encodeURIComponent(scoped(shopCap.entity.id))}&state=resolved`,
         );
-        await expect(heading(page, enabled.ledgerCap.name)).toBeVisible();
-        out.ledger = await drillToSource(
-          page,
-          page.locator("body"),
-          enabled.ledgerCap.name,
-          ledger,
+        const resolved = links.items.find((l) => l.package?.name === PACKAGE);
+        assert(
+          resolved?.evidence,
+          "The shop's capability must resolve its lumen-ledger dependency",
         );
-        return out;
+        assert.equal(resolved.state, "resolved");
+        assert.equal(
+          resolved.evidence.publisher.repoId,
+          ledger.id,
+          "Resolved to the ledger repository",
+        );
+        assert.equal(resolved.evidence.publisher.registry.name, PACKAGE);
+        for (const f of resolved.evidence.importers.files) {
+          assert.equal(f.repoId, shop.id);
+          assert.equal(f.commit, shop.head, "Importers are cited at the shop's own commit");
+          assert(SHOP_CAPABILITY.includes(f.path), f.path);
+        }
+        const composition = await api<AtlasWorkspaceComposition>(
+          `${ws}/composition?repos=${names}`,
+        );
+        const composite = composition.items.find(
+          (c) => c.repos.includes(ledger.id) && c.repos.includes(shop.id),
+        );
+        const repoVectors = composition.snapshot.repos.map((r) => ({
+          repo: `${r.owner}/${r.name}`,
+          state: r.state,
+          vector: r.snapshot?.vector ?? null,
+        }));
+        assert.deepEqual(
+          repoVectors.map((r) => r.vector?.[0]?.commit ?? "").sort((a, b) => a.localeCompare(b)),
+          [ledger.head, shop.head].sort((a, b) => a.localeCompare(b)),
+          "Each repository at its own commit: no common head",
+        );
+        evidence.workspace = {
+          repos: repoVectors,
+          shopBuild: {
+            id: shopBuild.id,
+            atlasDescribed: shopBuild.stats.atlasDescribed,
+            atlasSpend: shopBuild.stats.atlasSpend,
+          },
+          shopCapability: {
+            id: shopCap.entity.id,
+            name: shopCap.entity.name,
+            summary: shopCap.entity.summary,
+          },
+          resolved: {
+            package: resolved.package,
+            publisher: resolved.evidence.publisher,
+            importers: resolved.evidence.importers,
+            manifest: resolved.evidence.manifest,
+          },
+          // Composites need a canonical concept both sides share (model-derived), so it's recorded, not required.
+          composite: composite
+            ? {
+                id: composite.id,
+                name: composite.name,
+                members: composite.members.map((m) => m.name),
+                concepts: composite.concepts,
+                counts: composite.counts,
+              }
+            : null,
+        };
+        const citations = await browse("priya", "workspace", async (page) => {
+          const base = `/priya/-/atlas?repos=${names}`;
+          const out: Record<string, unknown> = {};
+          await page.goto(`${base}&select=${encodeURIComponent(scoped(shopCap.entity.id))}`);
+          const coverage = page.getByRole("region", { name: "Coverage" });
+          await expect(coverage.getByText(short(ledger.head), { exact: true })).toBeVisible();
+          await expect(coverage.getByText(short(shop.head), { exact: true })).toBeVisible();
+          await expect(heading(page, shopCap.entity.name)).toBeVisible();
+          const across = page.getByRole("region", { name: "Across repositories" });
+          await expect(
+            across
+              .getByText(
+                new RegExp(`Depends on ${escape(ledger.name)} through npm:${escape(PACKAGE)}`),
+              )
+              .first(),
+          ).toBeVisible();
+          out.shop = await drillToSource(page, page.locator("body"), shopCap.entity.name, shop);
+          await page.goto(
+            `${base}&select=${encodeURIComponent(`${ledger.id}/${enabled.ledgerCap.id}`)}`,
+          );
+          await expect(heading(page, enabled.ledgerCap.name)).toBeVisible();
+          out.ledger = await drillToSource(
+            page,
+            page.locator("body"),
+            enabled.ledgerCap.name,
+            ledger,
+          );
+          return out;
+        });
+        (evidence.workspace as Record<string, unknown>).ui = citations;
       });
-      (evidence.workspace as Record<string, unknown>).ui = citations;
-    });
 
     // ---- 4. Unchanged inputs are never inferred again (gate 15) -------------------------
-    await step("atlas-reuse", async () => {
-      const previous = enabled.build;
-      await pushFiles(
-        ledger,
-        { "README.md": `${LEDGER["README.md"]}\nSee index.ts for the public API.\n` },
-        "Point the README at the public API",
-      );
-      const build = await built(ledger);
-      const stats = build.stats as {
-        atlasError?: string;
-        atlasTimings?: { mode: string; projectMs: number; describeMs: number; modelCalls: number };
-        atlasDescribed?: {
-          capabilities: number;
-          cached: number;
-          inferred: number;
-          current: number;
-        };
-        atlasSpend?: { calls: number };
-      };
-      assert.equal(stats.atlasError, undefined);
-      assert(stats.atlasTimings && stats.atlasDescribed && stats.atlasSpend);
-      const now: {
-        id: string;
-        name: string;
-        sameInputs: boolean;
-        reinferred: boolean;
-        basis: AtlasInference["basis"];
-      }[] = [];
-      for (const cap of [enabled.ledgerCap, enabled.currencyCap]) {
-        const detail = await api<AtlasDetail>(
-          `${atlasOf(ledger)}/detail?id=${encodeURIComponent(cap.id)}`,
+    if (want("atlas-reuse"))
+      await step("atlas-reuse", ["atlas-reuse"], async () => {
+        const previous = enabled.build;
+        await pushFiles(
+          ledger,
+          { "README.md": `${LEDGER["README.md"]}\nSee index.ts for the public API.\n` },
+          "Point the README at the public API",
         );
-        assert.equal(detail.snapshot.vector[0]?.commit, ledger.head);
-        const before = (cap.data.provenance as AtlasProvenance).inferred!;
-        const after = (detail.entity.data.provenance as AtlasProvenance).inferred!;
-        assert.deepEqual(detail.entity.summaryState, { status: "current" });
-        now.push({
-          id: cap.id,
-          name: detail.entity.name,
-          sameInputs: before.inputsHash === after.inputsHash,
-          reinferred: before.inferredAt !== after.inferredAt,
-          basis: after.basis,
-        });
-      }
-      const changed = now.filter((c) => !c.sameInputs).length;
-      evidence.reuse = {
-        build: build.id,
-        previousBuild: previous.id,
-        commit: ledger.head,
-        atlasTimings: stats.atlasTimings,
-        atlasDescribed: stats.atlasDescribed,
-        atlasSpend: stats.atlasSpend,
-        capabilities: now,
-      };
-      // Identity holds across the push, and identical inputs reuse their prose.
-      for (const c of now) if (c.sameInputs) assert(!c.reinferred, `${c.name} was inferred again`);
-      assert(
-        now.some((c) => c.sameInputs),
-        "A README edit changed every capability's inputs",
-      );
-      assert.equal(stats.atlasSpend.calls, stats.atlasDescribed.inferred);
-      assert(stats.atlasDescribed.inferred <= changed, "Only changed inputs may be inferred");
-      assert.equal(stats.atlasTimings.mode, "incremental");
-      // Gate 19: publication within 30 s of the graph, the model's share reported apart.
-      assert(
-        stats.atlasTimings.projectMs - stats.atlasTimings.describeMs <= 30_000,
-        `Projection took ${stats.atlasTimings.projectMs} ms (${stats.atlasTimings.describeMs} ms model)`,
-      );
-    });
+        const build = await built(ledger);
+        const stats = build.stats as {
+          atlasError?: string;
+          atlasTimings?: {
+            mode: string;
+            projectMs: number;
+            describeMs: number;
+            modelCalls: number;
+          };
+          atlasDescribed?: {
+            capabilities: number;
+            cached: number;
+            inferred: number;
+            current: number;
+          };
+          atlasSpend?: { calls: number };
+        };
+        assert.equal(stats.atlasError, undefined);
+        assert(stats.atlasTimings && stats.atlasDescribed && stats.atlasSpend);
+        const now: {
+          id: string;
+          name: string;
+          sameInputs: boolean;
+          reinferred: boolean;
+          basis: AtlasInference["basis"];
+        }[] = [];
+        for (const cap of [enabled.ledgerCap, enabled.currencyCap]) {
+          const detail = await api<AtlasDetail>(
+            `${atlasOf(ledger)}/detail?id=${encodeURIComponent(cap.id)}`,
+          );
+          assert.equal(detail.snapshot.vector[0]?.commit, ledger.head);
+          const before = (cap.data.provenance as AtlasProvenance).inferred!;
+          const after = (detail.entity.data.provenance as AtlasProvenance).inferred!;
+          assert.deepEqual(detail.entity.summaryState, { status: "current" });
+          now.push({
+            id: cap.id,
+            name: detail.entity.name,
+            sameInputs: before.inputsHash === after.inputsHash,
+            reinferred: before.inferredAt !== after.inferredAt,
+            basis: after.basis,
+          });
+        }
+        const changed = now.filter((c) => !c.sameInputs).length;
+        evidence.reuse = {
+          build: build.id,
+          previousBuild: previous.id,
+          commit: ledger.head,
+          atlasTimings: stats.atlasTimings,
+          atlasDescribed: stats.atlasDescribed,
+          atlasSpend: stats.atlasSpend,
+          capabilities: now,
+        };
+        // Identity holds across the push, and identical inputs reuse their prose.
+        for (const c of now)
+          if (c.sameInputs) assert(!c.reinferred, `${c.name} was inferred again`);
+        assert(
+          now.some((c) => c.sameInputs),
+          "A README edit changed every capability's inputs",
+        );
+        assert.equal(stats.atlasSpend.calls, stats.atlasDescribed.inferred);
+        assert(stats.atlasDescribed.inferred <= changed, "Only changed inputs may be inferred");
+        assert.equal(stats.atlasTimings.mode, "incremental");
+        // Gate 19: publication within 30 s of the graph, the model's share reported apart.
+        assert(
+          stats.atlasTimings.projectMs - stats.atlasTimings.describeMs <= 30_000,
+          `Projection took ${stats.atlasTimings.projectMs} ms (${stats.atlasTimings.describeMs} ms model)`,
+        );
+      });
 
     // ---- 5. The degraded providers: disabled, refused, exhausted -------------------------
     const degraded: {
-      mode: Mode;
+      mode: Exclude<Mode, "enabled">;
       reason: "disabled" | "provider_error" | "budget_exhausted";
       notice: RegExp;
       note: string;
@@ -1132,8 +1238,9 @@ export async function runAtlasProviderE2E(
     const degradedEvidence: Record<string, unknown> = {};
     evidence.degraded = degradedEvidence;
     for (const expected of degraded) {
+      if (!want(`atlas-${expected.mode}`)) continue;
       const repo = repos.get(expected.mode)!;
-      await step(`atlas-${expected.mode}`, async () => {
+      await step(`atlas-${expected.mode}`, [`atlas-${expected.mode}`], async () => {
         const build = await built(repo);
         const stats = build.stats as {
           atlasError?: string;
@@ -1282,7 +1389,7 @@ export async function runAtlasProviderE2E(
       });
     }
 
-    await step("atlas-usage", async () => {
+    await step("atlas-usage", ["atlas-describe"], async () => {
       const rows = await spendRows([...repos.values()].map((r) => r.id));
       const byRepo = new Map([...repos.values()].map((r) => [r.id, `${r.owner}/${r.name}`]));
       evidence.providerUsage = {

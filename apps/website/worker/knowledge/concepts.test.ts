@@ -233,3 +233,64 @@ test("alignPairs counts stored pair decisions only, not reviews", async () => {
   // One stored first-pass decision; the review-only pair must not read as asked.
   expect(stats.decided).toBe(1);
 });
+
+test("alignPairs decides what a newcomer changes in its neighbours' closest candidates (CORE-286)", async () => {
+  const sqlite = migratedDatabase();
+  sqlite.exec(`
+    INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc', 'org', 'org', 'Org');
+    INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote)
+      VALUES ('repo', 'acc', 'app', 'private', 'a', 'https://a');
+  `);
+  const asked: string[] = [];
+  const AI = {
+    // Orthogonal name vectors pair nothing by embedding.
+    run: async (
+      _model: string,
+      inputs: { text?: string[]; state?: Record<string, { name: string }> },
+    ) => {
+      if (inputs.text)
+        return { data: inputs.text.map((_, i) => inputs.text!.map((__, j) => (i === j ? 1 : 0))) };
+      asked.push(pairKey(inputs.state!.entity_a!.name, inputs.state!.entity_b!.name));
+      return {
+        answers: {
+          link: { type: "score", score: 0, probabilities: [1, 0, 0], confidence: 1 },
+          a_in_b: { type: "noul", noul: 0 },
+          b_in_a: { type: "noul", noul: 0 },
+        },
+      };
+    },
+  };
+  const env = { DB: d1(sqlite), AI } as unknown as Env;
+  const stores = ["Token Store", "Session Store", "Blob Store", "Key Store", "Cache Store"];
+  const file = (path: string, concepts: string[]) => ({
+    file: { path, blob: path, mode: "100644" },
+    analysis: { concepts, skipped: undefined } as never,
+  });
+  const before = stores.map((name, i) => file(`src/${i}.ts`, [name]));
+  const run = async (entries: ReturnType<typeof file>[]) =>
+    alignPairs(
+      env,
+      LEGACY_AI_SNAPSHOT.models,
+      "repo",
+      entries.map((e) => e.file),
+      new Map(entries.map((e) => [e.file.blob, e.analysis])),
+    );
+  await run(before);
+  // Settled: these concepts are known now.
+  for (const name of stores)
+    sqlite
+      .prepare("INSERT INTO kg_concepts (repo_id, key, canonical) VALUES ('repo', ?, ?)")
+      .run(name.toLowerCase().replace(" ", "-"), name.toLowerCase().replace(" ", "-"));
+  asked.length = 0;
+  // "Store" nests in all five; it keeps only four of them as its own closest,
+  // but it is among the closest of the fifth too.
+  await run([...before, file("src/new.ts", ["Store"])]);
+  const names = new Map(
+    [...stores, "Store"].map((n) => [n.toLowerCase().replace(" ", "-"), n] as [string, string]),
+  );
+  const own = tokenCandidates(names, 4, new Set(["store"]));
+  expect(own.length).toBe(4);
+  // Every pair with the newcomer is decided, the fifth too: what a full rebuild decides.
+  expect(asked.length).toBe(5);
+  expect(asked.every((p) => p.includes("Store\u0000") || p.endsWith("\u0000Store"))).toBe(true);
+});

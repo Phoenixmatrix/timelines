@@ -166,7 +166,7 @@ describe("by keyboard alone", () => {
     const app = renderApp(`${repo.base}?view=outline`);
     const tree = outline(repo.name);
     const status = (text: RegExp) => page.getByRole("status").filter({ hasText: text }).first();
-    await expect.element(status(/^Update queued$/)).toBeVisible();
+    await expect.element(status(/ · update queued$/)).toBeVisible();
     const opened = treeitem(tree, capability.name);
     await expect.element(opened).toBeVisible();
     await focusOn(opened);
@@ -194,7 +194,7 @@ describe("by keyboard alone", () => {
     await focusOn(changed);
     await press("Enter");
     await expect.element(selection().getByText(/changed in this build/)).toBeVisible();
-    await expect.element(status(/^Update queued$/), { timeout: 10_000 }).toBeVisible();
+    await expect.element(status(/ · update queued$/), { timeout: 10_000 }).toBeVisible();
     const pinnedAt = app.url().href;
     expect(app.url().searchParams.get("snapshot"), "A selection pins the snapshot").toBeTruthy();
     const reader = selection().getByRole("heading", { level: 2 });

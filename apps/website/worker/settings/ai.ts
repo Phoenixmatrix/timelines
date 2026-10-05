@@ -3,11 +3,14 @@ import type { Insertable } from "kysely";
 import {
   AI_MODEL_CATALOG,
   DEFAULT_AI_CONFIGURATION,
+  DEFAULT_KNOWLEDGE_SCHEDULE,
+  MAX_KNOWLEDGE_WAIT_MINUTES,
   type AiRole,
   type AiSettings,
   type AiSettingsPatch,
   type AiSettingsView,
   type AiSnapshot,
+  type KnowledgeUpdateSchedule,
 } from "../../shared/ai.ts";
 import { fail, requireActor, requirePerson } from "../api/http.ts";
 import type { AppEnv } from "../auth.ts";
@@ -28,6 +31,8 @@ export async function aiSettings(d1: D1Database, accountId: string): Promise<AiS
       "s.ai_fast_model",
       "s.ai_task_model",
       "s.ai_updated_at",
+      "s.knowledge_quiet_minutes",
+      "s.knowledge_max_wait_minutes",
       "a.slug",
     ])
     .where("s.account_id", "=", accountId)
@@ -36,6 +41,7 @@ export async function aiSettings(d1: D1Database, accountId: string): Promise<AiS
     return {
       features: { ...DEFAULT_AI_CONFIGURATION.features },
       models: { ...DEFAULT_AI_CONFIGURATION.models },
+      knowledgeUpdates: { ...DEFAULT_KNOWLEDGE_SCHEDULE },
       updatedAt: null,
       updatedBy: null,
     };
@@ -50,6 +56,10 @@ export async function aiSettings(d1: D1Database, accountId: string): Promise<AiS
       classification: row.ai_classification_model,
       fast: row.ai_fast_model,
       task: row.ai_task_model,
+    },
+    knowledgeUpdates: {
+      quietMinutes: row.knowledge_quiet_minutes,
+      maxWaitMinutes: row.knowledge_max_wait_minutes,
     },
     updatedAt: row.ai_updated_at,
     updatedBy: row.slug,
@@ -75,6 +85,36 @@ export async function repoAiSnapshot(d1: D1Database, repoId: string): Promise<Ai
     features: settings.features,
     models: { classification: model("classification"), fast: model("fast"), task: model("task") },
     updatedAt: settings.updatedAt,
+  };
+}
+
+/**
+ * When a repository's pushes update its Knowledge (CORE-286): its account's
+ * schedule, in milliseconds. Development environments may shorten both waits
+ * (`GITMATRIX_KNOWLEDGE_QUIET_SECONDS` and `GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS`,
+ * the KNOWLEDGE_QUIET_SECONDS / KNOWLEDGE_MAX_WAIT_SECONDS text bindings);
+ * deployed Workers use the account's settings.
+ */
+export async function knowledgeSchedule(
+  env: Env,
+  repoId: string,
+): Promise<{ quietMs: number; maxWaitMs: number }> {
+  const repo = await db(env.DB)
+    .selectFrom("repos")
+    .select("owner_id")
+    .where("id", "=", repoId)
+    .executeTakeFirst();
+  const schedule: KnowledgeUpdateSchedule = repo
+    ? (await aiSettings(env.DB, repo.owner_id)).knowledgeUpdates
+    : DEFAULT_KNOWLEDGE_SCHEDULE;
+  const seconds = (name: string) => {
+    const raw = Reflect.get(env, name);
+    const value = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  };
+  return {
+    quietMs: (seconds("KNOWLEDGE_QUIET_SECONDS") ?? schedule.quietMinutes * 60) * 1000,
+    maxWaitMs: (seconds("KNOWLEDGE_MAX_WAIT_SECONDS") ?? schedule.maxWaitMinutes * 60) * 1000,
   };
 }
 
@@ -104,7 +144,8 @@ function object(value: unknown): value is Record<string, unknown> {
 function validate(body: unknown): AiSettingsPatch | string {
   if (!object(body)) return "AI settings must be a JSON object.";
   for (const key of Object.keys(body))
-    if (key !== "features" && key !== "models") return `Unknown field: ${key}.`;
+    if (key !== "features" && key !== "models" && key !== "knowledgeUpdates")
+      return `Unknown field: ${key}.`;
   if (body.features !== undefined) {
     if (!object(body.features)) return "features must be an object of boolean toggles.";
     for (const [key, value] of Object.entries(body.features)) {
@@ -120,6 +161,21 @@ function validate(body: unknown): AiSettingsPatch | string {
       const options = AI_MODEL_CATALOG[key as AiRole];
       if (!options.some((option) => option.id === value))
         return `models.${key} must be one of: ${options.map((option) => option.id).join(", ")}.`;
+    }
+  }
+  if (body.knowledgeUpdates !== undefined) {
+    if (!object(body.knowledgeUpdates))
+      return "knowledgeUpdates must be an object of waits in minutes.";
+    for (const [key, value] of Object.entries(body.knowledgeUpdates)) {
+      if (!Object.hasOwn(DEFAULT_KNOWLEDGE_SCHEDULE, key))
+        return `Unknown field: knowledgeUpdates.${key}.`;
+      if (
+        typeof value !== "number" ||
+        !Number.isInteger(value) ||
+        value < 0 ||
+        value > MAX_KNOWLEDGE_WAIT_MINUTES
+      )
+        return `knowledgeUpdates.${key} must be a whole number of minutes from 0 to ${MAX_KNOWLEDGE_WAIT_MINUTES}.`;
     }
   }
   return body as AiSettingsPatch;
@@ -171,6 +227,10 @@ aiSettingsApi.patch("/", async (c) => {
     values.ai_classification_model = patch.models.classification;
   if (patch.models?.fast !== undefined) values.ai_fast_model = patch.models.fast;
   if (patch.models?.task !== undefined) values.ai_task_model = patch.models.task;
+  if (patch.knowledgeUpdates?.quietMinutes !== undefined)
+    values.knowledge_quiet_minutes = patch.knowledgeUpdates.quietMinutes;
+  if (patch.knowledgeUpdates?.maxWaitMinutes !== undefined)
+    values.knowledge_max_wait_minutes = patch.knowledgeUpdates.maxWaitMinutes;
   if (Object.keys(values).length) {
     values.ai_updated_by = actor.id;
     values.ai_updated_at = nowIso();

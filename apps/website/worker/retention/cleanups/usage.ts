@@ -197,9 +197,10 @@ export const aiUsage: CategoryCleanup<Item> = {
       d1
         .prepare(
           `INSERT INTO ai_usage_monthly (month, account_id, feature, model, calls, input_tokens,
-             output_tokens, total_tokens, days)
+             output_tokens, total_tokens, failed_calls, days)
            SELECT substr(t.day, 1, 7), t.account_id, t.feature, t.model, sum(t.calls),
-             sum(t.input_tokens), sum(t.output_tokens), sum(t.total_tokens), count(DISTINCT t.day)
+             sum(t.input_tokens), sum(t.output_tokens), sum(t.total_tokens), sum(t.failed_calls),
+             count(DISTINCT t.day)
            FROM ai_usage t WHERE ${matching}
            GROUP BY substr(t.day, 1, 7), t.account_id, t.feature, t.model
            ON CONFLICT (month, account_id, feature, model) DO UPDATE SET
@@ -207,6 +208,7 @@ export const aiUsage: CategoryCleanup<Item> = {
              input_tokens = ai_usage_monthly.input_tokens + excluded.input_tokens,
              output_tokens = ai_usage_monthly.output_tokens + excluded.output_tokens,
              total_tokens = ai_usage_monthly.total_tokens + excluded.total_tokens,
+             failed_calls = ai_usage_monthly.failed_calls + excluded.failed_calls,
              days = ai_usage_monthly.days + excluded.days`,
         )
         .bind(cutoff, list),

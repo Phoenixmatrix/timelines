@@ -1,10 +1,11 @@
 import { cloudflare } from "@cloudflare/vite-plugin";
 import tailwindcss from "@tailwindcss/vite";
+import type { Plugin } from "vite-plus";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite-plus";
 import { browserCommands } from "./vite/browser-commands.ts";
 import { ciRunners } from "./vite/ci-runners.ts";
-import { developmentEnvironment } from "./vite/environment.ts";
+import { DEV_AI_OPT_IN, developmentEnvironment } from "./vite/environment.ts";
 
 const local = developmentEnvironment(process.env);
 // Only Vitest needs the browser provider: dev and build don't load Playwright.
@@ -26,6 +27,19 @@ export default defineConfig({
     !process.env.VITEST && ciRunners(),
     !process.env.VITEST &&
       cloudflare({ persistState: { path: local.stateDir }, inspectorPort: false }),
+    // Say whether the dev server spends on AI: it's opt-in (CORE-284).
+    !process.env.VITEST &&
+      ({
+        name: "gitmatrix-ai-notice",
+        apply: "serve",
+        configureServer(server) {
+          server.config.logger.info(
+            local.ai
+              ? "  AI is on: Workers AI, AI Gateway, Vectorize and AI Search are bound, and Knowledge builds of pushed repositories spend money."
+              : `  AI is off: no Workers AI, AI Gateway, Vectorize or AI Search; Knowledge, wiki, search, the assistant, release notes, avatars and Atlas descriptions show their AI-off states. Opt in with ${local.agent ? "vp run agent setup --ai" : DEV_AI_OPT_IN}.`,
+          );
+        },
+      } satisfies Plugin),
   ],
   // The dev server's own port, strictly. Not under Vitest: the browser project
   // (`extends: true`) would inherit `strictPort` onto its browser server, which

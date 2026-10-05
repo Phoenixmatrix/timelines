@@ -1,11 +1,15 @@
 // One coordinator per repository (a Durable Object) decides when to build.
 //
-// Every push pings it. It waits for a short quiet period, so an agent pushing
-// five times in ten seconds causes one build rather than five, then starts a
-// Workflow. While a build runs, further pushes only mark the repo dirty; when
-// the build finishes, a dirty repo builds again right away with the latest
-// HEAD. Per-file work is cached by content, so the follow-up build is cheap.
-// At most one build per repository is ever in flight.
+// Every push pings it. A push that moves main marks Knowledge pending (CORE-286):
+// it records main's new head, how many pushes are waiting and when the first
+// and last arrived. One update then runs, asynchronously, at the latest head
+// once pushes have paused for the account's quiet period (10 minutes by
+// default), and never later than its longest wait after the first pending
+// push (30 minutes by default). An admin can ask for it now. The first build
+// of a repository, an explicit full rebuild and a watchdog retry start right
+// away. While a build runs, further pushes only add to what is pending; the
+// next update follows the same windows. At most one build per repository is
+// ever in flight.
 //
 // The same pings keep timeline overlays current (overlay.ts, CORE-83): after
 // the quiet period the coordinator lists the repository's `timeline/<slug>`
@@ -52,7 +56,7 @@ import {
 } from "./pages.ts";
 import type { Checkpoint } from "../../shared/timelines.ts";
 import { watchdog } from "./watchdog.ts";
-import { repoAiSnapshot } from "../settings/ai.ts";
+import { knowledgeSchedule, repoAiSnapshot } from "../settings/ai.ts";
 import { knowledgePolicy, LEGACY_KNOWLEDGE_POLICY, type KnowledgePolicy } from "./policy.ts";
 import {
   clearStorage,
@@ -67,7 +71,7 @@ import {
 } from "../durable/contract.ts";
 import { durableStub } from "../durable/registry.ts";
 
-/** Quiet period after the last push before building. */
+/** Quiet period after the last push before looking at the refs (overlays, pending main). */
 const DEBOUNCE_MS = 1_500;
 /** …but never wait longer than this after the first push of a burst. */
 const MAX_WAIT_MS = 8_000;
@@ -80,21 +84,43 @@ const OVERLAY_MAX_MS = 2 * 60 * 60_000;
 /** A page set is a few model calls; one running longer than this is stopped. */
 const PAGES_MAX_MS = 2 * 60 * 60_000;
 
+/** Whether a Workflow instance's status says it ended on its own (nothing left to stop). */
+function instanceEnded(status: { status: string } | null): boolean {
+  return status !== null && ["errored", "terminated", "complete"].includes(status.status);
+}
+
 interface Running {
   buildId: string;
-  /** The push sequence number the build covers. */
-  seq: number;
+  /** The push sequence number the build covers (builds started before CORE-286). */
+  seq?: number;
   startedAt: number;
   policy?: KnowledgePolicy;
   force?: boolean;
   ai?: KnowledgePolicy["ai"];
   commit?: string;
+  /** Pushes to main the build covers (CORE-286). */
+  pushes?: number;
+}
+
+/** Main's pushes waiting for the next update (CORE-286). */
+export interface PendingUpdate {
+  /** Main's latest head. */
+  head: string;
+  /** Distinct heads main moved to since the last update started. */
+  pushes: number;
+  /** When the first and the latest of them were seen. */
+  firstAt: number;
+  lastAt: number;
+  /** When the update will start, as scheduled at the latest look; null until scheduled. */
+  dueAt: number | null;
 }
 
 export interface CoordinatorStatus {
   running: (Running & { phase?: string }) | null;
   /** Pushes not yet covered by a finished or running build. */
   pending: boolean;
+  /** What is pending, and when it will be built (CORE-286). */
+  update: (PendingUpdate & { now: boolean }) | null;
   lastError: string | null;
   lastFinishedAt: number | null;
   /** Per timeline bookmark (refs/heads/timeline/<slug>). */
@@ -107,8 +133,13 @@ export interface CoordinatorStatus {
 
 interface State {
   repoId: string | null;
+  /** Pings received, and those the refs have been looked at for. */
   seq: number;
   builtSeq: number;
+  /** Main's pushes waiting for the next update (CORE-286). */
+  update?: PendingUpdate | null;
+  /** An admin asked for the pending update now. */
+  now?: boolean;
   burstStartedAt: number | null;
   running: Running | null;
   /** A watchdog continuation is separate from newer pending push signals. */
@@ -159,13 +190,18 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     await this.ctx.storage.put("state", state);
   }
 
-  /** Something changed in the repository (a push, a new repo, a manual rebuild). */
-  async notify(repoId: string, options: { force?: boolean } = {}): Promise<void> {
+  /**
+   * Something changed in the repository (a push, a new repo, a manual
+   * rebuild). `force` asks for a full rebuild now; `now` for the pending
+   * update now (CORE-286), without waiting for its settle window.
+   */
+  async notify(repoId: string, options: { force?: boolean; now?: boolean } = {}): Promise<void> {
     const state = await this.#state();
     const now = Date.now();
     state.repoId = repoId;
     state.seq += 1;
     state.force ||= Boolean(options.force);
+    state.now ||= Boolean(options.now);
     state.scan = true;
     state.pagesDue = true;
     state.burstStartedAt ??= now;
@@ -212,12 +248,18 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     if (!state.repoId) return;
     if (state.running) await this.#watchBuild(state);
     await this.#watchOverlays(state);
-    const buildDue =
-      !state.running && (Boolean(state.retry) || state.seq > state.builtSeq || state.force);
+    // Pings not yet looked at, a pending update, or work asked for: list the refs.
+    const look =
+      state.seq > state.builtSeq ||
+      state.force ||
+      Boolean(state.retry) ||
+      Boolean(state.now) ||
+      Boolean(state.update) ||
+      state.scan;
     let refs: RepoRefs | null = null;
     let indexed: string | null = null;
     let ownerId: string | null = null;
-    if (buildDue || state.scan) {
+    if (look) {
       const [repo, kgState] = await Promise.all([
         db(this.env.DB)
           .selectFrom("repos")
@@ -239,44 +281,22 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
             return null;
           })
         : null;
-      // A deleted repository has nothing left to compare.
-      if (!repo) state.scan = false;
-    }
-    if (buildDue) {
-      // Pushes that only moved other branches (timeline bookmarks) leave main as indexed.
-      if (!state.retry && !state.force && refs?.head && refs.head === indexed)
+      // A deleted repository has nothing left to compare or build.
+      if (!repo) {
+        state.scan = false;
+        state.update = null;
+        state.now = false;
+        state.force = false;
         state.builtSeq = state.seq;
-      else {
-        const retry = state.retry;
-        const policy =
-          retry?.policy ??
-          (retry ? LEGACY_KNOWLEDGE_POLICY : await knowledgePolicy(this.env, state.repoId));
-        if (!policy.ai.features.knowledge) {
-          state.builtSeq = state.seq;
-          state.force = false;
-        } else {
-          const buildId = crypto.randomUUID();
-          const force = retry ? true : state.force;
-          state.running = {
-            buildId,
-            seq: retry?.seq ?? state.seq,
-            force,
-            policy,
-            commit: retry?.commit ?? refs?.head ?? undefined,
-            startedAt: Date.now(),
-          };
-          if (!retry) state.force = false;
-          state.retry = undefined;
-          await this.#save(state);
-          await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
-          await this.env.KNOWLEDGE_BUILD.create({
-            id: buildId,
-            params: { repoId: state.repoId, buildId, force, policy, commit: state.running.commit },
-          });
-        }
+      }
+      // Every ping so far has been looked at (without a listing, the next alarm looks again).
+      if (refs) {
+        state.builtSeq = state.seq;
+        this.#observe(state, refs.head ?? null, indexed);
       }
     }
     // Main's next build waits for its own run to end (finished() schedules it).
+    if (!state.running) await this.#startBuild(state, refs, indexed);
     state.burstStartedAt = null;
     // Without a ref listing the scan waits for the next ping.
     let quietWake: number | null = null;
@@ -286,11 +306,100 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     if (state.pagesDue) await this.#startPages(state);
     await this.#save(state);
     if (this.#busy(state)) await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
-    // A timeline still in its quiet period is looked at again when it's due.
-    if (quietWake !== null) {
+    // A timeline still in its quiet period, or main's pending update, is looked at again when due.
+    const wakes = [quietWake, !state.running ? (state.update?.dueAt ?? null) : null];
+    if (refs === null && state.seq > state.builtSeq) wakes.push(Date.now() + WATCHDOG_MS);
+    for (const wake of wakes) {
+      if (wake === null) continue;
       const alarm = await this.ctx.storage.getAlarm();
-      if (alarm === null || alarm > quietWake) await this.ctx.storage.setAlarm(quietWake);
+      if (alarm === null || alarm > wake)
+        await this.ctx.storage.setAlarm(Math.max(wake, Date.now()));
     }
+  }
+
+  /**
+   * What main's head says is pending (CORE-286): nothing once the head is
+   * indexed or being built; otherwise one more push each time it moves.
+   */
+  #observe(state: State, head: string | null, indexed: string | null) {
+    const covered = state.running ? (state.running.commit ?? null) : indexed;
+    if (!head || head === covered) {
+      state.update = null;
+      return;
+    }
+    if (state.update?.head === head) return;
+    const now = Date.now();
+    state.update = {
+      head,
+      pushes: (state.update?.pushes ?? 0) + 1,
+      firstAt: state.update?.firstAt ?? now,
+      lastAt: now,
+      dueAt: null,
+    };
+  }
+
+  /**
+   * Start main's build when one is due: a watchdog retry, an explicit full
+   * rebuild, the first build, an update asked for now, or a pending update
+   * whose settle window has passed. Otherwise schedule the pending update.
+   */
+  async #startBuild(state: State, refs: RepoRefs | null, indexed: string | null) {
+    const retry = state.retry;
+    const pending = state.update ?? null;
+    let due = Boolean(retry) || state.force;
+    if (!due && pending) {
+      if (state.now || indexed === null) due = true;
+      else {
+        const { quietMs, maxWaitMs } = await knowledgeSchedule(this.env, state.repoId!);
+        pending.dueAt = Math.min(pending.lastAt + quietMs, pending.firstAt + maxWaitMs);
+        due = pending.dueAt <= Date.now();
+      }
+    }
+    if (!due) {
+      // Nothing pending: an update asked for now has nothing to do.
+      if (!pending) state.now = false;
+      return;
+    }
+    const policy =
+      retry?.policy ??
+      (retry ? LEGACY_KNOWLEDGE_POLICY : await knowledgePolicy(this.env, state.repoId!));
+    if (!policy.ai.features.knowledge) {
+      state.update = null;
+      state.force = false;
+      state.now = false;
+      return;
+    }
+    const buildId = crypto.randomUUID();
+    const force = retry ? Boolean(retry.force) : state.force;
+    const commit = retry?.commit ?? pending?.head ?? refs?.head ?? undefined;
+    state.running = {
+      buildId,
+      force,
+      policy,
+      commit,
+      startedAt: Date.now(),
+      pushes: retry ? retry.pushes : (pending?.pushes ?? 0),
+    };
+    if (!retry) {
+      state.force = false;
+      state.now = false;
+      // The build covers main's latest head; later pushes start a new count.
+      if (pending && (commit === undefined || pending.head === commit)) state.update = null;
+    }
+    state.retry = undefined;
+    await this.#save(state);
+    await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+    await this.env.KNOWLEDGE_BUILD.create({
+      id: buildId,
+      params: {
+        repoId: state.repoId!,
+        buildId,
+        force,
+        policy,
+        commit,
+        ...(state.running.pushes ? { pushes: state.running.pushes } : {}),
+      },
+    });
   }
 
   /**
@@ -349,7 +458,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       const overdue = Date.now() - run.startedAt > PAGES_MAX_MS;
       if (status?.status === "complete") delete state.pages[run.buildId];
       else if (!status || overdue || ["errored", "terminated"].includes(status.status)) {
-        if (overdue) await instance?.terminate().catch(() => undefined);
+        if (!instanceEnded(status)) await instance?.terminate().catch(() => undefined);
         const error = `Pages ${overdue ? "ran too long; stopped by the watchdog" : (status?.status ?? "vanished")}`;
         await abandonSet(
           this.env.DB,
@@ -415,12 +524,14 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     const stale = verdict !== "running";
     if (status?.status === "complete") {
       state.lastError = null;
-      state.builtSeq = running.seq;
       state.running = null;
       state.scan = true;
     } else if (!status || stale || ["errored", "terminated"].includes(status.status)) {
       // Crashed, vanished or hung: stop it, and retry once before giving up.
-      if (stale) await instance?.terminate().catch(() => undefined);
+      // Unless it already ended, terminate it, even when only its status was
+      // unreadable: a retry must never run beside a build still spending
+      // (CORE-285). Marking it failed below also stops its model calls.
+      if (!instanceEnded(status)) await instance?.terminate().catch(() => undefined);
       await db(this.env.DB)
         .updateTable("kg_builds")
         .set({
@@ -443,7 +554,6 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
           policy: running.policy ?? LEGACY_KNOWLEDGE_POLICY,
         };
       } else {
-        state.builtSeq = running.seq;
         state.retries = 0;
       }
       state.running = null;
@@ -461,7 +571,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       if (status?.status === "complete") {
         this.#overlayEnded(state, overlay, { commit: run.commit, base: run.base }, null);
       } else if (!status || overdue || ["errored", "terminated"].includes(status.status)) {
-        if (overdue) await instance?.terminate().catch(() => undefined);
+        if (!instanceEnded(status)) await instance?.terminate().catch(() => undefined);
         const error = `Overlay ${overdue ? "ran too long; stopped by the watchdog" : (status?.status ?? "vanished")}`;
         await overlayFailed(this.env.DB, state.repoId!, ref, run.commit, error).catch(
           () => undefined,
@@ -587,7 +697,6 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
   async finished(buildId: string, ok: boolean, error: string | null): Promise<void> {
     const state = await this.#state();
     if (state.running?.buildId !== buildId) return;
-    state.builtSeq = state.running.seq;
     state.running = null;
     state.retries = 0;
     state.lastError = ok ? null : error;
@@ -599,8 +708,10 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       state.pagesDue = true;
     }
     await this.#save(state);
-    // Pushes that arrived during the build: build again now, for the latest HEAD.
-    if (state.seq > state.builtSeq || state.scan) await this.ctx.storage.setAlarm(Date.now() + 250);
+    // Pushes that arrived during the build: schedule their update (the alarm
+    // applies the settle windows), and compare timelines with the new graph.
+    if (state.seq > state.builtSeq || state.scan || state.update || state.now)
+      await this.ctx.storage.setAlarm(Date.now() + 250);
     // A retiring coordinator's alarm purges it once this was the last work.
     else if (await pendingRetirement(this.ctx.storage))
       await this.ctx.storage.setAlarm(Date.now() + 250);
@@ -640,7 +751,8 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       running: state.running
         ? { ...state.running, ai: state.running.policy?.ai ?? LEGACY_KNOWLEDGE_POLICY.ai }
         : null,
-      pending: state.seq > state.builtSeq && !state.running,
+      pending: (Boolean(state.update) || state.seq > state.builtSeq) && !state.running,
+      update: state.update ? { ...state.update, now: Boolean(state.now) } : null,
       lastError: state.lastError,
       lastFinishedAt: state.lastFinishedAt,
       overlays: Object.fromEntries(
@@ -661,7 +773,11 @@ export function coordinator(env: Env, repoId: string): DurableObjectStub<Knowled
 }
 
 /** Tell a repository's coordinator that something changed. */
-export async function notifyKnowledge(env: Env, repoId: string, options: { force?: boolean } = {}) {
+export async function notifyKnowledge(
+  env: Env,
+  repoId: string,
+  options: { force?: boolean; now?: boolean } = {},
+) {
   // Automatic non-AI agent environments omit provider bindings altogether,
   // and a preview never starts the (production) KnowledgeBuild Workflow.
   if (!env.AI || !productionOnly(env, "workflow", "a knowledge build")) return false;

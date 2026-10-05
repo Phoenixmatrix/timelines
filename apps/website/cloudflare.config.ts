@@ -3,8 +3,8 @@ import { developmentEnvironment } from "./vite/environment.ts";
 import { previewResources } from "./vite/preview.ts";
 
 // Remote services have no local emulator, so dev talks to the real ones
-// (Artifacts, Workers AI, Vectorize, AI Search). D1, the Durable Object and
-// the Workflow run locally.
+// (Artifacts, and with GITMATRIX_DEV_AI=enabled Workers AI, Vectorize and AI
+// Search). D1, the Durable Object and the Workflow run locally.
 const remote = { dev: { remote: true } };
 
 // CI jobs run in Cloudflare Sandbox containers once deployed. In `vp dev` they
@@ -75,7 +75,9 @@ export default defineConfig(({ mode, isPreview }) => {
   // (producers and consumers), cron, email, AI, the domain and the Secrets
   // Store. PREVIEW_MODE turns on worker/preview.ts's guards behind that.
   const preview = isPreview ? previewResources(env) : null;
-  const ai = !preview && !(dev && local.agent && env.GITMATRIX_AGENT_AI === "disabled");
+  // Deployed Workers always bind AI; development only when opted in
+  // (GITMATRIX_DEV_AI=enabled, or an agent environment set up with --ai).
+  const ai = !preview && (!dev || local.ai);
   const runner = (env.GITMATRIX_CI_RUNNER ?? (dev ? "local" : "sandbox")) as Runner;
   const sandboxed = runner === "sandbox";
   // Declaring the container makes `vite build` build its image, which needs
@@ -233,6 +235,15 @@ export default defineConfig(({ mode, isPreview }) => {
         // (worker/timelines/quiet.ts); agent environments shorten it.
         ...(dev && env.GITMATRIX_TIMELINE_QUIET_SECONDS
           ? { TIMELINE_QUIET_SECONDS: bindings.text(env.GITMATRIX_TIMELINE_QUIET_SECONDS) }
+          : {}),
+        // Development only: how long main's pushes settle before one Knowledge
+        // update (worker/settings/ai.ts `knowledgeSchedule`, CORE-286);
+        // deployed Workers use each account's settings.
+        ...(dev && env.GITMATRIX_KNOWLEDGE_QUIET_SECONDS
+          ? { KNOWLEDGE_QUIET_SECONDS: bindings.text(env.GITMATRIX_KNOWLEDGE_QUIET_SECONDS) }
+          : {}),
+        ...(dev && env.GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS
+          ? { KNOWLEDGE_MAX_WAIT_SECONDS: bindings.text(env.GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS) }
           : {}),
         ...(dev && env.GITMATRIX_ATLAS_CONFIG
           ? { ATLAS_CONFIG: bindings.text(env.GITMATRIX_ATLAS_CONFIG) }

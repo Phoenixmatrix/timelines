@@ -24,12 +24,15 @@ vp run agent up
 ```
 
 Use the origin printed by `up`. Setup builds the worktree's CLI, installs and
-checks Chromium, provisions dedicated Artifacts/Vectorize/AI Search resources,
-migrates both local D1 databases, and seeds deterministic Git/tracker fixtures.
-Use `vp run agent inspect` for data, `vp run agent test` for non-AI real-service
-E2E, and `vp run agent test-ai` when verifying knowledge/wiki/search capabilities.
-Automatic E2E provisions only Artifacts and disables background AI work; normal
-interactive setup remains AI-enabled. Use `vp run agent destroy` when finished.
+checks Chromium, provisions a dedicated Artifacts namespace, migrates both local
+D1 databases, and seeds deterministic Git/tracker fixtures. It provisions **no
+paid AI** (Workers AI, AI Gateway, Vectorize, AI Search) and starts no Knowledge
+builds; the app shows its AI-off states. `vp run agent setup --ai` adds them, for
+changes to knowledge, wiki, embeddings, AI Search, the assistant, release-note
+generation, avatars or Atlas descriptions only. Use `vp run agent inspect` for
+data, `vp run agent test` for non-AI real-service E2E, and `vp run agent test-ai`
+(targeted at the stages your change maps to) when verifying AI capabilities.
+Use `vp run agent destroy` when finished.
 Hourly cleanup and 24-hour expiry bound resource accumulation; see the root README
 for costs and failure recovery.
 
@@ -39,7 +42,7 @@ with the runtime imports in `shared/semantic/`: discovering another parser on
 first source navigation can reload the dev page and interrupt browser E2E.
 
 There is no local Artifacts, Workers AI, Vectorize or AI Search emulator.
-These bindings use real services; D1, Durable Objects and Workflows run locally
+These bindings (the AI ones only when opted in) use real services; D1, Durable Objects and Workflows run locally
 under the environment's `.gitmatrix-agent` state directory. The pinned Vite
 plugin v2 reads `cloudflare.config.ts` directly. A pinned Miniflare lifecycle
 patch makes local `cf d1` commands exit normally; do not terminate them early
@@ -47,7 +50,11 @@ after merely seeing output.
 
 The canonical source host remains a separate, owner-managed environment:
 from this directory, `vp run db:migrate`, `vp run db:seed` and `vp dev` use port 5180 and
-`.wrangler/state`. Feature agents must not reuse that state or test mutations
+`.wrangler/state`. Its AI is opt-in: plain `vp dev` binds no Workers AI, AI
+Gateway, Vectorize or AI Search and prints `AI is off` when it starts;
+`GITMATRIX_DEV_AI=enabled vp dev` binds the shared development resources
+(`gitmatrix-dev`, `gitmatrix-knowledge`, `gitmatrix`), and every repository
+pushed to it then gets paid Knowledge builds. Feature agents must not reuse that state or test mutations
 against it. **Load samples** creates four small empty named repositories;
 the agent harness fills them through real `gm` commits, without GitHub imports.
 
@@ -250,8 +257,11 @@ boundaries, and continue unrelated work only under its own valid claim.
 The queue pins the base and source, prepares an exact two-parent candidate, runs
 the configured required merge gates on that candidate, then advances main with
 compare-and-swap. Missing/invalid configuration, no runnable gates or skipped
-required jobs fail closed. If main moves, the candidate must be merged and tested
-again. Failed/cancelled entries release scheduling capacity; retry fences off old
+required jobs fail closed. Persisted job specifications retain their `on` trigger
+restrictions, so step-only and preview-only jobs stay excluded when landing gates
+are verified; a skipped job that does apply still blocks landing. If main moves,
+the candidate must be merged and tested again. Failed/cancelled entries release
+scheduling capacity; retry fences off old
 attempts. Post-landing main CI/deployment is tracked separately: failure creates
 remediation without changing the landed status or rewinding main.
 Notification retries do not block deployment startup or failure remediation.
@@ -1717,7 +1727,9 @@ release introductions. Embedding models and dimensions remain fixed.
 
 `GET/PATCH /api/accounts/:slug/settings/ai` returns features, selected option IDs,
 the catalog, save provenance and `canManage`. PATCH accepts partial nested
-`features` and `models` objects; unknown keys and out-of-role model IDs are rejected.
+`features`, `models` and `knowledgeUpdates` (`quietMinutes`, `maxWaitMinutes`,
+whole minutes 0–1440) objects; unknown keys, out-of-role model IDs and other
+waits are rejected.
 The [CLI equivalent](../cli/README.md#automatic-ai-settings) is `gm settings ai`.
 
 Policy is frozen when a Workflow is admitted or a release generation captures its
@@ -1742,10 +1754,16 @@ AI behavior is verified on demand, not by automatic CI. Follow the repository's
 and run `vp run agent test-ai` for real build/graph/wiki/Vectorize/AI Search evidence.
 The isolated non-AI test mode omits provider bindings, suppresses background builds,
 and rejects explicit rebuild/search with 503; production behavior is unchanged.
+Use `vp run agent test-ai --all` for a fresh check of the entire provider
+surface rather than only the stages selected by changed paths. Atlas evidence
+retains build statistics and the structural graph before membership assertions;
+description citations must belong to the capability's actual primary members
+and retain their exact commit and blob provenance.
 
 ```
 push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
-                       debounce 1.5s (max 8s), one build in flight, rebuild if dirty
+                       main's pushes pending until they settle (10 min quiet, 30 min at most),
+                       one update in flight, at the latest head
                      ─▶ KnowledgeBuild (Workflow, durable retried steps)
    snapshot ─▶ analyze ─▶ graph ─▶ align ─▶ concepts ─▶ synthesize ─▶ review ─▶ graph-final ─▶ index ─▶ wiki ─▶ finish
                  │           │        │          │            │                         │        │
@@ -1754,6 +1772,48 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
                                                       links, trim)                                         clef gate)
 ```
 
+- **Batched, asynchronous updates** (CORE-286). A push to main marks the
+  repository's Knowledge pending: the coordinator records main's new head, how
+  many pushes are waiting and when the first and last came. One update then
+  runs at the latest head once pushes have paused for the account's quiet
+  period, and never later than its longest wait after the first pending push
+  (10 and 30 minutes by default; `knowledgeUpdates` in the account's AI
+  settings, 0–1440 minutes each; development environments shorten both with
+  `GITMATRIX_KNOWLEDGE_QUIET_SECONDS` / `GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS`).
+  Pushes during an update wait for their own window. A repository's first
+  build, an explicit rebuild and a watchdog retry start at once, and a
+  repository admin can start the pending update now (`POST …/knowledge/update`,
+  the Knowledge tab's **Update now**). Timeline overlays and page sets keep
+  their own short debounce. The status says what Knowledge reflects:
+  `pending: {pushes, since, dueAt}` beside `indexedCommit` ("Reflects abc1234 ·
+  3 pushes pending · update at ~14:05").
+- **Updates, not rebuilds** (CORE-286). An update is driven by the diff from
+  the indexed commit: it reads only the trees that changed (an unchanged
+  subtree's files are the indexed ones), analyzes only new blobs, and every
+  model decision after that is reused unless its inputs changed: concept pairs
+  (by pair), salience (by the group's names and files), definitions (by the
+  concept's name, aliases and the files it is defined from, in its
+  repository; not by their summaries, which change wording on every edit),
+  reviews (by both entries), component and overview syntheses and wiki pages
+  (by their inputs hash). Pairs are decided over the whole repository's
+  candidates, so a newcomer that becomes one of an established concept's
+  closest is asked about too; names are embedded only when the set of concepts
+  changed. Review rounds run until nothing is left to ask, so one update
+  settles what its own push changed. Vectors follow the graph's change feed,
+  search items their blob or page versions, the Atlas its feed (CORE-166), and
+  only changed concept rows are written. A **full rebuild** (`POST
+…/knowledge/rebuild`, a repository's first build, or a new pipeline version
+  `kg_state.pipeline`) runs every phase over the whole repository, still
+  reusing decisions whose inputs are unchanged, and re-embeds every node.
+  `worker/knowledge/incremental.test.ts` builds one history twice through the
+  real Workflow with deterministic models, updates on one side and full
+  rebuilds on the other, and requires identical Knowledge after every push.
+- **Per-build AI cost** (CORE-286). Each step meters its model calls into its
+  build (`kg_builds.ai_usage`, by model, retried calls included); the build's
+  stats get `aiUsage` (calls, tokens, list-price cost by model) and `mode`
+  (`update` or `full`, with `fullBecause`), `pushes` and `treesRead`. The usage
+  report adds a **Knowledge updates** section: updates and full rebuilds over
+  30 days, their calls, cost each and the costliest repositories.
 - **Analysis per content, not per commit.** Each file version (blob) is
   analyzed once: exact structure from regex extractors (imports, symbols,
   resolved file/package edges), its role from the Classification model, and a
@@ -1782,7 +1842,9 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   (3+ files always stay); the rest become `topics` on their files. Once kept
   concepts have definitions, their related pairs are asked again with the
   definitions (`review`), which settles many that names alone left in between.
-  Decisions are stored, so a push only asks about the concepts it introduced.
+  Decisions are stored, so an update only asks about pairs it has never
+  decided: the concepts its push introduced and the neighbours whose closest
+  candidates they changed.
   The wording was picked on hand-labelled samples from this repo: the glossary
   framing with file paths ranked pairs best (AUC 0.94 vs 0.85 for the recipe's
   wording; file summaries made it worse) with all level-2 merges correct; the
@@ -1797,9 +1859,32 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
 - **Historical Clef/Qwen latency** on this repo: a 2-file push updated the graph
   in ~14s, summaries in ~40s, search in ~60s and the affected wiki page in ~90s.
   A first build of ~100 files took ~13 minutes (mostly writing every page once).
-- **Robustness:** model calls have deadlines and back off on Workers AI rate
-  limits; a failed file is retried next build; the coordinator's watchdog
-  stops a hung build and retries it once.
+- **Robustness:** model calls have deadlines by job (writing 180 s, fast
+  90 s, classification 60 s; a call past its deadline is aborted, though the
+  provider may still bill it) and back off on Workers AI rate limits (at most
+  six retries); a failed file is retried next build; the coordinator's
+  watchdog stops a hung build and retries it once.
+- **Paid work stops (CORE-285, `paid-work.ts`, `paid-steps.ts`):** each
+  Workflow step re-enters the build's metering context (AsyncLocalStorage
+  doesn't cross `step.do`), so its calls record in `ai_usage` for the
+  repository owner, not as `unattributed`. No call starts after a step
+  attempt's timeout (in-flight calls are aborted: the runtime has retried the
+  step), or once main's build is no longer `running` (the watchdog stopped it,
+  it failed, or the repository is being deleted), which fails the step without
+  retries. The watchdog terminates any instance it gives up on unless it
+  already ended, even when only its status was unreadable. A failed batch of
+  model calls starts nothing more and waits for those in flight.
+- **Metering matches the Gateway:** every call's AI Gateway log carries the
+  `account` and `feature` it is recorded under; failed attempts (rate limits,
+  timeouts, stops) count in `ai_usage.failed_calls`. `test-ai` reconciles the
+  fixture owner's `ai_usage` with the owned gateway's logs per feature and
+  model (`tools/agent/usage-reconciliation.ts`). Pagination follows the raw
+  provider page size, not the filtered count: sparse or empty filtered pages
+  must not truncate the audit. When comparing with the
+  account meter (`events.aiInference`), use plain `count()` and
+  `sum(neurons)`: that dataset is adaptively sampled and its aggregates are
+  already weighted by `sampleInterval`. Multiplying by it again squares the
+  weight, which overstated spend about 7× in CORE-284.
 - **Timeline overlays** (`worker/knowledge/overlay.ts`, CORE-83): every push to
   a `timeline/<slug>` bookmark recomputes that timeline's graph diff against
   main's indexed graph: the files it changed since its merge base with main,
@@ -2925,6 +3010,14 @@ a pending approval without executing it or generating a second reply, and reload
 It retains `assistant-approval.png` and `assistant-approval.zip` with the provider
 evidence. Provider stream errors also pass through the assistant's error handler
 so Worker logs include their message rather than only a provider stack trace.
+
+Before a stream opens, `worker/assistant/capacity.ts` retries only the Workers AI
+binding's `3021` inference-per-minute refusal: at most three retries after
+5, 15 and 45 seconds, within a 90-second acquisition deadline. Stop cancels
+the request or backoff. Once a stream opens, neither partial text nor tool
+steps are replayed; the acquisition deadline no longer applies. Exhaustion
+surfaces the original provider error. The SDK's existing transient-error
+retries remain enabled.
 
 ## Mirrors
 

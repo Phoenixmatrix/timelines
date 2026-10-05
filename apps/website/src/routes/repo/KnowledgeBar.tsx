@@ -47,7 +47,7 @@ export function KnowledgeBar({
         Wiki
       </Link>
       <ExportGraph repo={repo} disabled={!status?.indexedCommit} />
-      {status && <KnowledgeStatusPill status={status} />}
+      {status && <KnowledgeStatusPill status={status} repo={repo} />}
     </div>
   );
 }

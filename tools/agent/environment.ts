@@ -32,6 +32,17 @@ export interface Environment {
   };
   status: "provisioning" | "ready" | "deleting" | "deleted";
   server?: { pid: number; start: string };
+  /**
+   * Whether this environment has paid AI (Workers AI, AI Gateway, Vectorize,
+   * AI Search). Setup leaves it off unless `--ai` (CORE-284). Journals written
+   * before the field derive it from their resources.
+   */
+  ai?: boolean;
+}
+
+/** Whether the environment binds paid AI: Knowledge builds and other model calls run. */
+export function aiEnabled(env: Environment): boolean {
+  return env.ai ?? !(env.resources.vectors === "deleted" && env.resources.search === "deleted");
 }
 
 export function validateEnvironment(value: Environment): void {
@@ -69,6 +80,8 @@ export function validateEnvironment(value: Environment): void {
     !["pending", "created", "deleted"].includes(value.resources.gateway as string)
   )
     throw new Error("Invalid resource ownership journal.");
+  if (Object.hasOwn(value, "ai") && typeof value.ai !== "boolean")
+    throw new Error("Invalid environment AI flag.");
 }
 
 function requireGateway(env: Environment): void {
@@ -452,7 +465,8 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
     const local = await recordAt(join(env.dir, "environment.json"));
     if (local?.id === env.id) {
       for (const name of await readdir(env.dir)) {
-        if (["artifacts", "environment.json", "runs"].includes(name)) continue;
+        // test-ai's run history outlives environments: --resume and the failure cooldown.
+        if (["artifacts", "environment.json", "runs", "test-ai"].includes(name)) continue;
         await rm(join(env.dir, name), { recursive: true, force: true });
       }
     }
@@ -497,10 +511,14 @@ async function allocatePort(): Promise<number> {
   return address.port;
 }
 
+/**
+ * Provisions an owned environment, or returns this worktree's existing one.
+ * Paid AI resources (AI Gateway, Vectorize, AI Search) only when `ai`.
+ */
 export async function createEnvironment(
   root: string,
   ephemeral = false,
-  ai = true,
+  ai = false,
 ): Promise<Environment> {
   root = await realpath(root);
   await cleanupExpired();
@@ -515,6 +533,10 @@ export async function createEnvironment(
         if (current.status !== "ready")
           throw new Error("Partial environment exists; run destroy before setup.");
         requireGateway(current);
+        if (ai && !aiEnabled(current))
+          throw new Error(
+            "This worktree's environment has no AI. Run `vp run agent destroy`, then `vp run agent setup --ai`.",
+          );
         return current;
       }
     }
@@ -563,6 +585,7 @@ export async function createEnvironment(
         gateway: ai ? "pending" : "deleted",
       },
       status: "provisioning",
+      ai,
     };
     await persist(env);
     try {
@@ -648,6 +671,7 @@ export async function createEnvironment(
           event: "environment.created",
           id,
           origin: env.origin,
+          ai,
           expires: new Date(env.expires).toISOString(),
         }),
       );
@@ -701,7 +725,7 @@ export async function context(env: Environment): Promise<HarnessContext> {
     GITMATRIX_PUBLIC_URL: env.origin,
     GITMATRIX_STATE_DIR: join(env.dir, "state"),
     GITMATRIX_ARTIFACTS_NAMESPACE: env.id,
-    GITMATRIX_AGENT_AI: env.resources.vectors === "deleted" ? "disabled" : "enabled",
+    GITMATRIX_AGENT_AI: aiEnabled(env) ? "enabled" : "disabled",
     GITMATRIX_VECTORIZE_INDEX: env.id,
     GITMATRIX_SEARCH_NAMESPACE: env.id,
     GITMATRIX_AI_GATEWAY: env.id,
@@ -711,6 +735,10 @@ export async function context(env: Environment): Promise<HarnessContext> {
     // A timeline's full CI and overlays wait for its pushes to pause (CORE-238):
     // seconds here, so scenarios exercise the wait without spending minutes on it.
     GITMATRIX_TIMELINE_QUIET_SECONDS: "3",
+    // Main's pushes settle before one Knowledge update (CORE-286): seconds
+    // here, unless the caller chose its own (a batching measurement does).
+    GITMATRIX_KNOWLEDGE_QUIET_SECONDS: process.env.GITMATRIX_KNOWLEDGE_QUIET_SECONDS ?? "2",
+    GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS: process.env.GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS ?? "8",
     HOME: join(env.dir, "home"),
     TMPDIR: temporary,
     XDG_CONFIG_HOME: join(env.dir, "config"),
@@ -762,6 +790,7 @@ export async function listEnvironments(): Promise<unknown[]> {
       origin: e.origin,
       expires: new Date(e.expires).toISOString(),
       status: e.status,
+      ai: aiEnabled(e),
       resources: e.resources,
     }));
 }

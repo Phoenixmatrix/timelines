@@ -4,6 +4,7 @@
 // measured, the catalog price used, the retention category that cleans it up).
 
 import type {
+  KnowledgeUpdateSpend,
   UsageCategoryLink,
   UsageCost,
   UsageFigure,
@@ -256,6 +257,70 @@ function Trend({ report }: { report: UsageReport }) {
   );
 }
 
+/** What Knowledge builds cost per update, beside full rebuilds (CORE-286). */
+function KnowledgeUpdates({ spend }: { spend: KnowledgeUpdateSpend }) {
+  const total = spend.updates.count + spend.fullRebuilds.count + spend.unmetered;
+  if (total === 0) return null;
+  // Cents hide what one small update costs.
+  const each = (value: number | null) =>
+    value === null
+      ? "not metered"
+      : `${value > 0 && value < 0.01 ? `$${value.toFixed(4)}` : usd(value)} each`;
+  return (
+    <section aria-labelledby="usage-knowledge" data-usage-knowledge>
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+        <h2 id="usage-knowledge" className="m-0 text-title">
+          Knowledge updates
+        </h2>
+        <span className="text-body-sm text-ink-muted">
+          Since {day(spend.from)}, model calls at list price
+        </span>
+      </div>
+      <ul className="m-0 list-none overflow-hidden rounded-pane bg-pane p-0">
+        {(
+          [
+            ["Updates after pushes", spend.updates],
+            ["Full rebuilds", spend.fullRebuilds],
+          ] as const
+        ).map(([label, s]) => (
+          <li
+            key={label}
+            className="flex min-h-11 flex-wrap items-center gap-x-3 border-t border-line-soft px-4 py-2 first:border-t-0"
+          >
+            <span className="min-w-0 flex-1">
+              {label}{" "}
+              <span className="text-ink-muted">
+                {s.count} · {s.calls.toLocaleString()} model calls · {each(s.eachUsd)}
+              </span>
+            </span>
+            <span className="font-semibold tabular-nums">{usd(s.costUsd)}</span>
+          </li>
+        ))}
+        {spend.repos.map((r) => (
+          <li
+            key={r.name}
+            className="flex min-h-11 flex-wrap items-center gap-x-3 border-t border-line-soft px-4 py-2 pl-8"
+          >
+            <span className="min-w-0 flex-1 break-words">
+              {r.name}{" "}
+              <span className="text-ink-muted">
+                {r.updates} updates, {r.fullRebuilds} full rebuilds
+              </span>
+            </span>
+            <span className="tabular-nums">{usd(r.costUsd)}</span>
+          </li>
+        ))}
+      </ul>
+      {spend.unmetered > 0 && (
+        <p className="mt-2 mb-0 text-body-sm text-ink-muted">
+          {spend.unmetered} earlier {spend.unmetered === 1 ? "build" : "builds"} ran before builds
+          metered their own calls and {spend.unmetered === 1 ? "is" : "are"} not priced here.
+        </p>
+      )}
+    </section>
+  );
+}
+
 export function UsageReportView({
   report,
   csvHref,
@@ -333,6 +398,8 @@ export function UsageReportView({
           )}
         </section>
       )}
+
+      {report.knowledgeUpdates && <KnowledgeUpdates spend={report.knowledgeUpdates} />}
 
       {report.constructs.map((c) => (
         <section key={c.construct} aria-labelledby={`usage-${c.construct}`}>

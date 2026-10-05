@@ -265,6 +265,14 @@ export interface KnowledgeStatus {
   indexedAt: string | null;
   /** The repository's current HEAD, to compare with `indexedCommit`. */
   head: string | null;
+  /**
+   * Pushes to main waiting for the next update (CORE-286): how many, since
+   * when, and when the update starts (null until scheduled). Null when the
+   * indexed commit is HEAD or an update is running.
+   */
+  pending: { pushes: number; since: string; dueAt: string | null } | null;
+  /** Whether the viewer may start the pending update now (repository admins). */
+  canUpdate: boolean;
   state: "empty" | "up-to-date" | "queued" | "building" | "failed";
   /** Changes whenever the stored graph does, including mid-build; the map is cached by it. */
   graphVersion: string;

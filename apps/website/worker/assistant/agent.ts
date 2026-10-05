@@ -18,6 +18,7 @@ import {
   generateText,
   stepCountIs,
   streamText,
+  wrapLanguageModel,
   type ToolSet,
   type UIMessage,
 } from "ai";
@@ -35,6 +36,7 @@ import {
 } from "../durable/contract.ts";
 import { recordPurge } from "../durable/record.ts";
 import { credential, type AssistantCredential } from "./identity.ts";
+import { assistantCapacity } from "./capacity.ts";
 import { apiClient } from "./internal.ts";
 import { clefState, planFrom, questions, type TurnPlan } from "./plan.ts";
 import {
@@ -374,10 +376,13 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
 
         const workersai = createWorkersAI({ binding: this.env.AI });
         const result = streamText({
-          model: workersai(model, {
-            ...aiGatewayOptions(this.env, "assistant"),
-            reasoning_effort: plan.reasoning,
-            sessionAffinity: this.name,
+          model: wrapLanguageModel({
+            model: workersai(model, {
+              ...aiGatewayOptions(this.env, "assistant"),
+              reasoning_effort: plan.reasoning,
+              sessionAffinity: this.name,
+            }),
+            middleware: assistantCapacity,
           }),
           instructions: instructions({
             person: person?.display_name ?? "the person",

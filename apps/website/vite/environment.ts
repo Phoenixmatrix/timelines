@@ -1,9 +1,17 @@
 type Environment = Record<string, string | undefined>;
 
+/** How to turn paid AI on for the canonical development server. */
+export const DEV_AI_OPT_IN = "GITMATRIX_DEV_AI=enabled vp dev";
+
 /** Shared by cf's config evaluator and Vite; never fall back to shared resources in agent mode. */
 export function developmentEnvironment(env: Environment) {
   const agentId = env.GITMATRIX_AGENT_ID;
   const agent = agentId !== undefined;
+  // Paid AI (Workers AI, AI Gateway, Vectorize, AI Search) is opt-in in
+  // development (CORE-284): Knowledge builds of real repositories cost money.
+  // An agent environment says which it provisioned; the canonical server
+  // binds them only with GITMATRIX_DEV_AI=enabled.
+  const ai = agent ? env.GITMATRIX_AGENT_AI === "enabled" : env.GITMATRIX_DEV_AI === "enabled";
   const required = (key: string) => {
     const value = env[key];
     if (!value?.trim()) throw new Error(`Agent mode requires ${key}`);
@@ -72,12 +80,14 @@ export function developmentEnvironment(env: Environment) {
       if (required(key) !== agentId)
         throw new Error(`${key} must match the owned environment resource namespace`);
     }
-    if (env.GITMATRIX_AGENT_AI !== "disabled" && required("GITMATRIX_AI_GATEWAY") !== agentId)
+    if (env.GITMATRIX_AGENT_AI !== "enabled" && env.GITMATRIX_AGENT_AI !== "disabled")
+      throw new Error("Agent mode requires GITMATRIX_AGENT_AI=enabled or disabled");
+    if (ai && required("GITMATRIX_AI_GATEWAY") !== agentId)
       throw new Error("GITMATRIX_AI_GATEWAY must match the owned environment resource namespace");
     required("GITMATRIX_AGENT_SECRET");
     required("GITMATRIX_CI_DISPATCH_SECRET");
     if (env.GITMATRIX_CI_RUNNER !== "local")
       throw new Error("Agent mode requires local CI runners");
   }
-  return { agent, agentId, port, host, publicUrl, stateDir, runnerHomes };
+  return { agent, agentId, ai, port, host, publicUrl, stateDir, runnerHomes };
 }

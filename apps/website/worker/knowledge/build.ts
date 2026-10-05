@@ -54,7 +54,7 @@ import { recordPublishedPackages, recordsPackages } from "../atlas/publishers.ts
 import { invalidateRefs, RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
-import { analyzeFiles, loadAnalyses, type FileToAnalyze } from "./analyze.ts";
+import { ANALYZER, analyzeFiles, loadAnalyses, type FileToAnalyze } from "./analyze.ts";
 import { atlasInfer, atlasRunSpend } from "./budget.ts";
 import {
   applyGraph,
@@ -66,6 +66,7 @@ import {
   type Syntheses,
 } from "./graph.ts";
 import {
+  ALIGNER,
   alignPairs,
   loadConceptModel,
   reviewConcepts,
@@ -73,13 +74,15 @@ import {
   type ConceptModel,
 } from "./concepts.ts";
 import { syncSearchFiles, syncSearchPages, syncVectors } from "./indexes.ts";
-import { synthesize } from "./synthesize.ts";
+import { DEFINER, synthesize } from "./synthesize.ts";
+import { buildAiUsage, meterBuildCall, type ModelUsage } from "./meter.ts";
 import { coordinator } from "./coordinator.ts";
 import { computeOverlay, overlayFailed, planOverlay, toAnalyze } from "./overlay.ts";
 import { runPageSet } from "./pages.ts";
 import { chunk } from "./util.ts";
-import { planWiki, updatePages, type WikiSource, type WikiStats } from "./wiki.ts";
-import { aiWork } from "../usage/ai.ts";
+import { planWiki, updatePages, WRITER, type WikiSource, type WikiStats } from "./wiki.ts";
+import { aiWork, type AiWork } from "../usage/ai.ts";
+import { paidSteps } from "./paid-steps.ts";
 
 export interface BuildParams {
   repoId: string;
@@ -88,8 +91,10 @@ export interface BuildParams {
   policy?: KnowledgePolicy;
   /** Pin watchdog continuations to their original work, not a newer push. */
   commit?: string;
-  /** Rebuild even when HEAD is already indexed. */
+  /** A full rebuild (an explicit request): every phase over the whole repository, even when HEAD is already indexed. */
   force?: boolean;
+  /** Pushes to main this update covers (CORE-286). */
+  pushes?: number;
   /** Compute a timeline's overlay instead of building main's graph. */
   overlay?: { ref: string; commit: string; base?: string };
   /** Write a timeline's wiki page set (queued in kg_page_sets) instead. */
@@ -111,6 +116,8 @@ const STEP = {
 /** Steps that make Atlas paid calls run once: budgets allow no automatic paid retries. */
 const PAID_STEP = { ...STEP, retries: { ...STEP.retries, limit: 0 } } as const;
 const ANALYZE_BATCH = 32;
+/** Review rounds per build at most; each settles what the one before regrouped. */
+const REVIEW_ROUNDS = 6;
 /** Wiki pages per step: a few model calls, far inside the step timeout. */
 const WIKI_BATCH = 6;
 /** Atlas retention passes around a publication; each is bounded (worker/atlas/retention.ts). */
@@ -133,6 +140,31 @@ async function repoRow(d1: D1Database, repoId: string): Promise<RepoRow | null> 
     full_name: `${row.slug}/${row.name}`,
   };
 }
+
+/** Why a build may no longer spend on models, or null while it may. */
+export async function buildStopped(
+  d1: D1Database,
+  repoId: string,
+  buildId: string,
+): Promise<string | null> {
+  const [build, repo] = await Promise.all([
+    db(d1).selectFrom("kg_builds").select("status").where("id", "=", buildId).executeTakeFirst(),
+    db(d1).selectFrom("repos").select("deleted_at").where("id", "=", repoId).executeTakeFirst(),
+  ]);
+  if (repo?.deleted_at) return "The repository is being deleted; the build stopped";
+  // Recorded by the first step; until then it is starting.
+  if (build && build.status !== "running")
+    return `The build is ${build.status}; it makes no more model calls`;
+  return null;
+}
+
+const repoOf = (row: RepoRow) => ({ id: row.id, fullName: row.full_name });
+
+/**
+ * The pipeline's version: the analyzer's, aligner's, definer's and wiki
+ * writer's. Knowledge indexed with another is rebuilt in full (CORE-286).
+ */
+export const PIPELINE = `${ANALYZER}.${ALIGNER}.${DEFINER}.${WRITER}`;
 
 /** Merge `stats` into a build's stats JSON. */
 const patchStats = (stats: Record<string, unknown>) =>
@@ -159,6 +191,41 @@ type Progress = <T extends Rpc.Serializable<T>>(
   work: () => Promise<T>,
   config?: WorkflowStepConfig,
 ) => Promise<T>;
+
+/**
+ * A commit's files. Given the indexed commit's tree and files, only trees
+ * that changed are read: an unchanged subtree's files are the indexed ones
+ * (CORE-286). Without it, every tree is read.
+ */
+export async function listFiles(
+  reader: Pick<RepoReader, "tree">,
+  tree: string,
+  base: { tree: string; files: SnapshotFile[] } | null,
+): Promise<{ files: SnapshotFile[]; treesRead: number }> {
+  const files: SnapshotFile[] = [];
+  let treesRead = 0;
+  const read = async (hash: string) => {
+    treesRead++;
+    return (await reader.tree(hash)) ?? [];
+  };
+  const walk = async (hash: string, prefix: string, before: string | null) => {
+    const old = before ? new Map((await read(before)).map((e) => [e.name, e])) : null;
+    for (const entry of await read(hash)) {
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.type === "tree") {
+        const was = old?.get(entry.name);
+        if (base && was?.type === "tree" && was.hash === entry.hash) {
+          const inside = `${path}/`;
+          for (const f of base.files) if (f.path.startsWith(inside)) files.push(f);
+        } else await walk(entry.hash, path, was?.type === "tree" ? was.hash : null);
+      } else if (entry.type === "blob" || entry.type === "exec")
+        files.push({ path, blob: entry.hash, mode: entry.mode });
+    }
+  };
+  await walk(tree, "", base?.tree ?? null);
+  files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return { files, treesRead };
+}
 
 function merge(base: Syntheses, over: Syntheses): Syntheses {
   return {
@@ -213,7 +280,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     const { syntheses } = await synthesize(
       env,
       models,
-      row.full_name,
+      repoOf(row),
       files,
       analyses,
       buildGraph(
@@ -240,7 +307,28 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       : event.payload.pages
         ? "wiki"
         : "knowledge";
-    return aiWork({ feature, repo: event.payload.repoId }, () => this.#run(event, step));
+    const main = !event.payload.overlay && !event.payload.pages;
+    const work: AiWork = {
+      feature,
+      repo: event.payload.repoId,
+      // Main's builds meter their own calls (CORE-286), retried and failed attempts included.
+      ...(main
+        ? {
+            onCall: (model: string, usage: ModelUsage) =>
+              meterBuildCall(this.env.DB, event.payload.buildId, model, usage),
+          }
+        : {}),
+    };
+    // Each step re-enters that attribution, and stops paying (CORE-285) once
+    // its attempt has timed out or, for main's builds, once the build is no
+    // longer running (the watchdog stopped it, or it failed) or its repository
+    // is being deleted.
+    const { repoId, buildId } = event.payload;
+    const live =
+      event.payload.overlay || event.payload.pages
+        ? undefined
+        : () => buildStopped(this.env.DB, repoId, buildId);
+    return aiWork(work, () => this.#run(event, paidSteps(step, work, live)));
   }
 
   async #run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
@@ -282,24 +370,39 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         const head = event.payload.commit ?? refs.head;
         const state = await db(env.DB)
           .selectFrom("kg_state")
-          .select("indexed_commit")
+          .select(["indexed_commit", "pipeline"])
           .where("repo_id", "=", repoId)
           .executeTakeFirst();
+        const previous = state?.indexed_commit ?? null;
+        // An update by default; a full rebuild when asked for, for the first
+        // build, or when the pipeline's version changed (CORE-286).
+        const fullBecause = force
+          ? "requested"
+          : !previous
+            ? "first"
+            : state?.pipeline && state.pipeline !== PIPELINE
+              ? "version"
+              : null;
         await db(env.DB)
           .insertInto("kg_builds")
           .values({
             id: buildId,
             repo_id: repoId,
-            from_commit: state?.indexed_commit ?? null,
+            from_commit: previous,
             to_commit: head ?? "",
             status: "running",
             phase: "snapshot",
             ai_snapshot: JSON.stringify(policy),
-            stats: JSON.stringify({ ai: policy.ai }),
+            stats: JSON.stringify({
+              ai: policy.ai,
+              mode: fullBecause ? "full" : "update",
+              ...(fullBecause ? { fullBecause } : {}),
+              ...(event.payload.pushes ? { pushes: event.payload.pushes } : {}),
+            }),
           })
           .onConflict((oc) => oc.column("id").doNothing())
           .execute();
-        return { row, head, previous: state?.indexed_commit ?? null };
+        return { row, head, previous, full: fullBecause !== null };
       });
       if (!start?.head) {
         await this.#finish(step, repoId, buildId, null, { empty: true });
@@ -321,24 +424,27 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         return { status: "up-to-date" };
       }
 
+      // A full rebuild (or a first build) runs every phase over the whole
+      // repository; an update is driven by the diff from the indexed commit.
+      const full = start.full ?? Boolean(force);
       const toAnalyze = await progress("snapshot", "snapshot", async () =>
         this.#withReader(row, async (reader) => {
           const commit = await reader.commit(head);
           if (!commit) throw new Error(`Commit ${head} not found`);
-          const files: SnapshotFile[] = [];
-          const walk = async (tree: string, prefix: string) => {
-            for (const entry of (await reader.tree(tree)) ?? []) {
-              const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-              if (entry.type === "tree") await walk(entry.hash, path);
-              else if (entry.type === "blob" || entry.type === "exec")
-                files.push({ path, blob: entry.hash, mode: entry.mode });
-            }
-          };
-          await walk(commit.treeHash, "");
-          await saveSnapshot(env.DB, repoId, buildId, files);
-          const previous = new Map(
-            (await loadSnapshot(env.DB, repoId, "current")).map((f) => [f.path, f.blob]),
+          const indexedFiles = await loadSnapshot(env.DB, repoId, "current");
+          // An update reads only the trees that changed since the indexed commit.
+          const base =
+            !full && start.previous && indexedFiles.length
+              ? await reader.commit(start.previous)
+              : null;
+          const listed = await listFiles(
+            reader,
+            commit.treeHash,
+            base ? { tree: base.treeHash, files: indexedFiles } : null,
           );
+          const files = listed.files;
+          await saveSnapshot(env.DB, repoId, buildId, files);
+          const previous = new Map(indexedFiles.map((f) => [f.path, f.blob]));
           const known = await loadAnalyses(
             env.DB,
             files.map((f) => f.blob),
@@ -346,12 +452,13 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           const pending: FileToAnalyze[] = files
             .filter((f) => !known.has(f.blob))
             .map((f) => ({ path: f.path, blob: f.blob, previousBlob: previous.get(f.path) }));
+          const paths = new Set(files.map((f) => f.path));
           await recordStats(env.DB, buildId, {
             files: files.length,
             changedFiles: files.filter((f) => previous.get(f.path) !== f.blob).length,
-            removedFiles: [...previous.keys()].filter((p) => !files.some((f) => f.path === p))
-              .length,
+            removedFiles: [...previous.keys()].filter((p) => !paths.has(p)).length,
             toAnalyze: pending.length,
+            treesRead: listed.treesRead,
           });
           return pending;
         }),
@@ -402,7 +509,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           const { syntheses } = await synthesize(
             env,
             models,
-            row.full_name,
+            repoOf(row),
             files,
             analyses,
             draft,
@@ -451,7 +558,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             env.DB,
             files.map((f) => f.blob),
           );
-          return alignPairs(env, models, repoId, files, analyses);
+          return alignPairs(env, models, repoId, files, analyses, undefined, { full });
         });
         pairsAsked = Math.max(0, aligned.decided - decidedBefore);
         if (aligned.remaining === 0) break;
@@ -494,7 +601,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           const { stats } = await synthesize(
             env,
             models,
-            row.full_name,
+            repoOf(row),
             files,
             analyses,
             draft,
@@ -506,44 +613,57 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
 
       // With definitions written, related pairs of kept concepts get a second
       // look; any merge it finds regroups concepts and defines the new group.
-      const review = await progress("review", "synthesize", () =>
-        this.#withReader(row, async (reader) => {
-          const files = await loadSnapshot(env.DB, repoId, buildId);
-          const analyses = await loadAnalyses(
-            env.DB,
-            files.map((f) => f.blob),
-          );
-          const readme = await this.#readme(reader, files);
-          const graphWith = async (model: ConceptModel) => {
-            const draft = buildGraph(
-              row.full_name,
-              files,
-              analyses,
-              { components: new Map(), concepts: new Map() },
-              model,
+      // With definitions written, related pairs of kept concepts get a second
+      // look; any answer can regroup concepts, which defines the new groups and
+      // brings new pairs to review. Rounds go on until nothing is left to ask,
+      // so a build leaves the concept model settled and the next update asks
+      // only about what its push changed (CORE-286).
+      const review = { asked: 0, newMerges: 0, rounds: 0 };
+      for (let round = 0; round < REVIEW_ROUNDS; round++) {
+        const stats = await progress(round ? `review-${round}` : "review", "synthesize", () =>
+          this.#withReader(row, async (reader) => {
+            const files = await loadSnapshot(env.DB, repoId, buildId);
+            const analyses = await loadAnalyses(
+              env.DB,
+              files.map((f) => f.blob),
             );
-            const { syntheses } = await synthesize(
-              env,
-              models,
-              row.full_name,
-              files,
-              analyses,
-              draft,
-              readme,
-              true,
-            );
-            return { draft, graph: buildGraph(row.full_name, files, analyses, syntheses, model) };
-          };
-          const { graph } = await graphWith(await loadConceptModel(env.DB, repoId));
-          const stats = await reviewConcepts(env, models, repoId, graph);
-          if (stats.newMerges > 0) {
-            await settleConcepts(env, models, repoId, files, analyses);
-            const { draft } = await graphWith(await loadConceptModel(env.DB, repoId));
-            await synthesize(env, models, row.full_name, files, analyses, draft, readme);
-          }
-          return stats;
-        }),
-      );
+            const readme = await this.#readme(reader, files);
+            const graphWith = async (model: ConceptModel) => {
+              const draft = buildGraph(
+                row.full_name,
+                files,
+                analyses,
+                { components: new Map(), concepts: new Map() },
+                model,
+              );
+              const { syntheses } = await synthesize(
+                env,
+                models,
+                repoOf(row),
+                files,
+                analyses,
+                draft,
+                readme,
+                true,
+              );
+              return { draft, graph: buildGraph(row.full_name, files, analyses, syntheses, model) };
+            };
+            const { graph } = await graphWith(await loadConceptModel(env.DB, repoId));
+            const stats = await reviewConcepts(env, models, repoId, graph);
+            // New answers can regroup concepts; without any, the model is as settled.
+            if (stats.asked > 0) {
+              await settleConcepts(env, models, repoId, files, analyses);
+              const { draft } = await graphWith(await loadConceptModel(env.DB, repoId));
+              await synthesize(env, models, repoOf(row), files, analyses, draft, readme);
+            }
+            return stats;
+          }),
+        );
+        review.asked += stats.asked;
+        review.newMerges = stats.newMerges;
+        review.rounds = round + 1;
+        if (stats.asked === 0) break;
+      }
 
       // When upstream graph inputs are ready: what Atlas timings are measured from.
       const graphFinal = await progress("graph-final", "synthesize", () =>
@@ -568,7 +688,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           const { syntheses } = await synthesize(
             env,
             models,
-            row.full_name,
+            repoOf(row),
             files,
             analyses,
             draft,
@@ -610,7 +730,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           const { syntheses } = await synthesize(
             env,
             models,
-            row.full_name,
+            repoOf(row),
             files,
             analyses,
             buildGraph(
@@ -633,7 +753,13 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             merge(await storedSyntheses(env.DB, repoId), syntheses),
             concepts,
           );
-          const vectors = await syncVectors(env, repoId, graph.nodes, diff);
+          // A full rebuild embeds every node again; an update only what changed.
+          const vectors = await syncVectors(
+            env,
+            repoId,
+            graph.nodes,
+            full ? { ...diff, changed: graph.nodes.map((n) => n.id) } : diff,
+          );
           const search = await syncSearchFiles(env, reader, repoId, head, files, analyses);
           await recordStats(env.DB, buildId, {
             vectorsUpserted: vectors.upserted,
@@ -695,7 +821,9 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       }
       // Pages that fail keep their old text and are retried by the next build,
       // but a wiki that could not write anything means the provider is down.
-      if (wiki.failed > 0 && wiki.written + wiki.kept === 0) {
+      // One page alone failing says nothing of the kind: an update often has
+      // only one page to settle (CORE-286), and it must not fail the build.
+      if (wiki.failed > 1 && wiki.written + wiki.kept === 0) {
         throw new Error(`No wiki page could be written: ${wiki.errors[0] ?? "unknown error"}`);
       }
       if (policy.ai.features.wiki)
@@ -718,6 +846,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         conceptSalienceAsked: conceptStats.askedSalience,
         conceptReviewsAsked: review.asked,
         conceptReviewMerges: review.newMerges,
+        conceptReviewRounds: review.rounds,
         pagesWritten: wiki.written,
         pagesKept: wiki.kept,
         pagesRemoved: plan.removed,
@@ -727,10 +856,24 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await step.do("fail", async () => {
+        // A failed build's calls were paid for too (CORE-286).
+        const aiUsage = await buildAiUsage(env.DB, buildId).catch(() => null);
+        if (aiUsage)
+          await db(env.DB)
+            .updateTable("kg_builds")
+            .set({ stats: patchStats({ aiUsage }) })
+            .where("id", "=", buildId)
+            .execute();
+        // A build the watchdog already stopped keeps the watchdog's reason.
         await db(env.DB)
           .updateTable("kg_builds")
-          .set({ status: "failed", error: message.slice(0, 2000), finished_at: nowIso() })
+          .set({
+            status: "failed",
+            error: message.slice(0, 2000),
+            finished_at: nowIso(),
+          })
           .where("id", "=", buildId)
+          .where("status", "=", "running")
           .execute();
         await coordinator(env, repoId).finished(buildId, false, message);
         return null;
@@ -1027,24 +1170,28 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
             indexed_commit: head,
             indexed_at: nowIso(),
             last_build_id: buildId,
+            pipeline: PIPELINE,
           })
           .onConflict((oc) =>
             oc.column("repo_id").doUpdateSet((eb) => ({
               indexed_commit: eb.ref("excluded.indexed_commit"),
               indexed_at: eb.ref("excluded.indexed_at"),
               last_build_id: eb.ref("excluded.last_build_id"),
+              pipeline: eb.ref("excluded.pipeline"),
             })),
           )
           .execute();
       }
       // Atlas paid synthesis is attributed apart from upstream Knowledge tokens.
       const atlasSpend = await atlasRunSpend(env.DB, "build", buildId);
+      // What this build's model calls cost (CORE-286), from its own meter.
+      const aiUsage = await buildAiUsage(env.DB, buildId);
       await db(env.DB)
         .updateTable("kg_builds")
         .set({
           status: "succeeded",
           phase: "done",
-          stats: patchStats({ ...stats, atlasSpend }),
+          stats: patchStats({ ...stats, atlasSpend, aiUsage }),
           finished_at: nowIso(),
         })
         .where("id", "=", buildId)
