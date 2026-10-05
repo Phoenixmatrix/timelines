@@ -259,6 +259,12 @@ The usage and retention browser journeys close each persona/viewport context aft
 its assertions and trace finish, before opening the next. Keep that lifetime bounded:
 finished pages still consume renderer memory if left open until scenario teardown.
 
+The Chronicle journey compares the range summary with the same API issue population
+the browser loads. Ruler drags update the address before the inspector's close link
+necessarily rerenders: wait for that link's final range destination, then verify
+closing preserves it before comparing counts. The selected range must include the
+showcase issue's completion so the done-count check cannot pass without exercising it.
+
 The E2E command creates a **separate ephemeral environment**, seeds it twice,
 exercises it and destroys it on success or failure. It does not reset the interactive
 environment. Its checks include:
