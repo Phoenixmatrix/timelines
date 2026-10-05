@@ -2073,7 +2073,17 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       "the landed timeline's bookmark and landing branch to go",
     );
     await gm(["timeline", "land", slug, "--owner", fixtures.tracker.owner], "jun", clone, /landed/);
-    const why = JSON.parse(await gm(["why", `${marker}:1`], "jun", clone)) as WhyResponse;
+    // Landing completion precedes the asynchronous push log's change index.
+    // Wait for that input, then assert the authoritative queue provenance below.
+    const why = await poll(
+      async () => JSON.parse(await gm(["why", `${marker}:1`], "jun", clone)) as WhyResponse,
+      (result) =>
+        result.chains.some(
+          (chain) =>
+            chain.oid === checkpointCommit && chain.refs.some((ref) => ref.kind === "main"),
+        ),
+      "the landed change's main ref to be indexed",
+    );
     record({ why, checkpoint });
     const provenance = why.chains.find((chain) => chain.oid === checkpointCommit)?.landing;
     assert.equal(provenance?.via, "queue", "gm why reads authoritative queue provenance");

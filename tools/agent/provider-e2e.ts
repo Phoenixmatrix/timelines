@@ -18,7 +18,7 @@ import { searchItemStatus } from "./search-item-status.ts";
 import { runAtlasProviderE2E } from "./atlas-provider-e2e.ts";
 import { command, validateEnvironment, type Environment } from "./environment.ts";
 import { runQueueAiE2E } from "./queue-ai-e2e.ts";
-import { reconcileUsage, type UsageRow } from "./usage-reconciliation.ts";
+import { collectGatewayLogs, reconcileUsage, type UsageRow } from "./usage-reconciliation.ts";
 import type { Outcome, Selection, StageDefinition } from "./ai-stages.ts";
 
 const WORKER = "apps/website/worker";
@@ -195,6 +195,22 @@ interface GatewayLog {
   cost?: number;
 }
 
+interface GatewayLogSummary {
+  id: string;
+  createdAt: string;
+  component: string;
+  model: string;
+  provider: string;
+  success: boolean;
+  cached: boolean;
+  responseContentType: string;
+  tokensIn: number;
+  tokensOut: number;
+  cost?: number;
+  account?: string;
+  feature?: string;
+}
+
 // List metadata only: never fetch request/response bodies or persist raw cf output.
 async function gatewayLogs(
   owned: Environment,
@@ -243,7 +259,7 @@ async function gatewayLogs(
     throw new Error("Gateway metadata lookup returned invalid JSON");
   }
   assert(Array.isArray(logs), "Gateway metadata lookup must return a list");
-  return logs.flatMap((log) => {
+  const selected: GatewayLogSummary[] = logs.flatMap((log) => {
     assert(
       typeof log.id === "string" &&
         typeof log.model === "string" &&
@@ -280,22 +296,7 @@ async function gatewayLogs(
       },
     ];
   });
-}
-
-/** Every page of a component's logs since `since` (bounded: 40 pages). */
-async function allGatewayLogs(owned: Environment, since: string, component: string) {
-  const logs: Awaited<ReturnType<typeof gatewayLogs>> = [];
-  const seen = new Set<string>();
-  for (let page = 1; page <= 40; page++) {
-    const batch = await gatewayLogs(owned, since, component, undefined, page);
-    for (const log of batch) {
-      if (seen.has(log.id)) continue;
-      seen.add(log.id);
-      logs.push(log);
-    }
-    if (batch.length < 50) return logs;
-  }
-  throw new Error(`More ${component} Gateway logs than reconciliation reads`);
+  return { logs: selected, rawCount: logs.length };
 }
 
 /**
@@ -2064,7 +2065,7 @@ export async function runProviderE2E(
         for (const requirement of requirements) {
           begin(requirement.stage);
           await waitFor(`gateway-${requirement.key}`, 120_000, async () => {
-            const logs = await gatewayLogs(
+            const { logs } = await gatewayLogs(
               owned,
               String(evidence.startedAt),
               requirement.component,
@@ -2124,7 +2125,9 @@ export async function runProviderE2E(
         usageEvidence.account = ownerAccount;
         let rows: ReturnType<typeof reconcileUsage>["rows"] = [];
         await waitFor("usage-reconciliation", 180_000, async () => {
-          const logs = await allGatewayLogs(owned, String(evidence.startedAt), "knowledge");
+          const logs = await collectGatewayLogs((page) =>
+            gatewayLogs(owned, String(evidence.startedAt), "knowledge", undefined, page),
+          );
           const result = reconcileUsage(await appUsage(), logs, ownerAccount);
           rows = result.rows;
           usageEvidence.rows = result.rows;
@@ -2321,7 +2324,7 @@ export async function runProviderE2E(
         evidence.queue = queueEvidence;
         await runQueueAiE2E(ctx, fixtures, queueEvidence);
         await waitFor("queue-gateway-evidence", 120_000, async () => {
-          const logs = await gatewayLogs(owned, String(queueEvidence.startedAt), "knowledge");
+          const { logs } = await gatewayLogs(owned, String(queueEvidence.startedAt), "knowledge");
           queueEvidence.usage = logs;
           const successful = logs.filter((log) => log.success && !log.cached);
           const repair = successful.filter((log) => log.model.includes("gemma-4-26b"));

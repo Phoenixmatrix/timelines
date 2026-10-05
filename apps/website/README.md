@@ -1754,6 +1754,11 @@ AI behavior is verified on demand, not by automatic CI. Follow the repository's
 and run `vp run agent test-ai` for real build/graph/wiki/Vectorize/AI Search evidence.
 The isolated non-AI test mode omits provider bindings, suppresses background builds,
 and rejects explicit rebuild/search with 503; production behavior is unchanged.
+Use `vp run agent test-ai --all --force` for a fresh check of the entire provider
+surface rather than only the stages selected by changed paths. Atlas evidence
+retains build statistics and the structural graph before membership assertions;
+description citations must belong to the capability's actual primary members
+and retain their exact commit and blob provenance.
 
 ```
 push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
@@ -1873,7 +1878,9 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   `account` and `feature` it is recorded under; failed attempts (rate limits,
   timeouts, stops) count in `ai_usage.failed_calls`. `test-ai` reconciles the
   fixture owner's `ai_usage` with the owned gateway's logs per feature and
-  model (`tools/agent/usage-reconciliation.ts`). When comparing with the
+  model (`tools/agent/usage-reconciliation.ts`). Pagination follows the raw
+  provider page size, not the filtered count: sparse or empty filtered pages
+  must not truncate the audit. When comparing with the
   account meter (`events.aiInference`), use plain `count()` and
   `sum(neurons)`: that dataset is adaptively sampled and its aggregates are
   already weighted by `sampleInterval`. Multiplying by it again squares the
@@ -2978,6 +2985,14 @@ a pending approval without executing it or generating a second reply, and reload
 It retains `assistant-approval.png` and `assistant-approval.zip` with the provider
 evidence. Provider stream errors also pass through the assistant's error handler
 so Worker logs include their message rather than only a provider stack trace.
+
+Before a stream opens, `worker/assistant/capacity.ts` retries only the Workers AI
+binding's `3021` inference-per-minute refusal: at most three retries after
+5, 15 and 45 seconds, within a 90-second acquisition deadline. Stop cancels
+the request or backoff. Once a stream opens, neither partial text nor tool
+steps are replayed; the acquisition deadline no longer applies. Exhaustion
+surfaces the original provider error. The SDK's existing transient-error
+retries remain enabled.
 
 ## Mirrors
 
