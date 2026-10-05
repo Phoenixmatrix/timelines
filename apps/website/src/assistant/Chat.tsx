@@ -20,6 +20,7 @@ import {
   type ReactNode,
 } from "react";
 import { useNavigate, useRevalidator } from "react-router";
+import type { AssistantSkillInvocation } from "../../shared/assistant-skills.ts";
 import { WRITE_TOOLS, type PageContext } from "../../shared/assistant.ts";
 import { Tip } from "../components/ui.tsx";
 import { contextLabel } from "./page.ts";
@@ -32,6 +33,7 @@ import {
   type ToolPart,
 } from "./parts.tsx";
 import { useAssistant } from "./state.tsx";
+import { SkillReceipt, useSkillPicker } from "./skills.tsx";
 import { suggestionsFor } from "./suggestions.ts";
 import { waitingFor } from "./waiting.ts";
 
@@ -40,6 +42,7 @@ const STALL_MS = 300;
 interface Part {
   type: string;
   text?: string;
+  data?: AssistantSkillInvocation;
 }
 interface Message {
   id: string;
@@ -55,10 +58,13 @@ function blocks(message: Message) {
     | { kind: "text"; text: string; key: string }
     | { kind: "tools"; parts: ToolPart[]; key: string }
     | { kind: "approval"; part: ToolPart; key: string }
+    | { kind: "skill"; skill: AssistantSkillInvocation; key: string }
   )[] = [];
   message.parts.forEach((part, i) => {
     if (part.type === "text" && part.text?.trim()) {
       out.push({ kind: "text", text: part.text, key: `${message.id}-${i}` });
+    } else if (part.type === "data-skill" && part.data) {
+      out.push({ kind: "skill", skill: part.data, key: `${message.id}-${i}` });
     } else if (isTool(part)) {
       const tool = part as unknown as ToolPart;
       if (tool.state === "approval-requested") {
@@ -102,6 +108,12 @@ export default function Chat({
   const pinned = useRef(true);
   const input = useRef<HTMLTextAreaElement>(null);
   const redirectedApprovals = useRef(new Set<string>());
+  const skills = useSkillPicker({
+    repo: withPage ? page.repo : undefined,
+    draft,
+    setDraft,
+    input,
+  });
 
   const agent = useAgent({ agent: "assistant", basePath: `api/assistant/chats/${chatId}/agent` });
   const chat = useAgentChat({
@@ -214,7 +226,13 @@ export default function Chat({
     else send(draft);
   };
   const onKey = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+    if (skills.onKeyDown(event)) return;
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.nativeEvent.isComposing &&
+      event.keyCode !== 229
+    ) {
       event.preventDefault();
       send(draft);
     }
@@ -273,6 +291,8 @@ export default function Chat({
                       />
                     ) : block.kind === "tools" ? (
                       <Receipts key={block.key} parts={block.parts} onNavigate={closeIfCompact} />
+                    ) : block.kind === "skill" ? (
+                      <SkillReceipt key={block.key} skill={block.skill} />
                     ) : (
                       <ApprovalCard
                         key={block.key}
@@ -313,11 +333,12 @@ export default function Chat({
         withPage={withPage}
         onWithPage={setWithPage}
         onSubmit={submit}
+        popup={skills.popup}
         field={
           <textarea
             ref={input}
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            {...skills.field}
             onKeyDown={onKey}
             rows={1}
             placeholder={pending.length ? "Or say what to do instead…" : placeholder(page)}
@@ -342,6 +363,7 @@ function Composer({
   onWithPage,
   onSubmit,
   field,
+  popup,
   stop,
   canSend,
 }: {
@@ -350,6 +372,7 @@ function Composer({
   onWithPage?: (next: boolean) => void;
   onSubmit?: (event: FormEvent) => void;
   field: ReactNode;
+  popup?: ReactNode;
   stop: boolean;
   canSend: boolean;
 }) {
@@ -392,6 +415,7 @@ function Composer({
           </span>
         </div>
       )}
+      {popup}
       <div className="flex shrink-0 items-end gap-2 rounded-control bg-sunken p-1.5 shadow-[0_0_0_1px_var(--line-soft)] focus-within:bg-rail focus-within:shadow-[0_0_0_2px_var(--signal-line)]">
         {field}
         <button

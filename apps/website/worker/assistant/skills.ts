@@ -7,6 +7,12 @@ import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import type { CallApi } from "./internal.ts";
 import type { Group } from "./plan.ts";
+import type { UIMessage } from "ai";
+import type {
+  AssistantSkillInvocation,
+  AssistantSkillSummary,
+} from "../../shared/assistant-skills.ts";
+import { personalSkills, SKILL_NAME } from "./personal-skills.ts";
 
 interface Builtin {
   name: string;
@@ -183,10 +189,9 @@ Answer "how do I…" questions with the exact command.`,
   },
 ];
 
-export interface Skill {
-  name: string;
-  description: string;
+export interface Skill extends AssistantSkillSummary {
   body: string;
+  repo?: string;
 }
 
 /** Where skills come from: built in, or a repository's .agents/skills. */
@@ -195,16 +200,16 @@ export interface SkillSource {
 }
 
 /** name and description from a SKILL.md's frontmatter, and the body after it. */
-export function parseSkill(markdown: string): Skill | null {
+export function parseSkill(markdown: string): Pick<Skill, "name" | "description" | "body"> | null {
   const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(markdown);
   if (!match) return null;
   const field = (key: string) => {
-    const line = new RegExp(`^${key}:\\s*(.+)$`, "m").exec(match[1]!)?.[1]?.trim();
+    const line = new RegExp(`^${key}:[\\t ]*([^\\r\\n]*)$`, "m").exec(match[1]!)?.[1]?.trim();
     return line?.replace(/^(["'])(.*)\1$/, "$2") ?? null;
   };
   const name = field("name");
-  const description = field("description");
-  return name && description ? { name, description, body: match[2]!.trim() } : null;
+  const description = field("description") ?? "";
+  return name && SKILL_NAME.test(name) ? { name, description, body: match[2]!.trim() } : null;
 }
 
 /**
@@ -227,6 +232,21 @@ export class SkillRegistry {
 
   get(name: string): Skill | null {
     return this.skills.get(name) ?? null;
+  }
+
+  restore(receipt: AssistantSkillInvocation): Skill | null {
+    for (const skill of this.skills.values())
+      if (skill.id === receipt.id && skill.source === receipt.source) return skill;
+    return null;
+  }
+
+  summaries(): AssistantSkillSummary[] {
+    return [...this.skills.values()].map(({ id, name, description, source }) => ({
+      id,
+      name,
+      description,
+      source,
+    }));
   }
 
   catalog(except: readonly string[] = []): string {
@@ -257,7 +277,14 @@ export class SkillRegistry {
 /** The built-in skills. */
 export function builtinSkills(): SkillSource {
   return {
-    list: async () => BUILTIN.map(({ name, description, body }) => ({ name, description, body })),
+    list: async () =>
+      BUILTIN.map(({ name, description, body }) => ({
+        id: `builtin:${name}`,
+        source: "builtin",
+        name,
+        description,
+        body,
+      })),
   };
 }
 
@@ -297,10 +324,67 @@ export function repositorySkills(api: CallApi, repo: string): SkillSource {
           );
           const text = file.ok ? (file.body as { text: string | null }).text : null;
           const skill = text ? parseSkill(text) : null;
-          return skill ? { ...skill, description: `${skill.description} (from ${repo})` } : null;
+          return skill
+            ? { ...skill, id: `repo:${repo}:${dir.path}`, source: "repository" as const, repo }
+            : null;
         }),
       );
-      return skills.filter((s): s is Skill => s !== null);
+      return skills.filter((s) => s !== null);
     },
   };
+}
+
+/** One authorized catalog for both suggestions and model turns; first source wins. */
+export async function buildSkillRegistry(
+  d1: D1Database,
+  userId: string,
+  api: CallApi,
+  repo: string | null,
+) {
+  const registry = new SkillRegistry([
+    builtinSkills(),
+    {
+      list: async () =>
+        (await personalSkills(d1, userId))
+          .filter((skill) => skill.enabled)
+          .map(({ id, name, description, body }) => ({
+            id,
+            name,
+            description,
+            body,
+            source: "personal" as const,
+          })),
+    },
+    ...(repo ? [repositorySkills(api, repo)] : []),
+  ]);
+  await registry.load();
+  return registry;
+}
+
+/** Receipts contain identity and provenance, never executable instructions. */
+export function skillReceipt(message: UIMessage | undefined): AssistantSkillInvocation | null {
+  const part = message?.parts.find((part) => part.type === "data-skill");
+  if (!part || !("data" in part) || !part.data || typeof part.data !== "object") return null;
+  const data = part.data as Partial<AssistantSkillInvocation>;
+  return typeof data.id === "string" &&
+    typeof data.name === "string" &&
+    typeof data.description === "string" &&
+    (data.source === "builtin" || data.source === "personal" || data.source === "repository") &&
+    (data.repo === undefined || typeof data.repo === "string")
+    ? (data as AssistantSkillInvocation)
+    : null;
+}
+
+/** A continuation can only restore its recorded identity, never a same-name replacement. */
+export function resolveSkillInvocation(
+  registry: SkillRegistry,
+  message: string,
+  continuation: boolean,
+  receipt: AssistantSkillInvocation | null,
+): Skill | null {
+  if (continuation) {
+    return receipt ? registry.restore(receipt) : null;
+  }
+  const command = /^\/([a-z0-9][a-z0-9-]{0,63})(?=\s|$)/.exec(message);
+  return command ? registry.get(command[1]!) : null;
 }

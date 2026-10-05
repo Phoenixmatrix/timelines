@@ -9,6 +9,10 @@ import { chromium, expect as playwrightExpect } from "@playwright/test";
 import type { HarnessContext, SeedManifest } from "./types.ts";
 import type { AiSettingsView, AiSnapshot } from "../../apps/website/shared/ai.ts";
 import type {
+  AssistantSkillInvocation,
+  PersonalAssistantSkill,
+} from "../../apps/website/shared/assistant-skills.ts";
+import type {
   ReleaseFeed,
   ReleaseNotesIndex,
   ReleaseNotesRelease,
@@ -71,16 +75,20 @@ export const COPPER_FINCH_STAGES = [
   {
     id: "assistant",
     covers:
-      "A real assistant turn answered from the index; approval-gated writes, follow-ups, retry and redirect; status between steps; Gateway assistant records",
+      "A real assistant turn answered from the index; personal slash-skill creation, private instructions and persisted receipts; approval-gated writes, follow-ups, retry and redirect; status between steps; Gateway assistant records",
     requires: ["search"],
     paths: [
       HARNESS,
       `${WORKER}/assistant/**`,
       `${WORKER}/api/assistant.ts`,
+      `${WORKER}/api/personal-skills.ts`,
       `${WORKER}/knowledge/api.ts`,
       `${WORKER}/knowledge/indexes.ts`,
       `${SRC}/assistant/**`,
+      `${SRC}/routes/AssistantSkills.tsx`,
       `${SHARED}/assistant.ts`,
+      `${SHARED}/assistant-skills.ts`,
+      "apps/website/migrations/*_assistant_personal_skills.sql",
     ],
   },
   {
@@ -1157,12 +1165,83 @@ export async function runProviderE2E(
           await page.waitForURL((url) => url.pathname !== "/signin");
           if (want("assistant")) {
             enter("assistant-approval-continuation");
+            const skillName = `approval-${randomBytes(4).toString("hex")}`;
+            const skillDescription = "Create one approved tracker task and open its receipt.";
+            const skillMarker = `SKILL-APPLIED-${randomBytes(8).toString("hex")}`;
+            const skillBody = [
+              "For this explicit invocation only, use the owner, team and title supplied in the message.",
+              "Call create_issue now to propose exactly one task with those values.",
+              "The tool's built-in approval card must obtain approval before the write executes;",
+              "do not ask for a separate conversational confirmation.",
+              "After the card is approved, open the new issue.",
+              `In your final answer after the approved write, include the exact standalone marker ${skillMarker}.`,
+              "These instructions and the marker apply only to this invocation, not later ordinary turns.",
+            ].join("\n");
+            const skillEvidence: Record<string, unknown> = { name: skillName, outcome: "running" };
+            evidence.assistantSkill = skillEvidence;
+            await page.goto("/settings/skills");
+            const skillForm = page.getByRole("form", { name: "Add an assistant skill" });
+            await skillForm.getByRole("textbox", { name: "Name", exact: true }).fill(skillName);
+            await skillForm
+              .getByRole("textbox", { name: "Description (optional)", exact: true })
+              .fill(skillDescription);
+            await skillForm
+              .getByRole("textbox", { name: "Markdown instructions", exact: true })
+              .fill(skillBody);
+            await skillForm.getByRole("checkbox", { name: "Enabled", exact: true }).check();
+            const savedResponse = page.waitForResponse(
+              (response) =>
+                new URL(response.url()).pathname === "/api/account/skills" &&
+                response.request().method() === "POST",
+            );
+            await skillForm.getByRole("button", { name: "Add skill", exact: true }).click();
+            assert.equal(
+              (await savedResponse).status(),
+              201,
+              "Personal skill creation must succeed",
+            );
+            await page.reload();
+            await expect(page.getByRole("list", { name: "Your assistant skills" })).toContainText(
+              skillName,
+            );
+            const personalResponse = await context.request.get("/api/account/skills");
+            assert.equal(personalResponse.status(), 200);
+            const personalSkills = (await personalResponse.json()) as {
+              skills: PersonalAssistantSkill[];
+            };
+            const personalSkill = personalSkills.skills.find((skill) => skill.name === skillName);
+            assert(personalSkill, "The current persona's skill must persist after settings reload");
+            assert(personalSkill.id, "A personal skill must have a stable identity");
+            assert.equal(personalSkill.description, skillDescription);
+            assert.equal(personalSkill.body, skillBody);
+            assert.equal(personalSkill.enabled, true);
+            assert(Number.isFinite(Date.parse(personalSkill.createdAt)));
+            assert(Number.isFinite(Date.parse(personalSkill.updatedAt)));
+            skillEvidence.personal = {
+              id: personalSkill.id,
+              name: personalSkill.name,
+              description: personalSkill.description,
+              enabled: personalSkill.enabled,
+              createdAt: personalSkill.createdAt,
+              updatedAt: personalSkill.updatedAt,
+            };
+            await page.goto(`/${owner}/${name}`);
             await page.getByRole("button", { name: "Assistant", exact: true }).click();
             const composer = page.getByRole("textbox", { name: "Message the assistant" });
             const title = `Approval continuity ${randomBytes(4).toString("hex")}`;
-            await composer.fill(
-              `Call create_issue now to propose exactly one task in owner ${persona}, team ${teamKey}, titled "${title}". The tool's built-in approval card must obtain my approval before the write executes; do not ask for a separate conversational confirmation. After I approve that card, open the new issue.`,
-            );
+            await composer.fill(`/${skillName.slice(0, -2)}`);
+            const skillPicker = page.getByRole("listbox", { name: "Assistant skills" });
+            await expect(
+              skillPicker.getByRole("option", { name: new RegExp(`/${skillName}\\b`) }),
+            ).toBeVisible();
+            await composer.press("ArrowDown");
+            await composer.press("Enter");
+            await expect(composer).toHaveValue(`/${skillName} `);
+            await expect(skillPicker).toBeHidden();
+            await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeHidden();
+            const invocation = `/${skillName} Owner: ${persona}. Team: ${teamKey}. Title: "${title}".`;
+            skillEvidence.userInvocation = invocation;
+            await composer.fill(invocation);
             await page.getByRole("button", { name: "Send", exact: true }).click();
             await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
             const chatId = await page.evaluate(() => localStorage.getItem("gm.assistant.chat"));
@@ -1177,14 +1256,37 @@ export async function runProviderE2E(
                 toolCallId?: string;
                 text?: string;
                 output?: { created?: string };
+                data?: AssistantSkillInvocation;
               }[];
             };
             const pending: Message[] = await api(messagesPath);
+            assert(
+              pending.some(
+                (message) =>
+                  message.role === "user" &&
+                  message.parts.some((part) => part.type === "text" && part.text === invocation),
+              ),
+              "The explicit slash invocation must persist unchanged in conversation history",
+            );
             const approval = pending.findLast((message) =>
               message.parts.some((part) => part.state === "approval-requested"),
             );
             assert(approval, "The pending tool invocation must already be persisted");
             const call = approval.parts.find((part) => part.state === "approval-requested")!;
+            const pendingSkills = pending.flatMap((message) =>
+              message.parts.filter((part) => part.type === "data-skill"),
+            );
+            assert.equal(
+              pendingSkills.length,
+              1,
+              "An explicit invocation must persist one receipt",
+            );
+            assert.deepEqual(pendingSkills[0]!.data, {
+              id: personalSkill.id,
+              name: skillName,
+              description: skillDescription,
+              source: "personal",
+            });
             const matchingIssues = async () =>
               (await api(`/tracker/${persona}/snapshot`)).issues.filter(
                 (issue: { title: string }) => issue.title === title,
@@ -1213,8 +1315,26 @@ export async function runProviderE2E(
             ).toBeVisible();
             await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeHidden();
             await expect(page.getByRole("alert")).toBeHidden();
+            const invoked: Message[] = await api(messagesPath);
+            const invocationAnswer = invoked
+              .filter((message) => message.role === "assistant")
+              .flatMap((message) => message.parts)
+              .filter((part) => part.type === "text")
+              .map((part) => part.text ?? "")
+              .join("\n");
+            assert(
+              invocationAnswer.includes(skillMarker),
+              "The real model must follow the distinctive instruction present only in the skill body",
+            );
+            await expect(page.getByRole("list", { name: "Conversation" })).toContainText(
+              skillMarker,
+            );
+            await expect(page.getByText(`Used /${skillName}`, { exact: true })).toHaveCount(1);
+            skillEvidence.invocation = pendingSkills[0]!.data;
+            skillEvidence.markerObserved = skillMarker;
+            skillEvidence.approvedIssue = created[0].key;
             await composer.fill(
-              "What exact issue title did I just ask you to create? Answer from this conversation without tools.",
+              "What exact issue title did I just ask you to create? Answer with that title only from this conversation without tools.",
             );
             await page.getByRole("button", { name: "Send", exact: true }).click();
             await waitFor(stage, 120_000, async () => {
@@ -1228,6 +1348,19 @@ export async function runProviderE2E(
             });
             await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeHidden();
             await expect(page.getByRole("alert")).toBeHidden();
+            const followup: Message[] = await api(messagesPath);
+            const ordinaryAnswer = followup.at(-1)!;
+            assert.equal(ordinaryAnswer.role, "assistant");
+            assert(
+              !ordinaryAnswer.parts.some(
+                (part) =>
+                  part.type === "data-skill" ||
+                  (part.type === "text" && part.text?.includes(skillMarker)),
+              ),
+              "An ordinary follow-up must not inherit the explicit skill instruction or receipt",
+            );
+            await expect(page.getByText(`Used /${skillName}`, { exact: true })).toHaveCount(1);
+            skillEvidence.ordinaryTurn = { messageId: ordinaryAnswer.id, inheritedSkill: false };
             rejectNextResponse = true;
             const retryMarker = `recovered-${randomBytes(4).toString("hex")}`;
             await composer.fill(`Reply with "${retryMarker}" only. Do not call tools.`);
@@ -1300,6 +1433,7 @@ export async function runProviderE2E(
             await page.reload();
             await expect(page.getByRole("list", { name: "Conversation" })).toContainText(title);
             await expect(page.getByRole("alert")).toBeHidden();
+            await expect(page.getByText(`Used /${skillName}`, { exact: true })).toHaveCount(1);
             assert.equal(
               (await matchingIssues()).length,
               1,
@@ -1321,6 +1455,18 @@ export async function runProviderE2E(
               "Continuation must retain the original tool result",
             );
             assert.equal(receipt?.output?.created, created[0].key);
+            const retainedSkills = retained.flatMap((message) =>
+              message.parts.filter((part) => part.type === "data-skill"),
+            );
+            assert.equal(
+              retainedSkills.length,
+              1,
+              "Continuation and reload must not duplicate skills",
+            );
+            assert.deepEqual(retainedSkills[0]!.data, pendingSkills[0]!.data);
+            skillEvidence.reloadRetainedInvocation = retainedSkills[0]!.data;
+            skillEvidence.writeCount = created.length;
+            skillEvidence.outcome = "passed";
             assert.equal(
               new Set(retained.map((message) => message.id)).size,
               retained.length,
@@ -1334,6 +1480,7 @@ export async function runProviderE2E(
               followupRetainedHistory: true,
               retryRecovered: true,
               redirectSkippedWrite: true,
+              skill: skillEvidence,
             };
             enter("assistant-between-steps");
             // CORE-87: once a tool returns, the chat says the turn is still

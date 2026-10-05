@@ -4,6 +4,7 @@ import { useState } from "react";
 import { expect, onTestFinished, test, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { PageContext } from "../../shared/assistant.ts";
+import type { AssistantSkillSummary } from "../../shared/assistant-skills.ts";
 import { focusOn, press, pressUntil } from "../testing/focus.ts";
 import { renderApp } from "../testing/render.tsx";
 import { TestServer } from "../testing/server.ts";
@@ -54,8 +55,13 @@ const dock = () => page.getByRole("complementary", { name: "Assistant", exact: t
 const composer = () => dock().getByRole("textbox", { name: "Message the assistant" });
 const finalMarker = "Review ends here: preserve the final acceptance criterion.";
 const longDraft = Array.from({ length: 50 }, (_, i) => `Unsent draft line ${i + 1}`).join("\n");
+const catalog: AssistantSkillSummary[] = [
+  { id: "review", name: "review", description: "Inspect a change for defects", source: "builtin" },
+  { id: "plan", name: "plan", description: "Break work into actionable steps", source: "personal" },
+  { id: "quiet", name: "quiet", description: "", source: "repository" },
+];
 
-async function setup(width: number, height: number, approval = false) {
+async function setup(width: number, height: number, approval = false, receipt = false) {
   const previous = ["gm.assistant.open", "gm.assistant.chat"].map(
     (key) => [key, localStorage.getItem(key)] as const,
   );
@@ -99,13 +105,25 @@ async function setup(width: number, height: number, approval = false) {
           ],
         },
       ]
-    : [];
+    : receipt
+      ? [
+          {
+            id: "saved-answer",
+            role: "assistant",
+            parts: [
+              { type: "data-skill", id: "skill-saved-user", data: catalog[1] },
+              { type: "text", text: "Here is the saved plan." },
+            ],
+          },
+        ]
+      : [];
   await page.viewport(width, height);
   const server = await TestServer.start({ world: true });
   server.on("GET", "/api/assistant/chats", { chats: [] });
+  server.on("GET", "/api/assistant/skills", { skills: catalog });
   const app = renderApp("/tracker/orbit");
   await expect.element(composer()).toBeEnabled();
-  return app;
+  return { ...app, server };
 }
 
 function box(element: Element) {
@@ -241,3 +259,173 @@ for (const [width, height] of [
     });
   }
 }
+
+for (const theme of ["light", "dark"]) {
+  test(`slash completion lists and filters names and descriptions in ${theme} at narrow width`, async () => {
+    await setup(390, 640);
+    const previous = document.documentElement.getAttribute("data-theme");
+    document.documentElement.setAttribute("data-theme", theme);
+    onTestFinished(() => {
+      if (previous === null) document.documentElement.removeAttribute("data-theme");
+      else document.documentElement.setAttribute("data-theme", previous);
+    });
+    await userEvent.fill(composer(), "/");
+    const list = dock().getByRole("listbox", { name: "Assistant skills" });
+    await expect.element(list).toBeVisible();
+    await expect
+      .element(list.getByRole("option", { name: "/review Inspect a change for defects" }))
+      .toBeVisible();
+    await expect.element(list.getByRole("option", { name: "/quiet No description" })).toBeVisible();
+    await userEvent.fill(composer(), "/actionable");
+    await expect
+      .element(list.getByRole("option", { name: "/plan Break work into actionable steps" }))
+      .toBeVisible();
+    await expect.element(list.getByRole("option", { name: /^\/review/ })).not.toBeInTheDocument();
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(innerWidth);
+    await press("Enter");
+    await expect.element(composer()).toHaveValue("/plan ");
+    await expect.element(composer()).toHaveFocus();
+    await expect
+      .element(dock().getByRole("list", { name: "Conversation" }))
+      .not.toBeInTheDocument();
+  });
+}
+
+test("arrows wrap, Tab completes without sending, and the chosen prefix survives collapse", async () => {
+  await setup(1440, 900);
+  await userEvent.fill(composer(), "/");
+  const quiet = dock().getByRole("option", { name: "/quiet No description" });
+  await expect.element(quiet).toBeVisible();
+  await press("ArrowUp");
+  await expect.element(quiet).toHaveAttribute("aria-selected", "true");
+  await press("ArrowDown");
+  await expect
+    .element(dock().getByRole("option", { name: /^\/review/ }))
+    .toHaveAttribute("aria-selected", "true");
+  await press("ArrowDown");
+  await press("Tab");
+  await expect.element(composer()).toHaveValue("/plan ");
+  await expect.element(composer()).toHaveFocus();
+  await userEvent.click(dock().getByRole("button", { name: "Expand the assistant" }));
+  await focusOn(composer());
+  await press("Escape");
+  await expect.element(composer()).toHaveValue("/plan ");
+  await expect.element(dock().getByRole("list", { name: "Conversation" })).not.toBeInTheDocument();
+});
+
+test("pointer selection retains focus and preserves arguments when editing the leading token", async () => {
+  await setup(1440, 900);
+  await userEvent.fill(composer(), "/rev keep these arguments\nand this line");
+  await press("Control+Home");
+  for (let i = 0; i < 4; i++) await press("ArrowRight");
+  expect((composer().element() as HTMLTextAreaElement).selectionStart).toBe(4);
+  const option = dock().getByRole("option", { name: /^\/review/ });
+  await expect.element(option).toBeVisible();
+  await userEvent.click(option);
+  await expect.element(composer()).toHaveValue("/review keep these arguments\nand this line");
+  await expect.element(composer()).toHaveFocus();
+  await userEvent.click(dock().getByRole("button", { name: "Send", exact: true }));
+  await expect
+    .element(dock().getByRole("list", { name: "Conversation" }))
+    .toHaveTextContent("/review keep these arguments and this line");
+});
+
+test("Escape dismisses only the picker and unknown slash commands still send unchanged", async () => {
+  await setup(1440, 900);
+  await userEvent.click(dock().getByRole("button", { name: "Expand the assistant" }));
+  await userEvent.fill(composer(), "/");
+  await expect.element(dock().getByRole("listbox", { name: "Assistant skills" })).toBeVisible();
+  await press("Escape");
+  await expect
+    .element(dock().getByRole("listbox", { name: "Assistant skills" }))
+    .not.toBeInTheDocument();
+  await expect
+    .element(dock().getByRole("button", { name: "Collapse the assistant" }))
+    .toBeVisible();
+  await expect.element(composer()).toHaveValue("/");
+  await expect.element(composer()).toHaveFocus();
+  await userEvent.fill(composer(), "/unknown-command");
+  await expect
+    .element(dock().getByText("No matching skills. Send as a regular message."))
+    .toBeVisible();
+  await press("Enter");
+  await expect
+    .element(dock().getByRole("list", { name: "Conversation" }))
+    .toHaveTextContent("/unknown-command");
+  await expect.element(composer()).toHaveValue("");
+});
+
+test("IME confirmation never completes or sends; Shift+Enter remains multiline", async () => {
+  await setup(1440, 900);
+  await userEvent.fill(composer(), "/rev");
+  await expect.element(dock().getByRole("option", { name: /^\/review/ })).toBeVisible();
+  const field = composer().element() as HTMLTextAreaElement;
+  field.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "Enter", isComposing: true, bubbles: true }),
+  );
+  field.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 229, bubbles: true }));
+  await expect.element(composer()).toHaveValue("/rev");
+  await expect.element(dock().getByRole("list", { name: "Conversation" })).not.toBeInTheDocument();
+  await press("Shift+Enter");
+  await expect.element(composer()).toHaveValue("/rev\n");
+  await expect
+    .element(dock().getByRole("listbox", { name: "Assistant skills" }))
+    .not.toBeInTheDocument();
+});
+
+test("a persisted skill receipt retains its name and accessible source when the chat reloads", async () => {
+  const app = await setup(1440, 900, false, true);
+  const conversation = () => dock().getByRole("list", { name: "Conversation" });
+  await expect.element(conversation().getByText("Used /plan", { exact: true })).toBeVisible();
+  await expect.element(conversation().getByText("Personal skill", { exact: true })).toBeVisible();
+  app.unmount();
+  renderApp("/tracker/orbit");
+  await expect.element(conversation().getByText("Used /plan", { exact: true })).toBeVisible();
+  await expect.element(conversation().getByText("Personal skill", { exact: true })).toBeVisible();
+});
+
+test("a skill with no description can be selected and sent as ordinary visible text", async () => {
+  await setup(1440, 900);
+  await userEvent.fill(composer(), "/quiet");
+  await expect.element(dock().getByRole("option", { name: "/quiet No description" })).toBeVisible();
+  await press("Enter");
+  await expect.element(composer()).toHaveValue("/quiet ");
+  await press("Enter");
+  await expect
+    .element(dock().getByRole("list", { name: "Conversation" }))
+    .toHaveTextContent("/quiet");
+  await expect.element(composer()).toHaveValue("");
+});
+
+test("refocusing the composer refreshes changed personal skill configuration", async () => {
+  const { server } = await setup(1440, 900);
+  await userEvent.fill(composer(), "/");
+  await expect.element(dock().getByRole("option", { name: /^\/plan/ })).toBeVisible();
+  server.on("GET", "/api/assistant/skills", {
+    skills: [
+      {
+        id: "new",
+        name: "new-skill",
+        description: "Recently saved instructions",
+        source: "personal",
+      },
+    ],
+  });
+  await focusOn(dock().getByRole("button", { name: "Send", exact: true }));
+  await focusOn(composer());
+  await expect
+    .element(dock().getByRole("option", { name: "/new-skill Recently saved instructions" }))
+    .toBeVisible();
+  await expect.element(dock().getByRole("option", { name: /^\/plan/ })).not.toBeInTheDocument();
+});
+
+test("slashes in prose and command arguments do not open completion", async () => {
+  await setup(1440, 900);
+  for (const text of ["Please inspect /review", "/review inspect /plan"]) {
+    await userEvent.fill(composer(), text);
+    await expect
+      .element(dock().getByRole("listbox", { name: "Assistant skills" }))
+      .not.toBeInTheDocument();
+    await expect.element(composer()).toHaveValue(text);
+  }
+});

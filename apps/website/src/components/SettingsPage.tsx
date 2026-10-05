@@ -64,6 +64,7 @@ export function SettingsPage({
       context: null,
       links: [
         { label: "Profile", to: `/settings/profile${accountQuery}`, icon: UserCircleIcon },
+        { label: "Assistant skills", to: `/settings/skills${accountQuery}`, icon: RobotIcon },
         {
           label: "Preferences",
           to: `/settings/preferences${trackerQuery}`,

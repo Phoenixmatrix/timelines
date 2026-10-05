@@ -146,6 +146,16 @@ export interface Database {
     query: Generated<string>;
     updated_at: Generated<string>;
   };
+  assistant_personal_skills: {
+    id: string;
+    user_id: string;
+    name: string;
+    description: Generated<string>;
+    body: string;
+    enabled: Generated<number>;
+    created_at: Generated<string>;
+    updated_at: Generated<string>;
+  };
   assistant_chats: {
     id: string;
     user_id: string;

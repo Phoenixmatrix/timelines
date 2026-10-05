@@ -21,6 +21,8 @@ import { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
 import type { AppEnv } from "../auth.ts";
 import { accounts } from "../api/accounts.ts";
+import { personalSkillsApi } from "../api/personal-skills.ts";
+import { assistant } from "../api/assistant.ts";
 import { dev } from "../api/dev.ts";
 import { repos } from "../api/repos.ts";
 import { workspaceAtlas } from "../atlas/workspace.ts";
@@ -194,6 +196,8 @@ app.use(async (c, next) => {
 app.route("/api/accounts/:owner/atlas", workspaceAtlas);
 app.route("/api/agents", agents);
 app.route("/api", accounts);
+app.route("/api/account/skills", personalSkillsApi);
+app.route("/api/assistant", assistant);
 app.route("/api/tracker/:owner/release-notes", trackerReleaseNotes);
 app.route("/api/tracker/:owner/timelines", timelines);
 app.route("/api/tracker/:owner/timeline-graph", timelineGraph);

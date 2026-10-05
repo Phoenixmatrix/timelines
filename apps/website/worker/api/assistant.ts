@@ -9,10 +9,40 @@ import { durableAgent, purgeInstance } from "../durable/registry.ts";
 import { accountPolicies } from "../retention/policies.ts";
 import { db } from "../schema.ts";
 import { fail, readJson, requireActor } from "./http.ts";
+import { buildSkillRegistry } from "../assistant/skills.ts";
+import type { CallApi } from "../assistant/internal.ts";
 
 export const assistant = new Hono<AppEnv>();
 
 const CHAT_ID = /^[A-Za-z0-9_-]{8,64}$/;
+
+assistant.get("/skills", async (c) => {
+  const actor = requireActor(c);
+  if (actor instanceof Response) return actor;
+  const repo = c.req.query("repo") ?? null;
+  if (repo !== null && !/^[\w.-]+\/[\w.-]+$/.test(repo)) return fail(c, 400, "repo is owner/name.");
+  // Re-enter the actual repository routes as this caller; never trust a repo selector alone.
+  const api: CallApi = async (method, path) => {
+    // Static import creates app -> assistant -> app during route registration.
+    const { app } = await import("../app.ts");
+    const headers = new Headers();
+    for (const key of ["authorization", "cookie"]) {
+      const value = c.req.header(key);
+      if (value) headers.set(key, value);
+    }
+    const response = await app.fetch(
+      new Request(new URL(`/api${path}`, c.req.url), {
+        method,
+        headers,
+      }),
+      c.env,
+      c.executionCtx,
+    );
+    return { ok: response.ok, status: response.status, body: await response.json() };
+  };
+  const registry = await buildSkillRegistry(c.env.DB, actor.id, api, repo);
+  return c.json({ skills: registry.summaries() });
+});
 
 /** The Durable Object's answer, with headers the API's middleware can still set. */
 function passThrough(response: Response): Response {
