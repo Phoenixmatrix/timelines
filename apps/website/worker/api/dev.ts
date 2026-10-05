@@ -91,6 +91,7 @@ dev.use("*", async (c, next) => {
       "/atlas",
       "/durable",
       "/usage",
+      "/ai-usage",
       "/retention",
       "/retention-cron",
       "/ci-age",
@@ -135,6 +136,23 @@ dev.post("/usage", async (c) => {
     .bind(found.id)
     .all();
   return c.json({ runs, figures: results });
+});
+
+// Raw AI call records since a day (CORE-285): the E2E reconciles them with
+// the owned AI Gateway's logs per account, feature and model.
+dev.get("/ai-usage", async (c) => {
+  const since = c.req.query("since") ?? new Date().toISOString().slice(0, 10);
+  const { results } = await c.env.DB.prepare(
+    `SELECT u.account_id, a.slug, u.feature, u.model, SUM(u.calls) AS calls,
+            SUM(u.failed_calls) AS failed, SUM(u.input_tokens) AS input,
+            SUM(u.output_tokens) AS output, SUM(u.total_tokens) AS total
+     FROM ai_usage u LEFT JOIN accounts a ON a.id = u.account_id
+     WHERE u.day >= ?1 GROUP BY u.account_id, u.feature, u.model
+     ORDER BY u.account_id, u.feature, u.model`,
+  )
+    .bind(since)
+    .all();
+  return c.json({ since, usage: results });
 });
 
 // Retention runs in the real runtime with a moment `daysAhead` days from now

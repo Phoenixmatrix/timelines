@@ -464,44 +464,49 @@ export async function alignPairs(
     unsaved = [];
     await runBatched(env.DB, statements);
   };
-  await pool(batch, CLEF_CONCURRENCY, async ([, [x, y]]) => {
-    const [a, b] = x < y ? [x, y] : [y, x];
-    const answers = await decide(
-      env,
-      { repository: context, entity_a: entity(a), entity_b: entity(b) },
-      PAIR_QUESTIONS,
-      { model: models.classification },
-    );
-    const link = answers.link;
-    const score = link?.type === "score" ? link.score : 0;
-    const p = (name: string) => {
-      const answer = answers[name];
-      return answer?.type === "noul" ? answer.noul : 0;
-    };
-    unsaved.push(
-      db(env.DB)
-        .insertInto("kg_concept_pairs")
-        .values({
-          repo_id: repoId,
-          a,
-          b,
-          version: ALIGNER,
-          score,
-          a_in_b: p("a_in_b"),
-          b_in_a: p("b_in_a"),
-        })
-        .onConflict((oc) =>
-          oc.columns(["repo_id", "a", "b"]).doUpdateSet((eb) => ({
-            version: eb.ref("excluded.version"),
-            score: eb.ref("excluded.score"),
-            a_in_b: eb.ref("excluded.a_in_b"),
-            b_in_a: eb.ref("excluded.b_in_a"),
-          })),
-        ),
-    );
-    if (unsaved.length >= 40) await save();
-  });
-  await save();
+  // Answers already paid for are kept even if the step fails or is stopped,
+  // so a retry doesn't ask them again.
+  try {
+    await pool(batch, CLEF_CONCURRENCY, async ([, [x, y]]) => {
+      const [a, b] = x < y ? [x, y] : [y, x];
+      const answers = await decide(
+        env,
+        { repository: context, entity_a: entity(a), entity_b: entity(b) },
+        PAIR_QUESTIONS,
+        { model: models.classification },
+      );
+      const link = answers.link;
+      const score = link?.type === "score" ? link.score : 0;
+      const p = (name: string) => {
+        const answer = answers[name];
+        return answer?.type === "noul" ? answer.noul : 0;
+      };
+      unsaved.push(
+        db(env.DB)
+          .insertInto("kg_concept_pairs")
+          .values({
+            repo_id: repoId,
+            a,
+            b,
+            version: ALIGNER,
+            score,
+            a_in_b: p("a_in_b"),
+            b_in_a: p("b_in_a"),
+          })
+          .onConflict((oc) =>
+            oc.columns(["repo_id", "a", "b"]).doUpdateSet((eb) => ({
+              version: eb.ref("excluded.version"),
+              score: eb.ref("excluded.score"),
+              a_in_b: eb.ref("excluded.a_in_b"),
+              b_in_a: eb.ref("excluded.b_in_a"),
+            })),
+          ),
+      );
+      if (unsaved.length >= 40) await save();
+    });
+  } finally {
+    await save();
+  }
   // Count stored first-pass decisions, as the build's baseline does: `decided`
   // above also holds review-only pairs, which would read as pairs asked.
   const stored = await db(env.DB)

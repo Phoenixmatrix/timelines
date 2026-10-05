@@ -7,7 +7,8 @@
 //   embed     vectors for graph nodes (Vectorize)
 
 import { aiGatewayOptions } from "../ai-gateway.ts";
-import { recordAiCall, tokensOf } from "../usage/ai.ts";
+import { attribution, recordAiCall, tokensOf } from "../usage/ai.ts";
+import { paidWorkGuard } from "./paid-work.ts";
 
 export const MODELS = {
   fast: "@cf/zai-org/glm-5.3-flash",
@@ -40,57 +41,111 @@ interface ChatResult {
 
 // The binding's model list is typed per model; these are OpenAI-shaped chat
 // models, so call through a narrow untyped view. Every call has a deadline: a
-// hung call must fail (and its workflow step retry) rather than stall a build.
+// hung call is aborted and fails (and its workflow step retries) rather than
+// stall a build, and it is never left running, and billing, in the background.
 type LooseAi = {
   run(model: string, inputs: unknown, options?: AiOptions): Promise<unknown>;
 };
-const TIMEOUT_MS: Record<string, number> = {
-  [MODELS.fast]: 90_000,
-  [MODELS.reason]: 180_000,
-  [MODELS.classify]: 60_000,
-  [MODELS.route]: 8_000,
-  [MODELS.embed]: 30_000,
-};
-const RATE_LIMIT_RETRIES = 6;
+/**
+ * How long a call may take, by the job it does rather than the model: since
+ * accounts choose models (CORE-190), a long wiki page on the fast model still
+ * gets the writing deadline. A call cut off by its deadline has usually been
+ * billed by the provider anyway, and is asked again, so deadlines are for
+ * hung calls, not slow ones.
+ */
+const TIMEOUT_MS = {
+  fast: 90_000,
+  reason: 180_000,
+  classify: 60_000,
+  route: 8_000,
+  embed: 30_000,
+} as const;
+type Job = keyof typeof TIMEOUT_MS;
+/** Rate-limited attempts are retried this often at most (each is metered as failed). */
+export const RATE_LIMIT_RETRIES = 6;
 
 function rateLimited(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /\b3021\b|rate limit|too many requests|capacity/i.test(message);
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** Wait `ms`, or less if `signal` aborts first (then reject with its reason). */
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const timer = setTimeout(done, ms);
+    function done() {
+      signal?.removeEventListener("abort", aborted);
+      resolve();
+    }
+    function aborted() {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    }
+    signal?.addEventListener("abort", aborted, { once: true });
+  });
+}
 
 /** Call a model with a deadline, waiting out Workers AI rate limits with backoff. */
-const ai = (env: Env, rateLimitRetries = RATE_LIMIT_RETRIES): LooseAi => ({
+const ai = (env: Env, job: Job, rateLimitRetries = RATE_LIMIT_RETRIES): LooseAi => ({
   async run(model, inputs) {
     for (let attempt = 0; ; attempt++) {
       try {
-        return await once(env, model, inputs);
+        return await once(env, model, inputs, TIMEOUT_MS[job]);
       } catch (error) {
         if (!rateLimited(error) || attempt >= rateLimitRetries) throw error;
         // Per-minute limits: back off for most of a window, with jitter so
-        // parallel callers don't all come back at once.
-        await sleep(Math.min(60_000, 5_000 * 2 ** attempt) * (0.5 + Math.random()));
+        // parallel callers don't all come back at once. Stopped work stops waiting.
+        await sleep(
+          Math.min(60_000, 5_000 * 2 ** attempt) * (0.5 + Math.random()),
+          paidWorkGuard()?.signal,
+        );
       }
     }
   },
 });
 
-async function once(env: Env, model: string, inputs: unknown): Promise<unknown> {
-  const ms = TIMEOUT_MS[model] ?? 120_000;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${model} timed out after ${ms / 1000}s`)), ms);
+/**
+ * One attempt: refused once the work it belongs to has stopped (paid-work.ts),
+ * aborted at its deadline or when the work stops, and metered either way: a
+ * success with its tokens, anything else as a failed call.
+ */
+async function once(env: Env, model: string, inputs: unknown, timeout: number): Promise<unknown> {
+  const guard = paidWorkGuard();
+  await guard?.check();
+  const ms = Math.min(timeout, guard?.remaining() ?? Infinity);
+  const work = await attribution(env);
+  const controller = new AbortController();
+  const stopped = () => controller.abort(guard!.signal.reason);
+  guard?.signal.addEventListener("abort", stopped, { once: true });
+  const timer = setTimeout(
+    () => controller.abort(new Error(`${model} timed out after ${Math.round(ms / 1000)}s`)),
+    ms,
+  );
+  const aborted = new Promise<never>((_, reject) => {
+    controller.signal.addEventListener("abort", () => reject(controller.signal.reason), {
+      once: true,
+    });
   });
-  const result = await Promise.race([
-    (env.AI as unknown as LooseAi).run(model, inputs, aiGatewayOptions(env, "knowledge")),
-    deadline,
-  ]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
-  // Metering (CORE-207): the call's tokens, for the account whose work this is.
-  await recordAiCall(env, model, tokensOf(result));
-  return result;
+  try {
+    // The race: a binding that ignores the signal still can't hold the caller.
+    const result = await Promise.race([
+      (env.AI as unknown as LooseAi).run(model, inputs, {
+        ...aiGatewayOptions(env, "knowledge", work),
+        signal: controller.signal,
+      }),
+      aborted,
+    ]);
+    // Metering (CORE-207): the call's tokens, for the account whose work this is.
+    await recordAiCall(env, model, tokensOf(result));
+    return result;
+  } catch (error) {
+    await recordAiCall(env, model, {}, { failed: true });
+    throw controller.signal.aborted ? controller.signal.reason : error;
+  } finally {
+    clearTimeout(timer);
+    guard?.signal.removeEventListener("abort", stopped);
+  }
 }
 
 // Provider-specific reasoning controls: GLM and Qwen cannot use the old
@@ -123,7 +178,7 @@ async function chat(
   },
 ): Promise<{ text: string; usage: Usage }> {
   const model = options.model ?? MODELS[tier];
-  const result = (await ai(env, options.rateLimitRetries).run(model, {
+  const result = (await ai(env, tier, options.rateLimitRetries).run(model, {
     messages,
     max_tokens: options.maxTokens,
     ...(options.json ? { response_format: { type: "json_object" } } : {}),
@@ -258,11 +313,14 @@ export async function decide(
   options: { flash?: boolean; model?: string; rateLimitRetries?: number } = {},
 ): Promise<Record<string, ClefAnswer>> {
   const model = options.flash ? MODELS.route : (options.model ?? MODELS.classify);
-  const result = (await ai(env, options.rateLimitRetries).run(model, {
-    model: options.flash ? "clef-flash" : "clef",
-    state,
-    questions,
-  })) as { answers?: Record<string, ClefAnswer> };
+  const result = (await ai(env, options.flash ? "route" : "classify", options.rateLimitRetries).run(
+    model,
+    {
+      model: options.flash ? "clef-flash" : "clef",
+      state,
+      questions,
+    },
+  )) as { answers?: Record<string, ClefAnswer> };
   if (!result.answers) throw new Error(`${model} returned no answers`);
   return result.answers;
 }
@@ -282,7 +340,9 @@ export async function embed(env: Env, texts: string[]): Promise<number[][]> {
   const out: number[][] = [];
   for (let i = 0; i < texts.length; i += 64) {
     const batch = texts.slice(i, i + 64).map((t) => t.slice(0, 8000));
-    const result = (await ai(env).run(MODELS.embed, { text: batch })) as { data: number[][] };
+    const result = (await ai(env, "embed").run(MODELS.embed, { text: batch })) as {
+      data: number[][];
+    };
     out.push(...result.data);
   }
   return out;

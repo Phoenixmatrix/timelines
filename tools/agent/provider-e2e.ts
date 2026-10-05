@@ -18,6 +18,7 @@ import { searchItemStatus } from "./search-item-status.ts";
 import { runAtlasProviderE2E } from "./atlas-provider-e2e.ts";
 import { command, validateEnvironment, type Environment } from "./environment.ts";
 import { runQueueAiE2E } from "./queue-ai-e2e.ts";
+import { reconcileUsage, type UsageRow } from "./usage-reconciliation.ts";
 import type { Outcome, Selection, StageDefinition } from "./ai-stages.ts";
 
 const WORKER = "apps/website/worker";
@@ -41,6 +42,10 @@ export const COPPER_FINCH_STAGES = [
     paths: [
       HARNESS,
       KNOWLEDGE,
+      // Metering and Gateway labels: the stage reconciles them (CORE-285).
+      `${WORKER}/usage/ai.ts`,
+      `${WORKER}/ai-gateway.ts`,
+      "tools/agent/usage-reconciliation.ts",
       `${WORKER}/git/effects.ts`,
       `${SRC}/components/KnowledgeStatus.tsx`,
       `${SRC}/routes/repo/KnowledgeBar.tsx`,
@@ -165,7 +170,7 @@ interface GatewayLog {
   provider: string;
   success: boolean;
   cached: boolean;
-  metadata?: { component?: string };
+  metadata?: { component?: string; account?: string; feature?: string };
   request: string;
   response: string;
   response_content_type: string;
@@ -175,7 +180,13 @@ interface GatewayLog {
 }
 
 // List metadata only: never fetch request/response bodies or persist raw cf output.
-async function gatewayLogs(owned: Environment, since: string, component: string, model?: string) {
+async function gatewayLogs(
+  owned: Environment,
+  since: string,
+  component: string,
+  model?: string,
+  page = 1,
+) {
   let output: string;
   try {
     output = await command(
@@ -190,6 +201,8 @@ async function gatewayLogs(owned: Environment, since: string, component: string,
         since,
         "--per-page",
         "50",
+        "--page",
+        String(page),
         "--order-by",
         "created_at",
         "--order-by-direction",
@@ -246,9 +259,27 @@ async function gatewayLogs(owned: Environment, since: string, component: string,
         tokensIn: log.tokens_in,
         tokensOut: log.tokens_out,
         cost: log.cost,
+        account: log.metadata?.account,
+        feature: log.metadata?.feature,
       },
     ];
   });
+}
+
+/** Every page of a component's logs since `since` (bounded: 40 pages). */
+async function allGatewayLogs(owned: Environment, since: string, component: string) {
+  const logs: Awaited<ReturnType<typeof gatewayLogs>> = [];
+  const seen = new Set<string>();
+  for (let page = 1; page <= 40; page++) {
+    const batch = await gatewayLogs(owned, since, component, undefined, page);
+    for (const log of batch) {
+      if (seen.has(log.id)) continue;
+      seen.add(log.id);
+      logs.push(log);
+    }
+    if (batch.length < 50) return logs;
+  }
+  throw new Error(`More ${component} Gateway logs than reconciliation reads`);
 }
 
 /**
@@ -2027,6 +2058,48 @@ export async function runProviderE2E(
           });
         }
         for (const requirement of requirements) passed(requirement.stage);
+      }
+      if (want("knowledge")) {
+        // CORE-285: what the app records equals what the gateway saw, per
+        // feature and model, for the fixture repository's owner: every
+        // knowledge, edit, overlay, page-set and release-note call this run made.
+        begin("knowledge");
+        enter("usage-reconciliation");
+        const owned = await ownedEnvironment();
+        const usageEvidence: Record<string, unknown> = {};
+        evidence.usageReconciliation = usageEvidence;
+        const appUsage = async () => {
+          const response = await fetch(
+            `${ctx.origin}/api/dev/ai-usage?since=${String(evidence.startedAt).slice(0, 10)}`,
+            {
+              headers: { authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET ?? ""}` },
+              signal: AbortSignal.timeout(60_000),
+            },
+          );
+          assert.equal(response.status, 200, "Reading the app's AI usage failed");
+          return ((await response.json()) as { usage: UsageRow[] }).usage;
+        };
+        const ownerAccount = (await appUsage()).find((row) => row.slug === owner)?.account_id;
+        assert(ownerAccount, `The fixture owner ${owner} recorded no AI usage`);
+        usageEvidence.account = ownerAccount;
+        let rows: ReturnType<typeof reconcileUsage>["rows"] = [];
+        await waitFor("usage-reconciliation", 180_000, async () => {
+          const logs = await allGatewayLogs(owned, String(evidence.startedAt), "knowledge");
+          const result = reconcileUsage(await appUsage(), logs, ownerAccount);
+          rows = result.rows;
+          usageEvidence.rows = result.rows;
+          usageEvidence.mismatched = result.mismatched;
+          usageEvidence.unlabelledLogs = logs.filter((log) => !log.account).length;
+          return result.rows.length > 0 && result.mismatched.length === 0;
+        });
+        // Agreeing isn't enough: the builds' calls must be the owner's, not
+        // the site's `unattributed` (the Workflow step context bug).
+        const features = ["knowledge", ...(want("timeline-pages") ? ["wiki"] : [])];
+        for (const feature of features)
+          assert(
+            rows.some((row) => row.feature === feature && row.app.calls > 0),
+            `The fixture owner's ${feature} calls must be attributed to it`,
+          );
       }
       if (want("repository-deletion")) {
         begin("repository-deletion");

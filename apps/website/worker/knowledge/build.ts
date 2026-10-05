@@ -80,6 +80,7 @@ import { runPageSet } from "./pages.ts";
 import { chunk } from "./util.ts";
 import { planWiki, updatePages, type WikiSource, type WikiStats } from "./wiki.ts";
 import { aiWork } from "../usage/ai.ts";
+import { paidSteps } from "./paid-steps.ts";
 
 export interface BuildParams {
   repoId: string;
@@ -132,6 +133,23 @@ async function repoRow(d1: D1Database, repoId: string): Promise<RepoRow | null> 
     artifacts_remote: row.artifacts_remote,
     full_name: `${row.slug}/${row.name}`,
   };
+}
+
+/** Why a build may no longer spend on models, or null while it may. */
+export async function buildStopped(
+  d1: D1Database,
+  repoId: string,
+  buildId: string,
+): Promise<string | null> {
+  const [build, repo] = await Promise.all([
+    db(d1).selectFrom("kg_builds").select("status").where("id", "=", buildId).executeTakeFirst(),
+    db(d1).selectFrom("repos").select("deleted_at").where("id", "=", repoId).executeTakeFirst(),
+  ]);
+  if (repo?.deleted_at) return "The repository is being deleted; the build stopped";
+  // Recorded by the first step; until then it is starting.
+  if (build && build.status !== "running")
+    return `The build is ${build.status}; it makes no more model calls`;
+  return null;
 }
 
 /** Merge `stats` into a build's stats JSON. */
@@ -240,7 +258,17 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       : event.payload.pages
         ? "wiki"
         : "knowledge";
-    return aiWork({ feature, repo: event.payload.repoId }, () => this.#run(event, step));
+    const work = { feature, repo: event.payload.repoId };
+    // Each step re-enters that attribution, and stops paying (CORE-285) once
+    // its attempt has timed out or, for main's builds, once the build is no
+    // longer running (the watchdog stopped it, or it failed) or its repository
+    // is being deleted.
+    const { repoId, buildId } = event.payload;
+    const live =
+      event.payload.overlay || event.payload.pages
+        ? undefined
+        : () => buildStopped(this.env.DB, repoId, buildId);
+    return aiWork(work, () => this.#run(event, paidSteps(step, work, live)));
   }
 
   async #run(event: Readonly<WorkflowEvent<BuildParams>>, step: WorkflowStep) {
@@ -727,10 +755,12 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await step.do("fail", async () => {
+        // A build the watchdog already stopped keeps the watchdog's reason.
         await db(env.DB)
           .updateTable("kg_builds")
           .set({ status: "failed", error: message.slice(0, 2000), finished_at: nowIso() })
           .where("id", "=", buildId)
+          .where("status", "=", "running")
           .execute();
         await coordinator(env, repoId).finished(buildId, false, message);
         return null;

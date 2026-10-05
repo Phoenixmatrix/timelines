@@ -191,6 +191,8 @@ export interface Database {
     input_tokens: Generated<number>;
     output_tokens: Generated<number>;
     total_tokens: Generated<number>;
+    /** Attempts that failed or were cut off (CORE-285); `calls` counts successes. */
+    failed_calls: Generated<number>;
   };
   /** usage_snapshots past their policy, rolled up by month (CORE-225, worker/usage/history.ts). */
   usage_monthly: {
@@ -217,6 +219,7 @@ export interface Database {
     input_tokens: Generated<number>;
     output_tokens: Generated<number>;
     total_tokens: Generated<number>;
+    failed_calls: Generated<number>;
     days: Generated<number>;
   };
   /** Where a bounded, resumable cron pass left off. */

@@ -80,6 +80,11 @@ const OVERLAY_MAX_MS = 2 * 60 * 60_000;
 /** A page set is a few model calls; one running longer than this is stopped. */
 const PAGES_MAX_MS = 2 * 60 * 60_000;
 
+/** Whether a Workflow instance's status says it ended on its own (nothing left to stop). */
+function instanceEnded(status: { status: string } | null): boolean {
+  return status !== null && ["errored", "terminated", "complete"].includes(status.status);
+}
+
 interface Running {
   buildId: string;
   /** The push sequence number the build covers. */
@@ -349,7 +354,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       const overdue = Date.now() - run.startedAt > PAGES_MAX_MS;
       if (status?.status === "complete") delete state.pages[run.buildId];
       else if (!status || overdue || ["errored", "terminated"].includes(status.status)) {
-        if (overdue) await instance?.terminate().catch(() => undefined);
+        if (!instanceEnded(status)) await instance?.terminate().catch(() => undefined);
         const error = `Pages ${overdue ? "ran too long; stopped by the watchdog" : (status?.status ?? "vanished")}`;
         await abandonSet(
           this.env.DB,
@@ -420,7 +425,10 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       state.scan = true;
     } else if (!status || stale || ["errored", "terminated"].includes(status.status)) {
       // Crashed, vanished or hung: stop it, and retry once before giving up.
-      if (stale) await instance?.terminate().catch(() => undefined);
+      // Unless it already ended, terminate it, even when only its status was
+      // unreadable: a retry must never run beside a build still spending
+      // (CORE-285). Marking it failed below also stops its model calls.
+      if (!instanceEnded(status)) await instance?.terminate().catch(() => undefined);
       await db(this.env.DB)
         .updateTable("kg_builds")
         .set({
@@ -461,7 +469,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       if (status?.status === "complete") {
         this.#overlayEnded(state, overlay, { commit: run.commit, base: run.base }, null);
       } else if (!status || overdue || ["errored", "terminated"].includes(status.status)) {
-        if (overdue) await instance?.terminate().catch(() => undefined);
+        if (!instanceEnded(status)) await instance?.terminate().catch(() => undefined);
         const error = `Overlay ${overdue ? "ran too long; stopped by the watchdog" : (status?.status ?? "vanished")}`;
         await overlayFailed(this.env.DB, state.repoId!, ref, run.commit, error).catch(
           () => undefined,
