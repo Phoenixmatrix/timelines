@@ -31,6 +31,7 @@ import {
   CaretDownIcon,
   FunnelSimpleIcon,
   MagnifyingGlassIcon,
+  RowsIcon,
   StarIcon,
   XIcon,
 } from "@phosphor-icons/react";
@@ -88,12 +89,14 @@ import {
   DEFAULT_QUERY,
   facetsOf,
   filterToken,
+  groupIssues,
   parseWhen,
   sortIssues,
   toggleToken,
   tokenize,
   VIEWS,
   withoutKeys,
+  type GroupKey,
   type SortKey,
 } from "./query.ts";
 
@@ -461,6 +464,37 @@ function Workbench({ data }: { data: TrackerView }) {
     [snapshot.issues, compiled],
   );
   const issues = useMemo(() => sortIssues(matched, index, sort), [matched, index, sort]);
+  // The list groups by progress (CORE-295): work underway on top, the sort
+  // inside each group. One group alone needs no header, so it reads flat.
+  const grouped = view === "list" && params.get("group") !== "none";
+  const groups = useMemo(() => {
+    if (!grouped) return null;
+    const all = groupIssues(issues, index);
+    return all.length > 1 ? all : null;
+  }, [grouped, issues, index]);
+  const [folded, setFolded] = useState<ReadonlySet<GroupKey>>(new Set());
+  const toggleFold = (key: GroupKey) =>
+    setFolded((current) => {
+      const next = new Set(current);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  // What j and k step through: the rows on screen, in their order.
+  const listed = useMemo(
+    () => (groups ? groups.flatMap((g) => (folded.has(g.key) ? [] : g.issues)) : issues),
+    [groups, folded, issues],
+  );
+  // Opening an issue in a folded group unfolds it, so the selection is never hidden.
+  const selectedGroup = groups?.find((g) => g.issues.some((i) => i.id === selected?.id))?.key;
+  useEffect(() => {
+    if (!selectedGroup) return;
+    setFolded((current) => {
+      if (!current.has(selectedGroup)) return current;
+      const next = new Set(current);
+      next.delete(selectedGroup);
+      return next;
+    });
+  }, [selectedGroup]);
   const facets = useMemo(
     () => facetsOf(snapshot.issues, compiled, index, snapshot),
     [snapshot, compiled, index],
@@ -529,14 +563,14 @@ function Workbench({ data }: { data: TrackerView }) {
       } else if (event.key === "/") {
         event.preventDefault();
         queryRef.current?.focus();
-      } else if ((event.key === "j" || event.key === "k") && issues.length) {
+      } else if ((event.key === "j" || event.key === "k") && listed.length) {
         event.preventDefault();
-        const current = issues.findIndex((issue) => issue.id === selected?.id);
+        const current = listed.findIndex((issue) => issue.id === selected?.id);
         const at =
           current < 0
             ? 0
-            : Math.max(0, Math.min(issues.length - 1, current + (event.key === "j" ? 1 : -1)));
-        void navigate(href(issues[at]!.id), { preventScrollReset: true });
+            : Math.max(0, Math.min(listed.length - 1, current + (event.key === "j" ? 1 : -1)));
+        void navigate(href(listed[at]!.id), { preventScrollReset: true });
       } else if (event.key === "Escape" && selected) {
         void navigate(showInspector ? closeHref : href(), { preventScrollReset: true });
       }
@@ -1055,6 +1089,19 @@ function Workbench({ data }: { data: TrackerView }) {
                   </button>
                 ))}
               </div>
+              {view === "list" && (
+                <Tip label={grouped ? "Show one list" : "Group by progress"}>
+                  <button
+                    type="button"
+                    className="mk-btn mk-btn--ghost mk-btn--sm shrink-0 text-ink-muted aria-pressed:text-ink max-sm:min-h-11"
+                    aria-pressed={grouped}
+                    onClick={() => setParam("group", grouped ? "none" : null)}
+                  >
+                    <RowsIcon weight={grouped ? "fill" : "bold"} aria-hidden />
+                    Group
+                  </button>
+                </Tip>
+              )}
               <span className="shrink-0 text-body-sm text-ink-muted tabular-nums max-lg:hidden">
                 {count}
               </span>
@@ -1128,6 +1175,9 @@ function Workbench({ data }: { data: TrackerView }) {
             ) : (
               <IssueLog
                 issues={issues}
+                groups={groups}
+                folded={folded}
+                onFold={toggleFold}
                 index={index}
                 selected={selected?.id ?? null}
                 href={href}

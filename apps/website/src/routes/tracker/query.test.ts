@@ -5,6 +5,7 @@ import {
   buildIndex,
   compile,
   facetsOf,
+  groupIssues,
   parseQuery,
   queryTokenSet,
   sortIssues,
@@ -491,6 +492,60 @@ describe("facets, sorting and activity", () => {
       "CORE-2",
       "CORE-10",
       "WEB-1",
+    ]);
+  });
+
+  it("puts work underway above what can move now, in every sort, without splitting a group", () => {
+    const work = [
+      issue("CORE-1", { priority: 0, updatedAt: ago(5) }),
+      issue("CORE-2", {
+        priority: 3,
+        status: "in_progress",
+        updatedAt: ago(4),
+        claim: { actorId: "m-jun", agent: "codex", expiresAt: ago(-1) },
+      }),
+      issue("CORE-3", { priority: 2, status: "in_progress", updatedAt: ago(1) }),
+      issue("CORE-4", { status: "backlog", updatedAt: ago(0.5) }),
+      issue("CORE-5", { status: "done", updatedAt: ago(0.1) }),
+      issue("CORE-6", { status: "done_in_timeline", updatedAt: ago(2) }),
+    ];
+    const snap = snapshot(work);
+    const index = buildIndex(snap, snap.serverTime);
+    expect(sortIssues(work, index, "rank").map((i) => i.key)).toEqual([
+      "CORE-2",
+      "CORE-3",
+      "CORE-1",
+      "CORE-6",
+      "CORE-4",
+      "CORE-5",
+    ]);
+    const sections = (sort: "rank" | "updated" | "priority") =>
+      groupIssues(sortIssues(work, index, sort), index).map((g) => [
+        g.label,
+        g.issues.map((i) => i.key),
+      ]);
+    expect(sections("rank")).toEqual([
+      ["In progress", ["CORE-2", "CORE-3"]],
+      ["Up next", ["CORE-1"]],
+      ["Done in a timeline", ["CORE-6"]],
+      ["Backlog", ["CORE-4"]],
+      ["Closed", ["CORE-5"]],
+    ]);
+    // Another sort reorders inside each group; the groups keep their order.
+    expect(sections("updated")).toEqual([
+      ["In progress", ["CORE-3", "CORE-2"]],
+      ["Up next", ["CORE-1"]],
+      ["Done in a timeline", ["CORE-6"]],
+      ["Backlog", ["CORE-4"]],
+      ["Closed", ["CORE-5"]],
+    ]);
+    expect(sections("priority")[0]).toEqual(["In progress", ["CORE-3", "CORE-2"]]);
+    // A filtered list keeps only the groups it has, with a count per state.
+    const underway = groupIssues(sortIssues(work.slice(0, 3), index, "rank"), index);
+    expect(underway.map((g) => g.key)).toEqual(["underway", "next"]);
+    expect(underway[0]!.states).toEqual([
+      { state: "claimed", count: 1 },
+      { state: "in_progress", count: 1 },
     ]);
   });
 
