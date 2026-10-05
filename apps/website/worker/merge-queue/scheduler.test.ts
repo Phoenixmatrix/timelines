@@ -8,6 +8,7 @@ import {
 } from "../../shared/merge-queue.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { runOutcome } from "../ci/landing.ts";
+import { startRun } from "../ci/trigger.ts";
 import type { QueueDeps } from "./deps.ts";
 import { progressQueue, ancestor } from "./scheduler.ts";
 import {
@@ -20,6 +21,21 @@ import {
 } from "./store.ts";
 import * as queueStore from "./store.ts";
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+const files = vi.hoisted(() => ({ ciYml: "" }));
+vi.mock("../objects.ts", () => ({
+  RepoReader: class {
+    async commit(oid: string) {
+      return { message: `Commit ${oid}\n`, treeHash: `tree-${oid}` };
+    }
+    async entryAt(_tree: string, path: string) {
+      return path === ".gitmatrix/ci.yml" ? { type: "blob", hash: "ci" } : null;
+    }
+    async blob() {
+      return { bytes: new TextEncoder().encode(files.ciYml) };
+    }
+    async close() {}
+  },
+}));
 const databases: DatabaseSync[] = [];
 afterEach(() => {
   vi.restoreAllMocks();
@@ -186,6 +202,56 @@ function setup() {
   }
   return { sqlite, env, refs, parents, deps, behavior, admit, state, progress, settle };
 }
+
+const MIXED_TRIGGER_PIPELINE = `
+on: [push, step, preview]
+jobs:
+  check:
+    steps: [check]
+  shared:
+    on: [push, step]
+    steps: [shared-check]
+  step-only:
+    on: step
+    steps: [step-check]
+  preview-only:
+    on: preview
+    steps: [preview-check]
+`;
+
+function usePersistedPipeline(
+  t: { env: Env; sqlite: DatabaseSync; deps: QueueDeps },
+  pipeline = MIXED_TRIGGER_PIPELINE,
+) {
+  files.ciYml = pipeline;
+  Object.assign(t.env, { CI_RUN: { create: vi.fn(async () => {}) } });
+  const start = async (s: StoredQueue, deploy: boolean) => {
+    const result = await startRun(
+      t.env,
+      { id: "repo", artifacts_name: "a", artifacts_remote: "https://a" },
+      {
+        branch: deploy ? "main" : s.entry.candidateBranch,
+        commit: s.entry.candidate!,
+        trigger: deploy ? "push" : "landing",
+        queueId: deploy ? undefined : s.entry.id,
+        runId: deploy ? s.deployRunId! : s.gateRunId!,
+        actor: s.actor,
+        waitUntil: () => {},
+      },
+    );
+    if ("runId" in result && deploy) {
+      t.sqlite
+        .prepare(
+          "UPDATE ci_jobs SET status='succeeded',exit_code=0 WHERE run_id=? AND status='pending'",
+        )
+        .run(result.runId);
+      t.sqlite.prepare("UPDATE ci_runs SET status='succeeded' WHERE id=?").run(result.runId);
+    }
+    return result;
+  };
+  t.deps.gates = vi.fn(async (_repo, s) => start(s, false));
+  t.deps.deploy = vi.fn(async (_repo, s) => start(s, true));
+}
 describe("durable independent merge queue", () => {
   test("concurrent admissions and progress claim one repository slot, land once, and retain exact gate proof", async () => {
     const t = setup(),
@@ -208,6 +274,82 @@ describe("durable independent merge queue", () => {
     expect((await t.state(3)).entry.status).toBe("landed");
     expect(t.refs.get("refs/heads/main")).toBe((await t.state(3)).entry.candidate);
     expect((await t.state(3)).entry.base).toBe((await t.state(2)).entry.candidate);
+  });
+  test("persisted trigger restrictions let successful landing gates advance main and finish deployment", async () => {
+    const t = setup();
+    usePersistedPipeline(t);
+    await t.admit(2);
+    await t.settle(2);
+    const testing = await t.state(2);
+    expect(testing.entry.status).toBe("testing");
+    expect(
+      t.sqlite
+        .prepare("SELECT name,status FROM ci_jobs WHERE run_id=? ORDER BY name")
+        .all(testing.gateRunId!),
+    ).toEqual([
+      { name: "check", status: "pending" },
+      { name: "preview-only", status: "skipped" },
+      { name: "shared", status: "pending" },
+      { name: "step-only", status: "skipped" },
+    ]);
+    // Simulate runner completion, leaving startRun's skipped jobs and specs untouched.
+    t.sqlite
+      .prepare(
+        "UPDATE ci_jobs SET status='succeeded',exit_code=0 WHERE run_id=? AND status='pending'",
+      )
+      .run(testing.gateRunId!);
+    t.sqlite.prepare("UPDATE ci_runs SET status='succeeded' WHERE id=?").run(testing.gateRunId!);
+    await t.settle(2);
+    await t.progress();
+    const landed = await t.state(2);
+    expect(landed.entry.status).toBe("landed");
+    expect(t.refs.get("refs/heads/main")).toBe(testing.entry.candidate);
+    expect(landed.entry.gateRun).toBe(testing.entry.gateRun);
+    expect(landed.entry.deployRun).toEqual(expect.any(Number));
+    expect(landed.entry.deployStatus).toBe("succeeded");
+    expect(landed.entry.failure).toBeNull();
+    expect(t.deps.remediate).not.toHaveBeenCalled();
+  });
+  test.each(["failed", "skipped"])(
+    "a persisted push-and-step gate that is %s still blocks main despite another successful gate",
+    async (status) => {
+      const t = setup();
+      usePersistedPipeline(t);
+      await t.admit(2);
+      await t.settle(2);
+      const testing = await t.state(2);
+      t.sqlite
+        .prepare(
+          "UPDATE ci_jobs SET status='succeeded',exit_code=0 WHERE run_id=? AND name='check'",
+        )
+        .run(testing.gateRunId!);
+      t.sqlite
+        .prepare("UPDATE ci_jobs SET status=? WHERE run_id=? AND name='shared'")
+        .run(status, testing.gateRunId!);
+      // Even a successful aggregate cannot substitute for the required job's evidence.
+      t.sqlite.prepare("UPDATE ci_runs SET status='succeeded' WHERE id=?").run(testing.gateRunId!);
+      await t.settle(2);
+      expect((await t.state(2)).entry.status).toBe("failed");
+      expect((await t.state(2)).entry.failure).toMatchObject({
+        stage: "gates",
+        kind: "configuration",
+      });
+      expect(t.refs.get("refs/heads/main")).toBe(oid(1));
+      expect(t.deps.deploy).not.toHaveBeenCalled();
+    },
+  );
+  test("a persisted step-only pipeline has no runnable landing gates and never advances main", async () => {
+    const t = setup();
+    usePersistedPipeline(t, "on: step\njobs:\n  step-only:\n    on: step\n    steps: [check]\n");
+    await t.admit(2);
+    await t.settle(2);
+    expect((await t.state(2)).entry.status).toBe("failed");
+    expect((await t.state(2)).entry.failure).toMatchObject({
+      stage: "gates",
+      kind: "configuration",
+    });
+    expect(t.refs.get("refs/heads/main")).toBe(oid(1));
+    expect(t.deps.deploy).not.toHaveBeenCalled();
   });
   test.each(["failed", "cancelled", "skipped", "none"])(
     "%s gates fail closed and the next good submission still lands",

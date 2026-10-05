@@ -299,6 +299,7 @@ export async function startRun(
       const spec: StoredJob = {
         needs: job.needs,
         if: job.if,
+        on: job.on ?? null,
         image: job.image,
         instance: job.instance,
         env: { ...pipeline!.env, ...job.env },

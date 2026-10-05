@@ -257,8 +257,11 @@ boundaries, and continue unrelated work only under its own valid claim.
 The queue pins the base and source, prepares an exact two-parent candidate, runs
 the configured required merge gates on that candidate, then advances main with
 compare-and-swap. Missing/invalid configuration, no runnable gates or skipped
-required jobs fail closed. If main moves, the candidate must be merged and tested
-again. Failed/cancelled entries release scheduling capacity; retry fences off old
+required jobs fail closed. Persisted job specifications retain their `on` trigger
+restrictions, so step-only and preview-only jobs stay excluded when landing gates
+are verified; a skipped job that does apply still blocks landing. If main moves,
+the candidate must be merged and tested again. Failed/cancelled entries release
+scheduling capacity; retry fences off old
 attempts. Post-landing main CI/deployment is tracked separately: failure creates
 remediation without changing the landed status or rewinding main.
 Notification retries do not block deployment startup or failure remediation.
