@@ -91,6 +91,7 @@ beforeEach(async () => {
       ('${YESTERDAY}', 'acc_o', 'knowledge', '@cf/m', 3, 300, 30, 330),
       ('${YESTERDAY}', 'acc_o', 'release_notes', '@cf/m', 1, 100, 10, 110),
       ('${YESTERDAY}', '', 'unattributed', '@cf/e', 2, 0, 0, 0),
+      ('${YESTERDAY}', 'acc_o', 'knowledge', 'openrouter:google/gemini-3-flash', 5, 500, 50, 550),
       ('${TODAY}', 'acc_o', 'knowledge', '@cf/m', 9, 900, 90, 990);
   `);
   registry.exec(`
@@ -212,6 +213,8 @@ describe("collectUsage", () => {
     expect(q(`${YESTERDAY} workers_ai/@cf/m/input_tokens`)).toBe(400);
     expect(q(`${YESTERDAY} workers_ai/@cf/m/output_tokens`)).toBe(40);
     expect(o[`${YESTERDAY} workers_ai/@cf/m/calls`]!.kind).toBe("activity");
+    // An account's own provider bills its key, not Cloudflare (CORE-294).
+    expect(Object.keys(o).filter((key) => key.includes("openrouter:"))).toEqual([]);
     expect(q(`${YESTERDAY} ci/sandbox/jobs`)).toBe(2);
     expect(q(`${YESTERDAY} ci/sandbox/minutes`)).toBe(40);
     // What those minutes provision, by each job's instance type: 30 min on the

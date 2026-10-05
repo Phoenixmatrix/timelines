@@ -40,6 +40,7 @@ import { Device, deviceAction, deviceLoader } from "./routes/Device.tsx";
 import { Invites, invitesAction, invitesLoader } from "./routes/Invites.tsx";
 import { Profile, profileAction, profileLoader } from "./routes/Profile.tsx";
 import { Preferences, preferencesLoader } from "./routes/Preferences.tsx";
+import { AiProviders, aiProvidersLoader } from "./routes/AiProviders.tsx";
 import { AiSettings, aiSettingsLoader } from "./routes/AiSettings.tsx";
 import {
   AssistantSkills,
@@ -163,6 +164,11 @@ export const routes: RouteObject[] = [
             path: "settings/ai",
             loader: aiSettingsLoader,
             Component: AiSettings,
+          },
+          {
+            path: "settings/ai-providers",
+            loader: aiProvidersLoader,
+            Component: AiProviders,
           },
           { path: "settings/site-ai", loader: siteAiSettingsLoader, Component: SiteAiSettings },
           { path: "settings/usage", loader: usageLoader, Component: UsageCosts },

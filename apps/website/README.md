@@ -1203,7 +1203,7 @@ read as `agent_decides`.
 - **Settings:** the gear at the bottom of the navigation rail opens a shared
   settings area, starting with **Teams and workspaces** for the current tracker,
   or your default tracker when outside a tracker. A left-hand section navigation
-  brings together **AI settings**, profile, preferences, access tokens, SSH keys,
+  brings together **AI settings**, **AI providers**, profile, preferences, access tokens, SSH keys,
   agents, and invitations for site admins. On smaller screens it becomes a
   collapsible section menu. Account context follows section links; personal
   settings still belong to the signed-in person. Existing permissions apply.
@@ -1740,6 +1740,52 @@ the **Site AI settings** page (`/settings/site-ai`). Tables: `site_ai_log_bodies
 `account_ai_log_bodies`; `worker/ai-gateway.ts` resolves them per call from a
 once-a-minute isolate cache.
 The [CLI equivalent](../cli/README.md#automatic-ai-settings) is `gm settings ai`.
+
+### AI providers (CORE-294)
+
+An account can add models from its own providers, with its own API keys, on
+**Settings → AI providers** (`/settings/ai-providers?owner=<account>`). The same
+people who save AI settings manage it; members see what is connected and which
+models are offered, never a key.
+
+- **TypeSafe:** Jev (`typesafe:jev-latest`, $0.042 per million input tokens,
+  output free) answers typed `choice`/`score`/`noul` questions like Clef, so it
+  can be the **Classification** model.
+- **OpenRouter:** the page searches OpenRouter's public model list (text output
+  only, read at most every 15 minutes per isolate) by name, vendor or id, sorted
+  by match, recency or input price. Added models (`openrouter:<model>`) can be
+  the **Fast** or **Task** model. Models without a JSON response mode are marked;
+  structured jobs still parse their replies, with one repair attempt.
+
+Every model shows its published input, output, cached-input, cache-write and
+reasoning prices per million tokens where the provider has them. Routers with no
+fixed price say so, and Atlas paid synthesis can't use them; it spends at a
+provider model's published price otherwise. "Refresh prices" re-reads them.
+
+A key is checked with the provider (TypeSafe `GET /v1/models`, OpenRouter
+`GET /api/v1/key`) before it is sealed with `REGISTRY_KEK` into `ai_providers`
+(one per account and kind); views carry its last four characters only. Replacing
+a key keeps the row, so running work uses the new key. Added models are
+`ai_provider_models`, with the name and prices the provider published (never
+taken from the request). A model chosen for a role can't be removed, nor its
+provider disconnected, until another model is chosen: one guarded `DELETE`
+each. Should a chosen model go missing anyway, new work falls back to the role's
+default rather than failing.
+
+API: `GET /api/accounts/:slug/ai-providers` (`AiProvidersView`),
+`GET …/:kind/catalog`, `PUT …/:kind {apiKey}`, `DELETE …/:kind`,
+`POST …/:kind/models {model}`, `DELETE …/:kind/models?model=`,
+`POST …/:kind/models/refresh` (`worker/ai-providers/api.ts`). The AI settings
+`catalog` lists the built-in models, then the account's provider models for the
+roles their capability allows, and PATCH validates against it.
+
+Snapshots name a provider model as `<kind>:<provider row id>:<model>` and carry
+its prices (`AiSnapshot.prices`). `worker/knowledge/models.ts` sends those calls
+to the provider with the account's key (`worker/ai-providers/providers.ts`)
+instead of Workers AI: they are billed to that key and **don't pass through AI
+Gateway**, so gateway logging doesn't apply to them. They keep the same
+deadlines, rate-limit backoff (429, and 503/529 overload) and usage metering, recorded as
+`<kind>:<model>`. Tests fake both providers (`worker/testing/ai-providers.ts`).
 
 Policy is frozen when a Workflow is admitted or a release generation captures its
 refs. Retries, watchdog restarts and budget continuations keep that policy,

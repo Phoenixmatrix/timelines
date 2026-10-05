@@ -59,14 +59,16 @@ pub struct AiSetArgs {
     /// Automatic release-note generation.
     #[arg(long, value_parser = ["on", "off"])]
     release_notes: Option<String>,
-    /// Classification model; see show for published pricing and release dates.
-    #[arg(long, value_parser = ["clef"])]
+    /// Classification model: clef, or typesafe:<model> added in Settings → AI providers;
+    /// see show for published pricing and release dates.
+    #[arg(long, value_parser = classification_model)]
     classification: Option<String>,
-    /// Fast generation model; see show for published pricing and release dates.
-    #[arg(long, value_parser = ["glm-5.3-flash", "gemma-4-26b-a4b-it"])]
+    /// Fast generation model: glm-5.3-flash, gemma-4-26b-a4b-it, or openrouter:<model>
+    /// added in Settings → AI providers; see show for published pricing and release dates.
+    #[arg(long, value_parser = generation_model)]
     fast: Option<String>,
-    /// Task generation model; does not change running jobs or regenerate cached output.
-    #[arg(long, value_parser = ["glm-5.3-flash", "gemma-4-26b-a4b-it"])]
+    /// Task generation model (as --fast); does not change running jobs or regenerate cached output.
+    #[arg(long, value_parser = generation_model)]
     task: Option<String>,
     /// Knowledge updates start once pushes to main pause this long (0-1440 minutes; 0 = no wait).
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=1440))]
@@ -125,6 +127,41 @@ fn account_slug(value: &str) -> std::result::Result<String, String> {
         return Err("Use an account slug, not a repository or URL.".into());
     }
     Ok(value.to_string())
+}
+
+/// A curated model id, or `<provider>:<model>` from the account's own provider
+/// (CORE-294); the server checks the account actually added that model.
+fn model_choice(
+    value: &str,
+    curated: &[&str],
+    provider: &str,
+) -> std::result::Result<String, String> {
+    if curated.contains(&value) {
+        return Ok(value.to_string());
+    }
+    match value.split_once(':') {
+        Some((kind, model))
+            if kind == provider && !model.is_empty() && !model.contains(char::is_whitespace) =>
+        {
+            Ok(value.to_string())
+        }
+        _ => Err(format!(
+            "Use one of {}, or {provider}:<model> for a model added in Settings → AI providers.",
+            curated.join(", ")
+        )),
+    }
+}
+
+fn classification_model(value: &str) -> std::result::Result<String, String> {
+    model_choice(value, &["clef"], "typesafe")
+}
+
+fn generation_model(value: &str) -> std::result::Result<String, String> {
+    model_choice(
+        value,
+        &["glm-5.3-flash", "gemma-4-26b-a4b-it"],
+        "openrouter",
+    )
 }
 
 impl AiSetArgs {
@@ -334,6 +371,26 @@ mod tests {
     }
 
     #[test]
+    fn provider_models_are_accepted_for_their_roles() {
+        let args = parse_set(&[
+            "--classification",
+            "typesafe:jev-latest",
+            "--fast",
+            "openrouter:google/gemini-3-flash",
+            "--task",
+            "gemma-4-26b-a4b-it",
+        ]);
+        assert_eq!(
+            args.patch(),
+            json!({"models": {
+                "classification": "typesafe:jev-latest",
+                "fast": "openrouter:google/gemini-3-flash",
+                "task": "gemma-4-26b-a4b-it"
+            }})
+        );
+    }
+
+    #[test]
     fn site_defaults_take_only_log_bodies() {
         let args = parse_set(&["--site", "--log-bodies", "on"]);
         assert!(args.site);
@@ -379,6 +436,9 @@ mod tests {
             vec!["--task", "clef"],
             vec!["--classification", "jev"],
             vec!["--fast", "arbitrary-provider-model"],
+            vec!["--fast", "typesafe:jev-latest"],
+            vec!["--classification", "openrouter:anthropic/claude-sonnet-5"],
+            vec!["--task", "openrouter:"],
             vec!["--release-notes", "off", "--owner", "orbit/repo"],
             vec!["--wiki", "on", "--owner", ""],
             vec!["--indexing", "off"],

@@ -1,6 +1,11 @@
 import { Kysely, type Generated } from "kysely";
 import { D1Dialect } from "kysely-d1";
-import type { ClassificationModel, GenerationModel } from "../shared/ai.ts";
+import type {
+  AiCapability,
+  AiProviderKind,
+  ClassificationModel,
+  GenerationModel,
+} from "../shared/ai.ts";
 import type { QueueStatus } from "../shared/merge-queue.ts";
 
 /**
@@ -940,6 +945,29 @@ export interface Database {
     ai_updated_at: Generated<string | null>;
     knowledge_quiet_minutes: Generated<number>;
     knowledge_max_wait_minutes: Generated<number>;
+  };
+  /** An account's own AI provider and its sealed API key (CORE-294); one per kind. */
+  ai_providers: {
+    id: string;
+    account_id: string;
+    kind: AiProviderKind;
+    key_sealed: string;
+    key_last_four: string;
+    updated_by: string | null;
+    updated_at: Generated<string>;
+  };
+  /** A provider model an account made available, as the provider described it when added. */
+  ai_provider_models: {
+    provider_id: string;
+    model: string;
+    name: string;
+    capability: AiCapability;
+    /** JSON: the AiModelOption fields beyond id, name and model. */
+    details: string;
+    context_length: number | null;
+    json_mode: Generated<number>;
+    added_by: string | null;
+    checked_at: Generated<string>;
   };
   /** The site's AI Gateway body logging per component (CORE-290); absent: the environment's default. */
   site_ai_log_bodies: {

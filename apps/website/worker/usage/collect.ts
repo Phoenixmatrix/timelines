@@ -488,14 +488,19 @@ const aiSearch: Step = {
   },
 };
 
-/** Yesterday's Workers AI calls and tokens, by model. */
+/**
+ * Yesterday's Workers AI calls and tokens, by model. Calls to an account's own
+ * provider (CORE-294, `<provider>:<model>`) are billed to its key, not here.
+ */
 const workersAi: Step = {
   id: "workers_ai",
   async run(ctx) {
     const { results } = await ctx.env.DB.prepare(
       `SELECT model, SUM(calls) AS calls, SUM(input_tokens) AS input, SUM(output_tokens) AS output,
               SUM(total_tokens) AS total, SUM(failed_calls) AS failed
-       FROM ai_usage WHERE day = ?1 AND account_id = ?2 GROUP BY model`,
+       FROM ai_usage WHERE day = ?1 AND account_id = ?2
+         AND model NOT LIKE 'openrouter:%' AND model NOT LIKE 'typesafe:%'
+       GROUP BY model`,
     )
       .bind(ctx.yesterday, ctx.account)
       .all<{
