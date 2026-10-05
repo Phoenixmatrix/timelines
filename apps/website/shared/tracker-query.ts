@@ -75,13 +75,14 @@ const STATE_RANK: Record<IssueState, number> = {
   claimed: 1,
   leased: 2,
   in_progress: 3,
-  ready: 4,
-  todo: 5,
-  blocked: 6,
-  not_ready: 6.1,
-  human_only: 6.2,
-  // Finished, waiting for its timeline to land (CORE-74).
-  done_in_timeline: 7,
+  // Finished, waiting for its timeline to land (CORE-74): close to done, so
+  // it sits with work underway, ahead of what's next (CORE-298).
+  done_in_timeline: 4,
+  ready: 5,
+  todo: 6,
+  blocked: 7,
+  not_ready: 7.1,
+  human_only: 7.2,
   backlog: 8,
   done: 9,
   canceled: 10,
@@ -552,12 +553,12 @@ export const PROGRESS_GROUPS = [
     label: "In progress",
     states: ["waiting", "claimed", "leased", "in_progress"],
   },
+  { key: "landing", label: "Done in a timeline", states: ["done_in_timeline"] },
   {
     key: "next",
     label: "Up next",
     states: ["ready", "todo", "blocked", "not_ready", "human_only"],
   },
-  { key: "landing", label: "Done in a timeline", states: ["done_in_timeline"] },
   { key: "backlog", label: "Backlog", states: ["backlog"] },
   { key: "closed", label: "Closed", states: ["done", "canceled"] },
 ] as const satisfies readonly { key: string; label: string; states: readonly IssueState[] }[];
