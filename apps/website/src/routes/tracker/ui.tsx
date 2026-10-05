@@ -9,12 +9,15 @@ import {
   claimHolder,
   CLOSE_REASONS,
   hasActiveClaim,
+  ISSUE_PICKUPS,
+  issuePickup,
   leasedAncestor,
   readiness,
   readinessIndex,
   TIMELINE_USES,
   type Issue,
   type IssueCloseReason,
+  type IssuePickup,
   type IssueTimelineUse,
   type Snapshot,
 } from "../../../shared/tracker.ts";
@@ -129,6 +132,35 @@ export function CloseReasonField({
           </option>
         ))}
       </select>
+    </Field>
+  );
+}
+
+export function PickupField({
+  value,
+  onChange,
+}: {
+  value: IssuePickup | undefined;
+  onChange: (value: IssuePickup) => void;
+}) {
+  const hint = useId();
+  const current = value ?? "anyone";
+  return (
+    <Field label="Pickup">
+      <SelectField
+        ariaLabel="Issue pickup"
+        ariaDescribedBy={hint}
+        value={current}
+        options={Object.entries(ISSUE_PICKUPS).map(([value, label]) => ({ value, label }))}
+        onChange={(value) => onChange(value as IssuePickup)}
+      />
+      <p id={hint} className="mk-hint m-0 mt-1">
+        {current === "not_ready"
+          ? "No one can claim or start this issue until a person changes pickup."
+          : current === "human_only"
+            ? "People can pick this up. Agents cannot, even when assigned."
+            : "Agents and people can pick this up when it is ready."}
+      </p>
     </Field>
   );
 }
@@ -292,13 +324,23 @@ const STATE_DOT: Record<string, string> = {
   waiting: "bg-signal",
   ready: "bg-online",
   blocked: "bg-danger-text",
+  human_only: "bg-ink-muted",
+  not_ready: "bg-ink-faint",
 };
 function StateBadge({
   state,
   title,
   children,
 }: {
-  state?: "waiting" | "ready" | "claimed" | "leased" | "blocked" | "done_in_timeline";
+  state?:
+    | "waiting"
+    | "ready"
+    | "claimed"
+    | "leased"
+    | "blocked"
+    | "done_in_timeline"
+    | "human_only"
+    | "not_ready";
   title?: string;
   children: ReactNode;
 }) {
@@ -363,6 +405,20 @@ export function IssueState({
     );
   if (issue.status === "done" || issue.status === "canceled")
     return <StateBadge>{statusLabel(issue)}</StateBadge>;
+  const pickup = issuePickup(issue);
+  if (pickup !== "anyone")
+    return (
+      <StateBadge
+        state={pickup}
+        title={
+          pickup === "not_ready"
+            ? "Pickup is paused until a person enables it."
+            : "Only people can pick up this issue."
+        }
+      >
+        {ISSUE_PICKUPS[pickup]}
+      </StateBadge>
+    );
   if (blocked.length)
     return (
       <StateBadge state="blocked" title={blocked.map((item) => item.key).join(", ")}>

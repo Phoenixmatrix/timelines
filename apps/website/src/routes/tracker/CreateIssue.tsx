@@ -4,6 +4,7 @@ import {
   actorName,
   type Issue,
   type IssueCloseReason,
+  type IssuePickup,
   type IssueTimelineUse,
   type Mutation,
   type Snapshot,
@@ -22,6 +23,7 @@ import {
   CloseReasonField,
   Field,
   MultiCheck,
+  PickupField,
   statuses,
   TimelineFields,
   typeLabel,
@@ -60,6 +62,7 @@ export function CreateIssue({
   const [type, setType] = useState<Issue["type"]>(initialType);
   const [labels, setLabels] = useState(initialLabels);
   const [status, setStatus] = useState<Issue["status"]>("todo");
+  const [pickup, setPickup] = useState<IssuePickup>("anyone");
   const [closeReason, setCloseReason] = useState<IssueCloseReason | null>(null);
   const [priority, setPriority] = useState(2);
   const [timelineUse, setTimelineUse] = useState<IssueTimelineUse>("agent_decides");
@@ -106,6 +109,7 @@ export function CreateIssue({
                   description,
                   type,
                   status,
+                  pickup,
                   closeReason: status === "canceled" ? closeReason : null,
                   priority: priority as Issue["priority"],
                   timelineUse,
@@ -177,6 +181,7 @@ export function CreateIssue({
                       }}
                     />
                   </Field>
+                  <PickupField value={pickup} onChange={setPickup} />
                   {status === "canceled" && (
                     <CloseReasonField value={closeReason} onChange={setCloseReason} />
                   )}

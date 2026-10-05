@@ -6,6 +6,8 @@ import {
   attribution,
   claimAttribution,
   CLOSE_REASONS,
+  ISSUE_PICKUPS,
+  issuePickup,
   issueTimeline,
   issueTimelineText,
   leasedAncestor,
@@ -34,6 +36,7 @@ import {
   IssueState,
   MarkdownText,
   MultiCheck,
+  PickupField,
   statuses,
   statusLabel,
   TimelineFields,
@@ -64,6 +67,7 @@ const fieldNames: Record<keyof IssueFields, string> = {
   acceptance: "Acceptance criteria",
   type: "Type",
   status: "Status",
+  pickup: "Pickup",
   closeReason: "Close reason",
   timelineUse: "Timeline",
   timelinePolicy: "Timeline policy",
@@ -81,6 +85,7 @@ const fieldsOf = (issue: Issue): IssueFields => ({
   acceptance: issue.acceptance,
   type: issue.type,
   status: issue.status,
+  pickup: issuePickup(issue),
   closeReason: issue.closeReason ?? null,
   timelineUse: issueTimeline(issue).use,
   timelinePolicy: issueTimeline(issue).policy,
@@ -504,6 +509,7 @@ export function IssueDetail({
     if (key === "closeReason")
       return fields.closeReason ? CLOSE_REASONS[fields.closeReason] : "No reason recorded";
     if (key === "priority") return `P${fields.priority}`;
+    if (key === "pickup") return ISSUE_PICKUPS[issuePickup(fields)];
     if (key === "timelineUse") return issueTimelineText(fields);
     if (key === "timelinePolicy") return fields.timelinePolicy ?? "Either policy";
     return String(value);
@@ -885,6 +891,10 @@ export function IssueDetail({
                 onChange={(value) => change("assigneeId", value || null)}
               />
             </Field>
+            <PickupField
+              value={draft.fields.pickup}
+              onChange={(value) => change("pickup", value)}
+            />
             <TimelineFields
               use={draft.fields.timelineUse}
               policy={draft.fields.timelinePolicy}
@@ -1026,6 +1036,8 @@ export function IssueDetail({
           <dd className="m-0 min-w-0">{typeLabel(issue.type)}</dd>
           <dt className="text-ink-faint">Priority</dt>
           <dd className="m-0 min-w-0">P{issue.priority}</dd>
+          <dt className="text-ink-faint">Pickup</dt>
+          <dd className="m-0 min-w-0">{ISSUE_PICKUPS[issuePickup(issue)]}</dd>
           <dt className="text-ink-faint">Timeline</dt>
           <dd className="m-0 min-w-0">{issueTimelineText(issue)}</dd>
           {issue.status === "canceled" && (

@@ -41,7 +41,6 @@ test("requirements: edit them in the inspector and see eligibility per agent", a
 
   const app = renderApp("/tracker/orbit/issues/board");
   const section = page.getByRole("region", { name: "Agent requirements" });
-  await expect.element(section).toMatchTextContent(/Any agent can claim it/);
   const input = page.getByRole("textbox", { name: "Add requirements" });
 
   // A term that isn't one says what is.

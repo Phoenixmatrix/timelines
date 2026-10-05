@@ -66,6 +66,16 @@ export interface Workspace extends TrackerEntity {
   archived: boolean;
 }
 export type IssueType = "task" | "bug" | "prd" | "chore" | "research" | "remediation";
+export type IssuePickup = "anyone" | "not_ready" | "human_only";
+export const ISSUE_PICKUPS: Record<IssuePickup, string> = {
+  anyone: "Anyone",
+  not_ready: "Not ready",
+  human_only: "Human only",
+};
+/** Pickup policy is global across timeline views; legacy issues allow anyone. */
+export function issuePickup(issue: Pick<Issue, "pickup">): IssuePickup {
+  return issue.pickup ?? "anyone";
+}
 /**
  * `done_in_timeline` (TIMELINES-RESEARCH.md, "Tracker"; CORE-74): finished
  * inside a timeline that hasn't landed. It is main's view of that work, and
@@ -169,6 +179,8 @@ export interface Issue extends TrackerEntity {
   acceptance: string;
   type: IssueType;
   status: IssueStatus;
+  /** Who may start work; absent on legacy issues means anyone. */
+  pickup?: IssuePickup;
   /** Why it was canceled. Historical cancellations may have no recorded reason. */
   closeReason?: IssueCloseReason | null;
   /** Whether to work it in a timeline; absent on older issues (read as `agent_decides`). */
@@ -432,6 +444,7 @@ export type IssueFields = Pick<
   | "type"
   | "status"
   | "closeReason"
+  | "pickup"
   | "timelineUse"
   | "timelinePolicy"
   | "priority"
@@ -757,6 +770,8 @@ export function leasedAncestor(issue: Issue, index: ReadinessIndex, now: string)
  * - `claimed`: it has an active lease;
  * - `unavailable`: backlog, done, done in a timeline (not in this view),
  *   canceled, or in progress without a claim;
+ * - `not_ready`: pickup is disabled for everyone;
+ * - `human_only`: pickup is disabled for the default agent actor, not a person;
  * - `blocked`: a `blocks` predecessor isn't done in this view (a missing one,
  *   or one only done in another timeline, still blocks);
  * - `container`: it has open sub-issues, so the work is in those;
@@ -766,17 +781,27 @@ export function leasedAncestor(issue: Issue, index: ReadinessIndex, now: string)
 export type Readiness =
   | "ready"
   | "waiting"
+  | "not_ready"
+  | "human_only"
   | "claimed"
   | "unavailable"
   | "blocked"
   | "container"
   | "leased_above";
 
-export function readiness(issue: Issue, index: ReadinessIndex, now: string): Readiness {
+export function readiness(
+  issue: Issue,
+  index: ReadinessIndex,
+  now: string,
+  actor: "agent" | "person" = "agent",
+): Readiness {
   if (issue.waiting) return "waiting";
   if (hasActiveClaim(issue, now)) return "claimed";
   if (!(issue.status === "todo" || (issue.status === "in_progress" && issue.claim !== null)))
     return "unavailable";
+  const pickup = issuePickup(issue);
+  if (pickup === "not_ready") return "not_ready";
+  if (pickup === "human_only" && actor === "agent") return "human_only";
   if ((index.blockers.get(issue.id) ?? []).some((id) => index.byId.get(id)?.status !== "done"))
     return "blocked";
   if ((index.children.get(issue.id) ?? []).some(isOpen)) return "container";

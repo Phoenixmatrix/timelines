@@ -6,7 +6,7 @@
 
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
-import type { Issue, Snapshot } from "../../shared/tracker.ts";
+import { issuePickup, type Issue, type Snapshot } from "../../shared/tracker.ts";
 import {
   hasRequirements,
   parseRequirements,
@@ -116,6 +116,7 @@ function issueRow(issue: Issue, snapshot: Snapshot) {
     key: issue.key,
     title: issue.title,
     status: issue.status,
+    pickup: issuePickup(issue),
     ...(issue.doneIn ? { doneInTimeline: issue.doneIn.slug } : {}),
     type: issue.type,
     priority: `P${issue.priority}`,
@@ -365,7 +366,14 @@ export function buildTools(context: ToolContext) {
           .filter((i) => !teamId || i.teamId === teamId)
           .filter((i) => !type || i.type === type)
           .filter((i) => !label || i.labels.includes(label))
-          .filter((i) => !ready || (i.status === "todo" && !blocked.has(i.id) && !i.claim))
+          .filter(
+            (i) =>
+              !ready ||
+              (issuePickup(i) === "anyone" &&
+                i.status === "todo" &&
+                !blocked.has(i.id) &&
+                !i.claim),
+          )
           .filter((i) => {
             const text = `${i.key} ${i.title} ${i.description}`.toLowerCase();
             return words.every((w) => text.includes(w));
@@ -543,6 +551,7 @@ export function buildTools(context: ToolContext) {
         description: z.string().optional().describe("Markdown"),
         acceptance: z.string().optional().describe("Markdown acceptance criteria"),
         type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
+        pickup: z.enum(["anyone", "not_ready", "human_only"]).optional(),
         priority: z.number().int().min(0).max(4).optional().describe("0 is most urgent"),
         parent: KEY.optional(),
         labels: z.array(z.string()).optional(),
@@ -566,6 +575,7 @@ export function buildTools(context: ToolContext) {
         parent,
         labels,
         requires,
+        pickup,
       }) => {
         const required = requirementsInput(requires);
         if (typeof required === "string") return { error: required };
@@ -595,6 +605,7 @@ export function buildTools(context: ToolContext) {
                 ...(parentId ? { parentId } : {}),
                 ...(labels ? { labels } : {}),
                 ...(required ? { requires: required } : {}),
+                ...(pickup ? { pickup } : {}),
               },
             },
           ],
@@ -622,6 +633,7 @@ export function buildTools(context: ToolContext) {
             acceptance: z.string().optional(),
             status: z.enum(["backlog", "todo", "in_progress", "done", "canceled"]).optional(),
             priority: z.number().int().min(0).max(4).optional(),
+            pickup: z.enum(["anyone", "not_ready", "human_only"]).optional(),
             type: z.enum(["task", "bug", "prd", "chore", "research", "remediation"]).optional(),
             labels: z.array(z.string()).optional(),
             requires: z

@@ -2,6 +2,8 @@ import { timingSafeEqual } from "node:crypto";
 import {
   CLOSE_REASONS,
   DEFAULT_ATTEMPT_LIMIT,
+  ISSUE_PICKUPS,
+  issuePickup,
   SETTABLE_STATUSES,
   TIMELINE_USES,
   hasActiveClaim,
@@ -18,6 +20,7 @@ import {
   type IssueClaim,
   type IssueCloseReason,
   type IssueTimelineUse,
+  type IssuePickup,
   type EntityType,
   type Issue,
   type Link,
@@ -79,6 +82,7 @@ export type { SqlDatabase } from "./sql.ts";
 
 const closeReasons = Object.keys(CLOSE_REASONS) as IssueCloseReason[];
 const timelineUses = Object.keys(TIMELINE_USES) as IssueTimelineUse[];
+const pickups = Object.keys(ISSUE_PICKUPS) as IssuePickup[];
 
 export class TrackerError extends Error {
   public status: 400 | 401 | 403 | 404 | 409 | 410 | 413;
@@ -1615,6 +1619,28 @@ export class TrackerStore {
         fail("forbidden", "Claims can only be delegated to yourself or your own agents.", 403);
       return { actorId: agent.id, accountableId: agent.accountable.id };
     };
+    /** Pickup is authority, not a capability or assignment override. */
+    const pickupAllowed = (
+      issue: Issue,
+      holder = { actorId: access.actorId, accountableId: access.principalId },
+    ) => {
+      const pickup = issuePickup(issue);
+      if (pickup === "not_ready")
+        fail(
+          "pickup_not_ready",
+          `${issue.key} is not ready. A person must change its pickup policy before work can start.`,
+          409,
+        );
+      if (
+        pickup === "human_only" &&
+        (holder.actorId !== holder.accountableId || access.actorId !== access.principalId)
+      )
+        fail(
+          "pickup_human_only",
+          `${issue.key} is human only. A person must do this work or change its pickup policy.`,
+          409,
+        );
+    };
     /**
      * What `holder` misses of `issue`'s requirements (CORE-32): nothing for a
      * person (people can always claim), nor for the agent it's assigned to (an
@@ -1631,6 +1657,7 @@ export class TrackerStore {
       access.agents.find((a) => a.id === actorId)?.name ?? actorId;
     /** Refuse an agent that doesn't meet `issue`'s requirements, saying which. */
     const eligible = (issue: Issue, holder: { actorId: string; accountableId: string }) => {
+      pickupAllowed(issue, holder);
       const unmet = unmetFor(issue, holder);
       if (unmet.length)
         throw new TrackerError(
@@ -1747,6 +1774,7 @@ export class TrackerStore {
       },
       delegatedFrom?: Issue | null,
     ) => {
+      pickupAllowed(issue, holder);
       const assigneeId = issue.assigneeId ?? holder.actorId;
       validateAssignee(assigneeId, issue.teamId);
       const leaseToken = token ?? crypto.randomUUID() + crypto.randomUUID();
@@ -1791,7 +1819,14 @@ export class TrackerStore {
     ) => {
       const index = graph();
       const takeable = (issue: Issue) => {
-        const why = readiness(issue, index, now);
+        const why = readiness(
+          issue,
+          index,
+          now,
+          holder.actorId === holder.accountableId && access.actorId === access.principalId
+            ? "person"
+            : "agent",
+        );
         return (
           why === "ready" ||
           (why === "leased_above" && leasedAncestor(issue, index, now)?.id === scope.own?.id)
@@ -1933,6 +1968,30 @@ export class TrackerStore {
     };
     const fields = (data: Record<string, unknown>, issue: Issue, creating: boolean) => {
       const assignedBefore = issue.assigneeId;
+      if ("pickup" in data) {
+        const pickup = choice(data.pickup, pickups, "pickup");
+        const previous = issuePickup(issue);
+        if (
+          !creating &&
+          pickup !== previous &&
+          previous !== "anyone" &&
+          access.actorId !== access.principalId
+        )
+          fail("forbidden", "Only a person can change an existing restricted pickup policy.", 403);
+        if (pickup !== previous && pickup !== "anyone") {
+          const covering = hasActiveClaim(issue, now) ? issue : coveringLease(issue);
+          if (
+            covering &&
+            (pickup === "not_ready" || covering.claim!.actorId !== covering.claim!.accountableId)
+          )
+            fail(
+              "claim_busy",
+              `Release ${covering.key}'s active claim before restricting pickup. Retained timeline claims must land or be abandoned first.`,
+              409,
+            );
+        }
+        issue.pickup = pickup;
+      }
       if ("requires" in data) {
         try {
           const requires = normalizeRequirements(data.requires);
@@ -2146,6 +2205,7 @@ export class TrackerStore {
             "type",
             "status",
             "closeReason",
+            "pickup",
             "timelineUse",
             "timelinePolicy",
             "priority",
@@ -2182,6 +2242,7 @@ export class TrackerStore {
               acceptance: "",
               type: "task",
               status: "todo",
+              pickup: "anyone",
               closeReason: null,
               timelineUse: "agent_decides",
               timelinePolicy: null,
@@ -2230,6 +2291,7 @@ export class TrackerStore {
             (creating || issue.status !== previous) &&
             ["in_progress", "done"].includes(issue.status)
           ) {
+            pickupAllowed(issue);
             unblocked(issue);
             started.add(entityId);
           }
@@ -2821,6 +2883,7 @@ export class TrackerStore {
               );
             } else lease(issue, data.leaseToken);
             if (kind === "issue.complete") {
+              pickupAllowed(issue);
               unblocked(issue);
               childrenClosed(issue);
               const body = text(data.evidence, "evidence", 131072);

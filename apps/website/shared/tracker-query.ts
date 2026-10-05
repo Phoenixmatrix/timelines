@@ -3,13 +3,13 @@
 // query language over it, facet counts, and opened/closed activity buckets.
 // Everything here is pure, so it is tested without a browser.
 //
-//   is:ready is:waiting is:blocked is:claimed is:leased is:open is:closed
+//   is:ready is:waiting is:not_ready is:human_only is:blocked is:claimed is:leased is:open is:closed
 //   status:backlog|todo|in_progress|done|done_in_timeline|canceled
 //   team:CORE  ws:packages  assignee:jun|me|none  label:perf  type:bug  p:1
 //   since:7d until:2026-09-01   (last activity: updatedAt)
 //   parent:CORE-12   numbers/full keys match tickets exactly (case-insensitive);
 //   requires:ux|tag:ux|memory>=16GiB|none   eligible:builder|me (CORE-32: which
-//   agents meet an issue's requirements; people always can);
+//   agents meet an issue's requirements and pickup policy);
 //   other words match key, title and labels; - excludes.
 
 import { hasRequirements, requirementTerms, unmetRequirements } from "./requirements.ts";
@@ -17,6 +17,8 @@ import {
   actorName,
   claimHolder,
   leasedAncestor,
+  issuePickup,
+  ISSUE_PICKUPS,
   readiness,
   readinessIndex,
   type Issue,
@@ -26,6 +28,8 @@ import {
 
 export type IssueState =
   | "waiting"
+  | "not_ready"
+  | "human_only"
   | "claimed"
   | "leased"
   | "blocked"
@@ -39,6 +43,8 @@ export type IssueState =
 
 export const STATE_LABEL: Record<IssueState, string> = {
   waiting: "Waiting",
+  not_ready: "Not ready",
+  human_only: "Human only",
   ready: "Ready",
   in_progress: "In progress",
   claimed: "Claimed",
@@ -61,6 +67,8 @@ const STATE_RANK: Record<IssueState, number> = {
   in_progress: 4,
   todo: 5,
   blocked: 6,
+  not_ready: 6.1,
+  human_only: 6.2,
   // Finished, waiting for its timeline to land (CORE-74).
   done_in_timeline: 7,
   backlog: 8,
@@ -129,6 +137,7 @@ export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
     else if (issue.status === "done_in_timeline") value = "done_in_timeline";
     else if (why === "claimed") value = "claimed";
     else if (issue.status === "done" || issue.status === "canceled") value = issue.status;
+    else if (why === "not_ready" || why === "human_only") value = why;
     else if (why === "blocked") value = "blocked";
     else if (why === "leased_above") value = "leased";
     else if (why === "ready") value = "ready";
@@ -306,8 +315,8 @@ function predicate(filter: Filter, index: IssueIndex, viewerId: string, now: num
       const agents = index.people.agents.filter((a) =>
         id ? a.id === id : a.id.toLowerCase() === v || a.name.toLowerCase() === v,
       );
-      // People can always claim: `eligible:me` for a person matches everything.
-      if (v === "me" && !agents.length) return () => true;
+      // People bypass capability requirements, but never the not-ready policy.
+      if (v === "me" && !agents.length) return (i) => issuePickup(i) !== "not_ready";
       return (i) => agents.some((agent) => agentEligible(i, agent));
     }
   }
@@ -351,21 +360,25 @@ export function agentWork(
     missing: missing.slice(0, limit).map((i) => ({
       key: i.key,
       title: i.title,
-      unmet: unmetRequirements(i.requires, agent?.capabilities ?? null).map((u) => u.message),
+      unmet: [
+        ...(issuePickup(i) === "anyone" ? [] : [`Pickup: ${ISSUE_PICKUPS[issuePickup(i)]}.`]),
+        ...unmetRequirements(i.requires, agent?.capabilities ?? null).map((u) => u.message),
+      ],
     })),
   };
 }
 
 /**
  * Whether an agent may claim an issue (CORE-32), as the tracker decides it:
- * it meets the requirements, or the issue is assigned to it.
+ * pickup permits agents, and it meets requirements or is explicitly assigned.
  */
 export function agentEligible(
   issue: Issue,
   agent: Pick<Snapshot["agents"][number], "id" | "capabilities">,
 ): boolean {
   return (
-    issue.assigneeId === agent.id || !unmetRequirements(issue.requires, agent.capabilities).length
+    issuePickup(issue) === "anyone" &&
+    (issue.assigneeId === agent.id || !unmetRequirements(issue.requires, agent.capabilities).length)
   );
 }
 
@@ -451,6 +464,8 @@ export interface Facets {
 
 const STATE_TOKEN: Record<IssueState, { key: QueryKey; value: string }> = {
   waiting: { key: "is", value: "waiting" },
+  not_ready: { key: "is", value: "not_ready" },
+  human_only: { key: "is", value: "human_only" },
   ready: { key: "is", value: "ready" },
   claimed: { key: "is", value: "claimed" },
   leased: { key: "is", value: "leased" },

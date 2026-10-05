@@ -5,6 +5,9 @@ Work is tracked in Gitmatrix: {{SCOPE}}. The loop, in brief (the
 
 1. `gm issue next` picks and claims the most valuable ready issue in scope.
    Nothing ready means stop, not retry. No returned fencing token means no ownership.
+   `not_ready` pickup permits nobody to start; `human_only` permits people, never
+   agents, even when assigned or delegated. Only a person can change an existing
+   restricted policy. Ask them; do not bypass it with status changes or credentials.
 2. Choose where it goes before you start: the claim's `timelineRule` says
    whether the issue requires a timeline, never wants one, or leaves it to
    you (then read the description or PRD). Record it with a checkpoint:

@@ -5,7 +5,14 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { AgentCapabilities } from "../../shared/api.ts";
-import type { Issue, Mutation, TrackerAgent } from "../../shared/tracker.ts";
+import {
+  issuePickup,
+  readiness,
+  readinessIndex,
+  type Issue,
+  type Mutation,
+  type TrackerAgent,
+} from "../../shared/tracker.ts";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
 import { trackerSql, transactional } from "../testing/tracker.ts";
 
@@ -40,7 +47,7 @@ function agent(id: string, capabilities: AgentCapabilities | null, accountable =
 function fixture() {
   const db = new DatabaseSync(":memory:");
   databases.push(db);
-  const now = Date.parse("2026-10-01T00:00:00Z");
+  let now = Date.parse("2026-10-01T00:00:00Z");
   const store = new TrackerStore(trackerSql(db), transactional(db), () => now);
   const owner: Access = {
     actorId: "alice",
@@ -81,8 +88,337 @@ function fixture() {
     }
     throw new Error("Expected a refusal");
   };
-  return { store, owner, people, agents, run, create, issue, refusal };
+  return {
+    db,
+    store,
+    owner,
+    people,
+    agents,
+    run,
+    create,
+    issue,
+    refusal,
+    advance: (seconds: number) => {
+      now += seconds * 1000;
+    },
+  };
 }
+
+describe("issue pickup authority", () => {
+  test("expired holders cannot resume after pickup becomes restricted", () => {
+    const f = fixture();
+    f.create("work");
+    f.run(f.agents.ux, {
+      kind: "issue.claim",
+      id: "work",
+      data: { agent: "worker", ttlSeconds: 30 },
+    });
+    f.advance(31);
+    f.run(f.owner, {
+      kind: "issue.update",
+      id: "work",
+      expectedVersion: 2,
+      data: { pickup: "human_only" },
+    });
+    expect(
+      f.refusal(() =>
+        f.run(f.agents.ux, {
+          kind: "issue.resume",
+          id: "work",
+          data: {},
+        }),
+      ),
+    ).toMatchObject({ code: "pickup_human_only" });
+    expect(f.issue("work").claim?.expiresAt).toBe("2026-10-01T00:00:30.000Z");
+  });
+
+  test("restricting a descendant cannot invalidate its ancestor's active agent lease", () => {
+    const f = fixture();
+    f.create("parent");
+    f.create("child", { parentId: "parent" });
+    const token = f.run(f.agents.ux, {
+      kind: "issue.claim",
+      id: "parent",
+      data: { agent: "orchestrator" },
+    }).results[0]!.leaseToken!;
+    expect(
+      f.refusal(() =>
+        f.run(f.owner, {
+          kind: "issue.update",
+          id: "child",
+          expectedVersion: 1,
+          data: { pickup: "human_only" },
+        }),
+      ),
+    ).toMatchObject({ code: "claim_busy" });
+    f.run(f.agents.ux, {
+      kind: "issue.update",
+      id: "child",
+      expectedVersion: 1,
+      data: { status: "in_progress", leaseToken: token },
+    });
+    expect(f.issue("child").status).toBe("in_progress");
+  });
+  test("restricted work is excluded from next and exact claims, even when assigned", () => {
+    const f = fixture();
+    for (const pickup of ["not_ready", "human_only"] as const) {
+      f.create(pickup, { pickup, assigneeId: "agt-ux", priority: 0 });
+      expect(
+        f.refusal(() =>
+          f.run(f.agents.ux, {
+            kind: "issue.claim",
+            id: pickup,
+            data: { agent: "human-looking label" },
+          }),
+        ),
+      ).toMatchObject({ code: `pickup_${pickup}` });
+    }
+    f.create("plain", { priority: 4 });
+    const next = f.run(f.agents.ux, {
+      kind: "issue.next",
+      id: "next",
+      data: { agent: "Alice" },
+    }).results[0]!;
+    expect(next.key).toBe(f.issue("plain").key);
+    expect(f.issue("not_ready").claim).toBeNull();
+    expect(f.issue("human_only").claim).toBeNull();
+  });
+
+  test("people can take human-only work, but nobody can take not-ready work", () => {
+    const f = fixture();
+    f.create("human", { pickup: "human_only" });
+    f.create("later", { pickup: "not_ready" });
+    expect(
+      f.refusal(() =>
+        f.run(f.owner, {
+          kind: "issue.claim",
+          id: "later",
+          data: { agent: "person", force: true },
+        }),
+      ),
+    ).toMatchObject({ code: "pickup_not_ready" });
+    const next = f.run(f.owner, {
+      kind: "issue.next",
+      id: "next",
+      data: { agent: "claude-code" },
+    }).results[0]!;
+    expect(next.key).toBe(f.issue("human").key);
+    expect(f.issue("human").claim?.actorId).toBe("alice");
+    f.run(f.owner, { kind: "issue.renew", id: "human", data: { leaseToken: next.leaseToken! } });
+    f.run(f.owner, {
+      kind: "issue.complete",
+      id: "human",
+      data: { leaseToken: next.leaseToken!, evidence: "Reviewed by Alice" },
+    });
+    expect(f.issue("human").status).toBe("done");
+  });
+
+  test("delegated subtree claims and next cannot bypass pickup", () => {
+    const f = fixture();
+    f.create("parent");
+    f.create("human", { parentId: "parent", pickup: "human_only" });
+    f.create("later", { parentId: "parent", pickup: "not_ready" });
+    const token = f.run(f.owner, {
+      kind: "issue.claim",
+      id: "parent",
+      data: { agent: "orchestrator" },
+    }).results[0]!.leaseToken!;
+    for (const [id, code] of [
+      ["human", "pickup_human_only"],
+      ["later", "pickup_not_ready"],
+    ]) {
+      expect(
+        f.refusal(() =>
+          f.run(f.owner, {
+            kind: "issue.claim",
+            id: id!,
+            data: { agent: "worker", underToken: token, forActorId: "agt-ux" },
+          }),
+        ),
+      ).toMatchObject({ code });
+    }
+    const next = f.run(f.owner, {
+      kind: "issue.next",
+      id: "next",
+      data: { agent: "worker", underId: "parent", underToken: token, forActorId: "agt-ux" },
+    }).results[0]!;
+    expect(next.leaseToken).toBeUndefined();
+    expect(f.issue("human").claim).toBeNull();
+  });
+
+  test("agents cannot self-enable policies, including in the same mutation or batch", () => {
+    const f = fixture();
+    f.create("restricted", { pickup: "not_ready" });
+    for (const pickup of ["anyone", "human_only"] as const) {
+      expect(
+        f.refusal(() =>
+          f.run(f.agents.ux, {
+            kind: "issue.update",
+            id: "restricted",
+            expectedVersion: 1,
+            data: { pickup, status: "in_progress" },
+          }),
+        ),
+      ).toMatchObject({ code: "forbidden" });
+    }
+    f.create("plain");
+    expect(
+      f.refusal(() =>
+        f.run(
+          f.agents.ux,
+          { kind: "issue.update", id: "plain", expectedVersion: 1, data: { pickup: "human_only" } },
+          { kind: "issue.update", id: "plain", expectedVersion: 2, data: { pickup: "anyone" } },
+          { kind: "issue.claim", id: "plain", data: { agent: "worker" } },
+        ),
+      ),
+    ).toMatchObject({ code: "forbidden" });
+    expect(f.issue("plain")).toMatchObject({ pickup: "anyone", version: 1, claim: null });
+    f.run(f.agents.ux, {
+      kind: "issue.update",
+      id: "plain",
+      expectedVersion: 1,
+      data: { pickup: "human_only" },
+    });
+    f.run(f.owner, {
+      kind: "issue.update",
+      id: "restricted",
+      expectedVersion: 1,
+      data: { pickup: "anyone" },
+    });
+    f.run(f.agents.ux, { kind: "issue.claim", id: "restricted", data: { agent: "worker" } });
+    expect(f.issue("restricted").claim?.actorId).toBe("agt-ux");
+  });
+
+  test("direct status starts and completion cannot bypass policy", () => {
+    const f = fixture();
+    for (const pickup of ["not_ready", "human_only"] as const) {
+      f.create(pickup, { pickup });
+      for (const status of ["in_progress", "done"] as const) {
+        expect(
+          f.refusal(() =>
+            f.run(f.agents.ux, {
+              kind: "issue.update",
+              id: pickup,
+              expectedVersion: 1,
+              data: { status },
+            }),
+          ),
+        ).toMatchObject({ code: `pickup_${pickup}` });
+        expect(
+          f.refusal(() =>
+            f.run(f.agents.ux, {
+              kind: "issue.create",
+              id: `new-${pickup}-${status}`,
+              data: { teamId: "team", title: "Restricted", pickup, status },
+            }),
+          ),
+        ).toMatchObject({ code: `pickup_${pickup}` });
+      }
+    }
+    expect(
+      f.refusal(() =>
+        f.run(f.owner, {
+          kind: "issue.update",
+          id: "not_ready",
+          expectedVersion: 1,
+          data: { status: "done" },
+        }),
+      ),
+    ).toMatchObject({ code: "pickup_not_ready" });
+  });
+
+  test("active claims cannot be invalidated and human-only handoffs reject agents", () => {
+    const f = fixture();
+    f.create("work");
+    const token = f.run(f.agents.ux, {
+      kind: "issue.claim",
+      id: "work",
+      data: { agent: "worker" },
+    }).results[0]!.leaseToken!;
+    for (const pickup of ["human_only", "not_ready"] as const)
+      expect(
+        f.refusal(() =>
+          f.run(f.owner, {
+            kind: "issue.update",
+            id: "work",
+            expectedVersion: 2,
+            data: { pickup },
+          }),
+        ),
+      ).toMatchObject({ code: "claim_busy", message: expect.stringContaining("Release") });
+    f.run(f.agents.ux, { kind: "issue.renew", id: "work", data: { leaseToken: token } });
+    f.run(f.agents.ux, { kind: "issue.release", id: "work", data: { leaseToken: token } });
+    f.run(f.owner, {
+      kind: "issue.update",
+      id: "work",
+      expectedVersion: 4,
+      data: { pickup: "human_only" },
+    });
+    const humanToken = f.run(f.owner, {
+      kind: "issue.claim",
+      id: "work",
+      data: { agent: "person" },
+    }).results[0]!.leaseToken!;
+    expect(
+      f.refusal(() =>
+        f.run(f.owner, {
+          kind: "issue.offer",
+          id: "work",
+          data: { leaseToken: humanToken, toActorId: "agt-ux" },
+        }),
+      ),
+    ).toMatchObject({ code: "pickup_human_only" });
+    const code = f.run(f.owner, {
+      kind: "issue.offer",
+      id: "work",
+      data: { leaseToken: humanToken },
+    }).results[0]!.offerCode!;
+    expect(
+      f.refusal(() =>
+        f.run(f.agents.ux, {
+          kind: "issue.accept",
+          id: "work",
+          data: { code },
+        }),
+      ),
+    ).toMatchObject({ code: "pickup_human_only" });
+    expect(f.issue("work").claim?.actorId).toBe("alice");
+  });
+
+  test("invalid values fail, legacy records remain ready, and actor readiness differs", () => {
+    const f = fixture();
+    for (const pickup of ["later", null, false, 1])
+      expect(f.refusal(() => f.create("invalid", { pickup }))).toMatchObject({
+        code: "invalid_input",
+      });
+    f.create("existing");
+    expect(
+      f.refusal(() =>
+        f.run(f.owner, {
+          kind: "issue.update",
+          id: "existing",
+          expectedVersion: 1,
+          // @ts-expect-error Exercise untyped API input.
+          data: { pickup: "later" },
+        }),
+      ),
+    ).toMatchObject({ code: "invalid_input" });
+    f.create("legacy");
+    f.db
+      .prepare("UPDATE issues SET data = json_remove(data, '$.pickup') WHERE id = ?")
+      .run("legacy");
+    const legacy = f.issue("legacy");
+    const index = readinessIndex([legacy], []);
+    const now = "2026-10-01T00:00:00Z";
+    expect(issuePickup(legacy)).toBe("anyone");
+    expect(readiness(legacy, index, now)).toBe("ready");
+    expect(readiness({ ...legacy, pickup: "human_only" }, index, now)).toBe("human_only");
+    expect(readiness({ ...legacy, pickup: "human_only" }, index, now, "person")).toBe("ready");
+    expect(readiness({ ...legacy, pickup: "not_ready" }, index, now, "person")).toBe("not_ready");
+    f.run(f.agents.ux, { kind: "issue.claim", id: "legacy", data: { agent: "worker" } });
+    expect(f.issue("legacy").claim?.actorId).toBe("agt-ux");
+  });
+});
 
 describe("issue requirements", () => {
   test("are stored normalized, cleared by null, and recorded in history", () => {

@@ -251,6 +251,26 @@ verification. These are suggested free-form issue labels, not a registered
 catalog or claim restrictions. Updating `labels` replaces the whole list. To
 restrict which agents may claim an issue, use requirements (below).
 
+### Pickup: whether work may start
+
+Use `gm issue create|update --pickup anyone|not_ready|human_only`:
+
+- `anyone` (default, including legacy issues without the field): ordinary
+  dependency, claim and capability rules apply.
+- `not_ready`: nobody, including people, may claim or start it until a person
+  changes the policy. This is not a dependency or a status.
+- `human_only`: authenticated people may work it; agents cannot, including
+  assigned agents and delegated agents.
+
+`gm issue ready` is agent-oriented and excludes both restrictions. Agent `next`
+also skips them; a person's `next` may select human-only work. `gm issue show`
+prints the policy and acting identity's eligibility with an actionable reason.
+Pickup applies globally across timelines. Assignment, capability overrides,
+direct status changes and completion cannot bypass it. Only a person may change
+an existing restricted policy; agents can restrict `anyone`, never self-enable
+restricted work. Release an incompatible active claim before restricting pickup.
+Offline policy changes and readiness remain advisory until accepted by the server.
+
 ### Requirements: which agents may claim an issue
 
 An issue can require capabilities of the agent that claims it (`requires`),
@@ -260,7 +280,7 @@ model, OS, architecture, runtime, CPUs, memory, tags and skills):
 ```bash
 gm issue create 'Polish onboarding' --team ENG --requires 'tag:ux skill:playwright'
 gm issue update ENG-1 --requires 'model:claude-opus-*,gpt-5* os:linux memory>=16GiB cpus>=8'
-gm issue update ENG-1 --clear-requires          # any agent again
+gm issue update ENG-1 --clear-requires          # remove capabilities, not pickup policy
 ```
 
 Terms are `tag:`, `skill:`, `model:`, `harness:`, `os:`, `arch:`, `runtime:`
@@ -277,9 +297,9 @@ runtime, minMemory, minCpus}` (or null), recorded in its history like any field;
   `requirements_unmet` and names each unmet requirement.
 - An agent that never published capabilities meets no requirement: run
   `gm agent setup` (with `--tag`, `--model`) in its checkout.
-- People can always claim. A person who owns the tracker, or the agent's
-  accountable human, can assign the issue to an agent that doesn't meet them;
-  it may then claim it, and the issue shows the mismatch (`assigneeMismatch`).
+- People bypass capability requirements, not pickup policy. A person who owns
+  the tracker, or the agent's accountable human, can assign despite a capability
+  mismatch; pickup still applies and the issue shows `assigneeMismatch`.
 - `gm issue show` prints the requirements (`requiresText`) and whether the
   acting identity is eligible (`eligibility`).
 - This is eligibility, not authorization: capabilities are self-reported, and

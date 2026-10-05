@@ -2,7 +2,7 @@
 //! apps/website/shared/requirements.ts: the text form `gm issue create|update
 //! --requires` takes, the stored object the server keeps, and matching against
 //! an agent's self-reported capabilities (`gm agent setup`). Eligibility, not
-//! authorization: people can always claim, and permissions are enforced as before.
+//! authorization: people bypass capabilities, but pickup and permissions still apply.
 use crate::output::{GmError, Result};
 use serde_json::{Map, Value, json};
 

@@ -50,6 +50,64 @@ function setup() {
 }
 
 describe("timeline views of the tracker", () => {
+  test("pickup stays global across old timeline views and cannot be loosened by an agent", () => {
+    const t = setup();
+    t.mutate(undefined, {
+      kind: "issue.create",
+      id: "work",
+      data: { teamId: "team", title: "Work" },
+    });
+    t.fork("old-view");
+    t.update(undefined, "work", { pickup: "not_ready" });
+    expect(t.issue(t.view("old-view"), "work")?.pickup).toBe("not_ready");
+    expect(() =>
+      t.mutate("old-view", {
+        kind: "issue.claim",
+        id: "work",
+        data: { agent: "person" },
+      }),
+    ).toThrow(/not ready/);
+    t.update("old-view", "work", { pickup: "human_only" });
+    expect(t.issue(t.view(), "work")?.pickup).toBe("human_only");
+    t.access.actorId = "agt-worker";
+    expect(() => t.update("old-view", "work", { pickup: "anyone", status: "in_progress" })).toThrow(
+      /Only a person/,
+    );
+    expect(() => t.update("old-view", "work", { status: "done" })).toThrow(/human only/);
+    expect(t.issue(t.view(), "work")?.pickup).toBe("human_only");
+    t.db.close();
+  });
+
+  test("pickup restrictions never invalidate retained timeline leases", () => {
+    const t = setup();
+    t.mutate(undefined, {
+      kind: "issue.create",
+      id: "work",
+      data: { teamId: "team", title: "Work" },
+    });
+    t.fork("work-view");
+    const token = t.mutate("work-view", {
+      kind: "issue.claim",
+      id: "work",
+      data: { agent: "person" },
+    }).results[0]!.leaseToken!;
+    t.mutate("work-view", {
+      kind: "issue.complete",
+      id: "work",
+      data: { leaseToken: token, evidence: "Finished" },
+    });
+    expect(() => t.update(undefined, "work", { pickup: "not_ready" })).toThrow(
+      /Retained timeline claims/,
+    );
+    expect(t.issue(t.view(), "work")?.claim?.retainedIn?.slug).toBe("work-view");
+    t.mutate("work-view", {
+      kind: "issue.renew",
+      id: "work",
+      data: { leaseToken: token },
+    });
+    expect(t.issue(t.view("work-view"), "work")?.status).toBe("done");
+    t.db.close();
+  });
   test("shares timeline-only tag definitions with main and backfills timeline history", () => {
     const t = setup();
     t.fork("tags");

@@ -160,6 +160,12 @@ Primary buttons use amber with dark signal ink; secondary buttons use a raised n
 
 Tracker capture is a split action: **Create** remains the default submission, with a compact issue-type selector; the adjacent arrow reveals **Add details**, carrying the parsed title, tags, type, team and workspace scope into the dialog. Leading `(tag)` prefixes resolve against the shared catalog; unknown names require explicit inline definition before creation. Tags use a searchable Base UI combobox with keyboard selection, inline creation, and removable selections in both creation and editing. Keep the expanded path subordinate rather than presenting two competing primary buttons.
 
+Pickup is separate from issue status: **Anyone**, **Not ready**, or **Human only**.
+Use the shared select in creation details and the autosaving editor, with a
+screen-reader-associated explanation. Restricted pickup has a neutral state
+mark and explicit text, never the green Ready mark. Capability and assignment
+explanations must not imply they bypass pickup restrictions.
+
 The assistant composer starts at one row for short prompts, grows to a capped height and scrolls longer drafts within the field. Its containing form can scroll in short viewports without taking over conversation scrolling. **In context:** names the page included with the next message; removing it changes the label to **Not in context:** and the control to a plus for re-inclusion. This affects subsequent messages, not context already sent.
 
 ### Navigation and metadata

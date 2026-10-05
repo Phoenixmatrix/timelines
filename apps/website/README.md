@@ -987,8 +987,8 @@ read as `agent_decides`.
   without requiring a focus change or a resize.
 - **Coordination:** ready work is unblocked, unclaimed `todo` (or an expired
   claimed `in_progress` issue) with no open sub-issues, no other active lease
-  above it, and nothing waiting on a person (`readiness` in `shared/tracker.ts`,
-  mirrored by gm). Exclusive claims require an online transaction. Renew,
+  above it, nothing waiting on a person, and pickup permitted for the acting identity
+  (`readiness` in `shared/tracker.ts`, mirrored by gm). Exclusive claims require an online transaction. Renew,
   release and complete require the unexpired fencing token; completion also
   records evidence, rechecks blockers and refuses parents with open sub-issues.
   Tokens never appear in public snapshots or event feeds.
@@ -1000,6 +1000,22 @@ read as `agent_decides`.
   (or an agent's accountable person) must be an account member and belong to any
   restricted owning team. Admin write access does not waive this requirement.
   Invalid assignments reject the claim atomically without changing the issue or lease.
+- **Pickup (CORE-49):** each issue has a global `pickup` policy, independent of
+  status and timeline: `anyone` (also the legacy default), `not_ready` (nobody
+  may start), or `human_only` (authenticated people, never agents). Choose
+  **Pickup** in **Add details** before creation or in **Edit issue** afterward;
+  edits autosave. Quick title-only capture uses Anyone. CLI create/update take
+  `--pickup anyone|not_ready|human_only`.
+  Ready lists exclude restricted issues for agents; `is:not_ready` and
+  `is:human_only` expose them explicitly. Human-only work remains available to a
+  person's `issue.next`. Explicit assignment, capabilities, session labels and
+  delegated claims do not bypass this policy. The server enforces it on claims,
+  renewal, resume, handoff, completion and direct work-status transitions.
+  Agents may restrict open pickup but cannot change an existing restricted
+  policy; a person must re-enable it. Incompatible active claims must be released
+  before restricting pickup; retained timeline claims must land or be abandoned.
+  Offline edits are advisory until server synchronization; rejected batches
+  remain explicit conflicts rather than silently granting access.
 - **Graph engineering (CORE-4):** agents work through issue graphs on their own.
   - _Agents_ are identities a person creates (Settings > Agents, `gm agent`); they
     act with their person's access but everything is attributed to the agent, and
@@ -1022,7 +1038,7 @@ read as `agent_decides`.
     for detection limits, declaration replacement and privacy.
   - `issue.next` (`gm issue next`) picks and claims in one step: priority, then
     the most open work transitively unblocked, then age; it skips PRDs, other
-    people's assignments and issues whose requirements the agent doesn't meet.
+    people's assignments, pickup restrictions and requirements the agent doesn't meet.
   - _Requirements (CORE-32)_ say which agents may claim an issue: `requires`
     on `issue.create`/`issue.update` (null clears; recorded in history like any
     field) holds `tags` and `skills` (every one), `models`, `harnesses`, `os`,
@@ -1036,9 +1052,9 @@ read as `agent_decides`.
     passes it over, reporting `skipped: {requirements, keys, message}`. Refusals
     are 409 `requirements_unmet` with one `unmet` entry per requirement; an
     agent with no reported capabilities is told to run `gm agent setup`.
-    People can always claim. Assigning an agent that doesn't meet them takes a
-    person, the tracker owner or the agent's accountable person; the assigned
-    agent may then claim it, and the inspector shows the mismatch. This is
+    People bypass capability requirements, not pickup or readiness rules. Assigning
+    an agent that doesn't meet them takes a person, the tracker owner or the agent's
+    accountable person; assignment overrides capabilities only. The inspector shows the mismatch. This is
     eligibility, not authorization: capabilities are self-reported, and
     permissions apply as before. The inspector edits requirements as chips and
     lists each agent's eligibility; list and board rows mark them; the query

@@ -21,6 +21,20 @@ do is attributed to the agent and names your person as accountable.
 notes it doesn't, or `gm agent show` lists another model than the one you run,
 record yours with `gm agent configure --model <model-id>`.
 
+## Pickup policy
+
+Read `pickup` in `gm issue show` before work. `anyone` is the default, including
+older issues. `not_ready` means nobody may claim or start yet; `human_only`
+means an authenticated person must do the work, never an agent. Agent `ready`
+and `next` exclude both. Assignment, delegation, capability overrides, direct
+status updates and completion do not bypass this policy.
+
+Use `gm issue create|update --pickup anyone|not_ready|human_only` to record it.
+An agent may restrict `anyone` but only a person can change an existing
+restricted policy. Ask the person to do the work or change the policy; never
+switch credentials to evade it. Release an incompatible active claim before
+restricting pickup. Policy is global across timelines, not a branch-local override.
+
 ## The loop
 
 1. **Take work.** `gm issue next` picks the best ready issue in scope and claims

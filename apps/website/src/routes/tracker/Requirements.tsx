@@ -1,7 +1,7 @@
 // What an issue requires of the agent that works on it (CORE-32), in the
 // inspector: requirements as chips, edited in place, and which of the
-// tracker's agents meet them. Eligibility, not authorization: people can
-// always claim, and an explicit assignment stands but shows the mismatch.
+// tracker's agents meet them. Pickup policy still applies to both people
+// and explicit assignments.
 
 import { useState } from "react";
 import { CheckIcon, XIcon } from "@phosphor-icons/react";
@@ -15,7 +15,14 @@ import {
   withoutTerm,
   type IssueRequirements,
 } from "../../../shared/requirements.ts";
-import { attribution, type Issue, type Snapshot } from "../../../shared/tracker.ts";
+import {
+  attribution,
+  issuePickup,
+  ISSUE_PICKUPS,
+  type Issue,
+  type Snapshot,
+} from "../../../shared/tracker.ts";
+import { agentEligible } from "../../../shared/tracker-query.ts";
 import { FormError } from "../../components/ui.tsx";
 import { Actor } from "./Actor.tsx";
 import type { Mutate } from "./IssueDetail.tsx";
@@ -82,13 +89,16 @@ export function Requirements({
   const assigned = mismatch(issue, snapshot, issue.assigneeId);
   const holder = issue.claim ? mismatch(issue, snapshot, issue.claim.actorId) : null;
   const disabled = busy || saving;
+  const pickup = issuePickup(issue);
   return (
     <section className="border-t border-line-soft py-4" aria-label="Agent requirements">
       <h3 className="m-0 text-body-sm font-semibold">Agent requirements</h3>
       <p className="mt-1 mb-2 text-body-sm text-ink-muted">
-        {terms.length
-          ? "Only agents that report these can claim it or get it from gm issue next. People always can."
-          : "Any agent can claim it. Add what an agent must report in its profile (gm agent setup), such as tag:ux or memory>=16GiB."}
+        {pickup !== "anyone"
+          ? `${ISSUE_PICKUPS[pickup]}: agents cannot pick up this issue, even when assigned. A person must change Pickup to Anyone first.`
+          : terms.length
+            ? "Agents need these capabilities unless explicitly assigned. People do not need an agent profile. Pickup and readiness rules still apply."
+            : "No agent capability requirements. Add what an agent must report in its profile (gm agent setup), such as tag:ux or memory>=16GiB."}
       </p>
       {terms.length > 0 && (
         <ul className="m-0 mb-2 flex list-none flex-wrap gap-1 p-0" aria-label="Requirements">
@@ -136,8 +146,10 @@ export function Requirements({
       {assigned && (
         <p className="mt-3 mb-0 rounded-control bg-sunken px-3 py-2 text-body-sm" role="note">
           Assigned to {assigned.agent.name}, which doesn't meet them:{" "}
-          {assigned.unmet.map((u) => u.message).join("; ")}. It may still claim it because it's
-          assigned.
+          {assigned.unmet.map((u) => u.message).join("; ")}.{" "}
+          {pickup === "anyone"
+            ? "Assignment overrides capability requirements, but readiness rules still apply."
+            : "Assignment does not override the pickup restriction."}
         </p>
       )}
       {holder && holder.agent.id !== assigned?.agent.id && (
@@ -153,13 +165,14 @@ export function Requirements({
             {agents.map((agent) => {
               const unmet = unmetRequirements(issue.requires, agent.capabilities);
               const exempt = unmet.length > 0 && issue.assigneeId === agent.id;
+              const eligible = agentEligible(issue, agent);
               return (
                 <li
                   key={agent.id}
                   className="flex items-start gap-2 border-b border-line-soft py-1.5 text-body-sm last:border-b-0"
-                  data-eligible={unmet.length === 0 || exempt ? "true" : "false"}
+                  data-eligible={eligible ? "true" : "false"}
                 >
-                  {unmet.length === 0 ? (
+                  {eligible && unmet.length === 0 ? (
                     <CheckIcon
                       className="mt-1 size-3 shrink-0 text-online"
                       weight="bold"
@@ -175,9 +188,11 @@ export function Requirements({
                   <span className="min-w-0 [overflow-wrap:anywhere]">
                     <Actor who={attribution(snapshot, agent.id)} />
                     <span className="text-ink-muted">
-                      {unmet.length === 0
-                        ? " · Eligible"
-                        : ` · ${exempt ? "Assigned, so it may claim anyway; " : ""}${unmet.map((u) => u.message).join("; ")}`}
+                      {pickup !== "anyone"
+                        ? ` · ${ISSUE_PICKUPS[pickup]}: agents cannot pick up`
+                        : unmet.length === 0
+                          ? " · Eligible"
+                          : ` · ${exempt ? "Assigned, so it may claim anyway; " : ""}${unmet.map((u) => u.message).join("; ")}`}
                     </span>
                   </span>
                 </li>

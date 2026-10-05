@@ -137,6 +137,37 @@ describe("buildIndex", () => {
   });
 });
 
+it("keeps restricted pickup out of Ready while preserving explicit policy filters and human eligibility", () => {
+  const issues = [
+    issue("CORE-1"),
+    issue("CORE-2", { pickup: "not_ready" }),
+    issue("CORE-3", { pickup: "human_only", assigneeId: "agt-worker" }),
+    issue("CORE-4", { pickup: "human_only", status: "done" }),
+  ];
+  const snap = snapshot(issues);
+  snap.agents = [
+    {
+      id: "agt-worker",
+      name: "worker",
+      accountable: snap.members[0]!,
+      capabilities: null,
+      capabilitiesUpdatedAt: null,
+      revokedAt: null,
+    },
+  ];
+  const index = buildIndex(snap, snap.serverTime);
+  const keys = (query: string, viewer = "m-priya") => {
+    const compiled = compile(query, index, viewer, NOW);
+    return issues.filter((item) => compiled.matches(item)).map((item) => item.key);
+  };
+  expect(keys("is:ready")).toEqual(["CORE-1"]);
+  expect(keys("is:not_ready")).toEqual(["CORE-2"]);
+  expect(keys("is:human_only")).toEqual(["CORE-3"]);
+  expect(keys("is:open eligible:me")).toEqual(["CORE-1", "CORE-3"]);
+  expect(keys("is:open eligible:me", "agt-worker")).toEqual(["CORE-1"]);
+  expect(keys("is:closed")).toEqual(["CORE-4"]);
+});
+
 describe("done in a timeline", () => {
   it("has a state of its own, keeps blocking and stays open until it lands", () => {
     const doneIn = { id: "tl_1", slug: "search" };

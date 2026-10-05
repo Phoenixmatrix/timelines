@@ -63,12 +63,16 @@ impl Render for Shown {
 /// An issue's requirements and the acting identity's eligibility (CORE-32), as lines.
 fn requirements_text(shown: &Value) -> String {
     let mut out = String::new();
+    let policy = pickup(&shown["issue"]);
+    out.push_str(&format!("Pickup: {}\n", match policy {
+        "not_ready" => "Not ready — nobody may claim or start; ask a person to change the pickup policy.",
+        "human_only" => "Human only — agents cannot claim or start, even when assigned; ask a person to do the work or change the pickup policy.",
+        _ => "Anyone",
+    }));
     if let Some(text) = shown["issue"]["requiresText"].as_str() {
         out.push_str(&format!("Requires: {text}\n"));
     }
-    if let Some(why) = shown["eligibility"]["why"].as_str()
-        && requirements::has_requirements(&shown["issue"]["requires"])
-    {
+    if let Some(why) = shown["eligibility"]["why"].as_str() {
         out.push_str(&format!("Eligibility: {why}\n"));
     }
     if let Some(assignee) = shown["assigneeMismatch"]["assignee"].as_str() {
@@ -665,6 +669,8 @@ impl Replica {
                 Err(error) => {
                     if error.code == "conflict"
                         || error.code == "requirements_unmet"
+                        || error.code == "pickup_not_ready"
+                        || error.code == "pickup_human_only"
                         || error.code == "not_found"
                         || error.code == "forbidden"
                         || (error.code == "server_error" && error.message.starts_with("HTTP 4"))
@@ -977,6 +983,7 @@ fn validate_issue_fields(data: &serde_json::Map<String, Value>, creating: bool) 
                 "workspaceIds",
                 "labels",
                 "requires",
+                "pickup",
             ]
             .contains(&key.as_str())
         {
@@ -984,6 +991,13 @@ fn validate_issue_fields(data: &serde_json::Map<String, Value>, creating: bool) 
                 "Server-owned or unknown issue field '{key}'."
             )));
         }
+    }
+    if let Some(pickup) = data.get("pickup")
+        && !matches!(pickup.as_str(), Some("anyone" | "not_ready" | "human_only"))
+    {
+        return Err(GmError::usage(
+            "pickup must be anyone, not_ready or human_only.",
+        ));
     }
     if let Some(requires) = data.get("requires") {
         requirements::normalize(requires)?;
@@ -1158,7 +1172,7 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
         }
         let mut row = match entity {
             "issue" => {
-                json!({"key":null,"description":"","acceptance":"","type":"task","status":"todo","closeReason":null,"timelineUse":"agent_decides","timelinePolicy":null,"priority":2,"assigneeId":null,"parentId":null,"workspaceIds":[],"labels":[],"claim":null})
+                json!({"key":null,"description":"","acceptance":"","type":"task","status":"todo","pickup":"anyone","closeReason":null,"timelineUse":"agent_decides","timelinePolicy":null,"priority":2,"assigneeId":null,"parentId":null,"workspaceIds":[],"labels":[],"claim":null})
             }
             "team" => json!({"description":"","memberIds":[],"archived":false}),
             "workspace" => json!({"description":"","archived":false}),
@@ -1213,6 +1227,9 @@ fn issue_patch(snapshot: &Value, p: &IssuePatch) -> Result<Value> {
     };
     timeline_fields(&p.timeline, &mut data);
     requires_field(&p.requires, p.clear_requires, &mut data)?;
+    if let Some(pickup) = &p.pickup {
+        data["pickup"] = json!(pickup);
+    }
     Ok(json!({"kind":"issue.update","id":row["id"],"expectedVersion":row["version"],"data":data}))
 }
 /// `--requires TERMS` as the stored `requires` object; `--clear-requires` as null.
@@ -1698,6 +1715,25 @@ fn leased_ancestor<'a>(
 /// `done_in_timeline` (finished in a timeline that hasn't landed) is neither ready nor
 /// done: it keeps blocking, as on the server.
 fn ready(snapshot: &Value, issue: &Value, now: DateTime<Utc>) -> bool {
+    ready_for(snapshot, issue, now, false)
+}
+fn pickup(issue: &Value) -> &str {
+    issue["pickup"].as_str().unwrap_or("anyone")
+}
+fn pickup_refusal(issue: &Value, person: bool) -> Option<(&'static str, &'static str)> {
+    match pickup(issue) {
+        "not_ready" => Some((
+            "pickup_not_ready",
+            "Nobody may claim or start this issue yet. Ask a person to change its pickup policy.",
+        )),
+        "human_only" if !person => Some((
+            "pickup_human_only",
+            "Only a person may claim or start this issue. Assignment and capability overrides do not bypass pickup policy; ask a person to do the work or change the policy.",
+        )),
+        _ => None,
+    }
+}
+fn ready_for(snapshot: &Value, issue: &Value, now: DateTime<Utc>, person: bool) -> bool {
     // Waiting on a person is never ready, whatever the status says.
     if issue["waiting"].as_u64().unwrap_or(0) > 0 {
         return false;
@@ -1706,6 +1742,9 @@ fn ready(snapshot: &Value, issue: &Value, now: DateTime<Utc>) -> bool {
     if !(status == "todo" || (status == "in_progress" && !issue["claim"].is_null()))
         || active_claim(issue, now)
     {
+        return false;
+    }
+    if pickup_refusal(issue, person).is_some() {
         return false;
     }
     let blocked = snapshot["links"]
@@ -1748,6 +1787,7 @@ fn actor_name(snapshot: &Value, id: &str) -> String {
 /// The issue as stored, plus who holds its claim and who it's assigned to, by name.
 fn named(snapshot: &Value, issue: &Value) -> Value {
     let mut out = issue.clone();
+    out["pickup"] = json!(pickup(issue));
     let rule = timeline_rule(issue);
     out["timelineUse"] = rule["use"].clone();
     out["timelinePolicy"] = rule["policy"].clone();
@@ -1923,14 +1963,27 @@ fn acting(r: &Replica, snapshot: &Value, offline: bool) -> Acting {
         },
     }
 }
-/// Whether `acting` may claim `issue` by its requirements: people always may;
-/// an agent when it meets every one, or when the issue is assigned to it.
+/// Pickup policy takes precedence over capability requirements and assignment.
 fn eligibility(issue: &Value, acting: &Acting) -> Value {
+    if let Some((code, why)) = pickup_refusal(issue, matches!(acting, Acting::Person)) {
+        return match acting {
+            Acting::Person => json!({"kind":"person","eligible":false,"code":code,"why":why}),
+            Acting::Agent { name, .. } => {
+                json!({"kind":"agent","agent":name,"eligible":false,"code":code,"why":why})
+            }
+            Acting::Unknown if pickup(issue) == "not_ready" => {
+                json!({"eligible":false,"code":code,"why":why})
+            }
+            Acting::Unknown => {
+                json!({"eligible":null,"why":"Human only: authenticate as a person to claim or start this issue."})
+            }
+        };
+    }
     let requires = &issue["requires"];
     match acting {
         Acting::Unknown => Value::Null,
         Acting::Person => {
-            json!({"kind":"person","eligible":true,"why":"People can always claim; requirements apply to agents."})
+            json!({"kind":"person","eligible":true,"why":"Pickup policy permits people; capability requirements apply only to agents."})
         }
         Acting::Agent { name, entry: None } => json!({
             "kind":"agent","agent":name,"eligible":Value::Null,
@@ -2197,6 +2250,12 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 // Whether the acting identity may claim it, and whether its assignee could (CORE-32).
                 let acting = acting(r, &snapshot, args.scope.offline);
                 shown.0["eligibility"] = eligibility(&shown.0["issue"], &acting);
+                shown.0["ready"] = json!(ready_for(
+                    &snapshot,
+                    &shown.0["issue"],
+                    Utc::now(),
+                    matches!(acting, Acting::Person)
+                ));
                 if let Some(mismatch) = assignee_mismatch(&snapshot, &shown.0["issue"]) {
                     shown.0["assigneeMismatch"] = mismatch;
                 }
@@ -2231,6 +2290,7 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 );
                 timeline_fields(&a.timeline, &mut mutation["data"]);
                 requires_field(&a.requires, false, &mut mutation["data"])?;
+                mutation["data"]["pickup"] = json!(a.pickup);
                 mutation
             }
             IssueCommand::Update(p) => issue_patch(&snapshot, p)?,
@@ -3235,6 +3295,7 @@ mod tests {
             &IssuePatch {
                 id: "ENG-1".into(),
                 data: Some(r#"{"priority":1}"#.into()),
+                pickup: None,
                 timeline: flags(Some("required"), Some("approval")),
                 requires: RequiresArgs { requires: None },
                 clear_requires: false,
@@ -3250,6 +3311,7 @@ mod tests {
             &IssuePatch {
                 id: "a".into(),
                 data: None,
+                pickup: None,
                 timeline: flags(None, Some("none")),
                 requires: RequiresArgs { requires: None },
                 clear_requires: false,
@@ -3268,6 +3330,7 @@ mod tests {
                 &IssuePatch {
                     id: "ENG-1".into(),
                     data: None,
+                    pickup: None,
                     timeline: TimelineRule {
                         timeline_use: None,
                         timeline_policy: None,
@@ -3294,6 +3357,72 @@ mod tests {
         assert!(s["issues"][0]["requires"].is_null());
         assert!(project(&mut s, &json!({"kind":"issue.update","id":"a","expectedVersion":6,"data":{"requires":{"disk":1}}})).is_err());
         assert!(validate_batch(&[json!({"kind":"issue.create","id":"n","data":{"teamId":"t","title":"x","requires":{"minCpus":0}}})]).is_err());
+    }
+    #[test]
+    fn pickup_replica_rejects_invalid_values_without_changing_issue() {
+        let mut s = snapshot();
+        project(
+            &mut s,
+            &json!({"kind":"issue.create","id":"i","data":{"title":"Draft","pickup":"not_ready"}}),
+        )
+        .unwrap();
+        assert!(!ready(&s, &s["issues"][0], Utc::now()));
+        let before = s.clone();
+        for invalid in [Value::Null, json!("ready"), json!(true)] {
+            assert!(project(&mut s, &json!({"kind":"issue.update","id":"i","expectedVersion":1,"data":{"pickup":invalid}})).is_err());
+            assert_eq!(s, before);
+        }
+        project(
+            &mut s,
+            &json!({"kind":"issue.update","id":"i","expectedVersion":1,"data":{"pickup":"anyone"}}),
+        )
+        .unwrap();
+        assert!(ready(&s, &s["issues"][0], Utc::now()));
+    }
+    #[test]
+    fn pickup_restrictions_beat_assignment_and_capabilities() {
+        let agent = Acting::Agent {
+            name: "builder".into(),
+            entry: Some(json!({"id":"agt_1","capabilities":{"tags":["rust"]}})),
+        };
+        let mut issue = json!({"id":"i","assigneeId":"agt_1","requires":{"tags":["rust"]}});
+        assert_eq!(eligibility(&issue, &agent)["eligible"], true);
+        for policy in ["not_ready", "human_only"] {
+            issue["pickup"] = json!(policy);
+            assert_eq!(eligibility(&issue, &agent)["eligible"], false);
+            assert_eq!(
+                eligibility(&issue, &agent)["code"],
+                format!("pickup_{policy}")
+            );
+            assert_eq!(
+                eligibility(&issue, &Acting::Person)["eligible"],
+                policy == "human_only"
+            );
+        }
+        issue["pickup"] = json!("human_only");
+        assert!(eligibility(&issue, &Acting::Unknown)["eligible"].is_null());
+        issue["pickup"] = json!("not_ready");
+        assert_eq!(eligibility(&issue, &Acting::Unknown)["eligible"], false);
+    }
+    #[test]
+    fn pickup_readiness_preserves_graph_and_actor_boundaries() {
+        let now = DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut s = snapshot();
+        s["issues"] = json!([{"id":"i","status":"todo","claim":null,"parentId":null}]);
+        assert!(ready(&s, &s["issues"][0], now));
+        s["issues"][0]["pickup"] = json!("not_ready");
+        assert!(!ready_for(&s, &s["issues"][0], now, true));
+        assert!(!ready(&s, &s["issues"][0], now));
+        s["issues"][0]["pickup"] = json!("human_only");
+        assert!(!ready(&s, &s["issues"][0], now));
+        assert!(ready_for(&s, &s["issues"][0], now, true));
+        s["issues"][0]["waiting"] = json!(1);
+        assert!(!ready_for(&s, &s["issues"][0], now, true));
+        s["issues"][0]["waiting"] = json!(0);
+        s["links"] = json!([{"fromId":"missing","toId":"i","kind":"blocks"}]);
+        assert!(!ready_for(&s, &s["issues"][0], now, true));
     }
     #[test]
     fn agents_are_named_with_their_accountable_person() {

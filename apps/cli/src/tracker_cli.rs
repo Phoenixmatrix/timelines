@@ -183,6 +183,9 @@ pub struct IssueCreate {
     /// Required for canceled issues; forbidden for other statuses.
     #[arg(long, value_parser=["duplicate","not_planned","obsolete","cannot_reproduce","other"])]
     pub close_reason: Option<String>,
+    /// Who may pick up the issue: anyone (default), nobody yet, or people only.
+    #[arg(long, default_value="anyone", value_parser=["anyone","not_ready","human_only"])]
+    pub pickup: String,
     #[arg(long, default_value_t=2, value_parser=clap::value_parser!(u8).range(0..=4))]
     pub priority: u8,
     #[command(flatten)]
@@ -208,8 +211,8 @@ pub struct RequiresArgs {
     /// space-separated terms like 'tag:ux skill:playwright model:claude-opus-*,gpt-5*
     /// harness:claude-code os:linux arch:x86_64 runtime:host memory>=16GiB cpus>=8'.
     /// Tags and skills: every one; the rest: any one; `*` is a wildcard. Agents that
-    /// don't meet them can't claim it and `gm issue next` skips it; people can always
-    /// claim. Eligibility, not authorization: capabilities are self-reported.
+    /// don't meet them can't claim it and `gm issue next` skips it. People bypass
+    /// capability requirements, but not pickup policy.
     #[arg(long, value_name = "TERMS")]
     pub requires: Option<String>,
 }
@@ -232,18 +235,21 @@ pub struct IssuePatch {
     /// JSON object of mutable fields; use '-' for stdin or '@path' for a file:
     /// title, description, acceptance, type, status, closeReason, timelineUse,
     /// timelinePolicy, priority (0–4), assigneeId, parentId, workspaceIds, labels
-    /// and requires (an object, or null; --requires writes it from terms).
+    /// pickup and requires (an object, or null; --requires writes it from terms).
     /// Relationships use canonical IDs; null clears assigneeId/parentId.
     /// Setting status to canceled requires closeReason: duplicate, not_planned,
     /// obsolete, cannot_reproduce or other. Leaving canceled clears closeReason
     /// automatically, as leaving required clears timelinePolicy.
-    #[arg(long, required_unless_present_any=["timeline_use","timeline_policy","requires","clear_requires"])]
+    #[arg(long, required_unless_present_any=["timeline_use","timeline_policy","requires","clear_requires","pickup"])]
     pub data: Option<String>,
+    /// Pickup policy; only a person can change an existing restricted policy.
+    #[arg(long, value_parser=["anyone","not_ready","human_only"])]
+    pub pickup: Option<String>,
     #[command(flatten)]
     pub timeline: TimelineRule,
     #[command(flatten)]
     pub requires: RequiresArgs,
-    /// Let any agent claim it again (requires: null).
+    /// Remove capability requirements (requires: null); does not change pickup policy.
     #[arg(long, conflicts_with = "requires")]
     pub clear_requires: bool,
 }
