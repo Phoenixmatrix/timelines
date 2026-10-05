@@ -79,6 +79,25 @@ describe("the step feed", () => {
     });
   });
 
+  test("an account's shorter keep period expires its records sooner (CORE-244)", async () => {
+    const { ctx } = fakeDurableState();
+    const feed = new StepFeed(ctx as never, {} as Env);
+    await feed.publish(record(1), 24 * 60 * 60_000);
+    await feed.publish(record(2));
+    vi.useFakeTimers({ now: Date.now() + 2 * 24 * 60 * 60_000 });
+    try {
+      expect((await feed.since(0)).map((r) => r.seq)).toEqual([2]);
+      await feed.alarm();
+      expect((await feed.since(0)).map((r) => r.seq)).toEqual([2]);
+      // Never longer than the week.
+      await feed.publish(record(3), 30 * 24 * 60 * 60_000);
+      vi.setSystemTime(Date.now() + FEED_TTL_MS);
+      expect(await feed.since(0)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("keeps the newest records for a week", async () => {
     const { ctx } = fakeDurableState();
     const feed = new StepFeed(ctx as never, {} as Env);

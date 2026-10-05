@@ -10,7 +10,7 @@
 // again on reconnect.
 
 import { DurableObject } from "cloudflare:workers";
-import type { StepFeedRecord } from "../../shared/steps.ts";
+import { STEP_FEED_DAYS, type StepFeedRecord } from "../../shared/steps.ts";
 import {
   clearStorage,
   pendingRetirement,
@@ -24,12 +24,18 @@ import {
 
 /** Records kept, newest. */
 export const FEED_KEEP = 100;
-/** …for at most this long (the PRD's feed retention). */
-export const FEED_TTL_MS = 7 * 24 * 60 * 60_000;
+/** …for at most this long (the PRD's feed retention; an account may keep less, CORE-244). */
+export const FEED_TTL_MS = STEP_FEED_DAYS * 24 * 60 * 60_000;
+
+/** A stored record: what readers get, and when it expires. */
+type Stored = StepFeedRecord & { expiresAt?: number };
 /** A stream ends after this long; readers reconnect, and are checked again. */
 const STREAM_MS = 10 * 60_000;
 /** A comment line this often keeps proxies from closing an idle stream. */
 const KEEPALIVE_MS = 25_000;
+
+/** When a record expires: its own time, or a week after it arrived (older records). */
+const expiry = (record: Stored) => record.expiresAt ?? Date.parse(record.at) + FEED_TTL_MS;
 
 const KEY = (seq: number) => `r:${String(seq).padStart(12, "0")}`;
 const encoder = new TextEncoder();
@@ -43,15 +49,20 @@ export class StepFeed extends DurableObject<Env> implements Purgeable {
   #subscribers = new Set<WritableStreamDefaultWriter<Uint8Array>>();
 
   /** Append a record, keep the newest, and send it to everyone reading. */
-  async publish(record: Omit<StepFeedRecord, "seq" | "at">): Promise<StepFeedRecord> {
+  async publish(
+    record: Omit<StepFeedRecord, "seq" | "at">,
+    keepMs: number = FEED_TTL_MS,
+  ): Promise<StepFeedRecord> {
     const seq = ((await this.ctx.storage.get<number>("seq")) ?? 0) + 1;
-    const full: StepFeedRecord = { ...record, seq, at: new Date().toISOString() };
+    const now = Date.now();
+    const full: StepFeedRecord = { ...record, seq, at: new Date(now).toISOString() };
+    const expiresAt = now + Math.min(Math.max(keepMs, 60_000), FEED_TTL_MS);
     await this.ctx.storage.put("seq", seq);
-    await this.ctx.storage.put(KEY(seq), full);
+    await this.ctx.storage.put(KEY(seq), { ...full, expiresAt } satisfies Stored);
     if (seq > FEED_KEEP) await this.ctx.storage.delete(KEY(seq - FEED_KEEP));
-    // The oldest record expires a week from now at the latest.
-    if ((await this.ctx.storage.getAlarm()) === null)
-      await this.ctx.storage.setAlarm(Date.now() + FEED_TTL_MS);
+    // Wake when this record expires, unless something expires sooner.
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null || alarm > expiresAt) await this.ctx.storage.setAlarm(expiresAt);
     const event = encoder.encode(sseEvent(full));
     for (const writer of this.#subscribers) writer.write(event).catch(() => this.#drop(writer));
     return full;
@@ -60,11 +71,16 @@ export class StepFeed extends DurableObject<Env> implements Purgeable {
   /** Records after `after`, oldest first. */
   async since(after: number): Promise<StepFeedRecord[]> {
     // At most FEED_KEEP records: filtering here is as cheap as a ranged list.
-    const rows = await this.ctx.storage.list<StepFeedRecord>({ prefix: "r:" });
-    const cutoff = Date.now() - FEED_TTL_MS;
+    const rows = await this.ctx.storage.list<Stored>({ prefix: "r:" });
+    const now = Date.now();
     return [...rows.values()]
-      .filter((r) => r.seq > after && Date.parse(r.at) >= cutoff)
-      .sort((a, b) => a.seq - b.seq);
+      .filter((r) => r.seq > after && expiry(r) > now)
+      .sort((a, b) => a.seq - b.seq)
+      .map((stored) => {
+        const record: Stored = { ...stored };
+        delete record.expiresAt;
+        return record as StepFeedRecord;
+      });
   }
 
   /** GET: an SSE stream from after Last-Event-ID (or `?after=`), or the newest records. */
@@ -125,13 +141,12 @@ export class StepFeed extends DurableObject<Env> implements Purgeable {
       });
       return;
     }
-    // Expire records older than a week; come back when the next one is due.
-    const rows = await this.ctx.storage.list<StepFeedRecord>({ prefix: "r:" });
-    const cutoff = Date.now() - FEED_TTL_MS;
-    const old = [...rows].filter(([, r]) => Date.parse(r.at) < cutoff).map(([k]) => k);
-    for (const key of old) await this.ctx.storage.delete(key);
-    const next = [...rows.values()].find((r) => Date.parse(r.at) >= cutoff);
-    if (next) await this.ctx.storage.setAlarm(Date.parse(next.at) + FEED_TTL_MS);
+    // Expire records past their time; come back when the next one is due.
+    const rows = await this.ctx.storage.list<Stored>({ prefix: "r:" });
+    const now = Date.now();
+    for (const [key, record] of rows) if (expiry(record) <= now) await this.ctx.storage.delete(key);
+    const next = Math.min(...[...rows.values()].map(expiry).filter((at) => at > now));
+    if (Number.isFinite(next)) await this.ctx.storage.setAlarm(next);
   }
 
   async purge(reason: string): Promise<PurgeReport> {

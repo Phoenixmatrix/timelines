@@ -24,6 +24,7 @@ import {
   type StepAuthor,
   type StepContextBody,
   type StepFeedRecord,
+  STEP_FEED_DAYS,
   type StepPage,
   type StepTest,
   type StepTestSummary,
@@ -368,6 +369,30 @@ steps.post("/", async (c) => {
   return c.json(step, existing ? 200 : 201);
 });
 
+/**
+ * How long the repository's account keeps live feed records (retention
+ * category "step-feed", CORE-244): its stored days within 1–7, else 7.
+ */
+async function feedKeepMs(env: Env, repoId: string): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT p.thresholds FROM retention_policies p JOIN repos r ON r.owner_id = p.account_id
+     WHERE r.id = ? AND p.category = 'step-feed'`,
+  )
+    .bind(repoId)
+    .first<{ thresholds: string }>();
+  let days: unknown;
+  try {
+    days = row ? (JSON.parse(row.thresholds) as { days?: unknown }).days : undefined;
+  } catch {
+    days = undefined;
+  }
+  const kept =
+    typeof days === "number" && Number.isInteger(days) && days >= 1 && days <= STEP_FEED_DAYS
+      ? days
+      : STEP_FEED_DAYS;
+  return kept * 24 * 60 * 60_000;
+}
+
 /** The live feed of one repository's steps in one timeline. */
 function feed(env: Env, repoId: string, timeline: string) {
   return durableStub(env, "StepFeed", `${repoId}:${timeline}`, { repo: repoId });
@@ -396,7 +421,7 @@ async function publishStep(
     why: (step.context.why.split("\n").find((l) => l.trim()) ?? "").trim().slice(0, 200),
     committedAt: step.committedAt,
   };
-  await feed(env, repo.id, step.timeline!).publish(record);
+  await feed(env, repo.id, step.timeline!).publish(record, await feedKeepMs(env, repo.id));
 }
 
 /**

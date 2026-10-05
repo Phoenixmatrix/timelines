@@ -138,6 +138,8 @@ const CATEGORY_IDS: Record<string, string[]> = {
   "d1/atlas": ["atlas-snapshots"],
   "durable_objects/Tracker": ["closed-issues", "tracker-activity"],
   "durable_objects/Assistant": ["assistant-chats"],
+  "durable_objects/StepFeed": ["step-feed"],
+  "d1/step-context": ["step-steering", "step-artifacts"],
   "r2/registry_blobs": ["registry-proxy-cache"],
   "r2/registry_derived": ["registry-proxy-cache"],
   "r2/registry_blobs_all": ["registry-proxy-cache"],

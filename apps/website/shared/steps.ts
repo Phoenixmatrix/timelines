@@ -145,6 +145,12 @@ export const EMPTY_CONTEXT: StepContextBody = {
   model: null,
 };
 
+/** The live feed keeps a record this many days at most (CORE-244: an account may keep fewer). */
+export const STEP_FEED_DAYS = 7;
+
+/** The placeholder retention leaves for trimmed instructions and steering (CORE-244). */
+export const TRIMMED_TEXT = "(Removed by retention.)";
+
 /**
  * One record of a timeline's live feed (CORE-239): small, never the context
  * itself. `seq` orders a feed; readers may see a record twice and dedupe by

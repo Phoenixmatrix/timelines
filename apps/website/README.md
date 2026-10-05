@@ -366,6 +366,17 @@ repository's feed with `fetch` (not `EventSource`), and shows each agent's
 latest step, its test result, how many steps since when and its why, linked
 into the story. `gm steps --follow` streams the same feed.
 
+### Keeping work context
+
+A step's why, challenges, tests and coverage are kept as long as the
+repository. Three data-retention categories (CORE-244; see "Retention
+categories" below) cover the rest, on the account's Data retention page:
+`step-steering` trims instructions and steering text to a placeholder a year
+after the step's commit (sources and times stay), `step-artifacts` removes
+step-run summaries after 90 days, and `step-feed` keeps live feed records up
+to 7 days (an account can keep fewer). Like every policy category, the first
+two run once an administrator turns them on.
+
 ### Why on a line
 
 `GET /api/repos/:o/:n/why` adds each chain's `step` (CORE-243,
@@ -2967,8 +2978,8 @@ bounds shown.
   (`keepLatest`, 1–1000). Never deletes: the latest runs of each ref (the count
   below); running or queued runs, and runs with a job still running; runs a
   deployment, a landing or a package publish refers to. Can select the same
-  records as `ci-logs`: a dry run of both counts them under each, a run removes
-  each once.
+  records as `ci-logs`, `step-artifacts`: a dry run of both counts them under
+  each, a run removes each once.
 - **Expired preview deployment records** (`preview-records`, account scope; off
   until enabled). Records of preview deployments that expired more than the
   given days ago. Defaults when enabled: Days after expiry: 30 (`days`, 1–3650).
@@ -2984,6 +2995,23 @@ bounds shown.
   timelines that ended more than the given days ago. Defaults when enabled: Days
   after the timeline ended: 90 (`days`, 1–3650). Never deletes: data of open
   timelines; anything on the main line.
+- **Step instructions and steering** (`step-steering`, account scope; off until
+  enabled). The text of steps' instructions and steering (what people told their
+  agents), the given days after the step's commit, trimmed to a placeholder.
+  Defaults when enabled: Days after the step's commit: 365 (`days`, 1–3650).
+  Never deletes: a step's why, challenges, tests or coverage; the step itself
+  and its commit.
+- **Step run artifacts** (`step-artifacts`, account scope; off until enabled).
+  What step runs produced (test summaries), the given days after the run.
+  Defaults when enabled: Days after the step run: 90 (`days`, 1–3650). Never
+  deletes: the step and its context; the CI run that produced them. Can select
+  the same records as `ci-runs`: a dry run of both counts them under each, a run
+  removes each once.
+- **Live step feed** (`step-feed`, account scope; always on (it ran before
+  retention policies existed)). Each timeline's live feed keeps a step's small
+  record for the given days, enough for readers to catch up; the step itself
+  stays. An account can keep less, never more. Defaults: Days a feed record is
+  kept: 7 (`days`, 1–7). Never deletes: steps and their context.
 - **Push log** (`push-log`, account scope; off until enabled). Push log entries
   older than the given days, and records of changes on branches or bookmarks
   that no longer exist, last seen before then. Defaults when enabled: Days after
