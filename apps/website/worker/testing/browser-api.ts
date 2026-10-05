@@ -33,6 +33,7 @@ import { invalidateRefs } from "../objects.ts";
 import { refs } from "../refs/api.ts";
 import { trackerReleaseNotes } from "../release-notes/api.ts";
 import { search } from "../search/api.ts";
+import { aiProvidersApi } from "../ai-providers/api.ts";
 import { aiSettingsApi, siteAiSettingsApi } from "../settings/ai.ts";
 import { steps } from "../steps/api.ts";
 import { timelines } from "../timelines/api.ts";
@@ -41,6 +42,7 @@ import { Timing } from "../timing.ts";
 import { tracker } from "../tracker/api.ts";
 import { agents } from "../api/agents.ts";
 import { Tracker } from "../tracker/object.ts";
+import { fakeProviders, isProviderUrl } from "./ai-providers.ts";
 import { d1, migratedDatabase } from "./d1.ts";
 import { durableStorage } from "./durable.ts";
 import { fakeRemotes } from "./remote.ts";
@@ -113,6 +115,8 @@ function createWorld(persona: Persona): string {
     REGISTRY_DB: d1(registryDatabase()),
     DEV_MODE: "true",
     BETTER_AUTH_SECRET: "browser-tests-browser-tests-browser-tests",
+    // Seals AI provider keys (CORE-294).
+    REGISTRY_KEK: btoa("browser-tests-sealing-key-32-bytes"),
     // Tokens and the commits pushed; no trees or blobs.
     ARTIFACTS: {
       get: async () => ({
@@ -166,10 +170,13 @@ scope.caches ??= {
 };
 
 // Artifacts' git endpoints are what the routes fetch: answer them from the
-// world whose remote it is, and leave every other fetch alone.
+// world whose remote it is. TypeSafe and OpenRouter are answered in memory
+// (worker/testing/ai-providers.ts). Every other fetch is left alone.
 const realFetch = globalThis.fetch;
+const providers = fakeProviders();
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input);
+  if (isProviderUrl(url)) return providers.fetch(input, init);
   if (!url.startsWith(`${REMOTES}/`)) return realFetch(input, init);
   const world = worlds.get(new URL(url).pathname.split("/")[1] ?? "");
   if (!world) return new Response("Not found", { status: 404 });
@@ -197,6 +204,7 @@ app.use(async (c, next) => {
 app.route("/api/accounts/:owner/atlas", workspaceAtlas);
 app.route("/api/agents", agents);
 app.route("/api/accounts/:slug/settings/ai", aiSettingsApi);
+app.route("/api/accounts/:slug/ai-providers", aiProvidersApi);
 app.route("/api/admin/ai", siteAiSettingsApi);
 app.route("/api", accounts);
 app.route("/api/account/skills", personalSkillsApi);

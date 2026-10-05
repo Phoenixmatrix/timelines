@@ -7,8 +7,10 @@ import {
   DEFAULT_AI_CONFIGURATION,
   DEFAULT_KNOWLEDGE_SCHEDULE,
   MAX_KNOWLEDGE_WAIT_MINUTES,
+  parseProviderModelId,
   type AiLogBodiesPatch,
   type AiLogBodiesView,
+  type AiModelCatalog,
   type AiRole,
   type AiSettings,
   type AiSettingsPatch,
@@ -19,6 +21,7 @@ import {
   type SiteAiSettingsView,
 } from "../../shared/ai.ts";
 import { environmentKeepsBodies, forgetLogBodySettings } from "../ai-gateway.ts";
+import { accountCatalog, resolveProviderModel } from "../ai-providers/store.ts";
 import { fail, requireActor, requirePerson } from "../api/http.ts";
 import type { AppEnv } from "../auth.ts";
 import { findAccountBySlug, type AccountRow, type Actor } from "../db.ts";
@@ -82,15 +85,40 @@ export async function repoAiSnapshot(d1: D1Database, repoId: string): Promise<Ai
     .executeTakeFirst();
   if (!repo) throw new Error("Cannot resolve AI settings: no such repository.");
   const settings = await aiSettings(d1, repo.owner_id);
-  const model = (role: AiRole) => {
-    const option = AI_MODEL_CATALOG[role].find((entry) => entry.id === settings.models[role]);
+  const prices: NonNullable<AiSnapshot["prices"]> = {};
+  const builtIn = (role: AiRole, id: string) => {
+    const option = AI_MODEL_CATALOG[role].find((entry) => entry.id === id);
     if (!option) throw new Error(`Invalid stored AI model for ${role}.`);
     return option.model;
   };
+  const model = async (role: AiRole) => {
+    const id = settings.models[role];
+    const custom = parseProviderModelId(id);
+    if (!custom) return builtIn(role, id);
+    const resolved = await resolveProviderModel(d1, repo.owner_id, custom.provider, custom.model);
+    // Removing a model in use is refused (worker/ai-providers/api.ts); should one
+    // still go missing, new work uses the default rather than failing every read.
+    if (!resolved) {
+      console.warn(`AI settings: ${id} is no longer available; using the default ${role} model.`);
+      return builtIn(role, DEFAULT_AI_CONFIGURATION.models[role]);
+    }
+    if (!resolved.option.variablePricing)
+      prices[resolved.ref] = {
+        input: resolved.option.inputUsdPerMillion,
+        output: resolved.option.outputUsdPerMillion,
+      };
+    return resolved.ref;
+  };
+  const [classification, fast, task] = await Promise.all([
+    model("classification"),
+    model("fast"),
+    model("task"),
+  ]);
   return {
     version: 1,
     features: settings.features,
-    models: { classification: model("classification"), fast: model("fast"), task: model("task") },
+    models: { classification, fast, task },
+    ...(Object.keys(prices).length ? { prices } : {}),
     updatedAt: settings.updatedAt,
   };
 }
@@ -233,7 +261,8 @@ async function standing(d1: D1Database, account: AccountRow, actor: Actor) {
   return membership.role === "owner" ? "admin" : "member";
 }
 
-async function load(c: Context<AppEnv>, actor: Actor) {
+/** The account named in the route and the actor's standing in it; null when not a member. */
+export async function load(c: Context<AppEnv>, actor: Actor) {
   const account = await findAccountBySlug(c.env.DB, c.req.param("slug") ?? "");
   const role = account ? await standing(c.env.DB, account, actor) : "none";
   return account && role !== "none" ? { account, role } : null;
@@ -243,7 +272,7 @@ function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function validate(body: unknown): AiSettingsPatch | string {
+function validate(body: unknown, catalog: AiModelCatalog): AiSettingsPatch | string {
   if (!object(body)) return "AI settings must be a JSON object.";
   for (const key of Object.keys(body))
     if (key !== "features" && key !== "models" && key !== "knowledgeUpdates" && key !== "logBodies")
@@ -260,7 +289,7 @@ function validate(body: unknown): AiSettingsPatch | string {
     if (!object(body.models)) return "models must be an object of curated model choices.";
     for (const [key, value] of Object.entries(body.models)) {
       if (!Object.hasOwn(AI_MODEL_CATALOG, key)) return `Unknown field: models.${key}.`;
-      const options = AI_MODEL_CATALOG[key as AiRole];
+      const options = catalog[key as AiRole];
       if (!options.some((option) => option.id === value))
         return `models.${key} must be one of: ${options.map((option) => option.id).join(", ")}.`;
     }
@@ -297,7 +326,7 @@ aiSettingsApi.get("/", async (c) => {
   return c.json<AiSettingsView>({
     ...(await aiSettings(c.env.DB, found.account.id)),
     canManage: found.role === "admin" && !actor.agent,
-    catalog: AI_MODEL_CATALOG,
+    catalog: await accountCatalog(c.env.DB, found.account.id),
     logBodies: await logBodiesView(c.env, found.account.id),
   });
 });
@@ -319,7 +348,7 @@ aiSettingsApi.patch("/", async (c) => {
   } catch {
     return fail(c, 400, "AI settings must be valid JSON.");
   }
-  const patch = validate(body);
+  const patch = validate(body, await accountCatalog(c.env.DB, found.account.id));
   if (typeof patch === "string") return fail(c, 400, patch);
   // Only supplied columns participate in the upsert. No read/merge/write window:
   // concurrent changes to other choices or preview retention cannot be overwritten.
@@ -351,7 +380,7 @@ aiSettingsApi.patch("/", async (c) => {
   return c.json<AiSettingsView>({
     ...(await aiSettings(c.env.DB, found.account.id)),
     canManage: true,
-    catalog: AI_MODEL_CATALOG,
+    catalog: await accountCatalog(c.env.DB, found.account.id),
     logBodies: await logBodiesView(c.env, found.account.id),
   });
 });

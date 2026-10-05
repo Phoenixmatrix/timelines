@@ -7,6 +7,8 @@
 //   embed     vectors for graph nodes (Vectorize)
 
 import { aiGatewayOptions, componentOf } from "../ai-gateway.ts";
+import { callProvider } from "../ai-providers/providers.ts";
+import { parseProviderModelRef, providerKey } from "../ai-providers/store.ts";
 import { attribution, recordAiCall, tokensOf } from "../usage/ai.ts";
 import { paidWorkGuard } from "./paid-work.ts";
 
@@ -108,9 +110,13 @@ const ai = (env: Env, job: Job, rateLimitRetries = RATE_LIMIT_RETRIES): LooseAi 
 /**
  * One attempt: refused once the work it belongs to has stopped (paid-work.ts),
  * aborted at its deadline or when the work stops, and metered either way: a
- * success with its tokens, anything else as a failed call.
+ * success with its tokens, anything else as a failed call. A model from the
+ * account's own provider (CORE-294; `<provider>:<row>:<model>` in snapshots)
+ * goes to that provider with the account's key instead of Workers AI.
  */
 async function once(env: Env, model: string, inputs: unknown, timeout: number): Promise<unknown> {
+  const provider = parseProviderModelRef(model);
+  const metered = provider?.usageName ?? model;
   const guard = paidWorkGuard();
   await guard?.check();
   const ms = Math.min(timeout, guard?.remaining() ?? Infinity);
@@ -119,7 +125,7 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
   const stopped = () => controller.abort(guard!.signal.reason);
   guard?.signal.addEventListener("abort", stopped, { once: true });
   const timer = setTimeout(
-    () => controller.abort(new Error(`${model} timed out after ${Math.round(ms / 1000)}s`)),
+    () => controller.abort(new Error(`${metered} timed out after ${Math.round(ms / 1000)}s`)),
     ms,
   );
   const aborted = new Promise<never>((_, reject) => {
@@ -128,20 +134,30 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
     });
   });
   try {
-    const gateway = await aiGatewayOptions(env, componentOf(work.feature), work);
+    const call = provider
+      ? providerKey(env, provider).then((key) =>
+          callProvider(
+            env,
+            provider.kind,
+            key,
+            provider.model,
+            inputs as Record<string, unknown>,
+            controller.signal,
+          ),
+        )
+      : aiGatewayOptions(env, componentOf(work.feature), work).then((gateway) =>
+          (env.AI as unknown as LooseAi).run(model, inputs, {
+            ...gateway,
+            signal: controller.signal,
+          }),
+        );
     // The race: a binding that ignores the signal still can't hold the caller.
-    const result = await Promise.race([
-      (env.AI as unknown as LooseAi).run(model, inputs, {
-        ...gateway,
-        signal: controller.signal,
-      }),
-      aborted,
-    ]);
+    const result = await Promise.race([call, aborted]);
     // Metering (CORE-207): the call's tokens, for the account whose work this is.
-    await recordAiCall(env, model, tokensOf(result));
+    await recordAiCall(env, metered, tokensOf(result));
     return result;
   } catch (error) {
-    await recordAiCall(env, model, {}, { failed: true });
+    await recordAiCall(env, metered, {}, { failed: true });
     throw controller.signal.aborted ? controller.signal.reason : error;
   } finally {
     clearTimeout(timer);
@@ -152,6 +168,9 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
 // Provider-specific reasoning controls: GLM and Qwen cannot use the old
 // boolean toggle. `think: false` requests their lowest supported effort.
 function reasoning(model: string, think: boolean) {
+  // OpenRouter normalizes effort across its models and drops it where unsupported.
+  if (parseProviderModelRef(model)?.kind === "openrouter")
+    return { reasoning: { effort: think ? "high" : "low" } };
   switch (model) {
     case MODELS.fast:
       return { reasoning_effort: think ? "max" : "low" };

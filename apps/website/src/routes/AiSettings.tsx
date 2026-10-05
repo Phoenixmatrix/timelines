@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Link,
   redirect,
   useLoaderData,
   useNavigation,
@@ -9,16 +10,19 @@ import {
 } from "react-router";
 import type { AccountSummary } from "../../shared/api.ts";
 import {
+  AI_PROVIDERS,
   MAX_KNOWLEDGE_WAIT_MINUTES,
   type AiFeatures,
   type AiLogBodiesPatch,
   type AiLogComponent,
+  type AiModelOption,
   type AiModelSelection,
   type AiRole,
   type AiSettingsPatch,
   type AiSettingsView,
   type KnowledgeUpdateSchedule,
 } from "../../shared/ai.ts";
+import { modelPriceParts } from "../components/ModelPrices.tsx";
 import { SettingsPage } from "../components/SettingsPage.tsx";
 import { FormError, SelectField, link } from "../components/ui.tsx";
 import { api, ApiError } from "../lib/api.ts";
@@ -100,11 +104,11 @@ const ROLES: { key: AiRole; title: string; description: string }[] = [
     description: "Longer synthesis, wiki pages, and Atlas descriptions.",
   },
 ];
-const money = new Intl.NumberFormat("en-US", {
-  style: "currency",
-  currency: "USD",
-  maximumFractionDigits: 3,
-});
+/** A provider model's name says whose it is; the built-in ones run on Workers AI. */
+function modelName(option: AiModelOption) {
+  const provider = AI_PROVIDERS.find((info) => info.kind === option.provider);
+  return provider ? `${option.name} (${provider.name})` : option.name;
+}
 const releaseDate = new Intl.DateTimeFormat("en-US", {
   month: "short",
   day: "numeric",
@@ -363,6 +367,13 @@ function AiSettingsForm({
           Published provider prices in USD per million tokens, not an estimate of your bill. Release
           dates help compare model recency. Embedding models are fixed and are not changed here.
         </p>
+        <p className="mt-0 mb-5 text-body-sm text-ink-muted">
+          More models: connect this account’s own TypeSafe or OpenRouter key in{" "}
+          <Link to={`/settings/ai-providers?owner=${encodeURIComponent(owner)}`} className={link}>
+            AI providers
+          </Link>
+          . Their calls are billed to that key.
+        </p>
         <div className="flex flex-col gap-6">
           {ROLES.map(({ key, title, description }) => (
             <div key={key} className="min-w-0">
@@ -374,7 +385,7 @@ function AiSettingsForm({
                   value={models[key]}
                   options={saved.catalog[key].map((option) => ({
                     value: option.id,
-                    label: option.name,
+                    label: modelName(option),
                   }))}
                   className="w-full max-w-md"
                   onChange={(value) => {
@@ -385,23 +396,30 @@ function AiSettingsForm({
                 />
               ) : (
                 <p className="mt-0 mb-2 font-semibold">
-                  {saved.catalog[key].find((option) => option.id === models[key])?.name ??
-                    models[key]}
+                  {(() => {
+                    const option = saved.catalog[key].find((entry) => entry.id === models[key]);
+                    return option ? modelName(option) : models[key];
+                  })()}
                 </p>
               )}
               <ul className="mt-3 mb-0 flex list-none flex-col gap-3 p-0 text-body-sm">
                 {saved.catalog[key].map((option) => (
                   <li key={option.id} className="flex flex-wrap gap-x-2 gap-y-1">
                     <a href={option.url} className={link} target="_blank" rel="noreferrer">
-                      {option.name}
+                      {modelName(option)}
                       <span className="sr-only"> provider details (opens in a new tab)</span>
                     </a>
                     <span className="text-ink-muted">
-                      {money.format(option.inputUsdPerMillion)} input /{" "}
-                      {money.format(option.outputUsdPerMillion)} output · Released{" "}
-                      <time dateTime={option.releasedAt}>
-                        {releaseDate.format(new Date(`${option.releasedAt}T00:00:00Z`))}
-                      </time>
+                      {modelPriceParts(option).join(" / ")}
+                      {option.releasedAt && (
+                        <>
+                          {" "}
+                          · Released{" "}
+                          <time dateTime={option.releasedAt}>
+                            {releaseDate.format(new Date(`${option.releasedAt}T00:00:00Z`))}
+                          </time>
+                        </>
+                      )}
                     </span>
                   </li>
                 ))}

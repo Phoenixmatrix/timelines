@@ -1,5 +1,6 @@
 import { AI_MODEL_CATALOG, type AiSnapshot } from "../../shared/ai.ts";
 import type { ConflictFile, QueueDecision, QueueResolution } from "../../shared/merge-queue.ts";
+import { parseProviderModelRef } from "../ai-providers/store.ts";
 import { chatJson, decide } from "../knowledge/models.ts";
 import { aiWork } from "../usage/ai.ts";
 
@@ -30,10 +31,12 @@ function keys(value: Record<string, unknown>, expected: string[]): boolean {
 function probability(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
 }
+/** A captured model this role may use: a curated one, or the account's own provider model (CORE-294). */
 function catalogModel(role: "classification" | "task", model: unknown): model is string {
-  return (
-    typeof model === "string" && AI_MODEL_CATALOG[role].some((option) => option.model === model)
-  );
+  if (typeof model !== "string") return false;
+  const provider = parseProviderModelRef(model);
+  if (provider) return provider.kind === (role === "classification" ? "typesafe" : "openrouter");
+  return AI_MODEL_CATALOG[role].some((option) => option.model === model);
 }
 
 // Deliberately narrower than Markdown: no links, embedded code, HTML, commands,

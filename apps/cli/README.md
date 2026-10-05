@@ -932,8 +932,11 @@ These are account-wide settings, not repository settings. Omit `--owner` to use
 the authenticated person's own account; the current repository's owner is never
 inferred. `show` includes the curated catalog, prices, release dates, permissions
 and save provenance. `set` requires at least one option and changes only supplied
-fields. Feature values are `on|off`; Classification accepts only `clef`; Fast and
-Task allow `glm-5.3-flash|gemma-4-26b-a4b-it`. Defaults are all features on, Clef,
+fields. Feature values are `on|off`; Classification accepts `clef` or a
+`typesafe:<model>` the account added in **Settings → AI providers**; Fast and
+Task allow `glm-5.3-flash|gemma-4-26b-a4b-it` or an added `openrouter:<model>`
+(for example `--fast openrouter:google/gemini-3-flash`). The server refuses a
+provider model the account hasn't added. Defaults are all features on, Clef,
 and GLM 5.3 Flash for both generation roles. `--knowledge-quiet-minutes` and
 `--knowledge-max-wait-minutes` (0-1440, defaults 10 and 30) say when pushes to a
 repository's default branch update its Knowledge: once they pause that long, and

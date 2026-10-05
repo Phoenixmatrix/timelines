@@ -57,6 +57,7 @@ export const SHARED_PATHS = [
   "apps/website/worker/app.ts",
   "apps/website/worker/ai-gateway.ts",
   "apps/website/worker/knowledge/models.ts",
+  "apps/website/worker/ai-providers/**",
   "apps/website/worker/settings/**",
   "apps/website/worker/usage/ai.ts",
   "apps/website/shared/ai.ts",

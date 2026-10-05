@@ -1,8 +1,10 @@
 // Curated account-wide configuration for automatic AI work. Interactive chat
 // and the fixed-dimension embedding model are deliberately outside this catalog.
 export type AiRole = "classification" | "fast" | "task";
-export type ClassificationModel = "clef";
-export type GenerationModel = "glm-5.3-flash" | "gemma-4-26b-a4b-it";
+/** A model an account added from one of its own providers (CORE-294): `<provider>:<model>`. */
+export type ProviderModelId = `${AiProviderKind}:${string}`;
+export type ClassificationModel = "clef" | ProviderModelId;
+export type GenerationModel = "glm-5.3-flash" | "gemma-4-26b-a4b-it" | ProviderModelId;
 
 export interface AiFeatures {
   knowledge: boolean;
@@ -27,11 +29,21 @@ export interface AiModels {
 export interface AiModelOption {
   id: string;
   name: string;
+  /** The provider's own model id: `@cf/…` on Workers AI, `jev-latest`, `anthropic/…`. */
   model: string;
   releasedAt: string;
   inputUsdPerMillion: number;
   outputUsdPerMillion: number;
+  /** Published cache prices, where the provider charges for them. */
+  cacheReadUsdPerMillion?: number;
+  cacheWriteUsdPerMillion?: number;
+  /** Reasoning tokens, where they are priced apart from output. */
+  reasoningUsdPerMillion?: number;
+  /** The price depends on what the provider routes to: no fixed per-token price. */
+  variablePricing?: boolean;
   url: string;
+  /** Absent on the built-in Workers AI models; set on an account's own provider models. */
+  provider?: AiProviderKind;
 }
 
 const GLM_FLASH: AiModelOption = {
@@ -189,10 +201,13 @@ export interface AiSettings extends AiConfiguration {
   updatedBy: string | null;
 }
 
+export type AiModelCatalog = Readonly<Record<AiRole, readonly AiModelOption[]>>;
+
 /** GET/PATCH /api/accounts/:slug/settings/ai. */
 export interface AiSettingsView extends AiSettings {
   canManage: boolean;
-  catalog: typeof AI_MODEL_CATALOG;
+  /** The built-in models, then the models this account added from its providers. */
+  catalog: AiModelCatalog;
   /** Gateway body logging for this account's calls: site defaults and its overrides. */
   logBodies: AiLogBodiesView;
 }
@@ -209,6 +224,11 @@ export interface AiSnapshot {
   version: 1;
   features: AiFeatures;
   models: AiModels;
+  /**
+   * USD per million input and output tokens of the provider models among
+   * `models`, as published when the work started (Atlas budgets spend at them).
+   */
+  prices?: Record<string, { input: number; output: number }>;
   updatedAt: string | null;
 }
 
@@ -224,3 +244,103 @@ export const LEGACY_AI_SNAPSHOT: AiSnapshot = {
   },
   updatedAt: null,
 };
+
+// ---- an account's own providers (CORE-294) ------------------------------------
+
+/**
+ * Providers an account connects with its own API key. Their calls go straight
+ * to the provider, billed to that key: not through Workers AI or AI Gateway.
+ */
+export type AiProviderKind = "typesafe" | "openrouter";
+
+/** What a provider model can do here: answer typed questions, or write text. */
+export type AiCapability = "classification" | "generation";
+
+/** Which roles a model of each capability can fill. */
+export const CAPABILITY_ROLES: Readonly<Record<AiCapability, readonly AiRole[]>> = {
+  classification: ["classification"],
+  generation: ["fast", "task"],
+};
+
+export interface AiProviderInfo {
+  kind: AiProviderKind;
+  name: string;
+  description: string;
+  /** Where a person creates an API key. */
+  keysUrl: string;
+}
+
+export const AI_PROVIDERS: readonly AiProviderInfo[] = [
+  {
+    kind: "typesafe",
+    name: "TypeSafe",
+    description:
+      "Jev answers typed questions with calibrated probabilities. It can be the Classification model.",
+    keysUrl: "https://typesafe.ai",
+  },
+  {
+    kind: "openrouter",
+    name: "OpenRouter",
+    description:
+      "Hundreds of text models from many vendors behind one key. They can be the Fast or Task model.",
+    keysUrl: "https://openrouter.ai/settings/keys",
+  },
+];
+
+export function providerModelId(kind: AiProviderKind, model: string): ProviderModelId {
+  return `${kind}:${model}`;
+}
+
+/** The provider and model of `<provider>:<model>`; null for a built-in model id. */
+export function parseProviderModelId(
+  id: string,
+): { provider: AiProviderKind; model: string } | null {
+  const at = id.indexOf(":");
+  if (at <= 0) return null;
+  const provider = id.slice(0, at);
+  const model = id.slice(at + 1);
+  if (!model || !AI_PROVIDERS.some((info) => info.kind === provider)) return null;
+  return { provider: provider as AiProviderKind, model };
+}
+
+/** A model an account made available from one of its providers. */
+export interface AiProviderModel extends AiModelOption {
+  id: ProviderModelId;
+  provider: AiProviderKind;
+  capability: AiCapability;
+  contextLength: number | null;
+  /** False when the provider doesn't advertise a JSON response mode. */
+  jsonMode: boolean;
+  /** When this model and its prices were read from the provider. */
+  pricesCheckedAt: string;
+}
+
+/** A model a provider offers, before an account adds it. */
+export type AiProviderCatalogEntry = Omit<AiProviderModel, "id" | "pricesCheckedAt"> & {
+  id: ProviderModelId;
+  description: string;
+};
+
+export interface AiProviderView extends AiProviderInfo {
+  connected: boolean;
+  /** The key's last four characters; the key itself never leaves the server. */
+  keyLastFour: string | null;
+  connectedAt: string | null;
+  connectedBy: string | null;
+  models: AiProviderModel[];
+}
+
+/** GET /api/accounts/:slug/ai-providers. */
+export interface AiProvidersView {
+  canManage: boolean;
+  providers: AiProviderView[];
+  /** The account's current choices, so a page can say which models are in use. */
+  selection: AiModelSelection;
+}
+
+/** GET /api/accounts/:slug/ai-providers/:kind/catalog. */
+export interface AiProviderCatalogView {
+  provider: AiProviderKind;
+  models: AiProviderCatalogEntry[];
+  fetchedAt: string;
+}

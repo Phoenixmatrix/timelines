@@ -6,6 +6,7 @@ import {
   FingerprintIcon,
   GearSixIcon,
   KeyIcon,
+  PlugsConnectedIcon,
   RobotIcon,
   SlidersHorizontalIcon,
   UserCircleIcon,
@@ -51,6 +52,11 @@ export function SettingsPage({
           active: tracker,
         },
         { label: "AI settings", to: `/settings/ai${accountQuery}`, icon: GearSixIcon },
+        {
+          label: "AI providers",
+          to: `/settings/ai-providers${accountQuery}`,
+          icon: PlugsConnectedIcon,
+        },
         { label: "Usage & costs", to: `/settings/usage${accountQuery}`, icon: ChartBarIcon },
         {
           label: "Data retention",

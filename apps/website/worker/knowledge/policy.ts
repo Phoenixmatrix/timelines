@@ -16,5 +16,10 @@ export const LEGACY_KNOWLEDGE_POLICY: KnowledgePolicy = {
 
 export async function knowledgePolicy(env: Env, repoId: string): Promise<KnowledgePolicy> {
   const ai = await repoAiSnapshot(env.DB, repoId);
-  return { ai, atlas: await atlasSettings(env, repoId, ai.models.task) };
+  const atlas = await atlasSettings(env, repoId, ai.models.task);
+  // An account's own provider model (CORE-294) spends at the price its provider
+  // published; a configured environment's price table stays exactly as written.
+  if (ai.prices && atlas.source === "default")
+    return { ai, atlas: { ...atlas, prices: { ...atlas.prices, ...ai.prices } } };
+  return { ai, atlas };
 }

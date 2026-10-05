@@ -38,6 +38,7 @@ import { steps } from "./steps/api.ts";
 import { deployments } from "./deployments/api.ts";
 import { jobRoute } from "./deployments/job.ts";
 import { previewSettingsApi } from "./deployments/settings.ts";
+import { aiProvidersApi } from "./ai-providers/api.ts";
 import { aiSettingsApi, siteAiSettingsApi } from "./settings/ai.ts";
 import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./retention/api.ts";
 import { pricesApi } from "./usage/prices-api.ts";
@@ -100,6 +101,7 @@ api.use(async (c, next) => {
 });
 api.route("/accounts/:slug/settings/previews", previewSettingsApi);
 api.route("/accounts/:slug/settings/ai", aiSettingsApi);
+api.route("/accounts/:slug/ai-providers", aiProvidersApi);
 api.route("/accounts/:slug/settings/retention", accountRetentionApi);
 api.route("/accounts/:slug/retention/runs", accountRunsApi);
 api.route("/admin/retention", siteRetentionApi);
