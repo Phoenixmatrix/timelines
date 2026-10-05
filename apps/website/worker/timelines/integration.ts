@@ -89,8 +89,35 @@ export async function validateDependencies(env: Env, repo: LandingRepo, canonica
     );
 }
 
+/** Attribution is first service-recorded provenance, not where Git objects were authored. */
+async function acknowledgedLocalRevision(
+  env: Env,
+  source: Pick<SourceSnapshot, "repoId" | "sourceId">,
+  oid: string,
+): Promise<boolean> {
+  const member = await env.DB.prepare(`SELECT m.commit_oid FROM source_progress_members m
+    JOIN source_revision_origins origin ON origin.repo_id=m.repo_id
+      AND origin.commit_oid=m.commit_oid AND origin.source_id=m.source_id
+    WHERE m.repo_id=? AND m.source_id=? AND m.commit_oid=?
+      AND (EXISTS (
+        SELECT 1 FROM source_operations o
+        WHERE o.repo_id=m.repo_id AND o.source_id=m.source_id AND o.kind='push' AND o.state='accepted'
+          AND (o.id=m.operation_id OR EXISTS (
+            SELECT 1 FROM json_each(o.data,'$.commands') command
+            WHERE json_extract(command.value,'$.new')=m.commit_oid)))
+        OR EXISTS (
+          SELECT 1 FROM timeline_work_sources s
+          WHERE s.repo_id=m.repo_id AND s.source_id=m.source_id
+            AND s.allocation_operation_id=m.operation_id AND s.state IN ('ready','archived')))`)
+    .bind(source.repoId, source.sourceId, oid)
+    .first<{ commit_oid: string }>();
+  return member !== null;
+}
+
 /** Native merges cannot silently bypass the checkpoint's reviewed dependency edges. */
 export async function validateMergeEdges(
+  env: Env,
+  source: Pick<SourceSnapshot, "repoId" | "sourceId">,
   head: string,
   base: string,
   dependencies: readonly string[],
@@ -100,14 +127,37 @@ export async function validateMergeEdges(
   const covered = new Set(baseline);
   for (const dependency of dependencies)
     for (const oid of await revisionClosure(dependency, read)) covered.add(oid);
-  const source = await revisionClosure(head, read);
-  for (const oid of source) {
+  const local = new Map<string, boolean>();
+  const acknowledged = async (oid: string): Promise<boolean> => {
+    const cached = local.get(oid);
+    if (cached !== undefined) return cached;
+    const result = await acknowledgedLocalRevision(env, source, oid);
+    local.set(oid, result);
+    return result;
+  };
+  for (const oid of await revisionClosure(head, read)) {
     if (baseline.has(oid)) continue;
+    if (!covered.has(oid)) {
+      const origin = await env.DB.prepare(
+        "SELECT source_id FROM source_revision_origins WHERE repo_id=? AND commit_oid=?",
+      )
+        .bind(source.repoId, oid)
+        .first<{ source_id: string }>();
+      if (origin && origin.source_id !== source.sourceId)
+        throw new Error(
+          "blocked_dependency: foreign source ancestry has no reviewed exact logical dependency",
+        );
+    }
     const parents = (await read(oid))!;
-    if (parents.slice(1).some((parent) => !covered.has(parent)))
-      throw new Error(
-        "blocked_dependency: imported merge parent has no reviewed exact logical dependency; explicitly sync/rebase and renew checkpoint",
-      );
+    for (const parent of parents.slice(1)) {
+      if (covered.has(parent)) continue;
+      for (const member of await revisionClosure(parent, read)) {
+        if (covered.has(member) || (await acknowledged(member))) continue;
+        throw new Error(
+          "blocked_dependency: imported merge parent has no reviewed exact logical dependency or acknowledged same-source history; explicitly sync/rebase and renew checkpoint",
+        );
+      }
+    }
   }
 }
 

@@ -1,7 +1,14 @@
 import { describe, expect, test, vi } from "vite-plus/test";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Landing, LandingRepo, Timeline } from "../../shared/timelines.ts";
 import type { SourceSnapshot } from "../../shared/code-source.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
+import { initializeWorkSource, type WorkSourceRow } from "./sources.ts";
+import { retainProgress } from "../git/source-push.ts";
+import type { RepoRow } from "../db.ts";
 import { progress, type LandingDeps } from "./landing.ts";
 import { measure } from "./checkpoints.ts";
 import { lsRefs } from "../artifacts.ts";
@@ -467,6 +474,280 @@ describe("compact landing state", () => {
 });
 
 describe("exact nested admission", () => {
+  test.each(["separate tips", "first merge push", "legacy allocation"])(
+    "%s: local Git branches land without importing WIP ancestry",
+    async (mode) => {
+      const directory = mkdtempSync(join(tmpdir(), "same-source-merge-"));
+      const git = (args: string[], input?: string) =>
+        execFileSync("git", args, {
+          cwd: directory,
+          input,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: "Source test",
+            GIT_AUTHOR_EMAIL: "source@example.com",
+            GIT_COMMITTER_NAME: "Source test",
+            GIT_COMMITTER_EMAIL: "source@example.com",
+          },
+        }).trim();
+      const f = fixture(1);
+      try {
+        git(["init", "--quiet"]);
+        const baseTree = git(["mktree"], "");
+        const blob = git(["hash-object", "-w", "--stdin"], "merged work\n");
+        const workTree = git(["mktree"], `100644 blob ${blob}\twork.txt\n`);
+        const commit = (tree: string, parents: string[], message: string) =>
+          git(["commit-tree", tree, ...parents.flatMap((parent) => ["-p", parent]), "-m", message]);
+        const base = commit(baseTree, [], "B");
+        const left = commit(workTree, [base], "L");
+        const right = commit(workTree, [base], "R");
+        const merge = commit(workTree, [left, right], "WIP merge");
+        const compact = commit(workTree, [base], "Canonical landing");
+        const repo = f.current.repos[0]!;
+        const source = { ...repo.source!, commit: merge, tree: workTree };
+        Object.assign(repo, {
+          source,
+          commit: merge,
+          base,
+          merge: compact,
+          logicalBase: { ...repo.logicalBase!, commit: base, tree: baseTree },
+        });
+        for (const name of ["repo0", "work_0"]) {
+          const graph = f.graphs.get(name)!;
+          graph.clear();
+          for (const hash of [base, left, right, merge, compact]) {
+            const [treeHash, parents, ...message] = git([
+              "show",
+              "-s",
+              "--format=%T%n%P%n%B",
+              hash,
+            ]).split("\n");
+            graph.set(hash, {
+              hash,
+              treeHash: treeHash!,
+              parents: parents ? parents.split(" ") : [],
+              message: message.join("\n"),
+            });
+          }
+        }
+        f.refs.get("repo0")!.set("refs/heads/main", base);
+        f.refs.get("repo0")!.set("refs/heads/gitmatrix/landing/test", compact);
+        f.refs.get("work_0")!.set("refs/heads/work", merge);
+        git(["update-ref", "refs/heads/main", base]);
+        vi.mocked(lsRefs).mockImplementation(async (_env, name) =>
+          [...f.refs.get(name)!].map(([name, oid]) => ({ name, oid })),
+        );
+        const retain = async (id: string, tip: string) => {
+          f.sqlite
+            .prepare(`INSERT INTO source_operations
+          (id,owner_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
+          VALUES(?,'owner','timeline','repo0','work_0','push','accepted',?,'now','now')`)
+            .run(
+              id,
+              JSON.stringify({ commands: [{ ref: "refs/heads/work", old: base, new: tip }] }),
+            );
+          const root = `refs/gitmatrix/progress/${tip}`;
+          git(["update-ref", root, tip]);
+          f.refs.get("work_0")!.set(root, tip);
+          await retainProgress(
+            f.env,
+            {
+              id: "repo0",
+              source_id: "work_0",
+              artifacts_name: "work_0",
+              artifacts_remote: "https://work_0",
+            },
+            id,
+            tip,
+          );
+        };
+        if (mode === "legacy allocation") {
+          f.sqlite
+            .prepare(`UPDATE timeline_work_sources SET state='creating',
+          fork_commit=?,fork_tree=?,initial_commit=?,initial_tree=?,initial_ref='refs/heads/timeline/test'
+          WHERE source_id='work_0'`)
+            .run(base, baseTree, merge, workTree);
+          const tracker = f.env.TRACKER.getByName("owner");
+          Object.assign(tracker, {
+            reserveWorkSource: async () => ({
+              ok: true,
+              value: f.sqlite
+                .prepare("SELECT * FROM timeline_work_sources WHERE source_id='work_0'")
+                .get() as WorkSourceRow,
+            }),
+            transitionWorkSource: async (sourceId: string, version: number, state: string) => ({
+              ok: true,
+              value: f.sqlite
+                .prepare(
+                  "UPDATE timeline_work_sources SET state=?,version=? WHERE source_id=? RETURNING *",
+                )
+                .get(state, version + 1, sourceId) as WorkSourceRow,
+            }),
+          });
+          const get = f.env.ARTIFACTS.get.bind(f.env.ARTIFACTS);
+          Object.assign(f.env.ARTIFACTS, {
+            get: async (name: string) =>
+              Object.assign(await get(name), {
+                info: async () => ({ remote: `https://${name}` }),
+                listTokens: async () => ({ tokens: [] }),
+              }),
+          });
+          await initializeWorkSource(
+            f.env,
+            f.sqlite.prepare("SELECT * FROM repos WHERE id='repo0'").get() as unknown as RepoRow,
+            {
+              timelineId: "timeline",
+              timelineSlug: "test",
+              base: repo.logicalBase!,
+              initialHead: {
+                ...source,
+                sourceId: "canonical",
+                kind: "canonical",
+                ref: "refs/heads/timeline/test",
+              },
+            },
+          );
+          expect(
+            f.sqlite
+              .prepare("SELECT source_id FROM source_revision_origins WHERE commit_oid=?")
+              .get(base),
+          ).toEqual({ source_id: "canonical" });
+        } else {
+          f.sqlite
+            .prepare(
+              "INSERT INTO source_revision_origins(repo_id,commit_oid,source_id) VALUES('repo0',?,'canonical')",
+            )
+            .run(base);
+          if (mode === "separate tips") {
+            await retain("left-push", left);
+            await retain("right-push", right);
+          }
+          await retain("merge-push", merge);
+        }
+        const read = async (hash: string) => f.graphs.get("work_0")!.get(hash)?.parents ?? null;
+        const validate = () => validateMergeEdges(f.env, source, merge, base, [], read);
+        await expect(validate()).resolves.toBeUndefined();
+        const membership = f.sqlite
+          .prepare(
+            "SELECT operation_id,created_at FROM source_progress_members WHERE repo_id='repo0' AND source_id='work_0' AND commit_oid=?",
+          )
+          .get(right) as { operation_id: string; created_at: string };
+        f.sqlite
+          .prepare(
+            "DELETE FROM source_progress_members WHERE repo_id='repo0' AND source_id='work_0' AND commit_oid=?",
+          )
+          .run(right);
+        await expect(validate()).rejects.toThrow("blocked_dependency");
+        f.sqlite
+          .prepare(`INSERT INTO source_progress_members
+        (repo_id,source_id,commit_oid,operation_id,created_at) VALUES(?,?,?,?,?)`)
+          .run("repo0", "work_0", right, membership.operation_id, membership.created_at);
+        f.sqlite
+          .prepare("DELETE FROM source_revision_origins WHERE repo_id='repo0' AND commit_oid=?")
+          .run(right);
+        await expect(validate()).rejects.toThrow("blocked_dependency");
+        f.sqlite
+          .prepare(
+            "INSERT INTO source_revision_origins(repo_id,commit_oid,source_id) VALUES('repo0',?,'work_0')",
+          )
+          .run(right);
+        if (mode !== "legacy allocation") {
+          f.sqlite.exec("UPDATE source_operations SET state='ambiguous'");
+          await expect(validate()).rejects.toThrow("blocked_dependency");
+          f.sqlite.exec("UPDATE source_operations SET state='accepted',repo_id='another-repo'");
+          await expect(validate()).rejects.toThrow("blocked_dependency");
+          f.sqlite.exec("UPDATE source_operations SET repo_id='repo0'");
+        }
+        const foreign = commit(workTree, [base], "Foreign baseline");
+        const localTip = commit(workTree, [foreign], "Local work on foreign baseline");
+        const importedMerge = commit(workTree, [left, localTip], "Imported baseline merge");
+        for (const [hash, parents] of [
+          [foreign, [base]],
+          [localTip, [foreign]],
+          [importedMerge, [left, localTip]],
+        ] as const)
+          f.graphs.get("work_0")!.set(hash, {
+            hash,
+            parents: [...parents],
+            treeHash: workTree,
+            message: "foreign baseline",
+          });
+        f.sqlite
+          .prepare(
+            "INSERT INTO source_revision_origins(repo_id,commit_oid,source_id) VALUES('repo0',?,'foreign')",
+          )
+          .run(foreign);
+        await retain("import-push", localTip);
+        await expect(
+          validateMergeEdges(f.env, source, importedMerge, base, [], read),
+        ).rejects.toThrow("blocked_dependency");
+        // Even a linear import keeps its foreign attribution after physical expiry.
+        await expect(validateMergeEdges(f.env, source, localTip, base, [], read)).rejects.toThrow(
+          "blocked_dependency",
+        );
+        expect(
+          f.sqlite
+            .prepare("SELECT source_id FROM source_revision_origins WHERE commit_oid=?")
+            .get(foreign),
+        ).toEqual({ source_id: "foreign" });
+        f.sqlite.exec(`
+        INSERT INTO timeline_work_sources
+          (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,
+           allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
+           initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,initial_token_revoked)
+        VALUES('descendant','repo0','child','child','owner','descendant','https://descendant','ready',
+          'child-allocation','work_0','${right}','${workTree}','refs/heads/work',
+          'work_0','${right}','${workTree}','refs/heads/work',
+          '2026-10-05T00:00:01.000Z','2026-10-05T00:00:01.000Z',1);
+        INSERT INTO source_progress_members(repo_id,source_id,commit_oid,operation_id,created_at)
+        VALUES('repo0','descendant','${right}','child-allocation','2026-10-05T00:00:01.000Z');`);
+        f.sqlite.exec(`INSERT INTO timeline_work_sources
+        (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,
+         allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
+         initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,initial_token_revoked)
+        VALUES('foreign','repo0','foreign','foreign','owner','foreign','https://foreign','purged',
+          'foreign-allocation','canonical','${base}','${baseTree}','refs/heads/main',
+          'canonical','${base}','${baseTree}','refs/heads/main','now','now',1);`);
+        f.refs.get("work_0")!.set("refs/heads/work", localTip);
+        await expect(
+          measure(f.env, { id: "owner", slug: "owner", displayName: "Owner", isSiteAdmin: false }, {
+            id: "timeline",
+            repos: [repo],
+          } as unknown as Timeline),
+        ).rejects.toThrow("Source expired");
+        f.refs.get("work_0")!.set("refs/heads/work", merge);
+        await expect(validate()).resolves.toBeUndefined();
+        const [checkpoint] = await measure(
+          f.env,
+          { id: "owner", slug: "owner", displayName: "Owner", isSiteAdmin: false },
+          { id: "timeline", repos: [repo] } as unknown as Timeline,
+        );
+        expect(checkpoint!.dependencies).toEqual([]);
+        expect(checkpoint!.logicalBase).toEqual(repo.logicalBase);
+        const write = f.deps.writeRefs.bind(f.deps);
+        f.deps.writeRefs = async (target, changes) => {
+          const results = await write(target, changes);
+          for (const change of changes)
+            if (change.ref === "refs/heads/main" && results.find((r) => r.ref === change.ref)?.ok)
+              git(["update-ref", change.ref, change.new!, change.old!]);
+          return results;
+        };
+        expect((await f.run()).state).toBe("landed");
+        expect(git(["rev-list", "refs/heads/main"]).split("\n")).toEqual([compact, base]);
+        expect(git(["rev-parse", "refs/heads/main^{tree}"])).toBe(workTree);
+        for (const member of [left, right, merge])
+          expect(
+            await admittedReceipts(f.env, { ...source, commit: member }, new Set([base, compact])),
+          ).toMatchObject([
+            { source_id: source.sourceId, canonical_commit: compact, status: "complete" },
+          ]);
+      } finally {
+        f.sqlite.close();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
   test("measurement selects imported P1 after completed admission but preserves a pure P0 child", async () => {
     const f = fixture(1);
     const parent = f.current.repos[0]!;
@@ -486,7 +767,9 @@ describe("exact nested admission", () => {
       (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,initial_token_revoked)
       VALUES('work_child','repo0','child','child','owner','work_child','https://work_child','ready','child-allocation','${p0.sourceId}','${p0.commit}','${p0.tree}','refs/heads/work','${p0.sourceId}','${p0.commit}','${p0.tree}','refs/heads/work','now','now',1);
       INSERT INTO source_progress_members(repo_id,source_id,commit_oid,operation_id,created_at)
-      VALUES('repo0','${p0.sourceId}','${p1.commit}','parent-push','now')`);
+      VALUES('repo0','${p0.sourceId}','${p1.commit}','parent-push','now');
+      INSERT INTO source_revision_origins(repo_id,commit_oid,source_id)
+      VALUES('repo0','${p1.commit}','${p0.sourceId}')`);
     const child = {
       ...parent,
       source: { ...p0, sourceId: "work_child", timelineId: "child" },
@@ -577,6 +860,8 @@ describe("exact nested admission", () => {
     ).rejects.toThrow("blocked_dependency");
   });
   test("unrecorded and incomparable merge inputs block instead of replaying foreign work", async () => {
+    const f = fixture(1),
+      repo = f.current.repos[0]!;
     const graph: Record<string, string[]> = {
       base: [],
       local: ["base"],
@@ -584,12 +869,12 @@ describe("exact nested admission", () => {
       merge: ["local", "foreign"],
     };
     const read = async (oid: string) => graph[oid] ?? null;
-    await expect(validateMergeEdges("merge", "base", [], read)).rejects.toThrow(
-      "blocked_dependency",
-    );
-    await expect(validateMergeEdges("merge", "base", ["foreign"], read)).resolves.toBeUndefined();
-    const f = fixture(1),
-      repo = f.current.repos[0]!;
+    await expect(
+      validateMergeEdges(f.env, repo.source!, "merge", "base", [], read),
+    ).rejects.toThrow("blocked_dependency");
+    await expect(
+      validateMergeEdges(f.env, repo.source!, "merge", "base", ["foreign"], read),
+    ).resolves.toBeUndefined();
     await recordIntent(f.env, f.current, repo, oid(102));
     f.sqlite.exec("UPDATE source_integration_receipts SET status='complete'");
     const dependency = { source: repo.source!, base: repo.logicalBase! };

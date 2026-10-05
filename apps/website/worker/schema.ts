@@ -67,6 +67,11 @@ export interface Database {
     operation_id: string;
     created_at: string;
   };
+  source_revision_origins: {
+    repo_id: string;
+    commit_oid: string;
+    source_id: string;
+  };
   source_integration_receipts: {
     id: string;
     landing_id: string;

@@ -1068,6 +1068,10 @@ wire types.
   progress and pre-rewrite predecessors are rooted, not just checkpoints;
   durable mutation intents fence pushes against admitted landings and keep
   ambiguous provider outcomes fenced until reconciliation.
+  Only a complete negotiated Git `report-status`/`report-status-v2`, consistent
+  with the observed work ref, settles a push. HTTP failures, incomplete or
+  contradictory reports, and mismatched refs remain ambiguous even when the
+  old tip is still visible.
   CI retains the immutable `sourceId` and exact commit, with `timelineSlug`
   identifying its public Git address. Local and Sandbox runners validate the
   trusted origin, canonical repository, slug and source-ID pin before checkout.
@@ -1091,6 +1095,13 @@ wire types.
 - **Merges and progress** retain the work source's full Git history and
   source-qualified ref-update/membership evidence. Push events record agents
   and timeline dependencies; a logical timeline label alone is not source identity.
+  Ordinary local branch merges are allowed, including a merge first published
+  in one push. An immutable repository-qualified revision-origin ledger records
+  first source attribution; accepted pushes or completed allocation prove local
+  membership. Later child copies and source expiry cannot change attribution.
+  Known foreign work still needs exact reviewed integration. This is
+  service-recorded provenance, not proof of where otherwise unknown external
+  Git objects were authored.
 - **Abandoning** is for the accountable person or the agent that started the
   timeline. It ends writes and archives work sources rather than deleting their
   history. Settled partial landings retain successful receipts; abandoning never
@@ -2568,6 +2579,8 @@ its preview claim is released, and Workflow completion/termination is confirmed.
 A `tornDownAt` scheduling marker alone does not acknowledge teardown completion;
 unmanaged previews have no invented teardown job. Unknown Workflow state or a
 failed stop keeps its claim. Completed output metadata does not pin Git forever.
+Revision origins and integration receipts survive source Git expiry; canonical
+repository deletion removes them with the rest of its provenance.
 Retained child dependencies protect required bases and exact ancestry evidence.
 Once eligible sources enter purge, reads return `source_expired` (410), never
 canonical fallback. Canonical deletion tombstones immediately block all work
@@ -3072,8 +3085,8 @@ preview's teardown, a killed purge resumed, the name reused) and the
 
 ## Known gaps
 
-- No branch protection, events, or webhooks yet. `pushed_at` is set when receive-pack
-  returns 200, even if git rejected a ref inside the response.
+- No branch protection, events, or webhooks yet. For canonical pushes, `pushed_at`
+  is set when receive-pack returns 200, even if Git rejected a ref inside the response.
 - READMEs render Markdown without raw HTML, so `<details>` and `<br>` show as text.
 - In testing, imports brought over the default branch only, without tags.
 - Owner slugs `signin`, `new`, `settings`, `tracker`, `api`, `cli-auth`, `-` and the registry prefixes

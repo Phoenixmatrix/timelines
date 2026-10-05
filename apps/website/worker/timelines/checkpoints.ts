@@ -20,7 +20,7 @@ import {
 import { fail } from "../tracker/store.ts";
 import { checkpointSets } from "../knowledge/pages.ts";
 import { resolveTimelineSource } from "./sources.ts";
-import { admittedReceipts, revisionClosure } from "./integration.ts";
+import { admittedReceipts, revisionClosure, validateMergeEdges } from "./integration.ts";
 import type { SourceDependency } from "../../shared/code-source.ts";
 import { pinSourceRoot } from "../retention/work-sources.ts";
 
@@ -79,34 +79,22 @@ export async function measure(
         const value = await objects.readCommit(oid);
         if (!value) fail("blocked_dependency", "A source ancestor is unavailable.", 409);
         pending.push(...value.parents);
-        for (const parent of value.parents.slice(1)) {
-          if (baseMembers.has(parent)) continue;
-          const foreign = await db(env.DB)
-            .selectFrom("source_progress_members as m")
-            .innerJoin("timeline_work_sources as s", "s.source_id", "m.source_id")
-            .selectAll("s")
-            .where("m.repo_id", "=", row.id)
-            .where("m.commit_oid", "=", parent)
-            .where("m.source_id", "!=", physical.source.sourceId)
-            .execute();
-          if (foreign.length > 1)
-            fail(
-              "blocked_dependency",
-              "A merge parent belongs to multiple foreign sources; explicitly sync/rebase.",
-              409,
-            );
-          const owner = foreign[0];
-          if (
-            !owner ||
-            dependencies.some(
-              (dependency) =>
-                dependency.source.sourceId === owner.source_id &&
-                dependency.source.commit === parent,
-            )
+        const owner = await db(env.DB)
+          .selectFrom("source_revision_origins as origin")
+          .innerJoin("timeline_work_sources as s", "s.source_id", "origin.source_id")
+          .selectAll("s")
+          .where("origin.repo_id", "=", row.id)
+          .where("s.repo_id", "=", row.id)
+          .where("origin.commit_oid", "=", oid)
+          .where("origin.source_id", "!=", physical.source.sourceId)
+          .executeTakeFirst();
+        if (!owner) continue;
+        if (
+          !dependencies.some(
+            (dependency) =>
+              dependency.source.sourceId === owner.source_id && dependency.source.commit === oid,
           )
-            continue;
-          const metadata = await objects.readCommit(parent);
-          if (!metadata) fail("blocked_dependency", "Foreign source snapshot is unavailable.", 409);
+        )
           dependencies.push({
             source: {
               sourceId: owner.source_id,
@@ -114,8 +102,8 @@ export async function measure(
               kind: "timeline-work",
               timelineId: owner.timeline_id,
               ref: owner.work_ref,
-              commit: parent,
-              tree: metadata.treeHash,
+              commit: oid,
+              tree: value.treeHash,
             },
             base: {
               sourceId: owner.fork_source_id,
@@ -127,7 +115,13 @@ export async function measure(
               tree: owner.fork_tree,
             },
           });
-        }
+        // This exact imported snapshot covers its full ancestry, including
+        // older foreign revisions. Provenance outlives the source's objects.
+        for (const member of await revisionClosure(
+          oid,
+          async (hash) => (await objects.readCommit(hash))?.parents ?? null,
+        ))
+          visited.add(member);
       }
       // Select only from snapshots actually imported into this source, never
       // from a parent's newer landing tip. Persist this choice in the checkpoint.
@@ -161,6 +155,20 @@ export async function measure(
         // fresh checkpoint after proof exists may select a different baseline.
         if (uniquelyAdmitted && candidates.size === 1)
           logicalBase = candidates.values().next().value!;
+      }
+      try {
+        await validateMergeEdges(
+          env,
+          physical.source,
+          commit,
+          logicalBase.commit,
+          dependencies.map((dependency) => dependency.source.commit),
+          async (oid) => (await objects.readCommit(oid))?.parents ?? null,
+        );
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.startsWith("blocked_dependency:"))
+          throw error;
+        fail("blocked_dependency", error.message, 409);
       }
       for (const dependency of dependencies)
         if (dependency.source.sourceId !== physical.source.sourceId)

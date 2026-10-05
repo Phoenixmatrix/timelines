@@ -350,6 +350,8 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
           throw new Error("blocked_dependency: pinned source tree is unavailable or mismatched");
       }
       await validateMergeEdges(
+        ctx.env,
+        repo.source,
         repo.commit,
         repo.logicalBase.commit,
         repo.dependencies.map((dependency) => dependency.source.commit),

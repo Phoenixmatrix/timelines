@@ -13,7 +13,7 @@ import { landingBranch } from "../../shared/timelines.ts";
 import { isQueueSourceBranch } from "../../shared/merge-queue.ts";
 import { afterPush } from "./effects.ts";
 import { recordPush } from "../ref-log/record.ts";
-import { readReceivePackCommands, type ReceiveCommand } from "./receive-pack.ts";
+import { readReceivePackCommands, receivePackReport, type ReceiveCommand } from "./receive-pack.ts";
 import { resolveSource, getWorkSource, workGitPath } from "../timelines/sources.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { retainProgress, reconcileSourcePushes } from "./source-push.ts";
@@ -327,12 +327,18 @@ async function workPush(
     // Consume the response before checking durable state. A 200 is not a Git acknowledgement.
     const response = respond(upstream);
     const bytes = await protocolBytes(response);
+    if (!response.ok) throw new Error("Ambiguous source push HTTP outcome.");
+    const report = receivePackReport(bytes, request);
     const refs = await lsRefs(c.env, repo.artifacts_name, repo.artifacts_remote, [
       "refs/heads/work",
     ]);
     const tip = refs.find((ref) => ref.name === "refs/heads/work")?.oid;
-    const accepted = commands.every((command) => command.new === tip);
-    const rejected = commands.every((command) => command.old === (tip ?? null));
+    const accepted = commands.every(
+      (command) => report.get(command.ref) === "ok" && command.new === tip,
+    );
+    const rejected = commands.every(
+      (command) => report.get(command.ref) === "ng" && command.old === (tip ?? null),
+    );
     if (!accepted && !rejected) throw new Error("Ambiguous source push outcome.");
     if (accepted) {
       for (const command of commands) await retainProgress(c.env, repo, operationId, command.new);

@@ -51,6 +51,7 @@ export const REPO_TABLES = [
   "step_contexts",
   "source_operations",
   "source_progress_members",
+  "source_revision_origins",
   "source_integration_receipts",
   "source_integration_inputs",
   "source_integration_members",

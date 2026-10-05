@@ -10,6 +10,13 @@
 - Native timeline Git uses `/<owner>/<repo>@<slug>.git`. Canonical `timeline/*`
   pushes are refused with the timeline URL. The CLI pins immutable source IDs,
   keeps bound pushes out of the generic queue, and requires explicit unbinding.
+- Same-source WIP branch merges compact normally, including a first merged push.
+  Immutable first-observation provenance prevents later copies or source expiry
+  from disguising known foreign work. Legacy conversion attributes historical
+  timeline WIP to its owned source.
+- Work push fences settle only on complete negotiated Git status consistent with
+  the observed ref. HTTP failures and malformed or contradictory reports stay
+  ambiguous; seeing the old tip alone cannot release the fence.
 - Landing applies the approved logical-base-to-work tree delta onto pinned main,
   gates a single-parent candidate, and records exact integration provenance.
   WIP commits are not uploaded to canonical. All repositories prepare and gate

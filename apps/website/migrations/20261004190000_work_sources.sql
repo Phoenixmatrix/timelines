@@ -23,6 +23,11 @@ CREATE TABLE source_progress_members (
   operation_id TEXT NOT NULL, created_at TEXT NOT NULL,
   PRIMARY KEY(repo_id,source_id,commit_oid)
 );
+-- First service-recorded source attribution survives copies and source expiry.
+CREATE TABLE source_revision_origins (
+  repo_id TEXT NOT NULL, commit_oid TEXT NOT NULL, source_id TEXT NOT NULL,
+  PRIMARY KEY(repo_id,commit_oid)
+);
 CREATE TABLE source_integration_receipts (
   id TEXT PRIMARY KEY, landing_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL,
   repo_id TEXT NOT NULL, source_id TEXT NOT NULL, source_commit TEXT NOT NULL,

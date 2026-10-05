@@ -42,6 +42,11 @@ export async function retainProgress(
     if (!metadata) throw new Error(`Progress commit ${oid} is unavailable.`);
     pending.push(...metadata.parents);
     await db(env.DB)
+      .insertInto("source_revision_origins")
+      .values({ repo_id: repo.id, source_id: repo.source_id, commit_oid: oid })
+      .onConflict((oc) => oc.columns(["repo_id", "commit_oid"]).doNothing())
+      .execute();
+    await db(env.DB)
       .insertInto("source_progress_members")
       .values({
         repo_id: repo.id,

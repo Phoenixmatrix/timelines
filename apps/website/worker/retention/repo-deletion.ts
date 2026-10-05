@@ -1091,6 +1091,7 @@ export const CHILD_ROWS: [table: string, where: string][] = [
   ["source_integration_inputs", "repo_id = ?1"],
   ["source_integration_receipts", "repo_id = ?1"],
   ["source_progress_members", "repo_id = ?1"],
+  ["source_revision_origins", "repo_id = ?1"],
   ["source_operations", "repo_id = ?1"],
   ["timeline_work_sources", "repo_id = ?1 AND state = 'purged'"],
   ["merge_queue", "repo_id = ?1"],

@@ -269,6 +269,20 @@ export async function initializeWorkSource(
   const verified = await lsRefs(env, row.artifacts_name, row.artifacts_remote!);
   if (verified.find((ref) => ref.name === row.work_ref)?.oid !== row.initial_commit)
     fail("source_not_ready", "The pinned work ref changed during initialization.", 409);
+  const baseline = new Set<string>();
+  const basePending = [row.fork_commit];
+  while (basePending.length) {
+    const oid = basePending.pop()!;
+    if (baseline.has(oid)) continue;
+    const commit = await owned.readCommit(oid);
+    if (!commit) fail("source_not_ready", "The logical base graph is incomplete.", 409);
+    baseline.add(oid);
+    basePending.push(...commit.parents);
+  }
+  // Legacy timeline/* heads lived physically in canonical storage, but their
+  // revisions outside the pinned fork graph are this timeline's historical WIP.
+  const migratedWork =
+    row.initial_source_id === "canonical" && row.initial_ref.startsWith("refs/heads/timeline/");
   const pending = [row.initial_commit];
   const members = new Set<string>();
   while (pending.length) {
@@ -278,6 +292,19 @@ export async function initializeWorkSource(
     if (!commit) fail("source_not_ready", "The initial source graph is incomplete.", 409);
     members.add(oid);
     pending.push(...commit.parents);
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO source_revision_origins(repo_id,commit_oid,source_id) VALUES(?,?,?)",
+    )
+      .bind(
+        row.repo_id,
+        oid,
+        baseline.has(oid)
+          ? row.fork_source_id
+          : migratedWork
+            ? row.source_id
+            : row.initial_source_id,
+      )
+      .run();
     await env.DB.prepare(
       "INSERT OR IGNORE INTO source_progress_members(repo_id,source_id,commit_oid,operation_id,created_at) VALUES(?,?,?,?,?)",
     )

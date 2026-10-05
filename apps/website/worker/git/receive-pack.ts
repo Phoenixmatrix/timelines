@@ -7,6 +7,8 @@
 //   command-list    = PKT-LINE(command NUL capability-list) *PKT-LINE(command) flush-pkt
 //   command         = old-id SP new-id SP name
 
+import { parsePktLines } from "./pktline.ts";
+
 export interface ReceiveCommand {
   old: string;
   new: string;
@@ -15,6 +17,7 @@ export interface ReceiveCommand {
 
 export interface ReceivePackRequest {
   commands: ReceiveCommand[];
+  capabilities: string[];
   /** A signed push; commands are extracted for routing, never signature validation. */
   pushCert: boolean;
   /** The whole request again, the bytes already read first, to send on. */
@@ -40,6 +43,7 @@ export async function readReceivePackCommands(
   let offset = 0;
   let ended = false;
   const commands: ReceiveCommand[] = [];
+  let capabilities: string[] = [];
   let pushCert = false;
   let certificate: "headers" | "commands" | "signature" | null = null;
 
@@ -106,6 +110,7 @@ export async function readReceivePackCommands(
       const nul = text.indexOf("\0");
       if (nul !== -1) {
         if (commands.length) throw new Error("Capabilities after the first command");
+        capabilities = text.slice(nul + 1).split(" ");
         text = text.slice(0, nul);
       }
       const match = COMMAND.exec(text);
@@ -134,5 +139,96 @@ export async function readReceivePackCommands(
       return reader.cancel(reason);
     },
   });
-  return { commands, pushCert, body };
+  return { commands, capabilities, pushCert, body };
+}
+
+/**
+ * A complete, negotiated report is evidence; an HTTP status or an observed old
+ * ref is not. v2 rewrites must still describe exactly the admitted update.
+ */
+export function receivePackReport(bytes: Uint8Array, request: ReceivePackRequest) {
+  const v2 = request.capabilities.includes("report-status-v2");
+  if (!v2 && !request.capabilities.includes("report-status"))
+    throw new Error("Missing receive-pack report-status negotiation.");
+  if (request.capabilities.includes("side-band-64k")) {
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    let flushed = false;
+    for (const line of parsePktLines(bytes)) {
+      if (flushed) throw new Error("Data after receive-pack sideband flush.");
+      if (line.type === "flush") {
+        flushed = true;
+        continue;
+      }
+      if (line.type !== "data" || !line.data.length)
+        throw new Error("Invalid receive-pack sideband packet.");
+      const channel = line.data[0];
+      if (channel === 2) continue;
+      if (channel !== 1) throw new Error("Receive-pack sideband failure.");
+      const payload = line.data.subarray(1);
+      chunks.push(payload);
+      size += payload.length;
+    }
+    if (!flushed) throw new Error("Incomplete receive-pack sideband.");
+    bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.length;
+    }
+  }
+  const statuses = new Map<string, "ok" | "ng">();
+  const commands = new Map(request.commands.map((command) => [command.ref, command]));
+  let unpack: string | undefined;
+  let flushed = false;
+  let current: ReceiveCommand | undefined;
+  const options = new Set<string>();
+  for (const line of parsePktLines(bytes)) {
+    if (flushed) throw new Error("Data after receive-pack report flush.");
+    if (line.type === "flush") {
+      flushed = true;
+      continue;
+    }
+    if (line.type !== "data") throw new Error("Invalid receive-pack report packet.");
+    const text = decoder.decode(line.data).replace(/\n$/, "");
+    if (/[\0\n\r]/.test(text)) throw new Error("Invalid receive-pack report line.");
+    if (unpack === undefined) {
+      if (!text.startsWith("unpack ") || text.length === 7)
+        throw new Error("Missing receive-pack unpack result.");
+      unpack = text.slice(7);
+      continue;
+    }
+    if (text.startsWith("option ")) {
+      if (!v2 || !current || statuses.get(current.ref) !== "ok")
+        throw new Error("Unexpected receive-pack report option.");
+      const [, name, value, extra] = text.split(" ");
+      if (!name || options.has(name) || extra !== undefined)
+        throw new Error("Invalid receive-pack report option.");
+      options.add(name);
+      if (
+        !(
+          (name === "refname" && value === current.ref) ||
+          (name === "old-oid" && value === current.old) ||
+          (name === "new-oid" && value === current.new) ||
+          (name === "forced-update" && value === undefined)
+        )
+      )
+        throw new Error("Receive-pack report does not describe the admitted update.");
+      continue;
+    }
+    const match = /^(ok) (\S+)$|^(ng) (\S+) (.+)$/.exec(text);
+    const status = match?.[1] ?? match?.[3];
+    const ref = match?.[2] ?? match?.[4];
+    if (!ref || (status !== "ok" && status !== "ng") || statuses.has(ref))
+      throw new Error("Invalid or duplicate receive-pack ref result.");
+    current = commands.get(ref);
+    if (!current) throw new Error("Unexpected receive-pack ref result.");
+    if (unpack !== "ok" && status === "ok")
+      throw new Error("Contradictory receive-pack unpack result.");
+    statuses.set(ref, status);
+    options.clear();
+  }
+  if (!flushed || unpack === undefined || statuses.size !== commands.size)
+    throw new Error("Incomplete receive-pack report.");
+  return statuses;
 }
