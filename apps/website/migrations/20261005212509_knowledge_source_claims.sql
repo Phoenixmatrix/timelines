@@ -41,21 +41,21 @@ BEGIN SELECT RAISE(ABORT, 'Source expired; new consumer admission is closed'); E
 CREATE TRIGGER knowledge_pages_source_admission_insert BEFORE INSERT ON kg_page_sets
 WHEN NEW.source_id!='canonical' AND NEW.status='queued'
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT RAISE(ABORT, 'Knowledge source unavailable') WHERE NOT EXISTS (
     SELECT 1 FROM timeline_work_sources s JOIN repos p ON p.id=s.repo_id
     WHERE s.repo_id=NEW.repo_id AND s.source_id=NEW.source_id
       AND s.state='ready' AND s.expiry_requested_at IS NULL AND p.deleted_at IS NULL
-  ) THEN RAISE(ABORT, 'Knowledge source unavailable') END;
+  );
 END;
 CREATE TRIGGER knowledge_pages_source_admission_update BEFORE UPDATE OF status,build_id ON kg_page_sets
 WHEN NEW.source_id!='canonical' AND NEW.status IN ('queued','writing')
   AND (NEW.status IS NOT OLD.status OR NEW.build_id IS NOT OLD.build_id)
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT RAISE(ABORT, 'Knowledge source unavailable') WHERE NOT EXISTS (
     SELECT 1 FROM timeline_work_sources s JOIN repos p ON p.id=s.repo_id
     WHERE s.repo_id=NEW.repo_id AND s.source_id=NEW.source_id
       AND s.state='ready' AND s.expiry_requested_at IS NULL AND p.deleted_at IS NULL
-  ) THEN RAISE(ABORT, 'Knowledge source unavailable') END;
+  );
 END;
 CREATE TRIGGER knowledge_pages_source_queue_insert AFTER INSERT ON kg_page_sets
 WHEN NEW.source_id!='canonical' AND NEW.status='queued'
@@ -80,10 +80,10 @@ BEGIN
   FROM timeline_source_roots r WHERE r.repo_id=NEW.repo_id AND r.source_id=NEW.source_id
     AND r.consumer_kind='knowledge-pages' AND r.commit_oid=NEW.commit_oid
     AND r.consumer_id=NEW.repo_id||':'||NEW.source_id||':'||NEW.ref||':'||NEW.set_key;
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT RAISE(ABORT, 'Page workflow requires an admitted exact source claim') WHERE NOT EXISTS (
     SELECT 1 FROM timeline_source_roots r WHERE r.repo_id=NEW.repo_id AND r.source_id=NEW.source_id
       AND r.consumer_kind='knowledge-pages-build' AND r.consumer_id=NEW.build_id AND r.commit_oid=NEW.commit_oid
-  ) THEN RAISE(ABORT, 'Page workflow requires an admitted exact source claim') END;
+  );
   DELETE FROM timeline_source_roots WHERE consumer_kind='knowledge-pages'
     AND repo_id=NEW.repo_id AND source_id=NEW.source_id
     AND consumer_id=NEW.repo_id||':'||NEW.source_id||':'||NEW.ref||':'||NEW.set_key;

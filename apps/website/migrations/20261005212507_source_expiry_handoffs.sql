@@ -9,7 +9,7 @@ DROP TRIGGER ci_work_source_admission;
 CREATE TRIGGER ci_work_source_admission BEFORE INSERT ON ci_runs
 WHEN NEW.source_id != 'canonical'
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT RAISE(ABORT, 'CI source unavailable') WHERE NOT EXISTS (
     SELECT 1 FROM timeline_work_sources s JOIN repos p ON p.id=s.repo_id
     WHERE s.source_id=NEW.source_id AND s.repo_id=NEW.repo_id AND s.state IN ('ready','archived')
       AND (p.deleted_at IS NULL OR (NEW.preview_action='teardown' AND EXISTS (
@@ -21,14 +21,14 @@ BEGIN
           AND d.teardown_completed_at IS NULL AND d.teardown_unmanaged_at IS NULL
           AND r.repo_id=d.repo_id AND r.source_id=d.source_id AND r.commit_oid=d.commit_oid
       )))
-  ) THEN RAISE(ABORT, 'CI source unavailable') END;
+  );
 END;
 
 DROP TRIGGER deployment_work_source_admission;
 CREATE TRIGGER deployment_work_source_admission BEFORE INSERT ON deployments
 WHEN NEW.source_id != 'canonical'
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT RAISE(ABORT, 'Deployment source unavailable') WHERE NOT EXISTS (
     SELECT 1 FROM timeline_work_sources s JOIN repos p ON p.id=s.repo_id
     WHERE s.source_id=NEW.source_id AND s.repo_id=NEW.repo_id
       AND s.state IN ('ready','archived') AND p.deleted_at IS NULL
@@ -40,7 +40,7 @@ BEGIN
           AND j.source_id=NEW.source_id AND j.status='running'
           AND r.repo_id=NEW.repo_id AND r.source_id=NEW.source_id AND r.commit_oid=NEW.commit_oid
       ))
-  ) THEN RAISE(ABORT, 'Deployment source unavailable') END;
+  );
 END;
 
 DROP TRIGGER source_root_expiry_insert;
@@ -77,13 +77,13 @@ BEGIN SELECT RAISE(ABORT, 'Source expired; new consumer admission is closed'); E
 CREATE TRIGGER preview_teardown_parent_admission BEFORE INSERT ON ci_runs
 WHEN NEW.preview_teardown_of IS NOT NULL
 BEGIN
-  SELECT CASE WHEN NEW.preview_action IS NOT 'teardown' OR NOT EXISTS (
+  SELECT RAISE(ABORT, 'Teardown requires an unclaimed exact deployment parent') WHERE NEW.preview_action IS NOT 'teardown' OR NOT EXISTS (
     SELECT 1 FROM deployments d WHERE d.id=NEW.preview_teardown_of
       AND d.repo_id=NEW.repo_id AND d.source_id=NEW.source_id AND d.commit_oid=NEW.commit_oid
       AND d.timeline_slug=NEW.timeline_slug AND d.checkpoint_id IS NEW.checkpoint_id
       AND d.status='expired' AND d.teardown_completed_at IS NULL AND d.teardown_unmanaged_at IS NULL
       AND d.teardown_run_id IS NULL
-  ) THEN RAISE(ABORT, 'Teardown requires an unclaimed exact deployment parent') END;
+  );
 END;
 CREATE TRIGGER preview_teardown_parent_claim AFTER INSERT ON ci_runs
 WHEN NEW.preview_teardown_of IS NOT NULL
