@@ -130,6 +130,24 @@ export class TestServer {
     return (served.body ? JSON.parse(served.body) : undefined) as T;
   }
 
+  /** Call the world's server as one of its agents (by id), as its token would. */
+  async callAsAgent<T>(agentId: string, method: string, path: string, body?: unknown): Promise<T> {
+    const served = await this.#serve(
+      method,
+      path,
+      [
+        ["x-browser-test-agent", agentId],
+        ...(body === undefined
+          ? []
+          : ([["content-type", "application/json"]] as [string, string][])),
+      ],
+      body === undefined ? null : JSON.stringify(body),
+    );
+    if (served.status >= 400)
+      throw new Error(`${method} ${path}: ${served.status} ${served.body.slice(0, 500)}`);
+    return (served.body ? JSON.parse(served.body) : undefined) as T;
+  }
+
   /** Act as someone else from now on (null: signed out). */
   async as(persona: Persona): Promise<void> {
     await browserCommands.gmWorld("as", { world: this.#world(), persona });

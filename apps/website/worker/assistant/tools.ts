@@ -6,7 +6,12 @@
 
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
-import { issuePickup, type Issue, type Snapshot } from "../../shared/tracker.ts";
+import {
+  issuePickup,
+  type Issue,
+  type MutationResult,
+  type Snapshot,
+} from "../../shared/tracker.ts";
 import {
   hasRequirements,
   parseRequirements,
@@ -641,7 +646,7 @@ export function buildTools(context: ToolContext) {
     }),
     update_issue: tool({
       description:
-        "Change an issue's fields. Status changes on issues someone holds a lease on are refused by the tracker.",
+        "Change an issue's fields. Status changes on issues someone holds a lease on are refused by the tracker. When new requires no longer allow the agent holding the issue, the result's claimEffect says who and what it misses, and whether the claim was released (releaseClaim: true) or kept; tell the person.",
       inputSchema: z.object({
         owner: OWNER,
         key: KEY,
@@ -659,6 +664,12 @@ export function buildTools(context: ToolContext) {
               .optional()
               .describe("Replaces the issue's tags (from the tracker's tag catalog)"),
             labels: z.array(z.string()).optional().describe("Old name of tags"),
+            releaseClaim: z
+              .boolean()
+              .optional()
+              .describe(
+                "With new requires on a claimed issue: true releases the claim of an agent the new requirements no longer allow; otherwise the claim is kept. Either way the result reports who is affected.",
+              ),
             requires: z
               .string()
               .max(1000)
@@ -685,9 +696,19 @@ export function buildTools(context: ToolContext) {
           operationId: crypto.randomUUID(),
           mutations: [{ kind: "issue.update", id: issue.id, expectedVersion: issue.version, data }],
         });
-        return r.ok
-          ? { updated: issue.key, url: `/tracker/${owner}/issues/${issue.key}` }
-          : failed(r);
+        if (!r.ok) return failed(r);
+        // Tightened requirements on a claimed issue (CORE-272): say who's affected.
+        const effect = (r.body as MutationResult).results?.[0]?.claimEffect;
+        return {
+          updated: issue.key,
+          url: `/tracker/${owner}/issues/${issue.key}`,
+          ...(effect
+            ? {
+                claimEffect: effect,
+                note: `${effect.released ? "Released" : "Kept"} the claim held by ${effect.agent}: it ${effect.unmet.map((u) => u.message).join("; ")}.${effect.released ? "" : " Pass releaseClaim: true to release it instead."}`,
+              }
+            : {}),
+        };
       },
     }),
     comment_on_issue: tool({

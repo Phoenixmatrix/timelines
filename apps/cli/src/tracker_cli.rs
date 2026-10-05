@@ -242,7 +242,7 @@ pub struct IssuePatch {
     /// Setting status to canceled requires closeReason: duplicate, not_planned,
     /// obsolete, cannot_reproduce or other. Leaving canceled clears closeReason
     /// automatically, as leaving required clears timelinePolicy.
-    #[arg(long, required_unless_present_any=["timeline_use","timeline_policy","requires","clear_requires","pickup","tags","drop_tags"])]
+    #[arg(long, required_unless_present_any=["timeline_use","timeline_policy","requires","clear_requires","pickup","tags","drop_tags","require_issue_tags"])]
     pub data: Option<String>,
     /// Pickup policy; only a person can change an existing restricted policy.
     #[arg(long, value_parser=["anyone","not_ready","human_only"])]
@@ -254,6 +254,15 @@ pub struct IssuePatch {
     /// Remove a tag (repeat).
     #[arg(long = "drop-tag", value_name = "TAG")]
     pub drop_tags: Vec<String>,
+    /// Require agents tagged with this issue's saved tags: adds a `tag:` term for
+    /// each to its requirements.
+    #[arg(long)]
+    pub require_issue_tags: bool,
+    /// When new requirements no longer allow the agent holding the issue, release
+    /// its claim instead of keeping it (tracker owners and the agent's person).
+    /// Either way gm prints who's affected and the issue records it.
+    #[arg(long)]
+    pub release_claim: bool,
     #[command(flatten)]
     pub timeline: TimelineRule,
     #[command(flatten)]

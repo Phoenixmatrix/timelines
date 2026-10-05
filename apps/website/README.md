@@ -1101,6 +1101,28 @@ read as `agent_decides`.
     terms are `requires:ux` (`requires:tag:ux`, `requires:none`) and
     `eligible:<agent>` (`eligible:me` for the acting agent). Settings > Agents
     shows each agent's eligible open work per tracker (`GET /api/agent-eligibility`).
+  - _Requirements usability (CORE-272)._ The create dialog edits requirements with
+    the inspector's editor, and both offer **Require agents tagged with this
+    issue's tags** (`gm issue update --require-issue-tags`). **Tightening a claimed
+    issue is never silent:** when new `requires` no longer allow the agent holding
+    it (`tighteningEffect` in `shared/tracker-query.ts`, the same on both sides),
+    the inspector asks first, naming the holder, its session and what it misses,
+    and offers **Release the claim** or **Keep it**. `issue.update` then reports
+    `results[].claimEffect {actorId, agent, session, unmet, released}` and adds a
+    comment recording either choice. `releaseClaim: true` releases it (the issue
+    goes back to `todo`, unassigned from that agent so `next` does not hand it back); only a tracker owner or the agent's accountable person,
+    acting as themselves, may (403 otherwise). Without it the claim is kept. A
+    claim's own assignment doesn't exempt its holder here; people's claims are
+    never affected. gm prints the effect and takes `--release-claim`, and the
+    assistant's `update_issue` reports it and takes `releaseClaim`. List rows show
+    up to two issue tags (a `+N` for the rest) and board cards one; the
+    `requires` mark's tooltip and accessible name read plainly ("Only agents
+    tagged ux and with model claude-opus-*", `requirementsSentence`). The
+    inspector's eligible-agents list adds the profile change that would meet
+    each mismatch (`profileFix`), Settings > Agents lists a few issues each agent
+    can take now (`AgentWork.takeable`), and `issue.next` adds
+    `skipped.blocking` (the terms that kept the most issues) with the
+    `gm agent setup` flag that would meet them in its message.
   - _A lease covers its subtree._ Claiming a parent (allowed even with open
     sub-issues, which are never offered as work themselves) excludes everyone else
     below it; status and parent changes there need the covering token. The holder

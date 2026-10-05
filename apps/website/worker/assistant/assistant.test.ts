@@ -333,4 +333,44 @@ describe("issue requirements in the assistant's tools (CORE-32)", () => {
       expect(found.issues.map((i) => [i.key, i.tags])).toEqual([["CORE-1", ["UX"]]]);
     }
   });
+
+  test("tightening a claimed issue reports who's affected and can release the claim (CORE-272)", async () => {
+    const sent: Record<string, unknown>[] = [];
+    const issue = { id: "i1", key: "CORE-1", version: 3, teamId: "t", title: "x", labels: [] };
+    const effect = {
+      actorId: "agt",
+      agent: "builder",
+      session: "laptop",
+      unmet: [{ requirement: "tags", wanted: "tag:gpu", reported: null, message: "needs tag gpu" }],
+      released: true,
+    };
+    const api = async (method: string, _path: string, body?: unknown) => {
+      if (method === "GET")
+        return { status: 200, ok: true, body: { teams: [], issues: [issue], links: [] } };
+      sent.push((body as { mutations: { data: Record<string, unknown> }[] }).mutations[0]!.data);
+      return {
+        status: 200,
+        ok: true,
+        body: { events: [], results: [{ id: "i1", claimEffect: effect }] },
+      };
+    };
+    const { writes } = buildTools({
+      api: api as never,
+      writes: true,
+      approve: false,
+      navigate: false,
+    });
+    const result = await (
+      writes.update_issue!.execute as (i: unknown, o: unknown) => Promise<unknown>
+    )(
+      { owner: "o", key: "CORE-1", changes: { requires: "tag:gpu", releaseClaim: true } },
+      { toolCallId: "t", messages: [] },
+    );
+    expect(sent[0]).toEqual({ requires: { tags: ["gpu"] }, releaseClaim: true });
+    expect(result).toMatchObject({
+      updated: "CORE-1",
+      claimEffect: effect,
+      note: "Released the claim held by builder: it needs tag gpu.",
+    });
+  });
 });

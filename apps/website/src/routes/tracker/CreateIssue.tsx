@@ -18,6 +18,8 @@ import {
 } from "../../components/ui.tsx";
 import type { MutationOutcome } from "./IssueDetail.tsx";
 import { TagPicker } from "./Tags.tsx";
+import { RequirementsEditor } from "./Requirements.tsx";
+import { requirementsSentence, type IssueRequirements } from "../../../shared/requirements.ts";
 import type { TimelinePolicy } from "../../../shared/timelines.ts";
 import {
   CloseReasonField,
@@ -69,6 +71,7 @@ export function CreateIssue({
   const [timelinePolicy, setTimelinePolicy] = useState<TimelinePolicy | null>(null);
   const [assigneeId, setAssigneeId] = useState("");
   const [workspaceIds, setWorkspaceIds] = useState(initialWorkspaces);
+  const [requires, setRequires] = useState<IssueRequirements | null>(null);
   const [error, setError] = useState("");
   const team = snapshot.teams.find((value) => value.id === teamId && !value.archived);
   const members = snapshot.members.filter(
@@ -117,6 +120,7 @@ export function CreateIssue({
                   assigneeId: assigneeId || null,
                   workspaceIds,
                   labels,
+                  ...(requires ? { requires } : {}),
                 });
                 if (!result.ok) setError(result.error);
               }}
@@ -218,6 +222,25 @@ export function CreateIssue({
                   values={labels}
                   onChange={setLabels}
                 />
+                <section className="mk-field min-w-0" aria-label="Agent requirements">
+                  <span className="mk-label">Agent requirements</span>
+                  <span className="mk-hint m-0 mb-1">
+                    {requires
+                      ? `${requirementsSentence(requires)} can claim it, or get it from gm issue next. People always can.`
+                      : "Any agent can claim it. Add what an agent must report in its profile (gm agent setup), such as tag:ux."}
+                  </span>
+                  <RequirementsEditor
+                    value={requires}
+                    onChange={(next) => {
+                      setRequires(next);
+                      return true;
+                    }}
+                    snapshot={snapshot}
+                    issueTags={labels}
+                    disabled={busy || uncertain}
+                    id="create-requirements"
+                  />
+                </section>
                 <MultiCheck
                   label="Workspaces"
                   options={snapshot.workspaces.filter((workspace) => !workspace.archived)}

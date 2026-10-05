@@ -374,7 +374,66 @@ export function unmetRequirements(
   return unmet;
 }
 
+/**
+ * Requirements in plain words, for a tooltip or a sentence (CORE-272): "Only
+ * agents tagged ux, with model claude-opus-* or gpt-5*, and at least 16GiB of
+ * memory". Empty when there are none.
+ */
+export function requirementsSentence(requires: IssueRequirements | null | undefined): string {
+  if (!requires || !hasRequirements(requires)) return "";
+  const any = (values: string[]) =>
+    values.length > 1 ? `${values.slice(0, -1).join(", ")} or ${values.at(-1)}` : values[0]!;
+  const all = (values: string[]) =>
+    values.length > 1 ? `${values.slice(0, -1).join(", ")} and ${values.at(-1)}` : values[0]!;
+  const parts: string[] = [];
+  if (requires.tags?.length) parts.push(`tagged ${all(requires.tags)}`);
+  if (requires.skills?.length)
+    parts.push(`with skill${requires.skills.length > 1 ? "s" : ""} ${all(requires.skills)}`);
+  if (requires.models?.length) parts.push(`with model ${any(requires.models)}`);
+  if (requires.harnesses?.length) parts.push(`in ${any(requires.harnesses)}`);
+  if (requires.os?.length) parts.push(`on ${any(requires.os)}`);
+  if (requires.arch?.length) parts.push(`on ${any(requires.arch)}`);
+  if (requires.runtime?.length) parts.push(`running on ${any(requires.runtime)}`);
+  if (requires.minMemory !== undefined)
+    parts.push(`with at least ${formatBytes(requires.minMemory)} of memory`);
+  if (requires.minCpus !== undefined) parts.push(`with at least ${requires.minCpus} CPUs`);
+  return `Only agents ${parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0]}`;
+}
+
+/** Requirements plus `tag:` terms for these issue tags (the ones usable as requirement values). */
+export function withIssueTags(
+  requires: IssueRequirements | null | undefined,
+  tags: readonly string[],
+): IssueRequirements | null {
+  const usable = tags
+    .map((tag) => tag.trim().toLowerCase())
+    .filter((tag) => tag.length <= 100 && VALUE.test(tag));
+  return normalizeRequirements({ ...requires, tags: [...(requires?.tags ?? []), ...usable] });
+}
+
 /** "builder doesn't meet CORE-12's requirements: needs tag ux (…); needs …." */
 export function unmetText(agent: string, key: string, unmet: UnmetRequirement[]): string {
   return `${agent} doesn't meet ${key}'s requirements: ${unmet.map((u) => u.message).join("; ")}.`;
+}
+
+/** How an agent's profile would meet a requirement term, as a gm command (CORE-272). */
+export function profileFix(wanted: string): string {
+  const [term, values = ""] = wanted.split(":", 2);
+  const first = values.split(",")[0] ?? "";
+  switch (term) {
+    case "tag":
+      return `\`gm agent setup --tag ${first}\``;
+    case "model":
+      return first.includes("*")
+        ? "`gm agent setup --model <a matching model>`"
+        : `\`gm agent setup --model ${first}\``;
+    case "harness":
+      return "run it in a matching harness";
+    case "skill":
+      return `add the ${first} skill and rerun \`gm agent setup\``;
+    default:
+      return wanted.startsWith("memory") || wanted.startsWith("cpus")
+        ? "run it on a machine with more resources"
+        : "";
+  }
 }

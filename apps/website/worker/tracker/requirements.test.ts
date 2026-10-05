@@ -579,3 +579,143 @@ describe("issue requirements", () => {
     expect(f.issue("ui").claim?.actorId).toBe("agt-blank");
   });
 });
+
+describe("tightening requirements on a claimed issue (CORE-272)", () => {
+  const claimed = () => {
+    const f = fixture();
+    f.create("ui", { requires: { tags: ["ux"] } });
+    f.run(f.agents.ux, { kind: "issue.claim", id: "ui", data: { agent: "laptop" } });
+    return f;
+  };
+  const comments = (f: ReturnType<typeof fixture>) =>
+    f.store
+      .snapshot(f.owner)
+      .comments.filter((c) => c.issueId === "ui")
+      .map((c) => c.body);
+
+  test("keeping the claim names who's affected and what they miss, and records it", () => {
+    const f = claimed();
+    const result = f.run(f.owner, {
+      kind: "issue.update",
+      id: "ui",
+      expectedVersion: 2,
+      data: { requires: { tags: ["ux", "gpu"] } },
+    }).results[0]!;
+    expect(result.claimEffect).toEqual({
+      actorId: "agt-ux",
+      agent: "ux",
+      session: "laptop",
+      unmet: [
+        expect.objectContaining({
+          wanted: "tag:gpu",
+          message: "needs tag gpu (it reports tags: ux)",
+        }),
+      ],
+      released: false,
+    });
+    expect(f.issue("ui").claim?.actorId).toBe("agt-ux");
+    expect(comments(f)).toEqual([
+      "Kept the claim held by ux (session `laptop`) although the new requirements no longer allow it: it needs tag gpu (it reports tags: ux).",
+    ]);
+  });
+
+  test("releasing it ends the claim, puts the work back, and records it", () => {
+    const f = claimed();
+    const result = f.run(f.owner, {
+      kind: "issue.update",
+      id: "ui",
+      expectedVersion: 2,
+      data: { requires: { minMemory: 64 * GiB }, releaseClaim: true },
+    }).results[0]!;
+    expect(result.claimEffect).toMatchObject({ agent: "ux", released: true });
+    const issue = f.issue("ui");
+    expect(issue.claim).toBeNull();
+    expect(issue.status).toBe("todo");
+    // Unassigned too, so next doesn't hand it straight back.
+    expect(issue.assigneeId).toBeNull();
+    expect(
+      f.run(f.agents.ux, { kind: "issue.next", id: "n", data: { agent: "s" } }).results[0]!.issueId,
+    ).toBeUndefined();
+    expect(issue.requires).toEqual({ minMemory: 64 * GiB });
+    expect(comments(f)[0]).toMatch(
+      /^Released the claim held by ux \(session `laptop`\) and unassigned it/,
+    );
+    // The holder's lease token no longer works.
+    expect(
+      f.refusal(() =>
+        f.run(f.agents.ux, { kind: "issue.renew", id: "ui", data: { leaseToken: "x" } }),
+      ).code,
+    ).toBeTruthy();
+  });
+
+  test("only the tracker owner or the agent's person may release, and only what tightening affects", () => {
+    // Bob is neither: his release is refused and nothing changes.
+    const f = claimed();
+    expect(
+      f.refusal(() =>
+        f.run(f.people.bob, {
+          kind: "issue.update",
+          id: "ui",
+          expectedVersion: 2,
+          data: { requires: { tags: ["gpu"] }, releaseClaim: true },
+        }),
+      ),
+    ).toMatchObject({ code: "forbidden" });
+    expect(f.issue("ui").claim?.actorId).toBe("agt-ux");
+    // Loosening, or a change the holder still meets, affects nobody: no effect, no comment.
+    const loose = f.run(f.owner, {
+      kind: "issue.update",
+      id: "ui",
+      expectedVersion: 2,
+      data: { requires: { tags: ["ux"], models: ["claude-*"] }, releaseClaim: true },
+    }).results[0]!;
+    expect(loose.claimEffect).toBeUndefined();
+    expect(f.issue("ui").claim?.actorId).toBe("agt-ux");
+    expect(comments(f)).toEqual([]);
+    expect(
+      f.refusal(() =>
+        f.run(f.owner, {
+          kind: "issue.update",
+          id: "ui",
+          expectedVersion: 3,
+          data: { title: "x", releaseClaim: "yes" as unknown as boolean },
+        }),
+      ).code,
+    ).toBe("invalid_input");
+  });
+
+  test("a person's own claim is never affected", () => {
+    const g = fixture();
+    g.create("ui");
+    g.run(g.owner, { kind: "issue.claim", id: "ui", data: { agent: "me" } });
+    expect(
+      g.run(g.owner, {
+        kind: "issue.update",
+        id: "ui",
+        expectedVersion: 2,
+        data: { requires: { tags: ["gpu"] } },
+      }).results[0]!.claimEffect,
+    ).toBeUndefined();
+  });
+
+  test("next says which requirements kept the most work and how to change the profile", () => {
+    const f = fixture();
+    f.create("a", { requires: { tags: ["gpu"] } });
+    f.create("b", { requires: { tags: ["gpu"], minMemory: 64 * GiB } });
+    f.create("c", { requires: { models: ["gpt-5*"] } });
+    const skipped = f.run(f.agents.ux, {
+      kind: "issue.next",
+      id: "n",
+      data: { agent: "s" },
+    }).results[0]!.skipped!;
+    expect(skipped.blocking).toEqual([
+      { wanted: "tag:gpu", issues: 2 },
+      { wanted: "memory>=64GiB", issues: 1 },
+      { wanted: "model:gpt-5*", issues: 1 },
+    ]);
+    expect(skipped.message).toContain(
+      "Most need tag:gpu (2 issues), memory>=64GiB (1 issue), model:gpt-5* (1 issue).",
+    );
+    expect(skipped.message).toContain("`gm agent setup --tag gpu`");
+  });
+});

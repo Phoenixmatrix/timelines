@@ -515,9 +515,81 @@ pub fn required_tags(requires: &Value) -> Vec<String> {
         .collect()
 }
 
+/// How an agent's profile would meet a requirement term, as a command (CORE-272);
+/// mirrors `profileFix` in apps/website/shared/requirements.ts.
+pub fn profile_fix(wanted: &str) -> Option<String> {
+    let (term, values) = wanted.split_once(':').unwrap_or((wanted, ""));
+    let first = values.split(',').next().unwrap_or("");
+    match term {
+        "tag" => Some(format!("`gm agent setup --tag {first}`")),
+        "model" if first.contains('*') => {
+            Some("`gm agent setup --model <a matching model>`".into())
+        }
+        "model" => Some(format!("`gm agent setup --model {first}`")),
+        "harness" => Some("run it in a matching harness".into()),
+        "skill" => Some(format!("add the {first} skill and rerun `gm agent setup`")),
+        _ if wanted.starts_with("memory") || wanted.starts_with("cpus") => {
+            Some("run it on a machine with more resources".into())
+        }
+        _ => None,
+    }
+}
+
+/// " Most need tag:gpu (2 issues). If this agent fits that work: `gm agent setup --tag gpu`."
+/// from `issue.next`'s `skipped.blocking`; empty without it (older servers).
+pub fn blocking_text(blocking: &Value) -> String {
+    let Some(items) = blocking.as_array().filter(|items| !items.is_empty()) else {
+        return String::new();
+    };
+    let most: Vec<String> = items
+        .iter()
+        .map(|b| {
+            let n = b["issues"].as_u64().unwrap_or(0);
+            format!(
+                "{} ({n} issue{})",
+                b["wanted"].as_str().unwrap_or("?"),
+                if n == 1 { "" } else { "s" }
+            )
+        })
+        .collect();
+    let mut fixes: Vec<String> = Vec::new();
+    for fix in items
+        .iter()
+        .filter_map(|b| b["wanted"].as_str())
+        .filter_map(profile_fix)
+    {
+        if !fixes.contains(&fix) {
+            fixes.push(fix);
+        }
+    }
+    let mut out = format!(" Most need {}.", most.join(", "));
+    if !fixes.is_empty() {
+        out.push_str(&format!(
+            " If this agent fits that work, update its profile: {}.",
+            fixes.join("; ")
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_names_what_blocked_most_and_how_to_change_the_profile() {
+        let blocking =
+            json!([{"wanted": "tag:gpu", "issues": 2}, {"wanted": "memory>=64GiB", "issues": 1}]);
+        assert_eq!(
+            blocking_text(&blocking),
+            " Most need tag:gpu (2 issues), memory>=64GiB (1 issue). If this agent fits that work, update its profile: `gm agent setup --tag gpu`; run it on a machine with more resources."
+        );
+        assert_eq!(blocking_text(&Value::Null), "");
+        assert_eq!(
+            profile_fix("model:gpt-5*").unwrap(),
+            "`gm agent setup --model <a matching model>`"
+        );
+    }
 
     #[test]
     fn unknown_tags_warn_with_the_closest_catalog_name() {

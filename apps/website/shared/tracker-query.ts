@@ -13,10 +13,17 @@
 //   agents meet an issue's requirements and pickup policy);
 //   other words match key, title and tags; - excludes.
 
-import { hasRequirements, requirementTerms, unmetRequirements } from "./requirements.ts";
+import {
+  hasRequirements,
+  requirementTerms,
+  unmetRequirements,
+  type IssueRequirements,
+  type UnmetRequirement,
+} from "./requirements.ts";
 import {
   actorName,
   claimHolder,
+  hasActiveClaim,
   leasedAncestor,
   issuePickup,
   ISSUE_PICKUPS,
@@ -364,6 +371,11 @@ export interface AgentWork {
   eligible: number;
   /** A few it doesn't meet, highest priority first, and why. */
   missing: { key: string; title: string; unmet: string[] }[];
+  /**
+   * A few open issues it can take, to do first, highest priority first
+   * (CORE-272); absent from servers before it.
+   */
+  takeable?: { key: string; title: string; status: Issue["status"]; requires: boolean }[];
 }
 export interface AgentEligibility {
   trackers: {
@@ -388,11 +400,27 @@ export function agentWork(
   const missing = requiring
     .filter((i) => !agent || !agentEligible(i, agent))
     .sort((a, b) => a.priority - b.priority || a.key.localeCompare(b.key));
+  const order = (a: Issue, b: Issue) =>
+    Number(b.status === "todo") - Number(a.status === "todo") ||
+    a.priority - b.priority ||
+    a.key.localeCompare(b.key);
+  const takeable = open
+    .filter((i) => !i.claim && (!agent || agentEligible(i, agent)))
+    .filter((i) => i.status === "todo" || i.status === "backlog")
+    .sort(order)
+    .slice(0, limit)
+    .map((i) => ({
+      key: i.key,
+      title: i.title,
+      status: i.status,
+      requires: hasRequirements(i.requires),
+    }));
   return {
     agentId,
     open: open.length,
     requiring: requiring.length,
     eligible: requiring.length - missing.length,
+    takeable,
     missing: missing.slice(0, limit).map((i) => ({
       key: i.key,
       title: i.title,
@@ -402,6 +430,32 @@ export function agentWork(
       ],
     })),
   };
+}
+
+/**
+ * What new requirements would do to the claim on an issue (CORE-272): the
+ * holding agent, when it met the old ones (or missed less) and misses the new
+ * ones, with what it misses. Null when nothing changes for the holder: no
+ * active claim, or a person holds it.
+ * The tracker computes the same on save; the web previews it before.
+ */
+export function tighteningEffect(
+  issue: Issue,
+  requires: IssueRequirements | null | undefined,
+  agents: Snapshot["agents"],
+  now: string,
+): { agent: Snapshot["agents"][number]; unmet: UnmetRequirement[] } | null {
+  if (!issue.claim || !hasActiveClaim(issue, now)) return null;
+  const agent = agents.find((a) => a.id === issue.claim!.actorId);
+  // A claim assigns its holder, so assignment doesn't exempt it here: the
+  // editor decides, with the mismatch in view.
+  if (!agent) return null;
+  const unmet = unmetRequirements(requires, agent.capabilities);
+  if (!unmet.length) return null;
+  const before = new Set(
+    unmetRequirements(issue.requires, agent.capabilities).map((u) => u.wanted),
+  );
+  return unmet.some((u) => !before.has(u.wanted)) ? { agent, unmet } : null;
 }
 
 /**

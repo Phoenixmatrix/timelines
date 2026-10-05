@@ -87,7 +87,11 @@ test("requirements: edit them in the inspector and see eligibility per agent", a
   await app.navigate(`/tracker/orbit?q=${encodeURIComponent("is:open requires:ux")}`);
   const rows = page.getByRole("table", { name: "Issues" });
   await expect.element(rows.getByRole("row", { name: /ENG-1/ })).toBeVisible();
-  await expect.element(rows.getByLabelText("Requires tag:ux memory>=64GiB")).toBeVisible();
+  await expect
+    .element(
+      rows.getByLabelText("Requires: Only agents tagged ux and with at least 64GiB of memory"),
+    )
+    .toBeVisible();
   await expect.poll(() => rows.getByRole("row", { name: /ENG-2/ }).elements()).toHaveLength(0);
   await app.navigate(`/tracker/orbit?q=${encodeURIComponent("is:open eligible:designer")}`);
   await expect.element(rows.getByRole("row", { name: /ENG-2/ })).toBeVisible();
@@ -99,7 +103,7 @@ test("requirements: edit them in the inspector and see eligibility per agent", a
   await expect.element(work).toMatchTextContent(/eligible for 1 of 2 open issues/);
   await expect.element(work).toMatchTextContent(/ENG-1 needs at least 64GiB of memory/);
   await expect
-    .element(work.getByRole("link"))
+    .element(work.getByRole("link", { name: "Orbit Labs" }))
     .toHaveAttribute("href", `/tracker/orbit?q=${encodeURIComponent("is:open eligible:designer")}`);
 });
 
@@ -195,4 +199,142 @@ test("tags: one catalog for issues, agents and requirements, with label: as an a
   await expect
     .element(page.getByText(/desgin isn't in any of your trackers' tag catalogs/))
     .toBeVisible();
+});
+
+test("requirements: set at creation, from the issue's tags, and tightening a claim asks first (CORE-272)", async () => {
+  const server = await TestServer.start({ world: true });
+  await server.call("POST", "/api/tracker/orbit/mutate", {
+    operationId: crypto.randomUUID(),
+    mutations: [
+      { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } },
+      {
+        kind: "issue.create",
+        id: "board",
+        data: { teamId: "team", title: "Redesign the board", tags: ["ux", "frontend", "web"] },
+      },
+    ],
+  });
+  const { agent } = await server.call<{ agent: { id: string } }>("POST", "/api/agents", {
+    name: "designer",
+    capabilities: {
+      version: 1,
+      harness: "claude-code",
+      model: "claude-opus-4-5",
+      environment: {
+        os: "linux",
+        arch: "x86_64",
+        runtime: "host",
+        cpuCount: 8,
+        memoryBytes: 8 * GiB,
+      },
+      tags: ["ux"],
+      skills: [],
+    },
+  });
+  // The agent holds it.
+  await server.callAsAgent(agent.id, "POST", "/api/tracker/orbit/mutate", {
+    operationId: crypto.randomUUID(),
+    mutations: [{ kind: "issue.claim", id: "board", data: { agent: "laptop" } }],
+  });
+
+  const app = renderApp("/tracker/orbit/issues/board");
+  const section = page.getByRole("region", { name: "Agent requirements" });
+  // One click from the issue's tags: a change designer no longer meets, so it asks first.
+  await userEvent.click(
+    section.getByRole("button", { name: "Require agents tagged with this issue's tags" }),
+  );
+  const confirm = section.getByRole("group", { name: "Confirm the requirement change" });
+  await expect
+    .element(confirm)
+    .toMatchTextContent(
+      /designer holds ENG-1 \(session laptop\) and the new requirements wouldn't allow it: it needs tag frontend .*needs tag web/,
+    );
+  await expect.element(confirm).toMatchTextContent("tag:ux tag:frontend tag:web");
+  // Nothing saved yet.
+  const before = await server.call<{ issues: { id: string; requires?: unknown }[] }>(
+    "GET",
+    "/api/tracker/orbit/snapshot",
+  );
+  expect(before.issues.find((i) => i.id === "board")!.requires).toBeUndefined();
+  await userEvent.click(confirm.getByRole("button", { name: "Keep it" }));
+  await expect
+    .element(page.getByRole("list", { name: "Requirements" }))
+    .toMatchTextContent("tag:uxtag:frontendtag:web");
+  const kept = await server.call<{
+    issues: { id: string; claim: { actorId: string } | null }[];
+    comments: { issueId: string; body: string }[];
+  }>("GET", "/api/tracker/orbit/snapshot");
+  expect(kept.issues.find((i) => i.id === "board")!.claim?.actorId).toBe(agent.id);
+  expect(kept.comments.map((c) => c.body)).toContainEqual(
+    expect.stringMatching(/^Kept the claim held by designer \(session `laptop`\)/),
+  );
+  // The eligible-agents list says what it misses and how its profile could meet it.
+  const eligibility = page.getByRole("list", { name: "Agent eligibility" });
+  await expect
+    .element(eligibility)
+    .toMatchTextContent(
+      /If it fits this work: gm agent setup --tag frontend; gm agent setup --tag web/,
+    );
+
+  // Tightening further, the tracker owner releases the claim.
+  await userEvent.click(page.getByRole("button", { name: "Remove tag:web" }));
+  await expect
+    .element(page.getByRole("list", { name: "Requirements" }))
+    .toMatchTextContent("tag:uxtag:frontend");
+  await userEvent.fill(page.getByRole("textbox", { name: "Add requirements" }), "memory>=64GiB");
+  await userEvent.click(section.getByRole("button", { name: "Add", exact: true }));
+  await userEvent.click(confirm.getByRole("button", { name: "Release the claim" }));
+  await expect
+    .poll(async () => {
+      const after = await server.call<{
+        issues: { id: string; claim: unknown; requires?: unknown }[];
+      }>("GET", "/api/tracker/orbit/snapshot");
+      return after.issues.find((i) => i.id === "board")!.claim;
+    })
+    .toBeNull();
+
+  // The list shows the issue's tags and a requirement mark that reads plainly.
+  await app.navigate(`/tracker/orbit?q=${encodeURIComponent("is:open")}`);
+  const rows = page.getByRole("table", { name: "Issues" });
+  await expect
+    .element(rows.getByLabelText(/^Requires: Only agents tagged ux and frontend/))
+    .toBeVisible();
+
+  // The create dialog sets requirements, including from the draft's tags.
+  await app.navigate("/tracker/orbit");
+  await page
+    .getByRole("textbox", { name: "New issue title", exact: true })
+    .fill("(ux) Tidy the empty state");
+  await page.getByRole("button", { name: "More create options" }).click();
+  await page.getByRole("menuitem", { name: "Add details" }).click();
+  const dialog = page.getByRole("dialog", { name: "Create an issue" });
+  const editor = dialog.getByRole("region", { name: "Agent requirements" });
+  await userEvent.click(
+    editor.getByRole("button", { name: "Require agents tagged with this issue's tags" }),
+  );
+  await userEvent.fill(editor.getByRole("textbox", { name: "Add requirements" }), "model:claude-*");
+  await userEvent.keyboard("{Enter}");
+  await expect
+    .element(editor.getByRole("list", { name: "Requirements" }))
+    .toMatchTextContent("tag:uxmodel:claude-*");
+  await userEvent.click(dialog.getByRole("button", { name: "Create and edit" }));
+  await expect
+    .poll(async () => {
+      const created = await server.call<{ issues: { title: string; requires?: unknown }[] }>(
+        "GET",
+        "/api/tracker/orbit/snapshot",
+      );
+      return created.issues.find((i) => i.title === "Tidy the empty state")?.requires;
+    })
+    .toEqual({ tags: ["ux"], models: ["claude-*"] });
+
+  // Settings > Agents: what designer can take now.
+  await app.navigate("/settings/agents");
+  await expect
+    .element(page.getByRole("list", { name: "What designer can take in Orbit Labs" }))
+    .toMatchTextContent(/ENG-2Tidy the empty state/);
+  // Released and unassigned, ENG-1 is what it can't take, and why.
+  await expect
+    .element(page.getByRole("list", { name: "What designer can't take in Orbit Labs" }))
+    .toMatchTextContent(/ENG-1 needs tag frontend .*needs at least 64GiB of memory/);
 });

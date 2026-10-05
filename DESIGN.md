@@ -370,6 +370,8 @@ The kit's classes (`mk-btn`, `mk-input`, `mk-chip`, `mk-card`, `mk-popup`…) ar
   - **Requirement** (`mk-chip--requirement`): a mono term (`tag:ux`, `memory>=16GiB`) on a recessed `sunken` pill with a dashed edge, a gate rather than a description; the list and board mark reads `requires` the same way.
   - **Unknown** (`mk-chip--unknown`): a name no tag catalog has gets a dashed `ink-faint` edge and a warning-circle mark, plus words for screen readers. Unknown names warn and are kept, never refused.
   - **Link** (`mk-chip--link`): a chip that navigates keeps its 20px look but gains a touch-sized hit area, a hover step and the amber focus ring.
+- **Row marks** (CORE-272): list rows end the title with up to two issue-tag chips and a faint "+N" (board cards one), hidden in narrow lists; the `requires` mark reads its requirements in words in its tooltip and accessible name ("Only agents tagged ux and with model claude-opus-*").
+- **Tightening confirmation** (CORE-272): when a requirement change would leave the agent holding the issue not allowed, the inspector doesn't save; an inline `sunken` panel with a 1px ring takes focus, names the holder, its session and what it misses, shows the new terms in mono, and offers **Release the claim**, **Keep it** and **Cancel**, with a faint line on what each does. Release is disabled, with the reason, for people who may not release it. No modal: the decision stays beside the requirements it is about.
 - **Catalog suggestions:** under the requirement editor, up to eight catalog tags as small mono filter chips (`tag:ux`), most used by open issues first, narrowing as `tag:` is typed; a typed `tag:` value the catalog lacks gets a plain sentence below, not an error.
 
 ### Cards / Containers

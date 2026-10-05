@@ -183,10 +183,22 @@ fn mutate(body: &Value) -> (u16, Value) {
                 entity[key] = value.clone();
             }
             entity["version"] = json!(entity["version"].as_u64().unwrap_or(0) + 1);
+            // Requiring tag:gpu of ENG-1, which builder holds, tightens past it (CORE-272).
+            let gpu = mutation["data"]["requires"]["tags"]
+                .as_array()
+                .is_some_and(|tags| tags.contains(&json!("gpu")));
+            let mut result = json!({"id": id});
+            if id == "i1" && gpu {
+                let released = mutation["data"]["releaseClaim"] == true;
+                result["claimEffect"] = json!({"actorId": "agt_b", "agent": "builder", "session": "laptop",
+                    "unmet": [{"requirement": "tags", "wanted": "tag:gpu", "reported": "data", "message": "needs tag gpu (it reports tags: data)"}],
+                    "released": released});
+                entity.as_object_mut().unwrap().remove("releaseClaim");
+            }
             (
                 200,
                 json!({"cursor": 11, "events": [{"cursor": 11, "entityType": "issue", "entityId": id, "entity": entity, "kind": mutation["kind"]}],
-                       "results": [{"id": id}], "serverTime": "2026-10-04T00:00:00Z"}),
+                       "results": [result], "serverTime": "2026-10-04T00:00:00Z"}),
             )
         }
         "issue.claim" => (
@@ -198,7 +210,8 @@ fn mutate(body: &Value) -> (u16, Value) {
         "issue.next" => (
             200,
             json!({"cursor": 10, "events": [], "serverTime": "2026-10-04T00:00:00Z",
-                   "results": [{"id": id, "skipped": {"requirements": 2, "keys": ["ENG-1", "ENG-2"], "message": "Skipped 2 ready issues whose requirements builder doesn't meet."}}]}),
+                   "results": [{"id": id, "skipped": {"requirements": 2, "keys": ["ENG-1", "ENG-2"], "message": "Skipped 2 ready issues whose requirements builder doesn't meet.",
+                       "blocking": [{"wanted": "tag:ux", "issues": 1}, {"wanted": "model:claude-opus-*", "issues": 1}]}}]}),
         ),
         _ => (400, json!({"error": "Unexpected mutation"})),
     }
@@ -378,6 +391,12 @@ fn next_reports_skipped_issues_and_a_refused_claim_names_what_is_missing() {
     assert!(message.contains("skipped 2 ready issues"), "{message}");
     assert!(message.contains("ENG-1, ENG-2"), "{message}");
     assert!(message.contains("gm agent setup"), "{message}");
+    // CORE-272: which requirements kept the most, and how to change the profile.
+    assert!(
+        message.contains("Most need tag:ux (1 issue), model:claude-opus-* (1 issue)."),
+        "{message}"
+    );
+    assert!(message.contains("`gm agent setup --tag ux`"), "{message}");
 
     let (code, refused) = env.gm(&["issue", "claim", "ENG-1", "--agent", "builder"]);
     assert_eq!(code, 4, "{refused}");
@@ -555,5 +574,85 @@ fn unknown_catalog_tags_warn_and_never_fail() {
     assert_eq!(
         configured["tagCatalog"]["suggestions"],
         json!(["frontend", "data"])
+    );
+}
+
+/// CORE-272: tightening requirements on a claimed issue says who's affected and
+/// what they miss, keeps the claim unless --release-claim asks to release it, and
+/// --require-issue-tags turns the issue's tags into requirements.
+#[test]
+fn tightening_a_claimed_issue_reports_the_claim_and_can_release_it() {
+    let env = Env::new();
+    let (code, kept, _) = env.gm_with(
+        &["issue", "update", "ENG-1", "--requires", "tag:ux tag:gpu"],
+        &["--owner", "orbit", "--output", "json"],
+    );
+    assert_eq!(code, 0, "{kept}");
+    assert_eq!(kept["claimEffect"]["agent"], "builder");
+    assert_eq!(kept["claimEffect"]["released"], false);
+    assert!(
+        env.api.mutations().pop().unwrap()["data"]
+            .get("releaseClaim")
+            .is_none()
+    );
+    let (_, text, _) = env.gm_with(
+        &["issue", "update", "ENG-1", "--requires", "tag:gpu"],
+        &["--owner", "orbit", "--output", "text"],
+    );
+    let text = text.as_str().unwrap().to_owned();
+    assert!(
+        text.starts_with("Kept the claim held by builder (session laptop), although the new requirements no longer allow it: it needs tag gpu (it reports tags: data). Rerun with --release-claim"),
+        "{text}"
+    );
+
+    let (code, released) = env.gm(&[
+        "issue",
+        "update",
+        "ENG-1",
+        "--requires",
+        "tag:gpu",
+        "--release-claim",
+    ]);
+    assert_eq!(code, 0, "{released}");
+    assert_eq!(released["claimEffect"]["released"], true);
+    assert_eq!(
+        env.api.mutations().pop().unwrap()["data"]["releaseClaim"],
+        true
+    );
+
+    let before = env.api.mutations().len();
+    let (code, alone) = env.gm(&[
+        "issue",
+        "update",
+        "ENG-1",
+        "--data",
+        r#"{"priority":1}"#,
+        "--release-claim",
+    ]);
+    assert_eq!(code, 2, "{alone}");
+    assert!(
+        alone["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--release-claim goes with")
+    );
+    assert_eq!(env.api.mutations().len(), before);
+}
+
+#[test]
+fn require_issue_tags_adds_the_issues_tags_to_its_requirements() {
+    let env = Env::new();
+    let (code, out) = env.gm(&["issue", "update", "ENG-2", "--require-issue-tags"]);
+    assert_eq!(code, 0, "{out}");
+    // ENG-2 has no tags: nothing to add beyond what it requires.
+    assert_eq!(
+        env.api.mutations().pop().unwrap()["data"],
+        json!({"requires": {"models": ["claude-opus-*"]}})
+    );
+    let (code, out) = env.gm(&["issue", "update", "ENG-1", "--require-issue-tags"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        env.api.mutations().pop().unwrap()["data"],
+        json!({"requires": {"tags": ["ux", "frontend"], "minMemory": 16 * GIB}})
     );
 }

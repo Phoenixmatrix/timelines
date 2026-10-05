@@ -471,6 +471,11 @@ export type IssueFields = Pick<
 /** Fields a create or update may set beyond the inspector's draft fields. */
 export type IssueData = Partial<IssueFields> & {
   requires?: IssueRequirements | null;
+  /**
+   * With new `requires` on a claimed issue (CORE-272): release the claim of an
+   * agent that no longer meets them, rather than keep it. Ignored otherwise.
+   */
+  releaseClaim?: boolean;
   /** The issue's tags under the name people see; stored as `labels` (CORE-271). */
   tags?: string[];
 };
@@ -627,9 +632,36 @@ export interface MutationResult {
      * For issue.next: ready issues it passed over because the agent doesn't
      * meet their requirements (CORE-32), so it isn't silently starved.
      */
-    skipped?: { requirements: number; keys: string[]; message: string };
+    skipped?: {
+      requirements: number;
+      keys: string[];
+      message: string;
+      /**
+       * The requirement terms that kept the most of them, most first (CORE-272):
+       * `{wanted: "tag:ux", issues: 3}`.
+       */
+      blocking?: { wanted: string; issues: number }[];
+    };
+    /**
+     * For issue.update: the claim its new requirements no longer allow (CORE-272),
+     * and whether the edit released it or kept it. Never silent: either way it's
+     * recorded on the issue.
+     */
+    claimEffect?: ClaimEffect;
   }[];
   serverTime: string;
+}
+/** An agent holding a claim that an issue's tightened requirements no longer allow. */
+export interface ClaimEffect {
+  /** The holder's agent id and name. */
+  actorId: string;
+  agent: string;
+  /** The claim's session name. */
+  session: string;
+  /** What it now misses, in the requirements' words. */
+  unmet: { requirement: string; wanted: string; reported: string | null; message: string }[];
+  /** Released by the edit (`releaseClaim: true`), or kept and recorded. */
+  released: boolean;
 }
 /**
  * A timeline record or timeline event, in the change feed for replicas that

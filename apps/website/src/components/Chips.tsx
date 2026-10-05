@@ -111,3 +111,36 @@ export function RequirementChip({
     </li>
   );
 }
+
+/**
+ * An issue's tags in a row or card (CORE-272): the first `max` as issue-tag
+ * chips, then a faint "+N" naming the rest. Nothing without tags.
+ */
+export function IssueTagsInline({
+  tags,
+  max = 2,
+  className = "",
+}: {
+  tags: readonly string[];
+  max?: number;
+  className?: string;
+}) {
+  if (!tags.length) return null;
+  const rest = tags.slice(max);
+  return (
+    <span className={`min-w-0 shrink-0 items-center gap-1 ${className}`}>
+      <span className="sr-only">Tags: {tags.join(", ")}</span>
+      {tags.slice(0, max).map((tag) => (
+        <span key={tag} aria-hidden className="mk-chip mk-chip--tag mk-chip--issue-tag max-w-28">
+          <HashIcon className={MARK} weight="bold" aria-hidden />
+          <span className="min-w-0 truncate">{tag}</span>
+        </span>
+      ))}
+      {rest.length > 0 && (
+        <span aria-hidden className="text-micro text-ink-faint" title={rest.join(", ")}>
+          +{rest.length}
+        </span>
+      )}
+    </span>
+  );
+}

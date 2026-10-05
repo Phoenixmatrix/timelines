@@ -303,6 +303,8 @@ model, OS, architecture, runtime, CPUs, memory, tags and skills):
 gm issue create 'Polish onboarding' --team ENG --requires 'tag:ux skill:playwright'
 gm issue update ENG-1 --requires 'model:claude-opus-*,gpt-5* os:linux memory>=16GiB cpus>=8'
 gm issue update ENG-1 --clear-requires          # remove capabilities, not pickup policy
+gm issue update ENG-1 --require-issue-tags      # only agents tagged with its tags
+gm issue update ENG-1 --requires 'tag:gpu' --release-claim
 ```
 
 Terms are `tag:`, `skill:`, `model:`, `harness:`, `os:`, `arch:`, `runtime:`
@@ -317,6 +319,15 @@ runtime, minMemory, minCpus}` (or null), recorded in its history like any field;
   offered it, and `gm issue next` skips it, reporting how many ready issues it
   skipped (`skipped: {requirements, keys, message}`). A refusal has code
   `requirements_unmet` and names each unmet requirement.
+- Tightening requirements on a claimed issue is never silent. When the new ones
+  no longer allow the agent holding it, gm prints who it is, its session and
+  what it misses (`claimEffect`), keeps the claim and the issue records that;
+  `--release-claim` releases it instead (tracker owners and the agent's
+  accountable person). `--require-issue-tags` adds a `tag:` term for each of
+  the issue's tags.
+- `gm issue next` also names the requirements that kept the most ready issues
+  from the agent (`skipped.blocking`) and the `gm agent setup` flag that would
+  meet them, when the agent really fits that work.
 - An agent that never published capabilities meets no requirement: run
   `gm agent setup` (with `--tag`, `--model`) in its checkout.
 - People bypass capability requirements, not pickup policy. A person who owns

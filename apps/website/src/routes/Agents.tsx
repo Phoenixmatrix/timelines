@@ -1,6 +1,6 @@
 // Your agents: identities that work on their own, accountable to you.
 
-import { KeyIcon, RobotIcon } from "@phosphor-icons/react";
+import { CheckIcon, KeyIcon, RobotIcon, XIcon } from "@phosphor-icons/react";
 import { useEffect, useRef } from "react";
 import { Form, Link, useActionData, useFetcher, useLoaderData, useNavigation } from "react-router";
 import type { Agent, AgentCapabilities, CreatedAccessToken } from "../../shared/api.ts";
@@ -289,11 +289,37 @@ function TrackerWork({ agent, eligibility }: { agent: Agent; eligibility: AgentE
           {work.requiring === 0
             ? `no open issues require anything; it can take all ${work.open}`
             : `eligible for ${work.open - work.requiring + work.eligible} of ${work.open} open issues`}
+          {work.takeable && work.takeable.length > 0 && (
+            <ul
+              className="m-0 mt-1 flex list-none flex-col gap-0.5 p-0 pl-3"
+              aria-label={`What ${agent.name} can take in ${tracker.displayName}`}
+            >
+              {work.takeable.map((issue) => (
+                <li key={issue.key} className="flex min-w-0 items-center gap-1.5">
+                  <CheckIcon className="size-3 shrink-0 text-online" weight="bold" aria-hidden />
+                  <Link
+                    className="flex min-w-0 items-baseline gap-1.5 text-ink no-underline hover:underline"
+                    to={`/tracker/${tracker.slug}/issues/${issue.key}`}
+                  >
+                    <span className="mk-mono shrink-0 text-ink-faint">{issue.key}</span>
+                    <span className="min-w-0 truncate">{issue.title}</span>
+                  </Link>
+                  {issue.requires && <span className="sr-only">(its requirements are met)</span>}
+                </li>
+              ))}
+            </ul>
+          )}
           {work.missing.length > 0 && (
-            <ul className="m-0 mt-0.5 list-none p-0 pl-3 text-ink-faint">
+            <ul
+              className="m-0 mt-0.5 flex list-none flex-col gap-0.5 p-0 pl-3 text-ink-faint"
+              aria-label={`What ${agent.name} can't take in ${tracker.displayName}`}
+            >
               {work.missing.map((issue) => (
-                <li key={issue.key}>
-                  <span className="mk-mono">{issue.key}</span> {issue.unmet.join("; ")}
+                <li key={issue.key} className="flex min-w-0 items-start gap-1.5">
+                  <XIcon className="mt-1 size-3 shrink-0" weight="bold" aria-hidden />
+                  <span className="min-w-0 [overflow-wrap:anywhere]">
+                    <span className="mk-mono">{issue.key}</span> {issue.unmet.join("; ")}
+                  </span>
                 </li>
               ))}
               {work.requiring - work.eligible > work.missing.length && (

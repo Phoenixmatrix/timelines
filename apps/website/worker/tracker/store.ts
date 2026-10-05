@@ -37,16 +37,20 @@ import {
   type TrackerEvent,
   type TrackerIdentity,
   type Workspace,
+  type ClaimEffect,
 } from "../../shared/tracker.ts";
 import type { ShippedIssue } from "../../shared/release-notes.ts";
 import {
   hasRequirements,
   normalizeRequirements,
+  profileFix,
   RequirementError,
   unmetRequirements,
   unmetText,
+  type IssueRequirements,
   type UnmetRequirement,
 } from "../../shared/requirements.ts";
+import { tighteningEffect } from "../../shared/tracker-query.ts";
 import type { QueueFailure } from "../../shared/merge-queue.ts";
 import { sql as raw } from "kysely";
 import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
@@ -146,6 +150,15 @@ function keys(value: Record<string, unknown>, allowed: string[]) {
   for (const key of Object.keys(value))
     if (!allowed.includes(key)) fail("invalid_input", `Unknown field: ${key}.`);
 }
+/** A `requires` value from a mutation, or null when it isn't valid (fields() says why). */
+function requiresOf(value: unknown): IssueRequirements | null {
+  try {
+    return normalizeRequirements(value);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * An issue's tags are stored as `labels` (CORE-271): writers may send `tags`,
  * the name people see, and the old `labels` keeps working. Both at once must agree.
@@ -1722,19 +1735,96 @@ export class TrackerStore {
         { unmet },
       );
     };
+    /**
+     * Tightened requirements no longer allow the agent holding `issue`
+     * (CORE-272). Never silent: the edit either releases the claim (asked
+     * with `releaseClaim`, by a tracker owner or the agent's accountable
+     * person) or keeps it, and a comment records which and what it misses.
+     */
+    const claimEffect = (
+      issue: Issue,
+      effect: { agent: TrackerAgent; unmet: UnmetRequirement[] },
+      release: boolean,
+    ): ClaimEffect => {
+      const claim = issue.claim!;
+      const misses = effect.unmet.map((u) => u.message).join("; ");
+      if (release) {
+        const person = access.actorId === access.principalId;
+        if (!person || (!access.canAdmin && effect.agent.accountable.id !== access.principalId))
+          fail(
+            "forbidden",
+            `Only a tracker owner or ${effect.agent.accountable.displayName}, acting as themselves, can release ${effect.agent.name}'s claim. Save without releasing it to keep the claim.`,
+            403,
+          );
+        if (claim.retainedIn)
+          fail(
+            "lease_retained",
+            `${issue.key} is done in timeline ${claim.retainedIn.slug}, and its lease is held until that timeline lands or is abandoned.`,
+            409,
+          );
+        dropOffer(issue);
+        issue.claim = null;
+        run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", issue.id));
+        if (issue.status === "in_progress") issue.status = "todo";
+        // Its claim assigned it; left assigned, assignment would let it straight back in.
+        if (issue.assigneeId === effect.agent.id) issue.assigneeId = null;
+      }
+      const commentId = crypto.randomUUID();
+      emit(
+        "comment",
+        commentId,
+        {
+          id: commentId,
+          issueId: issue.id,
+          body: release
+            ? `Released the claim held by ${effect.agent.name} (session \`${claim.agent}\`) and unassigned it: the new requirements no longer allow it. It ${misses}.`
+            : `Kept the claim held by ${effect.agent.name} (session \`${claim.agent}\`) although the new requirements no longer allow it: it ${misses}.`,
+          kind: "comment",
+          actorId: access.actorId,
+          createdAt: now,
+        },
+        "comment.add",
+      );
+      return {
+        actorId: effect.agent.id,
+        agent: effect.agent.name,
+        session: claim.agent,
+        unmet: effect.unmet,
+        released: release,
+      };
+    };
     /** What `issue.next` says about ready work it passed over for requirements. */
     const skippedFor = (actorId: string, skipped: Issue[]) => {
       const name = agentName(actorId);
       const keys = skipped.slice(0, 10).map((issue) => issue.key);
       const more = skipped.length > keys.length ? ` and ${skipped.length - keys.length} more` : "";
       const reported = access.agents.find((a) => a.id === actorId)?.capabilities;
+      // Which requirements kept the most work from it (CORE-272), and how to change that.
+      const counts = new Map<string, number>();
+      if (reported)
+        for (const issue of skipped)
+          for (const u of unmetRequirements(issue.requires, reported))
+            counts.set(u.wanted, (counts.get(u.wanted) ?? 0) + 1);
+      const blocking = [...counts]
+        .map(([wanted, issues]) => ({ wanted, issues }))
+        .sort((a, b) => b.issues - a.issues || a.wanted.localeCompare(b.wanted))
+        .slice(0, 3);
+      const most = blocking
+        .map((b) => `${b.wanted} (${b.issues} issue${b.issues === 1 ? "" : "s"})`)
+        .join(", ");
+      const fix = blocking.map((b) => profileFix(b.wanted)).filter(Boolean);
       return {
         requirements: skipped.length,
         keys,
+        ...(blocking.length ? { blocking } : {}),
         message:
           `Skipped ${skipped.length} ready issue${skipped.length === 1 ? "" : "s"} whose requirements ${name} doesn't meet: ${keys.join(", ")}${more}. ` +
           (reported
-            ? "See what each needs with `gm issue show <key>`; `gm agent setup` (with --tag, --model…) updates what it reports."
+            ? `Most need ${most}. ` +
+              (fix.length
+                ? `If ${name} really fits that work, update its profile: ${[...new Set(fix)].join("; ")}. `
+                : "") +
+              "See what each needs with `gm issue show <key>`."
             : `${name} hasn't reported its capabilities: run \`gm agent setup\` in its checkout to publish them.`),
       };
     };
@@ -2247,8 +2337,10 @@ export class TrackerStore {
             "workspaceIds",
             "labels",
             "requires",
-            ...(creating ? ["teamId"] : ["leaseToken"]),
+            ...(creating ? ["teamId"] : ["leaseToken", "releaseClaim"]),
           ]);
+          if (data.releaseClaim !== undefined && typeof data.releaseClaim !== "boolean")
+            fail("invalid_input", "releaseClaim must be true or false.");
           let issue: Issue;
           if (creating) {
             unique("issue", entityId);
@@ -2307,7 +2399,18 @@ export class TrackerStore {
             }
           }
           const previous = issue.status;
+          // What new requirements do to the claim on it (CORE-272), judged
+          // against the old ones before the fields change.
+          const tightened =
+            !creating && "requires" in data
+              ? tighteningEffect(issue, requiresOf(data.requires), access.agents, now)
+              : null;
           fields(data, issue, creating);
+          if (tightened)
+            result = {
+              id: entityId,
+              claimEffect: claimEffect(issue, tightened, data.releaseClaim === true),
+            };
           if (issue.status === "canceled") {
             if (
               (creating || previous !== "canceled" || "closeReason" in data) &&

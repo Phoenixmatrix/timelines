@@ -179,7 +179,16 @@ app.use(async (c, next) => {
   c.set("timing", new Timing());
   const world = worldOf(c.req.header("x-browser-test-world") ?? "");
   const persona = (c.req.header("x-browser-test-as") || world.persona) as Persona;
-  c.set("actor", persona ? await findUserById(c.env.DB, `acc_${persona}`) : null);
+  // One of the world's agents, signed in as if with its token (its person's access).
+  const agentId = c.req.header("x-browser-test-agent");
+  if (agentId) {
+    const agent = await c.env.DB.prepare("SELECT id, name, accountable_id FROM agents WHERE id = ?")
+      .bind(agentId)
+      .first<{ id: string; name: string; accountable_id: string }>();
+    if (!agent) throw new Error(`No agent ${agentId}`);
+    const person = await findUserById(c.env.DB, agent.accountable_id);
+    c.set("actor", person ? { ...person, agent: { id: agent.id, name: agent.name } } : null);
+  } else c.set("actor", persona ? await findUserById(c.env.DB, `acc_${persona}`) : null);
   await next();
 });
 app.route("/api/accounts/:owner/atlas", workspaceAtlas);

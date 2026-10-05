@@ -30,6 +30,9 @@ impl Render for Shown {
             return catalog_text(owner, tags);
         }
         let mut body = serde_json::to_string_pretty(&self.0).unwrap_or_default();
+        if self.0["claimEffect"].is_object() {
+            body = format!("{}\n\n{body}", claim_effect_text(&self.0["claimEffect"]));
+        }
         // A claim leads with the issue's timeline rule, so the choice comes first.
         if let Some(rule) = self.0.get("timelineRule").filter(|r| r.is_object()) {
             body = format!(
@@ -64,6 +67,30 @@ impl Render for Shown {
     }
 }
 
+/// What tightened requirements did to the claim (CORE-272), as a sentence.
+fn claim_effect_text(effect: &Value) -> String {
+    let misses = effect["unmet"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|u| u["message"].as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let who = format!(
+        "{} (session {})",
+        effect["agent"].as_str().unwrap_or("its agent"),
+        effect["session"].as_str().unwrap_or("?")
+    );
+    if effect["released"] == true {
+        format!(
+            "Released the claim held by {who} and unassigned it: the new requirements no longer allow it. It {misses}."
+        )
+    } else {
+        format!(
+            "Kept the claim held by {who}, although the new requirements no longer allow it: it {misses}. Rerun with --release-claim to release it instead."
+        )
+    }
+}
 /// `gm issue tags`: one line per tag, "ux  4 issues, 2 open".
 fn catalog_text(owner: &str, tags: &[Value]) -> String {
     if tags.is_empty() {
@@ -469,6 +496,9 @@ struct Replica {
     owner: String,
     /// The timeline whose view this works in (`--timeline`); None for main.
     timeline: Option<String>,
+    /// Each operation the server acknowledged in this run, with its per-mutation
+    /// results (a claim effect, CORE-272), for the command that sent it to report.
+    receipts: std::cell::RefCell<Vec<(String, Value)>>,
 }
 impl Replica {
     fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -711,6 +741,9 @@ impl Replica {
                         return Err(error);
                     }
                     self.db.execute_batch("COMMIT").map_err(db_err)?;
+                    self.receipts
+                        .borrow_mut()
+                        .push((operation.to_string(), reply["results"].clone()));
                 }
                 Err(error) => {
                     if error.code == "conflict"
@@ -804,9 +837,20 @@ impl Replica {
                     .cloned()
             })
             .collect();
-        Ok(Shown(
-            json!({"operationId":operation,"queued":offline,"entities":entities,"cursor":view["cursor"]}),
-        ))
+        let mut shown = json!({"operationId":operation,"queued":offline,"entities":entities,"cursor":view["cursor"]});
+        // What the tracker said about a claim the change affected (CORE-272).
+        let effects: Vec<Value> = self
+            .receipts
+            .borrow()
+            .iter()
+            .filter(|(op, _)| *op == operation)
+            .flat_map(|(_, results)| results.as_array().cloned().unwrap_or_default())
+            .filter_map(|result| result.get("claimEffect").cloned())
+            .collect();
+        if let Some(effect) = effects.into_iter().next() {
+            shown["claimEffect"] = effect;
+        }
+        Ok(Shown(shown))
     }
 }
 fn conflict_error(operation: &str) -> GmError {
@@ -843,6 +887,7 @@ fn with_replica(
         config,
         owner,
         timeline: scope.timeline(),
+        receipts: Default::default(),
     };
     if !scope.offline && refresh && !ctx.dry_run {
         replica.sync()?;
@@ -1055,6 +1100,7 @@ fn validate_issue_fields(data: &serde_json::Map<String, Value>, creating: bool) 
                 "pickup",
             ]
             .contains(&key.as_str())
+            && !(!creating && key == "releaseClaim")
         {
             return Err(GmError::usage(format!(
                 "Server-owned or unknown issue field '{key}'."
@@ -1209,6 +1255,10 @@ fn project(snapshot: &mut Value, mutation: &Value) -> Result<()> {
             if ["id", "key", "version", "createdAt", "claim", "teamId"].contains(&key.as_str()) {
                 return Err(GmError::usage(format!("Immutable field '{key}'.")));
             }
+            // An instruction about the claim (CORE-272), not a field of the issue.
+            if key == "releaseClaim" {
+                continue;
+            }
             row.insert(key.clone(), value.clone());
         }
         if entity == "issue" && row.get("status").and_then(Value::as_str) != Some("canceled") {
@@ -1298,6 +1348,31 @@ fn issue_patch(snapshot: &Value, p: &IssuePatch) -> Result<Value> {
     requires_field(&p.requires, p.clear_requires, &mut data)?;
     if let Some(pickup) = &p.pickup {
         data["pickup"] = json!(pickup);
+    }
+    // One click from the issue's tags to its requirements (CORE-272): only agents
+    // tagged with them may claim it. Kept with whatever else it requires.
+    if p.require_issue_tags {
+        let base = match data.get("requires") {
+            Some(requires) => requires.clone(),
+            None => row["requires"].clone(),
+        };
+        let mut tags = requirements::required_tags(&base);
+        for tag in row["labels"].as_array().into_iter().flatten() {
+            if let Some(tag) = tag.as_str() {
+                tags.push(tag.to_lowercase());
+            }
+        }
+        let mut merged = if base.is_object() { base } else { json!({}) };
+        merged["tags"] = json!(tags);
+        data["requires"] = requirements::normalize(&merged)?;
+    }
+    if p.release_claim {
+        if data.get("requires").is_none() {
+            return Err(GmError::usage(
+                "--release-claim goes with a requirements change (--requires, --clear-requires or --require-issue-tags).",
+            ));
+        }
+        data["releaseClaim"] = json!(true);
     }
     if !p.tags.is_empty() || !p.drop_tags.is_empty() {
         if data.get("tags").is_some() || data.get("labels").is_some() {
@@ -2179,7 +2254,7 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
         });
         if skipped_count > 0 {
             out["message"] = json!(format!(
-                "Nothing in scope is ready for this agent: it skipped {skipped_count} ready issue{} whose requirements it doesn't meet ({}). See what one needs with `gm issue show <key>`; `gm agent setup` (e.g. --tag ux) updates what this agent reports, or a person can claim or assign them.",
+                "Nothing in scope is ready for this agent: it skipped {skipped_count} ready issue{} whose requirements it doesn't meet ({}).{} See what one needs with `gm issue show <key>`; `gm agent setup` (e.g. --tag ux) updates what this agent reports, or a person can claim or assign them.",
                 if skipped_count == 1 { "" } else { "s" },
                 skipped["keys"]
                     .as_array()
@@ -2188,6 +2263,7 @@ fn next_result(snapshot: &Value, response: &Value) -> Shown {
                     .filter_map(Value::as_str)
                     .collect::<Vec<_>>()
                     .join(", "),
+                requirements::blocking_text(&skipped["blocking"]),
             ));
             out["skipped"] = skipped;
         }
@@ -3471,6 +3547,8 @@ mod tests {
                 clear_requires: false,
                 tags: vec![],
                 drop_tags: vec![],
+                require_issue_tags: false,
+                release_claim: false,
             },
         )
         .unwrap();
@@ -3489,6 +3567,8 @@ mod tests {
                 clear_requires: false,
                 tags: vec![],
                 drop_tags: vec![],
+                require_issue_tags: false,
+                release_claim: false,
             },
         )
         .unwrap();
@@ -3515,6 +3595,8 @@ mod tests {
                     clear_requires: clear,
                     tags: vec![],
                     drop_tags: vec![],
+                    require_issue_tags: false,
+                    release_claim: false,
                 },
             )
         };
@@ -3739,6 +3821,7 @@ mod tests {
             config: Config::default(),
             owner: "orbit".into(),
             timeline: None,
+            receipts: Default::default(),
         };
         let snapshot =
             json!({"teams":[{"id":"t1","key":"CORE"},{"id":"t2","key":"OLD","archived":true}]});
@@ -3764,6 +3847,7 @@ mod tests {
             config: Config::default(),
             owner: "orbit".into(),
             timeline: None,
+            receipts: Default::default(),
         };
         r.set("snapshot", &snapshot().to_string()).unwrap();
         let first = json!({"operationId":"one","mutations":[{"kind":"issue.create","id":"stable","data":{"title":"Offline"}}]});
@@ -3795,6 +3879,7 @@ mod tests {
             config: Config::default(),
             owner: "orbit".into(),
             timeline: Some("search".into()),
+            receipts: Default::default(),
         };
         r.set("snapshot", &snapshot().to_string()).unwrap();
         assert_eq!(r.view().unwrap_err().code, "replica_uninitialized");

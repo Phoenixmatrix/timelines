@@ -937,6 +937,156 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     record({ tags: [ux, data], aliases: ["--label", "labels", "tags"] });
   });
 
+  await scenario("tightening-requirements-on-a-claimed-issue", async () => {
+    // CORE-272: a real agent claims; a person tightens the requirements. gm says
+    // who's affected and keeps the claim (recorded), --release-claim releases it,
+    // --require-issue-tags turns tags into requirements, and next names what blocked it.
+    const owner = fixtures.tracker.owner;
+    const key = `Q${randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase()}`;
+    const suffix = randomUUID().slice(0, 6);
+    const [ux, gpu] = [`ux-${suffix}`, `gpu-${suffix}`];
+    await json(`/api/tracker/${owner}/mutate`, ownerToken, "POST", {
+      operationId: randomUUID(),
+      mutations: [{ kind: "team.create", id: randomUUID(), data: { key, name: "Tighten" } }],
+    });
+    const { agent } = await json<{ agent: Agent }>(
+      "/api/agents",
+      ownerToken,
+      "POST",
+      { name: `tight-${suffix}` },
+      [201],
+    );
+    await json(`/api/agents/${agent.id}/capabilities`, ownerToken, "PUT", {
+      version: 1,
+      harness: "claude-code",
+      model: "fixture-model",
+      environment: {
+        os: "linux",
+        arch: "x86_64",
+        runtime: "host",
+        cpuCount: 4,
+        memoryBytes: 8 * 2 ** 30,
+      },
+      tags: [ux],
+      skills: [],
+    });
+    const token = await json<CreatedAccessToken>(
+      `/api/agents/${agent.id}/tokens`,
+      ownerToken,
+      "POST",
+      { scope: "write" },
+      [201],
+    );
+    secrets.add(token.secret);
+    const agentEnv = { GM_TOKEN: token.secret };
+    const created = JSON.parse(
+      await gm([
+        "issue",
+        "create",
+        "Tighten me",
+        "--team",
+        key,
+        "--tag",
+        ux,
+        "--tag",
+        gpu,
+        "--requires",
+        `tag:${ux}`,
+        "--owner",
+        owner,
+      ]),
+    ) as { entities: { id: string }[] };
+    const id = created.entities[0]!.id;
+    const claim = JSON.parse(
+      await gm(
+        ["issue", "claim", id, "--agent", "e2e-session", "--owner", owner],
+        "marco",
+        work,
+        undefined,
+        agentEnv,
+      ),
+    ) as { results: { leaseToken: string }[] };
+    secrets.add(claim.results[0]!.leaseToken);
+
+    type Effect = {
+      claimEffect?: {
+        agent: string;
+        session: string;
+        released: boolean;
+        unmet: { wanted: string }[];
+      };
+    };
+    // --require-issue-tags asks for tag:gpu-… too: the holder misses it, so the claim is kept and said.
+    const kept = JSON.parse(
+      await gm(["issue", "update", id, "--require-issue-tags", "--owner", owner]),
+    ) as Effect;
+    assert.equal(kept.claimEffect?.agent, agent.name);
+    assert.equal(kept.claimEffect?.session, "e2e-session");
+    assert.equal(kept.claimEffect?.released, false);
+    assert.deepEqual(
+      kept.claimEffect?.unmet.map((u) => u.wanted),
+      [`tag:${gpu}`],
+    );
+    const text = await gm([
+      "issue",
+      "update",
+      id,
+      "--requires",
+      `tag:${gpu} cpus>=64`,
+      "--owner",
+      owner,
+      "--output",
+      "text",
+    ]);
+    assert.match(
+      text,
+      new RegExp(`^Kept the claim held by ${agent.name} \\(session e2e-session\\)`),
+    );
+    // Releasing it: the claim ends, the work is back, and the issue records it.
+    const released = JSON.parse(
+      await gm([
+        "issue",
+        "update",
+        id,
+        "--requires",
+        `tag:${gpu} memory>=1TiB`,
+        "--release-claim",
+        "--owner",
+        owner,
+      ]),
+    ) as Effect;
+    assert.equal(released.claimEffect?.released, true);
+    const snapshot = await json<{
+      issues: { id: string; claim: unknown; requires?: unknown; status: string }[];
+      comments: { issueId: string; body: string }[];
+    }>(`/api/tracker/${owner}/snapshot`, ownerToken);
+    const issue = snapshot.issues.find((i) => i.id === id)!;
+    assert.equal(issue.claim, null);
+    assert.equal(issue.status, "todo");
+    const notes = snapshot.comments.filter((c) => c.issueId === id).map((c) => c.body);
+    assert(notes.some((n) => n.startsWith(`Kept the claim held by ${agent.name}`)));
+    assert(notes.some((n) => n.startsWith(`Released the claim held by ${agent.name}`)));
+    // next passes it over and says what kept it.
+    const next = JSON.parse(
+      await gm(
+        ["issue", "next", "--team", key, "--agent", "e2e-session", "--owner", owner],
+        "marco",
+        work,
+        undefined,
+        agentEnv,
+      ),
+    ) as {
+      claimed: unknown;
+      skipped: { blocking: { wanted: string; issues: number }[] };
+      message: string;
+    };
+    assert.equal(next.claimed, null, "next must pass over the released issue");
+    assert(next.skipped.blocking.some((b) => b.wanted === `tag:${gpu}` && b.issues === 1));
+    assert.match(next.message, new RegExp(`gm agent setup --tag ${gpu}`));
+    await gm(["agent", "revoke", agent.id]);
+    record({ agent: agent.name, kept: true, released: true, blocking: next.skipped.blocking });
+  });
+
   await scenario("agent-durable-interventions-and-resume", async () => {
     const owner = fixtures.tracker.owner;
     const directory = join(work, "autonomous-agent");
