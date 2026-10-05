@@ -65,14 +65,17 @@ export const STATE_LABEL: Record<IssueState, string> = {
   canceled: "Canceled",
 };
 
-/** How work sorts by default: what can move now first, closed last. */
+/**
+ * How work sorts by default: what's underway first (CORE-295), then what can
+ * move now, closed last. Each progress group below is a run of these ranks.
+ */
 const STATE_RANK: Record<IssueState, number> = {
   // Waiting needs a person, so it leads.
   waiting: 0,
-  ready: 1,
-  claimed: 2,
-  leased: 3,
-  in_progress: 4,
+  claimed: 1,
+  leased: 2,
+  in_progress: 3,
+  ready: 4,
   todo: 5,
   blocked: 6,
   not_ready: 6.1,
@@ -534,6 +537,72 @@ export function sortIssues(issues: Issue[], index: IssueIndex, sort: SortKey): I
     key: (a, b) => KEY_ORDER.compare(a.key, b.key),
   };
   return [...issues].sort(by[sort]);
+}
+
+// ── Progress groups ─────────────────────────────────────────────────────────
+
+/**
+ * The list's sections (CORE-295): work underway on top, then what's next, and
+ * what's finished below. A group is a run of state ranks, so a sort only ever
+ * reorders issues inside their group.
+ */
+export const PROGRESS_GROUPS = [
+  {
+    key: "underway",
+    label: "In progress",
+    states: ["waiting", "claimed", "leased", "in_progress"],
+  },
+  {
+    key: "next",
+    label: "Up next",
+    states: ["ready", "todo", "blocked", "not_ready", "human_only"],
+  },
+  { key: "landing", label: "Done in a timeline", states: ["done_in_timeline"] },
+  { key: "backlog", label: "Backlog", states: ["backlog"] },
+  { key: "closed", label: "Closed", states: ["done", "canceled"] },
+] as const satisfies readonly { key: string; label: string; states: readonly IssueState[] }[];
+export type GroupKey = (typeof PROGRESS_GROUPS)[number]["key"];
+
+const GROUP_OF = new Map<IssueState, GroupKey>(
+  PROGRESS_GROUPS.flatMap((g) => g.states.map((s): [IssueState, GroupKey] => [s, g.key])),
+);
+
+export interface IssueGroup {
+  key: GroupKey;
+  label: string;
+  issues: Issue[];
+  /** How many of each state, in rank order, for the group's summary. */
+  states: { state: IssueState; count: number }[];
+}
+
+/** Sorted issues split into their progress groups, keeping the sort; empty groups drop out. */
+export function groupIssues(sorted: Issue[], index: IssueIndex): IssueGroup[] {
+  const buckets = new Map<GroupKey, Issue[]>();
+  for (const issue of sorted) {
+    const key = GROUP_OF.get(index.state.get(issue.id) ?? "todo") ?? "next";
+    const bucket = buckets.get(key);
+    if (bucket) bucket.push(issue);
+    else buckets.set(key, [issue]);
+  }
+  return PROGRESS_GROUPS.flatMap((g) => {
+    const issues = buckets.get(g.key);
+    if (!issues) return [];
+    const counts = new Map<IssueState, number>();
+    for (const issue of issues) {
+      const state = index.state.get(issue.id) ?? "todo";
+      counts.set(state, (counts.get(state) ?? 0) + 1);
+    }
+    return [
+      {
+        key: g.key,
+        label: g.label,
+        issues,
+        states: g.states.flatMap((state) =>
+          counts.has(state) ? [{ state, count: counts.get(state)! }] : [],
+        ),
+      },
+    ];
+  });
 }
 
 // ── Facets ──────────────────────────────────────────────────────────────────
