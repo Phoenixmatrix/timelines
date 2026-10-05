@@ -514,8 +514,8 @@ describe("facets, sorting and activity", () => {
     expect(sortIssues(work, index, "rank").map((i) => i.key)).toEqual([
       "CORE-2",
       "CORE-3",
-      "CORE-1",
       "CORE-6",
+      "CORE-1",
       "CORE-4",
       "CORE-5",
     ]);
@@ -526,16 +526,16 @@ describe("facets, sorting and activity", () => {
       ]);
     expect(sections("rank")).toEqual([
       ["In progress", ["CORE-2", "CORE-3"]],
-      ["Up next", ["CORE-1"]],
       ["Done in a timeline", ["CORE-6"]],
+      ["Up next", ["CORE-1"]],
       ["Backlog", ["CORE-4"]],
       ["Closed", ["CORE-5"]],
     ]);
     // Another sort reorders inside each group; the groups keep their order.
     expect(sections("updated")).toEqual([
       ["In progress", ["CORE-3", "CORE-2"]],
-      ["Up next", ["CORE-1"]],
       ["Done in a timeline", ["CORE-6"]],
+      ["Up next", ["CORE-1"]],
       ["Backlog", ["CORE-4"]],
       ["Closed", ["CORE-5"]],
     ]);
