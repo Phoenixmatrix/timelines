@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { reconcileUsage, type UsageRow } from "./usage-reconciliation.ts";
+import { collectGatewayLogs, reconcileUsage, type UsageRow } from "./usage-reconciliation.ts";
 
 const row = (feature: string, model: string, calls: number, input = 0, output = 0): UsageRow => ({
   account_id: "acc_o",
@@ -76,4 +76,42 @@ await test("a call cut off by the app but billed upstream is an attempt on both 
     "acc_o",
   );
   assert.equal(missing.mismatched.length, 1);
+});
+
+await test("reconciliation reads past sparse and empty filtered pages without counting overlaps twice", async () => {
+  const first = { id: "first", ...log("knowledge", "glm", { tokensIn: 10, tokensOut: 5 }) };
+  const last = { id: "last", ...log("knowledge", "gemma", { tokensIn: 20, tokensOut: 8 }) };
+  const requested: number[] = [];
+  const logs = await collectGatewayLogs(async (page) => {
+    requested.push(page);
+    switch (page) {
+      case 1:
+        return { logs: [first], rawCount: 50 };
+      case 2:
+        return { logs: [], rawCount: 50 };
+      case 3:
+        return { logs: [first, last], rawCount: 2 };
+      default:
+        throw new Error("Read beyond the final provider page");
+    }
+  });
+  assert.deepEqual(requested, [1, 2, 3]);
+  const result = reconcileUsage(
+    [row("knowledge", "glm", 1, 10, 5), row("knowledge", "gemma", 1, 20, 8)],
+    logs,
+    "acc_o",
+  );
+  assert.deepEqual(result.mismatched, []);
+});
+
+await test("an unbounded Gateway listing fails rather than accepting truncated usage", async () => {
+  let pages = 0;
+  await assert.rejects(
+    collectGatewayLogs(async () => {
+      pages++;
+      return { logs: [], rawCount: 50 };
+    }),
+    /More Gateway logs than reconciliation reads/,
+  );
+  assert.equal(pages, 40);
 });

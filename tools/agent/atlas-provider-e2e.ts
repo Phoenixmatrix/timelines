@@ -828,6 +828,7 @@ export async function runAtlasProviderE2E(
       evidence.enabledBuild = {
         id: build.id,
         commit: build.toCommit,
+        knowledgeStats: build.stats,
         atlasSnapshot: stats.atlasSnapshot,
         atlasSeq: stats.atlasSeq,
         atlasTimings: stats.atlasTimings,
@@ -835,6 +836,11 @@ export async function runAtlasProviderE2E(
         atlasSpend: stats.atlasSpend,
         atlasError: stats.atlasError ?? null,
       };
+      // Retain the structural inputs before teardown, even if membership fails.
+      evidence.enabledGraph = await api(
+        `/repos/${ledger.owner}/${ledger.name}/knowledge/graph/export`,
+        tokenOf(ledger),
+      );
       assert.equal(stats.atlasError, undefined, `Atlas projection failed: ${stats.atlasError}`);
       assert(stats.atlasSnapshot && stats.atlasDescribed && stats.atlasSpend && stats.atlasTimings);
       const described = stats.atlasDescribed;
@@ -889,12 +895,17 @@ export async function runAtlasProviderE2E(
           `${entity.name}: ${entity.summary}`,
         );
         assert(inferred.sources.length > 0, "Prose rests on source files");
+        const sourceMembership = await capabilityOfFiles(
+          ledger,
+          inferred.sources.map((source) => source.path),
+        );
         for (const source of inferred.sources) {
           assert.equal(source.commit, ledger.head, "Citations are at the snapshot's commit");
           assert.equal(source.repoId, ledger.id);
-          assert(
-            paths.includes(source.path) || source.path === "index.ts",
-            `${source.path} isn't a member`,
+          assert.equal(
+            sourceMembership.get(source.path),
+            entity.id,
+            `${source.path} must be a primary member of the described capability`,
           );
           assert.match(source.blob ?? "", /^[0-9a-f]{40}$/, "Citations name the immutable blob");
         }

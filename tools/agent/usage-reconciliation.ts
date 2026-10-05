@@ -86,3 +86,27 @@ export function reconcileUsage(
   });
   return { rows, mismatched };
 }
+
+export interface GatewayLogPage<Log extends { id: string }> {
+  logs: Log[];
+  /** Number received from the provider, before any client-side filtering. */
+  rawCount: number;
+}
+
+/** Collect 50-record Gateway pages without truncating sparse filtered results. */
+export async function collectGatewayLogs<Log extends { id: string }>(
+  readPage: (page: number) => Promise<GatewayLogPage<Log>>,
+) {
+  const logs: Log[] = [];
+  const seen = new Set<string>();
+  for (let page = 1; page <= 40; page++) {
+    const batch = await readPage(page);
+    for (const log of batch.logs) {
+      if (seen.has(log.id)) continue;
+      seen.add(log.id);
+      logs.push(log);
+    }
+    if (batch.rawCount < 50) return logs;
+  }
+  throw new Error("More Gateway logs than reconciliation reads");
+}
