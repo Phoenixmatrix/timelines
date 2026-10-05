@@ -329,5 +329,7 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
     approval,
     landing,
     discussions: NO_DISCUSSIONS,
+    // Filled in by the route, which reads steps like the repository (CORE-243).
+    step: null,
   };
 }

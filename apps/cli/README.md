@@ -183,6 +183,15 @@ update, not proof of a queue landing. Tracker-inaccessible readers get no
 tracker provenance. Failed or unfinished advances do not become landings;
 in a partially landed timeline, only repositories already advanced qualify.
 
+Each chain also carries the **step** behind its commit (CORE-243): the step
+context its agent recorded (why, challenges, instructions and steering with
+their coverage, tests), or, for a commit a rebase or landing replaced, the
+newest step of its change (`step.commitOid` then names the commit it was
+recorded on). Landing merges keep the timeline's commits, so a landed line
+still leads to its step. Steps are as readable as the repository; a timeline
+commit without one says "no context recorded". On the web, a selected line's
+**Why?** shows the same, with a link into the timeline's story.
+
 ## Deployments
 
 Gitmatrix deploys nothing; whatever deploys tells it where code went. Inside a CI

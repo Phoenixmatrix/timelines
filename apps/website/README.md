@@ -366,6 +366,15 @@ repository's feed with `fetch` (not `EventSource`), and shows each agent's
 latest step, its test result, how many steps since when and its why, linked
 into the story. `gm steps --follow` streams the same feed.
 
+### Why on a line
+
+`GET /api/repos/:o/:n/why` adds each chain's `step` (CORE-243,
+`stepsFor` in `worker/steps/api.ts`): the step context of the chain's commit,
+else the newest step of its change, so a line keeps its step after a rebase
+and after landing. The file view's **Why?** panel shows it under **Step
+context** (who recorded it, why, challenges, steering coverage, tests) and
+links to the step in the timeline's story; `gm why` prints the same.
+
 ### The story view
 
 A timeline's **Story** (`/tracker/:owner/timelines/:slug/story`, linked from

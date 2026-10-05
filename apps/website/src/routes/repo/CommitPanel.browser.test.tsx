@@ -243,6 +243,7 @@ async function world() {
             }
           : null,
       discussions: { available: false, reason: "", threads: [] },
+      step: null,
     };
     return {
       repo: { owner: "orbit", name: "engine", defaultBranch: "main" },

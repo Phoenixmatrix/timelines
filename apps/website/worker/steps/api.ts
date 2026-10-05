@@ -215,6 +215,59 @@ async function artifactsOf(d1: D1Database, rows: Row[]): Promise<Map<string, Ste
   return out;
 }
 
+/**
+ * The step context for each of these commits (CORE-243: why on a line): the
+ * commit's own step, else, for a commit a rebase or landing replaced, the
+ * newest step of its change. Deleted steps come back as tombstones.
+ */
+export async function stepsFor(
+  c: Context<AppEnv>,
+  repoId: string,
+  commits: { oid: string; changeId: string | null }[],
+): Promise<Map<string, Step>> {
+  const out = new Map<string, Step>();
+  if (!commits.length) return out;
+  const kdb = db(c.env.DB);
+  const exact: Row[] = [];
+  const oids = [...new Set(commits.map((x) => x.oid))];
+  for (let i = 0; i < oids.length; i += ROWS_PER_QUERY)
+    exact.push(
+      ...(await kdb
+        .selectFrom("step_contexts")
+        .selectAll()
+        .where("repo_id", "=", repoId)
+        .where("commit_oid", "in", oids.slice(i, i + ROWS_PER_QUERY))
+        .execute()),
+    );
+  const found = new Set(exact.map((r) => r.commit_oid));
+  const byChange = new Map<string, string[]>();
+  for (const { oid, changeId } of commits)
+    if (!found.has(oid) && changeId)
+      byChange.set(changeId, [...(byChange.get(changeId) ?? []), oid]);
+  const versions: Row[] = [];
+  const changes = [...byChange.keys()];
+  for (let i = 0; i < changes.length; i += ROWS_PER_QUERY)
+    versions.push(
+      ...(await kdb
+        .selectFrom("step_contexts")
+        .selectAll()
+        .where("repo_id", "=", repoId)
+        .where("change_id", "in", changes.slice(i, i + ROWS_PER_QUERY))
+        .orderBy("committed_at", "desc")
+        .execute()),
+    );
+  const newest = new Map<string, Row>();
+  for (const row of versions) if (!newest.has(row.change_id)) newest.set(row.change_id, row);
+  const rows = [...exact, ...newest.values()];
+  const steps = await present(c, rows);
+  rows.forEach((row, i) => {
+    const step = steps[i]!;
+    if (row.commit_oid && found.has(row.commit_oid)) out.set(row.commit_oid, step);
+    for (const oid of byChange.get(row.change_id) ?? []) if (!out.has(oid)) out.set(oid, step);
+  });
+  return out;
+}
+
 /** Whether a push has shown this commit as this change (worker/ref-log). */
 async function seen(d1: D1Database, repoId: string, changeId: string, oid: string) {
   const row = await db(d1)

@@ -12,6 +12,7 @@
 // copy, a local rebase) and because the change id it reads is what makes the
 // chain survive rewrites. Both meet at the same resolver (why/chain.ts).
 
+import { stepsFor } from "../steps/api.ts";
 import { Hono, type Context } from "hono";
 import type { ChangeRef } from "../../shared/api.ts";
 import type { TimelineEvent, TimelineIssue } from "../../shared/timelines.ts";
@@ -285,6 +286,13 @@ why.get("/why", async (c) => {
     }
     const chains: WhyChain[] = [];
     for (const request of wanted) chains.push(await resolveChain(sources, request));
+    // The step context behind each commit, readable like the repository (CORE-243).
+    const steps = await stepsFor(
+      c,
+      row.id,
+      chains.map((chain) => ({ oid: chain.oid, changeId: chain.changeId })),
+    );
+    for (const chain of chains) chain.step = steps.get(chain.oid) ?? null;
     return c.json<WhyResponse>({
       repo: { owner: row.owner_slug, name: row.name, defaultBranch: row.default_branch },
       tracker: { owner: row.owner_slug, readable: sources.tracker !== null },

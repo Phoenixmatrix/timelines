@@ -8,6 +8,7 @@
 //
 // GET /api/repos/:owner/:name/why serves it to the web app and to `gm why`.
 
+import type { Step } from "./steps.ts";
 import type { RefUpdate } from "./api.ts";
 import type {
   ApprovalOutcome,
@@ -204,6 +205,12 @@ export interface WhyChain {
   approval: (WhyApproval & { checkpointId: string; timeline: string; number: number }) | null;
   landing: WhyLanding | null;
   discussions: WhyDiscussions;
+  /**
+   * The step context behind the commit (CORE-243): its own step, or the
+   * newest step of its change when a rebase or landing replaced the commit
+   * (then `step.commitOid` differs). Null when no step was recorded.
+   */
+  step: Step | null;
 }
 
 export interface WhyResponse {

@@ -170,6 +170,86 @@ function Step({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
+/**
+ * The step behind the commit (CORE-243): who recorded it, its why and
+ * challenges, what steered it, its tests, and the way into the story.
+ */
+function StepContext({
+  chain,
+  tracker,
+  repo,
+  onLeave,
+}: {
+  chain: WhyChain;
+  tracker: string;
+  repo: string;
+  onLeave: () => void;
+}) {
+  const step = chain.step;
+  if (!step) return <span className="text-ink-faint">No context was recorded for this step.</span>;
+  if (step.deleted)
+    return <span className="text-ink-faint">An admin removed this step&rsquo;s context.</span>;
+  const { context } = step;
+  const first = (text: string) =>
+    text
+      .split("\n")
+      .find((l) => l.trim())
+      ?.trim() ?? "";
+  const failed = context.tests.filter((t) => t.exit !== 0).length;
+  const by =
+    step.author.kind === "agent"
+      ? `${step.author.name} for ${step.author.accountable.displayName}`
+      : step.author.name;
+  const story = step.timeline
+    ? `/tracker/${encodeURIComponent(tracker)}/timelines/${encodeURIComponent(step.timeline)}/story?${new URLSearchParams({ step: chain.oid, repo })}`
+    : null;
+  return (
+    <>
+      <span className="text-ink-muted">
+        By {by}
+        {step.commitOid !== chain.oid && (
+          <>
+            {", recorded on "}
+            <code className="mk-mono">{shortOid(step.commitOid)}</code>
+            {" before a rebase"}
+          </>
+        )}
+      </span>
+      {context.why.trim() && (
+        <span>
+          <span className="text-ink-faint">Why: </span>
+          {first(context.why)}
+        </span>
+      )}
+      {context.challenges.trim() && (
+        <span>
+          <span className="text-ink-faint">Challenges: </span>
+          {first(context.challenges)}
+        </span>
+      )}
+      {(context.instructions.length > 0 || context.steering.length > 0) && (
+        <span className="text-ink-muted">
+          {context.instructions.length}{" "}
+          {context.instructions.length === 1 ? "instruction" : "instructions"},{" "}
+          {context.steering.length} steering ({context.coverage.steering})
+        </span>
+      )}
+      {context.tests.length > 0 && (
+        <span className={failed ? "text-danger-text" : "text-online"}>
+          {failed
+            ? `${failed} of ${context.tests.length} tests failed`
+            : `${context.tests.length} tests passed`}
+        </span>
+      )}
+      {story && (
+        <Link className={link} to={story} onClick={onLeave}>
+          Open in the timeline&rsquo;s story
+        </Link>
+      )}
+    </>
+  );
+}
+
 function Chain({
   chain,
   result,
@@ -409,6 +489,17 @@ function Chain({
             <span className="text-ink-muted">Not on {defaultBranch} yet.</span>
           )}
         </Step>
+
+        {(chain.step || chain.timelines.length > 0) && (
+          <Step title="Step context">
+            <StepContext
+              chain={chain}
+              tracker={tracker}
+              repo={`${owner}/${name}`}
+              onLeave={onLeave}
+            />
+          </Step>
+        )}
 
         <Step title="Discussion">
           <span className="text-ink-faint">{chain.discussions.reason}</span>
