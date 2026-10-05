@@ -41,6 +41,11 @@ import { Invites, invitesAction, invitesLoader } from "./routes/Invites.tsx";
 import { Profile, profileAction, profileLoader } from "./routes/Profile.tsx";
 import { Preferences, preferencesLoader } from "./routes/Preferences.tsx";
 import { AiSettings, aiSettingsLoader } from "./routes/AiSettings.tsx";
+import {
+  AssistantSkills,
+  assistantSkillsAction,
+  assistantSkillsLoader,
+} from "./routes/AssistantSkills.tsx";
 import { SiteUsage, siteUsageLoader, UsageCosts, usageLoader } from "./routes/UsageCosts.tsx";
 import {
   DataRetention,
@@ -141,6 +146,12 @@ export const routes: RouteObject[] = [
             loader: profileLoader,
             action: profileAction,
             Component: Profile,
+          },
+          {
+            path: "settings/skills",
+            loader: assistantSkillsLoader,
+            action: assistantSkillsAction,
+            Component: AssistantSkills,
           },
           {
             path: "settings/preferences",

@@ -185,6 +185,7 @@ export const TABLE_GROUPS: TableGroup[] = [
     tables: {
       accounts: "id = ?1",
       account_settings: "account_id = ?1",
+      assistant_personal_skills: "user_id = ?1",
       org_members: "org_id = ?1",
       agents: "accountable_id = ?1",
       access_tokens: "user_id = ?1",

@@ -2872,8 +2872,30 @@ short viewport, independently of the conversation.
   browser navigation routes, including ordinary answers that cite pages without
   navigating. Release-note browser links use `/:owner/:repo/releases` (or
   `/tracker/:owner/releases` for the tracker feed); `/release-notes` is a JSON API
-  suffix, not a page. A repository's own `.agents/skills/*/SKILL.md` join them when
-  the chat is about it.
+  suffix, not a page. Enabled personal skills and a repository's own
+  `.agents/skills/*/SKILL.md` join the catalog when the chat includes that repository.
+  Personal skills are available without repository context. Duplicate names resolve
+  built-in first, then personal, then repository; built-in names are reserved.
+  A skill may omit its description.
+- **Personal skills** (CORE-103): **Profile → Manage assistant skills**, or
+  **Settings → Personal → Assistant skills**, opens `/settings/skills`. Add or
+  edit a name, optional description and Markdown instructions; disable a skill
+  without deleting it, or confirm its removal. Skills belong to the signed-in
+  person, not the selected settings owner or an agent capability profile.
+  `GET/POST /api/account/skills` and `PUT/DELETE /api/account/skills/:id` manage
+  `assistant_personal_skills` in D1. Names use lowercase letters, digits and
+  hyphens (1–64 characters); descriptions allow 500 characters and instructions
+  20,000. Human-only CRUD checks ownership on every request.
+- **Slash commands.** Start a message with `/` to list authorized skills from
+  `GET /api/assistant/skills?repo=owner/name`; filtering matches names and
+  descriptions. Arrow keys move selection, Enter or Tab inserts the command
+  without sending, and Escape dismisses the list. Send `/name` with optional
+  arguments to preload its instructions for that turn, including approval and
+  navigation continuations. A persisted **Used /name** receipt identifies the
+  source; continuations retain that skill's identity and repository scope.
+  Unknown or unavailable commands remain ordinary text. A later user message
+  does not inherit the explicit invocation. The same leading-command syntax
+  works in `gm ask`; skills never grant permissions or bypass write approvals.
 - **The web** (`src/assistant/`): page context (repository, file and lines,
   issue, run) is included by default. **In context:** names the page that will
   accompany the next message; its remove button switches to **Not in context:**
@@ -2894,8 +2916,11 @@ short viewport, independently of the conversation.
   them, or returns one JSON object to agents. It lands in the same transcript,
   so a terminal conversation continues on the web.
 
-`vp run agent test-ai` covers a real browser approval, exactly-once issue creation,
-conversation-aware follow-up, retry after an injected stream failure, redirecting
+`vp run agent test-ai` creates a personal skill through settings, reloads its
+configuration, selects it with the keyboard, and proves that its private
+instructions affect the real model response. It covers a real browser approval,
+exactly-once issue creation and skill receipt, conversation-aware follow-up
+without inherited invocation, retry after an injected stream failure, redirecting
 a pending approval without executing it or generating a second reply, and reload.
 It retains `assistant-approval.png` and `assistant-approval.zip` with the provider
 evidence. Provider stream errors also pass through the assistant's error handler

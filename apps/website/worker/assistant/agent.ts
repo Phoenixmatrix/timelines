@@ -46,7 +46,7 @@ import {
   type ProgressStep,
 } from "./progress.ts";
 import { sentenceCase } from "./titles.ts";
-import { builtinSkills, preloaded, repositorySkills, SkillRegistry } from "./skills.ts";
+import { buildSkillRegistry, preloaded, resolveSkillInvocation, skillReceipt } from "./skills.ts";
 import { buildTools } from "./tools.ts";
 import { aiWork, recordAiCall, type AiTokens, type AiWork } from "../usage/ai.ts";
 
@@ -229,9 +229,11 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     const web = !cli;
     const body = options?.body ?? {};
     const page = web ? ((body.page as PageContext | undefined) ?? null) : null;
-    const repo = cli?.repo ?? page?.repo ?? null;
+    const currentRepo = cli?.repo ?? page?.repo ?? null;
     const lastUser = [...this.messages].reverse().find((m) => m.role === "user");
     const lastReply = [...this.messages].reverse().find((m) => m.role === "assistant");
+    const receipt = options?.continuation ? skillReceipt(lastReply) : null;
+    const repo = receipt?.source === "repository" ? (receipt.repo ?? null) : currentRepo;
     this.#turnAt = Date.now();
     await this.touch(web ? "web" : "cli");
 
@@ -247,14 +249,40 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     const stream = createUIMessageStream({
       originalMessages: history,
       execute: async ({ writer }) => {
+        // Establish the response identity before durable data parts reach the client.
+        // The outer stream assigns a new ID, or reuses the continued assistant ID.
+        writer.write({ type: "start" });
         const status = (value: string) => {
           writer.write({ type: "data-status", data: { text: value }, transient: true });
           void cli?.emit({ type: "status", text: value });
         };
         status("Thinking");
+        const api = apiClient(
+          app.fetch as never,
+          this.env,
+          (work) => this.ctx.waitUntil(work),
+          () => this.token(),
+        );
+        const registry = await buildSkillRegistry(this.env.DB, this.owner.userId, api, repo);
+        const invocation = resolveSkillInvocation(
+          registry,
+          text(lastUser),
+          Boolean(options?.continuation),
+          receipt,
+        );
+        if (invocation && !options?.continuation && lastUser) {
+          const { id, name, description, source, repo: skillRepo } = invocation;
+          writer.write({
+            type: "data-skill",
+            id: `skill-${lastUser.id}`,
+            data: { id, name, description, source, ...(skillRepo ? { repo: skillRepo } : {}) },
+          });
+        }
         const [{ plan, routedMs }, person] = await Promise.all([
           this.plan({
-            message: text(lastUser),
+            message: invocation
+              ? `${text(lastUser).replace(/^\/\S+\s*/, "")}\n\nSkill /${invocation.name}: ${invocation.description}\n${invocation.body}`
+              : text(lastUser),
             page: page ? { path: page.path, title: page.title } : null,
             previous: options?.continuation ? undefined : text(lastReply),
           }),
@@ -275,12 +303,6 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
           routedMs,
         });
 
-        const api = apiClient(
-          app.fetch as never,
-          this.env,
-          (work) => this.ctx.waitUntil(work),
-          () => this.token(),
-        );
         const tools = buildTools({
           api,
           writes: web || cli.write,
@@ -310,12 +332,8 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
             executor: new DynamicWorkerExecutor({ loader, globalOutbound: null, timeout: 30_000 }),
           });
 
-        const registry = new SkillRegistry([
-          builtinSkills(),
-          ...(repo ? [repositorySkills(api, repo)] : []),
-        ]);
-        await registry.load();
         const names = preloaded(groups, web && plan.intent === "navigate");
+        if (invocation && !names.includes(invocation.name)) names.push(invocation.name);
         const loaded = names.map((name) => registry.get(name)).filter((skill) => skill !== null);
         const skills = [
           registry.catalog(names),
@@ -398,7 +416,7 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
             return (onFinish as unknown as (event: unknown) => unknown)(event);
           }) as never,
         });
-        writer.merge(result.toUIMessageStream({ sendReasoning: false, onError }));
+        writer.merge(result.toUIMessageStream({ sendStart: false, sendReasoning: false, onError }));
       },
       onError,
     });
@@ -531,7 +549,20 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
   async transcript() {
     return this.messages.map((m) => ({
       role: m.role,
-      text: text(m),
+      text: [
+        ...m.parts.flatMap((part) => {
+          if (part.type !== "data-skill") return [];
+          const receipt = skillReceipt({ ...m, parts: [part] });
+          return receipt
+            ? [
+                `Used /${receipt.name} (${receipt.source}${receipt.repo ? `: ${receipt.repo}` : ""})`,
+              ]
+            : [];
+        }),
+        text(m),
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
       tools: m.parts
         .filter((p) => p.type.startsWith("tool-"))
         .map((p) => {

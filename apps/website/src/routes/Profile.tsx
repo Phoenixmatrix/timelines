@@ -89,6 +89,17 @@ export function Profile() {
             </div>
           </Form>
         </Card>
+        <Card title="Assistant skills" className="max-w-xl">
+          <div className="mk-card-body">
+            <p className="m-0 text-ink-muted">
+              Give recurring tasks personal instructions you can use with a slash command in the
+              assistant.
+            </p>
+            <Link to="/settings/skills" className={link}>
+              Manage assistant skills
+            </Link>
+          </div>
+        </Card>
       </div>
     </SettingsPage>
   );

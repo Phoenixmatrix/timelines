@@ -124,6 +124,11 @@ const pages: CommandSource = ({ viewer, pathname }) => {
     page("repos", "Your repositories", `/${viewer.slug}`, ["profile"]),
     page("your-packages", "Your packages", packagesPath(viewer.slug)),
     page("profile", "Profile settings", "/settings/profile", ["account", "username"]),
+    page("assistant-skills", "Assistant skills", "/settings/skills", [
+      "personal",
+      "slash",
+      "instructions",
+    ]),
     page("preferences", "Preferences", "/settings/preferences", [
       "default team",
       "layout",
