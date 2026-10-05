@@ -89,6 +89,25 @@ const step = (n: number, over: Partial<StepUpload> = {}): StepUpload => ({
 });
 
 describe("step context", () => {
+  test("a feed that fails never fails the upload or the reads (S11)", async () => {
+    const s = setup();
+    s.feeds.set("repo:search", {
+      publish: async () => {
+        throw new Error("feed down");
+      },
+    } as unknown as StepFeed);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const made = await s.upload(step(1));
+    expect(made.status).toBe(201);
+    expect(errors).toHaveBeenCalledWith(
+      "Steps: publishing to the live feed failed",
+      expect.anything(),
+    );
+    errors.mockRestore();
+    const page = (await (await s.call("?timeline=search")).json()) as StepPage;
+    expect(page.steps.map((x) => x.summary)).toEqual(["Step 1"]);
+  });
+
   test("a new timeline step goes out on its live feed, read by whoever can read the repo (CORE-239)", async () => {
     const s = setup();
     await s.upload(step(1));

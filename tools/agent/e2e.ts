@@ -25,6 +25,7 @@ import type { Chronicle, LinkedWork } from "../../apps/website/shared/chronicle.
 import type { Landing } from "../../apps/website/shared/timelines.ts";
 import type { UsageReport } from "../../apps/website/shared/usage.ts";
 import type { WhyResponse } from "../../apps/website/shared/why.ts";
+import type { StepFeedRecord, StepPage } from "../../apps/website/shared/steps.ts";
 import { atlasRevocationScenario, atlasSmokeScenario } from "./atlas-e2e.ts";
 import { chronicleScenario } from "./chronicle-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
@@ -2103,6 +2104,172 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       merge: mainAfter,
       checkpoint: checkpointCommit,
       gates: gates.number,
+    });
+  });
+
+  /** gm with a harness event on stdin, as Claude Code runs its hook (CORE-241). */
+  async function gmHook(clone: string, prompt: string) {
+    const env: NodeJS.ProcessEnv = {
+      ...ctx.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+    };
+    const { promise, resolve, reject } = Promise.withResolvers<string>();
+    const child = execFile(
+      ctx.gm,
+      ["hook", "claude-code"],
+      { cwd: clone, env, timeout: 30_000 },
+      (error, stdout) => (error ? reject(error) : resolve(stdout)),
+    );
+    child.stdin!.end(
+      JSON.stringify({
+        session_id: "steps-e2e",
+        hook_event_name: "UserPromptSubmit",
+        cwd: clone,
+        prompt,
+      }),
+    );
+    const stdout = await promise;
+    assert.equal(stdout, "", "A prompt hook never prints: its output would join the conversation");
+  }
+
+  /** `gm steps --follow --count 1` in the background: its first record, and when it came. */
+  function followOneStep(clone: string) {
+    const env: NodeJS.ProcessEnv = {
+      ...ctx.env,
+      GM_SERVER: ctx.origin,
+      GM_TOKEN: fixtures.tokens.jun,
+    };
+    for (const key of Object.keys(env))
+      if (key.startsWith("GIT_CONFIG_") || key === "SSH_AUTH_SOCK" || key === "GITMATRIX_TOKEN")
+        delete env[key];
+    env.GIT_CONFIG_NOSYSTEM = "1";
+    env.GIT_CONFIG_GLOBAL = "/dev/null";
+    const { promise, resolve, reject } = Promise.withResolvers<{ line: string; at: number }>();
+    const child = spawn(ctx.gm, ["--output", "json", "steps", "--follow", "--count", "1"], {
+      cwd: clone,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => child.kill("SIGKILL"), 120_000);
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0 && stdout.trim())
+        resolve({ line: stdout.trim().split("\n")[0]!, at: Date.now() });
+      else reject(new Error(`gm steps --follow exited ${code}: ${redact(stderr)}`));
+    });
+    return promise;
+  }
+
+  await scenario("steps-context-hook-live-run-landing-and-access", async () => {
+    // CORE-226 (S01, S02, S04, S06, S07, S09): an agent steps through a
+    // timeline: what the person said comes through the hook, the step carries
+    // its why and local tests, arrives on the live feed within seconds, gets
+    // its step run's summary, and after landing, gm why on its line shows it.
+    const slug = `steps-e2e-${randomUUID().slice(0, 8)}`;
+    const file = `steps-e2e/${slug}.txt`;
+    const clone = await landingTimeline(slug);
+    await mkdir(join(clone, "steps-e2e"), { recursive: true });
+    await writeFile(join(clone, file), `${slug}\n`);
+    await mkdir(join(clone, ".gitmatrix"), { recursive: true });
+    await writeFile(
+      join(clone, ".gitmatrix", "ci.yml"),
+      JSON.stringify({
+        on: { push: { branches: ["never-agent-auto"] }, step: {} },
+        jobs: {
+          "step-check": {
+            on: "step",
+            local: true,
+            steps: [{ run: `test -f ${file} && echo STEP_OK` }],
+          },
+          gate: { if: 'trigger == "landing"', steps: [{ run: "echo LANDING_GATE_OK" }] },
+        },
+      }),
+    );
+    // S02: the person's own words, through the Claude Code hook.
+    await gmHook(clone, "Mark the steps E2E file");
+    await gmHook(clone, "Keep it to one line");
+    const context = join(work, `${slug}-context.md`);
+    await writeFile(context, "## Why\nProve steps end to end.\n\n## Challenges\nNone so far.\n");
+
+    // S01: one command tests, commits with context and pushes; the live feed has it within seconds.
+    const following = followOneStep(clone);
+    await delay(1_500);
+    const stepped = JSON.parse(
+      await gm(["step", "-m", `Steps E2E ${slug}`, "--context", context], "jun", clone),
+    ) as { tests: { jobs: { name: string; status: string }[] }; push: { bookmark: string } };
+    const returnedAt = Date.now();
+    assert.deepEqual(
+      stepped.tests.jobs.map((job) => [job.name, job.status]),
+      [["step-check", "passed"]],
+      "gm step runs the repository's local step jobs",
+    );
+    assert.equal(stepped.push.bookmark, `timeline/${slug}`);
+    const followed = await following;
+    const live = JSON.parse(followed.line) as StepFeedRecord;
+    const latencyMs = Math.max(0, followed.at - returnedAt);
+    assert.equal(live.summary, `Steps E2E ${slug}`);
+    assert.equal(live.timeline, slug);
+    assert(latencyMs < 5_000, `The live feed took ${latencyMs} ms after gm step returned`);
+
+    // The stored step: verified by the push, with the hook's words, its why and tests.
+    const stepFor = () =>
+      json<StepPage>(`${api}/steps?commits=${live.commitOid}`, fixtures.tokens.sam).then(
+        (page) => page.steps[0],
+      );
+    // Verified once the push's ref log has shown the commit (it can trail the upload).
+    const step = await poll(stepFor, (s) => !!s?.verified, "the step verified by its push");
+    assert(step, "A reader of the repository reads the step");
+    assert.deepEqual(
+      step.context.instructions.map((e) => [e.text, e.source]),
+      [["Mark the steps E2E file", "hook"]],
+    );
+    assert.deepEqual(
+      step.context.steering.map((e) => [e.text, e.source]),
+      [["Keep it to one line", "hook"]],
+    );
+    assert.equal(step.context.coverage.steering, "hook:claude-code");
+    assert.equal(step.context.why, "Prove steps end to end.");
+    assert.deepEqual(
+      step.context.tests.map((t) => [t.command, t.exit, t.origin]),
+      [["gm test: step-check", 0, "local"]],
+    );
+    // S06: the push's step run attaches its summary to the step.
+    const withRun = await poll(
+      stepFor,
+      (s) => !!s && s.artifacts.length > 0,
+      "the step run's summary",
+    );
+    const summary = withRun!.artifacts[0]!;
+    assert.equal(summary.kind, "test-summary");
+    assert.equal(summary.kind === "test-summary" && summary.data.status, "succeeded");
+
+    // S04: an agent's commit without context warns and still commits.
+    await writeFile(join(clone, `${file}.more`), "more\n");
+    const quiet = JSON.parse(
+      await gm(["commit", "-m", "No context here"], "jun", clone, undefined, { GM_AGENT: "1" }),
+    ) as { warnings?: string[] };
+    assert.match(quiet.warnings?.[0] ?? "", /has no context/);
+
+    // S09: someone who can't read the repository sees neither steps nor the feed.
+    await request(`${api}/steps?timeline=${slug}`, null, "GET", undefined, [404]);
+    await request(`${api}/steps/live?timeline=${slug}`, null, "GET", undefined, [404]);
+
+    // S07: the timeline lands; gm why on the landed line still shows its step.
+    await writeFile(join(clone, `${file}.done`), "done\n");
+    await pushAndCheckpoint(clone, slug, `Steps E2E checkpoint ${slug}`);
+    const landing = await settledLanding(slug);
+    assert.equal(landing.state, "landed", `Landing stopped: ${landing.reason}`);
+    const why = JSON.parse(await gm(["why", `${file}:1`], "jun", clone)) as WhyResponse;
+    const chain = why.chains.find((c) => c.oid === live.commitOid);
+    assert(chain, "gm why leads the landed line to the step's commit");
+    assert.equal(chain.step?.context.why, "Prove steps end to end.");
+    record({
+      steps: { slug, commit: live.commitOid, latencyMs, artifact: summary.kind, landed: true },
     });
   });
 

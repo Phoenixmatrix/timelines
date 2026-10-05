@@ -97,6 +97,28 @@ the exact source revision. These links stay out of the reading view until opened
 Select another item's time to switch details, or use Close or Escape to dismiss
 the sidebar and return focus to the opener. On phones, details fill the screen.
 
+## Steps: work context for every commit
+
+In a timeline, agents commit at meaningful steps, and each step carries the
+context that produced it: the person's instructions and steering, why the
+work was done this way, what got in the way, and its test results (PRD
+CORE-226). People and agents read it live and long after:
+
+- **Writing:** `gm step -m '…' --context step.md` tests, commits and pushes;
+  harness hooks for Claude Code, Codex and Oh My Pi record what the person said
+  (`gm agent setup` installs them). Missing context warns, never blocks.
+- **Reading:** the timeline page's **Live now** and **Story**, a line's
+  **Why?** in the file view, and `gm steps --follow`, `gm context show`,
+  `gm log --context`, `gm why`.
+- **Checks:** `on: step` jobs in `.gitmatrix/ci.yml` run on every timeline push
+  (`gm test` runs the local ones); a timeline's full CI and knowledge overlays
+  wait for a quiet period or a checkpoint.
+- **Keeping it:** the why stays with the repository; instructions and steering,
+  step-run artifacts and the live feed follow the Data retention categories.
+
+Details: `apps/cli/README.md` ("Steps: context for every commit") and
+`apps/website/README.md` ("Steps: work context per commit", "Step runs").
+
 ## Data retention
 
 Gitmatrix deletes nothing new until someone turns a retention category on,
@@ -227,15 +249,16 @@ The E2E command creates a **separate ephemeral environment**, seeds it twice,
 exercises it and destroys it on success or failure. It does not reset the interactive
 environment. Its checks include:
 
-| Boundary                       | Observable behavior                                                                                                                                                               |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Authentication and permissions | Anonymous/public access, invalid and revoked tokens, read/write roles, private-repo concealment                                                                                   |
-| CLI and Git transport          | Real clone/commit/push; denied push leaves remote refs unchanged                                                                                                                  |
-| Tracker                        | Blocked and contested claims, fencing, completion evidence and local replica synchronization                                                                                      |
-| Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance                                |
-| CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                                                              |
-| Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries; a scoped timeline round trip; an Atlas smoke down to the cited source |
-| Mirror                         | Authenticated Git mirror update/tag/prune, default branch and tags only, rejected credentials and recovery against a real local HTTP target                                       |
+| Boundary                       | Observable behavior                                                                                                                                                                                                                 |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Authentication and permissions | Anonymous/public access, invalid and revoked tokens, read/write roles, private-repo concealment                                                                                                                                     |
+| CLI and Git transport          | Real clone/commit/push; denied push leaves remote refs unchanged                                                                                                                                                                    |
+| Tracker                        | Blocked and contested claims, fencing, completion evidence and local replica synchronization                                                                                                                                        |
+| Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance                                                                                  |
+| CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                                                                                                                |
+| Steps                          | `gm step` with a hook-captured instruction and steering, local `gm test` results, the live feed within 5 s, the step run's summary, a no-context warning, anonymous readers refused, and `gm why` on a landed line showing its step |
+| Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries; a scoped timeline round trip; an Atlas smoke down to the cited source                                                   |
+| Mirror                         | Authenticated Git mirror update/tag/prune, default branch and tags only, rejected credentials and recovery against a real local HTTP target                                                                                         |
 
 Local runners keep deadline and cancellation supervision after stdout/stderr EOF.
 Silent running steps use a five-second cancellation heartbeat. The live cancellation
