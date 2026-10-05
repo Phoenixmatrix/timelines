@@ -1724,7 +1724,9 @@ release introductions. Embedding models and dimensions remain fixed.
 
 `GET/PATCH /api/accounts/:slug/settings/ai` returns features, selected option IDs,
 the catalog, save provenance and `canManage`. PATCH accepts partial nested
-`features` and `models` objects; unknown keys and out-of-role model IDs are rejected.
+`features`, `models` and `knowledgeUpdates` (`quietMinutes`, `maxWaitMinutes`,
+whole minutes 0–1440) objects; unknown keys, out-of-role model IDs and other
+waits are rejected.
 The [CLI equivalent](../cli/README.md#automatic-ai-settings) is `gm settings ai`.
 
 Policy is frozen when a Workflow is admitted or a release generation captures its
@@ -1752,7 +1754,8 @@ and rejects explicit rebuild/search with 503; production behavior is unchanged.
 
 ```
 push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
-                       debounce 1.5s (max 8s), one build in flight, rebuild if dirty
+                       main's pushes pending until they settle (10 min quiet, 30 min at most),
+                       one update in flight, at the latest head
                      ─▶ KnowledgeBuild (Workflow, durable retried steps)
    snapshot ─▶ analyze ─▶ graph ─▶ align ─▶ concepts ─▶ synthesize ─▶ review ─▶ graph-final ─▶ index ─▶ wiki ─▶ finish
                  │           │        │          │            │                         │        │
@@ -1761,6 +1764,48 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
                                                       links, trim)                                         clef gate)
 ```
 
+- **Batched, asynchronous updates** (CORE-286). A push to main marks the
+  repository's Knowledge pending: the coordinator records main's new head, how
+  many pushes are waiting and when the first and last came. One update then
+  runs at the latest head once pushes have paused for the account's quiet
+  period, and never later than its longest wait after the first pending push
+  (10 and 30 minutes by default; `knowledgeUpdates` in the account's AI
+  settings, 0–1440 minutes each; development environments shorten both with
+  `GITMATRIX_KNOWLEDGE_QUIET_SECONDS` / `GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS`).
+  Pushes during an update wait for their own window. A repository's first
+  build, an explicit rebuild and a watchdog retry start at once, and a
+  repository admin can start the pending update now (`POST …/knowledge/update`,
+  the Knowledge tab's **Update now**). Timeline overlays and page sets keep
+  their own short debounce. The status says what Knowledge reflects:
+  `pending: {pushes, since, dueAt}` beside `indexedCommit` ("Reflects abc1234 ·
+  3 pushes pending · update at ~14:05").
+- **Updates, not rebuilds** (CORE-286). An update is driven by the diff from
+  the indexed commit: it reads only the trees that changed (an unchanged
+  subtree's files are the indexed ones), analyzes only new blobs, and every
+  model decision after that is reused unless its inputs changed: concept pairs
+  (by pair), salience (by the group's names and files), definitions (by the
+  concept's name, aliases and the files it is defined from, in its
+  repository; not by their summaries, which change wording on every edit),
+  reviews (by both entries), component and overview syntheses and wiki pages
+  (by their inputs hash). Pairs are decided over the whole repository's
+  candidates, so a newcomer that becomes one of an established concept's
+  closest is asked about too; names are embedded only when the set of concepts
+  changed. Review rounds run until nothing is left to ask, so one update
+  settles what its own push changed. Vectors follow the graph's change feed,
+  search items their blob or page versions, the Atlas its feed (CORE-166), and
+  only changed concept rows are written. A **full rebuild** (`POST
+…/knowledge/rebuild`, a repository's first build, or a new pipeline version
+  `kg_state.pipeline`) runs every phase over the whole repository, still
+  reusing decisions whose inputs are unchanged, and re-embeds every node.
+  `worker/knowledge/incremental.test.ts` builds one history twice through the
+  real Workflow with deterministic models, updates on one side and full
+  rebuilds on the other, and requires identical Knowledge after every push.
+- **Per-build AI cost** (CORE-286). Each step meters its model calls into its
+  build (`kg_builds.ai_usage`, by model, retried calls included); the build's
+  stats get `aiUsage` (calls, tokens, list-price cost by model) and `mode`
+  (`update` or `full`, with `fullBecause`), `pushes` and `treesRead`. The usage
+  report adds a **Knowledge updates** section: updates and full rebuilds over
+  30 days, their calls, cost each and the costliest repositories.
 - **Analysis per content, not per commit.** Each file version (blob) is
   analyzed once: exact structure from regex extractors (imports, symbols,
   resolved file/package edges), its role from the Classification model, and a
@@ -1789,7 +1834,9 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   (3+ files always stay); the rest become `topics` on their files. Once kept
   concepts have definitions, their related pairs are asked again with the
   definitions (`review`), which settles many that names alone left in between.
-  Decisions are stored, so a push only asks about the concepts it introduced.
+  Decisions are stored, so an update only asks about pairs it has never
+  decided: the concepts its push introduced and the neighbours whose closest
+  candidates they changed.
   The wording was picked on hand-labelled samples from this repo: the glossary
   framing with file paths ranked pairs best (AUC 0.94 vs 0.85 for the recipe's
   wording; file summaries made it worse) with all level-2 merges correct; the

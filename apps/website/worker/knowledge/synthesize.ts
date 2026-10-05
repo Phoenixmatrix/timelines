@@ -1,7 +1,14 @@
 // Meaning above the file level: what each component is for, what the
 // repository is, and what its recurring concepts mean. Every synthesis is
-// cached under a hash of exactly what it was written from, so a push only
+// cached under a hash of what it was written from, so a push only
 // re-synthesizes the components whose files actually changed meaning.
+//
+// A concept's definition is cached under the concept itself (CORE-286): its
+// name, the names it also goes by and the files it is defined from, in its
+// repository. Their summaries are what it is written from, but not what it
+// is cached by: a summary is model output that changes wording on every edit
+// of the file, and rewriting the definition each time made every review of
+// the concept ask again. Lookups are batched, a few queries per pass.
 
 import type { AiModels } from "../../shared/ai.ts";
 import { db, nowIso } from "../schema.ts";
@@ -17,6 +24,9 @@ import type {
 } from "./graph.ts";
 import { chatJson } from "./models.ts";
 import { chunk, pool, sha256 } from "./util.ts";
+
+/** Concept definition cache keys (CORE-286); bump to rewrite every definition. */
+export const DEFINER = "d2";
 
 /** A synthesis cached under `key` (a hash of exactly what it was written from). */
 export async function cached<T>(d1: D1Database, key: string): Promise<T | null> {
@@ -35,6 +45,31 @@ export async function cached<T>(d1: D1Database, key: string): Promise<T | null> 
       .where("key", "=", key)
       .execute();
   return JSON.parse(row.data) as T;
+}
+
+/** Many cached syntheses at once: a query per 90 keys, uses recorded as `cached` does. */
+export async function cachedMany<T>(d1: D1Database, keys: string[]): Promise<Map<string, T>> {
+  const out = new Map<string, T>();
+  const now = new Date();
+  const stale: string[] = [];
+  for (const group of chunk([...new Set(keys)], 90)) {
+    const rows = await db(d1)
+      .selectFrom("kg_synthesis")
+      .select(["key", "data", "used_at"])
+      .where("key", "in", group)
+      .execute();
+    for (const row of rows) {
+      out.set(row.key, JSON.parse(row.data) as T);
+      if (useIsStale(row.used_at, now)) stale.push(row.key);
+    }
+  }
+  for (const group of chunk(stale, 90))
+    await db(d1)
+      .updateTable("kg_synthesis")
+      .set({ used_at: now.toISOString() })
+      .where("key", "in", group)
+      .execute();
+  return out;
 }
 
 /** Cache a synthesis under the hash of its inputs, with the model that wrote it. */
@@ -107,7 +142,7 @@ export interface SynthesisStats {
 export async function synthesize(
   env: Env,
   models: AiModels,
-  repoName: string,
+  repo: { id: string; fullName: string },
   files: SnapshotFile[],
   analyses: Map<string, FileAnalysis>,
   graph: BuiltGraph,
@@ -115,76 +150,126 @@ export async function synthesize(
   /** Only use what's already cached: no model calls (for the fast first pass). */
   onlyCached = false,
 ): Promise<{ syntheses: Syntheses; stats: SynthesisStats }> {
+  const repoName = repo.fullName;
   const stats: SynthesisStats = { components: 0, concepts: 0, repo: false, tokens: 0 };
   const blobOf = new Map(files.map((f) => [f.path, f.blob]));
   const titleOf = (id: string) => id.replace(/^component:/, "");
 
-  // Components, in parallel; each cached by its inputs.
+  // Components, each cached by its inputs; looked up together, written in parallel.
   const components = new Map<string, ComponentSynthesis>();
-  await pool(graph.components, 4, async (plan) => {
-    const deps = [...(graph.componentDeps.get(plan.id)?.keys() ?? [])].map(titleOf).sort();
-    const usedBy = [...graph.componentDeps]
-      .filter(([, d]) => d.has(plan.id))
-      .map(([from]) => titleOf(from))
-      .sort();
-    const input = {
-      dir: plan.dir || "(repository root)",
-      files: plan.files.map((p) => fileBrief(p, analyses.get(blobOf.get(p) ?? ""))),
-      depends_on: deps,
-      used_by: usedBy,
-    };
-    const key = await sha256(`component:${ANALYZER}:${JSON.stringify(input)}`);
-    const hit = await cached<ComponentSynthesis>(env.DB, key);
-    if (hit) {
-      components.set(plan.id, hit);
-      return;
-    }
-    if (onlyCached) return;
-    const { value, usage } = await chatJson<{
-      title?: string;
-      summary?: string;
-      responsibilities?: string[];
-      key_files?: { path?: string; why?: string }[];
-    }>(env, "reason", COMPONENT_SYSTEM, JSON.stringify(input), {
-      maxTokens: 1500,
-      model: models.task,
-    });
-    const result: ComponentSynthesis = {
-      title: (value.title ?? "").trim() || plan.dir,
-      summary: (value.summary ?? "").trim(),
-      responsibilities: (value.responsibilities ?? []).slice(0, 6),
-      keyFiles: (value.key_files ?? [])
-        .filter((k) => k.path && plan.files.includes(k.path))
-        .slice(0, 5)
-        .map((k) => ({ path: k.path as string, why: k.why ?? "" })),
-    };
-    await remember(env.DB, key, result, usage.model, usage.tokens);
-    components.set(plan.id, result);
-    stats.components++;
-    stats.tokens += usage.tokens;
+  const planned = await Promise.all(
+    graph.components.map(async (plan) => {
+      const deps = [...(graph.componentDeps.get(plan.id)?.keys() ?? [])].map(titleOf).sort();
+      const usedBy = [...graph.componentDeps]
+        .filter(([, d]) => d.has(plan.id))
+        .map(([from]) => titleOf(from))
+        .sort();
+      const input = {
+        dir: plan.dir || "(repository root)",
+        files: plan.files.map((p) => fileBrief(p, analyses.get(blobOf.get(p) ?? ""))),
+        depends_on: deps,
+        used_by: usedBy,
+      };
+      return { plan, input, key: await sha256(`component:${ANALYZER}:${JSON.stringify(input)}`) };
+    }),
+  );
+  const componentHits = await cachedMany<ComponentSynthesis>(
+    env.DB,
+    planned.map((p) => p.key),
+  );
+  const componentMisses = planned.filter(({ plan, key }) => {
+    const hit = componentHits.get(key);
+    if (hit) components.set(plan.id, hit);
+    return !hit;
   });
+  if (!onlyCached)
+    await pool(componentMisses, 4, async ({ plan, input, key }) => {
+      const { value, usage } = await chatJson<{
+        title?: string;
+        summary?: string;
+        responsibilities?: string[];
+        key_files?: { path?: string; why?: string }[];
+      }>(env, "reason", COMPONENT_SYSTEM, JSON.stringify(input), {
+        maxTokens: 1500,
+        model: models.task,
+      });
+      const result: ComponentSynthesis = {
+        title: (value.title ?? "").trim() || plan.dir,
+        summary: (value.summary ?? "").trim(),
+        responsibilities: (value.responsibilities ?? []).slice(0, 6),
+        keyFiles: (value.key_files ?? [])
+          .filter((k) => k.path && plan.files.includes(k.path))
+          .slice(0, 5)
+          .map((k) => ({ path: k.path as string, why: k.why ?? "" })),
+      };
+      await remember(env.DB, key, result, usage.model, usage.tokens);
+      components.set(plan.id, result);
+      stats.components++;
+      stats.tokens += usage.tokens;
+    });
 
   // Concepts get a definition when clef judged them glossary-worthy, or,
   // until concepts have been aligned, when at least two files mention them.
   const concepts = new Map<string, string>();
-  const pending: { key: string; name: string; cacheKey: string; input: unknown }[] = [];
+  const wanted: {
+    key: string;
+    name: string;
+    cacheKey: string;
+    legacyKey: string;
+    input: unknown;
+  }[] = [];
   for (const node of graph.nodes) {
     if (node.kind !== "concept") continue;
     const key = node.id.slice(8);
     const paths = graph.conceptFiles.get(key) ?? [];
     if (node.data.salient !== true && paths.length < 2) continue;
     const aliases = (node.data.aliases as string[] | undefined) ?? [];
-    const input = {
+    const sources = paths.slice(0, 6);
+    const named = {
       name: node.name,
       ...(aliases.length ? { also_called: aliases.slice(0, 6) } : {}),
-      files: paths
-        .slice(0, 6)
-        .map((p) => ({ path: p, summary: analyses.get(blobOf.get(p) ?? "")?.summary ?? "" })),
     };
-    const cacheKey = await sha256(`concept:${ANALYZER}:${JSON.stringify(input)}`);
-    const hit = await cached<string>(env.DB, cacheKey);
-    if (hit) concepts.set(key, hit);
-    else if (!onlyCached) pending.push({ key, name: node.name, cacheKey, input });
+    // What the definition is written from: the concept and how its files use it.
+    const input = {
+      ...named,
+      files: sources.map((p) => ({
+        path: p,
+        summary: analyses.get(blobOf.get(p) ?? "")?.summary ?? "",
+      })),
+    };
+    wanted.push({
+      key,
+      name: node.name,
+      // What it is cached by: the concept and where it is defined from (see the top).
+      cacheKey: await sha256(
+        `concept-definition:${DEFINER}:${repo.id}:${JSON.stringify({ ...named, files: sources })}`,
+      ),
+      // Before CORE-286 a definition was cached by everything it was written from.
+      legacyKey: await sha256(`concept:${ANALYZER}:${JSON.stringify(input)}`),
+      input,
+    });
+  }
+  const definitions = await cachedMany<string>(
+    env.DB,
+    wanted.map((w) => w.cacheKey),
+  );
+  // A definition written before CORE-286 from exactly these inputs is adopted, not rewritten.
+  const missing = wanted.filter((w) => !definitions.has(w.cacheKey));
+  const legacy = missing.length
+    ? await cachedMany<string>(
+        env.DB,
+        missing.map((w) => w.legacyKey),
+      )
+    : new Map<string, string>();
+  const pending: typeof wanted = [];
+  for (const item of wanted) {
+    const hit = definitions.get(item.cacheKey);
+    if (hit) concepts.set(item.key, hit);
+    else if (legacy.has(item.legacyKey)) {
+      const adopted = legacy.get(item.legacyKey) as string;
+      await remember(env.DB, item.cacheKey, adopted, models.task, 0);
+      concepts.set(item.key, adopted);
+    } else if (!onlyCached) pending.push(item);
   }
   await pool(chunk(pending, 20), 3, async (group) => {
     const { value, usage } = await chatJson<{
@@ -223,8 +308,8 @@ export async function synthesize(
     })),
   };
   const repoKey = await sha256(`repo:${ANALYZER}:${JSON.stringify(repoInput)}`);
-  let repo = await cached<RepoSynthesis>(env.DB, repoKey);
-  if (!repo && !onlyCached) {
+  let overview = await cached<RepoSynthesis>(env.DB, repoKey);
+  if (!overview && !onlyCached) {
     const { value, usage } = await chatJson<{
       title?: string;
       summary?: string;
@@ -233,15 +318,15 @@ export async function synthesize(
       maxTokens: 1200,
       model: models.task,
     });
-    repo = {
+    overview = {
       title: (value.title ?? "").trim() || repoName,
       summary: (value.summary ?? "").trim(),
       techStack: (value.tech_stack ?? []).slice(0, 10),
     };
-    await remember(env.DB, repoKey, repo, usage.model, usage.tokens);
+    await remember(env.DB, repoKey, overview, usage.model, usage.tokens);
     stats.repo = true;
     stats.tokens += usage.tokens;
   }
 
-  return { syntheses: { repo: repo ?? undefined, components, concepts }, stats };
+  return { syntheses: { repo: overview ?? undefined, components, concepts }, stats };
 }

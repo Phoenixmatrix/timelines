@@ -19,6 +19,14 @@ export interface AiWork {
   account?: string | null;
   /** The repository, when the account isn't known up front (its owner is looked up once). */
   repo?: string | null;
+  /**
+   * Also told of every call, after it is recorded (a Knowledge build meters
+   * itself, CORE-286). Never throws into the call it describes.
+   */
+  onCall?: (
+    model: string,
+    usage: { calls: number; failed: number; input: number; output: number; total: number },
+  ) => unknown;
 }
 
 interface Context extends AiWork {
@@ -121,6 +129,14 @@ export async function recordAiCall(
         options.failed ? (options.calls ?? 1) : 0,
       )
       .run();
+    const calls = options.calls ?? 1;
+    await context?.onCall?.(model, {
+      calls: options.failed ? 0 : calls,
+      failed: options.failed ? calls : 0,
+      input,
+      output,
+      total,
+    });
   } catch (error) {
     console.warn("Usage: recording an AI call failed", model, error);
   }

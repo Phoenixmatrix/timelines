@@ -236,6 +236,15 @@ export default defineConfig(({ mode, isPreview }) => {
         ...(dev && env.GITMATRIX_TIMELINE_QUIET_SECONDS
           ? { TIMELINE_QUIET_SECONDS: bindings.text(env.GITMATRIX_TIMELINE_QUIET_SECONDS) }
           : {}),
+        // Development only: how long main's pushes settle before one Knowledge
+        // update (worker/settings/ai.ts `knowledgeSchedule`, CORE-286);
+        // deployed Workers use each account's settings.
+        ...(dev && env.GITMATRIX_KNOWLEDGE_QUIET_SECONDS
+          ? { KNOWLEDGE_QUIET_SECONDS: bindings.text(env.GITMATRIX_KNOWLEDGE_QUIET_SECONDS) }
+          : {}),
+        ...(dev && env.GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS
+          ? { KNOWLEDGE_MAX_WAIT_SECONDS: bindings.text(env.GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS) }
+          : {}),
         ...(dev && env.GITMATRIX_ATLAS_CONFIG
           ? { ATLAS_CONFIG: bindings.text(env.GITMATRIX_ATLAS_CONFIG) }
           : {}),

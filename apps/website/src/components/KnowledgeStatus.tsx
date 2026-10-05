@@ -16,6 +16,30 @@ const PHASES: Record<string, string> = {
   wiki: "Rewriting affected pages",
 };
 
+/** "14:05", local time: when a pending update starts. */
+function clock(iso: string): string {
+  return new Date(iso).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * What Knowledge reflects while pushes wait for their update (CORE-286):
+ * "Reflects abc1234 · 3 pushes pending · update at ~14:05".
+ */
+export function describePending(status: KnowledgeStatus): string {
+  const pending = status.pending;
+  const parts = [
+    status.indexedCommit ? `Reflects ${status.indexedCommit.slice(0, 7)}` : "Not built yet",
+  ];
+  if (pending) {
+    parts.push(`${pending.pushes} ${pending.pushes === 1 ? "push" : "pushes"} pending`);
+    if (pending.dueAt) {
+      const soon = new Date(pending.dueAt).getTime() - Date.now() < 60_000;
+      parts.push(soon ? "updating shortly" : `update at ~${clock(pending.dueAt)}`);
+    }
+  } else parts.push("update queued");
+  return parts.join(" · ");
+}
+
 function describe(status: KnowledgeStatus): string {
   switch (status.state) {
     case "building": {
@@ -31,7 +55,7 @@ function describe(status: KnowledgeStatus): string {
       return phase;
     }
     case "queued":
-      return "Update queued";
+      return describePending(status);
     case "failed":
       return "Last update failed";
     case "empty":
@@ -56,30 +80,43 @@ export function useKnowledgeStatus(owner: string, name: string, initial: Knowled
   useEffect(() => {
     const busy = status.state === "building" || status.state === "queued";
     if (!busy) return;
-    const timer = setTimeout(async () => {
-      try {
-        const next = await api<KnowledgeStatus>(`/repos/${owner}/${name}/knowledge/status`);
-        setStatus(next);
-        const nowBusy = next.state === "building" || next.state === "queued";
-        // A build writes the graph and wiki pages long before it finishes: show
-        // each as it lands.
-        const landed =
-          next.graphVersion !== status.graphVersion ||
-          next.current?.stats.wikiDone !== status.current?.stats.wikiDone;
-        if ((wasBusy.current && !nowBusy) || landed) void revalidator.revalidate();
-        wasBusy.current = nowBusy;
-      } catch {
-        // Try again on the next tick.
-        setStatus((s) => ({ ...s }));
-      }
-    }, 2000);
+    // A pending update minutes away is checked every half minute, not every two seconds.
+    const dueAt = status.state === "queued" ? status.pending?.dueAt : null;
+    const later = dueAt && new Date(dueAt).getTime() - Date.now() > 60_000;
+    const timer = setTimeout(
+      async () => {
+        try {
+          const next = await api<KnowledgeStatus>(`/repos/${owner}/${name}/knowledge/status`);
+          setStatus(next);
+          const nowBusy = next.state === "building" || next.state === "queued";
+          // A build writes the graph and wiki pages long before it finishes: show
+          // each as it lands.
+          const landed =
+            next.graphVersion !== status.graphVersion ||
+            next.current?.stats.wikiDone !== status.current?.stats.wikiDone;
+          if ((wasBusy.current && !nowBusy) || landed) void revalidator.revalidate();
+          wasBusy.current = nowBusy;
+        } catch {
+          // Try again on the next tick.
+          setStatus((s) => ({ ...s }));
+        }
+      },
+      later ? 30_000 : 2000,
+    );
     return () => clearTimeout(timer);
   }, [status, owner, name, revalidator]);
 
   return status;
 }
 
-export function KnowledgeStatusPill({ status }: { status: KnowledgeStatus }) {
+export function KnowledgeStatusPill({
+  status,
+  repo,
+}: {
+  status: KnowledgeStatus;
+  /** Given, a repository admin can start a pending update now (CORE-286). */
+  repo?: { owner: string; name: string };
+}) {
   const busy = status.state === "building" || status.state === "queued";
   const dot = busy
     ? "bg-signal-line animate-pulse"
@@ -90,15 +127,39 @@ export function KnowledgeStatusPill({ status }: { status: KnowledgeStatus }) {
         : "bg-ink-faint";
   // Why the last update failed; it retries on the next push.
   const failure = status.state === "failed" ? status.recent[0]?.error : null;
+  const [asked, setAsked] = useState<"idle" | "asking" | "asked" | "failed">("idle");
+  const canUpdate =
+    repo && status.canUpdate && status.state === "queued" && status.pending && asked !== "asked";
   return (
-    <span
-      className="inline-flex items-center gap-2 rounded-full bg-raised px-3 py-1 text-body-sm text-ink-muted"
-      title={failure ?? (status.indexedAt ? `Indexed ${timeAgo(status.indexedAt)}` : undefined)}
-      role="status"
-      aria-live="polite"
-    >
-      <span className={`size-2 rounded-full ${dot}`} aria-hidden />
-      {describe(status)}
+    <span className="inline-flex items-center gap-2">
+      <span
+        className="inline-flex items-center gap-2 rounded-full bg-raised px-3 py-1 text-body-sm text-ink-muted"
+        title={failure ?? (status.indexedAt ? `Indexed ${timeAgo(status.indexedAt)}` : undefined)}
+        role="status"
+        aria-live="polite"
+      >
+        <span className={`size-2 rounded-full ${dot}`} aria-hidden />
+        {asked === "asked" && status.state === "queued" ? "Updating shortly" : describe(status)}
+      </span>
+      {canUpdate && (
+        <button
+          type="button"
+          className="mk-btn mk-btn--ghost mk-btn--sm"
+          disabled={asked === "asking"}
+          title={asked === "failed" ? "Couldn't start the update; try again" : undefined}
+          onClick={async () => {
+            setAsked("asking");
+            try {
+              await api(`/repos/${repo.owner}/${repo.name}/knowledge/update`, { method: "POST" });
+              setAsked("asked");
+            } catch {
+              setAsked("failed");
+            }
+          }}
+        >
+          Update now
+        </button>
+      )}
     </span>
   );
 }

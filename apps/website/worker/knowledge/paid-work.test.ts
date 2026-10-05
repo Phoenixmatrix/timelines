@@ -429,6 +429,9 @@ async function runningBuild(status: () => Promise<{ status: string }>) {
     ARTIFACTS: git.artifacts,
     AI: {},
     TIMELINE_QUIET_SECONDS: "0",
+    // Main's pushes build at once here; batching has its own tests (CORE-286).
+    KNOWLEDGE_QUIET_SECONDS: "0",
+    KNOWLEDGE_MAX_WAIT_SECONDS: "0",
     KNOWLEDGE_BUILD: {
       create: async ({ id }: { id: string }) => {
         created.push(id);

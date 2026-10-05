@@ -29,7 +29,8 @@ pub enum AiCommand {
 #[derive(Args)]
 #[group(skip)]
 #[command(group(clap::ArgGroup::new("ai_changes").required(true).multiple(true).args([
-    "knowledge", "wiki", "atlas", "release_notes", "classification", "fast", "task"
+    "knowledge", "wiki", "atlas", "release_notes", "classification", "fast", "task",
+    "knowledge_quiet_minutes", "knowledge_max_wait_minutes"
 ])))]
 pub struct AiSetArgs {
     /// Account slug; defaults to the signed-in person, never the repository owner.
@@ -56,6 +57,12 @@ pub struct AiSetArgs {
     /// Task generation model; does not change running jobs or regenerate cached output.
     #[arg(long, value_parser = ["glm-5.3-flash", "gemma-4-26b-a4b-it"])]
     task: Option<String>,
+    /// Knowledge updates start once pushes to main pause this long (0-1440 minutes; 0 = no wait).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=1440))]
+    knowledge_quiet_minutes: Option<u32>,
+    /// …and never later than this after the first pending push (0-1440 minutes).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=1440))]
+    knowledge_max_wait_minutes: Option<u32>,
 }
 
 fn account_slug(value: &str) -> std::result::Result<String, String> {
@@ -98,6 +105,18 @@ impl AiSetArgs {
         }
         if !models.is_empty() {
             patch.insert("models".into(), Value::Object(models));
+        }
+        let mut updates = Map::new();
+        for (key, value) in [
+            ("quietMinutes", self.knowledge_quiet_minutes),
+            ("maxWaitMinutes", self.knowledge_max_wait_minutes),
+        ] {
+            if let Some(value) = value {
+                updates.insert(key.into(), json!(value));
+            }
+        }
+        if !updates.is_empty() {
+            patch.insert("knowledgeUpdates".into(), Value::Object(updates));
         }
         Value::Object(patch)
     }
@@ -182,6 +201,25 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_update_windows_are_minutes() {
+        let args = parse_set(&["--knowledge-quiet-minutes", "0"]);
+        assert_eq!(
+            args.patch(),
+            json!({"knowledgeUpdates": {"quietMinutes": 0}})
+        );
+        let args = parse_set(&[
+            "--knowledge-quiet-minutes",
+            "15",
+            "--knowledge-max-wait-minutes",
+            "60",
+        ]);
+        assert_eq!(
+            args.patch(),
+            json!({"knowledgeUpdates": {"quietMinutes": 15, "maxWaitMinutes": 60}})
+        );
+    }
+
+    #[test]
     fn invalid_or_empty_updates_fail_at_parse_time() {
         for flags in [
             vec![],
@@ -196,6 +234,9 @@ mod tests {
             vec!["--release-notes", "off", "--owner", "orbit/repo"],
             vec!["--wiki", "on", "--owner", ""],
             vec!["--indexing", "off"],
+            vec!["--knowledge-quiet-minutes", "1441"],
+            vec!["--knowledge-max-wait-minutes", "-1"],
+            vec!["--knowledge-quiet-minutes", "soon"],
         ] {
             let mut argv = vec!["gm", "settings", "ai", "set"];
             argv.extend(flags);

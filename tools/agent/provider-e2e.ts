@@ -163,6 +163,22 @@ export interface AiRun {
   outcomes: Record<string, Outcome>;
 }
 
+/** What a knowledge build's stats say of how it ran (only the fields read here). */
+interface BuildStats {
+  analyzed?: number;
+  reused?: number;
+  ai?: AiSnapshot;
+  atlasSpend?: { calls: number };
+  /** CORE-286: an update after a push, or a full rebuild, and its own metered calls. */
+  mode?: string;
+  aiUsage?: {
+    calls: number;
+    failedCalls?: number;
+    costUsd: number;
+    byModel: Record<string, unknown>;
+  };
+}
+
 interface GatewayLog {
   id: string;
   created_at: string;
@@ -485,6 +501,11 @@ export async function runProviderE2E(
   await mkdir(work);
   const token = randomBytes(24).toString("hex");
   const authorization = `Basic ${Buffer.from(`agent:${token}`).toString("base64")}`;
+  // Per-build model usage of the full build and the push's update (CORE-286).
+  const knowledgeUpdates: {
+    full?: { mode?: string; aiUsage: NonNullable<BuildStats["aiUsage"]> };
+    edit?: { mode?: string; aiUsage: NonNullable<BuildStats["aiUsage"]> };
+  } = {};
   const evidence: Record<string, unknown> = {
     version: 1,
     mode,
@@ -496,6 +517,7 @@ export async function runProviderE2E(
     evidence.selection = run.selection;
     evidence.stages = run.outcomes;
   }
+  evidence.knowledgeUpdates = knowledgeUpdates;
   const events: unknown[] = [];
   evidence.events = events;
   let stage = "setup";
@@ -854,6 +876,20 @@ export async function runProviderE2E(
             throw new Error("Knowledge build failed; see redacted provider evidence");
           return status.state === "up-to-date" && status.indexedCommit === final && Boolean(build);
         });
+        // The explicit rebuild runs in full and meters its own calls (CORE-286).
+        {
+          const full = (
+            evidence.knowledge as {
+              recent: { toCommit: string; status: string; stats: BuildStats }[];
+            }
+          ).recent.find((entry) => entry.toCommit === final && entry.status === "succeeded");
+          assert.equal(full?.stats.mode, "full", "The explicit rebuild must run in full");
+          assert(
+            full?.stats.aiUsage && full.stats.aiUsage.calls > 0,
+            "The full build metered no calls",
+          );
+          knowledgeUpdates.full = { mode: full.stats.mode, aiUsage: full.stats.aiUsage };
+        }
         enter("knowledge-graph");
         graph = await api(`${base}/knowledge/graph/export`);
         symbol = graph.nodes.find(
@@ -1454,16 +1490,7 @@ export async function runProviderE2E(
         ]);
         await git(["push", "origin", "main"], work, true);
         edited = await git(["rev-parse", "HEAD"]);
-        let editBuild:
-          | {
-              stats: {
-                analyzed?: number;
-                reused?: number;
-                ai?: AiSnapshot;
-                atlasSpend?: { calls: number };
-              };
-            }
-          | undefined;
+        let editBuild: { stats: BuildStats } | undefined;
         await waitFor(stage, 12 * 60_000, async () => {
           const status = await api(`${base}/knowledge/status`);
           if (status.state === "failed")
@@ -1476,6 +1503,19 @@ export async function runProviderE2E(
         });
         // A cosmetic verdict would reuse the old card and prove nothing about naming.
         assert.equal(editBuild?.stats.analyzed, 1, "The edit was not re-analyzed by the model");
+        // The push is an update, not a rebuild (CORE-286): driven by its diff,
+        // metered, and asking the model far less than the full build did.
+        assert.equal(
+          editBuild?.stats.mode,
+          "update",
+          "A push must update Knowledge, not rebuild it",
+        );
+        assert(editBuild?.stats.aiUsage, "The update metered no calls");
+        assert(
+          editBuild.stats.aiUsage.calls < (knowledgeUpdates.full?.aiUsage.calls ?? 0),
+          "An update asked the model as much as a full rebuild",
+        );
+        knowledgeUpdates.edit = { mode: editBuild.stats.mode, aiUsage: editBuild.stats.aiUsage };
         const editedGraph = await api(`${base}/knowledge/graph/export`);
         assert(
           editedGraph.nodes.some(

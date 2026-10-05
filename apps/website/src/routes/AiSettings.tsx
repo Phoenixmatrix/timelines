@@ -8,12 +8,14 @@ import {
   type LoaderFunctionArgs,
 } from "react-router";
 import type { AccountSummary } from "../../shared/api.ts";
-import type {
-  AiFeatures,
-  AiModelSelection,
-  AiRole,
-  AiSettingsPatch,
-  AiSettingsView,
+import {
+  MAX_KNOWLEDGE_WAIT_MINUTES,
+  type AiFeatures,
+  type AiModelSelection,
+  type AiRole,
+  type AiSettingsPatch,
+  type AiSettingsView,
+  type KnowledgeUpdateSchedule,
 } from "../../shared/ai.ts";
 import { SettingsPage } from "../components/SettingsPage.tsx";
 import { FormError, SelectField, link } from "../components/ui.tsx";
@@ -70,6 +72,19 @@ const FEATURES: { key: keyof AiFeatures; title: string; description: string }[] 
     description: "Automatically generate release notes for new repository changes.",
   },
 ];
+const SCHEDULE: { key: keyof KnowledgeUpdateSchedule; label: string; hint: string }[] = [
+  {
+    key: "quietMinutes",
+    label: "Quiet period",
+    hint: "Update once pushes have paused this long.",
+  },
+  {
+    key: "maxWaitMinutes",
+    label: "Longest wait",
+    hint: "Never wait longer than this after the first push.",
+  },
+];
+
 const ROLES: { key: AiRole; title: string; description: string }[] = [
   {
     key: "classification",
@@ -167,6 +182,12 @@ function AiSettingsForm({
   const [saved, setSaved] = useState(initial);
   const [features, setFeatures] = useState(initial.features);
   const [models, setModels] = useState(initial.models);
+  // Kept as typed text, so a field can be cleared while editing.
+  const scheduleText = (v: AiSettingsView) => ({
+    quietMinutes: String(v.knowledgeUpdates.quietMinutes),
+    maxWaitMinutes: String(v.knowledgeUpdates.maxWaitMinutes),
+  });
+  const [schedule, setSchedule] = useState(scheduleText(initial));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -186,7 +207,15 @@ function AiSettingsForm({
     (patch.models ??= {}).classification = models.classification;
   if (models.fast !== saved.models.fast) (patch.models ??= {}).fast = models.fast;
   if (models.task !== saved.models.task) (patch.models ??= {}).task = models.task;
-  const dirty = !!(patch.features || patch.models);
+  const minutes = (text: string) =>
+    /^\d+$/.test(text.trim()) && Number(text) <= MAX_KNOWLEDGE_WAIT_MINUTES ? Number(text) : null;
+  const invalidSchedule = SCHEDULE.filter(({ key }) => minutes(schedule[key]) === null);
+  for (const { key } of SCHEDULE) {
+    const value = minutes(schedule[key]);
+    if (value !== null && value !== saved.knowledgeUpdates[key])
+      (patch.knowledgeUpdates ??= {})[key] = value;
+  }
+  const dirty = !!(patch.features || patch.models || patch.knowledgeUpdates);
   const changed = () => {
     setNotice("");
     setError("");
@@ -198,7 +227,7 @@ function AiSettingsForm({
       aria-busy={busy}
       onSubmit={async (event) => {
         event.preventDefault();
-        if (busy || !saved.canManage || !dirty) return;
+        if (busy || !saved.canManage || !dirty || invalidSchedule.length) return;
         setSaving(true);
         changed();
         try {
@@ -210,6 +239,7 @@ function AiSettingsForm({
           setSaved(persisted);
           setFeatures(persisted.features);
           setModels(persisted.models);
+          setSchedule(scheduleText(persisted));
           setNotice(`AI settings saved for @${owner}. New jobs will use these settings.`);
         } catch (cause) {
           if (active.current)
@@ -268,6 +298,50 @@ function AiSettingsForm({
             ? "Turning Knowledge off also stops new Wiki and Atlas AI work. Their individual preferences are kept."
             : "Knowledge is off: no new Knowledge, Wiki, or Atlas AI work will start, even if Wiki or Atlas descriptions are checked. Their preferences are kept for when Knowledge is re-enabled."}
         </p>
+      </fieldset>
+      <fieldset disabled={busy || !saved.canManage} className="m-0 min-w-0 border-0 p-0">
+        <legend className="mb-2 text-title">Knowledge updates</legend>
+        <p className="mt-0 mb-4 max-w-[65ch] text-body-sm text-ink-muted">
+          Pushes to a repository’s default branch are batched: one update runs at the latest commit
+          once pushes pause, and never later than the longest wait after the first one. Repository
+          admins can start a waiting update at once. 0 means no wait.
+        </p>
+        <div className="flex flex-wrap gap-6">
+          {SCHEDULE.map(({ key, label, hint }) => {
+            const inputId = `knowledge-${key}`;
+            const bad = invalidSchedule.some((s) => s.key === key);
+            return (
+              <div key={key} className="flex min-w-0 flex-col gap-1">
+                <label htmlFor={inputId} className="text-field-label">
+                  {label}
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    id={inputId}
+                    type="number"
+                    inputMode="numeric"
+                    min={0}
+                    max={MAX_KNOWLEDGE_WAIT_MINUTES}
+                    step={1}
+                    required
+                    value={schedule[key]}
+                    aria-invalid={bad || undefined}
+                    aria-describedby={`${inputId}-hint`}
+                    onChange={(event) => {
+                      setSchedule({ ...schedule, [key]: event.target.value });
+                      changed();
+                    }}
+                    className="mk-input w-28 tabular-nums"
+                  />
+                  <span className="text-body-sm text-ink-muted">minutes</span>
+                </div>
+                <span id={`${inputId}-hint`} className="text-body-sm text-ink-faint">
+                  {bad ? `A whole number from 0 to ${MAX_KNOWLEDGE_WAIT_MINUTES}.` : hint}
+                </span>
+              </div>
+            );
+          })}
+        </div>
       </fieldset>
       <fieldset disabled={busy || !saved.canManage} className="m-0 min-w-0 border-0 p-0">
         <legend className="mb-2 text-title">Models for new work</legend>
@@ -339,17 +413,18 @@ function AiSettingsForm({
             <button
               type="submit"
               className="mk-btn mk-btn--primary min-h-11"
-              disabled={busy || !dirty}
+              disabled={busy || !dirty || invalidSchedule.length > 0}
             >
               {saving ? "Saving…" : "Save AI settings"}
             </button>
             <button
               type="button"
               className="mk-btn mk-btn--ghost min-h-11"
-              disabled={busy || !dirty}
+              disabled={busy || (!dirty && !invalidSchedule.length)}
               onClick={() => {
                 setFeatures(saved.features);
                 setModels(saved.models);
+                setSchedule(scheduleText(saved));
                 changed();
               }}
             >

@@ -297,6 +297,8 @@ export interface Database {
     finished_at: string | null;
     progress_at: string | null;
     ai_snapshot: Generated<string | null>;
+    /** Model calls by model (CORE-286): {"<model>": {calls, input, output, total}}. */
+    ai_usage: Generated<string | null>;
   };
   kg_changes: {
     repo_id: string;
@@ -311,6 +313,8 @@ export interface Database {
     indexed_at: string | null;
     last_build_id: string | null;
     graph_at: string | null;
+    /** The pipeline version the indexed Knowledge was built with (CORE-286). */
+    pipeline: Generated<string | null>;
   };
   kg_files: {
     repo_id: string;
@@ -924,6 +928,8 @@ export interface Database {
     ai_task_model: Generated<GenerationModel>;
     ai_updated_by: Generated<string | null>;
     ai_updated_at: Generated<string | null>;
+    knowledge_quiet_minutes: Generated<number>;
+    knowledge_max_wait_minutes: Generated<number>;
   };
   /** Retention policies (CORE-196): what an account changed; absent inherits. */
   retention_policies: {

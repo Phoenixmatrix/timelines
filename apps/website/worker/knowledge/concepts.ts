@@ -18,8 +18,11 @@
 //            asked again with the definitions, which settles many that names
 //            alone left in between; a "same" there merges them too.
 //
-// Every decision is stored, so after the first build a push only asks about
-// the concepts it introduced.
+// Every decision is stored, so after the first build an update only asks
+// about pairs it has never decided: those of the concepts a push introduced,
+// and of their neighbours whose closest candidates it changed (CORE-286). The
+// candidates are always the whole repository's, so an update decides exactly
+// what a full rebuild at the same commit would.
 //
 // Question wording was chosen on hand-labelled samples from this repository:
 // the glossary framing with file paths (no summaries) ranked pairs best, and
@@ -413,6 +416,11 @@ export interface AlignStats {
  * Ask clef about candidate pairs that have no stored decision, up to `budget`
  * per call (one Workflow step); call again while `remaining` > 0. Decisions
  * are saved as they arrive, so a retried step resumes where it stopped.
+ *
+ * Candidates are each concept's closest few by shared words, and mutual
+ * nearest neighbours by name embedding. Names are embedded only when the set
+ * of concepts changed since the last settle (or in a full rebuild): with the
+ * same concepts, the neighbours are the same and already decided.
  */
 export async function alignPairs(
   env: Env,
@@ -421,6 +429,7 @@ export async function alignPairs(
   files: SnapshotFile[],
   analyses: Map<string, FileAnalysis>,
   budget = 600,
+  options: { full?: boolean } = {},
 ): Promise<AlignStats> {
   const groups = collectConcepts(files, analyses);
   const names = new Map([...groups].map(([key, g]) => [key, displayName(g.names, key)]));
@@ -432,23 +441,19 @@ export async function alignPairs(
     .execute();
   const known = new Set(knownRows.map((r) => r.key));
   const fresh = [...names.keys()].filter((k) => !known.has(k));
+  const changedSet = fresh.length > 0 || [...known].some((k) => !names.has(k));
 
   const candidates = new Map<string, [string, string]>();
-  // Only concepts new to the repository bring pairs (on its first build, all are).
-  for (const [a, b] of tokenCandidates(names, PAIRS_PER_CONCEPT, new Set(fresh)))
+  for (const [a, b] of tokenCandidates(names, PAIRS_PER_CONCEPT))
     candidates.set(pairKey(a, b), [a, b]);
-  // Embeddings find synonyms with no word in common; they are only worth
-  // computing when there are new concepts to place.
-  if (fresh.length && names.size <= MAX_EMBEDDED) {
+  // Embeddings find synonyms with no word in common.
+  if ((options.full || changedSet) && names.size <= MAX_EMBEDDED && names.size > 1) {
     const keys = [...names.keys()];
     const vectors = await embed(
       env,
       keys.map((k) => names.get(k) as string),
     );
-    const freshSet = new Set(fresh);
-    for (const [a, b] of mutualNeighbours(keys, vectors)) {
-      if (freshSet.has(a) || freshSet.has(b)) candidates.set(pairKey(a, b), [a, b]);
-    }
+    for (const [a, b] of mutualNeighbours(keys, vectors)) candidates.set(pairKey(a, b), [a, b]);
   }
 
   const pending = [...candidates].filter(([pk]) => !decided.has(pk));
@@ -617,34 +622,85 @@ export async function settleConcepts(
     verdicts.set(lead, { recurring, salient: recurring >= 0.5, hash });
   });
 
-  const statements: Statement[] = [
-    db(d1).deleteFrom("kg_concepts").where("repo_id", "=", repoId),
-    db(d1).deleteFrom("kg_concept_links").where("repo_id", "=", repoId),
-  ];
+  // Only rows that changed are written (CORE-286); the model is the same as
+  // rewriting every row.
+  const statements: Statement[] = [];
+  const wantedRows = new Map<
+    string,
+    { canonical: string; recurring: number | null; salient: number | null; hash: string | null }
+  >();
   for (const key of keys) {
     const lead = canonical.get(key) as string;
     const verdict = key === lead ? verdicts.get(lead) : undefined;
+    wantedRows.set(key, {
+      canonical: lead,
+      recurring: verdict?.recurring ?? null,
+      salient: verdict ? (verdict.salient ? 1 : 0) : null,
+      hash: verdict?.hash ?? null,
+    });
+  }
+  for (const key of previous.keys())
+    if (!wantedRows.has(key))
+      statements.push(
+        db(d1).deleteFrom("kg_concepts").where("repo_id", "=", repoId).where("key", "=", key),
+      );
+  for (const [key, row] of wantedRows) {
+    const before = previous.get(key);
+    if (
+      before &&
+      before.canonical === row.canonical &&
+      before.recurring === row.recurring &&
+      before.salient === row.salient &&
+      before.salience_hash === row.hash
+    )
+      continue;
     statements.push(
       db(d1)
         .insertInto("kg_concepts")
         .values({
           repo_id: repoId,
           key,
-          canonical: lead,
-          recurring: verdict?.recurring ?? null,
-          salient: verdict ? (verdict.salient ? 1 : 0) : null,
-          salience_hash: verdict?.hash ?? null,
-        }),
+          canonical: row.canonical,
+          recurring: row.recurring,
+          salient: row.salient,
+          salience_hash: row.hash,
+        })
+        .onConflict((oc) =>
+          oc.columns(["repo_id", "key"]).doUpdateSet((eb) => ({
+            canonical: eb.ref("excluded.canonical"),
+            recurring: eb.ref("excluded.recurring"),
+            salient: eb.ref("excluded.salient"),
+            salience_hash: eb.ref("excluded.salience_hash"),
+          })),
+        ),
     );
   }
+  const storedLinks = await db(d1)
+    .selectFrom("kg_concept_links")
+    .select(["narrower", "broader"])
+    .where("repo_id", "=", repoId)
+    .execute();
+  const linkKey = (n: string, b: string) => `${n}\u0000${b}`;
+  const wantedLinks = new Set(links.map(([n, b]) => linkKey(n, b)));
+  const haveLinks = new Set(storedLinks.map((l) => linkKey(l.narrower, l.broader)));
+  for (const l of storedLinks)
+    if (!wantedLinks.has(linkKey(l.narrower, l.broader)))
+      statements.push(
+        db(d1)
+          .deleteFrom("kg_concept_links")
+          .where("repo_id", "=", repoId)
+          .where("narrower", "=", l.narrower)
+          .where("broader", "=", l.broader),
+      );
   for (const [narrower, broader] of links) {
+    if (haveLinks.has(linkKey(narrower, broader))) continue;
     statements.push(
       db(d1).insertInto("kg_concept_links").values({ repo_id: repoId, narrower, broader }),
     );
   }
   // One transaction when it fits, so readers never see a half-written model.
-  if (statements.length <= 1000) await batch(d1, statements);
-  else await runBatched(d1, statements);
+  if (statements.length && statements.length <= 1000) await batch(d1, statements);
+  else if (statements.length) await runBatched(d1, statements);
 
   const salient = [...verdicts.values()].filter((v) => v.salient).length;
   return {
@@ -672,6 +728,7 @@ const REVIEW_QUESTION: Record<string, ClefQuestion> = {
 
 export interface ReviewStats {
   candidates: number;
+  /** Pairs asked now; any answer can regroup concepts, so the build settles again only then. */
   asked: number;
   /** Reviewed pairs judged the same that are still separate groups. */
   newMerges: number;

@@ -6,7 +6,7 @@ import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { previewSettings, previewSettingsApi } from "../deployments/settings.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
-import { aiSettings, aiSettingsApi, repoAiSnapshot } from "./ai.ts";
+import { aiSettings, aiSettingsApi, knowledgeSchedule, repoAiSnapshot } from "./ai.ts";
 
 const databases: DatabaseSync[] = [];
 afterEach(() => {
@@ -254,5 +254,47 @@ describe("account AI settings", () => {
       features: { atlas: false, wiki: false },
       updatedBy: "admin",
     });
+  });
+
+  test("knowledge update windows (CORE-286): defaults, owners' choices, validation and the development override", async () => {
+    const t = await setup();
+    expect(await (await t.call(t.tokens.member)).json()).toMatchObject({
+      knowledgeUpdates: { quietMinutes: 10, maxWaitMinutes: 30 },
+    });
+    expect(await knowledgeSchedule(t.env, "repo")).toEqual({
+      quietMs: 10 * 60_000,
+      maxWaitMs: 30 * 60_000,
+    });
+    for (const bad of [
+      { knowledgeUpdates: { quietMinutes: -1 } },
+      { knowledgeUpdates: { maxWaitMinutes: 1441 } },
+      { knowledgeUpdates: { quietMinutes: 2.5 } },
+      { knowledgeUpdates: { quietMinutes: "5" } },
+      { knowledgeUpdates: { soon: 1 } },
+      { knowledgeUpdates: 5 },
+    ]) {
+      const refused = await t.call(t.tokens.owner, "PATCH", bad);
+      expect(refused.status, JSON.stringify(bad)).toBe(400);
+    }
+    expect(
+      (await t.call(t.tokens.member, "PATCH", { knowledgeUpdates: { quietMinutes: 1 } })).status,
+    ).toBe(403);
+    const saved = await t.call(t.tokens.owner, "PATCH", { knowledgeUpdates: { quietMinutes: 0 } });
+    expect(saved.status).toBe(200);
+    expect(await saved.json()).toMatchObject({
+      knowledgeUpdates: { quietMinutes: 0, maxWaitMinutes: 30 },
+      // Other choices are untouched.
+      features: DEFAULT_AI_CONFIGURATION.features,
+    });
+    expect(await knowledgeSchedule(t.env, "repo")).toEqual({ quietMs: 0, maxWaitMs: 30 * 60_000 });
+    // Another account's repositories keep the defaults.
+    expect((await knowledgeSchedule(t.env, "personal")).quietMs).toBe(10 * 60_000);
+    // Development environments may shorten both.
+    const dev = {
+      ...t.env,
+      KNOWLEDGE_QUIET_SECONDS: "2",
+      KNOWLEDGE_MAX_WAIT_SECONDS: "8",
+    } as unknown as Env;
+    expect(await knowledgeSchedule(dev, "repo")).toEqual({ quietMs: 2_000, maxWaitMs: 8_000 });
   });
 });

@@ -80,7 +80,26 @@ export const DEFAULT_AI_CONFIGURATION: AiConfiguration = {
   models: { classification: "clef", fast: "glm-5.3-flash", task: "glm-5.3-flash" },
 };
 
+/**
+ * When pushes to main update Knowledge (CORE-286): once they have paused for
+ * `quietMinutes`, and never later than `maxWaitMinutes` after the first push
+ * waiting. 0 means no wait.
+ */
+export interface KnowledgeUpdateSchedule {
+  quietMinutes: number;
+  maxWaitMinutes: number;
+}
+
+export const DEFAULT_KNOWLEDGE_SCHEDULE: KnowledgeUpdateSchedule = {
+  quietMinutes: 10,
+  maxWaitMinutes: 30,
+};
+
+/** The longest either wait may be: one day. */
+export const MAX_KNOWLEDGE_WAIT_MINUTES = 1440;
+
 export interface AiSettings extends AiConfiguration {
+  knowledgeUpdates: KnowledgeUpdateSchedule;
   updatedAt: string | null;
   updatedBy: string | null;
 }
@@ -94,6 +113,7 @@ export interface AiSettingsView extends AiSettings {
 export interface AiSettingsPatch {
   features?: Partial<AiFeatures>;
   models?: Partial<AiModelSelection>;
+  knowledgeUpdates?: Partial<KnowledgeUpdateSchedule>;
 }
 
 /** Frozen when work starts; retries and continuations keep this exact policy. */

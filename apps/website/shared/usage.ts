@@ -341,4 +341,28 @@ export interface UsageReport {
   accounts: { slug: string; displayName: string; monthlyUsd: number }[] | null;
   /** Caveats every reader should see. */
   notes: string[];
+  /** What Knowledge builds cost per update over the last 30 days (CORE-286). */
+  knowledgeUpdates?: KnowledgeUpdateSpend | null;
+}
+
+/**
+ * Knowledge builds since `from` (CORE-286): updates after pushes beside full
+ * rebuilds, with their metered model calls and list-price cost.
+ */
+export interface KnowledgeUpdateSpend {
+  from: string;
+  updates: KnowledgeBuildSpend;
+  fullRebuilds: KnowledgeBuildSpend;
+  /** Builds from before builds metered themselves: counted, not priced. */
+  unmetered: number;
+  /** The repositories that spent most, highest first (at most 10). */
+  repos: { name: string; updates: number; fullRebuilds: number; costUsd: number }[];
+}
+
+export interface KnowledgeBuildSpend {
+  count: number;
+  calls: number;
+  costUsd: number;
+  /** Average cost of one; null when none was metered. */
+  eachUsd: number | null;
 }

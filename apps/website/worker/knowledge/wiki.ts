@@ -14,7 +14,7 @@ import type { BuiltGraph, ComponentPlan, SnapshotFile, Syntheses } from "./graph
 import { chatText, decide, yes } from "./models.ts";
 import { pool, runBatched, sha256, slug, type Statement } from "./util.ts";
 
-const WRITER = "w1";
+export const WRITER = "w1";
 
 export interface PlannedPage {
   slug: string;

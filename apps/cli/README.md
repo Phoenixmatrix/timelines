@@ -907,6 +907,7 @@ gm settings ai set --owner orbit --wiki on --atlas on --release-notes off
 gm settings ai set --owner orbit --classification clef \
   --fast gemma-4-26b-a4b-it --task glm-5.3-flash
 gm settings ai set --owner orbit --task gemma-4-26b-a4b-it --dry-run
+gm settings ai set --owner orbit --knowledge-quiet-minutes 15 --knowledge-max-wait-minutes 60
 ```
 
 These are account-wide settings, not repository settings. Omit `--owner` to use
@@ -915,7 +916,10 @@ inferred. `show` includes the curated catalog, prices, release dates, permission
 and save provenance. `set` requires at least one option and changes only supplied
 fields. Feature values are `on|off`; Classification accepts only `clef`; Fast and
 Task allow `glm-5.3-flash|gemma-4-26b-a4b-it`. Defaults are all features on, Clef,
-and GLM 5.3 Flash for both generation roles.
+and GLM 5.3 Flash for both generation roles. `--knowledge-quiet-minutes` and
+`--knowledge-max-wait-minutes` (0-1440, defaults 10 and 30) say when pushes to a
+repository's default branch update its Knowledge: once they pause that long, and
+never later than the longest wait after the first pending push.
 
 Only human account owners, organization owners and site admins can save; members
 can inspect and agent credentials cannot write. Knowledge off also prevents new

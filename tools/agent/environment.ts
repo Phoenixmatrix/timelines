@@ -735,6 +735,10 @@ export async function context(env: Environment): Promise<HarnessContext> {
     // A timeline's full CI and overlays wait for its pushes to pause (CORE-238):
     // seconds here, so scenarios exercise the wait without spending minutes on it.
     GITMATRIX_TIMELINE_QUIET_SECONDS: "3",
+    // Main's pushes settle before one Knowledge update (CORE-286): seconds
+    // here, unless the caller chose its own (a batching measurement does).
+    GITMATRIX_KNOWLEDGE_QUIET_SECONDS: process.env.GITMATRIX_KNOWLEDGE_QUIET_SECONDS ?? "2",
+    GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS: process.env.GITMATRIX_KNOWLEDGE_MAX_WAIT_SECONDS ?? "8",
     HOME: join(env.dir, "home"),
     TMPDIR: temporary,
     XDG_CONFIG_HOME: join(env.dir, "config"),
