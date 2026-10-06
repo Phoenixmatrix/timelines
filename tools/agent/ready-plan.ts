@@ -102,6 +102,17 @@ function documentation(path: string): boolean {
   );
 }
 
+function agentConfig(path: string): boolean {
+  // Coding agents' instructions, subagents, skills and harness settings: nothing builds from or
+  // tests them, and the mandatory root check still formats and lints them. Scripts and hooks
+  // beside them are not covered.
+  return (
+    /^\.claude\/(?:agents|rules|skills)\/.+\.md$/.test(path) ||
+    /^\.agents\/skills\/.+\.md$/.test(path) ||
+    path === ".claude/settings.json"
+  );
+}
+
 function testOnly(path: string): boolean {
   return /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(path) || /^apps\/cli\/tests\/.*\.rs$/.test(path);
 }
@@ -210,7 +221,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
   const affected = new Set<Workspace>();
   const production = new Set<Workspace>();
   for (const path of plan.changed) {
-    if (documentation(path)) continue;
+    if (documentation(path) || agentConfig(path)) continue;
     const workspace = WORKSPACES.find((prefix) => path.startsWith(`${prefix}/`));
     if (!workspace) return full(`Unclassified or global path: ${path}`);
     if (path === `${workspace}/package.json`)

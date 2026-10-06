@@ -105,6 +105,20 @@ await test("ready options accept explicit flags and reject malformed or unknown 
     assert.throws(() => parseReadyOptions(args), Error, args.join(" "));
 });
 
+await test("coding-agent configuration runs only the mandatory check", async () => {
+  await fixture(async (root, _git, put) => {
+    await put(".claude/settings.json", "{}\n");
+    await put(".claude/agents/runner.md");
+    await put(".claude/rules/delegation.md");
+    await put(".claude/skills/gitmatrix-graph-work/SKILL.md");
+    await put(".agents/skills/gitmatrix-graph-work/SKILL.md");
+    const plan = await readinessPlan(root, options);
+    assert.deepEqual(names(plan), ["check"]);
+    assert.equal(plan.full, false);
+    assert.equal(plan.e2e, false);
+  });
+});
+
 await test("unchanged and allowlisted documentation run only mandatory checks", async () => {
   await fixture(async (root, _git, put) => {
     assert.deepEqual(names(await readinessPlan(root, options)), ["check"]);
@@ -274,6 +288,8 @@ await test("unknown/global paths, task manifests and shared harness changes fail
     "vite.config.ts",
     "patches/cf.patch",
     "unknown.md",
+    ".claude/hooks/check.sh",
+    ".agents/skills/gitmatrix-graph-work/run.ts",
     "packages/new/src/index.ts",
     "tools/new-tool/task.ts",
     "tools/agent/environment.ts",
