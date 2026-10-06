@@ -3298,7 +3298,8 @@ export async function runProviderE2E(
         evidence.queue = queueEvidence;
         await runQueueAiE2E(ctx, fixtures, queueEvidence);
         await waitFor("queue-gateway-evidence", 120_000, async () => {
-          const { logs } = await gatewayLogs(owned, String(queueEvidence.startedAt), "knowledge");
+          // The queue's calls log under their own component (CORE-290's componentOf).
+          const { logs } = await gatewayLogs(owned, String(queueEvidence.startedAt), "merge-queue");
           queueEvidence.usage = logs;
           const successful = logs.filter((log) => log.success && !log.cached);
           const repair = successful.filter((log) => log.model.includes("gemma-4-26b"));
