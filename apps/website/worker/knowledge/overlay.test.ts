@@ -14,6 +14,7 @@ import {
   overlayRef,
   planOverlay,
   scanOverlays,
+  storeOverlay,
   toAnalyze,
   type OverlayState,
 } from "./overlay.ts";
@@ -275,6 +276,71 @@ describe("diffGraphs", () => {
       removed: [{ id: "file:src/legacy.ts", kind: "contains" }],
     });
   });
+  test("adding a work file cannot reorder an unchanged canonical file's topics", () => {
+    const main = [{ path: "verify-all.ts", blob: "verify", mode: "100644" }];
+    const model = {
+      canonical: new Map<string, string>(),
+      salient: new Set<string>(),
+      trimmed: new Set(["parcel-validation", "batch-processing"]),
+      partOf: [] as [string, string][],
+    };
+    const cards = new Map([
+      ["verify", analysis({ concepts: ["Parcel Validation", "Batch Processing"] })],
+      ["limits", analysis({ concepts: ["Batch Processing"] })],
+      ["verify-next", analysis({ concepts: ["Batch Processing"] })],
+    ]);
+    const base = buildGraph("org/app", main, cards, empty, model);
+    const added = applyChanges(main, [
+      { path: "limits.ts", blob: "limits", before: null, mode: "100644" },
+    ]);
+    const projected = diffGraphs(base, buildGraph("org/app", added, cards, empty, model));
+    expect(
+      projected
+        .filter((change) => change.kind === "file")
+        .map(({ id, change }) => ({ id, change })),
+    ).toEqual([{ id: "file:limits.ts", change: "added" }]);
+
+    const changed = applyChanges(added, [
+      { path: "verify-all.ts", blob: "verify-next", before: "verify", mode: "100644" },
+    ]);
+    const revised = diffGraphs(base, buildGraph("org/app", changed, cards, empty, model));
+    expect(revised.find((change) => change.id === "file:verify-all.ts")?.fields).toContain(
+      "topics",
+    );
+  });
+
+  test("a work file's spelling of a topic cannot relabel an unchanged canonical file", () => {
+    const main = [{ path: "verify-all.ts", blob: "verify", mode: "100644" }];
+    const model = {
+      canonical: new Map<string, string>(),
+      salient: new Set<string>(),
+      trimmed: new Set(["batch-processing"]),
+      partOf: [] as [string, string][],
+    };
+    // Tied counts: on its own the lower-case spelling would win the label.
+    const cards = new Map([
+      ["verify", analysis({ concepts: ["Batch Processing"] })],
+      ["limits", analysis({ concepts: ["batch processing"] })],
+    ]);
+    const base = buildGraph("org/app", main, cards, empty, model);
+    const added = applyChanges(main, [
+      { path: "limits.ts", blob: "limits", before: null, mode: "100644" },
+    ]);
+    const projected = diffGraphs(
+      base,
+      buildGraph("org/app", added, cards, empty, model, { topicNames: base.topicNames }),
+    );
+    expect(
+      projected
+        .filter((change) => change.kind === "file")
+        .map(({ id, change }) => ({ id, change })),
+    ).toEqual([{ id: "file:limits.ts", change: "added" }]);
+    // Without main's labels, the tie relabels it: the overlay must pass them.
+    const unpinned = diffGraphs(base, buildGraph("org/app", added, cards, empty, model));
+    expect(unpinned.find((change) => change.id === "file:verify-all.ts")?.fields).toEqual([
+      "topics",
+    ]);
+  });
 });
 
 describe("stored overlays", () => {
@@ -297,6 +363,111 @@ describe("stored overlays", () => {
       insert.run(blob, ANALYZER, JSON.stringify(a));
     return sqlite;
   }
+
+  test("archiving a work source fences late overlay publication and page completion", async () => {
+    const sqlite = setup();
+    sqlite.exec(`
+      INSERT INTO timeline_work_sources
+        (source_id, repo_id, timeline_id, timeline_slug, owner_id, artifacts_name,
+         state, allocation_operation_id, fork_source_id, fork_commit, fork_tree,
+         fork_ref, created_at, updated_at, initial_source_id, initial_commit, initial_tree, initial_ref)
+      VALUES ('work_one', 'repo', 'timeline-one', 'fast', 'acc', 'owned',
+        'ready', 'allocate-one', 'canonical', 'm1', 'tree-main', 'refs/heads/main', 'now', 'now',
+        'canonical', 'm1', 'tree-main', 'refs/heads/main');
+      INSERT INTO kg_overlays (repo_id, source_id, ref, overlay_id, head_commit, status, attempted_commit)
+        VALUES ('repo', 'work_one', 'refs/heads/timeline/fast', 'kept', 't1', 'succeeded', 't1');
+      INSERT INTO kg_page_sets (repo_id, source_id, ref, set_key, commit_oid, status, build_id)
+        VALUES ('repo', 'work_one', 'refs/heads/timeline/fast', 'checkpoint', 't1', 'writing', 'job');
+      INSERT INTO kg_overlays (repo_id, source_id, ref, overlay_id, head_commit, status, attempted_commit)
+        VALUES ('repo', 'canonical', 'refs/heads/timeline/fast', 'historical', 'legacy', 'succeeded', 'legacy');
+      UPDATE timeline_work_sources SET state = 'archived', archived_at = 'ended', updated_at = 'ended'
+        WHERE source_id = 'work_one';
+    `);
+    await overlayFailed(
+      d1(sqlite),
+      "repo",
+      "refs/heads/timeline/fast",
+      "late",
+      "late failure",
+      "work_one",
+    );
+    expect(
+      sqlite
+        .prepare(
+          "SELECT overlay_id, head_commit, status, ended_at FROM kg_overlays WHERE source_id = 'work_one'",
+        )
+        .get(),
+    ).toEqual({ overlay_id: "kept", head_commit: "t1", status: "succeeded", ended_at: "ended" });
+    expect(sqlite.prepare("SELECT status FROM kg_page_sets").get()).toEqual({ status: "ended" });
+    expect(
+      sqlite
+        .prepare(
+          "SELECT overlay_id, head_commit, ended_at FROM kg_overlays WHERE source_id = 'canonical'",
+        )
+        .get(),
+    ).toEqual({ overlay_id: "historical", head_commit: "legacy", ended_at: null });
+    await overlayFailed(
+      d1(sqlite),
+      "repo",
+      "refs/heads/timeline/late",
+      "late",
+      "late failure",
+      "work_one",
+    );
+    for (const ref of ["refs/heads/timeline/fast", "refs/heads/timeline/late"]) {
+      const late = await storeOverlay(
+        d1(sqlite),
+        "repo",
+        ref,
+        "late-build",
+        "late",
+        "m1",
+        { mergeBase: "m1", historyTruncated: false, changes: [] },
+        [
+          {
+            id: "file:late.ts",
+            kind: "file",
+            change: "added",
+            name: "late.ts",
+            path: "late.ts",
+            summary: "Unpublished late file",
+            fields: [],
+            links: { added: [], removed: [] },
+          },
+        ],
+        { sourceId: "work_one" },
+      );
+      expect(late.kept).toBe(false);
+      expect(
+        sqlite
+          .prepare("SELECT node_id FROM kg_overlay_changes WHERE overlay_id='late-build'")
+          .all(),
+      ).toEqual([]);
+    }
+    expect(
+      sqlite
+        .prepare("SELECT overlay_id,head_commit FROM kg_overlays WHERE source_id='work_one'")
+        .get(),
+    ).toEqual({ overlay_id: "kept", head_commit: "t1" });
+    expect(
+      sqlite.prepare("SELECT ref FROM kg_overlays WHERE ref = 'refs/heads/timeline/late'").get(),
+    ).toBeUndefined();
+  });
+
+  test("owned-source planning uses the explicit fork tree without requiring canonical main objects", async () => {
+    const reader = history([commit("work-tip", ["fork"], 2, "work-tree")], {
+      "fork-tree": [file("main.ts", "original")],
+      "work-tree": [file("main.ts", "original"), file("limits.ts", "work-only")],
+    });
+    expect(
+      await planOverlay(reader, "work-tip", "canonical-new", { commit: "fork", tree: "fork-tree" }),
+    ).toEqual({
+      base: "canonical-new",
+      mergeBase: "fork",
+      historyTruncated: false,
+      changes: [{ path: "limits.ts", blob: "work-only", before: null, mode: "100644" }],
+    });
+  });
 
   test("computeOverlay stores the diff and leaves main's graph alone", async () => {
     const sqlite = setup();
@@ -392,6 +563,17 @@ describe("stored overlays", () => {
       {},
     );
     expect(late.stored).toBe(0);
+    // Retrying the already-published step after archive must not erase its own rows.
+    const replay = await computeOverlay(
+      db,
+      { id: "repo", full_name: "org/app" },
+      ref,
+      "o2",
+      "t2",
+      { ...plan, changes: plan.changes.slice(1) },
+      {},
+    );
+    expect(replay.stored).toBe(0);
     await overlayFailed(db, "repo", ref, "t3", "boom");
     // Ending it again keeps the first answer.
     await endOverlays(db, "repo", new Map([[ref, "ended"]]));

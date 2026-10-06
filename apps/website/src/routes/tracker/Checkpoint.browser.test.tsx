@@ -51,17 +51,33 @@ async function approvalWorld(server: TestServer) {
     timeline,
     "Adds **ranked** search.\n\n- Indexes the docs\n- Ranks by freshness",
   );
-  const ref = `timeline/${timeline.slug}`;
-  await ciRun(server, { repo: engine, number: 4, commit: engine.tip, ref, status: "succeeded" });
+  // Runs of the timeline's work: its owned source's work branch (CORE-255).
+  const ref = "work";
+  await ciRun(server, {
+    repo: engine,
+    number: 4,
+    commit: engine.tip,
+    ref,
+    sourceId: engine.sourceId,
+    status: "succeeded",
+  });
   await ciRun(server, {
     repo: engine,
     number: 5,
     commit: engine.tip,
     ref,
+    sourceId: engine.sourceId,
     status: "running",
     preview: "create",
   });
-  await ciRun(server, { repo: web, number: 2, commit: web.tip, ref, status: "failed" });
+  await ciRun(server, {
+    repo: web,
+    number: 2,
+    commit: web.tip,
+    ref,
+    sourceId: web.sourceId,
+    status: "failed",
+  });
   const original = await deployment(server, view, engine, {
     status: "active",
     url: "https://search.engine.preview.test",
@@ -121,28 +137,33 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
   await expect
     .element(card())
     .toMatchTextContent(
-      "Approving lands it: the checkpoint is merged into main and tested, and main moves only if that passes.",
+      "Approving lands the reviewed result as one compact commit on main, after its gates pass. Progress history stays in the work source.",
     );
   // The summary, as Markdown.
   await expect.element(card().getByText("ranked", { exact: true })).toBeVisible();
   await expect.element(card().getByText("Ranks by freshness")).toBeVisible();
 
-  // Each repository: its commit onto main's, its changes, CI runs and previews.
+  // Each repository: its work's commit (in its owned source, which canonical
+  // history never has) onto main's, its changes, CI runs and previews.
   for (const repo of [engine, web, docs, site]) {
     const row = repoRow(repo.name);
     await expect
       .element(row.getByRole("link", { name: short(repo.tip), exact: true }))
-      .toHaveAttribute("href", `/orbit/${repo.name}?commit=${repo.tip}`);
+      .toHaveAttribute("href", `/orbit/${repo.name}/tree/${repo.tip}?source=${repo.sourceId}`);
     await expect.element(row).toMatchTextContent(`onto main ${short(repo.main)}`);
+    await expect.element(row).toMatchTextContent("Work source");
+    // Main's commit is canonical: it opens in the commit panel.
     await expect
-      .element(row.getByRole("link", { name: short(repo.main), exact: true }))
+      .element(row.getByTitle("Main when the checkpoint was made"))
       .toHaveAttribute("href", `/orbit/${repo.name}?commit=${repo.main}`);
     await expect
       .element(row.getByRole("link", { name: "Knowledge diff" }))
       .toHaveAttribute("href", `/orbit/${repo.name}/knowledge?timeline=search`);
   }
   const engineChanges = repoRow("engine").getByRole("link", { name: "3 changes" });
-  await expect.element(engineChanges).toHaveAttribute("href", `/orbit/engine?commit=${engine.tip}`);
+  await expect
+    .element(engineChanges)
+    .toHaveAttribute("href", `/orbit/engine/commits/${engine.tip}?source=${engine.sourceId}`);
   await expect.element(engineChanges).toHaveAttribute("title", "wxyzabcd\nlmnopqrs\nkxqrstuv");
   await expect.element(repoRow("web").getByRole("link", { name: "1 change" })).toBeVisible();
   await expect.element(repoRow("docs").getByRole("link", { name: "0 changes" })).toBeVisible();
@@ -175,7 +196,7 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
   ).toHaveLength(0);
   const expired = repoRow("docs").getByText("Preview expired");
   await expect.element(expired).toBeVisible();
-  await expect.poll(() => expired.element().getAttribute("title")).toMatch(/^Torn down /);
+  await expect.poll(() => expired.element().getAttribute("title")).toMatch(/^Expired /);
   expect(
     repoRow("site")
       .getByText(/Preview/)
@@ -189,7 +210,7 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
     .element(pages("engine").getByRole("link", { name: "Search ranking" }))
     .toHaveAttribute(
       "href",
-      `/orbit/engine/wiki/search-ranking?set=${view.checkpoint.id}&tl=search`,
+      `/orbit/engine/wiki/search-ranking?set=${view.checkpoint.id}&source=${engine.sourceId}&tl=search`,
     );
   await expect.element(pages("engine")).toMatchTextContent("Search rankingNew");
   await expect.element(pages("engine")).toMatchTextContent("Ranks results by freshness and links.");
@@ -297,7 +318,8 @@ test("an auto timeline's card says it lands when green; Revive preview starts a 
     repo: engine,
     number: 1,
     commit: engine.tip,
-    ref: `timeline/${timeline.slug}`,
+    ref: "work",
+    sourceId: engine.sourceId,
     status: "failed",
   });
   const view = await checkpoint(server, timeline, "Ranks results");
@@ -320,7 +342,7 @@ test("an auto timeline's card says it lands when green; Revive preview starts a 
   await expect
     .element(card())
     .toMatchTextContent(
-      "It lands once its CI is green; the merge into main is tested before main moves.",
+      "It lands once CI is green; the compact result is tested before main moves. Progress history stays in the work source.",
     );
   const revive = card().getByRole("button", { name: "Revive preview" });
   await expect
@@ -375,10 +397,11 @@ test("the timeline inspector's Checkpoints: previews per checkpoint, and revivin
       revived++;
       // The preview run records its rebuild, as its job would once it's up.
       await server.sql(
-        `INSERT INTO deployments (repo_id, environment, timeline_slug, timeline_id, checkpoint_id,
-           commit_oid, url, status, revived, rebuilt_from)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?)`,
+        `INSERT INTO deployments (repo_id, source_id, environment, timeline_slug, timeline_id,
+           checkpoint_id, commit_oid, url, status, revived, rebuilt_from)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?)`,
         engine.id,
+        engine.sourceId,
         "timeline/search",
         "search",
         first.timeline.id,

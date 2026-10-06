@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { Issue, Mutation } from "../../shared/tracker.ts";
 import { TrackerStore, type Access } from "./store.ts";
 import { durableStorage } from "../testing/durable.ts";
+import { ownedCheckpointRepo, ownedTimeline } from "../testing/timeline-source.ts";
 
 const databases: { close(): void }[] = [];
 afterEach(() => {
@@ -188,6 +189,103 @@ describe("leases across timelines", () => {
     // Ready again, for the agent it's assigned to.
     expect(f.next(f.ann)).toBe("a");
   });
+
+  test.each([false, true])(
+    "partial abandonment preserves receipts and fences unresolved CAS (%s)",
+    (unresolved) => {
+      const f = fixture();
+      const timelines = f.store.timelines;
+      const search = ownedTimeline(timelines, f.ann, {
+        slug: "search",
+        parent: null,
+        policy: "auto",
+        repos: ["app", "lib"].map((id) => ({ id, owner: "org", name: id })),
+        commits: { app: oid(1), lib: oid(1) },
+      });
+      for (const repo of search.repos) {
+        const operationId = `push-${repo.id}`;
+        timelines.beginSourcePush({
+          operationId,
+          timelineId: search.id,
+          repoId: repo.id,
+          sourceId: repo.source!.sourceId,
+          commands: [{ ref: "refs/heads/work", old: oid(1), new: oid(2) }],
+          actorId: "ann",
+          accountableId: "ann",
+        });
+        timelines.finishSourcePush(operationId, "accepted");
+      }
+      f.finishIn("search");
+      timelines.createCheckpoint(f.ann, "search", {
+        repos: search.repos.map((repo) =>
+          ownedCheckpointRepo(timelines, "search", {
+            id: repo.id,
+            owner: repo.owner,
+            name: repo.name,
+            commit: oid(2),
+            base: oid(1),
+            changes: [],
+          }),
+        ),
+      });
+      const started = timelines.beginLanding(f.ann, "search", {
+        trigger: "request",
+        green: { ok: true, why: null },
+        agentId: null,
+      }).landing;
+      const stopped = timelines.saveLanding(
+        {
+          ...started,
+          state: "failed",
+          repos: [
+            {
+              ...started.repos[0]!,
+              state: "advanced",
+              base: oid(1),
+              merge: oid(3),
+              casIntent: { base: oid(1), candidate: oid(3), tree: oid(30) },
+            },
+            {
+              ...started.repos[1]!,
+              state: "failed",
+              base: oid(1),
+              merge: oid(4),
+              ...(unresolved
+                ? { casIntent: { base: oid(1), candidate: oid(4), tree: oid(40) } }
+                : {}),
+            },
+          ],
+        },
+        started.version,
+        "ann",
+      );
+      expect(timelines.get("search").status).toBe("partly_landed");
+      if (unresolved) {
+        expect(() => timelines.abandon(f.ann, "search", {})).toThrow(
+          expect.objectContaining({ code: "landing_unresolved", status: 409 }),
+        );
+        expect(f.issue("a")).toMatchObject({
+          status: "done_in_timeline",
+          claim: { retainedIn: { id: search.id } },
+        });
+        expect(timelines.get("search").status).toBe("partly_landed");
+      } else {
+        const { timeline } = timelines.abandon(f.ann, "search", {});
+        f.store.timelineAbandoned(f.ann, timeline);
+        expect(timeline.status).toBe("abandoned");
+        expect(f.issue("a")).toMatchObject({ status: "todo", claim: null, doneIn: null });
+        expect(f.leases()).toEqual([]);
+        expect(() =>
+          timelines.beginLanding(f.ann, "search", {
+            trigger: "request",
+            green: { ok: true, why: null },
+            agentId: null,
+          }),
+        ).toThrow(expect.objectContaining({ code: "timeline_ended" }));
+      }
+      expect(timelines.landing("search")).toEqual(stopped);
+    },
+  );
 
   test("merging the timeline into another moves the lease with the work", () => {
     const f = fixture();

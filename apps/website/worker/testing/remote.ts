@@ -11,6 +11,12 @@ const decoder = new TextDecoder();
 export interface FakeRemote {
   refs: Map<string, string>;
   head: string;
+  /** Commits retained by this repository, copied independently on fork. */
+  commits: Set<string>;
+  /** Unlisted fixture commits are roots; callers can supply a real DAG. */
+  parents: Map<string, string[]>;
+  tokens: Map<string, { id: string; plaintext: string; expiresAt: string }>;
+  isolated: boolean;
   /** Every receive-pack: its commands, and whether an empty pack followed them. */
   pushes: { commands: string[]; pack: "none" | "empty" | "other" }[];
   /** Refuse every receive-pack with this reason. */
@@ -24,15 +30,36 @@ function sideband(band: number, text: string): string {
 export function fakeRemotes() {
   const remotes = new Map<string, FakeRemote>();
   const commits = new Set<string>();
-  const add = (url: string, refs: Record<string, string>, head = "refs/heads/main") => {
-    const remote: FakeRemote = { refs: new Map(Object.entries(refs)), head, pushes: [] };
+  const names = new Map<string, string>();
+  const add = (
+    url: string,
+    refs: Record<string, string>,
+    head = "refs/heads/main",
+    name?: string,
+  ) => {
+    const parsed = new URL(url);
+    const remote: FakeRemote = {
+      refs: new Map(Object.entries(refs)),
+      head,
+      pushes: [],
+      commits: new Set(Object.values(refs)),
+      parents: new Map(),
+      tokens: new Map(),
+      isolated: false,
+    };
+    names.set(
+      name ?? (parsed.pathname.split("/").filter(Boolean).at(-1) || `r-${parsed.hostname}`),
+      url,
+    );
     for (const oid of Object.values(refs)) commits.add(oid);
     remotes.set(url, remote);
     return remote;
   };
   const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const href = input instanceof Request ? input.url : String(input);
-    const url = [...remotes.keys()].find((base) => href.startsWith(`${base}/`));
+    const url = [...remotes.keys()]
+      .filter((base) => href.startsWith(`${base}/`))
+      .sort((a, b) => b.length - a.length)[0];
     if (!url) throw new Error(`Unexpected fetch: ${href}`);
     const remote = remotes.get(url)!;
     const path = href.slice(url.length);
@@ -86,7 +113,8 @@ export function fakeRemotes() {
       const reason = (u: (typeof updates)[number]) => {
         if (remote.refuse) return remote.refuse;
         if ((remote.refs.get(u.ref) ?? ZERO_OID) !== u.old) return "stale info";
-        if (u.next !== ZERO_OID && !commits.has(u.next)) return "missing necessary objects";
+        if (u.next !== ZERO_OID && !(remote.isolated ? remote.commits : commits).has(u.next))
+          return "missing necessary objects";
         return null;
       };
       const failed = updates.map(reason);
@@ -96,7 +124,10 @@ export function fakeRemotes() {
       if (ok)
         for (const u of updates)
           if (u.next === ZERO_OID) remote.refs.delete(u.ref);
-          else remote.refs.set(u.ref, u.next);
+          else {
+            remote.refs.set(u.ref, u.next);
+            remote.commits.add(u.next);
+          }
       let report = pkt(`unpack ${unpack}\n`);
       for (const [i, u] of updates.entries())
         report += ok
@@ -106,16 +137,77 @@ export function fakeRemotes() {
     }
     throw new Error(`Unexpected fetch: ${href}`);
   };
-  const artifacts = {
-    get: async () => ({
-      createToken: async () => ({
-        id: "token",
-        plaintext: "artifacts-token",
-        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-      }),
-      readCommit: async (hash: string) => (commits.has(hash) ? { hash } : null),
-      [Symbol.dispose]() {},
-    }),
+  const getByName = (name: string): FakeRemote => {
+    const url = names.get(name);
+    const remote = url ? remotes.get(url) : undefined;
+    if (!remote)
+      throw Object.assign(new Error(`No Artifacts repository ${name}`), { code: "NOT_FOUND" });
+    return remote;
   };
-  return { remotes, commits, add, fetch, artifacts };
+  const artifacts = {
+    delete: async (name: string) => {
+      const url = names.get(name);
+      if (!url || !remotes.has(url))
+        throw Object.assign(new Error("Repository is already gone"), { code: "NOT_FOUND" });
+      remotes.delete(url);
+      names.delete(name);
+    },
+    get: async (name?: string) => {
+      const url = name ? names.get(name) : undefined;
+      const remote = url ? remotes.get(url) : undefined;
+      if (name && !remote)
+        throw Object.assign(new Error(`No Artifacts repository ${name}`), { code: "NOT_FOUND" });
+      return {
+        info: async () => ({ remote: url }),
+        fork: async (newName: string, options: { readOnly: boolean }) => {
+          if (!remote || !url) throw new Error("Fork requires a named source repository");
+          if (names.has(newName))
+            throw Object.assign(new Error(`Artifacts repository ${newName} exists`), {
+              code: "ALREADY_EXISTS",
+            });
+          const destination = new URL(`forks/${encodeURIComponent(newName)}`, `${url}/`).href;
+          const fork = add(destination, Object.fromEntries(remote.refs), remote.head, newName);
+          fork.commits = new Set([...remote.commits, ...remote.refs.values()]);
+          fork.parents = new Map([...remote.parents].map(([oid, parents]) => [oid, [...parents]]));
+          fork.isolated = true;
+          if (options.readOnly) fork.refuse = "read-only";
+          const id = crypto.randomUUID();
+          fork.tokens.set(id, {
+            id,
+            plaintext: `artifacts-${id}`,
+            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+          });
+          return { remote: destination };
+        },
+        createToken: async () => {
+          const id = crypto.randomUUID();
+          const token = {
+            id,
+            plaintext: `artifacts-${id}`,
+            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+          };
+          remote?.tokens.set(id, token);
+          return token;
+        },
+        listTokens: async () => ({ tokens: [...(remote?.tokens.values() ?? [])] }),
+        revokeToken: async (id: string) => {
+          if (!remote?.tokens.delete(id)) throw new Error(`Unknown token ${id}`);
+        },
+        readCommit: async (hash: string) =>
+          (
+            remote
+              ? remote.commits.has(hash) || [...remote.refs.values()].includes(hash)
+              : commits.has(hash)
+          )
+            ? {
+                hash,
+                treeHash: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                parents: [...(remote?.parents.get(hash) ?? [])],
+              }
+            : null,
+        [Symbol.dispose]() {},
+      };
+    },
+  };
+  return { remotes, commits, add, getByName, fetch, artifacts };
 }

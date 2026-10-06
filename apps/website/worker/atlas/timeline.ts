@@ -22,6 +22,7 @@
 // inference) or unclassified. Nothing is computed here.
 
 import type { Selectable } from "kysely";
+import { HTTPException } from "hono/http-exception";
 import type { KnowledgeOverlayChange, KnowledgePageSet } from "../../shared/api.ts";
 import {
   ATLAS_TIMELINE_REGIONS,
@@ -43,6 +44,7 @@ import type { RepoRow } from "../db.ts";
 import { coordinator } from "../knowledge/coordinator.ts";
 import { overlayState } from "../knowledge/overlay.ts";
 import { listSets } from "../knowledge/pages.ts";
+import { knowledgeRepo, timelineKnowledgeSource } from "../knowledge/sources.ts";
 import { RepoReader } from "../objects.ts";
 import { readTimelineRegrouping, type StoredRegrouping } from "./timelineGrouping.ts";
 import { db, type Database } from "../schema.ts";
@@ -63,6 +65,7 @@ type OverlayRow = Selectable<Database["kg_overlays"]>;
 /** What the overlay route would say about the timeline, read without side effects. */
 export interface TimelineState {
   ref: string;
+  sourceId: string;
   row: OverlayRow | undefined;
   head: string | null;
   headKnown: boolean;
@@ -81,15 +84,41 @@ export async function readTimelineState(
   timing: Timing,
   waitUntil: (work: Promise<unknown>) => void,
 ): Promise<TimelineState | null> {
-  const reader = new RepoReader(env, repo.artifacts_name, repo.artifacts_remote, timing, waitUntil);
-  const [refs, row, state, status] = await Promise.all([
-    reader.refs().catch(() => null),
-    db(env.DB)
+  const owned = await timelineKnowledgeSource(env, repo.id, ref);
+  const row = await db(env.DB)
+    .selectFrom("kg_overlays")
+    .selectAll()
+    .where("repo_id", "=", repo.id)
+    .where("source_id", "=", owned?.source_id ?? "canonical")
+    .where("ref", "=", ref)
+    .executeTakeFirst();
+  if (!owned && !row) {
+    const orphan = await db(env.DB)
       .selectFrom("kg_overlays")
-      .selectAll()
+      .select("source_id")
       .where("repo_id", "=", repo.id)
       .where("ref", "=", ref)
-      .executeTakeFirst(),
+      .executeTakeFirst();
+    if (orphan) throw new HTTPException(409, { message: "Timeline source migration required" });
+    return null;
+  }
+  if (!owned && !row?.ended_at)
+    throw new HTTPException(409, { message: "Timeline source migration required" });
+  const sourceId = owned?.source_id ?? row!.source_id;
+  // Ended pre-migration overlays are historical canonical evidence; never read
+  // an active canonical timeline bookmark as a substitute for an owned source.
+  const physical = await knowledgeRepo(env, repo.id, sourceId);
+  if (!physical) return null;
+  const reader = new RepoReader(
+    env,
+    physical.artifacts_name,
+    physical.artifacts_remote,
+    timing,
+    waitUntil,
+    owned?.work_ref,
+  );
+  const [refs, state, status] = await Promise.all([
+    owned && !row?.ended_at ? reader.refs().catch(() => null) : null,
     db(env.DB)
       .selectFrom("kg_state")
       .select("indexed_commit")
@@ -102,13 +131,14 @@ export async function readTimelineState(
       : null,
   ]);
   await reader.close();
-  const head = refs?.branches.find((b) => b.name === ref)?.oid ?? null;
+  const head = refs?.branches.find((b) => b.name === owned?.work_ref)?.oid ?? null;
   if (!row && !head) return null;
   return {
     ref,
+    sourceId,
     row,
     head,
-    headKnown: refs !== null,
+    headKnown: Boolean(row?.ended_at) || refs !== null,
     indexed: state?.indexed_commit ?? null,
     running: Boolean(status?.overlays[ref]?.running),
   };
@@ -484,7 +514,7 @@ export async function timelineView(
   for (const r of regrouped?.regions ?? []) if (!byRegion.has(r.id)) byRegion.set(r.id, []);
 
   // Wiki: the newest timeline page set, and main's pages about changed nodes.
-  const [newest] = await listSets(d1, repo.id, state.ref, { limit: 1 });
+  const [newest] = await listSets(d1, repo.id, state.ref, { limit: 1, sourceId: state.sourceId });
   const nodes = stored.filter((c) => c.kind === "component" || c.kind === "concept");
   const mainRows = nodes.length
     ? await db(d1)
@@ -702,6 +732,7 @@ function factsOf(
     stats.changes ?? Object.values(counts).reduce((n, k) => n + k.added + k.changed + k.removed, 0);
   return {
     repoId: repo.id,
+    sourceId: state.sourceId,
     owner: repo.owner_slug,
     name: repo.name,
     ref: state.ref.replace(/^refs\/heads\//, ""),
@@ -775,6 +806,7 @@ export function timelineAbsent(
 ): AtlasTimelineRepo {
   return {
     repoId: repo.id,
+    sourceId: null,
     owner: repo.owner_slug,
     name: repo.name,
     ref: ref.replace(/^refs\/heads\//, ""),
@@ -802,6 +834,7 @@ async function wikiOf(
 ): Promise<AtlasTimelineWiki> {
   return {
     key: set.key,
+    sourceId: set.sourceId,
     checkpoint: set.checkpoint,
     commit: set.commit,
     baseCommit: set.baseCommit,

@@ -54,6 +54,7 @@ import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts
 import { fakeDurableState } from "../testing/durable-state.ts";
 import { runPurge } from "../retention/repo-deletion.ts";
 import { fakeRemotes } from "../testing/remote.ts";
+import { Tracker } from "../tracker/object.ts";
 import { clearCompositionCache } from "./compose.ts";
 import { publishAtlasFixture, writeAtlasFixtureGraph } from "./fixture.ts";
 import {
@@ -146,16 +147,27 @@ async function world() {
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
       .run(r.id, ownerId, r.name, r.visibility, `authz-${run}-${r.id}`, `https://${r.id}`);
-    git.add(`https://${r.id}`, {
-      "refs/heads/main": head,
-      "refs/heads/timeline/plan": oid(2),
-    });
+    git.add(`https://${r.id}`, { "refs/heads/main": head }, undefined, `authz-${run}-${r.id}`);
+    git.add(
+      `https://${r.id}-work`,
+      { "refs/heads/work": oid(2) },
+      "refs/heads/work",
+      `authz-${run}-${r.id}-work`,
+    );
     sqlite.exec(`
+      INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, owner_id,
+        artifacts_name, artifacts_remote, state, allocation_operation_id, fork_source_id,
+        fork_commit, fork_tree, fork_ref, initial_source_id, initial_commit, initial_tree, initial_ref,
+        initial_token_revoked, created_at, updated_at)
+      VALUES ('work_${r.id}', '${r.id}', 'plan-${ownerId}', 'plan', '${ownerId}',
+        'authz-${run}-${r.id}-work', 'https://${r.id}-work', 'ready', 'allocate-${r.id}',
+        'canonical', '${head}', '${head}', 'refs/heads/main',
+        'canonical', '${head}', '${head}', 'refs/heads/main', 1, '', '');
       INSERT INTO kg_state (repo_id, indexed_commit, indexed_at) VALUES ('${r.id}', '${head}', '2026-10-01T00:00:00Z');
       INSERT INTO wiki_pages (repo_id, slug, title, section, position, body, inputs_hash, generated_in)
         VALUES ('${r.id}', 'overview', '${r.marker} overview', 'Overview', 0, '${r.marker} body', 'h', '${head}');
-      INSERT INTO kg_overlays (repo_id, ref, overlay_id, head_commit, base_commit, stats, updated_at, status, attempted_commit)
-        VALUES ('${r.id}', 'refs/heads/timeline/plan', 'ov-${r.id}', '${oid(2)}', '${head}',
+      INSERT INTO kg_overlays (repo_id, source_id, ref, overlay_id, head_commit, base_commit, stats, updated_at, status, attempted_commit)
+        VALUES ('${r.id}', 'work_${r.id}', 'refs/heads/timeline/plan', 'ov-${r.id}', '${oid(2)}', '${head}',
           '{"counts":{"file":{"added":1,"changed":0,"removed":0}},"stored":1}', '2026-10-01T00:00:00Z', 'succeeded', '${oid(2)}');
       INSERT INTO kg_overlay_changes (repo_id, overlay_id, node_id, kind, change, name, path)
         VALUES ('${r.id}', 'ov-${r.id}', 'file:plan.ts', 'file', 'added', '${r.marker} plan', 'plan.ts');
@@ -194,6 +206,8 @@ async function world() {
   /** Fresh bindings over the same database: a cold isolate. */
   const environment = () => {
     const coordinators = new Map<string, KnowledgeCoordinator>();
+    const trackers = new Map<string, Tracker>();
+    const allocations = sqlite.prepare("SELECT * FROM timeline_work_sources").all();
     const env = {
       DB: counted(d1(sqlite)),
       REGISTRY_DB: forbidden("REGISTRY_DB", touched),
@@ -206,6 +220,29 @@ async function world() {
       KNOWLEDGE_QUEUE: forbidden("KNOWLEDGE_QUEUE", touched),
       // Deleting a repository starts its purge (CORE-199); the test runs it.
       REPO_PURGE: { create: async () => ({}) },
+      TRACKER: {
+        getByName: (id: string) => {
+          let found = trackers.get(id);
+          if (!found) {
+            const state = fakeDurableState({ name: id });
+            found = new Tracker(state.ctx, env);
+            for (const source of allocations.filter((row) => row.owner_id === id)) {
+              state.db
+                .prepare(
+                  "INSERT INTO timeline_source_allocations (source_id, timeline_id, repo_id, data) VALUES (?, ?, ?, ?)",
+                )
+                .run(
+                  String(source.source_id),
+                  String(source.timeline_id),
+                  String(source.repo_id),
+                  JSON.stringify(source),
+                );
+            }
+            trackers.set(id, found);
+          }
+          return found;
+        },
+      },
       KNOWLEDGE_COORDINATOR: {
         getByName: (id: string) => {
           let found = coordinators.get(id);
@@ -265,6 +302,7 @@ async function world() {
   const warm = view(warmEnv);
   return {
     sqlite,
+    git,
     db: DB,
     env: warmEnv,
     touched,
@@ -760,6 +798,7 @@ describe("Atlas authorization, revocation and privacy", () => {
         VALUES ('r_vault2', 'ann', 'vault', 'private', 'authz-vault2', 'https://r_vault');
       INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('r_vault2', 'ben', 'read');
     `);
+    w.git.add("https://r_vault", { "refs/heads/main": oid(1) }, undefined, "authz-vault2");
     await writeFixture(w.sqlite, w.db, "r_vault2", "vault", "Newleaf", oid(1));
     await publishAtlasFixture({ DB: w.db }, "r_vault2", oid(1));
 

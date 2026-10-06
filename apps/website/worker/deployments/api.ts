@@ -42,6 +42,7 @@ import { db, nowIso, type DB } from "../schema.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { jobCaller, jobSecret, type JobCaller } from "./job.ts";
 import { previewSettings } from "./settings.ts";
+import { resolveSource } from "../timelines/sources.ts";
 
 const PAGE = 50;
 const MAX_PAGE = 100;
@@ -85,6 +86,7 @@ type DeploymentRow = InferResult<ReturnType<typeof selectDeployments>>[number];
 
 const toDeployment = (row: DeploymentRow): Deployment => ({
   id: row.id,
+  sourceId: row.source_id,
   environment: row.environment,
   timeline: row.timeline_slug,
   timelineId: row.timeline_id,
@@ -136,6 +138,8 @@ async function writer(c: Context<AppEnv>): Promise<Writer | Response> {
     );
     if (!repo || repo.id !== job.repoId)
       return fail(c, 403, "A CI job records deployments for its own repository only.");
+    if (job.sourceId !== "canonical" || !repo.deleted_at)
+      await resolveSource(c.env, repo, job.sourceId);
     return { kind: "job", repo, job };
   }
   const repo = await loadRepo(c, "write");
@@ -284,6 +288,7 @@ deployments.get("/deployments", async (c) => {
   const limit = Math.min(MAX_PAGE, Math.max(1, Number(q("limit")) || PAGE));
   const kdb = db(c.env.DB);
   let query = selectDeployments(kdb).where("d.repo_id", "=", repo.id).where("d.id", "<", before);
+  query = query.where("d.source_id", "=", c.req.query("source") ?? "canonical");
   const environment = q("environment");
   if (environment) query = query.where("d.environment", "=", environment);
   const timeline = q("timeline");
@@ -320,6 +325,7 @@ deployments.post("/deployments", async (c) => {
   if (who instanceof Response) return who;
   const data = await body(c, [
     "commit",
+    "source",
     "url",
     "environment",
     "timeline",
@@ -328,6 +334,11 @@ deployments.post("/deployments", async (c) => {
     "expiresAt",
   ]);
   const job = who.kind === "job" ? who.job : null;
+  const sourceId = job?.sourceId ?? optionalString(data.source, "source") ?? "canonical";
+  if (job && data.source !== undefined && data.source !== job.sourceId)
+    throw new Invalid("A job records only its exact source.");
+  if (sourceId !== "canonical" || !who.repo.deleted_at)
+    await resolveSource(c.env, who.repo, sourceId);
   const commit = optionalString(data.commit, "commit")?.toLowerCase() ?? job?.commit;
   if (!commit) throw new Invalid("Name the commit that was deployed (commit: a full commit id).");
   if (!OID.test(commit)) throw new Invalid("commit must be a full 40-character commit id.");
@@ -367,6 +378,7 @@ deployments.post("/deployments", async (c) => {
     .insertInto("deployments")
     .values({
       repo_id: who.repo.id,
+      source_id: sourceId,
       environment: where.environment,
       timeline_slug: where.timeline,
       timeline_id: timeline?.id ?? null,
@@ -406,6 +418,8 @@ deployments.patch("/deployments/:id{[0-9]+}", async (c) => {
   const id = Number(c.req.param("id"));
   const existing = await findDeployment(kdb, who.repo.id, id);
   if (!existing) return fail(c, 404, "No such deployment.");
+  if (who.kind === "job" && existing.source_id !== who.job.sourceId)
+    return fail(c, 403, "A job may update only its own source's deployments.");
   const changes: {
     status?: DeploymentStatus;
     url?: string | null;
@@ -446,6 +460,7 @@ deployments.get("/environments", async (c) => {
       sql<number>`sum(status IN ('active', 'sleeping'))`.as("live"),
     ])
     .where("repo_id", "=", repo.id)
+    .where("source_id", "=", c.req.query("source") ?? "canonical")
     .groupBy("environment")
     .orderBy("latest", "desc")
     .limit(MAX_ENVIRONMENTS)

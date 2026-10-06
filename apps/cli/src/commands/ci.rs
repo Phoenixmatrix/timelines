@@ -681,7 +681,7 @@ fn private_runner_dir(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
-fn cache_scope(server: &str, repo: &str, job: &str) -> String {
+fn cache_scope(server: &str, repo: &str, job: &str, source: &str) -> String {
     use sha2::{Digest, Sha256};
     // Normalize URL spelling without folding case-sensitive repository/path names.
     let server = server.trim_end_matches('/');
@@ -704,11 +704,44 @@ fn cache_scope(server: &str, repo: &str, job: &str) -> String {
         server.to_string()
     };
     let mut digest = Sha256::new();
-    for part in [canonical.as_str(), repo, job] {
+    for part in [canonical.as_str(), repo, job, source] {
         digest.update((part.len() as u64).to_be_bytes());
         digest.update(part.as_bytes());
     }
     format!("{:x}", digest.finalize())
+}
+
+/// A job may check out only its server-issued canonical or owned-work endpoint.
+fn job_git_url<'a>(server: &str, job: &'a Value) -> Result<&'a str> {
+    let source = s(job, "sourceId");
+    let repo = s(job, "repo");
+    let url = s(job, "gitUrl");
+    if source.is_empty() || repo.is_empty() || url.is_empty() {
+        return Err(GmError::new(
+            "invalid_job_source",
+            "The job is missing its code source or scoped Git URL.",
+        ));
+    }
+    let server = server.trim_end_matches('/');
+    let expected = if source == "canonical" {
+        format!("{server}/{repo}.git")
+    } else {
+        let slug = s(job, "timelineSlug");
+        if !source.starts_with("work_") || !crate::profile::is_timeline_slug(slug) {
+            return Err(GmError::new(
+                "invalid_job_source",
+                "The job lacks its pinned timeline source address.",
+            ));
+        }
+        format!("{server}/{repo}@{slug}.git")
+    };
+    if url != expected {
+        return Err(GmError::new(
+            "invalid_job_source",
+            "The job's Git URL does not match its server, repository and code source.",
+        ));
+    }
+    Ok(url)
 }
 
 struct CompilerCache {
@@ -990,7 +1023,8 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
     };
     let deadline =
         Instant::now() + Duration::from_secs(job["timeoutMinutes"].as_u64().unwrap_or(20) * 60);
-    let scope = cache_scope(&config.server(), s(job, "repo"), s(job, "name"));
+    let server = config.server();
+    let scope = cache_scope(&server, s(job, "repo"), s(job, "name"), s(job, "sourceId"));
     let attempt = format!("{:032x}", rand::random::<u128>());
     let dir = root.join("jobs").join(&attempt);
     private_runner_dir(&dir)?;
@@ -1015,7 +1049,12 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
                 &s(job, "commit")[..12.min(s(job, "commit").len())]
             ),
         );
-        let url = format!("{}/{}.git", config.server(), s(job, "repo"));
+        let url = job_git_url(&server, job)?;
+        let branch = if s(job, "sourceId") == "canonical" {
+            s(job, "ref")
+        } else {
+            "work"
+        };
         let clone = remote::git(
             config,
             &dir,
@@ -1026,8 +1065,8 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
                 "50",
                 "--single-branch",
                 "--branch",
-                s(job, "ref"),
-                &url,
+                branch,
+                url,
                 "repo",
             ],
         )?;
@@ -1251,10 +1290,10 @@ mod tests {
     #[test]
     fn compiler_cache_scopes_separate_untrusted_identities() {
         use super::cache_scope;
-        let scope = cache_scope("HTTPS://Example.COM:443/", "owner/repo", "e2e");
+        let scope = cache_scope("HTTPS://Example.COM:443/", "owner/repo", "e2e", "canonical");
         assert_eq!(
             scope,
-            cache_scope("https://example.com", "owner/repo", "e2e")
+            cache_scope("https://example.com", "owner/repo", "e2e", "canonical")
         );
         for (server, repo, job) in [
             ("https://other.example", "owner/repo", "e2e"),
@@ -1262,22 +1301,60 @@ mod tests {
             ("https://example.com", "owner/repo", "build"),
             ("https://example.com/path", "owner/repo", "e2e"),
         ] {
-            assert_ne!(scope, cache_scope(server, repo, job));
+            assert_ne!(scope, cache_scope(server, repo, job, "canonical"));
         }
         assert_ne!(
-            cache_scope("https://example.com", "a", "bc"),
-            cache_scope("https://example.com", "ab", "c")
+            cache_scope("https://example.com", "a", "bc", "canonical"),
+            cache_scope("https://example.com", "ab", "c", "canonical")
         );
-        let hostile = cache_scope("https://example.com", "../../outside", "/tmp/escape");
+        assert_ne!(
+            scope,
+            cache_scope("https://example.com", "owner/repo", "e2e", "work_a")
+        );
+        let hostile = cache_scope(
+            "https://example.com",
+            "../../outside",
+            "/tmp/escape",
+            "work_a",
+        );
         assert_eq!(hostile.len(), 64);
         assert!(hostile.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn checkout_requires_the_jobs_exact_gitmatrix_source() {
+        use super::job_git_url;
+        let mut job = json!({
+            "repo": "owner/repo", "sourceId": "work_a", "timelineSlug": "feature-a",
+            "gitUrl": "https://example.com/owner/repo@feature-a.git"
+        });
+        assert_eq!(
+            job_git_url("https://example.com/", &job).unwrap(),
+            "https://example.com/owner/repo@feature-a.git"
+        );
+        for url in [
+            "https://provider.example/owner/repo@feature-a.git",
+            "https://example.com/owner/other@feature-a.git",
+            "https://example.com/owner/repo@feature-b.git",
+            "https://example.com/owner/repo.git",
+        ] {
+            job["gitUrl"] = json!(url);
+            assert!(job_git_url("https://example.com", &job).is_err());
+        }
+        job["sourceId"] = json!("canonical");
+        assert_eq!(
+            job_git_url("https://example.com", &job).unwrap(),
+            "https://example.com/owner/repo.git"
+        );
+        job.as_object_mut().unwrap().remove("sourceId");
+        assert!(job_git_url("https://example.com", &job).is_err());
     }
 
     #[test]
     fn compiler_cache_leases_isolate_active_jobs_and_reuse_released_outputs() {
         use super::{CompilerCache, cache_scope};
         let root = tempfile::tempdir().unwrap();
-        let scope = cache_scope("https://example.com", "owner/repo", "test");
+        let scope = cache_scope("https://example.com", "owner/repo", "test", "canonical");
         let first = CompilerCache::acquire(root.path(), &scope).unwrap();
         let first_path = first.target.clone();
         std::fs::write(first_path.join("compiled-output"), "first").unwrap();

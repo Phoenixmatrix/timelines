@@ -443,6 +443,19 @@ function removableTimelines(sql: SqlDatabase, before: string): string[] {
      FROM timeline_events WHERE json_extract(data, '$.kind') = 'merge'`,
   ))
     if (merge.fromId && merge.intoId) holds.push([merge.intoId, merge.fromId]);
+  // Source dependencies need their exact base and admission evidence even if
+  // there is no parent/merge event (for example a reviewed cross-timeline sync).
+  for (const dependency of rows<{ keeper: string; kept: string | null }>(
+    sql,
+    `SELECT t.id AS keeper, json_extract(d.value, '$.source.timelineId') AS kept
+       FROM timelines t, json_each(t.data, '$.repos') r, json_each(r.value, '$.dependencies') d
+     UNION SELECT t.id, json_extract(d.value, '$.base.timelineId')
+       FROM timelines t, json_each(t.data, '$.repos') r, json_each(r.value, '$.dependencies') d
+     UNION SELECT t.id, json_extract(r.value, '$.logicalBase.timelineId')
+       FROM timelines t, json_each(t.data, '$.repos') r`,
+  ))
+    if (dependency.kept && dependency.kept !== dependency.keeper)
+      holds.push([dependency.keeper, dependency.kept]);
   for (let changed = true; changed;) {
     changed = false;
     for (const [keeper, kept] of holds)
@@ -629,6 +642,20 @@ export function removeActivity(
         list,
       );
       const seqs = JSON.stringify(records.events.map((event) => event.seq));
+      // Preserve end evidence with the minimal source ownership inventory before
+      // deleting rich Tracker detail. This also upgrades pre-policy allocations.
+      sql.exec(
+        `UPDATE timeline_source_allocations AS a SET data = json_set(a.data,
+           '$.archive_disposition', (SELECT json_extract(t.data, '$.status') FROM timelines t WHERE t.id=a.timeline_id),
+           '$.archived_at', (SELECT json_extract(t.data, '$.endedAt') FROM timelines t WHERE t.id=a.timeline_id))
+         WHERE a.timeline_id IN (SELECT value FROM json_each(?))
+           AND json_extract(a.data, '$.archive_disposition') IS NULL
+           AND json_extract(a.data, '$.state') = 'archived'
+           AND EXISTS (SELECT 1 FROM timelines t WHERE t.id=a.timeline_id
+             AND json_extract(t.data, '$.status') IN ('landed','abandoned')
+             AND json_extract(t.data, '$.endedAt') IS NOT NULL)`,
+        list,
+      );
       sql.exec(
         "DELETE FROM timeline_event_index WHERE seq IN (SELECT value FROM json_each(?))",
         seqs,

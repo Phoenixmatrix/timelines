@@ -135,7 +135,7 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
           .updateTable("ci_jobs")
           .set({ status: "cancelled", finished_at: now })
           .where("run_id", "=", id)
-          .where("status", "in", ["pending", "queued", "running"]),
+          .where("status", "in", ["pending", "queued"]),
       ]);
       await Promise.all(jobs.map((j) => revokeJobTokens(env.DB, j.id)));
       const instance = await env.CI_RUN.get(id).catch(() => null);

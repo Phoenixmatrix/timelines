@@ -75,6 +75,7 @@ export class RepoReader {
   private remote: string;
   private timing: Timing;
   private waitUntil: (work: Promise<unknown>) => void;
+  private sourceRef: string | undefined;
 
   constructor(
     env: Env,
@@ -82,12 +83,14 @@ export class RepoReader {
     remote: string,
     timing: Timing,
     waitUntil: (work: Promise<unknown>) => void,
+    sourceRef?: string,
   ) {
     this.env = env;
     this.artifactsName = artifactsName;
     this.remote = remote;
     this.timing = timing;
     this.waitUntil = waitUntil;
+    this.sourceRef = sourceRef;
   }
 
   /** The binding stub, fetched only when something misses the cache. */
@@ -111,7 +114,7 @@ export class RepoReader {
   ): Promise<T> {
     const key = `${this.artifactsName}/${kind}/${id}`;
     const hit = recall<T>(key);
-    if (hit !== undefined) {
+    if (hit !== undefined && hit !== null) {
       this.timing.count(`${kind}-memory`);
       return hit;
     }
@@ -124,18 +127,25 @@ export class RepoReader {
       const url = `${CACHE_ORIGIN}/${key}`;
       const cache = caches.default;
       const stored = await cache.match(url);
-      if (stored) {
+      if (stored?.headers.get("x-gitmatrix-object") === "present") {
         this.timing.count(`${kind}-cache`);
         const value = await decode(stored);
         remember(key, value, encode(value).size);
         return value;
       }
       const value = await this.timing.measure(kind, load());
+      // Absence is mutable: an object may arrive in a later push or fork.
+      if (value === null) return value;
       const { body, size } = encode(value);
       remember(key, value, size);
       await cache.put(
         url,
-        new Response(body, { headers: { "cache-control": "public, max-age=31536000, immutable" } }),
+        new Response(body, {
+          headers: {
+            "cache-control": "public, max-age=31536000, immutable",
+            "x-gitmatrix-object": "present",
+          },
+        }),
       );
       return value;
     })();
@@ -217,13 +227,25 @@ export class RepoReader {
     return value;
   }
 
+  /** A work repository exposes its logical work HEAD, never the fork's inherited HEAD. */
+  #sourceRefs(refs: RepoRefs): RepoRefs {
+    if (!this.sourceRef) return refs;
+    const branch = refs.branches.find((entry) => entry.name === this.sourceRef);
+    return {
+      headBranch: this.sourceRef.replace(/^refs\/heads\//, ""),
+      head: branch?.oid ?? null,
+      branches: branch ? [branch] : [],
+      tags: [],
+    };
+  }
+
   /** Branch and tag tips: cached, and refreshed in the background once stale. */
   async refs(): Promise<RepoRefs> {
     const cached = refsCache.get(this.artifactsName);
     const age = cached ? Date.now() - cached.at : Infinity;
     if (cached && age < REFS_FRESH_MS) {
       this.timing.count("refs-memory");
-      return cached.refs;
+      return this.#sourceRefs(cached.refs);
     }
     const refresh = async () => {
       const refs = await listRefs(this.env, this.artifactsName, this.remote);
@@ -235,10 +257,10 @@ export class RepoReader {
       // Mark it fresh now so concurrent requests don't all refresh at once.
       refsCache.set(this.artifactsName, { at: Date.now(), refs: cached.refs });
       this.waitUntil(refresh().catch(() => refsCache.delete(this.artifactsName)));
-      return cached.refs;
+      return this.#sourceRefs(cached.refs);
     }
     this.#refs ??= this.timing.measure("ls-refs", refresh());
-    return this.#refs;
+    return this.#sourceRefs(await this.#refs);
   }
 
   /** A branch, tag or commit id, as a commit id. */

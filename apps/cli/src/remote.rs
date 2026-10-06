@@ -764,6 +764,15 @@ fn status_error(status: u16, value: &Value) -> GmError {
             .hint("Sign in: `gm auth login` (in the browser), or `--persona <name>` in dev.")
             .exit(exit::AUTH),
         403 => GmError::new("forbidden", message).exit(exit::AUTH),
+        410 if value.get("code").and_then(Value::as_str) == Some("source_expired") => {
+            GmError::new("source_expired", message)
+                .hint("Source retention expired. Local work remains; recover it explicitly into a new timeline.")
+        }
+        409 if value.get("code").and_then(Value::as_str) == Some("source_migration_required") => {
+            GmError::new("source_migration_required", message)
+                .hint("Run `gm timeline migrate`, then renew checkpoint and approval.")
+                .exit(exit::CONFLICT)
+        }
         // Retention (CORE-203) says when and why it removed an issue or timeline.
         404 if value.get("code").and_then(Value::as_str) == Some("removed_by_retention") => {
             GmError::not_found("removed_by_retention", message)

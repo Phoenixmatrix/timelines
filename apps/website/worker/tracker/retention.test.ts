@@ -248,6 +248,36 @@ describe("closed issues", () => {
 });
 
 describe("activity logs and ended timelines", () => {
+  test("a retained source dependency keeps ancestor evidence without a parent or merge event", () => {
+    const f = setup();
+    const ancestor = f.fork("ancestor");
+    f.store.timelines.abandon(f.access, "ancestor", { app: oid(1) });
+    const child = f.fork("independent");
+    const source = {
+      sourceId: "work_ancestor",
+      repoId: "app",
+      kind: "timeline-work",
+      timelineId: ancestor.id,
+      ref: "refs/heads/work",
+      commit: oid(1),
+      tree: oid(2),
+    };
+    f.sql.exec(
+      "UPDATE timelines SET data=json_set(data,'$.repos[0].dependencies',json(?)) WHERE id=?",
+      JSON.stringify([
+        { source, base: { ...source, sourceId: "canonical", kind: "canonical", timelineId: null } },
+      ]),
+      child.id,
+    );
+    expect(selectActivity(f.sql, ACTIVITY, NOW, "t:", 100).items).not.toContain(`t:${ancestor.id}`);
+    f.sql.exec(
+      "UPDATE timelines SET data=json_set(data,'$.repos[0].dependencies',json('[]')) WHERE id=?",
+      child.id,
+    );
+    expect(selectActivity(f.sql, ACTIVITY, NOW, "t:", 100).items).toContain(`t:${ancestor.id}`);
+    f.db.close();
+  });
+
   function timelines() {
     const f = seeded();
     // "old" (H changed in it) and "gone" ended on day 0; "parent" too, but

@@ -122,6 +122,7 @@ const C1 = "1".repeat(40);
 const C2 = "2".repeat(40);
 const TIP = "7".repeat(40);
 const REF = "refs/heads/timeline/plan";
+const SOURCE = "work_regroup_plan";
 let names = 0;
 
 function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
@@ -131,9 +132,22 @@ function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('ann', 'user', 'ann', 'Ann');
     INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r1', 'ann', 'shop', 'private', '${artifacts}', 'https://shop');
+    INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, owner_id,
+      artifacts_name, artifacts_remote, state, allocation_operation_id, fork_source_id,
+      fork_commit, fork_tree, fork_ref, initial_source_id, initial_commit, initial_tree, initial_ref,
+      initial_token_revoked, created_at, updated_at)
+    VALUES ('${SOURCE}', 'r1', 'plan', 'plan', 'ann', '${artifacts}-work', 'https://shop-work',
+      'ready', 'allocate-plan', 'canonical', '${C1}', '${C1}', 'refs/heads/main',
+      'canonical', '${C1}', '${C1}', 'refs/heads/main', 1, '', '');
   `);
   const git = fakeRemotes();
-  git.add("https://shop", { "refs/heads/main": C1, ...bookmarks });
+  git.add("https://shop", { "refs/heads/main": C1 }, undefined, artifacts);
+  git.add(
+    "https://shop-work",
+    bookmarks[REF] ? { "refs/heads/work": bookmarks[REF] } : {},
+    "refs/heads/work",
+    `${artifacts}-work`,
+  );
   const env = {
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
@@ -201,6 +215,7 @@ function storedGraph(sqlite: ReturnType<typeof migratedDatabase>): BuiltGraph {
     components: [],
     componentDeps: new Map(),
     conceptFiles: new Map(),
+    topicNames: new Map(),
   };
 }
 
@@ -209,7 +224,14 @@ describe("A timeline's regrouping", () => {
     const s = setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     await publishAtlasFixture(s.env, "r1", C1);
-    const { overlayId } = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1);
+    const { overlayId } = await writeAtlasFixtureOverlay(
+      s.env.DB,
+      "r1",
+      "timeline/plan",
+      TIP,
+      C1,
+      SOURCE,
+    );
     expect(s.rows()).toEqual([{ overlay_id: overlayId, seq: 1, state: "computed", reason: null }]);
 
     const { first, items } = await all();
@@ -268,7 +290,14 @@ describe("A timeline's regrouping", () => {
     const s = setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     await publishAtlasFixture(s.env, "r1", C1);
-    const { overlayId } = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1);
+    const { overlayId } = await writeAtlasFixtureOverlay(
+      s.env.DB,
+      "r1",
+      "timeline/plan",
+      TIP,
+      C1,
+      SOURCE,
+    );
     // The timeline cuts search in two: its files stop importing across the
     // halves and stop sharing its concept.
     const main = storedGraph(s.sqlite);
@@ -326,9 +355,9 @@ describe("A timeline's regrouping", () => {
     const s = setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     await publishAtlasFixture(s.env, "r1", C1);
-    const first = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1);
+    const first = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1, SOURCE);
     // A push computes the overlay again, and its regrouping with it.
-    const second = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1);
+    const second = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1, SOURCE);
     expect(s.rows().map((r) => r.overlay_id)).toEqual([second.overlayId]);
     expect(await readTimelineRegrouping(s.env.DB, "r1", first.overlayId)).toBeNull();
 
@@ -336,7 +365,7 @@ describe("A timeline's regrouping", () => {
     await endAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", "landed");
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C2, "merged");
     await publishAtlasFixture(s.env, "r1", C2);
-    const late = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C2);
+    const late = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C2, SOURCE);
     expect(late.stored).toBe(0);
     expect(s.rows()).toEqual([
       { overlay_id: second.overlayId, seq: 1, state: "computed", reason: null },
@@ -347,7 +376,7 @@ describe("A timeline's regrouping", () => {
     const s = setup();
     await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
     // No map of main yet when the overlay is stored.
-    const early = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1);
+    const early = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1, SOURCE);
     expect(s.rows()).toEqual([
       { overlay_id: early.overlayId, seq: null, state: "skipped", reason: "no-snapshot" },
     ]);

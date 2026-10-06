@@ -30,10 +30,10 @@ import { bytes, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { formatLabel, packagePath } from "../../lib/packages.ts";
 import { STATUS_LABEL } from "../packages/PackageConsole.tsx";
 import type { Published } from "../../../shared/packages.ts";
-import { commitsUrl, repoPath } from "../../lib/refs.ts";
+import { commitsUrl, repoPath, sourceUrl, treeUrl } from "../../lib/refs.ts";
 import { PersonLink } from "../../components/PersonLink.tsx";
-import { repoData, routeData } from "../../lib/repoData.ts";
-import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
+import { repoData, requestSource, routeData } from "../../lib/repoData.ts";
+import { bookmarkIn, scopeBookmark, scopeOf } from "../../lib/timelineScope.ts";
 import { useRememberPlace } from "../../lib/recentPlaces.ts";
 import { CommitLink } from "../../components/CommitLink.tsx";
 import { useRepo } from "./RepoLayout.tsx";
@@ -48,19 +48,23 @@ const olderPages = new Map<string, Promise<CiRunSummary[]>>();
 
 export async function ciLoader({ request, params }: LoaderFunctionArgs) {
   const path = base(params.owner, params.repo);
+  const source = await requestSource(params.owner ?? "", params.repo ?? "", request);
   // In a timeline's scope (?tl=), the runs on its bookmark, where the repository has one.
   const scope = scopeOf(new URL(request.url).search);
   const ref = scope
-    ? bookmarkIn(await routeData(repoData.detail(params.owner ?? "", params.repo ?? "")), scope)
+    ? (bookmarkIn(
+        await routeData(repoData.detail(params.owner ?? "", params.repo ?? "", source)),
+        scope,
+      ) ?? (source ? scopeBookmark(scope) : null))
     : null;
   const only = ref ? `ref=${encodeURIComponent(ref)}` : "";
-  const list = await load<CiRunList>(only ? `${path}?${only}` : path, request);
+  const list = await load<CiRunList>(sourceUrl(only ? `${path}?${only}` : path, source), request);
   // The health strip shows up to 60 runs; the page holds 30. The next page
   // streams in behind the table and never holds it up.
   const last = list.runs.at(-1);
   let older: Promise<CiRunSummary[]> = Promise.resolve([]);
   if (last && list.runs.length >= 30) {
-    const key = `${path}?before=${last.number}${only ? `&${only}` : ""}`;
+    const key = sourceUrl(`${path}?before=${last.number}${only ? `&${only}` : ""}`, source);
     older =
       olderPages.get(key) ??
       api<CiRunList>(key)
@@ -135,6 +139,7 @@ export async function ciAction({ request, params }: ActionFunctionArgs) {
   const form = await request.formData();
   const root = base(params.owner, params.repo);
   const intent = field(form, "intent");
+  const source = await requestSource(params.owner ?? "", params.repo ?? "", request);
   const result = await attempt(async () => {
     if (intent === "cancel") {
       await api(`${root}/runs/${field(form, "number")}/cancel`, { method: "POST" });
@@ -142,13 +147,15 @@ export async function ciAction({ request, params }: ActionFunctionArgs) {
     }
     const path =
       intent === "rerun" ? `${root}/runs/${field(form, "number")}/rerun` : `${root}/runs`;
-    return api<{ number: number }>(path, {
+    return api<{ number: number }>(sourceUrl(path, source), {
       method: "POST",
       json: intent === "start" ? { ref: field(form, "ref") || undefined } : {},
     });
   });
   if ("error" in result) return result;
-  return redirect(repoPath(params.owner ?? "", params.repo ?? "", "ci", String(result.number)));
+  return redirect(
+    sourceUrl(repoPath(params.owner ?? "", params.repo ?? "", "ci", String(result.number)), source),
+  );
 }
 
 /** Revalidate on a timer while `busy`, so live runs update themselves. */
@@ -794,22 +801,33 @@ export function CiRun() {
             )}
             <span>·</span>
             <Link
-              to={commitsUrl(repo.owner.slug, repo.name, run.ref)}
+              to={commitsUrl(repo.owner.slug, repo.name, run.ref, "", run.sourceId ?? undefined)}
               className="inline-flex items-center gap-1 text-ink-muted no-underline hover:text-ink"
               title={`Commits on ${run.ref}`}
             >
               <GitBranchIcon weight="bold" aria-hidden />
               {run.ref}
             </Link>
-            <CommitLink
-              owner={repo.owner.slug}
-              name={repo.name}
-              sha={run.commit}
-              className="mk-chip mk-chip--tag mk-mono h-6 no-underline"
-              title={`Open commit ${shortOid(run.commit)}`}
-            >
-              {shortOid(run.commit)}
-            </CommitLink>
+            {/* The commit panel reads canonical history; a work source's commit opens in its own source. */}
+            {run.sourceId && run.sourceId !== "canonical" ? (
+              <PrefetchLink
+                to={treeUrl(repo.owner.slug, repo.name, run.commit, "", run.sourceId)}
+                className="mk-chip mk-chip--tag mk-mono h-6 no-underline"
+                title="Browse files at this commit"
+              >
+                {shortOid(run.commit)}
+              </PrefetchLink>
+            ) : (
+              <CommitLink
+                owner={repo.owner.slug}
+                name={repo.name}
+                sha={run.commit}
+                className="mk-chip mk-chip--tag mk-mono h-6 no-underline"
+                title={`Open commit ${shortOid(run.commit)}`}
+              >
+                {shortOid(run.commit)}
+              </CommitLink>
+            )}
           </div>
         </div>
         {canRun && (active || !run.queueId) && (

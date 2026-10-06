@@ -14,6 +14,7 @@ import {
   writeAtlasFixtureOverlay,
 } from "../atlas/fixture.ts";
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
+import { timelineKnowledgeSource } from "../knowledge/sources.ts";
 import { findAccountBySlug } from "../db.ts";
 import { accessFor } from "../tracker/access.ts";
 import { trackerObject } from "../tracker/stub.ts";
@@ -32,6 +33,11 @@ import type { DurableClass } from "../durable/classes.ts";
 import { batch, db } from "../schema.ts";
 import { fail, readJson } from "./http.ts";
 import { issueToken } from "./tokens.ts";
+import { sourceFixtures } from "./dev-source-fixtures.ts";
+import { sourceRetentionFixture } from "./dev-source-retention.ts";
+import { sourceAuthFixture } from "./dev-source-auth.ts";
+import { landingFixtures } from "./dev-landing-fixtures.ts";
+import { knowledgeFixtures } from "./dev-knowledge-fixtures.ts";
 
 // DEVELOPMENT ONLY: empty, named repositories exercising the persona permissions.
 // The harness populates their bounded, pinned contents through the real CLI.
@@ -100,6 +106,11 @@ dev.use("*", async (c, next) => {
       "/repo-orphans",
       "/auth-expired",
       "/assistant-chat",
+      "/source-fixtures",
+      "/source-retention",
+      "/source-auth",
+      "/landing-fixtures",
+      "/knowledge-fixtures",
       "/chronicle",
     ].some((path) => c.req.path.endsWith(path))
   ) {
@@ -113,6 +124,12 @@ dev.use("*", async (c, next) => {
   }
   await next();
 });
+
+dev.post("/source-fixtures", sourceFixtures);
+dev.post("/source-retention", sourceRetentionFixture);
+dev.post("/source-auth", sourceAuthFixture);
+dev.post("/landing-fixtures", landingFixtures);
+dev.post("/knowledge-fixtures", knowledgeFixtures);
 
 // The Durable Object purge contract in the real runtime (CORE-197): every
 // class, a fresh instance each, registered, given storage, purged.
@@ -292,6 +309,7 @@ dev.post("/repo-purge", async (c) => {
   }
   if (body.action === "resume") {
     const started = await resumeDeletions(c.env, {
+      repoId: id,
       staleMs: 0,
       waitUntil: (work) => c.executionCtx.waitUntil(work),
     });
@@ -710,8 +728,18 @@ dev.post("/atlas", async (c) => {
       !oid.test(body.base ?? "")
     )
       return fail(c, 400, "Send {repo, action: overlay, ref: timeline/<slug>, commit, base}.");
+    const source = await timelineKnowledgeSource(c.env, repo.id, `refs/heads/${body.ref}`);
+    if (!source || source.state !== "ready")
+      return fail(c, 409, "The fixture requires a ready owned timeline source.");
     return c.json(
-      await writeAtlasFixtureOverlay(c.env.DB, repo.id, body.ref, body.commit!, body.base!),
+      await writeAtlasFixtureOverlay(
+        c.env.DB,
+        repo.id,
+        body.ref,
+        body.commit!,
+        body.base!,
+        source.source_id,
+      ),
       201,
     );
   }

@@ -271,6 +271,13 @@ export async function stepsFor(
 
 /** Whether a push has shown this commit as this change (worker/ref-log). */
 async function seen(d1: D1Database, repoId: string, changeId: string, oid: string) {
+  const member = await db(d1)
+    .selectFrom("source_progress_members")
+    .select("commit_oid")
+    .where("repo_id", "=", repoId)
+    .where("commit_oid", "=", oid)
+    .executeTakeFirst();
+  if (member) return true;
   const row = await db(d1)
     .selectFrom("change_refs")
     .select("ref")
@@ -337,16 +344,32 @@ steps.post("/", async (c) => {
     .insertInto("step_contexts")
     .values({ ...values, verified_at: verified ? sqlNow : null })
     .onConflict((oc) =>
-      oc.columns(["repo_id", "change_id", "commit_oid"]).doUpdateSet({
-        timeline: values.timeline,
-        issue_key: values.issue_key,
-        summary: values.summary,
-        context: values.context,
-        committed_at: values.committed_at,
-        ...(verified ? { verified_at: sqlNow } : {}),
-      }),
+      oc
+        .columns(["repo_id", "change_id", "commit_oid"])
+        .doUpdateSet({
+          timeline: values.timeline,
+          issue_key: values.issue_key,
+          summary: values.summary,
+          context: values.context,
+          committed_at: values.committed_at,
+          ...(verified ? { verified_at: sqlNow } : {}),
+        })
+        .where("step_contexts.author_id", "=", authorId)
+        .where("step_contexts.deleted_at", "is", null),
     )
     .execute();
+  // Close the upload/push race: a membership inserted after the first check
+  // may have tried to verify this row before the insert above existed.
+  if (!verified && (await seen(c.env.DB, repoId, changeId, commitOid))) {
+    await db(c.env.DB)
+      .updateTable("step_contexts")
+      .set({ verified_at: sqlNow })
+      .where("repo_id", "=", repoId)
+      .where("change_id", "=", changeId)
+      .where("commit_oid", "=", commitOid)
+      .where("verified_at", "is", null)
+      .execute();
+  }
   const row = await db(c.env.DB)
     .selectFrom("step_contexts")
     .selectAll()
@@ -354,6 +377,9 @@ steps.post("/", async (c) => {
     .where("change_id", "=", changeId)
     .where("commit_oid", "=", commitOid)
     .executeTakeFirstOrThrow();
+  if (row.author_id !== authorId)
+    return fail(c, 409, "This step's context belongs to whoever made the commit.");
+  if (row.deleted_at) return fail(c, 410, "This step's context was deleted.");
   const [step] = await present(c, [row]);
   // A new step in a timeline goes out on its live feed (CORE-239), after the answer.
   if (!existing && step!.timeline && Reflect.has(c.env, "STEP_FEED")) {

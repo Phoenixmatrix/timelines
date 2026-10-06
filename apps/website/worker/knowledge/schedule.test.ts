@@ -65,7 +65,12 @@ function setup(options: { indexed?: boolean; settings?: [number, number] } = {})
     sqlite.exec(`INSERT INTO account_settings (account_id, knowledge_quiet_minutes, knowledge_max_wait_minutes)
       VALUES ('ann', ${options.settings[0]}, ${options.settings[1]})`);
   const git = fakeRemotes();
-  const remote = git.add("https://app", { "refs/heads/main": oid(1) });
+  const remote = git.add(
+    "https://app",
+    { "refs/heads/main": oid(1) },
+    "refs/heads/main",
+    artifacts,
+  );
   vi.stubGlobal("fetch", git.fetch);
   const builds: { id: string; params: Record<string, unknown> }[] = [];
   const running = new Set<string>();

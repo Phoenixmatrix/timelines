@@ -14,8 +14,21 @@ import { landedTimelines, ownerTimelines } from "./timelines.ts";
 import { releaseIndex, releaseNotesFor, viewerTrackers } from "./read.ts";
 import { issuesFrom } from "./trackers.ts";
 import { ensureReleaseNotes } from "./queue.ts";
+import { compactReleaseInputs } from "./compact.ts";
 
 export const releaseNotes = new Hono<AppEnv>();
+
+releaseNotes.use("*", async (c, next) => {
+  if (c.req.query("source") && c.req.query("source") !== "canonical")
+    return c.json(
+      {
+        error:
+          "Release notes describe canonical history; work progress is available through its source.",
+      },
+      400,
+    );
+  await next();
+});
 
 function summary(commit: ArtifactsCommitMetadata): CommitSummary {
   return {
@@ -92,11 +105,30 @@ releaseNotes.get("/range", async (c) => {
       fromOid ? (oid) => oid === fromOid : (oid) => tagged.has(oid),
       { includeStart: Boolean(toParam) },
     );
-    const commits: RangeCommit[] = walk.commits.map((commit) => ({
-      ...summary(commit),
-      issueKeys: issueKeys(commit.message),
-      landing: walk.landings.get(commit.hash) ?? null,
-    }));
+    const compact = await compactReleaseInputs(
+      c.env.DB,
+      row.id,
+      walk.commits.map((commit) => commit.hash),
+    );
+    const commits: RangeCommit[] = walk.commits.flatMap((commit) => {
+      const input = compact.get(commit.hash);
+      const canonical: RangeCommit = {
+        ...summary(commit),
+        issueKeys: issueKeys(commit.message),
+        landing: walk.landings.get(commit.hash) ?? null,
+      };
+      return input
+        ? [
+            canonical,
+            ...input.commits.map((metadata) => ({
+              ...summary(metadata),
+              source: input.source,
+              issueKeys: issueKeys(metadata.message),
+              landing: commit.hash,
+            })),
+          ]
+        : [canonical];
+    });
     const merges = walk.commits.filter(
       (commit) => commit.parents.length > 1 && !walk.landings.has(commit.hash),
     );
@@ -107,19 +139,18 @@ releaseNotes.get("/range", async (c) => {
         ? { tag: fromParam || tagged.get(walk.base) || walk.base, oid: walk.base }
         : null,
       commits,
-      timelines: merges.length
-        ? [
-            ...(
-              await landedTimelines(
-                c.env.DB,
-                row.id,
-                refs.headBranch,
-                merges,
-                ownerTimelines(c.env, row.owner_id),
-              )
-            ).values(),
-          ]
-        : [],
+      timelines: [
+        ...(
+          await landedTimelines(
+            c.env.DB,
+            row.id,
+            refs.headBranch,
+            merges,
+            ownerTimelines(c.env, row.owner_id),
+          )
+        ).values(),
+        ...[...compact.values()].map((input) => input.timeline),
+      ],
       truncated: walk.truncated,
       issues: await linkedIssues(c.env, c.get("actor"), row, keys),
     };

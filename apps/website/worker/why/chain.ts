@@ -7,6 +7,7 @@
 // update joins the authoritative landing and its pinned checkpoint.
 
 import type { ChangeRef } from "../../shared/api.ts";
+import type { CodeSource } from "../../shared/code-source.ts";
 import type {
   CheckpointState,
   Landing,
@@ -38,6 +39,7 @@ const MESSAGE_COMMITS = 8;
 export interface WhySources {
   repoId: string;
   defaultBranch: string;
+  source?: CodeSource;
   /** A commit the repository has, or null. */
   commit(oid: string): Promise<WhyCommit | null>;
   /** The change the push log saw this commit as (first or latest commit on a ref). */
@@ -147,13 +149,20 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
   const bySlug = new Map(records.map((t) => [t.slug, t]));
   const byId = new Map(records.map((t) => [t.id, t]));
 
-  const landed = changeRefs.find((row) => row.ref === mainRef);
+  const landed =
+    sources.source?.kind === "timeline-work"
+      ? undefined
+      : changeRefs.find((row) => row.ref === mainRef);
   const refs: WhyRef[] = changeRefs.map((row) => {
     const slug = timelineSlugOf(row.ref);
-    const timeline = slug ? bySlug.get(slug) : undefined;
+    const timeline = sources.source?.timelineId
+      ? byId.get(sources.source.timelineId)
+      : slug
+        ? bySlug.get(slug)
+        : undefined;
     return {
       ref: row.ref,
-      kind: lineKind(row.ref, mainRef),
+      kind: sources.source?.kind === "timeline-work" ? "timeline" : lineKind(row.ref, mainRef),
       timeline: timeline ? whyTimeline(timeline) : null,
       firstCommit: row.firstCommit,
       firstSeenAt: row.firstSeenAt,
@@ -168,6 +177,11 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
   for (const ref of refs)
     if (ref.timeline && !ref.afterLanding && !timelines.some((t) => t.id === ref.timeline!.id))
       timelines.push(ref.timeline);
+  const sourceTimeline = sources.source?.timelineId
+    ? byId.get(sources.source.timelineId)
+    : undefined;
+  if (sourceTimeline && !timelines.some((timeline) => timeline.id === sourceTimeline.id))
+    timelines.push(whyTimeline(sourceTimeline));
 
   // Main's first update identifies the operation that introduced this change,
   // not a later rewrite or a nearby timeline push. Match that exact advance
@@ -202,7 +216,7 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
   const merges: WhyMerge[] = [];
   const checkpoints: WhyCheckpoint[] = [];
   const issues: WhyIssue[] = [];
-  if (tracker && changeId) {
+  if (tracker && (changeId || sources.source?.kind === "timeline-work")) {
     const seen = new Set<string>();
     for (const timeline of timelines) {
       const detail = await tracker.timeline(timeline.slug);
@@ -234,13 +248,22 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
           });
       for (const state of await tracker.checkpoints(timeline.slug)) {
         const repo = state.checkpoint.repos.find((r) => r.id === sources.repoId);
-        const pinned = repo?.changes.find((c) => c.changeId === changeId);
-        if (!pinned) continue;
+        const sameSource =
+          !sources.source || (repo?.source?.sourceId ?? "canonical") === sources.source.sourceId;
+        const pinned =
+          sameSource &&
+          repo?.changes.find((c) =>
+            sources.source?.kind === "timeline-work"
+              ? c.commit === request.oid
+              : c.changeId === changeId,
+          );
+        const exactHead = sameSource && repo?.commit === request.oid;
+        if (!pinned && !exactHead) continue;
         checkpoints.push({
           id: state.checkpoint.id,
           timeline: timeline.slug,
           number: state.checkpoint.number,
-          commit: pinned.commit,
+          commit: pinned ? pinned.commit : request.oid,
           summary: state.checkpoint.summary,
           createdAt: state.checkpoint.createdAt,
           actorId: state.checkpoint.actorId,
@@ -270,7 +293,8 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
 
   // Landing: when the change reached the default branch, and how.
   let landing: WhyLanding | null = null;
-  const main = refs.find((ref) => ref.ref === mainRef);
+  const main =
+    sources.source?.kind === "timeline-work" ? undefined : refs.find((ref) => ref.ref === mainRef);
   if (main) {
     const queue = authoritative?.landing;
     landing = {
@@ -316,6 +340,7 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
   }));
 
   return {
+    ...(sources.source ? { source: sources.source } : {}),
     commit,
     oid: request.oid,
     lines: request.lines,

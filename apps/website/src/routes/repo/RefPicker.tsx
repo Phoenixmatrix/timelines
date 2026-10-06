@@ -2,7 +2,7 @@ import { GitBranchIcon, TagIcon } from "@phosphor-icons/react";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import type { RepoDetail } from "../../../shared/api.ts";
 import { SelectField } from "../../components/ui.tsx";
-import { encodePath, repoPath } from "../../lib/refs.ts";
+import { encodePath, repoPath, sourceUrl } from "../../lib/refs.ts";
 import { CommitCi, refCommit } from "./CommitCi.tsx";
 
 /** Branch or tag switcher plus a breadcrumb for the current path. */
@@ -51,7 +51,10 @@ export function RefBar({
       {view !== "commits" && (
         <nav aria-label="Path" className="flex min-w-0 flex-wrap items-center gap-1 text-body">
           <PrefetchLink
-            to={repoPath(repo.owner.slug, repo.name, "tree", encodePath(refName))}
+            to={sourceUrl(
+              repoPath(repo.owner.slug, repo.name, "tree", encodePath(refName)),
+              repo.source?.sourceId,
+            )}
             className="font-semibold text-ink-muted no-underline hover:text-ink"
           >
             {repo.name}
@@ -73,7 +76,10 @@ export function RefBar({
                     {segment}
                   </span>
                 ) : (
-                  <PrefetchLink to={to} className="text-ink-muted no-underline hover:text-ink">
+                  <PrefetchLink
+                    to={sourceUrl(to, repo.source?.sourceId)}
+                    className="text-ink-muted no-underline hover:text-ink"
+                  >
                     {segment}
                   </PrefetchLink>
                 )}

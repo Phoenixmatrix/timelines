@@ -1,6 +1,6 @@
 // The README's list of retention categories (CORE-211), generated from the
 // registry so it never drifts: every category with its scope, whether it is
-// off until enabled, its defaults and bounds, and what it never deletes.
+// enabled by default, its thresholds and bounds, and what it never deletes.
 // docs.test.ts fails when README.md differs; regenerate it with
 //   node apps/website/worker/retention/docs.ts
 
@@ -21,9 +21,8 @@ function threshold(t: RetentionThreshold): string {
 function state(c: RetentionCategory): string {
   if (c.control === "active") return "always on (it ran before retention policies existed)";
   if (c.control === "fixed") return "always on, read-only";
-  return cleanupFor(c.id)
-    ? "off until enabled"
-    : "off until enabled; no cleanup, so it never deletes anything";
+  const enabled = c.defaultEnabled ? "on by default" : "off until enabled";
+  return cleanupFor(c.id) ? enabled : `${enabled}; no cleanup, so it never deletes anything`;
 }
 
 /** One category as a Markdown list item, wrapped at 80 columns. */
@@ -31,7 +30,7 @@ function item(c: RetentionCategory): string {
   const text = [
     `**${c.label}** (\`${c.id}\`, ${c.scope === "site" ? "site" : "account"} scope; ${state(c)}).`,
     c.description,
-    `${c.control === "policy" ? "Defaults when enabled" : "Defaults"}: ${c.thresholds.map(threshold).join("; ")}.`,
+    `${c.control === "policy" && !c.defaultEnabled ? "Defaults when enabled" : "Defaults"}: ${c.thresholds.map(threshold).join("; ")}.`,
     `Never deletes: ${c.never.map((n) => n[0]!.toLowerCase() + n.slice(1)).join("; ")}.`,
     ...(c.overlaps?.length
       ? [

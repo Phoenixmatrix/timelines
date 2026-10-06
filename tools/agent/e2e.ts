@@ -22,7 +22,8 @@ import type { Deployment, DeploymentList } from "../../apps/website/shared/deplo
 import type { Published } from "../../apps/website/shared/packages.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import type { Chronicle, LinkedWork } from "../../apps/website/shared/chronicle.ts";
-import type { Landing } from "../../apps/website/shared/timelines.ts";
+import type { Checkpoint, Landing, TimelineDetail } from "../../apps/website/shared/timelines.ts";
+import type { SourceSnapshot } from "../../apps/website/shared/code-source.ts";
 import type { UsageReport } from "../../apps/website/shared/usage.ts";
 import type { WhyResponse } from "../../apps/website/shared/why.ts";
 import type { StepFeedRecord, StepPage } from "../../apps/website/shared/steps.ts";
@@ -30,6 +31,11 @@ import { atlasRevocationScenario, atlasSmokeScenario } from "./atlas-e2e.ts";
 import { chronicleScenario } from "./chronicle-e2e.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 import { runQueueE2E } from "./queue-e2e.ts";
+import { runSourceMigrationE2E } from "./source-migration-e2e.ts";
+import { runSourceRetentionE2E } from "./source-retention-e2e.ts";
+import { runSourceAuthE2E } from "./source-auth-e2e.ts";
+import { runSourceLandingE2E } from "./source-landing-e2e.ts";
+import { runSourceSyncE2E } from "./source-sync-e2e.ts";
 
 type Evidence = {
   scenario: string;
@@ -118,7 +124,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     args: string[],
     persona: Persona | "read" = "marco",
     cwd = work,
-    failure?: RegExp,
+    failure?: RegExp | true,
     extra: NodeJS.ProcessEnv = {},
   ) {
     const token = persona === "read" ? fixtures.readToken : fixtures.tokens[persona];
@@ -171,11 +177,12 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     record({ client: "gm", args, persona, code: result.code, stderr: result.stderr });
     if (failure) {
       assert.notEqual(result.code, 0, `gm ${args.join(" ")} unexpectedly succeeded`);
-      assert.match(
-        result.stderr + result.stdout,
-        failure,
-        "Failure must be the intended product rejection",
-      );
+      if (failure !== true)
+        assert.match(
+          result.stderr + result.stdout,
+          failure,
+          "Failure must be the intended product rejection",
+        );
     } else assert.equal(result.code, 0, `gm ${args.join(" ")}: ${redact(result.stderr)}`);
     return result.stdout;
   }
@@ -206,6 +213,50 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
   const checkout = join(work, "checkout");
   const packageName = `agent-e2e-${randomUUID().slice(0, 8)}`;
   const bytes = "gitmatrix live regression artifact\n";
+
+  async function timelineSource(slug: string) {
+    const detail = await json<TimelineDetail>(
+      `/api/tracker/${fixtures.tracker.owner}/timelines/${slug}`,
+      ownerToken,
+    );
+    const entry = detail.timeline.repos.find(
+      (entry) => `${entry.owner}/${entry.name}` === fullName,
+    );
+    assert(entry?.source, "An owned timeline exposes its source identity");
+    assert.match(entry.source.sourceId, /^work_[0-9a-f-]+$/);
+    assert.equal(entry.source.kind, "timeline-work");
+    assert.equal(entry.source.timelineId, detail.timeline.id);
+    assert.equal(entry.source.ref, "refs/heads/work");
+    assert.equal(entry.bookmark, "work");
+    return entry.source;
+  }
+  async function sourceTip(slug: string) {
+    const source = await timelineSource(slug);
+    return (await json<RepoDetail>(`${api}?source=${source.sourceId}`, ownerToken)).branches.find(
+      (branch) => branch.shortName === "work",
+    )?.oid;
+  }
+  async function nativeGit(args: string[], cwd = work, token = ownerToken) {
+    const env: NodeJS.ProcessEnv = { ...ctx.env };
+    for (const key of Object.keys(env))
+      if (key.startsWith("GIT_CONFIG_") || key === "SSH_AUTH_SOCK") delete env[key];
+    Object.assign(env, {
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: `http.${ctx.origin}/.extraHeader`,
+      GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+    });
+    return (
+      await promisify(execFile)("git", args, {
+        cwd,
+        env,
+        timeout: 90_000,
+        maxBuffer: 16 << 20,
+      })
+    ).stdout.trim();
+  }
 
   await scenario("authorization-and-token-revocation", async () => {
     await request(`/api/repos/${publicRepo.owner}/${publicRepo.name}`, null);
@@ -481,13 +532,10 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     record({ key, span: { endedBy: span.endedBy, renewals: span.renewals.length } });
   });
 
-  await scenario("timeline-fork-bookmark-and-abandon-permissions", async () => {
-    // A writer forks a timeline from main: the bookmark exists in Artifacts at
-    // main's tip. Only its accountable person may abandon it, which deletes the
-    // bookmark and keeps the record and its events.
+  await scenario("timeline-fork-owned-source-and-abandon-permissions", async () => {
+    // Forks allocate a separate source; abandonment archives it without changing main.
     const timelines = `/api/tracker/${fixtures.tracker.owner}/timelines`;
     const slug = `e2e-${randomUUID().slice(0, 8)}`;
-    const bookmark = `timeline/${slug}`;
     const jun = fixtures.tokens.jun;
     await request(timelines, fixtures.tokens.sam, "POST", { slug, repos: [fullName] }, [403]);
     const before = await json<RepoDetail>(api, ownerToken);
@@ -497,17 +545,26 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }>(timelines, jun, "POST", { slug, repos: [fullName] }, [201]);
     assert(
       created.bookmarks.every((b) => b.ok),
-      "Every bookmark must be created",
+      "Every work source must be ready",
     );
     const forked = Object.values(created.timeline.forkPoint.commits)[0];
     const main = before.branches.find((b) => b.shortName === before.defaultBranch)?.oid;
     assert.equal(forked, main, "A fork from main starts at the default branch's tip");
-    await poll(
-      () => json<RepoDetail>(api, ownerToken),
-      (detail) => detail.branches.some((b) => b.shortName === bookmark && b.oid === forked),
-      "the timeline bookmark",
+    const source = await timelineSource(slug);
+    assert.equal(await sourceTip(slug), forked);
+    const canonical = await json<RepoDetail>(api, ownerToken);
+    assert(!canonical.branches.some((b) => b.shortName === `timeline/${slug}`));
+    assert(!canonical.branches.some((b) => b.shortName === "work"));
+    const retried = await json<typeof created>(
+      timelines,
+      jun,
+      "POST",
+      { slug, repos: [fullName] },
+      [201],
     );
-    await request(timelines, jun, "POST", { slug, repos: [fullName] }, [409]);
+    assert.equal(retried.timeline.id, created.timeline.id, "A retry reuses the timeline");
+    assert.deepEqual(retried.timeline.forkPoint, created.timeline.forkPoint);
+    assert.deepEqual(await timelineSource(slug), source, "A retry reuses the owned source");
     await request(`${timelines}/${slug}/abandon`, ownerToken, "POST", undefined, [403]);
     const abandoned = await json<{ timeline: { status: string }; bookmarks: { ok: boolean }[] }>(
       `${timelines}/${slug}/abandon`,
@@ -515,11 +572,17 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       "POST",
     );
     assert.equal(abandoned.timeline.status, "abandoned");
-    assert(abandoned.bookmarks.length === 1 && abandoned.bookmarks[0]!.ok, "Bookmark deleted");
-    await poll(
-      () => json<RepoDetail>(api, ownerToken),
-      (detail) => !detail.branches.some((b) => b.shortName === bookmark),
-      "the bookmark's deletion",
+    assert(
+      abandoned.bookmarks.every((b) => b.ok),
+      "Every work source is archived",
+    );
+    assert.equal(await sourceTip(slug), forked, "Abandoned work remains readable");
+    assert.equal(
+      (await json<RepoDetail>(api, ownerToken)).branches.find(
+        (b) => b.shortName === before.defaultBranch,
+      )?.oid,
+      main,
+      "Abandoning does not mutate canonical main",
     );
     const detail = await json<{ events: { kind: string; lastCommits?: Record<string, string> }[] }>(
       `${timelines}/${slug}`,
@@ -530,16 +593,14 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       ["fork", "abandon"],
     );
     assert.equal(Object.values(detail.events[1]!.lastCommits ?? {})[0], forked);
-    record({ timeline: slug, forked, abandoned: true });
+    record({ timeline: slug, source, forked, abandoned: true, archiveReadable: true });
   });
 
   await scenario("gm-timeline-start-push-and-abandon", async () => {
-    // gm forks a timeline through the API and binds a fresh clone to it: a
-    // plain `gm push` lands on timeline/<slug>, main is refused, and
-    // abandoning puts the checkout back on main.
+    // A bound checkout pushes to its owned source, never a canonical timeline branch.
     const owner = fixtures.tracker.owner;
     const slug = `gm-e2e-${randomUUID().slice(0, 8)}`;
-    const bookmark = `timeline/${slug}`;
+    const bookmark = "work";
     const clone = join(work, "timeline-checkout");
     await gm(["clone", fullName, clone], "jun");
     const binding = () =>
@@ -564,15 +625,31 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     assert.equal(started.timeline.policy, "approval");
     assert.equal(started.use.timeline, slug, "Starting binds the checkout");
     assert.match(await binding(), new RegExp(`timeline: ${slug}`));
+    const source = await timelineSource(slug);
+    const beforeMigration = await json<TimelineDetail>(
+      `/api/tracker/${owner}/timelines/${slug}`,
+      ownerToken,
+    );
+    await gm(["timeline", "migrate", slug, "--owner", owner], "jun", clone);
+    await gm(["timeline", "migrate", slug, "--owner", owner], "jun", clone);
+    const afterMigration = await json<TimelineDetail>(
+      `/api/tracker/${owner}/timelines/${slug}`,
+      ownerToken,
+    );
+    assert.deepEqual(
+      afterMigration.timeline,
+      beforeMigration.timeline,
+      "Migrating an already-owned timeline is an exact no-op",
+    );
+    assert.deepEqual(afterMigration.events, beforeMigration.events);
 
     await writeFile(join(clone, "timeline-e2e.txt"), "timeline work\n");
     await gm(["commit", "-m", "Timeline work from gm"], "jun", clone);
-    const pushed = JSON.parse(await gm(["push"], "jun", clone)) as { bookmark: string };
-    assert.equal(pushed.bookmark, bookmark, "A bound checkout pushes to its timeline");
+    await gm(["push"], "jun", clone);
     const tip = await poll(
-      () => json<RepoDetail>(api, ownerToken),
+      () => json<RepoDetail>(`${api}?source=${source.sourceId}`, ownerToken),
       (detail) => detail.branches.some((b) => b.shortName === bookmark && b.oid !== main),
-      "the pushed timeline bookmark",
+      "the pushed owned work source",
     );
     await gm(["push", "-b", "main"], "jun", clone, /timeline_bound/);
     assert.equal(await mainTip(), main, "Main never moves from a bound checkout");
@@ -609,14 +686,16 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     await gm(["timeline", "abandon", "--owner", owner], "marco", clone, /"forbidden"/);
     const abandoned = JSON.parse(
       await gm(["timeline", "abandon", "--owner", owner], "jun", clone),
-    ) as { timeline: { status: string }; use: { previous: string } };
+    ) as { timeline: { status: string } };
     assert.equal(abandoned.timeline.status, "abandoned");
-    assert.equal(abandoned.use.previous, slug, "Abandoning unbinds the checkout");
+    assert.match(await binding(), new RegExp(`timeline: ${slug}`));
+    await gm(["push"], "jun", clone, /timeline_ended/);
+    await gm(["timeline", "use", "main", "--owner", owner], "jun", clone);
     assert.doesNotMatch(await binding(), /timeline:/);
-    await poll(
-      () => json<RepoDetail>(api, ownerToken),
-      (detail) => !detail.branches.some((b) => b.shortName === bookmark),
-      "the abandoned bookmark's deletion",
+    assert.equal(
+      await sourceTip(slug),
+      tip.branches.find((b) => b.shortName === bookmark)?.oid,
+      "Abandon preserves the archived source head",
     );
     record({
       timeline: slug,
@@ -1772,7 +1851,13 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         } else {
           gate.writeHead(204).end();
         }
-        const run = await poll(() => runDetail(number), terminal, `job token ${expected} run`);
+        // Cancelling the run precedes the runner's durable shutdown acknowledgement.
+        const run = await poll(
+          () => runDetail(number),
+          (run) =>
+            terminal(run) && run.jobs.every((job) => !["queued", "running"].includes(job.status)),
+          `job token ${expected} shutdown acknowledgement`,
+        );
         assert.equal(run.status, expected);
         assert(run.jobs.every((job) => job.status === expected));
         await request(
@@ -1897,12 +1982,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     }
   });
 
-  // CORE-77: a timeline lands through the queue. The merge job and the gates
-  // run on the local runner `vp dev` starts per job: the merge job fetches
-  // its landing credential with its job token, merges the checkpoint into
-  // main and pushes the merge to gitmatrix/landing/<slug>; the repository's
-  // own pipeline tests it there (trigger == "landing"); only then does main
-  // advance, with a compare-and-swap.
+  // Real runner gates evaluate a one-parent compact candidate before canonical CAS.
   const timelinesApi = `/api/tracker/${fixtures.tracker.owner}/timelines`;
   const mutateTracker = (token: string, mutations: unknown[], timeline?: string) =>
     json<{ results: { leaseToken?: string }[] }>(
@@ -1928,7 +2008,8 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
             ownerToken,
           )
         ).landing,
-      (value) => !!value && ["landed", "conflict", "failed"].includes(value.state),
+      (value) =>
+        !!value && ["landed", "conflict", "failed", "blocked_dependency"].includes(value.state),
       `timeline ${slug} to land or stop`,
       300_000,
     );
@@ -1950,15 +2031,15 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     );
     return clone;
   }
-  /** Push the clone's work to its bookmark, then checkpoint it: an auto timeline queues itself. */
+  /** Push owned work, then checkpoint it: an auto timeline queues itself. */
   async function pushAndCheckpoint(clone: string, slug: string, message: string) {
-    const before = await branchTip(`timeline/${slug}`);
+    const before = await sourceTip(slug);
     await gm(["commit", "-m", message], "jun", clone);
     await gm(["push"], "jun", clone);
     await poll(
-      () => branchTip(`timeline/${slug}`),
+      () => sourceTip(slug),
       (tip) => !!tip && tip !== before,
-      "the pushed timeline bookmark",
+      "the pushed owned work source",
     );
     const checkpoint = JSON.parse(
       await gm(
@@ -1966,11 +2047,11 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         "jun",
         clone,
       ),
-    ) as { checkpoint: { id: string; number: number; repos: { commit: string; base: string }[] } };
+    ) as { checkpoint: Checkpoint };
     return checkpoint.checkpoint;
   }
 
-  await scenario("timeline-lands-merge-gates-and-advance-main", async () => {
+  await scenario("timeline-compact-landing-gates-receipt-and-native-source", async () => {
     const slug = `land-e2e-${randomUUID().slice(0, 8)}`;
     const marker = `landing-e2e/${slug}.txt`;
     const clone = await landingTimeline(slug);
@@ -2003,20 +2084,33 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     assert.equal(doneInTimeline?.status, "done_in_timeline");
     assert.equal(doneInTimeline?.claim?.retainedIn?.slug, slug, "Finishing retains the lease");
 
-    // The work, and gates that only a landing runs: they check the merge itself.
+    // The gates check the compact candidate, not a merge with the WIP graph.
     await mkdir(join(clone, "landing-e2e"), { recursive: true });
+    await writeFile(join(clone, marker), `${slug} in progress\n`);
+    await gm(["commit", "-m", `Uncheckpointed progress ${slug}`], "jun", clone);
+    await gm(["push"], "jun", clone);
+    const progressCommit = await sourceTip(slug);
+    assert(progressCommit && progressCommit !== mainBefore);
     await writeFile(join(clone, marker), `${slug}\n`);
     await mkdir(join(clone, ".gitmatrix"), { recursive: true });
     await writeFile(
       join(clone, ".gitmatrix", "ci.yml"),
       JSON.stringify({
-        on: { push: { branches: ["never-agent-auto"] } },
+        on: { push: { branches: ["never-agent-auto"] }, preview: {} },
         jobs: {
           gate: {
             if: 'trigger == "landing"',
             steps: [
               {
-                run: `test -f ${marker} && test "$(git log -1 --format=%P | wc -w)" = 2 && echo LANDING_GATE_OK`,
+                run: `test -f ${marker} && test "$(git log -1 --format=%P | wc -w)" = 1 && echo LANDING_GATE_OK`,
+              },
+            ],
+          },
+          preview: {
+            if: 'trigger == "preview" && action == "create"',
+            steps: [
+              {
+                run: `test -f ${marker} && test "$(git rev-parse HEAD)" = "$GITMATRIX_COMMIT" && case "$GITMATRIX_SOURCE_ID" in work_*) echo SOURCE_PREVIEW_OK;; *) exit 1;; esac`,
               },
             ],
           },
@@ -2025,21 +2119,18 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     );
     const checkpoint = await pushAndCheckpoint(clone, slug, `Landing E2E ${slug}`);
     const checkpointCommit = checkpoint.repos[0]!.commit;
-    // Asking by hand finds it queued already, or queues it: never two landings.
-    const asked = JSON.parse(
-      await gm(["timeline", "land", slug, "--owner", fixtures.tracker.owner], "jun", clone),
-    ) as { landing: { id: string } };
+    // Auto landing waits for this checkpoint's preview CI to become green.
     const landing = await settledLanding(slug);
-    assert.equal(landing.id, asked.landing.id);
+    assert.equal(landing.checkpointId, checkpoint.id);
     assert.equal(landing.state, "landed", `Landing stopped: ${landing.reason}`);
     const [landed] = landing.repos;
-    assert(landed?.gateRun?.number, "The gates ran on the merge");
+    assert(landed?.gateRun?.number, "The gates ran on the compact candidate");
     const gates = await runDetail(landed.gateRun.number);
     assert.equal(gates.status, "succeeded");
     assert.equal(gates.ref, `gitmatrix/landing/${slug}`);
     assert.equal(gates.trigger, "landing", "Landing runs report their trigger");
 
-    // Main advanced to a merge of [old main, checkpoint].
+    // Main advances by one single-parent commit; source progress stays outside canonical.
     const mainAfter = await branchTip("main");
     assert.equal(mainAfter, landed.merge);
     const [merge] = (
@@ -2051,9 +2142,69 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     assert.equal(merge?.oid, mainAfter);
     assert.deepEqual(
       merge?.parents,
-      [mainBefore, checkpointCommit],
-      "main is a merge of old main and the checkpoint",
+      [mainBefore],
+      "Compact landing has only the previous canonical main as parent",
     );
+    const source = await timelineSource(slug);
+    assert.equal(checkpoint.repos[0]?.source?.sourceId, source.sourceId);
+    const lineage = await json<{
+      status: string;
+      integration: {
+        source: SourceSnapshot;
+        canonical: SourceSnapshot;
+        logicalBase: SourceSnapshot;
+      } | null;
+      members: string[];
+    }>(`${api}/sources/${source.sourceId}/lineage?commit=${checkpointCommit}`, ownerToken);
+    assert.equal(lineage.status, "integrated");
+    assert.equal(lineage.integration?.source.commit, checkpointCommit);
+    assert.equal(lineage.integration?.canonical.commit, mainAfter);
+    assert.equal(lineage.integration?.logicalBase.commit, mainBefore);
+    assert.deepEqual(lineage.members, [checkpointCommit]);
+    const sourceRemote = `${ctx.origin}/${fullName}@${slug}.git`;
+    const sourceMirror = join(work, `${slug}-source.git`);
+    const canonicalMirror = join(work, `${slug}-canonical.git`);
+    await nativeGit(["clone", "--mirror", sourceRemote, sourceMirror]);
+    await nativeGit(["clone", "--mirror", `${ctx.origin}/${fullName}.git`, canonicalMirror]);
+    assert.equal(await nativeGit(["rev-parse", "refs/heads/work"], sourceMirror), checkpointCommit);
+    assert.equal(await nativeGit(["show", `${checkpointCommit}:${marker}`], sourceMirror), slug);
+    assert.equal(await nativeGit(["show", `${mainAfter}:${marker}`], canonicalMirror), slug);
+    const canonicalObjects = (
+      await nativeGit(
+        ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+        canonicalMirror,
+      )
+    ).split("\n");
+    assert(
+      !canonicalObjects.includes(checkpointCommit),
+      "Canonical Git contains no source WIP commit object",
+    );
+    const sourceProgress = (
+      await nativeGit(["rev-list", checkpointCommit, `^${mainBefore}`], sourceMirror)
+    ).split("\n");
+    assert(sourceProgress.includes(progressCommit), "The work repository retains earlier progress");
+    for (const oid of sourceProgress) {
+      assert(!canonicalObjects.includes(oid), `Canonical Git excludes progress commit ${oid}`);
+      await request(`${api}/commits?ref=${oid}`, ownerToken, "GET", undefined, [404]);
+      const readable = await json<{ commits: { oid: string }[] }>(
+        `${api}/commits?ref=${oid}&source=${source.sourceId}`,
+        ownerToken,
+      );
+      assert.equal(
+        readable.commits[0]?.oid,
+        oid,
+        "Source-qualified history retains exact progress",
+      );
+    }
+    await assert.rejects(
+      nativeGit(
+        ["push", sourceRemote, "refs/heads/work:refs/heads/archive-write-probe"],
+        sourceMirror,
+      ),
+      /read.only|archiv|ended|denied|403/i,
+      "Archived source rejects native Git writes",
+    );
+    record({ source, lineage, canonicalSourceObjectAbsent: true, nativeArchiveReadable: true });
 
     const timeline = await json<{ timeline: { status: string; endedAt?: string } }>(
       `${timelinesApi}/${slug}`,
@@ -2064,32 +2215,79 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     const doneOnMain = await trackerIssue(issueId);
     assert.equal(doneOnMain?.status, "done", "The issue done in the timeline is done on main");
     assert.equal(doneOnMain?.claim, null, "Landing releases the retained lease");
-    await poll(
-      async () => [
-        await branchTip(`timeline/${slug}`),
-        await branchTip(`gitmatrix/landing/${slug}`),
-      ],
-      (tips) => tips.every((tip) => tip === undefined),
-      "the landed timeline's bookmark and landing branch to go",
+    assert.equal(
+      await sourceTip(slug),
+      checkpointCommit,
+      "The landed source is archived read-only",
     );
+    assert.equal(await branchTip(`timeline/${slug}`), undefined);
+    await poll(
+      () => branchTip(`gitmatrix/landing/${slug}`),
+      (tip) => tip === undefined,
+      "the compact landing staging branch to go",
+    );
+    const revived = await json<{ runs: { number?: number; skipped?: string }[] }>(
+      `${timelinesApi}/${slug}/checkpoints/${checkpoint.number}/revive`,
+      fixtures.tokens.jun,
+      "POST",
+      {},
+      [201],
+    );
+    assert.equal(revived.runs.length, 1);
+    const revivedNumber = revived.runs[0]?.number;
+    assert(revivedNumber, `Archived preview revival must start: ${JSON.stringify(revived.runs)}`);
+    const revivedRun = await poll(
+      () => runDetail(revivedNumber),
+      terminal,
+      "archived work preview revival",
+    );
+    assert.equal(revivedRun.status, "succeeded");
+    assert.equal(revivedRun.commit, checkpointCommit);
+    assert.equal(revivedRun.trigger, "preview");
+    assert.equal(revivedRun.sourceId, source.sourceId);
+    assert.equal(await sourceTip(slug), checkpointCommit, "Revival cannot mutate the archive");
+    record({ archivedPreviewRevival: revivedNumber, sourceId: source.sourceId });
+    const retention = await json<{
+      run: { status: string; categories: { error: string | null }[] };
+    }>("/api/dev/retention", ctx.env.GITMATRIX_AGENT_SECRET ?? "", "POST", {
+      account: fixtures.tracker.owner,
+      categories: { "tracker-activity": { eventDays: 365, endedTimelineDays: 180 } },
+      daysAhead: 179,
+      dryRun: false,
+    });
+    assert.equal(retention.run.status, "succeeded");
+    assert(retention.run.categories.every((category) => category.error === null));
+    assert.equal(
+      await sourceTip(slug),
+      checkpointCommit,
+      "Archive survives before endedTimelineDays",
+    );
+    assert.equal(
+      await nativeGit(["ls-remote", sourceRemote, "refs/heads/work"]),
+      `${checkpointCommit}\trefs/heads/work`,
+    );
+    record({ archiveRetentionBeforeDeadline: retention.run });
     await gm(["timeline", "land", slug, "--owner", fixtures.tracker.owner], "jun", clone, /landed/);
-    // Landing completion precedes the asynchronous push log's change index.
-    // Wait for that input, then assert the authoritative queue provenance below.
+    // The work commit never reaches canonical refs: its main provenance is the
+    // source's integration receipt. Wait for that, then assert it exactly below.
     const why = await poll(
       async () => JSON.parse(await gm(["why", `${marker}:1`], "jun", clone)) as WhyResponse,
       (result) =>
         result.chains.some(
-          (chain) =>
-            chain.oid === checkpointCommit && chain.refs.some((ref) => ref.kind === "main"),
+          (chain) => chain.oid === checkpointCommit && chain.landing?.via === "compact",
         ),
-      "the landed change's main ref to be indexed",
+      "the landed work commit's compact integration provenance",
     );
     record({ why, checkpoint });
     const provenance = why.chains.find((chain) => chain.oid === checkpointCommit)?.landing;
-    assert.equal(provenance?.via, "queue", "gm why reads authoritative queue provenance");
+    assert.equal(provenance?.via, "compact", "gm why reads exact compact integration provenance");
     assert.equal(provenance.timeline, slug);
-    assert.equal(provenance.commit, checkpointCommit);
-    assert.equal(provenance.update.new, mainAfter);
+    assert.equal(provenance.commit, mainAfter);
+    assert.equal(
+      provenance.update,
+      null,
+      "Compact provenance comes from the integration receipt, not a work push",
+    );
     assert.equal(provenance.queue?.id, landing.id);
     assert.equal(provenance.queue.checkpointId, checkpoint.id);
     assert.equal(provenance.queue.checkpointNumber, checkpoint.number);
@@ -2101,13 +2299,26 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     assert.equal(provenance.queue.mergeRun?.number, landed.mergeRun?.number);
     assert.equal(provenance.queue.gateRun?.number, gates.number);
     const readerWhy = await json<WhyResponse>(
-      `${api}/why?commit=${checkpointCommit}`,
+      `${api}/why?commit=${checkpointCommit}&source=${source.sourceId}`,
       fixtures.tokens.sam,
     );
     assert.equal(readerWhy.tracker.readable, false);
-    assert.equal(readerWhy.chains[0]?.landing?.via, "unknown");
-    assert.equal(readerWhy.chains[0]?.landing?.queue, null);
+    const restricted = readerWhy.chains.find((chain) => chain.oid === checkpointCommit);
+    assert(restricted);
+    assert.equal(restricted.landing, null, "A work commit cannot imply a canonical push");
+    assert.deepEqual(restricted.checkpoints, [], "Tracker-private checkpoint context is omitted");
+    assert.equal(restricted.approval, null);
     record({ whyLanding: provenance, trackerRestricted: true });
+    await writeFile(join(clone, "late-local.txt"), "Preserve unpushed local work after landing.\n");
+    await gm(["commit", "-m", "Late local suffix"], "jun", clone);
+    await gm(["push"], "jun", clone, /timeline_ended/);
+    await gm(["sync"], "jun", clone);
+    assert.equal(
+      await readFile(join(clone, "late-local.txt"), "utf8"),
+      "Preserve unpushed local work after landing.\n",
+    );
+    await gm(["push"], "jun", clone, /timeline_ended/);
+    await gm(["timeline", "use", "main", "--owner", fixtures.tracker.owner], "jun", clone);
     record({
       timeline: slug,
       mainBefore,
@@ -2287,6 +2498,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     const slug = `clash-e2e-${randomUUID().slice(0, 8)}`;
     const file = `landing-e2e/${slug}.txt`;
     const clone = await landingTimeline(slug);
+    const mainBefore = await branchTip("main");
     // Main changes the same file after the fork.
     const mainClone = join(work, `main-${slug}`);
     await gm(["clone", fullName, mainClone], "marco");
@@ -2296,7 +2508,7 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     await gm(["push", "-b", "main"], "marco", mainClone);
     const mainTip = await poll(
       () => branchTip("main"),
-      (tip) => !!tip,
+      (tip) => !!tip && tip !== mainBefore,
       "main after the clashing push",
     );
     await mkdir(join(clone, "landing-e2e"), { recursive: true });
@@ -2305,7 +2517,6 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await pushAndCheckpoint(clone, slug, `Clashing E2E ${slug}`);
       const landing = await settledLanding(slug);
       assert.equal(landing.state, "conflict", `Expected a conflict, got: ${landing.reason}`);
-      assert.match(landing.reason ?? "", /needs a sync/);
       assert.equal(landing.repos[0]?.gateRun, null, "A conflicting merge is never tested");
       assert.equal(await branchTip("main"), mainTip, "Main never moves on a conflict");
       const timeline = await json<{
@@ -2322,6 +2533,141 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
     } finally {
       await request(`${timelinesApi}/${slug}/abandon`, fixtures.tokens.jun, "POST").catch(() => {});
     }
+  });
+
+  await scenario("timeline-nested-admission-and-canonical-revert", async () => {
+    const parent = `parent-${randomUUID().slice(0, 8)}`;
+    const child = `child-${randomUUID().slice(0, 8)}`;
+    const parentClone = await landingTimeline(parent);
+    const parentFile = `${parent}.txt`;
+    const laterFile = `${parent}-later.txt`;
+    const childFile = `${child}.txt`;
+    await writeFile(join(parentClone, parentFile), "Parent P0\n");
+    await gm(["commit", "-m", "Parent P0"], "jun", parentClone);
+    await gm(["push"], "jun", parentClone);
+    const p0 = await sourceTip(parent);
+    assert(p0);
+    await json(
+      timelinesApi,
+      fixtures.tokens.jun,
+      "POST",
+      { slug: child, parent, policy: "auto", repos: [fullName] },
+      [201],
+    );
+    const parentSource = await timelineSource(parent);
+    const childSource = await timelineSource(child);
+    assert.notEqual(childSource.sourceId, parentSource.sourceId);
+    assert.equal(await sourceTip(child), p0);
+    const childClone = join(work, child);
+    await gm(["clone", fullName, childClone], "jun");
+    await gm(["timeline", "use", child, "--owner", fixtures.tracker.owner], "jun", childClone);
+    await writeFile(join(childClone, childFile), "Child delta\n");
+    const checkpoint = await pushAndCheckpoint(childClone, child, "Child before parent lands");
+    assert.equal(checkpoint.repos[0]?.logicalBase?.commit, p0);
+    const blocked = await settledLanding(child);
+    assert.equal(blocked.state, "blocked_dependency");
+    // A separate child imports the parent's later P1; its fresh checkpoint must
+    // review P1 as B rather than permanently inheriting its original P0.
+    const importedChild = `${child}-imported`;
+    await json(
+      timelinesApi,
+      fixtures.tokens.jun,
+      "POST",
+      { slug: importedChild, parent, policy: "auto", repos: [fullName] },
+      [201],
+    );
+    const importedClone = join(work, importedChild);
+    const importedFile = `${importedChild}.txt`;
+    await gm(["clone", fullName, importedClone], "jun");
+    await gm(
+      ["timeline", "use", importedChild, "--owner", fixtures.tracker.owner],
+      "jun",
+      importedClone,
+    );
+    await writeFile(join(importedClone, importedFile), "Imported child's own delta\n");
+    await gm(["commit", "-m", "Child delta before importing P1"], "jun", importedClone);
+    await writeFile(join(parentClone, laterFile), "Parent P1\n");
+    const parentCheckpoint = await pushAndCheckpoint(parentClone, parent, "Parent P1 includes P0");
+    const parentLanding = await settledLanding(parent);
+    assert.equal(parentLanding.state, "landed", parentLanding.reason ?? "");
+    const integrated = await json<{
+      status: string;
+      integration: { source: SourceSnapshot } | null;
+      members: string[];
+    }>(`${api}/sources/${parentSource.sourceId}/lineage?commit=${p0}`, ownerToken);
+    assert.equal(integrated.status, "integrated");
+    assert.equal(integrated.integration?.source.commit, parentCheckpoint.repos[0]?.commit);
+    assert.deepEqual(integrated.members, [p0]);
+    await gm(["timeline", "merge", parent], "jun", importedClone);
+    const importedCheckpoint = await pushAndCheckpoint(
+      importedClone,
+      importedChild,
+      "Review imported P1 baseline",
+    );
+    assert.equal(importedCheckpoint.repos[0]?.logicalBase?.sourceId, parentSource.sourceId);
+    assert.equal(
+      importedCheckpoint.repos[0]?.logicalBase?.commit,
+      parentCheckpoint.repos[0]?.commit,
+    );
+    const importedLanding = await settledLanding(importedChild);
+    assert.equal(importedLanding.state, "landed", importedLanding.reason ?? "");
+    const importedCompact = importedLanding.repos[0]?.merge;
+    assert(importedCompact);
+    await nativeGit(["fetch", "origin", "main"], importedClone);
+    assert.equal(
+      await nativeGit(["show", "-s", "--format=%P", importedCompact], importedClone),
+      parentLanding.repos[0]?.merge,
+    );
+    assert.equal(
+      await nativeGit(["show", `${importedCompact}:${importedFile}`], importedClone),
+      "Imported child's own delta",
+    );
+    assert.equal(
+      await nativeGit(["show", `${importedCompact}:${laterFile}`], importedClone),
+      "Parent P1",
+    );
+    record({
+      importedChild,
+      importedCompact,
+      reviewedBase: importedCheckpoint.repos[0]?.logicalBase,
+    });
+
+    // Reverting the compact parent must not cause the child to replay parent content.
+    const reverted = join(work, `${parent}-revert`);
+    await nativeGit(["clone", `${ctx.origin}/${fullName}.git`, reverted]);
+    const parentCompact = parentLanding.repos[0]?.merge;
+    assert(parentCompact);
+    await nativeGit(
+      [
+        "-c",
+        "user.name=Agent Fixture",
+        "-c",
+        "user.email=agent@gitmatrix.invalid",
+        "revert",
+        "--no-edit",
+        parentCompact,
+      ],
+      reverted,
+    );
+    await nativeGit(["push", "origin", "HEAD:main"], reverted);
+    const revertTip = await nativeGit(["rev-parse", "HEAD"], reverted);
+    await gm(["timeline", "land", child, "--owner", fixtures.tracker.owner], "jun", childClone);
+    const childLanding = await settledLanding(child);
+    assert.equal(childLanding.state, "landed", childLanding.reason ?? "");
+    const childCompact = childLanding.repos[0]?.merge;
+    assert(childCompact);
+    await nativeGit(["fetch", "origin", "main"], reverted);
+    assert.equal(
+      await nativeGit(["show", `${childCompact}:${childFile}`], reverted),
+      "Child delta",
+    );
+    const files = (await nativeGit(["ls-tree", "-r", "--name-only", childCompact], reverted)).split(
+      "\n",
+    );
+    assert(!files.includes(parentFile), "Child does not replay reverted P0 content");
+    assert(!files.includes(laterFile), "Child does not replay reverted P1 content");
+    assert.equal(await nativeGit(["show", "-s", "--format=%P", childCompact], reverted), revertTip);
+    record({ parent, child, p0, parentCompact, childCompact, revertTip, integrated });
   });
 
   await scenario("queue-concurrency-failure-fencing-and-push-recovery", async () => {
@@ -3105,10 +3451,14 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       const cron = await json<{
         scheduled: { id: number; account: string | null; categories: string[] }[];
       }>("/api/dev/retention-cron", secret, "POST", {});
+      assert(
+        cron.scheduled.some(
+          (run) => run.account === owner && run.categories.includes("release-notes"),
+        ),
+        "The explicitly enabled category is scheduled",
+      );
       for (const run of cron.scheduled)
-        if (run.account === owner)
-          assert.deepEqual(run.categories, ["release-notes"], "Only what's on is scheduled");
-        else if (run.account === null)
+        if (run.account === null)
           assert.deepEqual(run.categories, ["auth-hygiene"], "The site's only always-on category");
       assert(
         !cron.scheduled.some(
@@ -4395,22 +4745,19 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
   });
 
   await scenario("browser-timeline-scope-round-trip", async () => {
-    // CORE-82 and CORE-86 across the real stack: a timeline forked through the
-    // API (its bookmark written in git), chosen in the rail of a real session,
-    // opens the code at that bookmark; its Experimental flag set in the page
-    // persists; Back to main leaves it. (Scoping links, CI, Knowledge and the
-    // Stalled view are browser-mode tests: TimelineScope.browser.test.tsx.)
+    // A real session carries the owned source through code links, then explicitly returns to main.
     const timelines = `/api/tracker/${fixtures.tracker.owner}/timelines`;
     const slug = `e2e-switch-${randomUUID().slice(0, 8)}`;
     const name = `Switcher ${slug.slice(-8)}`;
-    const bookmark = `timeline/${slug}`;
+    const bookmark = "work";
     await json(timelines, fixtures.tokens.jun, "POST", { slug, name, repos: [fullName] }, [201]);
-    const detail = await json<RepoDetail>(`/api/repos/${fullName}`, ownerToken);
+    const source = await timelineSource(slug);
+    const detail = await json<RepoDetail>(api, ownerToken);
     assert.equal(
-      detail.branches.find((b) => b.shortName === bookmark)?.oid,
+      await sourceTip(slug),
       detail.branches.find((b) => b.shortName === detail.defaultBranch)?.oid,
-      "Forking writes the bookmark at main's tip",
     );
+    assert(!detail.branches.some((b) => b.shortName === `timeline/${slug}`));
     const browserTimeout = 15_000;
     const expect = playwrightExpect.configure({ timeout: browserTimeout });
     const browser = await chromium.launch({ headless: true });
@@ -4433,10 +4780,14 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       await page.getByRole("button", { name: /^Timeline: main/ }).click();
       await page.getByRole("link", { name: new RegExp(name) }).click();
       await page.waitForURL((url) => url.searchParams.get("tl") === slug);
-      await expect(banner).toContainText(`Code on ${bookmark}`);
+      await expect(banner).toBeVisible();
       await expect(page.getByLabel("Branch or tag")).toContainText(bookmark);
       // The listing is git's, at the bookmark.
       await expect(page.getByRole("link", { name: "README.md" }).first()).toBeVisible();
+      assert.equal(new URL(page.url()).searchParams.get("source"), source.sourceId);
+      await page.getByRole("link", { name: "README.md" }).first().click();
+      await page.waitForURL((url) => url.pathname.includes("/blob/"));
+      assert.equal(new URL(page.url()).searchParams.get("source"), source.sourceId);
 
       await page.goto(`/tracker/${fixtures.tracker.owner}/timelines?tl=${slug}`);
       const flag = page.getByRole("switch", { name: "Experimental" });
@@ -4455,9 +4806,10 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
 
       await banner.getByRole("link", { name: "Back to main" }).click();
       await page.waitForURL((url) => url.searchParams.get("tl") === "main");
+      assert.equal(new URL(page.url()).searchParams.get("source"), null);
       await expect(banner).toHaveCount(0);
       await context.tracing.stop();
-      record({ timeline: slug, bookmark, flagged: true });
+      record({ timeline: slug, source, bookmark, flagged: true });
     } catch (error) {
       await page
         .screenshot({ path: join(ctx.artifacts, "browser-timeline-failure.png"), fullPage: true })
@@ -4681,6 +5033,21 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
       chats: { fresh: fresh.length, idleRemoved: idle.length },
     });
   });
+  await scenario("source-authorization-native-and-canonical-separation", () =>
+    runSourceAuthE2E(ctx, fixtures, gm, record),
+  );
+  await scenario("source-multi-repository-landing-and-durable-recovery", () =>
+    runSourceLandingE2E(ctx, fixtures, gm, record),
+  );
+  await scenario("source-late-sync-lineage-conflicts-guard-and-expiry", () =>
+    runSourceSyncE2E(ctx, fixtures, gm, record),
+  );
+  await scenario("source-finite-legacy-migration-and-partial-revert", () =>
+    runSourceMigrationE2E(ctx, fixtures, gm, record),
+  );
+  await scenario("source-retention-expiry-orphan-and-canonical-purge", () =>
+    runSourceRetentionE2E(ctx, fixtures, gm, record),
+  );
 
   await scenario("browser-chronicle-scrub-range-span-and-links", async () => {
     // CORE-251: a month of real tracker history read on a time axis, at

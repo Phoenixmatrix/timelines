@@ -109,6 +109,24 @@ function setup() {
   return { sqlite, env, repo, delivery, sent, knowledge, state };
 }
 
+test("work pushes do not mutate canonical push time or enqueue its mirror and release notes", async () => {
+  const f = setup();
+  const pending: Promise<unknown>[] = [];
+  afterPush(
+    f.env,
+    { ...f.repo, source_id: "work_a", artifacts_name: "work-physical", default_branch: "work" },
+    null,
+    (work) => pending.push(work),
+  );
+  await Promise.all(pending);
+  expect(f.sent).toEqual([]);
+  expect(f.sqlite.prepare("SELECT pushed_at FROM repos WHERE id='repo'").get()).toEqual({
+    pushed_at: null,
+  });
+  expect(f.sqlite.prepare("SELECT status FROM repo_mirrors").get()).toEqual({ status: "ok" });
+  expect(f.sqlite.prepare("SELECT repo_id FROM release_note_state").all()).toEqual([]);
+});
+
 describe("queued push notification delivery", () => {
   for (const failed of ["mirror", "release-notes", "knowledge"]) {
     test(`${failed} rejection retains the durable outbox until real consumer delivery recovers`, async () => {

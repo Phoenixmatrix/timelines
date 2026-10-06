@@ -343,12 +343,14 @@ describe("Atlas cross-repository composition", () => {
             files: [
               {
                 repoId: "r_app",
+                sourceId: "canonical",
                 commit: "a1",
                 path: "web/src/checkout.ts",
                 blob: "blob-r_app-web/src/checkout.ts",
               },
               {
                 repoId: "r_app",
+                sourceId: "canonical",
                 commit: "a1",
                 path: "web/src/invoice-view.ts",
                 blob: "blob-r_app-web/src/invoice-view.ts",
@@ -357,6 +359,7 @@ describe("Atlas cross-repository composition", () => {
           },
           manifest: {
             repoId: "r_app",
+            sourceId: "canonical",
             commit: "a1",
             path: "web/package.json",
             blob: "blob-r_app-web/package.json",

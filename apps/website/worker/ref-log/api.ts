@@ -8,7 +8,7 @@ import { Hono } from "hono";
 import type { InferResult } from "kysely";
 import type { ChangeHistory, RefUpdate, RefUpdateList } from "../../shared/api.ts";
 import { fail } from "../api/http.ts";
-import { loadRepo } from "../api/repos.ts";
+import { loadSourceRepo } from "../api/repos.ts";
 import type { AppEnv } from "../auth.ts";
 import { db, type DB } from "../schema.ts";
 
@@ -27,6 +27,7 @@ type UpdateRow = InferResult<ReturnType<typeof selectUpdates>>[number];
 
 export const toUpdate = (row: UpdateRow): RefUpdate => ({
   id: row.id,
+  sourceId: row.source_id,
   ref: row.ref,
   old: row.old_oid,
   new: row.new_oid,
@@ -39,12 +40,14 @@ export const toUpdate = (row: UpdateRow): RefUpdate => ({
 export const refLog = new Hono<AppEnv>();
 
 refLog.get("/ref-updates", async (c) => {
-  const repo = await loadRepo(c);
+  const repo = await loadSourceRepo(c, "read", true);
   if (repo instanceof Response) return repo;
+  c.header("x-code-source-state", repo.expired ? "expired" : "available");
   const ref = c.req.query("ref")?.trim();
   const before = Number(c.req.query("before")) || Number.MAX_SAFE_INTEGER;
   let query = selectUpdates(db(c.env.DB))
     .where("u.repo_id", "=", repo.row.id)
+    .where("u.source_id", "=", repo.source.sourceId)
     .where("u.id", "<", before);
   if (ref) {
     query = query.where(
@@ -65,8 +68,9 @@ refLog.get("/ref-updates", async (c) => {
 });
 
 refLog.get("/changes/:change", async (c) => {
-  const repo = await loadRepo(c);
+  const repo = await loadSourceRepo(c, "read", true);
   if (repo instanceof Response) return repo;
+  c.header("x-code-source-state", repo.expired ? "expired" : "available");
   const change = c.req.param("change").toLowerCase();
   if (!CHANGE_ID.test(change)) return fail(c, 400, "Invalid change id.");
   const rows = await selectUpdates(db(c.env.DB))
@@ -80,6 +84,7 @@ refLog.get("/changes/:change", async (c) => {
       "m.last_seen_at",
     ])
     .where("m.repo_id", "=", repo.row.id)
+    .where("m.source_id", "=", repo.source.sourceId)
     // A prefix range the primary key serves ("{" sorts right after "z").
     .where("m.change_id", ">=", change)
     .where("m.change_id", "<", `${change}{`)
@@ -90,6 +95,7 @@ refLog.get("/changes/:change", async (c) => {
   if (ids.size === 0) return fail(c, 404, `No change ${change} has reached a ref.`);
   if (ids.size > 1) return fail(c, 409, `${change} matches ${ids.size} changes; use more of it.`);
   return c.json<ChangeHistory>({
+    sourceId: repo.source.sourceId,
     changeId: rows[0]!.change_id,
     refs: rows.map((row) => ({
       changeId: row.change_id,

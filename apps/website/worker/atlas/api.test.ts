@@ -226,7 +226,7 @@ describe("Atlas read API", () => {
     expect(overview.snapshot).toMatchObject({
       id: snapshotId,
       seq,
-      vector: [{ repoId: "r1", commit: "c1", buildId: "b-c1" }],
+      vector: [{ repoId: "r1", sourceId: "canonical", commit: "c1", buildId: "b-c1" }],
       partial: false,
       expiresAt: null,
     });
@@ -602,6 +602,7 @@ describe("Atlas read API", () => {
         entityId: "sym:hub.ts#route",
         kind: "symbol",
         repoId: "r1",
+        sourceId: "canonical",
         commit: "c1",
         path: "hub.ts",
         blob: "blob-hub",

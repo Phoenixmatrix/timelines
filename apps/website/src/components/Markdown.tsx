@@ -1,7 +1,7 @@
 import { link } from "./ui.tsx";
 import ReactMarkdown from "react-markdown";
 import { Link } from "react-router";
-import { blobUrl, repoPath } from "../lib/refs.ts";
+import { blobUrl, repoPath, sourceUrl } from "../lib/refs.ts";
 import { Mermaid } from "./Mermaid.tsx";
 import type { ReactNode } from "react";
 import { useRefMarkdown } from "../refs/remark.tsx";
@@ -72,11 +72,15 @@ export function Markdown({
   owner,
   name,
   refName,
+  sourceId,
+  sourceLocations,
 }: {
   text: string;
   owner: string;
   name: string;
   refName: string;
+  sourceId?: string;
+  sourceLocations?: { path: string; sourceId: string; commit: string }[];
 }) {
   // Refs in the page link when they resolve, in this repository (CORE-22).
   const refs = useRefMarkdown(outsideLink, { owner, repo: name });
@@ -95,7 +99,10 @@ export function Markdown({
           a({ href = "", children }) {
             if (href.startsWith("wiki:")) {
               return (
-                <Link className={link} to={repoPath(owner, name, "wiki", href.slice(5))}>
+                <Link
+                  className={link}
+                  to={sourceUrl(repoPath(owner, name, "wiki", href.slice(5)), sourceId)}
+                >
                   {children}
                 </Link>
               );
@@ -121,8 +128,12 @@ export function Markdown({
               );
             }
             const path = href.replace(/^\.\//, "").replace(/#.*$/, "");
+            const location = sourceLocations?.find((source) => source.path === path);
             return (
-              <Link className={link} to={blobUrl(owner, name, refName, path)}>
+              <Link
+                className={link}
+                to={`${blobUrl(owner, name, location?.commit ?? refName, path, location?.sourceId ?? sourceId)}${href.includes("#") ? href.slice(href.indexOf("#")) : ""}`}
+              >
                 {children}
               </Link>
             );

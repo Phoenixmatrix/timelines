@@ -15,9 +15,27 @@ export type QueueGm = (
   args: string[],
   persona?: Persona | "read",
   cwd?: string,
-  failure?: RegExp,
+  failure?: RegExp | true,
   extra?: NodeJS.ProcessEnv,
 ) => Promise<string>;
+
+export interface QueueFixture {
+  repo: string;
+  root: string;
+  api: string;
+  json<T>(
+    path: string,
+    method?: string,
+    body?: unknown,
+    statuses?: number[],
+    credential?: string | null,
+  ): Promise<T>;
+  git(args: string[], cwd?: string, raw?: boolean): Promise<string>;
+  tip(): Promise<string>;
+  show(id: string): Promise<QueueEntry>;
+  wait(id: string, done?: (entry: QueueEntry) => boolean): Promise<QueueEntry>;
+  landed(id: string): Promise<QueueEntry>;
+}
 
 /** Owned fixture only: credentials travel in environment/headers, never URLs or evidence. */
 export async function queueFixture(
@@ -25,7 +43,7 @@ export async function queueFixture(
   fixtures: SeedManifest,
   record: (value: unknown) => void,
   holdSeconds = 12,
-) {
+): Promise<QueueFixture> {
   const name = `queue-${randomUUID().slice(0, 8)}`;
   const repo = `orbit/${name}`;
   const root = join(ctx.work, name);
@@ -363,7 +381,9 @@ export async function runQueueE2E(
   const heldId = await submit(held);
   const firstAttempt = await f.wait(
     heldId,
-    (entry) => entry.status === "testing" || entry.status === "failed",
+    (entry) =>
+      (entry.status === "testing" && !!entry.gateRun && !!entry.candidate) ||
+      entry.status === "failed",
   );
   assert.equal(firstAttempt.status, "testing");
   const beforeCancel = await f.tip();
@@ -415,7 +435,7 @@ export async function runQueueE2E(
 }
 
 // Node-side wire shape, kept separate from Worker-only runtime types.
-interface RepoInventory {
+export interface RepoInventory {
   repoId: string;
   repo: { name: string; deletedAt: string | null } | null;
   d1: Record<string, number>;
@@ -484,7 +504,9 @@ async function runActiveQueueDeletion(
   // its next step: wait for the gate run, not just the status.
   const entry = await f.wait(
     id,
-    (value) => (value.status === "testing" && value.gateRun !== null) || value.status === "failed",
+    (value) =>
+      (value.status === "testing" && !!value.gateRun && !!value.candidate) ||
+      value.status === "failed",
   );
   assert.equal(entry.status, "testing");
   assert(entry.gateRun && entry.candidate);

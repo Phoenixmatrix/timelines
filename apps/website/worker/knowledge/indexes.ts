@@ -51,7 +51,13 @@ export async function syncVectors(
       group.map(async (node, i) => ({
         id: await vectorId(repoId, node.id),
         values: vectors[i] as number[],
-        metadata: { repo: repoId, kind: node.kind, node: node.id, path: node.path ?? "" },
+        metadata: {
+          repo: repoId,
+          sourceId: "canonical",
+          kind: node.kind,
+          node: node.id,
+          path: node.path ?? "",
+        },
       })),
     );
     await env.VECTORS.upsert(records);
@@ -97,7 +103,7 @@ async function upload(
   const items = env.SEARCH.get(SEARCH_INSTANCE).items;
   if (previous) await items.delete(previous.item_id).catch(() => undefined);
   const info = await items.upload(itemName(repoId, key), body, {
-    metadata: { repo: repoId, ...metadata },
+    metadata: { repo: repoId, ...metadata, sourceId: "canonical" },
   });
   await db(env.DB)
     .insertInto("kg_search_items")

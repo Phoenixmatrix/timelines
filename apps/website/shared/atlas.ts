@@ -29,6 +29,8 @@ export const ATLAS_WORKSPACE_MAX_REPOS = 50;
 /** One repository's place in a snapshot: there is no common HEAD across repositories. */
 export interface AtlasVectorEntry {
   repoId: string;
+  /** Omitted only by persisted pre-source canonical snapshots. */
+  sourceId?: string;
   commit: string;
   buildId: string;
 }
@@ -245,6 +247,7 @@ export interface AtlasEvidence {
   entityId: string;
   kind: string;
   repoId: string;
+  sourceId?: string;
   commit: string;
   path: string;
   blob: string | null;
@@ -284,6 +287,7 @@ export type AtlasUnavailableReason =
 /** An immutable source location: a file at an indexed commit, with what's known of its range. */
 export interface AtlasSourceRef {
   repoId: string;
+  sourceId?: string;
   commit: string;
   path: string;
   blob: string | null;
@@ -338,7 +342,7 @@ export interface AtlasInference {
   /** Hash of exactly what the model was given; identical inputs are never re-inferred. */
   inputsHash: string;
   /** The source version the prose was written from (the original one, when stale). */
-  basis: { repoId: string; commit: string; buildId: string };
+  basis: { repoId: string; sourceId?: string; commit: string; buildId: string };
   inferredAt: string;
   derivedFrom: AtlasDerivation[];
   /** The member files the prose rests on, at `basis.commit`. */
@@ -565,6 +569,7 @@ export interface AtlasPublisher {
 /** A source file at a snapshot's commit (inspectable, immutable). */
 export interface AtlasFileRef {
   repoId: string;
+  sourceId?: string;
   commit: string;
   path: string;
   blob: string | null;
@@ -912,6 +917,8 @@ export type AtlasMainRelation = "same" | "older" | "newer" | "unknown";
 /** One repository's part in a timeline, each value independently known or not. */
 export interface AtlasTimelineRepo {
   repoId: string;
+  /** Null when this repository does not participate in the timeline. */
+  sourceId: string | null;
   owner: string;
   name: string;
   /** The bookmark, `timeline/<slug>`. */
@@ -1061,6 +1068,7 @@ export interface AtlasTimelineRegion {
 /** The newest wiki page set written for the timeline, in brief. */
 export interface AtlasTimelineWiki {
   key: string;
+  sourceId?: string;
   checkpoint: { id: string; number: number | null } | null;
   /** The timeline commit the pages describe, and the main they were measured against. */
   commit: string;

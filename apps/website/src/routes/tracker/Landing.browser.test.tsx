@@ -10,7 +10,12 @@
 import { describe, expect, test } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
 import type { TimelineGraphData } from "../../../shared/timeline-graph.ts";
-import type { Landing, LandingRepo, TimelineStatus } from "../../../shared/timelines.ts";
+import type {
+  Landing,
+  LandingRepo,
+  TimelineDetail,
+  TimelineStatus,
+} from "../../../shared/timelines.ts";
 import { commitId, sidewaysOverflow } from "../../testing/atlas.ts";
 import { focused, focusOn, press } from "../../testing/focus.ts";
 import { renderApp } from "../../testing/render.tsx";
@@ -57,7 +62,7 @@ test("Land says why a timeline can't land yet", async () => {
   await expect
     .element(panel())
     .toMatchTextContent(
-      "Lands once a person approves a checkpoint: its merge into main is tested before main moves.",
+      "Lands once a person approves a checkpoint: its compact result is tested before main moves.",
     );
   await expect.element(landButton()).toHaveTextContent("Land");
   await refused("search has no checkpoint to land; make one with gm timeline checkpoint.");
@@ -75,19 +80,27 @@ test("Land says why a timeline can't land yet", async () => {
 
   // An auto timeline lands once green; a failed run on its checkpoint isn't.
   const auto = { ...timeline, slug: "ranking", name: "Ranking" };
-  await server.call("POST", "/api/tracker/orbit/timelines", {
+  const created = await server.call<TimelineDetail>("POST", "/api/tracker/orbit/timelines", {
     slug: auto.slug,
     name: auto.name,
     policy: "auto",
     repos: ["orbit/engine"],
   });
-  const engine = { ...timeline.repos[0]!, tip: commitId() };
-  await server.push("orbit/engine", `timeline/${auto.slug}`, engine.tip);
+  // Its own work source in orbit/engine (CORE-255), not search's.
+  const source = created.timeline.repos[0]!.source!;
+  const engine = {
+    ...timeline.repos[0]!,
+    sourceId: source.sourceId,
+    sourceRef: source.ref,
+    tip: commitId(),
+  };
+  await server.push("orbit/engine", "work", engine.tip, engine.sourceId);
   await ciRun(server, {
     repo: engine,
     number: 3,
     commit: engine.tip,
-    ref: `timeline/${auto.slug}`,
+    ref: "work",
+    sourceId: engine.sourceId,
     status: "failed",
   });
   await checkpoint(server, { ...auto, repos: [engine] }, "Ranks by freshness");
@@ -95,7 +108,7 @@ test("Land says why a timeline can't land yet", async () => {
   await expect
     .element(panel())
     .toMatchTextContent(
-      "Lands once a checkpoint's CI is green: its merge into main is tested before main moves.",
+      "Lands once a checkpoint's CI is green: its compact result is tested before main moves.",
     );
   await refused(
     "Checkpoint #1 isn't green: CI run #3 on orbit/engine failed. Push a fix and make a new checkpoint.",
@@ -128,10 +141,10 @@ test("an approved checkpoint lands: queued and merging, a conflict asks for a sy
   // Queued: merging into main, with its merge run, and nothing to press.
   let app = inspect(timeline);
   await expect.element(inspector()).toMatchTextContent("searchLandingLands after approval");
-  await expect.element(panel()).toMatchTextContent("Checkpoint #1: Merging into main");
+  await expect.element(panel()).toMatchTextContent("Checkpoint #1: Preparing the result on main");
   await expect.element(repoRow("engine")).toMatchTextContent("orbit/enginemerging");
   await expect
-    .element(repoRow("engine").getByRole("link", { name: `Merge #${first}` }))
+    .element(repoRow("engine").getByRole("link", { name: `Preparation #${first}` }))
     .toHaveAttribute("href", `/orbit/engine/ci/${first}?tl=search`);
   expect(landButton().elements()).toHaveLength(0);
   app.unmount();
@@ -144,20 +157,20 @@ test("an approved checkpoint lands: queued and merging, a conflict asks for a sy
   await expect
     .element(panel())
     .toMatchTextContent(
-      `Checkpoint #1 conflicts with orbit/engine's main (CI run #${first} lists the files). Landing needs a sync: merge main into timeline/search (gm merge, or ask an agent to), push, make a new checkpoint, and land that.`,
+      `Checkpoint #1 conflicts with orbit/engine's main (CI run #${first} lists the files). Explicitly sync/rebase the owned work source, resolve conflicts, and renew the checkpoint and approval.`,
     );
   await expect.element(inspector()).toMatchTextContent("searchActiveLands after approval");
 
-  // Land again, by keyboard: a new landing of the same approved checkpoint.
+  // Land again, by keyboard: the same approved checkpoint's landing, retried.
   const again = panel().getByRole("button", { name: "Land again" });
   await focusOn(again);
   const mark = server.requests.length;
   await press("Enter");
-  await expect.element(panel()).toMatchTextContent("Checkpoint #1: Merging into main");
+  await expect.element(panel()).toMatchTextContent("Checkpoint #1: Preparing the result on main");
   // The button went with the stop: focus is on where the landing stands now.
   await expect
     .poll(() => focused())
-    .toMatchObject({ role: "p", name: "Checkpoint #1: Merging into main" });
+    .toMatchObject({ role: "p", name: "Checkpoint #1: Preparing the result on main" });
   expect(
     server
       .since(mark)
@@ -167,11 +180,13 @@ test("an approved checkpoint lands: queued and merging, a conflict asks for a sy
   ).toHaveLength(1);
   const retry = await landing(server, timeline);
   expect(retry).toMatchObject({ state: "merging", trigger: "request" });
-  expect(retry!.id).not.toBe(queued!.id);
+  // The same checkpoint's landing is retried in place (CORE-255): it keeps any
+  // published outcome or CAS intent, and its merge starts afresh.
+  expect(retry!.id).toBe(queued!.id);
   const second = retry!.repos[0]!.mergeRun!.number;
   expect(second).toBeGreaterThan(first);
   await expect
-    .element(repoRow("engine").getByRole("link", { name: `Merge #${second}` }))
+    .element(repoRow("engine").getByRole("link", { name: `Preparation #${second}` }))
     .toBeVisible();
   expect(landButton().elements()).toHaveLength(0);
   // The timeline is landing again: the inspector re-read it.
@@ -221,6 +236,8 @@ describe("the later states, with the runs that merged and tested them", () => {
       createdAt: "2026-10-04T10:00:00.000Z",
       updatedAt: "2026-10-04T10:05:00.000Z",
       repos: timeline.repos.map((repo) => ({
+        // Each repository's approved work source, as the checkpoint measured it.
+        source: view.checkpoint.repos.find((pinned) => pinned.id === repo.id)!.source,
         id: repo.id,
         owner: repo.owner,
         name: repo.name,
@@ -248,18 +265,35 @@ describe("the later states, with the runs that merged and tested them", () => {
   const run = (number: number) => ({ id: `run${number}`, number });
 
   test("testing: the merge, and the runs that merged and test it", async () => {
-    await landed("testing", "landing", {
+    const { timeline } = await landed("testing", "landing", {
       engine: { state: "testing", merge: merge.engine, mergeRun: run(3), gateRun: run(4) },
       web: { state: "tested", merge: merge.web, mergeRun: run(5), gateRun: run(6) },
     });
-    await expect.element(panel()).toMatchTextContent("Checkpoint #1: Testing the merge");
+    await expect.element(panel()).toMatchTextContent("Checkpoint #1: Testing the result");
     await expect.element(repoRow("engine")).toMatchTextContent("orbit/enginetesting");
     await expect.element(repoRow("web")).toMatchTextContent("orbit/webpassed");
     await expect
-      .element(repoRow("engine").getByRole("link", { name: `merge ${short(merge.engine)}` }))
+      .element(
+        repoRow("engine").getByRole("link", {
+          name: `compact candidate ${short(merge.engine)}`,
+        }),
+      )
       .toHaveAttribute("href", `/orbit/engine?commit=${merge.engine}&tl=search`);
+    // The approved work itself is read from its owned source, never canonical.
+    const engine = timeline.repos.find((repo) => repo.name === "engine")!;
     await expect
-      .element(repoRow("engine").getByRole("link", { name: "Merge #3" }))
+      .poll(() =>
+        new URL(
+          repoRow("engine")
+            .getByRole("link", { name: `approved source ${short(engine.tip)}` })
+            .element()
+            .getAttribute("href")!,
+          location.origin,
+        ).searchParams.get("source"),
+      )
+      .toBe(engine.sourceId);
+    await expect
+      .element(repoRow("engine").getByRole("link", { name: "Preparation #3" }))
       .toHaveAttribute("href", "/orbit/engine/ci/3?tl=search");
     await expect
       .element(repoRow("engine").getByRole("link", { name: "Gates #4" }))
@@ -279,7 +313,9 @@ describe("the later states, with the runs that merged and tested them", () => {
     await expect.element(panel()).toMatchTextContent("Checkpoint #1: Advancing main");
     await expect.element(repoRow("engine")).toMatchTextContent("orbit/enginemain advanced");
     await expect.element(repoRow("web")).toMatchTextContent("orbit/webpassed");
-    await expect.element(repoRow("web").getByRole("link", { name: "Merge #5" })).toBeVisible();
+    await expect
+      .element(repoRow("web").getByRole("link", { name: "Preparation #5" }))
+      .toBeVisible();
     expect(repoRow("web").getByRole("link", { name: /Gates/ }).elements()).toHaveLength(0);
     expect(landButton().elements()).toHaveLength(0);
   });
@@ -290,11 +326,11 @@ describe("the later states, with the runs that merged and tested them", () => {
       web: { state: "merging", attempt: 2, mergeRun: run(7) },
     });
     await expect.element(inspector()).toMatchTextContent("searchPartly landedLands after approval");
-    await expect.element(panel()).toMatchTextContent("Checkpoint #1: Merging into main");
+    await expect.element(panel()).toMatchTextContent("Checkpoint #1: Preparing the result on main");
     await expect.element(repoRow("engine")).toMatchTextContent("orbit/enginemain advanced");
     await expect.element(repoRow("web")).toMatchTextContent("orbit/webmerging");
     await expect
-      .element(repoRow("web").getByRole("link", { name: "Merge #7" }))
+      .element(repoRow("web").getByRole("link", { name: "Preparation #7" }))
       .toHaveAttribute("href", "/orbit/web/ci/7?tl=search");
     expect(landButton().elements()).toHaveLength(0);
   });
@@ -308,7 +344,7 @@ describe("the later states, with the runs that merged and tested them", () => {
     await expect.element(repoRow("engine")).toMatchTextContent("orbit/enginemain advanced");
     await expect.element(repoRow("web")).toMatchTextContent("orbit/webmain advanced");
     await expect
-      .element(repoRow("web").getByRole("link", { name: `merge ${short(merge.web)}` }))
+      .element(repoRow("web").getByRole("link", { name: `compact commit ${short(merge.web)}` }))
       .toHaveAttribute("href", `/orbit/web?commit=${merge.web}&tl=search`);
     expect(landButton().elements()).toHaveLength(0);
   });
@@ -323,7 +359,7 @@ describe("the later states, with the runs that merged and tested them", () => {
           engine: { state: "conflict", merge: null, mergeRun: run(3) },
           web: { state: "tested", merge: merge.web, mergeRun: run(5), gateRun: run(6) },
         },
-        "Checkpoint #1 conflicts with orbit/engine's main (CI run #3 lists the files). Landing needs a sync: merge main into timeline/search-with-a-long-name-that-does-not-break (gm merge, or ask an agent to), push, make a new checkpoint, and land that.",
+        "Checkpoint #1 conflicts with orbit/engine's main (CI run #3 lists the files). Explicitly sync/rebase the owned work source, resolve conflicts, and renew the checkpoint and approval of timeline/search-with-a-long-name-that-does-not-break.",
       );
       await expect.element(panel()).toMatchTextContent("Stopped: conflicts with main");
       const again = panel().getByRole("button", { name: "Land again" });

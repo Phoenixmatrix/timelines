@@ -613,9 +613,10 @@ pub fn run(ctx: &Ctx, args: &WhyArgs) -> Result<Why> {
         None => current_repo(ctx)?,
     };
     let config = Config::load();
+    let source = super::timeline::source_query(ctx, &config)?;
     let mut responses = Vec::new();
     for batch in local.commits.chunks(COMMITS_PER_REQUEST) {
-        let path = request_path(&repo, &target.path, batch)?;
+        let path = format!("{}&{source}", request_path(&repo, &target.path, batch)?);
         responses.push(remote::api(&config, "GET", &path, None)?);
     }
     // Commits the server answered for, by oid, keep the local order.

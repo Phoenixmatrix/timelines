@@ -20,7 +20,7 @@ const xOf = (column: number, min: number) => PAD + (column - min) * LANE_WIDTH;
 export function eventRepo(
   event: TimelineEvent | null,
   timelines: (Timeline | null | undefined)[],
-): { owner: string; name: string } | null {
+): Timeline["repos"][number] | null {
   if (!event || event.kind !== "merge") return null;
   for (const t of timelines) {
     const repo = t?.repos.find((r) => r.id === event.repoId);

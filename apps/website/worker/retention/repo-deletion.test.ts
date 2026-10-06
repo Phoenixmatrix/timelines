@@ -15,6 +15,7 @@ import { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
 import { vectorId } from "../knowledge/indexes.ts";
 import { forgetRecorded } from "../durable/registry.ts";
 import { repos } from "../api/repos.ts";
+import { runner } from "../ci/api.ts";
 import { SimulatedCrash } from "./runs.ts";
 import {
   deletionStatus,
@@ -415,6 +416,56 @@ const NOTHING_LEFT = {
 // ---- tests ------------------------------------------------------------------
 
 describe("repository deletion", () => {
+  test.each([false, true])(
+    "waits for CI acknowledgment after tombstone (historical ambiguity: %s)",
+    async (historical) => {
+      const w = await setup();
+      w.sqlite
+        .prepare("UPDATE ci_runs SET status=? WHERE id='r_doomed-run1'")
+        .run(historical ? "cancelled" : "running");
+      w.sqlite
+        .prepare(`UPDATE ci_jobs SET status=?,source_completion_pending=?,
+      runner='local',spec='{"secrets":[]}' WHERE id='r_doomed-job1'`)
+        .run(historical ? "cancelled" : "running", historical ? 1 : 0);
+      await requestDeletion(w.env, cleanRow, "ann");
+      await expect(purge(w)).rejects.toThrow(/CI consumer acknowledgment/);
+      expect(w.artifacts.repos.has("art-r_doomed")).toBe(true);
+      expect((await deletionStatus(w.env, "r_doomed"))?.phase).toBe("stop");
+      // Reports use the owner's control-plane credential and remain available
+      // after the repository disappears from normal readers.
+      const app = new Hono<AppEnv>();
+      app.use("*", async (c, next) => {
+        c.set("actor", ann);
+        await next();
+      });
+      app.route("/runner", runner);
+      const heartbeat = await app.request(
+        "/runner/jobs/r_doomed-job1",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ logs: [{ step: -1, text: "stopping" }] }),
+        },
+        w.env,
+      );
+      expect(heartbeat.status).toBe(200);
+      expect(await heartbeat.json()).toEqual({ cancelled: true });
+      await expect(purge(w)).rejects.toThrow(/CI consumer acknowledgment/);
+      const finished = await app.request(
+        "/runner/jobs/r_doomed-job1",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ done: { status: "cancelled" } }),
+        },
+        w.env,
+      );
+      expect(finished.status).toBe(200);
+      expect(await purge(w)).toBe("done");
+      expect(w.artifacts.repos.has("art-r_doomed")).toBe(false);
+    },
+  );
+
   test("hides the repository at once, then purges everything it owned, everywhere", async () => {
     const w = await setup();
     const keepBefore = left(await repoInventory(w.env, "r_keep"));
@@ -587,6 +638,27 @@ describe("repository deletion", () => {
     expect(await resumeDeletions(w.env, { now, waitUntil: () => {} })).toEqual([]);
   });
 
+  test("a scoped recovery leaves another unfinished repository deletion untouched", async () => {
+    const w = await setup();
+    await requestDeletion(w.env, cleanRow, "ann");
+    await requestDeletion(
+      w.env,
+      { ...cleanRow, id: "r_keep", name: "keep", artifacts_name: "art-r_keep" },
+      "ann",
+    );
+    const now = Date.now() + 60 * 60_000;
+    expect(await resumeDeletions(w.env, { repoId: "r_doomed", now, waitUntil: () => {} })).toEqual([
+      "r_doomed",
+    ]);
+    expect((await deletionStatus(w.env, "r_doomed"))?.attempts).toBe(1);
+    expect(await deletionStatus(w.env, "r_keep")).toMatchObject({
+      attempts: 0,
+      workflowId: null,
+      phase: "stop",
+    });
+    expect(await resumeDeletions(w.env, { now, waitUntil: () => {} })).toEqual(["r_keep"]);
+  });
+
   test("without a Workflow (a preview), the purge runs in the background", async () => {
     const w = await setup();
     Reflect.deleteProperty(w.env, "REPO_PURGE");
@@ -650,6 +722,15 @@ describe("the orphan sweep", () => {
       createdAt: new Date(Date.now() - 2 * DAY).toISOString(),
     });
     await w.artifacts.create("r-young");
+    // A crashed allocation older than the orphan grace is still an owned name.
+    w.sqlite.exec(`INSERT INTO timeline_work_sources
+      (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,state,allocation_operation_id,
+       fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
+      VALUES ('work_reserved','r_keep','reserved-timeline','reserved','orbit','old-reserved','reserved','allocation-reserved',
+        'canonical','head','tree','refs/heads/main','canonical','head','tree','refs/heads/main','2020-01-01','2020-01-01');`);
+    w.artifacts.repos.set("old-reserved", {
+      createdAt: new Date(Date.now() - 3 * DAY).toISOString(),
+    });
     // A repository being deleted isn't an orphan.
     await requestDeletion(w.env, cleanRow, "ann");
 
@@ -673,6 +754,7 @@ describe("the orphan sweep", () => {
     expect(w.artifacts.repos.has("r-young")).toBe(true);
     expect(w.artifacts.repos.has("art-r_keep")).toBe(true);
     expect(w.artifacts.repos.has("art-r_doomed")).toBe(true);
+    expect(w.artifacts.repos.has("old-reserved")).toBe(true);
     const orphans = w.sqlite
       .prepare(
         "SELECT repo_id, source, phase FROM repo_deletions WHERE source = 'orphan-sweep' ORDER BY repo_id",

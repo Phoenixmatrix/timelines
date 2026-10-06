@@ -10,6 +10,7 @@ import type { Mutation } from "../../shared/tracker.ts";
 import { durableStorage } from "../testing/durable.ts";
 import { removeActivity, selectActivity } from "./retention.ts";
 import { TrackerStore, type Access } from "./store.ts";
+import { ownedTimeline, ownedCheckpointRepo } from "../testing/timeline-source.ts";
 
 const databases: { close(): void }[] = [];
 afterEach(() => {
@@ -145,7 +146,7 @@ function history() {
   // e: worked in timeline "search" (forked at 140), finished there at 160
   // (its lease retained), checkpointed at 170, landed at 400.
   now = T0 + 140 * 60_000;
-  store.timelines.create(alice, {
+  ownedTimeline(store.timelines, alice, {
     slug: "search",
     parent: null,
     repos: [{ id: "app", owner: "org", name: "app" }],
@@ -161,14 +162,14 @@ function history() {
   store.timelines.createCheckpoint(bot, "search", {
     summary: "Ranking ready",
     repos: [
-      {
+      ownedCheckpointRepo(store.timelines, "search", {
         id: "app",
         owner: "org",
         name: "app",
         commit: oid(2),
         base: oid(1),
         changes: [{ changeId: "changeone", commit: oid(2) }],
-      },
+      }),
     ],
   });
   now = T0 + 400 * 60_000;

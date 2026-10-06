@@ -420,7 +420,7 @@ async function runningBuild(status: () => Promise<{ status: string }>) {
     INSERT INTO kg_state (repo_id, indexed_commit) VALUES ('repo', '${oid(1)}');
   `);
   const git = fakeRemotes();
-  git.add("https://app", { "refs/heads/main": oid(2) });
+  git.add("https://app", { "refs/heads/main": oid(2) }, "refs/heads/main", artifacts);
   vi.stubGlobal("fetch", git.fetch);
   const created: string[] = [];
   const terminated: string[] = [];

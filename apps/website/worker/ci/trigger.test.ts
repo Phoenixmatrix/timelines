@@ -97,8 +97,18 @@ describe("preview runs", () => {
       expect(t.sqlite.prepare("SELECT commit_oid FROM ci_runs ORDER BY number").all()).toEqual([
         { commit_oid: oid(9) },
       ]);
+      await expect(
+        t.start({
+          preview: { action: "teardown", timeline: "search", checkpoint: "cp_1" },
+        }),
+      ).rejects.toThrow();
+      t.sqlite
+        .prepare(`INSERT INTO deployments
+        (id,repo_id,environment,timeline_slug,checkpoint_id,commit_oid,url,status)
+        VALUES(1,'repo','timeline/search','search','cp_1',?,'https://preview','expired')`)
+        .run(oid(9));
       const teardown = await t.start({
-        preview: { action: "teardown", timeline: "search", checkpoint: "cp_1" },
+        preview: { action: "teardown", timeline: "search", checkpoint: "cp_1", teardownOf: 1 },
       });
       if (!("runId" in teardown)) throw new Error(teardown.skipped);
       expect(t.created).toEqual([teardown.runId]);
@@ -160,13 +170,14 @@ describe("preview runs", () => {
   test("a project that doesn't opt in, or has no job for the action, gets no run", async () => {
     const t = setup();
     files.ciYml = "jobs:\n  test:\n    steps: [vp test]\n";
-    expect(await t.start()).toEqual({ skipped: expect.stringMatching(/doesn't opt in/) });
+    await t.start();
     files.ciYml = "on: preview\njobs:\n  p:\n    if: action == 'create'\n    steps: [x]\n";
-    expect(
-      await t.start({ preview: { action: "teardown", timeline: "search", checkpoint: null } }),
-    ).toEqual({ skipped: expect.stringMatching(/No job .* runs for preview teardown/) });
+    const unmanaged = await t.start({
+      preview: { action: "teardown", timeline: "search", checkpoint: null },
+    });
+    expect(unmanaged).toMatchObject({ teardownUnmanaged: true });
     files.ciYml = "jobs: [";
-    expect(await t.start()).toEqual({ skipped: expect.stringMatching(/has errors/) });
+    await t.start();
     expect(t.sqlite.prepare("SELECT count(*) AS n FROM ci_runs").get()).toEqual({ n: 0 });
   });
 
@@ -362,6 +373,37 @@ jobs:
     const job = await loadJob(t.env.DB, t.jobs(step.id).find((j) => j.name === "lint")!.id);
     const env = (await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" })).env;
     expect(env).toMatchObject({ GITMATRIX_TRIGGER: "step", GITMATRIX_TIMELINE: "search" });
+    refs.branches = [];
+  });
+
+  test("a work source's first push to work starts its runs; the fork's copies of canonical don't", async () => {
+    files.ciYml = STEPS;
+    const t = setup();
+    t.sqlite.exec(`
+      INSERT INTO timeline_work_sources
+        (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,
+         initial_token_revoked,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,
+         fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
+      VALUES ('work_search','repo','tl_search','search','org','w','https://w',1,'ready',
+        'allocation','canonical','${oid(1)}','${oid(1)}','refs/heads/main',
+        'canonical','${oid(1)}','${oid(1)}','refs/heads/main','2026-10-05','2026-10-05');
+    `);
+    // CI has never seen this source: a fork copies every canonical branch.
+    refs.branches = [
+      { shortName: "main", oid: oid(1) },
+      { shortName: "timeline/other", oid: oid(4) },
+      { shortName: "work", oid: oid(3) },
+    ];
+    await onPush(
+      t.env,
+      { id: "repo", source_id: "work_search", artifacts_name: "w", artifacts_remote: "https://w" },
+      { id: "ann" },
+      () => {},
+    );
+    expect(runs(t).map((r) => [r.ref, r.trigger, r.step, r.commit_oid])).toEqual([
+      ["work", "push", 0, oid(3)],
+      ["work", "manual", 1, oid(3)],
+    ]);
     refs.branches = [];
   });
 

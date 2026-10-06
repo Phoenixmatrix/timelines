@@ -44,6 +44,7 @@ import { accountRetentionApi, accountRunsApi, siteRetentionApi } from "./retenti
 import { pricesApi } from "./usage/prices-api.ts";
 import { queueApi } from "./merge-queue/index.ts";
 import { accountUsageApi, siteUsageApi } from "./usage/report-api.ts";
+import { TrackerError } from "./tracker/store.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -140,6 +141,8 @@ api.route("/refs", refs);
 api.route("/", avatars);
 api.notFound((c) => c.json({ error: "Not found." }, 404));
 api.onError((error, c) => {
+  if (error instanceof TrackerError)
+    return c.json({ error: error.message, code: error.code, ...error.details }, error.status);
   if (
     isArtifactsError(error, "IMPORT_IN_PROGRESS") ||
     isArtifactsError(error, "CREATE_IN_PROGRESS") ||

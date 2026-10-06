@@ -43,6 +43,7 @@ export async function loadJob(d1: D1Database, jobId: string) {
       "p.artifacts_remote",
     ])
     .where("j.id", "=", jobId)
+    .whereRef("j.source_id", "=", "r.source_id")
     .executeTakeFirst();
   return row ?? null;
 }
@@ -73,12 +74,28 @@ export async function jobPayload(
   // The preview contract (CORE-79): a preview run names its timeline,
   // checkpoint and action; a push to a timeline's bookmark names the timeline.
   const timeline = job.timeline_slug ?? timelineSlugOf(`refs/heads/${job.ref}`);
+  const owned =
+    job.source_id === "canonical"
+      ? null
+      : await db(d1)
+          .selectFrom("timeline_work_sources")
+          .select("timeline_slug")
+          .where("repo_id", "=", job.repo_id)
+          .where("source_id", "=", job.source_id)
+          .executeTakeFirst();
+  if (job.source_id !== "canonical" && !owned)
+    throw new Error("Job's exact work source is unavailable.");
+  const timelineSlug = owned?.timeline_slug ?? null;
+  const gitUrl = `${registry.origin}/${job.full_name}${timelineSlug ? `@${encodeURIComponent(timelineSlug)}` : ""}.git`;
   return {
     id: job.id,
     runId: job.run_id,
     runNumber: job.number,
     name: job.name,
     repo: job.full_name,
+    sourceId: job.source_id,
+    timelineSlug,
+    gitUrl,
     commit: job.commit_oid,
     ref: job.ref,
     timeoutMinutes: spec.timeoutMinutes,
@@ -88,6 +105,8 @@ export async function jobPayload(
       GITMATRIX_REPOSITORY: job.full_name,
       GITMATRIX_BRANCH: job.ref,
       GITMATRIX_COMMIT: job.commit_oid,
+      GITMATRIX_SOURCE_ID: job.source_id,
+      GITMATRIX_GIT_URL: gitUrl,
       GITMATRIX_RUN_NUMBER: String(job.number),
       GITMATRIX_JOB: job.name,
       GITMATRIX_TRIGGER: job.preview_action
@@ -176,9 +195,20 @@ export async function report(
     statements.push(
       kdb
         .updateTable("ci_jobs")
-        .set({ status, exit_code: exitCode ?? null, error: error ?? null, finished_at: now })
+        .set({
+          status,
+          exit_code: exitCode ?? null,
+          error: error ?? null,
+          finished_at: now,
+          source_completion_pending: 0,
+        })
         .where("id", "=", jobId)
-        .where("status", "in", ["queued", "running"]),
+        .where((eb) =>
+          eb.or([
+            eb("status", "in", ["queued", "running"]),
+            eb("source_completion_pending", "=", 1),
+          ]),
+        ),
       // Steps that never ran are skipped; one cut off mid-way takes the job's fate.
       kdb
         .updateTable("ci_steps")
@@ -205,11 +235,44 @@ export async function report(
       ?.sendEvent({ type: doneEvent(job.name), payload: { status: update.done.status } })
       .catch((error) => console.error("CI: could not wake the run", error));
   }
-  const status = update.done
-    ? (await kdb.selectFrom("ci_jobs").select("status").where("id", "=", jobId).executeTakeFirst())
-        ?.status
-    : job.status;
-  return { cancelled: status === "cancelled" };
+  // Parent cancellation asks a runner to stop, but its source claim remains
+  // until the runner reports done. Never mistake the request for completion.
+  const current = await kdb
+    .selectFrom("ci_jobs as j")
+    .innerJoin("ci_runs as r", "r.id", "j.run_id")
+    .select(["j.status", "r.status as run_status"])
+    .where("j.id", "=", jobId)
+    .executeTakeFirst();
+  return {
+    cancelled:
+      current?.status === "cancelled" ||
+      current?.run_status === "cancelled" ||
+      current?.run_status === "failed",
+  };
+}
+
+/** A dispatch/lease failure is not acknowledgment that a running consumer ended. */
+export async function failDispatch(d1: D1Database, jobId: string, error: string): Promise<void> {
+  await db(d1)
+    .updateTable("ci_jobs")
+    .set((eb) => ({
+      error,
+      status: eb
+        .case()
+        .when(eb.and([eb("source_id", "!=", "canonical"), eb("status", "=", "running")]))
+        .then("running" as const)
+        .else("failed" as const)
+        .end(),
+      finished_at: eb
+        .case()
+        .when(eb.and([eb("source_id", "!=", "canonical"), eb("status", "=", "running")]))
+        .then(eb.ref("finished_at"))
+        .else(nowIso())
+        .end(),
+    }))
+    .where("id", "=", jobId)
+    .where("status", "in", ["pending", "queued", "running"])
+    .execute();
 }
 
 /** Claim a queued job for a local runner; false if someone else got it first. */
@@ -219,6 +282,9 @@ export async function claim(d1: D1Database, jobId: string, runnerName: string): 
     .set({ status: "running", claimed_by: runnerName, started_at: nowIso() })
     .where("id", "=", jobId)
     .where("status", "=", "queued")
+    .where("run_id", "in", (eb) =>
+      eb.selectFrom("ci_runs").select("id").where("status", "in", ["queued", "running"]),
+    )
     .executeTakeFirst();
-  return result.numUpdatedRows === BigInt(1);
+  return result.numUpdatedRows > 0n;
 }

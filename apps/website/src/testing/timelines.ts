@@ -5,7 +5,12 @@
 // wiki page sets, the push log's change ids) is written as that machinery
 // leaves it, with `server.sql`.
 
-import type { CheckpointView, Landing, TimelinePolicy } from "../../shared/timelines.ts";
+import type {
+  CheckpointView,
+  Landing,
+  TimelineDetail,
+  TimelinePolicy,
+} from "../../shared/timelines.ts";
 import { commitId } from "./atlas.ts";
 import type { TestServer } from "./server.ts";
 
@@ -15,8 +20,12 @@ export interface WorldRepo {
   name: string;
   /** Main's tip. */
   main: string;
-  /** The timeline bookmark's tip: its work. */
+  /** The timeline's work tip, in its owned work source. */
   tip: string;
+  /** The timeline's owned work source in this repository (CORE-255). */
+  sourceId: string;
+  /** The branch of that source holding the work (`refs/heads/work`). */
+  sourceRef: string;
 }
 
 export interface WorldTimeline {
@@ -52,7 +61,15 @@ export async function timelineWorld(
     const { id } = await server.repo("orbit", repoName);
     const main = commitId();
     await server.push(`orbit/${repoName}`, "main", main);
-    repos.push({ id, owner: "orbit", name: repoName, main, tip: main });
+    repos.push({
+      id,
+      owner: "orbit",
+      name: repoName,
+      main,
+      tip: main,
+      sourceId: "",
+      sourceRef: "",
+    });
   }
   await mutate(server, [
     {
@@ -62,46 +79,60 @@ export async function timelineWorld(
     },
     { kind: "issue.create", id: "work", data: { teamId: "team", title: `Ship ${name}` } },
   ]);
-  await server.call("POST", "/api/tracker/orbit/timelines", {
+  const created = await server.call<TimelineDetail>("POST", "/api/tracker/orbit/timelines", {
     slug,
     name,
     policy,
     repos: names.map((n) => `orbit/${n}`),
   });
+  for (const repo of repos) {
+    const source = created.timeline.repos.find((r) => r.id === repo.id)?.source;
+    if (!source || source.kind !== "timeline-work")
+      throw new Error(`The timeline has no work source in orbit/${repo.name}`);
+    repo.sourceId = source.sourceId;
+    repo.sourceRef = source.ref;
+  }
   const timeline = { slug, name, issue: "work", repos };
   for (const repo of repos) await work(server, timeline, repo);
   return timeline;
 }
 
-/** Push a new commit to the timeline's bookmark in `repo`. */
-export async function work(server: TestServer, timeline: WorldTimeline, repo: WorldRepo) {
+/** Push a new commit to the timeline's work in `repo`: its owned source, never canonical. */
+export async function work(server: TestServer, _timeline: WorldTimeline, repo: WorldRepo) {
   repo.tip = commitId();
-  await server.push(`orbit/${repo.name}`, `timeline/${timeline.slug}`, repo.tip);
+  await server.push(
+    `orbit/${repo.name}`,
+    repo.sourceRef.replace(/^refs\/heads\//, ""),
+    repo.tip,
+    repo.sourceId,
+  );
   return repo.tip;
 }
 
-/** The change ids the push log saw reach the bookmark in `repo`, oldest first. */
+/** The change ids the push log saw reach the timeline's work in `repo`, oldest first. */
 export async function changes(
   server: TestServer,
-  timeline: WorldTimeline,
+  _timeline: WorldTimeline,
   repo: WorldRepo,
   ids: string[],
 ) {
-  const ref = `refs/heads/timeline/${timeline.slug}`;
+  const ref = repo.sourceRef;
   const [update] = await server.sql<{ id: number }>(
-    `INSERT INTO ref_updates (repo_id, ref, old_oid, new_oid, actor_id)
-     VALUES (?, ?, ?, ?, 'acc_marco') RETURNING id`,
+    `INSERT INTO ref_updates (repo_id, source_id, ref, old_oid, new_oid, actor_id)
+     VALUES (?, ?, ?, ?, ?, 'acc_marco') RETURNING id`,
     repo.id,
+    repo.sourceId,
     ref,
     repo.main,
     repo.tip,
   );
   for (const [i, id] of ids.entries())
     await server.sql(
-      `INSERT INTO change_refs (repo_id, change_id, ref, first_commit_oid, first_update_id,
-         last_commit_oid, first_seen_at, last_seen_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO change_refs (repo_id, source_id, change_id, ref, first_commit_oid,
+         first_update_id, last_commit_oid, first_seen_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       repo.id,
+      repo.sourceId,
       id,
       ref,
       repo.tip,
@@ -143,7 +174,10 @@ export async function askApproval(
   return id;
 }
 
-/** A CI run, as a push (or a preview, or a landing) leaves it. */
+/**
+ * A CI run, as a push (or a preview, or a landing) leaves it. A run of the
+ * timeline's work names its source (`sourceId`); a landing's runs are canonical.
+ */
 export async function ciRun(
   server: TestServer,
   run: {
@@ -151,16 +185,19 @@ export async function ciRun(
     number: number;
     commit: string;
     ref: string;
+    sourceId?: string;
     status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
     preview?: "create" | "teardown";
   },
 ) {
   const id = crypto.randomUUID().replaceAll("-", "");
   await server.sql(
-    `INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, preview_action)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO ci_runs (id, repo_id, source_id, number, commit_oid, ref, trigger, status,
+       preview_action)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     id,
     run.repo.id,
+    run.sourceId ?? "canonical",
     run.number,
     run.commit,
     run.ref,
@@ -186,10 +223,11 @@ export async function deployment(
   },
 ) {
   const [row] = await server.sql<{ id: number }>(
-    `INSERT INTO deployments (repo_id, environment, timeline_slug, timeline_id, checkpoint_id,
-       commit_oid, url, status, revived, rebuilt_from, expires_at, torn_down_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+    `INSERT INTO deployments (repo_id, source_id, environment, timeline_slug, timeline_id,
+       checkpoint_id, commit_oid, url, status, revived, rebuilt_from, expires_at, torn_down_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
     repo.id,
+    repo.sourceId,
     `timeline/${view.timeline.slug}`,
     view.timeline.slug,
     view.timeline.id,
@@ -225,24 +263,27 @@ export async function pageSet(
   const ref = `refs/heads/timeline/${view.timeline.slug}`;
   const key = view.checkpoint.id;
   await server.sql(
-    `INSERT INTO kg_page_sets (repo_id, ref, set_key, checkpoint_id, checkpoint_number,
-       commit_oid, status, error)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO kg_page_sets (repo_id, source_id, ref, set_key, checkpoint_id,
+       checkpoint_number, commit_oid, status, error)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     repo.id,
+    repo.sourceId,
     ref,
     key,
     key,
     view.checkpoint.number,
     repo.tip,
-    set.status,
+    // Pages are only written while their set is writing; then it finishes.
+    set.pages?.length ? "writing" : set.status,
     set.error ?? null,
   );
   for (const [position, page] of (set.pages ?? []).entries())
     await server.sql(
-      `INSERT INTO kg_page_set_pages (repo_id, ref, set_key, slug, title, section, position,
-         kind, change, outcome, body, inputs_hash)
-       VALUES (?, ?, ?, ?, ?, 'Components', ?, 'component', ?, ?, ?, 'hash')`,
+      `INSERT INTO kg_page_set_pages (repo_id, source_id, ref, set_key, slug, title, section,
+         position, kind, change, outcome, body, inputs_hash)
+       VALUES (?, ?, ?, ?, ?, ?, 'Components', ?, 'component', ?, ?, ?, 'hash')`,
       repo.id,
+      repo.sourceId,
       ref,
       key,
       page.slug,
@@ -251,6 +292,16 @@ export async function pageSet(
       page.change,
       page.outcome,
       page.body ?? "",
+    );
+  if (set.pages?.length && set.status !== "writing")
+    await server.sql(
+      `UPDATE kg_page_sets SET status = ? WHERE repo_id = ? AND source_id = ? AND ref = ?
+         AND set_key = ?`,
+      set.status,
+      repo.id,
+      repo.sourceId,
+      ref,
+      key,
     );
 }
 

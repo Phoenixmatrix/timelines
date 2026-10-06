@@ -22,7 +22,7 @@ export type PushedRepo = Pick<
   | "default_branch"
   | "artifacts_name"
   | "artifacts_remote"
->;
+> & { source_id?: string };
 
 /**
  * Knowledge, release notes, the mirror, the push log (and what it did to
@@ -45,6 +45,12 @@ function pushEffects(
   strict: boolean,
 ): void {
   invalidateRefs(repo.artifacts_name);
+  if (repo.source_id && repo.source_id !== "canonical") {
+    // Work is an isolated source. Never wake canonical mirrors or observers.
+    waitUntil(notifyKnowledge(env, repo.id));
+    waitUntil(onPush(env, repo, actor, waitUntil));
+    return;
+  }
   waitUntil(notifyKnowledge(env, repo.id));
   const releaseNotes = notifyReleaseNotes(env, repo.id);
   waitUntil(

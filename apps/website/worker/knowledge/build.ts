@@ -79,10 +79,15 @@ import { buildAiUsage, meterBuildCall, type ModelUsage } from "./meter.ts";
 import { coordinator } from "./coordinator.ts";
 import { computeOverlay, overlayFailed, planOverlay, toAnalyze } from "./overlay.ts";
 import { runPageSet } from "./pages.ts";
+import { knowledgeFixtureBarrier } from "./fixture-barrier.ts";
 import { chunk } from "./util.ts";
 import { planWiki, updatePages, WRITER, type WikiSource, type WikiStats } from "./wiki.ts";
 import { aiWork, type AiWork } from "../usage/ai.ts";
 import { paidSteps } from "./paid-steps.ts";
+import { knowledgeRepo, timelineKnowledgeSource } from "./sources.ts";
+import { getWorkSource } from "../timelines/sources.ts";
+import { releaseSourceRoots } from "../retention/work-sources.ts";
+import { pinKnowledgeBase, releaseKnowledgeBase, withOverlayReader } from "./source-reader.ts";
 
 export interface BuildParams {
   repoId: string;
@@ -96,13 +101,14 @@ export interface BuildParams {
   /** Pushes to main this update covers (CORE-286). */
   pushes?: number;
   /** Compute a timeline's overlay instead of building main's graph. */
-  overlay?: { ref: string; commit: string; base?: string };
+  overlay?: { ref: string; sourceId: string; commit: string; base?: string };
   /** Write a timeline's wiki page set (queued in kg_page_sets) instead. */
-  pages?: { ref: string; key: string };
+  pages?: { ref: string; key: string; sourceId?: string };
 }
 
 interface RepoRow {
   id: string;
+  source_id?: string;
   artifacts_name: string;
   artifacts_remote: string;
   full_name: string;
@@ -122,24 +128,6 @@ const REVIEW_ROUNDS = 6;
 const WIKI_BATCH = 6;
 /** Atlas retention passes around a publication; each is bounded (worker/atlas/retention.ts). */
 const ATLAS_RETENTION_STEPS = 20;
-
-async function repoRow(d1: D1Database, repoId: string): Promise<RepoRow | null> {
-  const row = await db(d1)
-    .selectFrom("repos as r")
-    .innerJoin("accounts as o", "o.id", "r.owner_id")
-    .select(["r.id", "r.artifacts_name", "r.artifacts_remote", "o.slug", "r.name"])
-    .where("r.id", "=", repoId)
-    // A repository being deleted builds nothing more (CORE-199).
-    .where("r.deleted_at", "is", null)
-    .executeTakeFirst();
-  if (!row) return null;
-  return {
-    id: row.id,
-    artifacts_name: row.artifacts_name,
-    artifacts_remote: row.artifacts_remote,
-    full_name: `${row.slug}/${row.name}`,
-  };
-}
 
 /** Why a build may no longer spend on models, or null while it may. */
 export async function buildStopped(
@@ -243,11 +231,31 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       row.artifacts_remote,
       new Timing(),
       (work) => this.ctx.waitUntil(work),
+      row.source_id && row.source_id !== "canonical" ? "refs/heads/work" : undefined,
     );
   }
 
-  async #withReader<T>(row: RepoRow, work: (reader: RepoReader) => Promise<T>): Promise<T> {
-    const reader = this.#reader(row);
+  async #withReader<T>(
+    row: RepoRow,
+    work: (reader: RepoReader) => Promise<T>,
+    snapshot?: string,
+  ): Promise<T> {
+    if (snapshot && row.source_id && row.source_id !== "canonical")
+      return withOverlayReader(
+        this.env,
+        row.id,
+        row.source_id,
+        snapshot,
+        (pending) => this.ctx.waitUntil(pending),
+        work,
+      );
+    const current = await knowledgeRepo(this.env, row.id, row.source_id);
+    if (!current) throw new Error("Repository not found");
+    if (row.source_id && row.source_id !== "canonical") {
+      const source = await getWorkSource(this.env, row.id, row.source_id);
+      if (source?.state !== "ready") throw new Error("Timeline source is read-only or unavailable");
+    }
+    const reader = this.#reader(current);
     try {
       return await work(reader);
     } finally {
@@ -337,8 +345,14 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     if (event.payload.overlay) return this.#overlay(event.payload, step);
     if (event.payload.pages)
       return runPageSet(this.env, { ...event.payload, pages: event.payload.pages }, step, {
-        repo: (id) => repoRow(this.env.DB, id),
-        withReader: (row, work) => this.#withReader(row, work),
+        repo: async (id, ref, sourceId) => {
+          const source = await timelineKnowledgeSource(this.env, id, ref);
+          if (!source || source.state !== "ready" || source.source_id !== sourceId)
+            throw new Error("Timeline source unavailable or migration required");
+          return knowledgeRepo(this.env, id, sourceId);
+        },
+        withReader: (row, work, snapshot) => this.#withReader(row, work, snapshot),
+        pinBase: (id, commit, snapshot) => pinKnowledgeBase(this.env, id, commit, snapshot),
         finished: (buildId) => coordinator(this.env, event.payload.repoId).pagesFinished(buildId),
       });
     const { repoId, buildId, force } = event.payload;
@@ -363,7 +377,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       });
     try {
       const start = await progress("start", "snapshot", async () => {
-        const row = await repoRow(env.DB, repoId);
+        const row = await knowledgeRepo(env, repoId);
         if (!row) return null;
         invalidateRefs(row.artifacts_name);
         const refs = await this.#withReader(row, (reader) => reader.refs());
@@ -889,8 +903,9 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
     const models = (params.policy ?? LEGACY_KNOWLEDGE_POLICY).ai.models;
     const env = this.env;
     try {
+      if (!params.overlay!.sourceId) throw new Error("Timeline source migration required");
       const plan = await step.do("overlay-plan", STEP, async () => {
-        const row = await repoRow(env.DB, repoId);
+        const row = await knowledgeRepo(env, repoId, params.overlay!.sourceId);
         const state = await db(env.DB)
           .selectFrom("kg_state")
           .select("indexed_commit")
@@ -898,8 +913,12 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
           .executeTakeFirst();
         if (!row || !state?.indexed_commit) return null;
         const base = params.overlay!.base ?? state.indexed_commit;
-        const plan = await this.#withReader(row, (reader) => planOverlay(reader, commit, base));
-        const main = await loadSnapshot(env.DB, repoId, "current");
+        const source = await getWorkSource(env, repoId, params.overlay!.sourceId);
+        if (!source || source.state !== "ready") throw new Error("Timeline source is not active");
+        const plan = await this.#withReader(row, (reader) =>
+          planOverlay(reader, commit, base, { commit: source.fork_commit, tree: source.fork_tree }),
+        );
+        const main = await pinKnowledgeBase(env, repoId, base, `knowledge:${buildId}`);
         const known = await loadAnalyses(
           env.DB,
           plan.changes.flatMap((c) => (c.blob ? [c.blob] : [])),
@@ -909,6 +928,11 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
       if (!plan) {
         await step.do("overlay-finish", STEP, async () => {
           await coordinator(env, repoId).overlayFinished(ref, buildId, true, null, null);
+          await releaseSourceRoots(
+            env,
+            "knowledge-overlay",
+            `${repoId}:${params.overlay!.sourceId}:${buildId}`,
+          );
           return null;
         });
         return { status: "waiting" };
@@ -925,22 +949,46 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams> {
         reused += stats.reused;
         failed += stats.failed;
       }
-      const result = await step.do("overlay-diff", STEP, () =>
-        computeOverlay(env.DB, row, ref, buildId, commit, plan.plan, {
-          analyzed,
-          reused,
-          failed,
-        }),
-      );
+      await knowledgeFixtureBarrier(env, step, params.overlay!.sourceId, buildId);
+      const result = await step.do("overlay-diff", STEP, async () => {
+        const result = await computeOverlay(
+          env.DB,
+          row,
+          ref,
+          buildId,
+          commit,
+          plan.plan,
+          {
+            analyzed,
+            reused,
+            failed,
+            sourceId: params.overlay!.sourceId,
+          },
+          `knowledge:${buildId}`,
+        );
+        return result;
+      });
       await step.do("overlay-finish", STEP, async () => {
         await coordinator(env, repoId).overlayFinished(ref, buildId, true, null, result.base);
+        await releaseSourceRoots(
+          env,
+          "knowledge-overlay",
+          `${repoId}:${params.overlay!.sourceId}:${buildId}`,
+        );
+        await releaseKnowledgeBase(env, repoId, `knowledge:${buildId}`);
         return null;
       });
       return { status: "succeeded", commit, counts: result.counts };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await step.do("overlay-fail", async () => {
-        await overlayFailed(env.DB, repoId, ref, commit, message);
+        await overlayFailed(env.DB, repoId, ref, commit, message, params.overlay!.sourceId);
+        await releaseSourceRoots(
+          env,
+          "knowledge-overlay",
+          `${repoId}:${params.overlay!.sourceId}:${buildId}`,
+        );
+        await releaseKnowledgeBase(env, repoId, `knowledge:${buildId}`);
         await coordinator(env, repoId).overlayFinished(ref, buildId, false, message, null);
         return null;
       });

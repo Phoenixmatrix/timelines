@@ -27,6 +27,12 @@ const REPO = z
   .string()
   .regex(/^[\w.-]+\/[\w.-]+$/)
   .describe("owner/name, e.g. matrixorg/gitmatrix");
+const SOURCE = z
+  .string()
+  .optional()
+  .describe(
+    "Code source ID from the timeline or page context; canonical when omitted. Preserve it when reading timeline work.",
+  );
 const OWNER = z
   .string()
   .regex(/^[\w-]+$/)
@@ -186,11 +192,12 @@ export function buildTools(context: ToolContext) {
         'List a folder of a repository (the root by default), with its README if it has one. Returns {ref, entries: ["dir path" | "file path"], readme?, url}.',
       inputSchema: z.object({
         repo: REPO,
+        source: SOURCE,
         path: z.string().optional().describe("Folder path; empty for the root"),
         ref: z.string().optional().describe("Branch, tag or commit; the default branch otherwise"),
       }),
-      execute: async ({ repo, path = "", ref }) => {
-        const query = new URLSearchParams({ ref: ref ?? "", path });
+      execute: async ({ repo, path = "", ref, source = "canonical" }) => {
+        const query = new URLSearchParams({ ref: ref ?? "", path, source });
         const r = await api("GET", `${repoApi(repo)}/tree?${query.toString()}`);
         if (!r.ok) return failed(r);
         const body = r.body as {
@@ -202,7 +209,8 @@ export function buildTools(context: ToolContext) {
           ref: body.ref,
           entries: body.entries.map((e) => `${e.type === "tree" ? "dir " : "file"} ${e.path}`),
           ...(body.readme ? { readme: clip(body.readme.text, 3000) } : {}),
-          url: `/${repo}/tree/${body.ref}/${path}`.replace(/\/$/, ""),
+          source,
+          url: `${`/${repo}/tree/${body.ref}/${path}`.replace(/\/$/, "")}?source=${enc(source)}`,
         };
       },
     }),
@@ -211,6 +219,7 @@ export function buildTools(context: ToolContext) {
         "Read a file from a repository, with line numbers. Use lines (e.g. 120-180) for part of a long file; otherwise the first 400 lines. Returns {ref, commit, totalLines, content, url}.",
       inputSchema: z.object({
         repo: REPO,
+        source: SOURCE,
         path: z.string().min(1),
         ref: z.string().optional(),
         lines: z
@@ -218,8 +227,8 @@ export function buildTools(context: ToolContext) {
           .regex(/^\d+(-\d+)?$/)
           .optional(),
       }),
-      execute: async ({ repo, path, ref, lines }) => {
-        const query = new URLSearchParams({ ref: ref ?? "", path });
+      execute: async ({ repo, path, ref, lines, source = "canonical" }) => {
+        const query = new URLSearchParams({ ref: ref ?? "", path, source });
         const r = await api("GET", `${repoApi(repo)}/blob?${query.toString()}`);
         if (!r.ok) return failed(r);
         const blob = r.body as {
@@ -236,7 +245,8 @@ export function buildTools(context: ToolContext) {
           commit: blob.commitOid.slice(0, 12),
           totalLines: total,
           content: clip(text, 24_000),
-          url: `/${repo}/blob/${blob.ref}/${path}${lines ? `#L${lines.replace("-", "-L")}` : ""}`,
+          source,
+          url: `/${repo}/blob/${blob.ref}/${path}?source=${enc(source)}${lines ? `#L${lines.replace("-", "-L")}` : ""}`,
         };
       },
     }),
@@ -245,11 +255,13 @@ export function buildTools(context: ToolContext) {
         "Recent commits on a branch (newest first), 30 per page. Returns {ref, hasMore, commits: [{commit, title, author, at}], url}.",
       inputSchema: z.object({
         repo: REPO,
+        source: SOURCE,
         ref: z.string().optional(),
         page: z.number().int().min(1).optional(),
       }),
-      execute: async ({ repo, ref, page }) => {
+      execute: async ({ repo, ref, page, source = "canonical" }) => {
         const query = new URLSearchParams({
+          source,
           ...(ref ? { ref } : {}),
           ...(page ? { page: String(page) } : {}),
         });
@@ -269,18 +281,24 @@ export function buildTools(context: ToolContext) {
             author: c.authorName,
             at: new Date(c.authoredAt * 1000).toISOString(),
           })),
-          url: `/${repo}/commits/${body.ref}`,
+          source,
+          url: `/${repo}/commits/${body.ref}?source=${enc(source)}`,
         };
       },
     }),
     semantic_changes: tool({
       description:
         "What recently changed in a repository at the level of code meaning (functions, types, exports added, changed or removed), newest first.",
-      inputSchema: z.object({ repo: REPO }),
-      execute: async ({ repo }) => {
-        const r = await api("GET", `${repoApi(repo)}/semantic`);
+      inputSchema: z.object({ repo: REPO, source: SOURCE, ref: z.string().optional() }),
+      execute: async ({ repo, source = "canonical", ref }) => {
+        const query = new URLSearchParams({ source, ...(ref ? { ref } : {}) });
+        const r = await api("GET", `${repoApi(repo)}/semantic?${query.toString()}`);
         return r.ok
-          ? { ...(compact(r.body, { strings: 300, items: 30 }) as object), url: `/${repo}/changes` }
+          ? {
+              ...(compact(r.body, { strings: 300, items: 30 }) as object),
+              source,
+              url: `/${repo}/changes?${query.toString()}`,
+            }
           : failed(r);
       },
     }),

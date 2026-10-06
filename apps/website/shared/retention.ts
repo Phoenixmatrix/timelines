@@ -10,7 +10,7 @@ export type RetentionScope = "account" | "site";
 
 /**
  * How a category is controlled:
- * - "policy": off until an administrator enables it (every new category).
+ * - "policy": administrator-configurable; off unless defaultEnabled is set.
  * - "active": cleanup that already ran before retention policies existed and
  *   always runs (preview teardown, Atlas snapshots); its thresholds are
  *   editable within their bounds.
@@ -36,6 +36,8 @@ export interface RetentionCategory {
   id: string;
   scope: RetentionScope;
   control: RetentionControl;
+  /** Policy categories normally opt in; lifecycle byte retention starts enabled. */
+  defaultEnabled?: boolean;
   label: string;
   description: string;
   /** In plain words, what this category never deletes. */

@@ -48,6 +48,7 @@ const C1 = "1".repeat(40);
 const C2 = "2".repeat(40);
 const TIP = "7".repeat(40);
 const REF = "refs/heads/timeline/plan";
+const SOURCE = "work_atlas_plan";
 /** The fixture timeline's regrouping: over search and billing's ledger, against #1. */
 const COMPUTED = {
   code: "regrouping",
@@ -81,9 +82,23 @@ function setup(bookmarks: Record<string, string> = { [REF]: TIP }) {
       ('ann', 'user', 'ann', 'Ann'), ('ben', 'user', 'ben', 'Ben');
     INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r1', 'ann', 'shop', 'private', '${artifacts}', 'https://shop');
+    INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, owner_id,
+      artifacts_name, artifacts_remote, state, allocation_operation_id, fork_source_id,
+      fork_commit, fork_tree, fork_ref, initial_source_id, initial_commit, initial_tree, initial_ref,
+      initial_token_revoked, created_at, updated_at)
+    VALUES ('${SOURCE}', 'r1', 'timeline-plan', 'plan', 'ann', '${artifacts}-work',
+      'https://shop-work', 'ready', 'allocate-plan', 'canonical', '${C1}', '${C1}',
+      'refs/heads/main', 'canonical', '${C1}', '${C1}', 'refs/heads/main',
+      1, '2026-10-04T00:00:00Z', '2026-10-04T00:00:00Z');
   `);
   const git = fakeRemotes();
-  git.add("https://shop", { "refs/heads/main": C1, ...bookmarks });
+  git.add("https://shop", { "refs/heads/main": C1, [REF]: C2 }, undefined, artifacts);
+  git.add(
+    "https://shop-work",
+    bookmarks[REF] ? { "refs/heads/work": bookmarks[REF] } : {},
+    "refs/heads/work",
+    `${artifacts}-work`,
+  );
   const touched: string[] = [];
   const env = {
     DB: d1(sqlite),
@@ -127,7 +142,7 @@ const repo = { owner: "ann", name: "shop" };
 async function planned(s: ReturnType<typeof setup>) {
   await writeAtlasFixtureGraph(s.env.DB, "r1", "shop", C1);
   const main = await publishAtlasFixture(s.env, "r1", C1);
-  const overlay = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1);
+  const overlay = await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1, SOURCE);
   return { main, overlay };
 }
 
@@ -147,6 +162,24 @@ async function all(request: Parameters<typeof atlasApi.timeline>[2] = {}) {
 }
 
 describe("Timelines in the Atlas", () => {
+  test("source selection cannot read another timeline or fall back to a canonical bookmark", async () => {
+    const s = setup();
+    await planned(s);
+    await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", C2, C1, "canonical");
+    const selected = await atlasApi.timeline(repo, "timeline/plan");
+    expect(selected.repos[0]).toMatchObject({ sourceId: SOURCE, commit: TIP, head: TIP });
+    const projection = await s.call(`overview?source=${SOURCE}`);
+    expect(projection.status).toBe(400);
+    expect(await projection.json()).toMatchObject({ code: "bad_request" });
+    const wrong = await s.call("timeline?ref=timeline/plan&source=work_other");
+    expect(wrong.status).toBe(409);
+    expect(await wrong.json()).toMatchObject({ code: "timeline_changed" });
+    s.sqlite.exec("DELETE FROM timeline_work_sources");
+    const missing = await s.call("timeline?ref=timeline/plan");
+    expect(missing.status).toBe(409);
+    expect(await missing.text()).toContain("migration required");
+  });
+
   test("a timeline's files are placed in capabilities, with what's inferred said so", async () => {
     const s = setup();
     const { main } = await planned(s);
@@ -162,6 +195,7 @@ describe("Timelines in the Atlas", () => {
     expect(first.repos).toEqual([
       expect.objectContaining({
         repoId: "r1",
+        sourceId: SOURCE,
         owner: "ann",
         name: "shop",
         ref: "timeline/plan",
@@ -349,24 +383,27 @@ describe("Timelines in the Atlas", () => {
   test("wiki pages are reachable from the capabilities they're about, labelled by their main", async () => {
     const s = setup();
     await planned(s);
-    // Main's page about the search concept, and the timeline's checkpoint set.
+    // Publish pages while the owned set is writing; completed sets are immutable.
     s.sqlite.exec(`
       INSERT INTO kg_overlay_changes (repo_id, overlay_id, node_id, kind, change, name, path, summary, detail)
         SELECT 'r1', overlay_id, 'concept:search', 'concept', 'changed', 'Search', NULL, '',
           '{"fields":["summary"],"links":{"added":[],"removed":[]}}' FROM kg_overlays;
       INSERT INTO wiki_pages (repo_id, slug, title, section, position, node_id, body, inputs_hash, generated_in)
         VALUES ('r1', 'search', 'Search', 'Concepts', 3, 'concept:search', 'Search.', 'h', '${C1}');
-      INSERT INTO kg_page_sets (repo_id, ref, set_key, checkpoint_id, checkpoint_number, commit_oid,
+      INSERT INTO kg_page_sets (repo_id, source_id, ref, set_key, checkpoint_id, checkpoint_number, commit_oid,
           base_commit, status, finished_at)
-        VALUES ('r1', '${REF}', 'cp_1', 'cp_1', 1, '${TIP}', '${C1}', 'succeeded', '2026-10-03T00:00:00.000Z');
-      INSERT INTO kg_page_set_pages (repo_id, ref, set_key, slug, title, section, position, node_id,
+        VALUES ('r1', '${SOURCE}', '${REF}', 'cp_1', 'cp_1', 1, '${TIP}', '${C1}', 'writing', NULL);
+      INSERT INTO kg_page_set_pages (repo_id, source_id, ref, set_key, slug, title, section, position, node_id,
           kind, change, outcome, inputs_hash)
-        VALUES ('r1', '${REF}', 'cp_1', 'search', 'Search', 'Concepts', 0, 'concept:search',
+        VALUES ('r1', '${SOURCE}', '${REF}', 'cp_1', 'search', 'Search', 'Concepts', 0, 'concept:search',
           'glossary', 'changed', 'written', 'h');
+      UPDATE kg_page_sets SET status = 'succeeded', finished_at = '2026-10-03T00:00:00.000Z'
+        WHERE repo_id = 'r1' AND source_id = '${SOURCE}' AND ref = '${REF}' AND set_key = 'cp_1';
     `);
     const page = await atlasApi.timeline(repo, "timeline/plan");
     expect(page.wiki).toMatchObject({
       key: "cp_1",
+      sourceId: SOURCE,
       checkpoint: { id: "cp_1", number: 1 },
       commit: TIP,
       baseCommit: C1,
@@ -396,7 +433,7 @@ describe("Timelines in the Atlas", () => {
     await planned(s);
     const first = await atlasApi.timeline(repo, "timeline/plan", { limit: 1 });
     // A push recomputes the overlay: the traversal stops, it doesn't mix two.
-    await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1);
+    await writeAtlasFixtureOverlay(s.env.DB, "r1", "timeline/plan", TIP, C1, SOURCE);
     const changed = await atlasApi
       .timeline(repo, "timeline/plan", { limit: 1, cursor: first.next })
       .then(() => null, atlasErrorOf);

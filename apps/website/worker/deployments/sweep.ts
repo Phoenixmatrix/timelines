@@ -27,6 +27,7 @@ const livePreviews = (kdb: DB) =>
     .select([
       "d.id",
       "d.repo_id",
+      "d.source_id",
       "d.timeline_slug",
       "d.timeline_id",
       "d.checkpoint_id",
@@ -35,12 +36,24 @@ const livePreviews = (kdb: DB) =>
       "d.expiry_pinned",
       "d.revived",
       "d.created_at",
+      "d.status",
+      "d.teardown_run_id",
       "p.owner_id",
       "p.artifacts_name",
       "p.artifacts_remote",
       "p.default_branch",
     ])
-    .where("d.status", "in", ["active", "sleeping"])
+    .where((eb) =>
+      eb.or([
+        eb("d.status", "in", ["active", "sleeping"]),
+        eb.and([
+          eb("d.status", "=", "expired"),
+          eb("d.teardown_completed_at", "is", null),
+          eb("d.teardown_unmanaged_at", "is", null),
+          eb("d.teardown_run_id", "is", null),
+        ]),
+      ]),
+    )
     .where("d.timeline_slug", "is not", null)
     // A repository's deletion tears down its own previews (CORE-199).
     .where("p.deleted_at", "is", null)
@@ -83,6 +96,13 @@ export async function sweepPreviews(
 ): Promise<SweepResult> {
   const now = options.now ?? Date.now();
   const kdb = db(env.DB);
+  // Retry only acknowledged failed/cancelled teardown attempts, never leases.
+  await env.DB.prepare(`UPDATE deployments SET teardown_run_id=NULL
+    WHERE status='expired' AND teardown_completed_at IS NULL AND teardown_unmanaged_at IS NULL
+      AND EXISTS (SELECT 1 FROM ci_runs c WHERE c.id=deployments.teardown_run_id
+        AND c.status IN ('failed','cancelled')
+        AND NOT EXISTS (SELECT 1 FROM ci_jobs j WHERE j.run_id=c.id
+          AND (j.status IN ('pending','queued','running') OR j.source_completion_pending=1)))`).run();
   const rows = await livePreviews(kdb).execute();
   const result: SweepResult = { moved: 0, expired: [], teardowns: [] };
 
@@ -124,11 +144,12 @@ export async function sweepPreviews(
     // A timeline's previews in a repository go together, once all are due.
     const groups = new Map<string, Row[]>();
     for (const row of previews) {
-      const key = `${row.repo_id}\0${row.timeline_slug}`;
+      const key = `${row.repo_id}\0${row.source_id}\0${row.timeline_slug}`;
       groups.set(key, [...(groups.get(key) ?? []), row]);
     }
     for (const group of groups.values()) {
       const due = group.every((row) => {
+        if (row.status === "expired") return true;
         const at = expiry.get(row.id);
         return at != null && Date.parse(at) <= now;
       });
@@ -161,7 +182,10 @@ async function tearDown(
       "in",
       group.map((row) => row.id),
     )
-    .where("status", "in", ["active", "sleeping"])
+    .where("status", "in", ["active", "sleeping", "expired"])
+    .where("teardown_run_id", "is", null)
+    .where("teardown_completed_at", "is", null)
+    .where("teardown_unmanaged_at", "is", null)
     .returning("id")
     .execute();
   if (!claimed.length) return [];
@@ -174,6 +198,7 @@ async function tearDown(
       {
         repo: {
           id: newest.repo_id,
+          source_id: newest.source_id,
           artifacts_name: newest.artifacts_name,
           artifacts_remote: newest.artifacts_remote,
           default_branch: newest.default_branch,
@@ -183,6 +208,7 @@ async function tearDown(
           action: "teardown",
           timeline: newest.timeline_slug!,
           checkpoint: newest.checkpoint_id,
+          teardownOf: newest.id,
         },
       },
     ],
@@ -195,6 +221,14 @@ async function tearDown(
       .updateTable("deployments")
       .set({ teardown_run_id: started.runId })
       .where("id", "in", ids)
+      .execute();
+  }
+  if (started && "skipped" in started && started.teardownUnmanaged) {
+    await kdb
+      .updateTable("deployments")
+      .set({ teardown_unmanaged_at: at })
+      .where("id", "in", ids)
+      .where("teardown_run_id", "is", null)
       .execute();
   }
   return runs;

@@ -58,6 +58,22 @@ export interface TrackerDatabase {
   timeline_heads: { timeline_id: string; repo_id: string; oid: string | null };
   /** Landings (CORE-77), whole as JSON; a timeline's newest is its current one. */
   timeline_landings: { id: string; timeline_id: string; created_at: string; data: string };
+  timeline_reservations: { slug: string; id: string; actor_id: string; input: string };
+  timeline_creation_cancellations: { timeline_id: string };
+  timeline_source_operations: {
+    id: string;
+    timeline_id: string;
+    repo_id: string;
+    source_id: string;
+    state: string;
+    data: string;
+  };
+  timeline_source_allocations: {
+    source_id: string;
+    timeline_id: string;
+    repo_id: string;
+    data: string;
+  };
 }
 
 /**
@@ -71,7 +87,11 @@ export const TIMELINE_TABLES = `CREATE TABLE IF NOT EXISTS timelines (id TEXT PR
   CREATE TABLE IF NOT EXISTS timeline_checkpoints (id TEXT PRIMARY KEY, timeline_id TEXT NOT NULL, number INTEGER NOT NULL, data TEXT NOT NULL, UNIQUE (timeline_id, number));
   CREATE TABLE IF NOT EXISTS timeline_heads (timeline_id TEXT NOT NULL, repo_id TEXT NOT NULL, oid TEXT, PRIMARY KEY (timeline_id, repo_id));
   CREATE TABLE IF NOT EXISTS timeline_landings (id TEXT PRIMARY KEY, timeline_id TEXT NOT NULL, created_at TEXT NOT NULL, data TEXT NOT NULL);
-  CREATE INDEX IF NOT EXISTS timeline_landings_by_timeline ON timeline_landings(timeline_id, created_at);`;
+  CREATE INDEX IF NOT EXISTS timeline_landings_by_timeline ON timeline_landings(timeline_id, created_at);
+  CREATE TABLE IF NOT EXISTS timeline_reservations (slug TEXT PRIMARY KEY, id TEXT NOT NULL UNIQUE, actor_id TEXT NOT NULL, input TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS timeline_creation_cancellations (timeline_id TEXT PRIMARY KEY);
+  CREATE TABLE IF NOT EXISTS timeline_source_operations (id TEXT PRIMARY KEY, timeline_id TEXT NOT NULL, repo_id TEXT NOT NULL, source_id TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS timeline_source_allocations (source_id TEXT PRIMARY KEY, timeline_id TEXT NOT NULL, repo_id TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(timeline_id,repo_id));`;
 
 /** The storage surface the store needs: `ctx.storage.sql`, or a test double. */
 export interface SqlDatabase {

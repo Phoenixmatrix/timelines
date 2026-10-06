@@ -19,6 +19,10 @@ import {
 } from "../../shared/timelines.ts";
 import { fail } from "../tracker/store.ts";
 import { checkpointSets } from "../knowledge/pages.ts";
+import { resolveTimelineSource } from "./sources.ts";
+import { admittedReceipts, revisionClosure, validateMergeEdges } from "./integration.ts";
+import type { SourceDependency } from "../../shared/code-source.ts";
+import { pinSourceRoot } from "../retention/work-sources.ts";
 
 /** CI runs shown per commit: the newest. */
 const RUNS_PER_COMMIT = 3;
@@ -39,7 +43,8 @@ export async function measure(
   const rows = ids.length
     ? await selectRepos(env.DB, actor.id).where("r.id", "in", ids).execute()
     : [];
-  const bookmark = `refs/heads/${timelineBookmark(timeline.slug)}`;
+  if (timeline.migrationState === "frozen")
+    fail("migration_required", "Migration is in progress.", 409);
   return Promise.all(
     timeline.repos.map(async (repo): Promise<CheckpointRepo> => {
       const row = rows.find((r) => r.id === repo.id);
@@ -48,14 +53,137 @@ export async function measure(
         fail("not_found", `No repository ${repo.owner}/${repo.name}.`, 404);
       if (!atLeast(role, "write"))
         fail("forbidden", `A checkpoint needs write access to ${row.owner_slug}/${row.name}.`, 403);
-      const refs = await lsRefs(env, row.artifacts_name, row.artifacts_remote);
+      const physical = await resolveTimelineSource(env, row, repo);
+      const bookmark = physical.source.ref;
+      const refs = await lsRefs(env, physical.repo.artifacts_name, physical.repo.artifacts_remote);
       const commit = refs.find((ref) => ref.name === bookmark)?.oid;
       if (!commit) fail("no_bookmark", `${row.owner_slug}/${row.name} has no ${bookmark}.`, 409);
-      const base = refs.find((ref) => ref.name === `refs/heads/${row.default_branch}`)?.oid ?? null;
+      const canonicalRefs = await lsRefs(env, row.artifacts_name, row.artifacts_remote);
+      const base =
+        canonicalRefs.find((ref) => ref.name === `refs/heads/${row.default_branch}`)?.oid ?? null;
+      using objects = await env.ARTIFACTS.get(physical.repo.artifacts_name);
+      const snapshot = await objects.readCommit(commit);
+      if (!snapshot || !repo.logicalBase)
+        fail("invalid_source", "The source snapshot or logical base is unavailable.", 409);
+      const dependencies: SourceDependency[] = [...(repo.dependencies ?? [])];
+      const baseMembers = await revisionClosure(
+        repo.logicalBase.commit,
+        async (oid) => (await objects.readCommit(oid))?.parents ?? null,
+      );
+      const visited = new Set<string>();
+      const pending = [commit];
+      while (pending.length) {
+        const oid = pending.pop()!;
+        if (visited.has(oid) || baseMembers.has(oid)) continue;
+        visited.add(oid);
+        const value = await objects.readCommit(oid);
+        if (!value) fail("blocked_dependency", "A source ancestor is unavailable.", 409);
+        pending.push(...value.parents);
+        const owner = await db(env.DB)
+          .selectFrom("source_revision_origins as origin")
+          .innerJoin("timeline_work_sources as s", "s.source_id", "origin.source_id")
+          .selectAll("s")
+          .where("origin.repo_id", "=", row.id)
+          .where("s.repo_id", "=", row.id)
+          .where("origin.commit_oid", "=", oid)
+          .where("origin.source_id", "!=", physical.source.sourceId)
+          .executeTakeFirst();
+        if (!owner) continue;
+        if (
+          !dependencies.some(
+            (dependency) =>
+              dependency.source.sourceId === owner.source_id && dependency.source.commit === oid,
+          )
+        )
+          dependencies.push({
+            source: {
+              sourceId: owner.source_id,
+              repoId: row.id,
+              kind: "timeline-work",
+              timelineId: owner.timeline_id,
+              ref: owner.work_ref,
+              commit: oid,
+              tree: value.treeHash,
+            },
+            base: {
+              sourceId: owner.fork_source_id,
+              repoId: row.id,
+              kind: owner.fork_source_id === "canonical" ? "canonical" : "timeline-work",
+              timelineId: null,
+              ref: owner.fork_ref,
+              commit: owner.fork_commit,
+              tree: owner.fork_tree,
+            },
+          });
+        // This exact imported snapshot covers its full ancestry, including
+        // older foreign revisions. Provenance outlives the source's objects.
+        for (const member of await revisionClosure(
+          oid,
+          async (hash) => (await objects.readCommit(hash))?.parents ?? null,
+        ))
+          visited.add(member);
+      }
+      // Select only from snapshots actually imported into this source, never
+      // from a parent's newer landing tip. Persist this choice in the checkpoint.
+      let logicalBase = repo.logicalBase;
+      if (base && dependencies.some((dependency) => !baseMembers.has(dependency.source.commit))) {
+        using canonicalObjects = await env.ARTIFACTS.get(row.artifacts_name);
+        const canonical = await revisionClosure(
+          base,
+          async (oid) => (await canonicalObjects.readCommit(oid))?.parents ?? null,
+        );
+        const snapshots = [logicalBase, ...dependencies.map((dependency) => dependency.source)];
+        const foreign = snapshots.filter(
+          (source) =>
+            source.kind === "timeline-work" && source.sourceId !== physical.source.sourceId,
+        );
+        let uniquelyAdmitted = true;
+        for (const source of foreign)
+          if ((await admittedReceipts(env, source, canonical)).length !== 1)
+            uniquelyAdmitted = false;
+        const candidates = new Map<string, typeof logicalBase>();
+        for (const source of foreign) {
+          const closure = await revisionClosure(
+            source.commit,
+            async (oid) => (await objects.readCommit(oid))?.parents ?? null,
+          );
+          if (snapshots.every((snapshot) => closure.has(snapshot.commit)))
+            candidates.set(`${source.sourceId}:${source.commit}`, source);
+        }
+        // Unproved imports still belong in the checkpoint's dependency record.
+        // Preserve B so landing can report its admission/closure blocker; only a
+        // fresh checkpoint after proof exists may select a different baseline.
+        if (uniquelyAdmitted && candidates.size === 1)
+          logicalBase = candidates.values().next().value!;
+      }
+      try {
+        await validateMergeEdges(
+          env,
+          physical.source,
+          commit,
+          logicalBase.commit,
+          dependencies.map((dependency) => dependency.source.commit),
+          async (oid) => (await objects.readCommit(oid))?.parents ?? null,
+        );
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.startsWith("blocked_dependency:"))
+          throw error;
+        fail("blocked_dependency", error.message, 409);
+      }
+      for (const dependency of dependencies)
+        if (dependency.source.sourceId !== physical.source.sourceId)
+          await pinSourceRoot(env, {
+            repoId: row.id,
+            sourceId: dependency.source.sourceId,
+            consumerKind: "dependency",
+            consumerId: timeline.id,
+            commit: dependency.source.commit,
+          });
       const changes = await db(env.DB)
         .selectFrom("change_refs")
         .select(["change_id", "last_commit_oid"])
         .where("repo_id", "=", row.id)
+        .where("source_id", "=", physical.source.sourceId)
         .where("ref", "=", bookmark)
         .orderBy("last_seen_at", "desc")
         .orderBy("change_id")
@@ -67,6 +195,9 @@ export async function measure(
         name: row.name,
         commit,
         base,
+        source: { ...physical.source, commit, tree: snapshot.treeHash },
+        logicalBase,
+        dependencies,
         changes: changes.map((c) => ({ changeId: c.change_id, commit: c.last_commit_oid })),
       };
     }),
@@ -114,6 +245,7 @@ export async function view(
           .selectFrom("ci_runs")
           .select(["repo_id", "number", "status", "commit_oid", "created_at", "preview_action"])
           .where("repo_id", "=", repo.id)
+          .where("source_id", "=", repo.source?.sourceId ?? "canonical")
           .where("commit_oid", "=", repo.commit)
           .where("step", "=", 0)
           .orderBy("number", "desc")
@@ -175,6 +307,7 @@ export async function view(
       slug: timeline.slug,
       name: timeline.name,
       policy: timeline.policy,
+      status: timeline.status,
     },
     runs,
     previews: previews.map((p) => ({

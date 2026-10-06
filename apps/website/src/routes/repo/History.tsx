@@ -1,11 +1,18 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router";
-import type { CommitSummary, HistoryPage, RepoDetail, TreeEntry } from "../../../shared/api.ts";
+import type {
+  CommitSummary,
+  HistoryPage,
+  RepoDetail,
+  SourceLineage,
+  TreeEntry,
+} from "../../../shared/api.ts";
 import { CommitLink } from "../../components/CommitLink.tsx";
 import { coAuthors } from "../../lib/commitAttribution.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
-import { commitsUrl } from "../../lib/refs.ts";
+import { commitsUrl, treeUrl } from "../../lib/refs.ts";
 import { repoData } from "../../lib/repoData.ts";
+import { api } from "../../lib/api.ts";
 import { LinkedText } from "../../refs/RefLink.tsx";
 
 export function mergeHistory(previous: HistoryPage | null, page: HistoryPage): HistoryPage {
@@ -56,7 +63,14 @@ export function useHistory(
     setLoading(true);
     setError(false);
     repoData
-      .history(repo.owner.slug, repo.name, `${head}${path ? `/${path}` : ""}`, withEntries, cursor)
+      .history(
+        repo.owner.slug,
+        repo.name,
+        `${head}${path ? `/${path}` : ""}`,
+        withEntries,
+        cursor,
+        repo.source?.sourceId,
+      )
       .then(
         (page) => {
           if (current) {
@@ -74,7 +88,17 @@ export function useHistory(
     return () => {
       current = false;
     };
-  }, [repo.owner.slug, repo.name, head, path, withEntries, cursor, attempt, seeded]);
+  }, [
+    repo.owner.slug,
+    repo.name,
+    repo.source?.sourceId,
+    head,
+    path,
+    withEntries,
+    cursor,
+    attempt,
+    seeded,
+  ]);
   return {
     history,
     loading: loading || (!!seeking && !error),
@@ -116,16 +140,26 @@ export function CommitInfo({ commit, repo }: { commit: CommitSummary; repo: Repo
       <span className="block truncate font-semibold" title={firstLine(commit.message)}>
         <LinkedText
           text={firstLine(commit.message)}
-          plain={(text) => (
-            <CommitLink
-              className="text-ink no-underline hover:underline"
-              owner={repo.owner.slug}
-              name={repo.name}
-              sha={commit.oid}
-            >
-              {text}
-            </CommitLink>
-          )}
+          plain={(text) =>
+            // The commit panel reads canonical history; a work source's commit opens in its own source.
+            repo.source && repo.source.sourceId !== "canonical" ? (
+              <Link
+                className="text-ink no-underline hover:underline"
+                to={treeUrl(repo.owner.slug, repo.name, commit.oid, "", repo.source.sourceId)}
+              >
+                {text}
+              </Link>
+            ) : (
+              <CommitLink
+                className="text-ink no-underline hover:underline"
+                owner={repo.owner.slug}
+                name={repo.name}
+                sha={commit.oid}
+              >
+                {text}
+              </CommitLink>
+            )
+          }
         />
       </span>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -191,12 +225,81 @@ export function FileHistory({
         )}
         <Link
           className="mk-btn mk-btn--sm no-underline"
-          to={commitsUrl(repo.owner.slug, repo.name, head, path)}
+          to={commitsUrl(repo.owner.slug, repo.name, head, path, repo.source?.sourceId)}
         >
           {history ? countLabel(history.commits.length, !!history.next) : "File history"}
         </Link>
       </div>
       <HistoryProgress state={state} />
+    </section>
+  );
+}
+
+/** A receipt is evidence of exact source membership, not a claim of Git ancestry. */
+export function SourceHistory({ repo, head }: { repo: RepoDetail; head: string | null }) {
+  const source = repo.source;
+  const path =
+    source?.kind === "timeline-work" && head
+      ? `/repos/${encodeURIComponent(repo.owner.slug)}/${encodeURIComponent(repo.name)}/sources/${encodeURIComponent(source.sourceId)}/lineage?commit=${encodeURIComponent(head)}`
+      : null;
+  const [state, setState] = useState<{
+    path: string;
+    receipt?: SourceLineage;
+    error?: string;
+  } | null>(null);
+  useEffect(() => {
+    if (!path) return;
+    let live = true;
+    api<SourceLineage>(path).then(
+      (receipt) => live && setState({ path, receipt }),
+      (error: unknown) =>
+        live && setState({ path, error: error instanceof Error ? error.message : String(error) }),
+    );
+    return () => {
+      live = false;
+    };
+  }, [path]);
+  if (!path || !source) return null;
+  const current = state?.path === path ? state : null;
+  const receipt = current?.receipt;
+  return (
+    <section aria-label="Source history" className="border-b border-line-soft pb-3 text-body-sm">
+      <p className="m-0 font-semibold">Timeline progress history</p>
+      <p className="m-0 mt-1 break-all text-ink-muted">
+        <code className="mk-mono">{source.sourceId}</code>
+        {" · "}Progress is stored separately from canonical history.
+      </p>
+      <div className="mt-1 text-ink-muted" aria-live="polite">
+        {current?.error ? (
+          <span role="alert">{current.error}</span>
+        ) : !receipt ? (
+          "Loading integration receipt…"
+        ) : receipt.integration ? (
+          <>
+            Integrated result{" "}
+            <Link
+              to={treeUrl(
+                repo.owner.slug,
+                repo.name,
+                receipt.integration.canonical.commit,
+                "",
+                "canonical",
+              )}
+            >
+              <code className="mk-mono">{receipt.integration.canonical.commit.slice(0, 7)}</code>
+            </Link>
+            {". The source snapshot is admitted by receipt, not as a canonical ancestor."}
+          </>
+        ) : receipt.status === "expired" ? (
+          "This source has expired; its progress objects are no longer retained."
+        ) : receipt.status === "ambiguous" ? (
+          "No unique integration receipt. Sync requires an explicit source anchor."
+        ) : receipt.status === "pending" ? (
+          "Not integrated into canonical history."
+        ) : (
+          "No integration receipt records this exact commit."
+        )}
+      </div>
     </section>
   );
 }

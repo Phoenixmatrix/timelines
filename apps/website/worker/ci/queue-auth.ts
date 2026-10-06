@@ -71,6 +71,7 @@ export async function queueMergeJob(
   }
   if (
     !row ||
+    job.sourceId !== "canonical" ||
     !/^[0-9a-f]{40}$/.test(row.queueId) ||
     (queueId !== undefined && row.queueId !== queueId) ||
     job.jobName !== "land" ||

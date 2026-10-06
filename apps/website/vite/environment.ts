@@ -86,8 +86,8 @@ export function developmentEnvironment(env: Environment) {
       throw new Error("GITMATRIX_AI_GATEWAY must match the owned environment resource namespace");
     required("GITMATRIX_AGENT_SECRET");
     required("GITMATRIX_CI_DISPATCH_SECRET");
-    if (env.GITMATRIX_CI_RUNNER !== "local")
-      throw new Error("Agent mode requires local CI runners");
+    if (!["local", "sandbox"].includes(env.GITMATRIX_CI_RUNNER ?? ""))
+      throw new Error("Agent mode requires an explicit local or sandbox CI runner");
   }
   return { agent, agentId, ai, port, host, publicUrl, stateDir, runnerHomes };
 }

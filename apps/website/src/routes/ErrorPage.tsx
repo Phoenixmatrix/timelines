@@ -16,15 +16,21 @@ export function ErrorPage() {
         ? "You don't have access"
         : status === 401
           ? "Sign in to see this"
-          : "Something went wrong";
+          : status === 410
+            ? "Source or revision unavailable"
+            : status === 409
+              ? "Source unavailable"
+              : "Something went wrong";
   const hint =
     status === 404 && !viewer
       ? "It may be private. Sign in with an account that can see it."
       : status === 404
         ? `It doesn't exist, or ${viewer?.displayName ?? "you"} can't see it.`
-        : status >= 500
-          ? "Try again in a moment."
-          : null;
+        : status === 410
+          ? "This view has not switched to main. Canonical commits and integration records have separate retention policies."
+          : status >= 500
+            ? "Try again in a moment."
+            : null;
 
   if (status >= 500 && !isRouteErrorResponse(error)) console.error(error);
 

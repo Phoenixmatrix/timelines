@@ -121,6 +121,28 @@ describe("semantic repository feed", () => {
     ).rejects.toThrow("Invalid cursor");
   });
 
+  test("keeps work-source links and rejects a cursor from another source", async () => {
+    const f = fixture();
+    const before = f.add(1, { "config.json": '{"alpha":1,"beta":2}' });
+    f.add(2, { "config.json": '{"alpha":3,"beta":4}' }, [before]);
+    const query = parseFeedQuery({ limit: "1" });
+    const page = await semanticFeed(f.reader, f.cache, "repo", "/owner/repo", query, "work_a");
+    const entry = page.entries[0]!;
+    for (const link of [entry.links.commit, entry.links.before, entry.links.after]) {
+      expect(link).not.toBeNull();
+      expect(new URL(link!, "https://gitmatrix.test").searchParams.get("source")).toBe("work_a");
+    }
+    expect(new URL(entry.links.after!, "https://gitmatrix.test").hash).toMatch(/^#L\d+$/);
+    const next = { ...query, cursor: page.nextCursor! };
+    await expect(
+      semanticFeed(f.reader, f.cache, "repo", "/owner/repo", next, "work_b"),
+    ).rejects.toThrow();
+    await expect(semanticFeed(f.reader, f.cache, "repo", "/owner/repo", next)).rejects.toThrow();
+    const rest = await semanticFeed(f.reader, f.cache, "repo", "/owner/repo", next, "work_a");
+    expect(rest.head).toBe(page.head);
+    expect(rest.entries[0]?.id).not.toBe(entry.id);
+  });
+
   test("returns resumable empty pages and coverage rather than dropping unsupported files", async () => {
     const f = fixture();
     const files = Object.fromEntries(

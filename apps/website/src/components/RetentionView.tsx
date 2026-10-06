@@ -882,7 +882,7 @@ export function RetentionView({
             <p className="mt-1 mb-0 max-w-[70ch] text-body-sm text-ink-muted">
               {site
                 ? "Data no account owns: shared caches, the registry, sign-in state and records. Enabled categories run once a day."
-                : "Every category is off until you turn it on; then it runs once a day with the values shown. Values left at their default follow the site-wide default when a site administrator sets one."}
+                : "Enabled categories run once a day with the values shown. Timeline work Git retention starts on; other policy categories start off. Values left at their default follow the site-wide default when a site administrator sets one."}
             </p>
           </div>
           {rows(own, settings.level)}

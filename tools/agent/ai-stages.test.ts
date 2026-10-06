@@ -42,7 +42,7 @@ await test("changed paths select their stages and the stages those require", () 
     ],
     [
       ["apps/website/worker/timelines/checkpoints.ts"],
-      ["knowledge", "knowledge-edit", "overlays", "timeline-pages"],
+      ["knowledge", "knowledge-edit", "release-notes", "overlays", "timeline-pages"],
     ],
     [
       ["apps/website/worker/retention/repo-purge.ts"],
@@ -53,7 +53,15 @@ await test("changed paths select their stages and the stages those require", () 
     [["apps/website/src/routes/atlas/WorkspaceAtlas.tsx"], ["atlas-describe", "atlas-workspace"]],
     [
       ["apps/website/worker/knowledge/wiki.ts"],
-      ["knowledge", "search", "knowledge-edit", "overlays", "timeline-pages", ...ATLAS],
+      [
+        "knowledge",
+        "search",
+        "knowledge-edit",
+        "release-notes",
+        "overlays",
+        "timeline-pages",
+        ...ATLAS,
+      ],
     ],
     [["tools/agent/provider-e2e.ts"], STAGE_IDS.filter((id) => !id.startsWith("atlas"))],
     [["tools/agent/atlas-provider-e2e.ts"], ATLAS],

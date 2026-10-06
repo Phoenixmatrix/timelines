@@ -33,7 +33,7 @@ import { timelineSlugOf } from "../../shared/timelines.ts";
 import type { RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import { analyzeFiles, loadAnalyses } from "./analyze.ts";
-import { loadSnapshot, type BuiltGraph, type Syntheses } from "./graph.ts";
+import type { BuiltGraph, Syntheses, SnapshotFile } from "./graph.ts";
 import { countChanges, diffGraphs, overlayGraphs, planOverlay, toAnalyze } from "./overlay.ts";
 import type { KnowledgePolicy } from "./policy.ts";
 import { chunk, pool, sha256 } from "./util.ts";
@@ -49,6 +49,9 @@ import {
   type PlannedPage,
   type WikiSource,
 } from "./wiki.ts";
+import { getWorkSource } from "../timelines/sources.ts";
+import { releaseKnowledgeBase } from "./source-reader.ts";
+import { releaseSourceRoots } from "../retention/work-sources.ts";
 
 /** Component pages per set; the rest are counted as skipped. */
 export const MAX_COMPONENT_PAGES = 12;
@@ -191,6 +194,7 @@ export interface PageSetRef {
   repoId: string;
   ref: string;
   key: string;
+  sourceId?: string;
 }
 
 export interface PageSetStats {
@@ -240,6 +244,7 @@ export async function writeSetPages(
   diff: KnowledgeOverlayChange[],
   chosen: ChosenPage[],
   budget = MAX_SET_TOKENS,
+  provenance?: { baseCommit: string; changedPaths: ReadonlySet<string> },
 ): Promise<PageSetStats> {
   const stats = emptyStats();
   const k = db(env.DB);
@@ -252,6 +257,7 @@ export async function writeSetPages(
       .selectFrom("kg_page_set_pages")
       .select(["slug", "inputs_hash", "tokens"])
       .where("repo_id", "=", set.repoId)
+      .where("source_id", "=", set.sourceId ?? "canonical")
       .where("ref", "=", set.ref)
       .where("set_key", "=", set.key)
       .execute(),
@@ -279,6 +285,7 @@ export async function writeSetPages(
       .insertInto("kg_page_set_pages")
       .values({
         repo_id: set.repoId,
+        source_id: set.sourceId ?? "canonical",
         ref: set.ref,
         set_key: set.key,
         slug: page.slug,
@@ -292,13 +299,26 @@ export async function writeSetPages(
         body: row.body,
         diagram: row.outcome === "written" ? diagramFor(page, source.graph, source.syntheses) : "",
         sources: JSON.stringify(page.component?.files ?? []),
+        source_locations: JSON.stringify(
+          (page.component?.files ?? []).map((path) => ({
+            path,
+            sourceId:
+              provenance && !provenance.changedPaths.has(path)
+                ? "canonical"
+                : (set.sourceId ?? "canonical"),
+            commit:
+              provenance && !provenance.changedPaths.has(path)
+                ? provenance.baseCommit
+                : source.commit,
+          })),
+        ),
         inputs_hash: hash,
         model: row.model,
         tokens: row.tokens,
         updated_at: nowIso(),
       })
       .onConflict((oc) =>
-        oc.columns(["repo_id", "ref", "set_key", "slug"]).doUpdateSet((eb) => ({
+        oc.columns(["repo_id", "source_id", "ref", "set_key", "slug"]).doUpdateSet((eb) => ({
           title: eb.ref("excluded.title"),
           section: eb.ref("excluded.section"),
           position: eb.ref("excluded.position"),
@@ -308,6 +328,7 @@ export async function writeSetPages(
           body: eb.ref("excluded.body"),
           diagram: eb.ref("excluded.diagram"),
           sources: eb.ref("excluded.sources"),
+          source_locations: eb.ref("excluded.source_locations"),
           inputs_hash: eb.ref("excluded.inputs_hash"),
           model: eb.ref("excluded.model"),
           tokens: eb.ref("excluded.tokens"),
@@ -342,6 +363,7 @@ export async function writeSetPages(
       .selectFrom("kg_page_set_pages")
       .select(["outcome", "body", "model"])
       .where("repo_id", "=", set.repoId)
+      .where("source_id", "=", set.sourceId ?? "canonical")
       .where("ref", "=", set.ref)
       .where("slug", "=", slug)
       .where("inputs_hash", "=", hash)
@@ -395,11 +417,17 @@ export interface PageRequest extends PageSetRef {
 }
 
 /** Whether a timeline's overlay has ended: its pages are read-only. */
-export async function overlayEnded(d1: D1Database, repoId: string, ref: string) {
+export async function overlayEnded(
+  d1: D1Database,
+  repoId: string,
+  ref: string,
+  sourceId = "canonical",
+) {
   const row = await db(d1)
     .selectFrom("kg_overlays")
     .select("ended_at")
     .where("repo_id", "=", repoId)
+    .where("source_id", "=", sourceId)
     .where("ref", "=", ref)
     .executeTakeFirst();
   return Boolean(row?.ended_at);
@@ -419,17 +447,19 @@ export async function queueSet(
     .selectFrom("kg_page_sets")
     .select("status")
     .where("repo_id", "=", request.repoId)
+    .where("source_id", "=", request.sourceId ?? "canonical")
     .where("ref", "=", request.ref)
     .where("set_key", "=", request.key)
     .executeTakeFirst();
   if (existing && existing.status !== "failed") return { status: existing.status, queued: false };
-  if (await overlayEnded(d1, request.repoId, request.ref))
+  if (await overlayEnded(d1, request.repoId, request.ref, request.sourceId))
     return { status: "ended", queued: false };
   if (existing) {
     await k
       .updateTable("kg_page_sets")
       .set({ status: "queued", build_id: null, error: null, finished_at: null })
       .where("repo_id", "=", request.repoId)
+      .where("source_id", "=", request.sourceId ?? "canonical")
       .where("ref", "=", request.ref)
       .where("set_key", "=", request.key)
       .where("status", "=", "failed")
@@ -440,6 +470,7 @@ export async function queueSet(
     .insertInto("kg_page_sets")
     .values({
       repo_id: request.repoId,
+      source_id: request.sourceId ?? "canonical",
       ref: request.ref,
       set_key: request.key,
       checkpoint_id: request.checkpoint?.id ?? null,
@@ -449,10 +480,19 @@ export async function queueSet(
       requested_by: request.requestedBy,
       requested_at: nowIso(),
     })
-    .onConflict((oc) => oc.columns(["repo_id", "ref", "set_key"]).doNothing())
+    .onConflict((oc) => oc.columns(["repo_id", "source_id", "ref", "set_key"]).doNothing())
     .returning("status")
     .executeTakeFirst();
-  return { status: "queued", queued: Boolean(inserted) };
+  if (inserted) return { status: "queued", queued: true };
+  const current = await k
+    .selectFrom("kg_page_sets")
+    .select("status")
+    .where("repo_id", "=", request.repoId)
+    .where("source_id", "=", request.sourceId ?? "canonical")
+    .where("ref", "=", request.ref)
+    .where("set_key", "=", request.key)
+    .executeTakeFirst();
+  return { status: current?.status ?? "ended", queued: false };
 }
 
 /** A set being written, as the coordinator tracks it. */
@@ -460,6 +500,7 @@ export interface PageRun {
   buildId: string;
   ref: string;
   key: string;
+  sourceId?: string;
   startedAt: number;
 }
 
@@ -469,12 +510,12 @@ export interface PageRun {
  */
 export function schedulePages(
   running: PageRun[],
-  queued: { ref: string; key: string }[],
+  queued: { ref: string; key: string; sourceId?: string }[],
   max = MAX_PAGE_JOBS,
-): { start: { ref: string; key: string }[]; more: boolean } {
+): { start: { ref: string; key: string; sourceId?: string }[]; more: boolean } {
   const busy = new Set(running.map((r) => r.ref));
   let room = max - running.length;
-  const start: { ref: string; key: string }[] = [];
+  const start: { ref: string; key: string; sourceId?: string }[] = [];
   let more = false;
   for (const set of queued) {
     if (busy.has(set.ref) || room <= 0) {
@@ -492,7 +533,7 @@ export function schedulePages(
 export async function queuedSets(d1: D1Database, repoId: string, limit = 20) {
   return db(d1)
     .selectFrom("kg_page_sets")
-    .select(["ref", "set_key as key"])
+    .select(["ref", "set_key as key", "source_id as sourceId"])
     .where("repo_id", "=", repoId)
     .where("status", "=", "queued")
     .orderBy("requested_at")
@@ -511,25 +552,13 @@ export async function claimSet(
     .updateTable("kg_page_sets")
     .set({ status: "writing", build_id: buildId, ai_snapshot: JSON.stringify(policy) })
     .where("repo_id", "=", set.repoId)
+    .where("source_id", "=", set.sourceId ?? "canonical")
     .where("ref", "=", set.ref)
     .where("set_key", "=", set.key)
     .where("status", "=", "queued")
     .returning("set_key")
     .executeTakeFirst();
   return Boolean(row);
-}
-
-/** Put a claimed set back in the queue: its workflow could not be started. */
-export async function releaseSet(d1: D1Database, set: PageSetRef, buildId: string) {
-  await db(d1)
-    .updateTable("kg_page_sets")
-    .set({ status: "queued", build_id: null, ai_snapshot: null })
-    .where("repo_id", "=", set.repoId)
-    .where("ref", "=", set.ref)
-    .where("set_key", "=", set.key)
-    .where("build_id", "=", buildId)
-    .where("status", "=", "writing")
-    .execute();
 }
 
 /** The set `buildId` is writing, or null when it no longer is (it was retried or closed). */
@@ -539,6 +568,7 @@ export async function setFor(d1: D1Database, set: PageSetRef, buildId: string) {
       .selectFrom("kg_page_sets")
       .selectAll()
       .where("repo_id", "=", set.repoId)
+      .where("source_id", "=", set.sourceId ?? "canonical")
       .where("ref", "=", set.ref)
       .where("set_key", "=", set.key)
       .where("build_id", "=", buildId)
@@ -563,9 +593,11 @@ export async function recordSet(
       stats: JSON.stringify({ ...JSON.parse(row.stats), ...values.stats }),
     })
     .where("repo_id", "=", set.repoId)
+    .where("source_id", "=", set.sourceId ?? "canonical")
     .where("ref", "=", set.ref)
     .where("set_key", "=", set.key)
     .where("build_id", "=", buildId)
+    .where("status", "=", "writing")
     .execute();
 }
 
@@ -588,9 +620,11 @@ export async function closeSet(
       finished_at: nowIso(),
     })
     .where("repo_id", "=", set.repoId)
+    .where("source_id", "=", set.sourceId ?? "canonical")
     .where("ref", "=", set.ref)
     .where("set_key", "=", set.key)
     .where("build_id", "=", buildId)
+    .where("status", "=", "writing")
     .execute();
 }
 
@@ -610,8 +644,9 @@ const ANALYZE_BATCH = 32;
 
 /** What the knowledge Workflow lends a page set. */
 export interface PageSetDeps<R extends { id: string; full_name: string }> {
-  repo(repoId: string): Promise<R | null>;
-  withReader<T>(row: R, work: (reader: RepoReader) => Promise<T>): Promise<T>;
+  repo(repoId: string, ref: string, sourceId?: string): Promise<R | null>;
+  withReader<T>(row: R, work: (reader: RepoReader) => Promise<T>, snapshot?: string): Promise<T>;
+  pinBase(repoId: string, commit: string, snapshot: string): Promise<SnapshotFile[]>;
   /** Tell the coordinator the set's run is over. */
   finished(buildId: string): Promise<void>;
 }
@@ -628,7 +663,7 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
   params: {
     repoId: string;
     buildId: string;
-    pages: { ref: string; key: string };
+    pages: { ref: string; key: string; sourceId?: string };
     policy?: KnowledgePolicy;
   },
   step: WorkflowStep,
@@ -638,20 +673,31 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
   // Only payloads admitted before account AI settings lack their frozen policy.
   const { models } = params.policy?.ai ?? LEGACY_AI_SNAPSHOT;
   const set: PageSetRef = { repoId, ...params.pages };
+  const snapshot = `knowledge:${buildId}`;
   const done = (status: "succeeded" | "failed" | "ended", values = {}) =>
     step.do(`pages-${status}`, STEP, async () => {
       await closeSet(env.DB, set, buildId, status, values);
+      await releaseSourceRoots(env, "knowledge-pages-build", buildId);
+      await releaseKnowledgeBase(env, repoId, snapshot);
       await deps.finished(buildId);
       return null;
     });
   try {
-    const repo = await deps.repo(repoId);
+    const stored = await setFor(env.DB, set, buildId);
+    if (!stored) {
+      await releaseSourceRoots(env, "knowledge-pages-build", buildId);
+      await releaseKnowledgeBase(env, repoId, snapshot);
+      await deps.finished(buildId);
+      return { status: "gone" };
+    }
+    const repo = await deps.repo(repoId, set.ref, stored.source_id);
     if (!repo) throw new Error("Repository not found");
     const plan = await step.do("pages-plan", STEP, async () => {
       const row = await setFor(env.DB, set, buildId);
       // Retried or closed meanwhile: nothing to do.
       if (!row) return { state: "gone" as const };
-      if (await overlayEnded(env.DB, repoId, set.ref)) return { state: "ended" as const };
+      if (await overlayEnded(env.DB, repoId, set.ref, set.sourceId))
+        return { state: "ended" as const };
       const kg = await db(env.DB)
         .selectFrom("kg_state")
         .select("indexed_commit")
@@ -659,10 +705,15 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
         .executeTakeFirst();
       if (!kg?.indexed_commit) throw new Error("Main has no knowledge graph yet");
       const base = kg.indexed_commit;
+      const work = await getWorkSource(env, repoId, row.source_id);
+      if (!work || work.state !== "ready") return { state: "ended" as const };
       const plan = await deps.withReader(repo, (reader) =>
-        planOverlay(reader, row.commit_oid, base),
+        planOverlay(reader, row.commit_oid, base, {
+          commit: work.fork_commit,
+          tree: work.fork_tree,
+        }),
       );
-      const main = await loadSnapshot(env.DB, repoId, "current");
+      const main = await deps.pinBase(repoId, base, snapshot);
       const known = await loadAnalyses(
         env.DB,
         plan.changes.flatMap((c) => (c.blob ? [c.blob] : [])),
@@ -673,12 +724,16 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
       });
       return {
         state: "planned" as const,
+        base,
         commit: row.commit_oid,
         changes: plan.changes,
         pending: toAnalyze(plan.changes, main, known),
       };
     });
-    if (plan.state === "gone") return { status: "gone" };
+    if (plan.state === "gone") {
+      await done("ended");
+      return { status: "gone" };
+    }
     if (plan.state === "ended") {
       await done("ended");
       return { status: "ended" };
@@ -691,7 +746,7 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
     }
     // Rebuilt in each step from D1, as main's wiki steps do: nothing large crosses steps.
     const graphsAt = async (reader: RepoReader) => {
-      const graphs = await overlayGraphs(env.DB, repo, changes);
+      const graphs = await overlayGraphs(env.DB, repo, changes, snapshot);
       const source: WikiSource = {
         repoId,
         commit,
@@ -705,29 +760,40 @@ export async function runPageSet<R extends { id: string; full_name: string }>(
       return { graphs, source, diff: diffGraphs(graphs.main, graphs.timeline) };
     };
     const chosen = await step.do("pages-choose", STEP, () =>
-      deps.withReader(repo, async (reader) => {
-        const { graphs, diff } = await graphsAt(reader);
-        const picked = choosePages(graphs.timeline, graphs.syntheses, diff);
-        await recordSet(env.DB, set, buildId, {
-          stats: {
-            counts: countChanges(diff),
-            planned: picked.pages.length,
-            capped: picked.skipped,
-          },
-        });
-        return picked.pages;
-      }),
+      deps.withReader(
+        repo,
+        async (reader) => {
+          const { graphs, diff } = await graphsAt(reader);
+          const picked = choosePages(graphs.timeline, graphs.syntheses, diff);
+          await recordSet(env.DB, set, buildId, {
+            stats: {
+              counts: countChanges(diff),
+              planned: picked.pages.length,
+              capped: picked.skipped,
+            },
+          });
+          return picked.pages;
+        },
+        snapshot,
+      ),
     );
     const totals = emptyStats();
     let ended = false;
     for (const [i, batch] of chunk(chosen, PAGES_PER_STEP).entries()) {
       const stats = await step.do(`pages-write-${i}`, STEP, async () => {
         // An ended timeline's pages are read-only: stop, keeping what's written.
-        if (await overlayEnded(env.DB, repoId, set.ref)) return null;
-        return deps.withReader(repo, async (reader) => {
-          const { diff, source } = await graphsAt(reader);
-          return writeSetPages(env, models, set, source, diff, batch);
-        });
+        if (await overlayEnded(env.DB, repoId, set.ref, set.sourceId)) return null;
+        return deps.withReader(
+          repo,
+          async (reader) => {
+            const { diff, source } = await graphsAt(reader);
+            return writeSetPages(env, models, set, source, diff, batch, MAX_SET_TOKENS, {
+              baseCommit: plan.base,
+              changedPaths: new Set(changes.map((change) => change.path)),
+            });
+          },
+          snapshot,
+        );
       });
       if (!stats) {
         ended = true;
@@ -772,6 +838,7 @@ export function excerpt(body: string, max = 240): string {
 
 type SetRow = {
   repo_id: string;
+  source_id?: string;
   ref: string;
   set_key: string;
   checkpoint_id: string | null;
@@ -792,6 +859,7 @@ export function toSet(row: SetRow, pages: KnowledgeTimelinePageSummary[]): Knowl
     skipped?: number;
   };
   return {
+    sourceId: row.source_id ?? "canonical",
     ref: row.ref.replace(/^refs\/heads\//, ""),
     timeline: timelineSlugOf(row.ref) ?? row.ref,
     key: row.set_key,
@@ -816,6 +884,7 @@ async function withPages(d1: D1Database, rows: SetRow[]): Promise<KnowledgePageS
     .selectFrom("kg_page_set_pages")
     .select([
       "repo_id",
+      "source_id",
       "ref",
       "set_key",
       "slug",
@@ -839,7 +908,13 @@ async function withPages(d1: D1Database, rows: SetRow[]): Promise<KnowledgePageS
     toSet(
       row,
       pages
-        .filter((p) => p.repo_id === row.repo_id && p.ref === row.ref && p.set_key === row.set_key)
+        .filter(
+          (p) =>
+            p.repo_id === row.repo_id &&
+            p.source_id === (row.source_id ?? "canonical") &&
+            p.ref === row.ref &&
+            p.set_key === row.set_key,
+        )
         .map((p) => ({
           slug: p.slug,
           title: p.title,
@@ -858,6 +933,7 @@ async function withPages(d1: D1Database, rows: SetRow[]): Promise<KnowledgePageS
 
 const SET_COLUMNS = [
   "repo_id",
+  "source_id",
   "ref",
   "set_key",
   "checkpoint_id",
@@ -876,7 +952,7 @@ export async function listSets(
   d1: D1Database,
   repoId: string,
   ref: string,
-  options: { key?: string; limit?: number } = {},
+  options: { key?: string; limit?: number; sourceId?: string } = {},
 ): Promise<KnowledgePageSet[]> {
   let query = db(d1)
     .selectFrom("kg_page_sets")
@@ -884,6 +960,7 @@ export async function listSets(
     .where("repo_id", "=", repoId)
     .where("ref", "=", ref);
   if (options.key) query = query.where("set_key", "=", options.key);
+  if (options.sourceId) query = query.where("source_id", "=", options.sourceId);
   const rows = await query
     .orderBy("requested_at", "desc")
     .limit(Math.min(options.limit ?? MAX_SETS, MAX_SETS))
@@ -920,12 +997,14 @@ export async function timelinePage(
   ref: string,
   slug: string,
   key?: string,
+  sourceId?: string,
 ) {
   let query = db(d1)
     .selectFrom("kg_page_set_pages as p")
     .innerJoin("kg_page_sets as s", (join) =>
       join
         .onRef("s.repo_id", "=", "p.repo_id")
+        .onRef("s.source_id", "=", "p.source_id")
         .onRef("s.ref", "=", "p.ref")
         .onRef("s.set_key", "=", "p.set_key"),
     )
@@ -934,12 +1013,14 @@ export async function timelinePage(
     .where("p.ref", "=", ref)
     .where("p.slug", "=", slug);
   if (key) query = query.where("p.set_key", "=", key);
+  if (sourceId) query = query.where("s.source_id", "=", sourceId);
   const page = await query.orderBy("s.requested_at", "desc").limit(1).executeTakeFirst();
   if (!page) return null;
   const set = await db(d1)
     .selectFrom("kg_page_sets")
     .select(SET_COLUMNS)
     .where("repo_id", "=", repoId)
+    .where("source_id", "=", page.source_id)
     .where("ref", "=", ref)
     .where("set_key", "=", page.set_key)
     .executeTakeFirstOrThrow();

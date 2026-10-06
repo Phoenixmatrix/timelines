@@ -1,17 +1,17 @@
 import { useEffect, useState } from "react";
-import { useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
+import { data, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
 import type { CiCommitStatuses, HistoryPage, RepoDetail } from "../../../shared/api.ts";
 import { CiStatusIcon, ciLabel } from "../../components/CiStatus.tsx";
 import { CommitLink } from "../../components/CommitLink.tsx";
 import { DeploymentMark, useCommitDeployments } from "../../components/Deployments.tsx";
 import { Monogram } from "../../components/Monogram.tsx";
-import { repoData, routeData } from "../../lib/repoData.ts";
+import { repoData, requestSource, routeData } from "../../lib/repoData.ts";
 import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { shortOid } from "../../lib/format.ts";
 import { api } from "../../lib/api.ts";
-import { commitsUrl, repoPath } from "../../lib/refs.ts";
-import { CommitInfo, HistoryProgress, countLabel, useHistory } from "./History.tsx";
+import { commitsUrl, repoPath, sourceUrl, treeUrl } from "../../lib/refs.ts";
+import { CommitInfo, HistoryProgress, SourceHistory, countLabel, useHistory } from "./History.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
 
@@ -19,25 +19,42 @@ export async function commitsLoader({ request, params }: LoaderFunctionArgs) {
   const owner = params.owner ?? "";
   const name = params.repo ?? "";
   let at = params["*"] ?? "";
+  const source = await requestSource(owner, name, request);
   // In a timeline's scope, history without a named branch is the bookmark's.
   const scope = at ? null : scopeOf(new URL(request.url).search);
-  if (scope) at = bookmarkIn(await routeData(repoData.detail(owner, name)), scope) ?? "";
-  return routeData(repoData.history(owner, name, at));
+  if (scope) {
+    const bookmark = bookmarkIn(await routeData(repoData.detail(owner, name, source)), scope);
+    if (!bookmark && source)
+      throw data(
+        {
+          message:
+            "This timeline's historical Git ref is unavailable. Open a recorded commit or select main explicitly.",
+        },
+        { status: 410 },
+      );
+    at = bookmark ?? "";
+  }
+  return routeData(repoData.history(owner, name, at, false, "", source));
 }
 
 /** CI results for the listed commits, loaded after the page shows so it never waits on them. */
-function useCiStatuses(owner: string, name: string, oids: string[]): CiCommitStatuses {
+function useCiStatuses(
+  owner: string,
+  name: string,
+  oids: string[],
+  source?: string,
+): CiCommitStatuses {
   const [statuses, setStatuses] = useState<CiCommitStatuses>({});
   const key = oids.join(",");
   useEffect(() => {
     let current = true;
-    api<CiCommitStatuses>(`/repos/${owner}/${name}/ci/status?commits=${key}`)
+    api<CiCommitStatuses>(sourceUrl(`/repos/${owner}/${name}/ci/status?commits=${key}`, source))
       .then((next) => current && setStatuses((previous) => ({ ...previous, ...next })))
       .catch(() => {});
     return () => {
       current = false;
     };
-  }, [owner, name, key]);
+  }, [owner, name, key, source]);
   return statuses;
 }
 
@@ -46,7 +63,7 @@ export function Commits() {
   const repo = useRepo();
   return (
     <History
-      key={`${repo.id}:${initial.ref}:${initial.head}:${initial.path}`}
+      key={`${repo.id}:${repo.source?.sourceId}:${initial.ref}:${initial.head}:${initial.path}`}
       repo={repo}
       initial={initial}
     />
@@ -61,11 +78,13 @@ function History({ repo, initial }: { repo: RepoDetail; initial: HistoryPage }) 
     repo.owner.slug,
     repo.name,
     history.commits.slice(-100).map((commit) => commit.oid),
+    repo.source?.sourceId,
   );
   const deployed = useCommitDeployments(
     repo.owner.slug,
     repo.name,
     history.commits.slice(-80).map((commit) => commit.oid),
+    repo.source?.sourceId,
   );
   return (
     <div className="flex flex-col gap-4">
@@ -74,8 +93,13 @@ function History({ repo, initial }: { repo: RepoDetail; initial: HistoryPage }) 
         refName={initial.ref}
         path={initial.path}
         view="commits"
-        onSwitch={(next) => navigate(commitsUrl(repo.owner.slug, repo.name, next, initial.path))}
+        onSwitch={(next) =>
+          navigate(
+            commitsUrl(repo.owner.slug, repo.name, next, initial.path, repo.source?.sourceId),
+          )
+        }
       />
+      <SourceHistory repo={repo} head={initial.head} />
       <div>
         <h2 className="m-0 text-title break-words">
           {initial.path ? `History of ${initial.path}` : "Repository history"}
@@ -100,15 +124,26 @@ function History({ repo, initial }: { repo: RepoDetail; initial: HistoryPage }) 
               </PrefetchLink>
             )}
             {deployed[commit.oid] && <DeploymentMark deployment={deployed[commit.oid]!} />}
-            <CommitLink
-              owner={repo.owner.slug}
-              name={repo.name}
-              sha={commit.oid}
-              className="mk-chip mk-chip--tag mk-mono hidden h-6 no-underline sm:inline-flex"
-              title={`Open commit ${shortOid(commit.oid)}`}
-            >
-              {shortOid(commit.oid)}
-            </CommitLink>
+            {/* The commit panel reads canonical history; a work source's commit opens in its own source. */}
+            {repo.source && repo.source.sourceId !== "canonical" ? (
+              <PrefetchLink
+                to={treeUrl(repo.owner.slug, repo.name, commit.oid, "", repo.source.sourceId)}
+                className="mk-chip mk-chip--tag mk-mono hidden h-6 no-underline sm:inline-flex"
+                title="Browse files at this commit"
+              >
+                {shortOid(commit.oid)}
+              </PrefetchLink>
+            ) : (
+              <CommitLink
+                owner={repo.owner.slug}
+                name={repo.name}
+                sha={commit.oid}
+                className="mk-chip mk-chip--tag mk-mono hidden h-6 no-underline sm:inline-flex"
+                title={`Open commit ${shortOid(commit.oid)}`}
+              >
+                {shortOid(commit.oid)}
+              </CommitLink>
+            )}
           </li>
         ))}
       </ol>

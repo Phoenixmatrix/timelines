@@ -70,6 +70,7 @@ async function fromJobToken(db: DB, secret: string): Promise<Actor | null> {
     .where("t.token_hash", "=", await hashSecret(secret))
     .where("t.expires_at", ">", nowIso())
     .where("j.status", "in", ["queued", "running"])
+    .where("r.status", "in", ["queued", "running"])
     .executeTakeFirst();
   if (!row) return null;
   const fullName = `${row.owner_slug}/${row.name}`;

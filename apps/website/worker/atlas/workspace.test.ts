@@ -245,8 +245,18 @@ describe("Atlas workspace scope", () => {
       ["building", "building", null, true],
       ["failed", "unavailable", null, false],
       ["nokg", "not-enabled", null, false],
-      ["open", "ready", [{ repoId: "r_open", commit: "o1", buildId: "b-r_open-o1" }], false],
-      ["secret", "ready", [{ repoId: "r_secret", commit: "s1", buildId: "b-r_secret-s1" }], false],
+      [
+        "open",
+        "ready",
+        [{ repoId: "r_open", sourceId: "canonical", commit: "o1", buildId: "b-r_open-o1" }],
+        false,
+      ],
+      [
+        "secret",
+        "ready",
+        [{ repoId: "r_secret", sourceId: "canonical", commit: "s1", buildId: "b-r_secret-s1" }],
+        false,
+      ],
     ]);
     expect(overview.snapshot.repos.find((r) => r.name === "open")?.snapshot?.id).toBe(
       open.snapshotId,

@@ -27,12 +27,14 @@ export async function activeRun(
   ref: string,
   commit: string,
   preview: { action: "create" | "teardown"; checkpoint: string | null } | null = null,
+  sourceId = "canonical",
   step = false,
 ) {
   let query = db(d1)
     .selectFrom("ci_runs")
     .select(["id", "number"])
     .where("repo_id", "=", repoId)
+    .where("source_id", "=", sourceId)
     .where("ref", "=", ref)
     .where("commit_oid", "=", commit)
     .where("status", "in", ["queued", "running"])
@@ -51,12 +53,14 @@ export async function inFlight(
   repoId: string,
   ref: string,
   except: string,
+  sourceId = "canonical",
 ): Promise<number> {
   const since = new Date(Date.now() - STALE_HOURS * 3_600_000).toISOString();
   const row = await db(d1)
     .selectFrom("ci_runs")
     .select((eb) => eb.fn.countAll<number>().as("n"))
     .where("repo_id", "=", repoId)
+    .where("source_id", "=", sourceId)
     .where("ref", "=", ref)
     .where("id", "<>", except)
     .where("status", "in", ["queued", "running"])
@@ -69,12 +73,19 @@ export async function inFlight(
 }
 
 /** Whether any run on the branch is held, waiting for its turn. */
-export async function anyHeld(d1: D1Database, repoId: string, ref: string, except: string) {
+export async function anyHeld(
+  d1: D1Database,
+  repoId: string,
+  ref: string,
+  except: string,
+  sourceId = "canonical",
+) {
   return Boolean(
     await db(d1)
       .selectFrom("ci_runs")
       .select("id")
       .where("repo_id", "=", repoId)
+      .where("source_id", "=", sourceId)
       .where("ref", "=", ref)
       .where("id", "<>", except)
       .where("held_at", "is not", null)
@@ -93,12 +104,14 @@ export async function lastPassed(
   ref: string,
   name: string,
   spec: string,
+  sourceId = "canonical",
 ): Promise<{ number: number; commit: string } | null> {
   const row = await db(d1)
     .selectFrom("ci_jobs as j")
     .innerJoin("ci_runs as r", "r.id", "j.run_id")
     .select(["r.number", "r.commit_oid"])
     .where("r.repo_id", "=", repoId)
+    .where("r.source_id", "=", sourceId)
     .where("r.ref", "=", ref)
     .where("j.name", "=", name)
     .where("j.spec", "=", spec)
@@ -122,12 +135,14 @@ export async function releaseHeld(
   repoId: string,
   ref: string,
   start: (runId: string) => Promise<void>,
+  sourceId = "canonical",
 ): Promise<number | null> {
   const kdb = db(d1);
   const held = await kdb
     .selectFrom("ci_runs")
     .select(["id", "number"])
     .where("repo_id", "=", repoId)
+    .where("source_id", "=", sourceId)
     .where("ref", "=", ref)
     .where("held_at", "is not", null)
     .where("status", "=", "queued")

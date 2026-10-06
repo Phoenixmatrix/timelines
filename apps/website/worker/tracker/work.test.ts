@@ -13,6 +13,7 @@ import { durableStorage } from "../testing/durable.ts";
 import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
 import { tracker as trackerApi } from "./api.ts";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
+import { ownedTimeline, ownedCheckpointRepo } from "../testing/timeline-source.ts";
 
 const closers: { close(): void }[] = [];
 afterEach(() => {
@@ -116,7 +117,7 @@ function world() {
     { id: "r-engine", owner: "orbit", name: "engine" },
     { id: "r-secret", owner: "orbit", name: "secret" },
   ];
-  const search = store.timelines.create(access, {
+  const search = ownedTimeline(store.timelines, access, {
     slug: "search",
     parent: null,
     repos,
@@ -135,8 +136,18 @@ function world() {
   store.timelines.createCheckpoint(access, "search", {
     summary: "Ranking ready",
     repos: [
-      { ...repos[0]!, commit: oid(2), base: oid(1), changes: [] },
-      { ...repos[1]!, commit: oid(3), base: oid(1), changes: [] },
+      ownedCheckpointRepo(store.timelines, "search", {
+        ...repos[0]!,
+        commit: oid(2),
+        base: oid(1),
+        changes: [],
+      }),
+      ownedCheckpointRepo(store.timelines, "search", {
+        ...repos[1]!,
+        commit: oid(3),
+        base: oid(1),
+        changes: [],
+      }),
     ],
   });
   const landing: Landing = {

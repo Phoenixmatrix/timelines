@@ -34,6 +34,23 @@ import {
 import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
 import { fail, text, type Access } from "./store.ts";
 import { RETENTION_TABLES, removedMessage, tombstone } from "./retention.ts";
+import type { WorkSourceRow, WorkSourceInput } from "../timelines/sources.ts";
+import type { SourceSnapshot } from "../../shared/code-source.ts";
+
+function sameSnapshot(a: SourceSnapshot | undefined, b: SourceSnapshot | undefined): boolean {
+  return (
+    a === b ||
+    (!!a &&
+      !!b &&
+      a.repoId === b.repoId &&
+      a.sourceId === b.sourceId &&
+      a.kind === b.kind &&
+      a.timelineId === b.timelineId &&
+      a.ref === b.ref &&
+      a.commit === b.commit &&
+      a.tree === b.tree)
+  );
+}
 
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const STATUSES: readonly TimelineStatus[] = [
@@ -65,6 +82,7 @@ export function timelineStatus(value: unknown): TimelineStatus {
 
 export interface NewTimeline {
   slug: string;
+  id?: string;
   name?: string;
   policy?: unknown;
   experimental?: unknown;
@@ -124,12 +142,37 @@ export interface PushActivity {
   }[];
 }
 
+export interface SourcePush {
+  operationId: string;
+  timelineId: string;
+  repoId: string;
+  sourceId: string;
+  commands: { ref: string; old: string | null; new: string | null }[];
+  actorId: string | null;
+  accountableId: string | null;
+}
+
 /** An event before it's stored: the store numbers it. */
 type EventInput = TimelineEvent extends infer E
   ? E extends unknown
     ? Omit<E, "seq">
     : never
   : never;
+
+function decodeTimeline(data: string): Timeline {
+  const timeline = JSON.parse(data) as Timeline;
+  if (ENDED.includes(timeline.status))
+    for (const repo of timeline.repos) {
+      repo.source ??= {
+        sourceId: "canonical",
+        repoId: repo.id,
+        kind: "canonical-historical",
+        timelineId: timeline.id,
+        ref: `refs/heads/${repo.bookmark}`,
+      };
+    }
+  return timeline;
+}
 
 export class TimelineStore {
   private sql: SqlDatabase;
@@ -149,6 +192,481 @@ export class TimelineStore {
     sql.exec(TIMELINE_TABLES);
     sql.exec(RETENTION_TABLES);
   }
+  reserveTimeline(access: Access, slug: string, parent: string | null, input: string): string {
+    return this.transaction(() => {
+      const found = first(
+        this.sql,
+        tracker.selectFrom("timeline_reservations").selectAll().where("slug", "=", slug),
+      );
+      if (found) {
+        this.assertCreationOpen(found.id);
+        if (found.actor_id !== access.actorId || found.input !== input)
+          fail("already_exists", "This timeline name is reserved for another creation.", 409);
+        return found.id;
+      }
+      this.prepare(slug, parent);
+      const id = `tl_${crypto.randomUUID()}`;
+      run(
+        this.sql,
+        tracker
+          .insertInto("timeline_reservations")
+          .values({ slug, id, actor_id: access.actorId, input }),
+      );
+      return id;
+    });
+  }
+  assertCreationOpen(timelineId: string): void {
+    if (
+      first(
+        this.sql,
+        tracker
+          .selectFrom("timeline_creation_cancellations")
+          .select("timeline_id")
+          .where("timeline_id", "=", timelineId),
+      )
+    )
+      fail("creation_cancelled", "This timeline creation was cancelled; choose a new name.", 409);
+  }
+  cancelReservedCreation(access: Access, slug: string): WorkSourceRow[] | null {
+    return this.transaction(() => {
+      if (this.find(slug)) return null;
+      const reservation = first(
+        this.sql,
+        tracker.selectFrom("timeline_reservations").selectAll().where("slug", "=", slug),
+      );
+      if (!reservation) fail("not_found", "No timeline or reserved creation.", 404);
+      if (reservation.actor_id !== access.actorId)
+        fail("forbidden", "Only the actor who reserved this creation may cancel it.", 403);
+      run(
+        this.sql,
+        tracker
+          .insertInto("timeline_creation_cancellations")
+          .values({ timeline_id: reservation.id })
+          .onConflict((oc) => oc.doNothing()),
+      );
+      return all(
+        this.sql,
+        tracker
+          .selectFrom("timeline_source_allocations")
+          .select("data")
+          .where("timeline_id", "=", reservation.id),
+      ).map((row) => JSON.parse(row.data) as WorkSourceRow);
+    });
+  }
+  reserveWorkSource(repo: { id: string; owner_id: string }, input: WorkSourceInput): WorkSourceRow {
+    return this.transaction(() => {
+      this.assertCreationOpen(input.timelineId);
+      const found = first(
+        this.sql,
+        tracker
+          .selectFrom("timeline_source_allocations")
+          .select("data")
+          .where("timeline_id", "=", input.timelineId)
+          .where("repo_id", "=", repo.id),
+      );
+      if (found) return JSON.parse(found.data) as WorkSourceRow;
+      const initial = input.initialHead ?? input.base;
+      const row: WorkSourceRow = {
+        source_id: `work_${crypto.randomUUID()}`,
+        repo_id: repo.id,
+        owner_id: repo.owner_id,
+        timeline_id: input.timelineId,
+        timeline_slug: input.timelineSlug,
+        artifacts_name: `w-${crypto.randomUUID().replaceAll("-", "")}`,
+        artifacts_remote: null,
+        state: "reserved",
+        version: 1,
+        allocation_operation_id: `alloc_${crypto.randomUUID()}`,
+        fork_source_id: input.base.sourceId,
+        fork_commit: input.base.commit,
+        fork_tree: input.base.tree,
+        fork_ref: input.base.ref,
+        work_ref: "refs/heads/work",
+        initial_source_id: initial.sourceId,
+        initial_commit: initial.commit,
+        initial_tree: initial.tree,
+        initial_ref: initial.ref,
+        initial_token_revoked: 0,
+        created_at: this.now(),
+        updated_at: this.now(),
+        archived_at: null,
+        archive_disposition: null,
+        error: null,
+      };
+      run(
+        this.sql,
+        tracker.insertInto("timeline_source_allocations").values({
+          source_id: row.source_id,
+          timeline_id: row.timeline_id,
+          repo_id: row.repo_id,
+          data: JSON.stringify(row),
+        }),
+      );
+      return row;
+    });
+  }
+  getWorkSource(sourceId: string): WorkSourceRow {
+    const row = first(
+      this.sql,
+      tracker
+        .selectFrom("timeline_source_allocations")
+        .select("data")
+        .where("source_id", "=", sourceId),
+    );
+    if (!row) fail("not_found", "No source allocation.", 404);
+    const source = JSON.parse(row.data) as WorkSourceRow;
+    if (source.state === "archived" && !source.archive_disposition) {
+      const timeline = this.find(source.timeline_slug);
+      if (
+        timeline?.id === source.timeline_id &&
+        timeline.endedAt &&
+        (timeline.status === "landed" || timeline.status === "abandoned")
+      ) {
+        source.archive_disposition = timeline.status;
+        source.archived_at = timeline.endedAt;
+      }
+    }
+    return source;
+  }
+  transitionWorkSource(
+    sourceId: string,
+    expectedVersion: number,
+    state: WorkSourceRow["state"],
+    remote?: string,
+  ): WorkSourceRow {
+    return this.transaction(() => {
+      const row = this.getWorkSource(sourceId);
+      if (state === "creating" || state === "ready") this.assertCreationOpen(row.timeline_id);
+      if (
+        row.state === "creating" &&
+        state === "purging" &&
+        !first(
+          this.sql,
+          tracker
+            .selectFrom("timeline_creation_cancellations")
+            .select("timeline_id")
+            .where("timeline_id", "=", row.timeline_id),
+        )
+      )
+        fail("source_busy", "Drain initialization before purging this source.", 409);
+      if (row.state === state) return row;
+      if (row.version !== expectedVersion)
+        fail("version_conflict", "Source allocation changed.", 409);
+      const allowed: Record<WorkSourceRow["state"], WorkSourceRow["state"][]> = {
+        reserved: ["creating", "purging"],
+        creating: ["ready", "failed", "purging"],
+        ready: ["archived", "purging"],
+        archived: ["purging"],
+        purging: ["purged"],
+        purged: [],
+        failed: ["creating", "purging"],
+      };
+      if (!allowed[row.state].includes(state))
+        fail("invalid_state", "Invalid source lifecycle transition.", 409);
+      row.state = state;
+      row.version++;
+      row.updated_at = this.now();
+      if (remote) row.artifacts_remote = remote;
+      if (state === "ready") row.initial_token_revoked = 1;
+      if (state === "archived") {
+        const timeline = this.find(row.timeline_slug);
+        if (
+          !timeline ||
+          timeline.id !== row.timeline_id ||
+          (timeline.status !== "landed" && timeline.status !== "abandoned") ||
+          !timeline.endedAt
+        )
+          fail("invalid_state", "Only an ended timeline can archive its source.", 409);
+        row.archived_at = timeline.endedAt;
+        row.archive_disposition = timeline.status;
+      }
+      run(
+        this.sql,
+        tracker
+          .updateTable("timeline_source_allocations")
+          .set({ data: JSON.stringify(row) })
+          .where("source_id", "=", sourceId),
+      );
+      return row;
+    });
+  }
+  sourcePushes(repoId?: string): (SourcePush & { state: string })[] {
+    let query = tracker
+      .selectFrom("timeline_source_operations")
+      .selectAll()
+      .where("state", "in", ["projecting", "admitted", "ambiguous"]);
+    if (repoId) query = query.where("repo_id", "=", repoId);
+    return all(this.sql, query).map((row) => ({
+      ...(JSON.parse(row.data) as SourcePush),
+      state: row.state,
+    }));
+  }
+  sourcePush(
+    operationId: string,
+    repoId?: string,
+    sourceId?: string,
+  ): SourcePush & { state: string } {
+    const row = first(
+      this.sql,
+      tracker.selectFrom("timeline_source_operations").selectAll().where("id", "=", operationId),
+    );
+    if (!row || (repoId && row.repo_id !== repoId) || (sourceId && row.source_id !== sourceId))
+      fail("not_found", "No matching source operation.", 404);
+    return { ...(JSON.parse(row.data) as SourcePush), state: row.state };
+  }
+  activateSourcePush(operationId: string): void {
+    const operation = this.sourcePush(operationId);
+    if (operation.state !== "projecting")
+      fail("operation_settled", "Push admission was interrupted.", 409);
+    run(
+      this.sql,
+      tracker
+        .updateTable("timeline_source_operations")
+        .set({ state: "admitted" })
+        .where("id", "=", operationId),
+    );
+  }
+  private writableSourceTimeline(timeline: Timeline) {
+    if (ENDED.includes(timeline.status))
+      fail(
+        "timeline_ended",
+        "This timeline has ended; select a new timeline or main explicitly.",
+        409,
+      );
+    if (timeline.migrationState === "frozen" || timeline.repos.some((repo) => !repo.source))
+      fail("migration_required", "This timeline requires source migration.", 409);
+    const landing = this.landing(timeline.slug);
+    if (
+      landing &&
+      (LANDING_ACTIVE.includes(landing.state) ||
+        landing.repos.some((repo) => repo.state === "advanced" || repo.casIntent))
+    )
+      fail("source_frozen", "Landing holds this timeline's source mutation fence.", 409);
+  }
+  beginSourcePush(input: SourcePush, projecting = false): { operationId: string } {
+    return this.transaction(() => {
+      const existing = first(
+        this.sql,
+        tracker
+          .selectFrom("timeline_source_operations")
+          .selectAll()
+          .where("id", "=", input.operationId),
+      );
+      if (existing) {
+        if (existing.data !== JSON.stringify(input))
+          fail("operation_conflict", "Push operation identity was reused.", 409);
+        if (existing.state !== (projecting ? "projecting" : "admitted"))
+          fail("operation_settled", "Push operation is already settled or ambiguous.", 409);
+        return { operationId: input.operationId };
+      }
+      const timeline = this.byId(input.timelineId);
+      this.writableSourceTimeline(timeline);
+      const repo = timeline.repos.find(
+        (entry) => entry.id === input.repoId && entry.source?.sourceId === input.sourceId,
+      );
+      if (!repo) fail("not_found", "Source does not belong to this timeline.", 404);
+      if (
+        !input.commands.length ||
+        input.commands.some(
+          (command) =>
+            command.ref !== repo.source!.ref ||
+            !command.new ||
+            !OID.test(command.new) ||
+            (command.old !== null && !OID.test(command.old)),
+        )
+      )
+        fail("invalid_ref", "Only the owned work ref may be updated; it cannot be deleted.", 409);
+      if (this.sourcePushes().some((operation) => operation.timelineId === timeline.id))
+        fail("source_busy", "A source mutation awaits reconciliation.", 409);
+      run(
+        this.sql,
+        tracker.insertInto("timeline_source_operations").values({
+          id: input.operationId,
+          timeline_id: input.timelineId,
+          repo_id: input.repoId,
+          source_id: input.sourceId,
+          state: projecting ? "projecting" : "admitted",
+          data: JSON.stringify(input),
+        }),
+      );
+      // Admission invalidates approval before provider I/O can become visible.
+      this.supersede(
+        timeline,
+        "Superseded by new source work.",
+        input.actorId,
+        input.accountableId,
+      );
+      return { operationId: input.operationId };
+    });
+  }
+  finishSourcePush(operationId: string, outcome: "accepted" | "rejected" | "ambiguous"): void {
+    this.transaction(() => {
+      const row = first(
+        this.sql,
+        tracker.selectFrom("timeline_source_operations").selectAll().where("id", "=", operationId),
+      );
+      if (!row) fail("not_found", "No admitted push operation.", 404);
+      if (row.state === outcome) return;
+      if (row.state === "accepted" || row.state === "rejected")
+        fail("operation_settled", "Push already settled.", 409);
+      const input = JSON.parse(row.data) as SourcePush;
+      if (outcome === "accepted") {
+        const timeline = this.byId(input.timelineId);
+        for (const command of input.commands) this.setHead(timeline.id, input.repoId, command.new);
+        timeline.pushedAt = this.now();
+        timeline.updatedAt = this.now();
+        timeline.version++;
+        if (
+          input.actorId &&
+          input.actorId !== input.accountableId &&
+          !timeline.agentIds.includes(input.actorId)
+        )
+          timeline.agentIds.push(input.actorId);
+        this.status(timeline);
+        this.save(timeline, "timeline.push", input.actorId);
+      }
+      run(
+        this.sql,
+        tracker
+          .updateTable("timeline_source_operations")
+          .set({ state: outcome })
+          .where("id", "=", operationId),
+      );
+    });
+  }
+  resolveLegacyLanding(
+    timelineId: string,
+    expectedVersion: number,
+    action: "cancel-unadvanced" | "accept-partial-and-abandon",
+    note: string,
+  ): Timeline {
+    return this.transaction(() => {
+      const timeline = this.byId(timelineId);
+      if (timeline.repos.some((repo) => repo.source?.kind === "timeline-work"))
+        fail("invalid_input", "This resolution is only for legacy canonical timelines.", 409);
+      const landing = this.landing(timeline.slug);
+      if (!landing || landing.version !== expectedVersion)
+        fail("version_conflict", "Legacy landing changed.", 409);
+      if (landing.state === "advancing" || landing.repos.some((repo) => repo.casIntent))
+        fail(
+          "landing_unresolved",
+          "Reconcile the canonical CAS outcome before resolving this landing.",
+          409,
+        );
+      const advanced = landing.repos.some((repo) => repo.state === "advanced");
+      if (advanced && action !== "accept-partial-and-abandon")
+        fail(
+          "landing_unresolved",
+          "Partial canonical success cannot be canceled or replayed.",
+          409,
+        );
+      text(note, "note");
+      const resolved: Landing = {
+        ...landing,
+        state: "failed",
+        reason: note,
+        version: landing.version + 1,
+        updatedAt: this.now(),
+      };
+      run(
+        this.sql,
+        tracker
+          .updateTable("timeline_landings")
+          .set({ data: JSON.stringify(resolved) })
+          .where("id", "=", landing.id),
+      );
+      timeline.status = action === "accept-partial-and-abandon" ? "abandoned" : "active";
+      if (timeline.status === "abandoned") timeline.endedAt = this.now();
+      timeline.version++;
+      timeline.updatedAt = this.now();
+      this.supersede(
+        timeline,
+        "Legacy landing explicitly resolved; migration needs fresh approval.",
+        null,
+        null,
+      );
+      this.landingEvent(resolved, "failed", note);
+      this.save(timeline, "timeline.migration.resolve", null);
+      return timeline;
+    });
+  }
+  beginLegacyMigration(timelineId: string): Timeline {
+    return this.transaction(() => {
+      const timeline = this.byId(timelineId);
+      if (timeline.migrationState === "ready") return timeline;
+      const landing = this.landing(timeline.slug);
+      if (
+        landing &&
+        landing.state !== "landed" &&
+        (LANDING_ACTIVE.includes(landing.state) ||
+          (!ENDED.includes(timeline.status) &&
+            landing.repos.some((repo) => repo.state === "advanced" || repo.casIntent)))
+      )
+        fail("landing_unresolved", "Resolve the legacy landing before migration.", 409);
+      if (this.sourcePushes().some((operation) => operation.timelineId === timeline.id))
+        fail("source_busy", "Resolve source operations before migration.", 409);
+      if (timeline.migrationState === "frozen") return timeline;
+      timeline.migrationState = "frozen";
+      timeline.version++;
+      timeline.updatedAt = this.now();
+      this.supersede(
+        timeline,
+        "Source migration requires a fresh checkpoint and approval.",
+        null,
+        null,
+      );
+      this.save(timeline, "timeline.migration", null);
+      return timeline;
+    });
+  }
+  completeLegacyMigration(timelineId: string, repos: TimelineRepo[]): Timeline {
+    return this.transaction(() => {
+      const timeline = this.byId(timelineId);
+      if (timeline.migrationState === "ready") return timeline;
+      if (timeline.migrationState !== "frozen")
+        fail("migration_not_frozen", "Freeze migration before replacing sources.", 409);
+      const historical = ENDED.includes(timeline.status);
+      if (
+        repos.length !== timeline.repos.length ||
+        timeline.repos.some(
+          (old) =>
+            !repos.some(
+              (repo) =>
+                repo.id === old.id &&
+                (historical
+                  ? repo.source?.kind === "canonical-historical"
+                  : repo.source?.kind === "timeline-work" &&
+                    repo.source.timelineId === timeline.id) &&
+                repo.logicalBase,
+            ),
+        )
+      )
+        fail("invalid_source", "Migration requires every ready owned source.", 409);
+      if (!historical)
+        for (const repo of repos) {
+          const allocation = first(
+            this.sql,
+            tracker
+              .selectFrom("timeline_source_allocations")
+              .select("data")
+              .where("source_id", "=", repo.source!.sourceId),
+          );
+          if (!allocation || (JSON.parse(allocation.data) as WorkSourceRow).state !== "ready")
+            fail(
+              "source_not_ready",
+              "Migration requires a ready allocation for every source.",
+              409,
+            );
+        }
+      timeline.repos = repos;
+      timeline.migrationState = "ready";
+      timeline.version++;
+      timeline.updatedAt = this.now();
+      for (const repo of repos) this.setHead(timeline.id, repo.id, null);
+      this.save(timeline, "timeline.migration", null);
+      return timeline;
+    });
+  }
   /** Not found: removed by retention (and why), or never there. */
   private missing(ref: string): never {
     const stone = tombstone(this.sql, "timeline", ref);
@@ -163,7 +681,7 @@ export class TimelineStore {
       this.sql,
       tracker.selectFrom("timelines").select("data").where(json("data", "$.slug"), "=", slug),
     );
-    return row ? (JSON.parse(row.data) as Timeline) : null;
+    return row ? decodeTimeline(row.data) : null;
   }
   private save(timeline: Timeline, kind: string, actorId: string | null) {
     this.feed(`timeline:${timeline.id}:v${timeline.version}`, kind, "timeline", timeline, actorId);
@@ -220,7 +738,7 @@ export class TimelineStore {
   /** Every timeline, newest first; ended ones included unless a status is asked for. */
   list(status?: TimelineStatus): Timeline[] {
     return all(this.sql, tracker.selectFrom("timelines").select("data"))
-      .map((row) => JSON.parse(row.data) as Timeline)
+      .map((row) => decodeTimeline(row.data))
       .filter((timeline) => !status || timeline.status === status)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.slug.localeCompare(b.slug));
   }
@@ -296,11 +814,38 @@ export class TimelineStore {
   create(access: Access, input: NewTimeline): Timeline {
     return this.transaction(() => {
       const slug = timelineSlug(input.slug);
+      const existing = this.find(slug);
+      if (existing && existing.id === input.id && existing.startedBy === access.actorId)
+        return existing;
       const parent = this.prepare(slug, input.parent);
       if (!input.repos.length) fail("invalid_input", "A timeline touches at least one repository.");
       for (const repo of input.repos)
         if (!/^[0-9a-f]{40}$/.test(input.commits[repo.id] ?? ""))
           fail("invalid_input", `No fork commit for ${repo.owner}/${repo.name}.`);
+      if (input.id) {
+        this.assertCreationOpen(input.id);
+        const reservation = first(
+          this.sql,
+          tracker.selectFrom("timeline_reservations").selectAll().where("id", "=", input.id),
+        );
+        if (!reservation || reservation.slug !== slug || reservation.actor_id !== access.actorId)
+          fail("invalid_source", "Creation must use its reserved timeline identity.", 409);
+        for (const repo of input.repos) {
+          if (!repo.source || repo.source.timelineId !== input.id || !repo.logicalBase)
+            fail("invalid_source", "Every new timeline repository needs its owned source.", 409);
+          const source = this.getWorkSource(repo.source.sourceId);
+          if (
+            source.state !== "ready" ||
+            source.repo_id !== repo.id ||
+            source.fork_commit !== input.commits[repo.id]
+          )
+            fail(
+              "source_not_ready",
+              "All pinned owned sources must be ready before creation.",
+              409,
+            );
+        }
+      }
       const now = this.now();
       const trackerCursor = one(
         this.sql,
@@ -310,14 +855,17 @@ export class TimelineStore {
       ).cursor;
       const agent = access.actorId !== access.principalId;
       const timeline: Timeline = {
-        id: `tl_${crypto.randomUUID()}`,
+        id: input.id ?? `tl_${crypto.randomUUID()}`,
         slug,
         name: input.name === undefined ? slug : text(input.name, "name"),
         policy: this.policy(input.policy),
         experimental: this.flag(input.experimental, "experimental") ?? false,
         parentId: parent?.id ?? null,
         forkPoint: { commits: input.commits, trackerCursor },
-        repos: input.repos.map((repo) => ({ ...repo, bookmark: timelineBookmark(slug) })),
+        repos: input.repos.map((repo) => ({
+          ...repo,
+          bookmark: repo.source ? "work" : timelineBookmark(slug),
+        })),
         status: "active",
         accountableId: access.principalId,
         startedBy: access.actorId,
@@ -381,6 +929,23 @@ export class TimelineStore {
   /** Only its accountable person, acting as themselves, or the agent that started it. */
   mayAbandon(access: Access, slug: string): Timeline {
     const timeline = this.get(slug);
+    if (this.sourcePushes().some((operation) => operation.timelineId === timeline.id))
+      fail("source_busy", "Reconcile pending source writes before abandoning.", 409);
+    const landing = this.landing(timeline.slug);
+    // Settled partial success is immutable evidence, not an outstanding write.
+    // Legacy partials use their explicit migration-resolution operation instead.
+    const settledOwnedPartial =
+      landing &&
+      timeline.repos.every((repo) => repo.source?.kind === "timeline-work") &&
+      landing.repos.some((repo) => repo.state === "advanced") &&
+      landing.repos.some((repo) => repo.state !== "advanced");
+    if (
+      landing &&
+      (LANDING_ACTIVE.includes(landing.state) ||
+        landing.repos.some((repo) => repo.state !== "advanced" && repo.casIntent) ||
+        (!settledOwnedPartial && landing.repos.some((repo) => repo.state === "advanced")))
+    )
+      fail("landing_unresolved", "Resolve the landing before abandoning.", 409);
     if (access.actorId !== timeline.accountableId && access.actorId !== timeline.startedBy)
       fail(
         "forbidden",
@@ -391,9 +956,9 @@ export class TimelineStore {
     return timeline;
   }
   /**
-   * End a timeline: its status, and an abandon event with each bookmark's last
-   * commit. Abandoning it again changes nothing (`abandoned` is false), so the
-   * caller can retry deleting bookmarks.
+   * End a timeline with each source's last commit. A settled partial landing's
+   * successful receipts remain intact; abandonment never rolls canonical back.
+   * Repeating abandonment changes nothing (`abandoned` is false).
    */
   abandon(
     access: Access,
@@ -440,6 +1005,14 @@ export class TimelineStore {
       const seen = new Map<string, Timeline>();
       const lookup = (slug: string) => {
         const timeline = seen.get(slug) ?? this.find(slug);
+        // Canonical bookmark observations can arrive after their migration cleanup.
+        // Only admitted source operations may update owned timeline heads or activity.
+        if (
+          timeline &&
+          (timeline.migrationState === "frozen" ||
+            timeline.repos.some((repo) => repo.source?.kind === "timeline-work"))
+        )
+          return null;
         if (timeline) seen.set(slug, timeline);
         return timeline;
       };
@@ -519,13 +1092,13 @@ export class TimelineStore {
 
   // ---- checkpoints (CORE-76) -------------------------------------------------
 
-  private byId(timelineId: string): Timeline {
+  byId(timelineId: string): Timeline {
     const row = first(
       this.sql,
       tracker.selectFrom("timelines").select("data").where("id", "=", timelineId),
     );
     if (!row) this.missing(timelineId);
-    return JSON.parse(row.data) as Timeline;
+    return decodeTimeline(row.data);
   }
   private setHead(timelineId: string, repoId: string, oid: string | null) {
     run(
@@ -558,6 +1131,19 @@ export class TimelineStore {
    * repository it doesn't have) moves the head past it.
    */
   private isCurrent(checkpoint: Checkpoint): boolean {
+    const timeline = this.byId(checkpoint.timelineId);
+    if (timeline.migrationState === "frozen") return false;
+    if (this.sourcePushes().some((operation) => operation.timelineId === timeline.id)) return false;
+    if (
+      timeline.migrationState === "ready" &&
+      checkpoint.repos.some(
+        (repo) =>
+          !repo.source ||
+          repo.source.sourceId !==
+            timeline.repos.find((entry) => entry.id === repo.id)?.source?.sourceId,
+      )
+    )
+      return false;
     if (this.latest(checkpoint.timelineId)?.id !== checkpoint.id) return false;
     const heads = all(
       this.sql,
@@ -748,6 +1334,9 @@ export class TimelineStore {
   createCheckpoint(access: Access, slug: string, input: NewCheckpoint): CheckpointState {
     return this.transaction(() => {
       const timeline = this.get(slug);
+      this.writableSourceTimeline(timeline);
+      if (this.sourcePushes().some((operation) => operation.timelineId === timeline.id))
+        fail("source_busy", "A source push is not reconciled.", 409);
       if (ENDED.includes(timeline.status))
         fail("timeline_ended", `${timeline.slug} is ${timeline.status}.`, 409);
       const summary =
@@ -762,6 +1351,21 @@ export class TimelineStore {
       )
         fail("timeline_changed", `${timeline.slug}'s repositories changed; try again.`, 409);
       for (const repo of input.repos) {
+        const owner = timeline.repos.find((entry) => entry.id === repo.id);
+        if (
+          !repo.source ||
+          !repo.logicalBase ||
+          !repo.dependencies ||
+          repo.source.sourceId !== owner?.source?.sourceId ||
+          repo.source.commit !== repo.commit ||
+          repo.source.repoId !== repo.id ||
+          !OID.test(repo.source.tree)
+        )
+          fail(
+            "invalid_source",
+            "Checkpoint must pin its exact owned source and logical base.",
+            409,
+          );
         if (!OID.test(repo.commit) || (repo.base !== null && !OID.test(repo.base)))
           fail("invalid_input", `Commits for ${repo.owner}/${repo.name} must be full commit ids.`);
         if (repo.changes.length > CHECKPOINT_CHANGES)
@@ -771,10 +1375,34 @@ export class TimelineStore {
       const previous = this.latest(timeline.id);
       const same = (pinned: Record<string, string>) =>
         input.repos.every((repo) => pinned[repo.id] === repo.commit);
-      if (previous && same(Object.fromEntries(previous.repos.map((r) => [r.id, r.commit]))))
+      // Source identity and reviewed dependency proof can change without a new work OID.
+      if (
+        previous &&
+        previous.repos.length === input.repos.length &&
+        input.repos.every((repo) => {
+          const pinned = previous.repos.find((entry) => entry.id === repo.id);
+          const dependencies = repo.dependencies ?? [];
+          const previousDependencies = pinned?.dependencies ?? [];
+          const sameDependency = (
+            a: (typeof dependencies)[number],
+            b: (typeof dependencies)[number],
+          ) => sameSnapshot(a.source, b.source) && sameSnapshot(a.base, b.base);
+          return (
+            pinned?.commit === repo.commit &&
+            sameSnapshot(pinned.source, repo.source) &&
+            sameSnapshot(pinned.logicalBase, repo.logicalBase) &&
+            dependencies.every((edge) =>
+              previousDependencies.some((other) => sameDependency(edge, other)),
+            ) &&
+            previousDependencies.every((edge) =>
+              dependencies.some((other) => sameDependency(edge, other)),
+            )
+          );
+        })
+      )
         fail(
           "unchanged",
-          `Checkpoint #${previous.number} already pins these commits; push new work first.`,
+          `Checkpoint #${previous.number} already pins this source and dependency proof.`,
           409,
         );
       if (!previous && same(timeline.forkPoint.commits))
@@ -791,6 +1419,9 @@ export class TimelineStore {
           commit: repo.commit,
           base: repo.base,
           changes: repo.changes.map((c) => ({ changeId: c.changeId, commit: c.commit })),
+          source: repo.source,
+          logicalBase: repo.logicalBase,
+          dependencies: repo.dependencies,
         })),
         summary,
         actorId: access.actorId,
@@ -989,6 +1620,10 @@ export class TimelineStore {
   ): { landing: Landing; queued: boolean } {
     return this.transaction(() => {
       const timeline = this.get(slug);
+      if (timeline.migrationState === "frozen" || timeline.repos.some((repo) => !repo.source))
+        fail("migration_required", "Migrate the legacy timeline before landing.", 409);
+      if (this.sourcePushes().some((operation) => operation.timelineId === timeline.id))
+        fail("source_busy", "A source mutation awaits reconciliation.", 409);
       if (ENDED.includes(timeline.status))
         fail("timeline_ended", `${timeline.slug} is ${timeline.status}.`, 409);
       const previous = this.landing(slug);
@@ -1037,14 +1672,29 @@ export class TimelineStore {
           409,
         );
       const now = this.now();
-      // Mains an earlier landing of this checkpoint advanced stay advanced.
+      if (
+        previous &&
+        previous.checkpointId !== head.id &&
+        previous.repos.some((repo) => repo.state === "advanced" || repo.casIntent)
+      )
+        fail(
+          "landing_unresolved",
+          "Resolve the previous landing before selecting another checkpoint.",
+          409,
+        );
+      const retry = previous?.checkpointId === head.id ? previous : null;
+      // Preserve published outcomes, unresolved CAS intents and tested siblings.
+      // The Worker rechecks every unadvanced main before using a retained candidate.
       const advanced = new Map(
         (previous?.checkpointId === head.id ? previous.repos : [])
-          .filter((repo) => repo.state === "advanced")
-          .map((repo) => [repo.id, repo]),
+          .filter((repo) => repo.state === "advanced" || repo.state === "tested" || repo.casIntent)
+          .map((repo) => [
+            repo.id,
+            repo.state === "advanced" ? repo : { ...repo, state: "tested" as const },
+          ]),
       );
       const landing: Landing = {
-        id: `ld_${crypto.randomUUID()}`,
+        id: retry?.id ?? `ld_${crypto.randomUUID()}`,
         timelineId: timeline.id,
         slug: timeline.slug,
         checkpointId: head.id,
@@ -1057,6 +1707,9 @@ export class TimelineStore {
               owner: repo.owner,
               name: repo.name,
               commit: repo.commit,
+              source: repo.source,
+              logicalBase: repo.logicalBase,
+              dependencies: repo.dependencies,
               base: null,
               merge: null,
               attempt: 0,
@@ -1073,18 +1726,21 @@ export class TimelineStore {
           accountableId: access.principalId,
           agentId: request.agentId,
         },
-        version: 1,
-        createdAt: now,
+        version: (retry?.version ?? 0) + 1,
+        createdAt: retry?.createdAt ?? now,
         updatedAt: now,
       };
       run(
         this.sql,
-        tracker.insertInto("timeline_landings").values({
-          id: landing.id,
-          timeline_id: timeline.id,
-          created_at: now,
-          data: JSON.stringify(landing),
-        }),
+        tracker
+          .insertInto("timeline_landings")
+          .values({
+            id: landing.id,
+            timeline_id: timeline.id,
+            created_at: now,
+            data: JSON.stringify(landing),
+          })
+          .onConflict((oc) => oc.column("id").doUpdateSet({ data: JSON.stringify(landing) })),
       );
       this.landingEvent(landing, "queued", null);
       this.landingStatus(timeline, landing, access.actorId);
@@ -1149,7 +1805,9 @@ export class TimelineStore {
       const outcome: LandingOutcome | null =
         saved.state === "landed"
           ? "landed"
-          : saved.state === "conflict" || saved.state === "failed"
+          : saved.state === "conflict" ||
+              saved.state === "failed" ||
+              saved.state === "blocked_dependency"
             ? saved.state
             : advanced(saved) > advanced(current) && advanced(saved) < saved.repos.length
               ? "partly_landed"

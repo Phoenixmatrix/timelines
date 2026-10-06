@@ -36,7 +36,6 @@ const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: fa
 const ben: Actor = { id: "ben", slug: "ben", displayName: "Ben", isSiteAdmin: false };
 const C1 = "1".repeat(40);
 const TIP = "7".repeat(40);
-const REF = "refs/heads/timeline/plan";
 let names = 0;
 
 async function setup() {
@@ -50,11 +49,29 @@ async function setup() {
       ('r2', 'ann', 'docs', 'public', 'ws-docs-${n}', 'https://docs'),
       ('r3', 'ann', 'notes', 'private', 'ws-notes-${n}', 'https://notes');
     INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('r3', 'ben', 'read');
+    INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, owner_id,
+      artifacts_name, artifacts_remote, state, allocation_operation_id, fork_source_id,
+      fork_commit, fork_tree, fork_ref, initial_source_id, initial_commit, initial_tree, initial_ref,
+      initial_token_revoked, created_at, updated_at)
+    VALUES
+      ('work_shop', 'r1', 'plan', 'plan', 'ann', 'ws-shop-work-${n}', 'https://shop-work',
+       'ready', 'allocate-shop', 'canonical', '${C1}', '${C1}', 'refs/heads/main',
+       'canonical', '${C1}', '${C1}', 'refs/heads/main', 1, '', ''),
+      ('work_notes', 'r3', 'plan', 'plan', 'ann', 'ws-notes-work-${n}', 'https://notes-work',
+       'ready', 'allocate-notes', 'canonical', '${C1}', '${C1}', 'refs/heads/main',
+       'canonical', '${C1}', '${C1}', 'refs/heads/main', 1, '', '');
   `);
   const git = fakeRemotes();
-  git.add("https://shop", { "refs/heads/main": C1, [REF]: TIP });
-  git.add("https://docs", { "refs/heads/main": C1 });
-  git.add("https://notes", { "refs/heads/main": C1, [REF]: TIP });
+  git.add("https://shop", { "refs/heads/main": C1 }, undefined, `ws-shop-${n}`);
+  git.add("https://shop-work", { "refs/heads/work": TIP }, "refs/heads/work", `ws-shop-work-${n}`);
+  git.add("https://docs", { "refs/heads/main": C1 }, undefined, `ws-docs-${n}`);
+  git.add("https://notes", { "refs/heads/main": C1 }, undefined, `ws-notes-${n}`);
+  git.add(
+    "https://notes-work",
+    { "refs/heads/work": TIP },
+    "refs/heads/work",
+    `ws-notes-work-${n}`,
+  );
   const env = {
     DB: d1(sqlite),
     ARTIFACTS: git.artifacts,
@@ -85,8 +102,8 @@ async function setup() {
     await writeAtlasFixtureGraph(env.DB, id, name, C1);
   await publishAtlasFixture(env, "r1", C1);
   await publishAtlasFixture(env, "r2", C1);
-  const shop = await writeAtlasFixtureOverlay(env.DB, "r1", "timeline/plan", TIP, C1);
-  await writeAtlasFixtureOverlay(env.DB, "r3", "timeline/plan", TIP, C1);
+  const shop = await writeAtlasFixtureOverlay(env.DB, "r1", "timeline/plan", TIP, C1, "work_shop");
+  await writeAtlasFixtureOverlay(env.DB, "r3", "timeline/plan", TIP, C1, "work_notes");
   return {
     sqlite,
     env,
@@ -123,6 +140,7 @@ describe("A timeline across a workspace", () => {
     expect(first.timeline).toBe("plan");
     expect([...byName.keys()]).toEqual(["shop", "docs", "notes"]);
     expect(byName.get("shop")).toMatchObject({
+      sourceId: "work_shop",
       state: "up-to-date",
       head: TIP,
       commit: TIP,
@@ -132,6 +150,7 @@ describe("A timeline across a workspace", () => {
       base: "same",
     });
     expect(byName.get("docs")).toMatchObject({
+      sourceId: null,
       state: "none",
       head: null,
       commit: null,
@@ -139,6 +158,7 @@ describe("A timeline across a workspace", () => {
       base: "unknown",
     });
     expect(byName.get("notes")).toMatchObject({
+      sourceId: "work_notes",
       state: "up-to-date",
       head: TIP,
       commit: TIP,
@@ -197,7 +217,7 @@ describe("A timeline across a workspace", () => {
   test("a push to any repository's timeline stops a traversal; unreadable ones are never mentioned", async () => {
     const s = await setup();
     const page = await atlasWorkspaceApi.timeline(workspace, "timeline/plan", { limit: 1 });
-    await writeAtlasFixtureOverlay(s.env.DB, "r3", "timeline/plan", TIP, C1);
+    await writeAtlasFixtureOverlay(s.env.DB, "r3", "timeline/plan", TIP, C1, "work_notes");
     const stopped = await atlasWorkspaceApi
       .timeline(workspace, "timeline/plan", { limit: 1, cursor: page.next })
       .then(() => null, atlasErrorOf);

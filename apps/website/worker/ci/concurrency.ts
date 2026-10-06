@@ -26,7 +26,7 @@ export async function concurrencyGate(
   const kdb = db(d1);
   const me = await kdb
     .selectFrom("ci_runs")
-    .select(["repo_id", "ref", "number", "status"])
+    .select(["repo_id", "source_id", "ref", "number", "status"])
     .where("id", "=", runId)
     .executeTakeFirstOrThrow();
   if (me.status === "cancelled") return { kind: "cancelled" };
@@ -35,6 +35,7 @@ export async function concurrencyGate(
     .innerJoin("ci_runs as r", "r.id", "j.run_id")
     .select("r.number")
     .where("r.repo_id", "=", me.repo_id)
+    .where("r.source_id", "=", me.source_id)
     .where("r.ref", "=", me.ref)
     .where("r.number", ">", me.number)
     .where(sql<string>`json_extract(j.spec, '$.concurrency')`, "=", group)
@@ -55,6 +56,7 @@ export async function concurrencyGate(
             .selectFrom("ci_jobs as o")
             .select("o.id")
             .where("o.repo_id", "=", me.repo_id)
+            .where("o.source_id", "=", me.source_id)
             .where("o.id", "<>", jobId)
             .where(sql<string>`json_extract(o.spec, '$.concurrency')`, "=", group)
             .where("o.concurrency_claimed_at", "is not", null)

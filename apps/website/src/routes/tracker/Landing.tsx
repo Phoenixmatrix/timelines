@@ -9,15 +9,16 @@ import type { Landing, LandingRepo, LandResult, Timeline } from "../../../shared
 import { link } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { shortOid } from "../../lib/format.ts";
-import { repoPath } from "../../lib/refs.ts";
+import { repoPath, treeUrl } from "../../lib/refs.ts";
 import { commitPanelUrl } from "../../lib/commitPanel.ts";
 
 const STATE: Record<Landing["state"], string> = {
-  merging: "Merging into main",
-  testing: "Testing the merge",
+  merging: "Preparing the result on main",
+  testing: "Testing the result",
   advancing: "Advancing main",
   conflict: "Stopped: conflicts with main",
   failed: "Stopped",
+  blocked_dependency: "Blocked: dependency needs integration",
   landed: "Landed",
 };
 
@@ -28,6 +29,7 @@ const REPO_STATE: Record<LandingRepo["state"], string> = {
   advanced: "main advanced",
   conflict: "conflict",
   failed: "failed",
+  blocked_dependency: "blocked dependency",
 };
 
 export function LandingPanel({
@@ -50,8 +52,8 @@ export function LandingPanel({
   const load = useCallback(async () => {
     try {
       setLanding((await api<{ landing: Landing | null }>(`${path}/landing`)).landing);
-    } catch {
-      setLanding(null);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure));
     }
   }, [path]);
   useEffect(() => {
@@ -82,7 +84,7 @@ export function LandingPanel({
       setBusy(false);
     }
   };
-  if (ended && !landing) return null;
+  if (ended && !landing && !error) return null;
   return (
     <section aria-labelledby={`landing-${timeline.id}`}>
       <div className="mt-4 mb-1 flex items-center gap-2">
@@ -110,8 +112,8 @@ export function LandingPanel({
       {!landing ? (
         <p className="m-0 text-body-sm text-ink-faint">
           {timeline.policy === "auto"
-            ? "Lands once a checkpoint's CI is green: its merge into main is tested before main moves."
-            : "Lands once a person approves a checkpoint: its merge into main is tested before main moves."}
+            ? "Lands once a checkpoint's CI is green: its compact result is tested before main moves."
+            : "Lands once a person approves a checkpoint: its compact result is tested before main moves."}
         </p>
       ) : (
         <>
@@ -130,9 +132,40 @@ export function LandingPanel({
                 <span>{REPO_STATE[repo.state]}</span>
                 {repo.merge && (
                   <Link className={link} to={commitPanelUrl(repo.owner, repo.name, repo.merge)}>
-                    merge <span className="mk-mono">{shortOid(repo.merge)}</span>
+                    {repo.source?.kind === "timeline-work"
+                      ? repo.state === "advanced"
+                        ? repo.noop
+                          ? "no-op receipt"
+                          : "compact commit"
+                        : "compact candidate"
+                      : "historical merge"}{" "}
+                    <span className="mk-mono">{shortOid(repo.merge)}</span>
                   </Link>
                 )}
+                {repo.source && (
+                  <Link
+                    className={link}
+                    to={treeUrl(repo.owner, repo.name, repo.commit, "", repo.source.sourceId)}
+                  >
+                    approved source <span className="mk-mono">{shortOid(repo.commit)}</span>
+                  </Link>
+                )}
+                {repo.reason && <span className="basis-full break-words">{repo.reason}</span>}
+                {repo.dependencies?.map((dependency) => (
+                  <Link
+                    key={`${dependency.source.sourceId}:${dependency.source.commit}`}
+                    className={link}
+                    to={treeUrl(
+                      repo.owner,
+                      repo.name,
+                      dependency.source.commit,
+                      "",
+                      dependency.source.sourceId,
+                    )}
+                  >
+                    dependency <span className="mk-mono">{shortOid(dependency.source.commit)}</span>
+                  </Link>
+                ))}
                 {[repo.mergeRun, repo.gateRun].map(
                   (run, i) =>
                     run &&
@@ -142,7 +175,7 @@ export function LandingPanel({
                         className={link}
                         to={repoPath(repo.owner, repo.name, "ci", String(run.number))}
                       >
-                        {i === 0 ? "Merge" : "Gates"} #{run.number}
+                        {i === 0 ? "Preparation" : "Gates"} #{run.number}
                       </Link>
                     ),
                 )}

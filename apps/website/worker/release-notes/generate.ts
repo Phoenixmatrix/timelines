@@ -2,15 +2,16 @@
 // issues they cite into stored entries, plus a short introduction per
 // release. Entries whose inputs are unchanged are reused, wherever in the
 // repository they were written, so a push only pays for what is new and
-// tag snapshots can reuse entries without another model call. Timelines land
-// as merges (CORE-72): a merge brings the commits it landed into its release,
-// and entries record the timeline their work landed with.
+// tag snapshots can reuse entries without another model call. Compact landings
+// group the durable source inputs captured with their receipts; historical real
+// merges retain their original ancestry and rendering.
 
 import type {
   LandedTimeline,
   LinkedIssue,
   ReleaseCategory,
   ReleaseNoteChange,
+  ReleaseNoteEntry,
 } from "../../shared/release-notes.ts";
 import { DAILY_RELEASE_PREFIX } from "../../shared/release-notes.ts";
 import type { AiModels } from "../../shared/ai.ts";
@@ -19,6 +20,7 @@ import { chatJson, chatText } from "../knowledge/models.ts";
 import { batch, db } from "../schema.ts";
 import { issueKeys } from "./keys.ts";
 import { walkRange, type HistoryReader } from "./range.ts";
+import { compactReleaseInputs, type CompactReleaseInput } from "./compact.ts";
 
 /** Bump when prompts change, so entries are rewritten. */
 const PROMPT_VERSION = 2;
@@ -54,6 +56,9 @@ interface Draft {
   /** The newest merge that landed some of the commits; null when none did. */
   landing: string | null;
   inputsHash: string;
+  provenance: NonNullable<ReleaseNoteEntry["provenance"]>;
+  /** Canonical objects used for semantic diffs; compact source OIDs never read on main. */
+  changeCommits: string[];
 }
 
 interface Written {
@@ -138,9 +143,9 @@ async function write(
 ): Promise<Written> {
   const changes: ReleaseNoteChange[] = [];
   // A merge's own diff is everything it landed, other entries' work included.
-  for (const commit of draft.commits.filter((c) => !isMerge(c)).slice(0, 10)) {
+  for (const oid of draft.changeCommits.slice(0, 10)) {
     if (changes.length >= 30) break;
-    changes.push(...(await source.changes(commit.hash)).slice(0, 30 - changes.length));
+    changes.push(...(await source.changes(oid)).slice(0, 30 - changes.length));
   }
   const { value, usage } = await chatJson<{ category?: string; title?: string; summary?: string }>(
     env,
@@ -262,6 +267,27 @@ export async function generateReleaseNotes(
       )
     : all;
 
+  const compact = await compactReleaseInputs(env.DB, repoId, [
+    ...new Set(releases.flatMap((release) => release.commits.map((commit) => commit.hash))),
+  ]);
+  const provenance = new Map<
+    ArtifactsCommitMetadata,
+    { landing: string; input: CompactReleaseInput; at: number }
+  >();
+  for (const release of releases) {
+    release.commits = release.commits.flatMap((commit) => {
+      const input = compact.get(commit.hash);
+      if (!input || !input.commits.length) return [commit];
+      // Only metadata is expanded. Source Git objects are neither copied to nor
+      // read from canonical storage, including during regeneration after purge.
+      return input.commits.map((metadata) => {
+        const captured = { ...metadata };
+        provenance.set(captured, { landing: commit.hash, input, at: commit.committedAt });
+        return captured;
+      });
+    });
+  }
+
   // Every key any release cites, resolved once.
   const keys = [
     ...new Set(releases.flatMap((r) => r.commits.flatMap((c) => issueKeys(c.message)))),
@@ -281,25 +307,29 @@ export async function generateReleaseNotes(
   const merges = new Map<string, ArtifactsCommitMetadata>();
   for (const release of releases)
     for (const commit of release.commits)
-      if (isMerge(commit) && !release.landings.has(commit.hash)) merges.set(commit.hash, commit);
+      if (isMerge(commit) && !provenance.has(commit) && !release.landings.has(commit.hash))
+        merges.set(commit.hash, commit);
   const timelines: Map<string, LandedTimeline> = merges.size
     ? await source.timelines([...merges.values()])
     : new Map();
+  for (const [landing, input] of compact) timelines.set(landing, input.timeline);
 
   // Drafts: an issue gathers the release's commits citing it; other commits
   // stand alone, except a landing's, which share one entry for the landing.
   const drafts: Draft[] = [];
   for (const release of releases) {
-    const bySubject = new Map<string, Omit<Draft, "inputsHash">>();
+    const bySubject = new Map<string, Omit<Draft, "inputsHash" | "provenance" | "changeCommits">>();
     const landingOf = (commit: ArtifactsCommitMetadata) =>
-      release.landings.get(commit.hash) ?? (merges.has(commit.hash) ? commit.hash : null);
+      provenance.get(commit)?.landing ??
+      release.landings.get(commit.hash) ??
+      (merges.has(commit.hash) ? commit.hash : null);
     const uncitedMerges: ArtifactsCommitMetadata[] = [];
     for (const commit of release.commits) {
       const cited = issueKeys(commit.message).flatMap((key) => byKey.get(key) ?? []);
       const landing = landingOf(commit);
       if (!cited.length) {
         // Merges are how work arrives, not work: a timeline's syncs drop out.
-        if (isMerge(commit)) {
+        if (isMerge(commit) && !provenance.has(commit)) {
           if (merges.has(commit.hash)) uncitedMerges.push(commit);
           continue;
         }
@@ -335,16 +365,38 @@ export async function generateReleaseNotes(
     // brought anything that cites nothing either.
     for (const merge of uncitedMerges)
       bySubject.get(`landing:${merge.hash}`)?.commits.unshift(merge);
-    for (const draft of bySubject.values())
+    for (const draft of bySubject.values()) {
+      const sourceEvidence = new Map<string, NonNullable<ReleaseNoteEntry["provenance"]>[number]>();
+      for (const commit of draft.commits) {
+        const recorded = provenance.get(commit);
+        if (!recorded) continue;
+        const evidence = sourceEvidence.get(recorded.input.receiptId) ?? {
+          source: recorded.input.source,
+          receiptId: recorded.input.receiptId,
+          commits: [],
+        };
+        evidence.commits.push(commit.hash);
+        sourceEvidence.set(evidence.receiptId, evidence);
+      }
       drafts.push({
         ...draft,
+        provenance: [...sourceEvidence.values()],
+        changeCommits: [
+          ...new Set(
+            draft.commits
+              .filter((commit) => provenance.has(commit) || !isMerge(commit))
+              .map((commit) => provenance.get(commit)?.landing ?? commit.hash),
+          ),
+        ],
         inputsHash: await sha256({
           v: PROMPT_VERSION,
           kind: draft.kind,
           issue: draft.issue && issueInputs(draft.issue),
           commits: draft.commits.map((c) => [c.hash, c.message.slice(0, 2000)]),
+          sources: [...sourceEvidence.values()],
         }),
       });
+    }
   }
 
   // Reuse anything already written from the same inputs.
@@ -371,10 +423,13 @@ export async function generateReleaseNotes(
   let more = upgrading;
   const stamp = now();
   for (const release of releases) {
-    const releasedAt = iso(Math.max(...release.commits.map((c) => c.committedAt)));
+    const releasedAt = iso(
+      Math.max(...release.commits.map((c) => provenance.get(c)?.at ?? c.committedAt)),
+    );
     const byHash = new Map(release.commits.map((c) => [c.hash, c]));
     // Landed work shipped when its landing did.
     const shippedAt = (commit: ArtifactsCommitMetadata) =>
+      provenance.get(commit)?.at ??
       (byHash.get(release.landings.get(commit.hash) ?? "") ?? commit).committedAt;
     await d
       .insertInto("release_notes")
@@ -432,7 +487,11 @@ export async function generateReleaseNotes(
         issue_type: issue?.type ?? null,
         labels: JSON.stringify(issue?.labels ?? []),
         workspace_ids: JSON.stringify(issue?.workspaceIds ?? []),
-        commits: JSON.stringify(draft.commits.map((c) => c.hash)),
+        commits: JSON.stringify([
+          ...new Set(draft.commits.map((c) => provenance.get(c)?.landing ?? c.hash)),
+        ]),
+        provenance: JSON.stringify(draft.provenance),
+        regeneration_inputs: JSON.stringify({ ...draft, changes: written.changes }),
         changes: JSON.stringify(written.changes),
         landing_oid: draft.landing,
         timeline_id: timeline?.id ?? null,

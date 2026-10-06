@@ -24,7 +24,7 @@ type PushedRepo = Pick<
   | "default_branch"
   | "artifacts_name"
   | "artifacts_remote"
->;
+> & { source_id?: string };
 
 /** A ref's line: null for main, a slug for a timeline bookmark, undefined for anything else. */
 function lineOf(ref: string, mainRef: string): string | null | undefined {
@@ -52,6 +52,10 @@ export async function timelineActivity(
   actor: Pick<Actor, "id" | "agent"> | null,
   logged: LoggedUpdate[],
 ): Promise<PushActivity | null> {
+  // Owned source pushes are admitted and recorded synchronously by Tracker.
+  // Their work ref must never be interpreted as canonical main or guessed
+  // into another timeline by an equal commit/change id.
+  if (repo.source_id && repo.source_id !== "canonical") return null;
   const mainRef = `refs/heads/${repo.default_branch}`;
   const pushed = new Set<string>();
   const heads: NonNullable<PushActivity["heads"]> = [];
@@ -80,6 +84,7 @@ export async function timelineActivity(
         .selectFrom("repo_refs")
         .select(["ref", "oid"])
         .where("repo_id", "=", repo.id)
+        .where("source_id", "=", "canonical")
         .where("oid", "in", oids)
         .where((eb) => eb.or([eb("ref", "=", mainRef), eb("ref", "like", "refs/heads/timeline/%")]))
         .execute(),
@@ -87,6 +92,7 @@ export async function timelineActivity(
         .selectFrom("ref_updates")
         .select(["ref", "new_oid as oid", "id"])
         .where("repo_id", "=", repo.id)
+        .where("source_id", "=", "canonical")
         .where("new_oid", "in", oids)
         .where((eb) => eb.or([eb("ref", "=", mainRef), eb("ref", "like", "refs/heads/timeline/%")]))
         .execute(),

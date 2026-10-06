@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import type { Deployment, DeploymentList, DeploymentStatus } from "../../shared/deployments.ts";
 import { api } from "../lib/api.ts";
 import { fullDate, timeAgo } from "../lib/format.ts";
+import { sourceUrl } from "../lib/refs.ts";
 
 export const DEPLOYMENT_LABEL: Record<DeploymentStatus, string> = {
   active: "Active",
@@ -96,13 +97,16 @@ export function useCommitDeployments(
   owner: string,
   name: string,
   oids: string[],
+  sourceId?: string,
 ): Record<string, Deployment> {
   const [latest, setLatest] = useState<Record<string, Deployment>>({});
   const key = oids.join(",");
   useEffect(() => {
     if (!key) return;
     let current = true;
-    api<DeploymentList>(`/repos/${owner}/${name}/deployments?limit=100&commit=${key}`)
+    api<DeploymentList>(
+      sourceUrl(`/repos/${owner}/${name}/deployments?limit=100&commit=${key}`, sourceId),
+    )
       .then((page) => {
         if (!current) return;
         const found: Record<string, Deployment> = {};
@@ -114,7 +118,7 @@ export function useCommitDeployments(
     return () => {
       current = false;
     };
-  }, [owner, name, key]);
+  }, [owner, name, key, sourceId]);
   return latest;
 }
 

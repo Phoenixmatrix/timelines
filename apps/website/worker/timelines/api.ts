@@ -2,14 +2,14 @@
 //   GET    /                  every timeline, newest first (?status= to filter;
 //                             ?stalled=true for open ones without a push for the
 //                             account's idle period, experimental ones left out)
-//   POST   /                  fork one from main or another timeline: a bookmark
-//                             `timeline/<slug>` in each repository, then the record
+//   POST   /                  fork an owned work source per repository, pinned
+//                             to main or another timeline's exact snapshot
 //   GET    /:slug             the timeline and its events (?after=&limit= to page)
 //   PATCH  /:slug             rename it, or set or clear its experimental flag
-//   POST   /:slug/abandon     end it and delete its bookmarks (events stay)
+//   POST   /:slug/abandon     archive work, or cancel/drain a reserved creation
 //   GET    /:slug/checkpoints       its checkpoints, newest first, each with its
 //                                   CI runs, previews and approval (CORE-76)
-//   POST   /:slug/checkpoints       {summary?}: record its bookmarks' commits now,
+//   POST   /:slug/checkpoints       {summary?}: pin exact sources and logical bases,
 //                                   and queue the timeline's wiki pages for it (CORE-84)
 //   GET    /:slug/checkpoints/:ref  one checkpoint, by id or number
 //   POST   /:slug/checkpoints/:ref/revive  rebuild its preview (CORE-79): a
@@ -22,14 +22,14 @@
 //   GET    /:slug/landing     its newest landing, if any
 //
 // Any tracker member (person or agent) with write access to the repositories
-// may fork; abandoning is checked by the tracker (timelines.ts). Bookmarks are
-// written before the record and removed again if it can't be made, so a
-// timeline never names a bookmark that wasn't created.
+// may fork; abandoning is checked by the tracker (timelines.ts). Creation
+// reservations and provider ownership precede routing; only fully ready owned
+// sources are published on the timeline.
 
 import { Hono, type Context } from "hono";
 import type { AppEnv } from "../auth.ts";
 import { lsRefs } from "../artifacts.ts";
-import { findRepo, roleFor, type RepoRow } from "../db.ts";
+import { findRepo, roleFor, selectRepos, type RepoRow } from "../db.ts";
 import { atLeast } from "../permissions.ts";
 import { db } from "../schema.ts";
 import {
@@ -39,6 +39,7 @@ import {
   type BookmarkResult,
   type Timeline,
   type TimelineChange,
+  type TimelineCreationCancellation,
   type TimelineDetail,
   type TimelineList,
   type TimelinePolicy,
@@ -55,12 +56,19 @@ import type { TrackerReply } from "../tracker/object.ts";
 import { TrackerError, fail, text } from "../tracker/store.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { timelineSlug, timelineStatus } from "../tracker/timelines.ts";
-import { logPush } from "./activity.ts";
 import { measure, mayWriteAll, view, writableRepoIds } from "./checkpoints.ts";
 import { overlayNow, requestCheckpointPages } from "../knowledge/coordinator.ts";
 import { releaseQuiet } from "../ci/trigger.ts";
 import { maybeLand, requestLanding, settled, workerDeps } from "./landing.ts";
-import { writeRefs, type RefWrite } from "./bookmarks.ts";
+import {
+  canonicalSource,
+  ensureWorkSource,
+  getWorkSource,
+  resolveTimelineSource,
+} from "./sources.ts";
+import type { SourceSnapshot } from "../../shared/code-source.ts";
+import type { TimelineRepo } from "../../shared/timelines.ts";
+import { migrateLegacyTimeline } from "./migration.ts";
 
 /** Repositories one timeline may touch. */
 const MAX_REPOS = 20;
@@ -104,29 +112,6 @@ async function input(c: Context<AppEnv>, allowed: string[]): Promise<Record<stri
   return value as Record<string, unknown>;
 }
 
-/** Write one ref per repository; whatever went wrong comes back as a failed result. */
-async function writeEach(
-  env: Env,
-  writes: { repo: BookmarkRepo; write: RefWrite }[],
-): Promise<BookmarkResult[]> {
-  return Promise.all(
-    writes.map(async ({ repo, write }) => {
-      try {
-        const [result] = await writeRefs(env, repo, [write]);
-        return { repoId: repo.id, ...result! };
-      } catch (error) {
-        console.error("Timelines: writing a bookmark failed", { repo: repo.id, error });
-        return {
-          repoId: repo.id,
-          ref: write.ref,
-          ok: false,
-          reason: error instanceof Error ? error.message : String(error),
-        };
-      }
-    }),
-  );
-}
-
 timelines.get("/", async (c) => {
   const access = await authorize(c, false);
   const status = c.req.query("status");
@@ -162,7 +147,7 @@ timelines.post("/", async (c) => {
   const parentSlug =
     data.parent === undefined || data.parent === "main" ? null : timelineSlug(data.parent);
   const tracker = trackerObject(c.env, access.owner.id);
-  const parent = unwrap(await tracker.prepareTimeline(slug, parentSlug));
+  const parent = parentSlug ? unwrap(await tracker.timeline(parentSlug, 0, 1)).timeline : null;
 
   // The repositories, by default the parent's: each the account's own, and writable.
   const requested =
@@ -175,7 +160,7 @@ timelines.post("/", async (c) => {
     fail("invalid_input", "Name the repositories the timeline touches (repos: [owner/name]).");
   if (requested.length > MAX_REPOS)
     fail("invalid_input", `A timeline touches at most ${MAX_REPOS} repositories.`);
-  const repos = new Map<string, { row: BookmarkRepo; commit: string | null }>();
+  const repos = new Map<string, { row: RepoRow; commit: string | null }>();
   for (const entry of requested) {
     if (!entry || typeof entry !== "object") fail("invalid_input", "repos must be owner/name.");
     const { repo: fullName, commit, ...rest } = entry as Record<string, unknown>;
@@ -199,64 +184,49 @@ timelines.post("/", async (c) => {
     repos.set(row.id, { row, commit: at });
   }
 
-  // Where each fork starts: the given commit, the parent's bookmark, or the default branch.
-  const bookmark = `refs/heads/${timelineBookmark(slug)}`;
-  const commits: Record<string, string> = {};
-  for (const { row, commit } of repos.values()) {
-    const refs = await lsRefs(c.env, row.artifacts_name, row.artifacts_remote);
-    if (refs.some((ref) => ref.name === bookmark))
-      fail("already_exists", `${row.owner_slug}/${row.name} already has ${bookmark}.`, 409);
-    if (commit) {
-      using artifacts = await c.env.ARTIFACTS.get(row.artifacts_name);
-      if (!(await artifacts.readCommit(commit)))
-        fail("not_found", `${row.owner_slug}/${row.name} has no commit ${commit}.`, 404);
-      commits[row.id] = commit;
-      continue;
-    }
-    const inParent = parent?.repos.find((repo) => repo.id === row.id);
-    const from = `refs/heads/${inParent ? inParent.bookmark : row.default_branch}`;
-    const tip = refs.find((ref) => ref.name === from)?.oid;
-    if (!tip) fail("no_commits", `${row.owner_slug}/${row.name} has no ${from} to fork from.`, 409);
-    commits[row.id] = tip;
-  }
-
-  const rows = [...repos.values()].map(({ row }) => row);
-  const created = await writeEach(
-    c.env,
-    rows.map((row) => ({ repo: row, write: { ref: bookmark, old: null, new: commits[row.id]! } })),
+  const timelineId = unwrap(
+    await tracker.reserveTimeline(access, slug, parentSlug, JSON.stringify(data)),
   );
-  const undo = () =>
-    writeEach(
-      c.env,
-      rows
-        .filter((row) => created.find((r) => r.repoId === row.id)?.ok)
-        .map((row) => ({ repo: row, write: { ref: bookmark, old: commits[row.id]!, new: null } })),
-    );
-  if (created.some((result) => !result.ok)) {
-    await undo();
-    const failed = created.filter((result) => !result.ok);
-    return c.json(
-      {
-        error: `Couldn't create ${bookmark}: ${failed.map((r) => r.reason).join("; ")}`,
-        code: "bookmark_failed",
-        bookmarks: created,
-      },
-      409,
-    );
+  const commits: Record<string, string> = {};
+  const entries: TimelineRepo[] = [];
+  const created: BookmarkResult[] = [];
+  for (const { row, commit } of repos.values()) {
+    const inParent = parent?.repos.find((entry) => entry.id === row.id);
+    const origin = inParent
+      ? await resolveTimelineSource(c.env, row, inParent)
+      : { repo: row, source: canonicalSource(row) };
+    const refs = await lsRefs(c.env, origin.repo.artifacts_name, origin.repo.artifacts_remote);
+    const tip = commit ?? refs.find((ref) => ref.name === origin.source.ref)?.oid;
+    if (!tip) fail("no_commits", `${row.owner_slug}/${row.name} has no commit to fork.`, 409);
+    using artifacts = await c.env.ARTIFACTS.get(origin.repo.artifacts_name);
+    const pinned = await artifacts.readCommit(tip);
+    if (!pinned) fail("not_found", `No commit ${tip} in the requested source.`, 404);
+    const base: SourceSnapshot = { ...origin.source, commit: tip, tree: pinned.treeHash };
+    const owned = await ensureWorkSource(c.env, row, { timelineId, timelineSlug: slug, base });
+    commits[row.id] = owned.logicalBase.commit;
+    entries.push({
+      id: row.id,
+      owner: row.owner_slug,
+      name: row.name,
+      bookmark: "work",
+      source: owned.source,
+      logicalBase: owned.logicalBase,
+      dependencies: inParent ? [...(inParent.dependencies ?? [])] : [],
+    });
+    created.push({ repoId: row.id, ref: owned.source.ref, ok: true });
   }
-  const recorded = await tracker.createTimeline(access, {
-    slug,
-    name,
-    policy: data.policy,
-    experimental: data.experimental,
-    parent: parentSlug,
-    repos: rows.map((row) => ({ id: row.id, owner: row.owner_slug, name: row.name })),
-    commits,
-  });
-  if (!recorded.ok) await undo();
-  const timeline = unwrap(recorded);
-  // The push log records the new bookmarks as the forker's.
-  for (const row of rows) c.executionCtx.waitUntil(logPush(c.env, row, actor));
+  const timeline = unwrap(
+    await tracker.createTimeline(access, {
+      id: timelineId,
+      slug,
+      name,
+      policy: data.policy,
+      experimental: data.experimental,
+      parent: parentSlug,
+      repos: entries,
+      commits,
+    }),
+  );
   return c.json<TimelineChange>({ timeline, bookmarks: created }, 201);
 });
 
@@ -292,44 +262,108 @@ timelines.patch("/:slug", async (c) => {
   );
 });
 
+timelines.post("/:slug/migrate", async (c) => {
+  const access = await authorize(c, true);
+  const detail = unwrap(
+    await trackerObject(c.env, access.owner.id).timeline(c.req.param("slug"), 0, 1),
+  );
+  const writable = await writableRepoIds(c.env.DB, c.get("actor")!, access.owner.id);
+  if (detail.timeline.repos.some((repo) => !writable.includes(repo.id)))
+    fail("forbidden", "Migration needs write access to every repository.", 403);
+  return c.json(await migrateLegacyTimeline(c.env, access.owner.id, detail.timeline.id));
+});
+
+timelines.post("/:slug/migration/resolve", async (c) => {
+  const access = await authorize(c, true);
+  const tracker = trackerObject(c.env, access.owner.id);
+  const detail = unwrap(await tracker.timeline(c.req.param("slug"), 0, 1));
+  const writable = await writableRepoIds(c.env.DB, c.get("actor")!, access.owner.id);
+  if (detail.timeline.repos.some((repo) => !writable.includes(repo.id)))
+    fail("forbidden", "Resolution needs write access to every repository.", 403);
+  const data = await input(c, ["expectedVersion", "action", "note"]);
+  if (
+    !Number.isSafeInteger(data.expectedVersion) ||
+    (data.action !== "cancel-unadvanced" && data.action !== "accept-partial-and-abandon")
+  )
+    fail("invalid_input", "Name the landing version and explicit resolution action.");
+  const landing = unwrap(await tracker.landing(detail.timeline.slug));
+  if (!landing) fail("not_found", "No legacy landing to resolve.", 404);
+  const runs = landing.repos
+    .flatMap((repo) => [repo.mergeRun?.id, repo.gateRun?.id])
+    .filter((id): id is string => !!id);
+  if (runs.length) {
+    const live = await db(c.env.DB)
+      .selectFrom("ci_runs")
+      .select("id")
+      .where("id", "in", runs)
+      .where("status", "in", ["queued", "running"])
+      .executeTakeFirst();
+    if (live)
+      fail(
+        "landing_unresolved",
+        "Cancel or finish live landing CI before resolving migration.",
+        409,
+      );
+  }
+  return c.json(
+    unwrap(
+      await tracker.resolveLegacyLanding(
+        detail.timeline.id,
+        data.expectedVersion as number,
+        data.action,
+        text(data.note, "note"),
+      ),
+    ),
+  );
+});
+
 timelines.post("/:slug/abandon", async (c) => {
   const access = await authorize(c, false);
   const actor = c.get("actor")!;
   const tracker = trackerObject(c.env, access.owner.id);
+  const cancellation = unwrap(await tracker.cancelReservedCreation(access, c.req.param("slug")));
+  if (cancellation) return c.json<TimelineCreationCancellation>({ ...cancellation, bookmarks: [] });
   const timeline = unwrap(await tracker.mayAbandonTimeline(access, c.req.param("slug")));
   const ids = timeline.repos.map((repo) => repo.id);
-  const rows = await db(c.env.DB)
-    .selectFrom("repos as r")
-    .innerJoin("accounts as o", "o.id", "r.owner_id")
-    .select([
-      "r.id",
-      "r.owner_id",
-      "o.slug as owner_slug",
-      "r.name",
-      "r.default_branch",
-      "r.artifacts_name",
-      "r.artifacts_remote",
-    ])
-    .where("r.id", "in", ids)
-    .where("r.deleted_at", "is", null)
-    .execute();
-  // Each bookmark's last commit goes into the abandon event before it's deleted.
+  const rows = await selectRepos(c.env.DB, actor.id).where("r.id", "in", ids).execute();
+  // Each source's last commit goes into the event before its read-only archive.
   const tips = new Map<string, { row: BookmarkRepo; ref: string; tip: string | null }>();
   for (const repo of timeline.repos) {
     const row = rows.find((r) => r.id === repo.id);
     if (!row) continue;
-    const ref = `refs/heads/${repo.bookmark}`;
-    const refs = await lsRefs(c.env, row.artifacts_name, row.artifacts_remote);
-    tips.set(repo.id, { row, ref, tip: refs.find((r) => r.name === ref)?.oid ?? null });
+    const physical = await resolveTimelineSource(c.env, row, repo);
+    const ref = physical.source.ref;
+    const refs = await lsRefs(c.env, physical.repo.artifacts_name, physical.repo.artifacts_remote);
+    tips.set(repo.id, {
+      row: physical.repo,
+      ref,
+      tip: refs.find((r) => r.name === ref)?.oid ?? null,
+    });
   }
   const lastCommits = Object.fromEntries(ids.map((id) => [id, tips.get(id)?.tip ?? null]));
   const result = unwrap(await tracker.abandonTimeline(access, timeline.slug, lastCommits));
-  const live = [...tips.values()].filter((t) => t.tip);
-  const bookmarks = await writeEach(
-    c.env,
-    live.map(({ row, ref, tip }) => ({ repo: row, write: { ref, old: tip, new: null } })),
-  );
-  for (const { row } of live) c.executionCtx.waitUntil(logPush(c.env, row, actor));
+  const bookmarks: BookmarkResult[] = [];
+  for (const entry of timeline.repos) {
+    if (!entry.source || entry.source.kind !== "timeline-work") continue;
+    const owned = await getWorkSource(c.env, entry.id, entry.source.sourceId);
+    if (owned?.state === "ready") {
+      const archived = unwrap(
+        await tracker.transitionWorkSource(owned.source_id, owned.version, "archived"),
+      );
+      await db(c.env.DB)
+        .updateTable("timeline_work_sources")
+        .set({
+          state: archived.state,
+          version: archived.version,
+          archived_at: archived.archived_at,
+          updated_at: archived.updated_at,
+        })
+        .where("source_id", "=", archived.source_id)
+        .where("version", "<=", archived.version)
+        .execute();
+    }
+    bookmarks.push({ repoId: entry.id, ref: entry.source.ref, ok: true });
+  }
   return c.json<TimelineChange>({ timeline: result.timeline, bookmarks });
 });
 
@@ -380,10 +414,16 @@ timelines.post("/:slug/checkpoints", async (c) => {
   // Its full CI and knowledge overlays now, not after the quiet period (CORE-238).
   for (const repo of state.checkpoint.repos) {
     const bookmark = timelineBookmark(timeline.slug);
+    // An owned work source runs its CI on its own `work` branch.
+    const work = repo.source?.kind === "timeline-work" ? repo.source : null;
     waitUntil(
-      releaseQuiet(c.env, repo.id, bookmark, repo.commit).catch((error) =>
-        console.error("CI: releasing the checkpoint's run failed", error),
-      ),
+      releaseQuiet(
+        c.env,
+        repo.id,
+        work ? work.ref.replace(/^refs\/heads\//, "") : bookmark,
+        repo.commit,
+        work?.sourceId,
+      ).catch((error) => console.error("CI: releasing the checkpoint's run failed", error)),
     );
     waitUntil(
       overlayNow(c.env, repo.id, [`refs/heads/${bookmark}`]).catch((error) =>

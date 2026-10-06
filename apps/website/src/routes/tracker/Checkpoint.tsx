@@ -18,7 +18,7 @@ import { PageSetSummary, pagesPending, useRefreshWhile } from "../../components/
 import { api } from "../../lib/api.ts";
 import { fullDate, shortOid } from "../../lib/format.ts";
 import { commitPanelUrl } from "../../lib/commitPanel.ts";
-import { repoPath } from "../../lib/refs.ts";
+import { commitsUrl, repoPath, treeUrl } from "../../lib/refs.ts";
 import { MarkdownText } from "./ui.tsx";
 
 /** Just the reference, where the checkpoint's details aren't loaded (an issue's requests). */
@@ -40,7 +40,7 @@ export function PreviewLink({ preview }: { preview: CheckpointPreview }) {
   const label = preview.revived ? "Preview (rebuilt)" : "Preview";
   const title = [
     preview.revived ? REBUILT : null,
-    preview.tornDownAt ? `Torn down ${fullDate(preview.tornDownAt)}` : null,
+    preview.tornDownAt ? `Expired ${fullDate(preview.tornDownAt)}` : null,
     !preview.tornDownAt && preview.expiresAt ? `Expires ${fullDate(preview.expiresAt)}` : null,
   ]
     .filter(Boolean)
@@ -180,8 +180,8 @@ export function CheckpointPanel({
       {view.current && !view.approved && (
         <p className="m-0 text-body-sm text-ink-muted">
           {timeline.policy === "approval"
-            ? "Approving lands it: the checkpoint is merged into main and tested, and main moves only if that passes."
-            : "It lands once its CI is green; the merge into main is tested before main moves."}
+            ? "Approving lands the reviewed result as one compact commit on main, after its gates pass. Progress history stays in the work source."
+            : "It lands once CI is green; the compact result is tested before main moves. Progress history stays in the work source."}
         </p>
       )}
       {checkpoint.summary && (
@@ -193,18 +193,35 @@ export function CheckpointPanel({
         {checkpoint.repos.map((repo) => {
           const runs = view.runs.filter((run) => run.repoId === repo.id);
           const previews = view.previews.filter((preview) => preview.repoId === repo.id);
+          const readableSource =
+            repo.source || timeline.status === "landed" || timeline.status === "abandoned";
+          // The commit panel reads canonical history; a work source's commit opens in its own source.
+          const workSource =
+            repo.source && repo.source.sourceId !== "canonical" ? repo.source.sourceId : null;
           return (
             <li key={repo.id} className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <span className="font-semibold">
                 {repo.owner}/{repo.name}
               </span>
-              <Link
-                to={commitPanelUrl(repo.owner, repo.name, repo.commit)}
-                className="mk-chip mk-chip--tag mk-mono no-underline"
-                title={`Open commit ${shortOid(repo.commit)}`}
-              >
-                {shortOid(repo.commit)}
-              </Link>
+              {!readableSource ? (
+                <span className="text-ink-muted">Source migration required</span>
+              ) : workSource ? (
+                <Link
+                  to={treeUrl(repo.owner, repo.name, repo.commit, "", workSource)}
+                  className="mk-chip mk-chip--tag mk-mono no-underline"
+                  title="Browse files at this commit"
+                >
+                  {shortOid(repo.commit)}
+                </Link>
+              ) : (
+                <Link
+                  to={commitPanelUrl(repo.owner, repo.name, repo.commit)}
+                  className="mk-chip mk-chip--tag mk-mono no-underline"
+                  title={`Open commit ${shortOid(repo.commit)}`}
+                >
+                  {shortOid(repo.commit)}
+                </Link>
+              )}
               {repo.base && (
                 <span className="text-ink-muted">
                   onto main{" "}
@@ -217,13 +234,61 @@ export function CheckpointPanel({
                   </Link>
                 </span>
               )}
-              <Link
-                to={commitPanelUrl(repo.owner, repo.name, repo.commit)}
-                className="text-ink-muted"
-                title={repo.changes.map((c) => c.changeId).join("\n")}
-              >
-                {repo.changes.length === 1 ? "1 change" : `${repo.changes.length} changes`}
-              </Link>
+              {readableSource && (
+                <Link
+                  to={
+                    workSource
+                      ? commitsUrl(repo.owner, repo.name, repo.commit, "", workSource)
+                      : commitPanelUrl(repo.owner, repo.name, repo.commit)
+                  }
+                  className="text-ink-muted"
+                  title={repo.changes.map((c) => c.changeId).join("\n")}
+                >
+                  {repo.changes.length === 1 ? "1 change" : `${repo.changes.length} changes`}
+                </Link>
+              )}
+              {repo.source?.kind === "timeline-work" && (
+                <span className="text-ink-muted" title={repo.source.sourceId}>
+                  Work source
+                </span>
+              )}
+              {repo.logicalBase && (
+                <span className="text-ink-muted">
+                  logical base{" "}
+                  <Link
+                    className="mk-mono"
+                    to={treeUrl(
+                      repo.owner,
+                      repo.name,
+                      repo.logicalBase.commit,
+                      "",
+                      repo.logicalBase.sourceId,
+                    )}
+                  >
+                    {shortOid(repo.logicalBase.commit)}
+                  </Link>
+                </span>
+              )}
+              {repo.dependencies?.map((dependency) => (
+                <span
+                  key={`${dependency.source.sourceId}:${dependency.source.commit}`}
+                  className="text-ink-muted"
+                >
+                  depends on{" "}
+                  <Link
+                    className="mk-mono"
+                    to={treeUrl(
+                      repo.owner,
+                      repo.name,
+                      dependency.source.commit,
+                      "",
+                      dependency.source.sourceId,
+                    )}
+                  >
+                    {shortOid(dependency.source.commit)}
+                  </Link>
+                </span>
+              ))}
               {runs.length === 0 ? (
                 <span className="text-ink-faint">No CI run</span>
               ) : (

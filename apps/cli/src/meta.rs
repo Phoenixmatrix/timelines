@@ -129,18 +129,19 @@ pub const COMMANDS: &[Meta] = &[
     meta!("queue wait", git: "", kw: "merge queue monitor wait landing main pipeline deployment covered verdict", mutates: false, out: Out::Other("{entry:QueueEntry}; follows coveredBy; exit 0 only on landing (and succeeded main pipeline with --deploy), nonzero on failure/cancel/timeout"), ex: ["gm queue wait COMMIT_ID --deploy --timeout 1800"]),
     meta!("queue cancel", git: "", kw: "merge queue cancel pending admission no rewind", mutates: true, out: Out::Other("{entry:QueueEntry}; --dry-run: {dry_run,id,action}"), ex: ["gm queue cancel COMMIT_ID"]),
     meta!("queue retry", git: "", kw: "merge queue retry failed cancelled admission same commit", mutates: true, out: Out::Other("{entry:QueueEntry}; --dry-run: {dry_run,id,action}"), ex: ["gm queue retry COMMIT_ID"]),
-    meta!("timeline start", git: "git switch -c (shared, server-side)", kw: "timeline start create fork parallel line work branch experiment approval policy agent separate", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline,bookmarks:[{repoId,ref,ok,reason?}],use:<timeline use result>}; --dry-run: {dry_run,owner,request,use}"), ex: ["gm timeline start search-v2", "gm timeline start search-v2 --policy approval --name \"Search v2\"", "gm timeline start probe --experimental --from search-v2", "gm timeline start shared --repo orbit/engine --repo orbit/web"]),
-    meta!("timeline list", git: "git branch -r --list 'origin/timeline/*'", kw: "timelines list parallel lines status landed abandoned stalled idle quiet", mutates: false, out: Out::Other("{timelines:[Timeline],owner,current,idleDays?}"), ex: ["gm timeline list", "gm timeline list --status active", "gm timeline list --stalled"]),
+    meta!("timeline start", git: "", kw: "timeline start create fork parallel line work owned source experiment approval policy", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline,bookmarks:[{repoId,ref,ok,reason?}],use:<timeline use result>}; Timeline repos carry typed source identity; canonical origin is unchanged; --dry-run: {dry_run,owner,request,use}"), ex: ["gm timeline start search-v2", "gm timeline start search-v2 --policy approval --name \"Search v2\"", "gm timeline start probe --experimental --from search-v2", "gm timeline start shared --repo orbit/engine --repo orbit/web"]),
+    meta!("timeline list", git: "", kw: "timelines list parallel lines status landed abandoned stalled idle quiet", mutates: false, out: Out::Other("{timelines:[Timeline],owner,current,idleDays?}"), ex: ["gm timeline list", "gm timeline list --status active", "gm timeline list --stalled"]),
     meta!("timeline show", git: "", kw: "timeline show events history fork merge landing which timeline am i in", mutates: false, out: Out::Other("{timeline:Timeline,events:[TimelineEvent],next,current}"), ex: ["gm timeline show", "gm timeline show search-v2 --after 40"]),
     meta!("timeline use", git: "git switch <branch> (and push there by default)", kw: "timeline use switch bind checkout work in timeline go back main unbind", mutates: true, out: Out::Other("OpResult & {timeline,previous,bookmark,file,record}"), ex: ["gm timeline use search-v2", "gm timeline use main"]),
-    meta!("timeline merge", git: "git merge --no-ff origin/<main|timeline>", kw: "timeline merge main into timeline sync catch up bring in other timeline combine", mutates: true, out: Out::Other("OpResult & {timeline,from,merged}"), ex: ["gm timeline merge main", "gm timeline merge search-v2"]),
-    meta!("timeline checkpoint", git: "", kw: "timeline checkpoint snapshot record commits approval gate review summary preview ci ready for review", mutates: true, out: Out::Other("CheckpointView {checkpoint:{id,number,repos:[{id,owner,name,commit,base,changes}],summary,actorId,createdAt},current,approval,approved,timeline,runs,previews} & {dry_run,next}"), ex: ["gm timeline checkpoint -m 'Search v2 ranking is ready: …'", "gm timeline checkpoint search-v2 -m @summary.md"]),
+    meta!("timeline merge", git: "git merge --no-ff <exact source revision>", kw: "timeline merge main into timeline sync catch up bring in other timeline combine source", mutates: true, out: Out::Other("OpResult & {timeline,from,merged}"), ex: ["gm timeline merge main", "gm timeline merge search-v2"]),
+    meta!("timeline checkpoint", git: "", kw: "timeline checkpoint snapshot record commits approval gate review summary preview ci ready for review", mutates: true, out: Out::Other("CheckpointView {checkpoint:{id,number,repos:[{id,owner,name,commit,base,source,logicalBase,dependencies,changes}],summary,actorId,createdAt},current,approval,approved,timeline,runs,previews} & {dry_run,next}"), ex: ["gm timeline checkpoint -m 'Search v2 ranking is ready: …'", "gm timeline checkpoint search-v2 -m @summary.md"]),
     meta!("timeline checkpoints", git: "", kw: "timeline checkpoints list approvals approved superseded ci previews", mutates: false, out: Out::Other("{checkpoints:[CheckpointView],owner,timeline}"), ex: ["gm timeline checkpoints", "gm timeline checkpoints search-v2"]),
     meta!("timeline revive", git: "", kw: "timeline preview revive rebuild regenerate restore expired torn down checkpoint deploy again investigate old", mutates: true, out: Out::Other("{checkpoint:CheckpointView,runs:[{repoId,number,runId}|{repoId,skipped}],owner,dry_run}; each started run is a preview `create` (trigger preview) at the checkpoint's commit; the deployment it records is marked revived (rebuilt, not the original)"), ex: ["gm timeline revive", "gm timeline revive search-v2 --checkpoint 3", "gm timeline revive search-v2 -c cp_…"]),
     meta!("timeline pages", git: "", kw: "timeline wiki pages knowledge docs review checkpoint gate components concepts glossary what changes write on demand", mutates: true, out: Out::Other("{owner,timeline,repos:[{repo,ended?,sets:[{ref,timeline,key,checkpoint:{id,number}|null,commit,baseCommit,state:'queued'|'writing'|'succeeded'|'failed'|'ended',counts,pages:[{slug,title,section,kind,change:'added'|'changed',outcome:'written'|'kept',excerpt,model}],skipped,error}]}],next}; --checkpoint: {owner,timeline,checkpoint,repos}; --page: the page in full {slug,title,body,generatedIn,outcome,set,repo}; --write queues them at the bookmarks' tips (AI; idempotent per commit; refused once the timeline ended)"), ex: ["gm timeline pages", "gm timeline pages search-v2 --checkpoint 2", "gm timeline pages --page components/apps-website-worker-knowledge", "gm timeline pages --write"]),
     meta!("timeline update", git: "git branch -m (the name only)", kw: "timeline update rename flag experimental unflag not expected to land marker", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline}; --dry-run: {dry_run,owner,timeline,request}"), ex: ["gm timeline flag probe --experimental", "gm timeline update probe --no-experimental", "gm timeline update --name \"Search v2\""]),
-    meta!("timeline land", git: "git merge --no-ff + CI + git push origin main (server-side, compare-and-swap)", kw: "timeline land landing queue merge into main ship release gates approve green partly landed conflict sync why can't land", mutates: true, out: Out::Other("{owner,queued,landing:Landing {id,slug,checkpointId,checkpointNumber,state:'merging'|'testing'|'advancing'|'conflict'|'failed'|'landed',repos:[{id,owner,name,commit,base,merge,attempt,state,mergeRun,gateRun,reason}],reason,trigger:'auto'|'approval'|'request',requestedBy}}; refused with needs_approval, not_green, checkpoint_stale or no_checkpoint saying why; --dry-run: {dry_run,owner,timeline}"), ex: ["gm timeline land", "gm timeline land search-v2"]),
-    meta!("timeline abandon", git: "git push --delete origin timeline/<slug>", kw: "timeline abandon end prune discard drop delete timeline", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline,bookmarks,use?}; --dry-run: {dry_run,owner,timeline,unbind}"), ex: ["gm timeline abandon", "gm timeline abandon probe --dry-run"]),
+    meta!("timeline land", git: "compact tree integration + CI + canonical compare-and-swap", kw: "timeline land landing compact source integration main ship release gates approval blocked dependency conflict", mutates: true, out: Out::Other("{owner,queued,landing:Landing {id,slug,checkpointId,checkpointNumber,state:'merging'|'testing'|'advancing'|'blocked_dependency'|'conflict'|'failed'|'landed',repos:[{id,owner,name,commit,base,source,logicalBase,dependencies,merge,attempt,state,mergeRun,gateRun,reason}],reason,trigger,requestedBy}}; source progress objects never enter canonical history; --dry-run: {dry_run,owner,timeline}"), ex: ["gm timeline land", "gm timeline land search-v2"]),
+    meta!("timeline abandon", git: "", kw: "timeline abandon end archive read only source", mutates: true, out: Out::Other("{dry_run,owner,timeline:Timeline,bookmarks}; binding remains guarded until explicit use main or a new timeline; --dry-run: {dry_run,owner,timeline,unbind:false}"), ex: ["gm timeline abandon", "gm timeline abandon probe --dry-run"]),
+    meta!("timeline migrate", git: "", kw: "timeline migrate legacy owned source cutover checkpoint approval resolve partial landing cancel", mutates: true, out: Out::Other("Timeline; --resolve performs explicit version-checked stopped-landing resolution, not conversion; --dry-run: {dry_run,timeline,request?}"), ex: ["gm timeline migrate", "gm timeline migrate search-v2", "gm timeline migrate search-v2 --resolve cancel-unadvanced --expected-version 7 --note 'Stopped CI; no canonical advance'", "gm timeline migrate search-v2 --resolve accept-partial-and-abandon --expected-version 9 --note 'Accept existing receipts; remaining work moves to a fresh timeline'"]),
     meta!("auth login", git: "git credential approve / ssh-add", kw: "login sign in authenticate token persona credentials ssh key agent 1password", mutates: true, out: Out::Other("{server,method,user:{slug},key?,scope?,sessionExpiresAt?}"), ex: ["gm auth login --ssh", "gm auth login --ssh --key ~/.ssh/id_ed25519", "gm auth login --persona jun", "gm auth login --token gmx_..."]),
     meta!("auth ssh-key add", git: "(GitHub: Settings > SSH keys)", kw: "add register upload ssh public key agent 1password", mutates: true, out: Out::Other("SshKey {id,title,type,fingerprint,scope}"), ex: ["gm auth ssh-key add", "gm auth ssh-key add --key SHA256:abc... --title Laptop"]),
     meta!("auth ssh-key list", git: "ssh-add -l", kw: "list ssh keys registered agent local fingerprints", mutates: false, out: Out::Other("{registered:[SshKey],local:[{fingerprint,type,comment,source,registered}],unreachableAgents}"), ex: ["gm auth ssh-key list"]),
@@ -617,11 +618,11 @@ the main checkout and your current checkout. Recorded gm history is archived;
 unsnapshotted edits and ignored files are discarded with --force.
 
 ## Timelines
-A timeline is a separate line of work on `timeline/<slug>` that lands on main
-later, automatically or after a person approves. Use one when the issue (its
-timeline field, description or PRD) or a person asks; otherwise work on main.
+A timeline owns a separate work repository per canonical repository and lands
+its approved tree compactly on main, automatically or after a person approves.
+Use one when the issue or a person asks; otherwise work on main.
     gm timeline start search-v2 --policy approval  # fork from main; work in it here
-    gm push                       # goes to timeline/search-v2, never main
+    gm push                       # goes to the owned source's work ref, never main
     gm timeline merge main        # only when a person asks; then gm push
     gm timeline use main          # back to main (`use <slug>` to join one)
     gm timeline checkpoint -m 'What it holds and why'  # pins the pushed commits
@@ -631,21 +632,27 @@ timeline field, description or PRD) or a person asks; otherwise work on main.
     gm timeline revive search-v2 -c 3   # rebuild an expired checkpoint's preview
     gm timeline flag <slug> --experimental   # not expected to land; --no-experimental clears it
 `use` writes `timeline: <slug>` to .gitmatrix/agent.local.yml (worktrees copy
-it). While bound, the timeline's bookmark is this checkout's trunk: push, sync
-and immutability follow it, main stays reachable as `origin/main`, and pushing
-to main is refused. `gm issue` commands work in its view of the tracker.
+it). While bound, the source's work ref is this checkout's trunk: push, sync
+and immutability follow it through a source-scoped Gitmatrix URL. Canonical origin
+stays unchanged, and pushing to main is refused. `gm issue` uses its tracker view.
 `GM_TIMELINE=<slug>` overrides the binding for one command.
 Only a timeline's accountable person or the agent that started it may abandon it.
-A checkpoint records each repository's pushed commit and main's, its changes and
-your summary; it never changes. An approval pins one checkpoint, is given by a
+A checkpoint records exact source snapshots, logical bases, dependencies, changes
+and your summary; it never changes. An approval pins one checkpoint, is given by a
 person with write access (never an agent), and only counts while it is still the
 timeline's head: new commits withdraw an open request, and need a new
 checkpoint and a new approval.
-Landing merges the checkpoint into each repository's current main in a CI job,
-runs the repository's gates on the merge, and only then advances main to it:
-`auto` timelines queue when the checkpoint's CI is green, `approval` ones when
-a person approves it. A conflict stops landing and asks for a sync (merge main
-in, push, checkpoint again); a main that moved is merged and tested again.
+Landing materializes the approved tree delta onto pinned current main, runs the
+repository's gates, and advances main to one compact child. WIP commit objects
+stay in the owned source. `auto` timelines queue when checkpoint CI is green;
+`approval` timelines require a person's approval. Dependency ambiguity blocks landing.
+Conflicts require reviewed sync and a renewed checkpoint; moving main is regated.
+After landing, `gm sync` uses exact source lineage to replay only unlanded local work,
+including edited revisions of an admitted change. Old refs remain recoverable.
+The ended-source push guard remains until an explicit new timeline or `use main`.
+Archive reads expire under the account's ended-timeline retention policy.
+Legacy active timelines require `gm timeline migrate`, then a new checkpoint/approval;
+there is no fallback write to canonical timeline bookmarks.
 
 ## Distributed tracker (no Git repository required)
     gm tracker use orbit

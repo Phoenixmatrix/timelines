@@ -83,7 +83,34 @@ impl Api {
                 reader.read_exact(&mut body).unwrap();
                 drop(reader);
                 let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let is_upload = method == "POST" && path.ends_with("/steps");
+                // The timeline's owned work source (CORE-255): what `work_source` validates.
+                let source = json!({"sourceId": "work_search", "repoId": "r1", "timelineId": "tl_search",
+                    "kind": "timeline-work", "ref": "refs/heads/work"});
+                if method == "GET" && path.starts_with("/api/tracker/orbit/timelines/search?") {
+                    let text = json!({"timeline": {"id": "tl_search", "slug": "search", "status": "active",
+                        "repos": [{"id": "r1", "owner": "orbit", "name": "engine", "bookmark": "work", "source": source}]},
+                        "events": [], "next": null}).to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                    continue;
+                }
+                if method == "GET" && path == "/api/repos/orbit/engine?source=work_search" {
+                    let text = json!({"source": source,
+                        "cloneUrl": format!("http://{address}/orbit/engine@search.git")})
+                    .to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                    continue;
+                }
+                // A timeline's steps upload names its source (`?source=`).
+                let is_upload =
+                    method == "POST" && path.split('?').next().unwrap_or("").ends_with("/steps");
                 let is_list =
                     method == "GET" && path.contains("/steps?") && !path.contains("/live?");
                 let (code, reply) = if (is_upload || is_list) && fail.load(Ordering::Acquire) {
@@ -176,6 +203,15 @@ impl Api {
         }
     }
 
+    fn upload_paths(&self) -> Vec<String> {
+        self.uploads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
     fn uploads(&self) -> Vec<Value> {
         self.uploads
             .lock()
@@ -212,16 +248,39 @@ impl Sandbox {
         git(&root.join("seed"), &["add", "."]);
         git(&root.join("seed"), &["commit", "-qm", "Initial"]);
         git(&root.join("seed"), &["push", "-q", "origin", "main"]);
+        git(
+            &root,
+            &["clone", "-q", "--bare", "remote.git", "source.git"],
+        );
         git(&root, &["clone", "-q", "remote.git", "work"]);
         git(&root.join("work"), &["config", "user.name", "Agent"]);
         git(
             &root.join("work"),
             &["config", "user.email", "agent@example.com"],
         );
+        // origin is the server's canonical URL; a timeline's work goes to its
+        // owned source (`@search.git`). Both resolve to local bare repositories.
+        let api = Api::new();
+        let canonical = format!("http://{}/orbit/engine.git", api.address);
+        let scoped = format!("http://{}/orbit/engine@search.git", api.address);
+        git(
+            &root.join("work"),
+            &["remote", "set-url", "origin", &canonical],
+        );
+        for (local, url) in [("remote.git", &canonical), ("source.git", &scoped)] {
+            git(
+                &root.join("work"),
+                &[
+                    "config",
+                    &format!("url.{}.insteadOf", root.join(local).display()),
+                    url,
+                ],
+            );
+        }
         let sandbox = Sandbox {
             _dir: dir,
             root,
-            api: Api::new(),
+            api,
         };
         sandbox.ok(&["init"], &[]);
         sandbox
@@ -259,6 +318,19 @@ impl Sandbox {
         let (code, value, stderr) = self.run(args, env);
         assert_eq!(code, 0, "gm {args:?} failed: {stderr} {value}");
         value
+    }
+
+    /// Timeline search's owned work source starts from main (`refs/heads/work`).
+    fn start_timeline(&self) {
+        git(
+            &self.root.join("seed"),
+            &[
+                "push",
+                "-q",
+                self.root.join("source.git").to_str().unwrap(),
+                "main:refs/heads/work",
+            ],
+        );
     }
 
     fn edit(&self, file: &str, text: &str) {
@@ -538,11 +610,8 @@ fn gm_step_works_only_in_a_timeline_and_tests_commits_and_pushes() {
     assert_ne!(code, 0);
     assert_eq!(value["error"]["code"], json!("not_in_timeline"), "{value}");
 
-    // A timeline's bookmark on origin, and a passing local job.
-    git(
-        &s.root.join("seed"),
-        &["push", "-q", "origin", "main:timeline/search"],
-    );
+    // A timeline's owned work source, and a passing local job.
+    s.start_timeline();
     fs::create_dir_all(s.work().join(".gitmatrix")).unwrap();
     s.edit(
         ".gitmatrix/ci.yml",
@@ -567,11 +636,21 @@ fn gm_step_works_only_in_a_timeline_and_tests_commits_and_pushes() {
     assert_eq!(up["why"], json!("Recency matters more than score."));
     assert_eq!(up["tests"][0]["command"], json!("gm test: lint"));
     assert_eq!(up["timeline"], json!("search"));
+    // The step went to the work source, never to canonical.
     let tip = git(
-        &s.root.join("remote.git"),
-        &["rev-parse", "timeline/search"],
+        &s.root.join("source.git"),
+        &["rev-parse", "refs/heads/work"],
     );
     assert_eq!(up["commitOid"], json!(tip));
+    assert_eq!(
+        s.api.upload_paths()[0],
+        "/api/repos/orbit/engine/steps?source=work_search"
+    );
+    let canonical = git(
+        &s.root.join("remote.git"),
+        &["for-each-ref", "--format=%(refname)"],
+    );
+    assert_eq!(canonical, "refs/heads/main");
 
     // --no-test, and no context: still a step, with the warning.
     s.edit("rank.rs", "fn rank() { 1 }\n");
@@ -708,10 +787,7 @@ fn codex_and_oh_my_pi_hooks_share_the_contract_and_name_their_harness() {
     run("codex", "Add a cache");
     // An unknown harness is ignored, quietly.
     run("nonsense", "Not kept");
-    git(
-        &s.root.join("seed"),
-        &["push", "-q", "origin", "main:timeline/search"],
-    );
+    s.start_timeline();
     s.ok(&["sync"], &timeline);
     s.edit("cache.rs", "fn cache() {}\n");
     let file = s.context_file("## Why\nSpeed.\n");
@@ -748,10 +824,7 @@ fn the_claude_code_hook_puts_the_persons_words_on_the_next_step() {
     let (code, out) = hook(&s, "s1", "  ", &timeline);
     assert_eq!((code, out), (0, String::new()));
 
-    git(
-        &s.root.join("seed"),
-        &["push", "-q", "origin", "main:timeline/search"],
-    );
+    s.start_timeline();
     s.ok(&["sync"], &timeline);
     s.edit("rank.rs", "fn rank() {}\n");
     let file = s.context_file("## Why\nRecency matters.\n\n## Steering\n- Noted the tie-breaker\n");
@@ -760,12 +833,6 @@ fn the_claude_code_hook_puts_the_persons_words_on_the_next_step() {
         &timeline,
     );
     s.ok(&["push"], &timeline);
-    eprintln!("DEBUG uploads {:?}", s.api.uploads());
-    eprintln!(
-        "DEBUG journal {:?}",
-        std::fs::read_dir(s.work().join(".git/gm/steps"))
-            .map(|d| d.map(|e| e.unwrap().file_name()).collect::<Vec<_>>())
-    );
     let up = s.api.uploads()[0].clone();
     assert_eq!(
         up["instructions"],

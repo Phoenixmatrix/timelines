@@ -7,7 +7,7 @@ import { useEffect } from "react";
 import { Link, useRevalidator } from "react-router";
 import type { KnowledgePageSet } from "../../shared/api.ts";
 import { shortOid } from "../lib/format.ts";
-import { repoPath } from "../lib/refs.ts";
+import { repoPath, sourceUrl } from "../lib/refs.ts";
 import { withScope } from "../lib/timelineScope.ts";
 
 /** Still being written: queued, or a model is on it. */
@@ -27,7 +27,10 @@ export function useRefreshWhile(pending: boolean) {
 /** Where a timeline page opens: the wiki, scoped to the timeline, at this set. */
 export function timelinePageUrl(owner: string, name: string, set: KnowledgePageSet, slug: string) {
   return withScope(
-    `${repoPath(owner, name, "wiki", slug)}?set=${encodeURIComponent(set.key)}`,
+    sourceUrl(
+      `${repoPath(owner, name, "wiki", slug)}?set=${encodeURIComponent(set.key)}`,
+      set.sourceId,
+    ),
     set.timeline,
   );
 }

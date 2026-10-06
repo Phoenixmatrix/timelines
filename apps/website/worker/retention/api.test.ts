@@ -83,6 +83,7 @@ describe("the category registry", () => {
       "step-steering",
       "step-artifacts",
       "step-feed",
+      "timeline-work-sources",
       "push-log",
       "unreachable-git",
       "closed-issues",
@@ -123,7 +124,9 @@ describe("account retention settings", () => {
     expect(settings.categories.map((c) => c.id)).toEqual(
       CATEGORIES.filter((c) => c.scope === "account").map((c) => c.id),
     );
-    for (const c of settings.categories.filter((c) => c.control === "policy"))
+    for (const c of settings.categories.filter(
+      (c) => c.control === "policy" && c.id !== "timeline-work-sources",
+    ))
       expect(c).toMatchObject({
         enabled: false,
         enabledFrom: "default",
@@ -147,12 +150,21 @@ describe("account retention settings", () => {
       enabled: true,
       values: { maxPrior: 20, priorDays: 7, capGib: 2 },
     });
+    // Work Git repositories expire by default, 30 days after landing and 90 after abandonment.
+    expect(policy(settings, "timeline-work-sources")).toMatchObject({
+      enabled: true,
+      enabledFrom: "default",
+      values: { landedDays: 30, abandonedDays: 90 },
+    });
     expect(settings.changes).toEqual([]);
-    // Only the site's always-on auth hygiene is scheduled.
+    // Besides that default, only the site's always-on auth hygiene is scheduled.
     const targets = await enabledTargets(t.env.DB);
-    expect(targets.map((x) => [x.target, x.policies.map((p) => p.id)])).toEqual([
-      [{ scope: "site" }, ["auth-hygiene"]],
-    ]);
+    expect(
+      targets.flatMap((x) => {
+        const ids = x.policies.map((p) => p.id).filter((id) => id !== "timeline-work-sources");
+        return ids.length ? [[x.target, ids]] : [];
+      }),
+    ).toEqual([[{ scope: "site" }, ["auth-hygiene"]]]);
   });
 
   test("enabling without values applies the defaults; values and resets are recorded", async () => {
@@ -180,10 +192,12 @@ describe("account retention settings", () => {
         ["release-notes", "ann", {}, { thresholds: { days: 400 } }],
       ]),
     );
-    const targets = (await enabledTargets(t.env.DB)).filter((x) => x.target.scope === "account");
+    const targets = (await enabledTargets(t.env.DB)).filter((target) =>
+      target.policies.some((p) => p.id === "ci-logs"),
+    );
     expect(targets).toHaveLength(1);
     expect(targets[0]!.target).toEqual({ scope: "account", accountId: "acc_org" });
-    expect(targets[0]!.policies.map((p) => p.id)).toEqual(["ci-logs"]);
+    expect(targets[0]!.policies.find((p) => p.id === "ci-logs")?.enabled).toBe(true);
 
     // The same values again change nothing and record nothing.
     await t.call(t.tokens.ann, "PATCH", ORG, { categories: { "ci-logs": { enabled: true } } });
@@ -408,7 +422,8 @@ describe("site retention settings", () => {
     expect(site.categories.filter((c) => c.control !== "policy").map((c) => c.id)).toEqual([
       "auth-hygiene",
     ]);
-    for (const c of site.categories) expect(c.enabled).toBe(c.id === "auth-hygiene");
+    for (const c of site.categories)
+      expect(c.enabled, c.id).toBe(c.id === "auth-hygiene" || c.id === "timeline-work-sources");
     expect(policy(site, "auth-hygiene")).toMatchObject({
       control: "fixed",
       enabled: true,
@@ -459,7 +474,11 @@ describe("site retention settings", () => {
       values: { days: 60 },
       valuesFrom: { days: "site" },
     });
-    expect((await enabledTargets(t.env.DB)).map((x) => x.target)).toEqual([{ scope: "site" }]);
+    expect(
+      (await enabledTargets(t.env.DB))
+        .filter((x) => x.target.scope === "site")
+        .map((x) => x.target),
+    ).toEqual([{ scope: "site" }]);
 
     // A site-wide default that enables an account category covers every
     // account that didn't decide otherwise.
@@ -471,7 +490,9 @@ describe("site retention settings", () => {
     expect(policy(org, "ci-logs")).toMatchObject({ enabled: true, enabledFrom: "site" });
     const targets = await enabledTargets(t.env.DB);
     const accounts = targets.flatMap((x) =>
-      x.target.scope === "account" ? [x.target.accountId] : [],
+      x.target.scope === "account" && x.policies.some((p) => p.id === "ci-logs")
+        ? [x.target.accountId]
+        : [],
     );
     expect(accounts).toContain("acc_org");
     expect(accounts).toContain("acc_ann");
@@ -492,7 +513,7 @@ describe("site retention settings", () => {
       valuesFrom: { days: "default" },
       updatedAt: null,
     });
-    const targets = await enabledTargets(t.env.DB);
+    const targets = (await enabledTargets(t.env.DB)).filter((x) => x.target.scope === "site");
     expect(targets.map((x) => [x.target, x.policies.map((p) => [p.id, p.values])])).toEqual([
       [{ scope: "site" }, [["auth-hygiene", { days: 7 }]]],
     ]);

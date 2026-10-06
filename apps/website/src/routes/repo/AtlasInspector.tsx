@@ -593,7 +593,13 @@ function Contributing({
           <li key={`${l.src}|${l.dst}`} className="truncate">
             {commit && l.srcPath ? (
               <Link
-                to={blobUrl(repo.owner, repo.name, commit, l.srcPath)}
+                to={blobUrl(
+                  repo.owner,
+                  repo.name,
+                  commit,
+                  l.srcPath,
+                  snapshot.vector[0]?.sourceId ?? "canonical",
+                )}
                 className="text-ink-muted hover:text-ink"
               >
                 {l.srcPath}
@@ -665,7 +671,7 @@ function Evidence({
           return (
             <li key={`${e.entityId}|${e.via}`} className="flex items-baseline gap-2 text-micro">
               <Link
-                to={`${blobUrl(repo.owner, repo.name, e.commit, e.path)}${anchor}`}
+                to={`${blobUrl(repo.owner, repo.name, e.commit, e.path, e.sourceId ?? "canonical")}${anchor}`}
                 className="min-w-0 flex-1 truncate font-mono text-ink-muted hover:text-ink pointer-coarse:py-2.5"
                 title={`${e.path} at ${e.commit.slice(0, 7)}`}
               >

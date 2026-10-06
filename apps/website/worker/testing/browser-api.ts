@@ -27,7 +27,7 @@ import { dev } from "../api/dev.ts";
 import { repos } from "../api/repos.ts";
 import { workspaceAtlas } from "../atlas/workspace.ts";
 import { atlas } from "../atlas/api.ts";
-import { findUserById } from "../db.ts";
+import { findRepo, findUserById } from "../db.ts";
 import { knowledge } from "../knowledge/api.ts";
 import { invalidateRefs } from "../objects.ts";
 import { refs } from "../refs/api.ts";
@@ -38,6 +38,7 @@ import { aiSettingsApi, siteAiSettingsApi } from "../settings/ai.ts";
 import { steps } from "../steps/api.ts";
 import { timelines } from "../timelines/api.ts";
 import { timelineGraph } from "../timelines/graph.ts";
+import { resolveSource } from "../timelines/sources.ts";
 import { Timing } from "../timing.ts";
 import { tracker } from "../tracker/api.ts";
 import { agents } from "../api/agents.ts";
@@ -110,7 +111,7 @@ function createWorld(persona: Persona): string {
   for (const sql of sqlFiles(new URL("../../seed/", import.meta.url).href)) sqlite.exec(sql);
   const git = fakeRemotes();
   const trackers = new Map<string, Tracker>();
-  const env = {
+  const env: Env = {
     DB: d1(sqlite),
     REGISTRY_DB: d1(registryDatabase()),
     DEV_MODE: "true",
@@ -119,8 +120,8 @@ function createWorld(persona: Persona): string {
     REGISTRY_KEK: btoa("browser-tests-sealing-key-32-bytes"),
     // Tokens and the commits pushed; no trees or blobs.
     ARTIFACTS: {
-      get: async () => ({
-        ...(await git.artifacts.get()),
+      get: async (name: string) => ({
+        ...(await git.artifacts.get(name)),
         readTree: async () => null,
         readBlob: async () => null,
         log: async () => [],
@@ -131,7 +132,7 @@ function createWorld(persona: Persona): string {
         if (!trackers.has(id)) {
           const { sql, transactionSync } = durableStorage();
           const ctx = { storage: { sql, transactionSync } } as unknown as DurableObjectState;
-          trackers.set(id, new Tracker(ctx, {} as Env));
+          trackers.set(id, new Tracker(ctx, env));
         }
         return trackers.get(id);
       },
@@ -252,17 +253,14 @@ export async function serve(request: ServedRequest): Promise<ServedResponse> {
   };
 }
 
-async function remoteOf(world: World, repo: string) {
+async function remoteOf(world: World, repo: string, sourceId?: string | null) {
   const [owner, name] = repo.split("/");
-  const row = await world.env.DB.prepare(
-    `SELECT r.artifacts_name AS artifacts, r.artifacts_remote AS remote
-     FROM repos r JOIN accounts a ON a.id = r.owner_id WHERE a.slug = ? AND r.name = ?`,
-  )
-    .bind(owner ?? "", name ?? "")
-    .first<{ artifacts: string; remote: string }>();
-  const remote = row && world.git.remotes.get(row.remote);
-  if (!row || !remote) throw new Error(`No repository ${repo}`);
-  return { ...row, refs: remote.refs };
+  const row = await findRepo(world.env.DB, null, owner ?? "", name ?? "");
+  if (!row) throw new Error(`No repository ${repo}`);
+  const resolved = await resolveSource(world.env, row, sourceId);
+  const remote = world.git.remotes.get(resolved.repo.artifacts_remote);
+  if (!remote) throw new Error(`No source ${sourceId ?? "canonical"} for ${repo}`);
+  return { artifacts: resolved.repo.artifacts_name, refs: remote.refs, commits: remote.commits };
 }
 
 /** Set up and change a world: what a test arranges before and while the page reads it. */
@@ -297,17 +295,18 @@ export async function world(action: string, input: unknown): Promise<unknown> {
           remote,
         )
         .run();
-      world.git.add(remote, {});
+      world.git.add(remote, {}, "refs/heads/main", artifacts);
       return { id, owner: args.owner, name: args.name };
     }
     case "push": {
       // Move a branch, as a push would: the routes read it through ls-refs.
       const world = worldOf(args.world ?? "");
-      const { artifacts, refs } = await remoteOf(world, args.repo ?? "");
+      const { artifacts, refs, commits } = await remoteOf(world, args.repo ?? "", args.sourceId);
       const ref = `refs/heads/${args.branch ?? "main"}`;
       if (args.commit) {
         refs.set(ref, args.commit);
         world.git.commits.add(args.commit);
+        commits.add(args.commit);
       } else refs.delete(ref);
       invalidateRefs(artifacts);
       await world.env.DB.prepare(`UPDATE repos SET pushed_at = ? WHERE artifacts_name = ?`)
@@ -317,7 +316,7 @@ export async function world(action: string, input: unknown): Promise<unknown> {
     }
     case "refs": {
       const world = worldOf(args.world ?? "");
-      return Object.fromEntries((await remoteOf(world, args.repo ?? "")).refs);
+      return Object.fromEntries((await remoteOf(world, args.repo ?? "", args.sourceId)).refs);
     }
     case "sql": {
       // Rows only machinery the world lacks would write (CI runs,

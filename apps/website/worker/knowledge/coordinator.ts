@@ -11,15 +11,11 @@
 // next update follows the same windows. At most one build per repository is
 // ever in flight.
 //
-// The same pings keep timeline overlays current (overlay.ts, CORE-83): after
-// the quiet period the coordinator lists the repository's `timeline/<slug>`
-// bookmarks and starts an overlay for each whose tip, or main's indexed
-// commit, moved since its last one: at most one per timeline in flight and a
-// few per repository, and a push during one runs it again when it ends.
-// Overlays never touch main's graph; a push that moved only timeline
-// bookmarks starts no main build. When a bookmark disappears its last overlay
-// is kept, read-only, as landed or abandoned (from the timeline's record in
-// the account's tracker) or just ended, and is never computed again (CORE-139).
+// The same pings keep timeline overlays current: after the quiet period the
+// coordinator scans owned ready work sources and starts overlays whose pinned
+// work tip or canonical indexed commit moved. Each source has one job in flight.
+// Logical timeline refs key scheduling and archived readers; they are never
+// used to discover active work in the canonical repository.
 //
 // It also runs the queue of timeline wiki page sets (pages.ts, CORE-84): a
 // checkpoint, or someone asking, queues a set in D1 and pings it; it starts
@@ -27,7 +23,9 @@
 // time, and watches them like overlays. Page sets never wait for pushes.
 
 import { DurableObject } from "cloudflare:workers";
-import { timelineSlugOf } from "../../shared/timelines.ts";
+import { liveTimelineSources, timelineKnowledgeSource, knowledgeRepo } from "./sources.ts";
+import { pinSourceRoot, releaseSourceRoots } from "../retention/work-sources.ts";
+import { releaseKnowledgeBase } from "./source-reader.ts";
 import { timelineQuietMs } from "../timelines/quiet.ts";
 import { listRefs, type RepoRefs } from "../artifacts.ts";
 import { productionOnly } from "../preview.ts";
@@ -49,7 +47,6 @@ import {
   claimSet,
   queuedSets,
   queueSet,
-  releaseSet,
   schedulePages,
   type PageRequest,
   type PageRun,
@@ -84,9 +81,22 @@ const OVERLAY_MAX_MS = 2 * 60 * 60_000;
 /** A page set is a few model calls; one running longer than this is stopped. */
 const PAGES_MAX_MS = 2 * 60 * 60_000;
 
+const TERMINAL_WORKFLOW = new Set(["complete", "errored", "terminated"]);
+
+/** An unavailable status or failed termination is not consumer completion. */
+async function confirmedWorkflowEnd(env: Env, buildId: string, stop: boolean) {
+  const instance = await env.KNOWLEDGE_BUILD.get(buildId);
+  let status = await instance.status();
+  if (TERMINAL_WORKFLOW.has(status.status)) return status;
+  if (!stop) return null;
+  await instance.terminate();
+  status = await instance.status();
+  return TERMINAL_WORKFLOW.has(status.status) ? status : null;
+}
+
 /** Whether a Workflow instance's status says it ended on its own (nothing left to stop). */
 function instanceEnded(status: { status: string } | null): boolean {
-  return status !== null && ["errored", "terminated", "complete"].includes(status.status);
+  return status !== null && TERMINAL_WORKFLOW.has(status.status);
 }
 
 interface Running {
@@ -156,7 +166,7 @@ interface State {
     string,
     OverlayState & {
       policy?: KnowledgePolicy;
-      retry?: { commit: string; base: string | null; policy: KnowledgePolicy };
+      retry?: { commit: string; base: string | null; sourceId?: string; policy: KnowledgePolicy };
     }
   >;
   /** Timeline wiki page sets being written, by build id. */
@@ -301,7 +311,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     // Without a ref listing the scan waits for the next ping.
     let quietWake: number | null = null;
     if (state.scan && refs && ownerId)
-      quietWake = await this.#scanOverlays(state, refs, indexed, ownerId);
+      quietWake = await this.#scanOverlays(state, indexed, ownerId);
     await this.#watchPages(state);
     if (state.pagesDue) await this.#startPages(state);
     await this.#save(state);
@@ -450,25 +460,25 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     );
   }
 
-  /** The page sets' watchdog: crashed, vanished or overdue ones fail (asking again retries). */
+  /** Release claims only after the workflow reports completion or confirmed termination. */
   async #watchPages(state: State) {
     for (const run of Object.values(state.pages)) {
-      const instance = await this.env.KNOWLEDGE_BUILD.get(run.buildId).catch(() => null);
-      const status = instance ? await instance.status().catch(() => null) : null;
       const overdue = Date.now() - run.startedAt > PAGES_MAX_MS;
-      if (status?.status === "complete") delete state.pages[run.buildId];
-      else if (!status || overdue || ["errored", "terminated"].includes(status.status)) {
-        if (!instanceEnded(status)) await instance?.terminate().catch(() => undefined);
-        const error = `Pages ${overdue ? "ran too long; stopped by the watchdog" : (status?.status ?? "vanished")}`;
+      const status = await confirmedWorkflowEnd(this.env, run.buildId, overdue);
+      if (!status) continue;
+      if (status.status !== "complete") {
+        const error = `Pages ${overdue ? "ran too long; stopped by the watchdog" : status.status}`;
         await abandonSet(
           this.env.DB,
-          { repoId: state.repoId!, ref: run.ref, key: run.key },
+          { repoId: state.repoId!, ref: run.ref, key: run.key, sourceId: run.sourceId },
           run.buildId,
           error,
-        ).catch(() => undefined);
-        delete state.pages[run.buildId];
+        );
         state.pagesDue = true;
       }
+      await releaseSourceRoots(this.env, "knowledge-pages-build", run.buildId);
+      await releaseKnowledgeBase(this.env, state.repoId!, `knowledge:${run.buildId}`);
+      delete state.pages[run.buildId];
     }
   }
 
@@ -492,19 +502,15 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       }
       const buildId = crypto.randomUUID();
       if (!(await claimSet(this.env.DB, { repoId, ...set }, buildId, policy))) continue;
-      try {
-        await this.env.KNOWLEDGE_BUILD.create({
-          id: buildId,
-          params: { repoId, buildId, pages: set, policy },
-        });
-      } catch (error) {
-        // Left queued for the next wake-up rather than stuck as being written.
-        console.error("Knowledge: starting a page set failed", { repo: repoId, set, error });
-        await releaseSet(this.env.DB, { repoId, ...set }, buildId);
-        plan.more = true;
-        continue;
-      }
       state.pages[buildId] = { buildId, ...set, startedAt: Date.now() };
+      await this.#save(state);
+      await this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS);
+      // Persist admission before create: an ambiguous provider response cannot
+      // turn a possibly-running producer back into unclaimed queued work.
+      await this.env.KNOWLEDGE_BUILD.create({
+        id: buildId,
+        params: { repoId, buildId, pages: set, policy },
+      });
     }
     // The rest start as these finish (pagesFinished), or at the next wake-up.
     state.pagesDue = plan.more;
@@ -513,8 +519,6 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
   /** Watchdog: a build that crashed without reporting must not block forever. */
   async #watchBuild(state: State) {
     const running = state.running!;
-    const instance = await this.env.KNOWLEDGE_BUILD.get(running.buildId).catch(() => null);
-    const status = instance ? await instance.status().catch(() => null) : null;
     const build = await db(this.env.DB)
       .selectFrom("kg_builds")
       .select(["progress_at", "to_commit"])
@@ -522,6 +526,10 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       .executeTakeFirst();
     const verdict = watchdog(Date.now(), running.startedAt, build?.progress_at ?? null);
     const stale = verdict !== "running";
+    // Main's build holds no work-source claims (overlays and page sets do, and
+    // wait for a confirmed end): marking it failed below fences its model calls.
+    const instance = await this.env.KNOWLEDGE_BUILD.get(running.buildId).catch(() => null);
+    const status = instance ? await instance.status().catch(() => null) : null;
     if (status?.status === "complete") {
       state.lastError = null;
       state.running = null;
@@ -565,19 +573,23 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
     for (const [ref, overlay] of Object.entries(state.overlays)) {
       const run = overlay.running;
       if (!run) continue;
-      const instance = await this.env.KNOWLEDGE_BUILD.get(run.buildId).catch(() => null);
-      const status = instance ? await instance.status().catch(() => null) : null;
       const overdue = Date.now() - run.startedAt > OVERLAY_MAX_MS;
-      if (status?.status === "complete") {
+      const status = await confirmedWorkflowEnd(this.env, run.buildId, overdue);
+      if (!status) continue;
+      if (status.status === "complete") {
         this.#overlayEnded(state, overlay, { commit: run.commit, base: run.base }, null);
-      } else if (!status || overdue || ["errored", "terminated"].includes(status.status)) {
-        if (!instanceEnded(status)) await instance?.terminate().catch(() => undefined);
-        const error = `Overlay ${overdue ? "ran too long; stopped by the watchdog" : (status?.status ?? "vanished")}`;
-        await overlayFailed(this.env.DB, state.repoId!, ref, run.commit, error).catch(
-          () => undefined,
-        );
+      } else {
+        const error = `Overlay ${overdue ? "ran too long; stopped by the watchdog" : status.status}`;
+        await overlayFailed(this.env.DB, state.repoId!, ref, run.commit, error, run.sourceId);
         this.#overlayEnded(state, overlay, { commit: run.commit, base: run.base }, error);
       }
+      if (run.sourceId)
+        await releaseSourceRoots(
+          this.env,
+          "knowledge-overlay",
+          `${state.repoId}:${run.sourceId}:${run.buildId}`,
+        );
+      await releaseKnowledgeBase(this.env, state.repoId!, `knowledge:${run.buildId}`);
     }
   }
 
@@ -597,12 +609,13 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       if (run)
         overlay.retry = {
           commit: run.commit,
+          sourceId: run.sourceId,
           base: run.base,
           policy: overlay.policy ?? LEGACY_KNOWLEDGE_POLICY,
         };
     } else {
       overlay.retries = 0;
-      overlay.done = covered;
+      overlay.done = { ...covered, sourceId: run?.sourceId };
       overlay.retry = undefined;
     }
     state.scan = true;
@@ -615,14 +628,18 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
   /** Starts what's due; returns when a timeline still in its quiet period is due, if any. */
   async #scanOverlays(
     state: State,
-    refs: RepoRefs,
     indexed: string | null,
     ownerId: string,
   ): Promise<number | null> {
     const repoId = state.repoId!;
-    const tips = new Map(
-      refs.branches.filter((b) => timelineSlugOf(b.name)).map((b) => [b.name, b.oid]),
-    );
+    const sources = await liveTimelineSources(this.env, repoId);
+    const tips = new Map([...sources].map(([ref, source]) => [ref, source.commit]));
+    for (const [ref, source] of sources) {
+      const overlay = state.overlays[ref];
+      if (!overlay || overlay.running) continue;
+      if (overlay.done?.sourceId !== source.sourceId) overlay.done = null;
+      if (overlay.retry?.sourceId !== source.sourceId) overlay.retry = undefined;
+    }
     // A bookmark this coordinator doesn't follow may be an ended overlay's,
     // pushed again: an ended timeline's overlay is never computed again.
     if ([...tips.keys()].some((ref) => !state.overlays[ref])) {
@@ -632,7 +649,7 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
           // The tracker never said it ended: it may have since, or it goes on.
           const ended = await timelineEnd(this.env, ownerId, ref);
           if (!ended) {
-            await reopenOverlay(this.env.DB, repoId, ref);
+            await reopenOverlay(this.env.DB, repoId, ref, sources.get(ref)!.sourceId);
             continue;
           }
           await setEndReason(this.env.DB, repoId, ref, ended);
@@ -667,10 +684,19 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
       const policy = retry?.policy ?? (await knowledgePolicy(this.env, repoId));
       if (!policy.ai.features.knowledge) continue;
       const buildId = crypto.randomUUID();
+      const sourceId = sources.get(ref)!.sourceId;
+      await pinSourceRoot(this.env, {
+        repoId,
+        sourceId,
+        consumerKind: "knowledge-overlay",
+        consumerId: `${repoId}:${sourceId}:${buildId}`,
+        commit: retry?.commit ?? commit,
+      });
       state.overlays[ref] = {
         ...(state.overlays[ref] ?? { done: null, retries: 0, lastError: null }),
         running: {
           buildId,
+          sourceId,
           commit: retry?.commit ?? commit,
           base: retry?.base ?? indexed!,
           startedAt: Date.now(),
@@ -685,7 +711,12 @@ export class KnowledgeCoordinator extends DurableObject<Env> implements Purgeabl
         params: {
           repoId,
           buildId,
-          overlay: { ref, commit: retry?.commit ?? commit, base: retry?.base ?? indexed! },
+          overlay: {
+            ref,
+            sourceId,
+            commit: retry?.commit ?? commit,
+            base: retry?.base ?? indexed!,
+          },
           policy,
         },
       });
@@ -806,6 +837,11 @@ export async function requestPages(env: Env, request: PageRequest) {
   if (!env.AI || !productionOnly(env, "workflow", "wiki pages")) return null;
   const ai = await repoAiSnapshot(env.DB, request.repoId);
   if (!ai.features.knowledge || !ai.features.wiki) return null;
+  const source = await timelineKnowledgeSource(env, request.repoId, request.ref);
+  if (!source || source.source_id !== request.sourceId)
+    throw new Error("Timeline source migration required or source mismatch");
+  if (source.state !== "ready") return { status: "ended" as const, queued: false };
+  if (!(await knowledgeRepo(env, request.repoId, source.source_id))) return null;
   const result = await queueSet(env.DB, request);
   if (result.status === "queued")
     await coordinator(env, request.repoId).pagesRequested(request.repoId);
@@ -828,6 +864,7 @@ export async function requestCheckpointPages(
     checkpoint.repos.map((repo) =>
       requestPages(env, {
         repoId: repo.id,
+        sourceId: repo.source?.sourceId,
         ref,
         key: checkpoint.id,
         commit: repo.commit,

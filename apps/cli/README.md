@@ -197,9 +197,9 @@ commit without one says "no context recorded". On the web, a selected line's
 
 Gitmatrix deploys nothing; whatever deploys tells it where code went. Inside a CI
 job, `gm deploy record` acts as the job (`GITMATRIX_TOKEN`): the server fills in
-the repository, run, job and commit, and the environment from the branch
-(`production` on the default branch, `timeline/<slug>` on a timeline bookmark,
-`branch/<name>` on any other, lowercased); `--environment` overrides it.
+the repository, source, run, job and commit. The environment is `production`
+for canonical default-branch work, `timeline/<slug>` for a timeline's owned
+source, or `branch/<name>` for another branch; `--environment` overrides it.
 Elsewhere it records as you and needs `--commit`. Records outlive their
 previews: tearing one down marks it `expired`.
 
@@ -744,14 +744,17 @@ ids live in a `change-id` commit header, the same one jj uses.
 
 A timeline is a separate line of work that lands on main later, automatically
 (`auto`) or after a person approves a checkpoint (`approval`)
-(`TIMELINES-RESEARCH.md`). It's an account-wide record in the tracker with a
-bookmark `timeline/<slug>` in each repository it touches. Timelines are
-optional: work in one when the issue or a person asks for it.
+([current server contract](../website/README.md#timelines)). The account-wide
+tracker record owns one work repository per canonical repository, shared by its
+agents: opaque `work_<id>`, physical `refs/heads/work`. `timeline/<slug>` is still
+a logical overlay/environment label. Work uses canonical permissions, but its
+WIP commits stay out of canonical even at landing. Timelines are optional unless
+the issue or a person requires one.
 
 ```bash
 gm timeline start search-v2 --policy approval   # fork from main, then work in it here
 gm commit -m "Rank by recency"
-gm push                                         # to timeline/search-v2, never main
+gm push                                         # to this source's work ref, never main
 gm timeline merge main && gm push               # bring main in, when a person asks
 gm timeline use main                            # back to main
 ```
@@ -760,22 +763,33 @@ gm timeline use main                            # back to main
   timeline with `--from <slug>`. `--name`, `--policy auto|approval`,
   `--experimental` (a marker for timelines not expected to land) and
   `--repo owner/name` (repeatable; default this checkout's repository, or the
-  parent timeline's) shape it. The server creates the bookmarks, then the
-  checkout is bound to it as by `use` (`--no-use` to skip that).
-- **`use <slug>`** binds the checkout: `timeline: <slug>` in
-  `.gitmatrix/agent.local.yml`, which `gm worktree add` copies, so new
-  worktrees work in the same timeline. It fetches and moves `@` onto the
-  bookmark, unless `@` is already built on it. `use main` unbinds and starts
-  `@` on main; work elsewhere stays where it was.
-- **A bound checkout treats the timeline's bookmark as trunk.** `gm push` goes to
-  `timeline/<slug>` (a fast-forward, like trunk), `gm sync` follows the
-  timeline, `trunk` names its head, and what's pushed there is immutable. Main
-  stays immutable and reachable as `origin/main`. Pushing to main
-  (`gm push -b main`) is refused (`timeline_bound`); work reaches main when the
-  timeline lands. If origin has no `timeline/<slug>` (abandoned, or not
-  fetched), push and sync stop with `timeline_missing`.
-- **`merge <main|slug>`** fetches and runs `gm merge` with `origin/main` or
-  `origin/timeline/<slug>`: a merge change below `@`, pushed with `gm push`.
+  parent timeline's) shape it. The server reserves and forks exact source
+  snapshots, then binds this checkout as by `use` (`--no-use` skips binding).
+- **`use <slug>`** records `timeline: <slug>` in `.gitmatrix/agent.local.yml`,
+  which `gm worktree add` copies. It validates the owned source, fetches through
+  `/<owner>/<repo>@<slug>.git`, and moves `@` onto its work head unless already
+  based there. A successful fetch pins the immutable source ID under
+  `gitmatrix.source-<slug>`; the friendly URL never replaces source identity.
+  `use main` explicitly unbinds and selects canonical main; work elsewhere stays
+  where it was. Pushing `timeline/*` to the canonical Git URL is refused with
+  the corresponding timeline URL, including for legacy branches.
+- **A bound checkout treats the owned work ref as trunk.** `gm push` updates
+  only `work`; `gm sync` follows that source. Canonical remains reachable as
+  `origin/main`. Alternate bookmarks/main and `gm push --queue` are rejected
+  (`timeline_bound`): use checkpoint/land, not generic queue admission, to land.
+  Missing or migrating source metadata fails closed (`source_migration_required`);
+  a canonical legacy bookmark is never a fallback.
+- **Ended sources stay guarded.** Push fails with `timeline_ended`, without
+  implicitly switching to canonical. After compact landing, `gm sync` uses
+  source lineage receipts and exact admitted membership to reconcile the local
+  suffix onto current canonical main. Equal change IDs alone do not prove
+  inclusion: edited revisions survive, ordinary conflicts remain visible, and
+  ambiguous/expired lineage stops rather than discarding work. A real sync
+  preserves the previous working-copy commit under
+  `refs/gm/source-sync/<sourceId>/<commit>`. Then explicitly start a new timeline
+  or run `gm timeline use main`; sync alone does not remove the ended guard.
+- **`merge <main|slug>`** fetches canonical main or the other timeline's owned
+  source and creates a merge change below `@`, pushed with `gm push`.
   Main is merged in only by a person, or an agent asked to.
 - **`list`**, **`show [<slug>]`** read the records and events (fork, merge,
   checkpoint, approval, landing, abandon); `*` and `current` mark this
@@ -787,16 +801,40 @@ gm timeline use main                            # back to main
   a timeline that isn't expected to land; it restricts nothing, so its work
   still merges into any timeline and it can still land. Any writer may change
   it.
-- **`abandon [<slug>]`** ends it and deletes its bookmarks; its events stay. The
-  server allows only its accountable person or the agent that started it. A
-  checkout bound to it goes back to main.
+- **`abandon [<slug>]`** ends writes and archives owned history read-only;
+  its events and any successful partial integration receipts stay. The server
+  allows only its accountable person or the agent that started it. Other
+  checkouts still bound to it retain the ended-source guard.
 - **`revive [<slug>] [--checkpoint <number|id>]`** rebuilds a checkpoint's
   preview (default: the newest checkpoint), for example to look into last
   week's work after its preview expired: Gitmatrix starts a preview `create`
   run in each repository whose ci.yml opts in (`on: preview`), at the
-  checkpoint's commits, landed and abandoned timelines included. The record it
+  checkpoint's commits, including retained landed/abandoned sources. Expired
+  sources fail explicitly rather than checking out canonical. The record it
   makes is marked rebuilt (`revived`, `rebuiltFrom`), since the toolchain or
   seed may have changed. Needs write access to every repository.
+- **`migrate [<slug>]`** converts legacy active/experimental canonical bookmarks
+  to pinned owned sources; completed timelines instead gain historical provenance.
+  After conversion run `gm timeline use <slug>`, make a new checkpoint and renew
+  approval. In-flight legacy landing must settle first. Inspect `timeline show`,
+  then resolve a stopped unadvanced landing with
+  `gm timeline migrate <slug> --resolve cancel-unadvanced --expected-version <version> --note "<reason>"`.
+  A stopped partial landing requires `--resolve accept-partial-and-abandon`
+  with the same version/note; it preserves successful receipts and abandons the
+  timeline. Resolution does not itself convert: run plain `migrate` afterward.
+
+Landing applies the approved B→T tree delta (explicit logical base to approved
+work) onto pinned canonical O. It gates one-parent compact candidates for all
+repositories before advancing any main, or records no-op receipts for unchanged
+trees. Main movement requires re-preparation/re-gating. There is no cross-repo
+transaction; partial retry/cancellation preserves successful receipts without
+replaying or rewinding them. Nested work must be covered by exact integrated
+ancestry; ambiguous foreign dependencies require reviewed sync/rebase.
+Ended work Git is read-only, then expires after 30 days landed or 90 days
+abandoned by default (`timeline-work-sources.landedDays` / `abandonedDays`).
+Both durations and enablement are configurable in Data retention, independently
+of Tracker detail, published wiki and preview expiry. Live dependencies and
+unacknowledged consumers delay deletion. A purged source returns explicit expiry.
 
 `--owner` picks the tracker account; by default it's `.gitmatrix/agents.yml`'s,
 else origin's owner. Every command takes `--dry-run` and prints JSON for agents.
@@ -898,6 +936,12 @@ and `verified` once a push showed the commit) or `local` (not pushed, never
 verified). When the server can't be reached, `note` says so and the local
 context is shown. A step without context reads as `step: null`.
 
+Timeline reads/uploads keep the owned source identity while contexts retain their
+canonical repository/change-ID/commit keys and author rules. Compact canonical
+landings link through integration receipts to the full WIP steps; `gm why` and
+release notes use that provenance rather than a second merge parent. Missing,
+ambiguous or expired source evidence is not guessed from matching change IDs.
+
 ## Automatic AI settings
 
 ```bash
@@ -960,6 +1004,7 @@ Settings mutations are not part of `gm undo`. The equivalent web page is
 gm retention show --owner orbit                  # categories, switches, thresholds, last run
 gm retention set ci-logs --enable --threshold days=14
 gm retention set ci-runs --reset keepLatest      # inherit the site-wide default again
+gm retention set timeline-work-sources --threshold landedDays=30 --threshold abandonedDays=90
 gm retention run ci-logs ci-runs --dry-run       # preview what a cleanup would delete
 gm retention run ci-logs --yes                   # clean up now and wait for the result
 gm retention runs                                # history; `gm retention runs 12` for one run
@@ -967,9 +1012,11 @@ gm retention show --site                         # site categories and site-wide
 ```
 
 The same policies, cleanup runs and history as the Data retention settings
-pages. Every category is off until enabled; then scheduled cleanups delete what
-its policy selects. Omit `--owner` for the signed-in person's own account;
-`--site` covers site categories and site-wide defaults (site administrators).
+pages. Policy categories are opt-in except `timeline-work-sources`, enabled by
+default at 30 days landed / 90 days abandoned; active categories always run.
+Scheduled cleanups apply the effective policy. Omit `--owner` for the signed-in
+person's own account; `--site` covers site categories and site-wide defaults
+(site administrators).
 `--inherit` and `--reset <key>` remove this level's value so it inherits again.
 `run` takes any categories with a cleanup, enabled or not, and per-run overrides
 (`--threshold category.key=value`). With `--dry-run` the server previews the run

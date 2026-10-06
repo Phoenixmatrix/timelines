@@ -18,12 +18,13 @@ export function pkt(line: string): string {
 export function* parsePktLines(bytes: Uint8Array): Generator<PktLine> {
   let offset = 0;
   while (offset + 4 <= bytes.length) {
-    const length = Number.parseInt(decoder.decode(bytes.subarray(offset, offset + 4)), 16);
-    if (Number.isNaN(length)) throw new Error(`Bad pkt-line length at byte ${offset}`);
+    const hex = decoder.decode(bytes.subarray(offset, offset + 4));
+    if (!/^[0-9a-f]{4}$/i.test(hex)) throw new Error(`Bad pkt-line length at byte ${offset}`);
+    const length = Number.parseInt(hex, 16);
     if (length === 0) yield { type: "flush" };
     else if (length === 1) yield { type: "delim" };
     else if (length === 2) yield { type: "end" };
-    else if (length < 4 || offset + length > bytes.length) {
+    else if (length < 4 || length > 65520 || offset + length > bytes.length) {
       throw new Error(`Truncated pkt-line at byte ${offset}`);
     } else yield { type: "data", data: bytes.subarray(offset + 4, offset + length) };
     offset += length < 4 ? 4 : length;

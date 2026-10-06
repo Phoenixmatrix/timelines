@@ -1,19 +1,7 @@
-// A landing's merge job (CORE-77, TIMELINES-RESEARCH.md "Landing"). The
-// Worker can't run `git merge`, so the merge runs where git already runs: a
-// CI job of Gitmatrix's own (not the repository's ci.yml) on the landing
-// branch, which holds the checkpoint's commit. It fetches main, merges the
-// checkpoint into the main commit the landing pinned, and pushes the merge
-// back to the landing branch, where the repository's own pipeline then tests
-// it before main moves (timelines/landing.ts).
-//
-// The landing credential is the job's own (gmj_…, for as long as the job
-// runs). The job fetches and pushes through Gitmatrix's git proxy
-// (git/http.ts), which takes that credential from a landing's merge job only,
-// for its own repository, and lets it push to nothing but its landing branch
-// (CORE-157): no Artifacts token reaches the sandbox. Every timeline
-// repository belongs to the tracker's own account. The commands are these,
-// never the repository's, and the Worker checks the merge's parents before
-// testing it and moves main itself, with a compare-and-swap.
+// Trusted timeline compaction and the independent ordinary queue merge job.
+// A compact job reads pinned work and canonical objects, computes exact B/O/T,
+// and publishes from a fresh canonical-only object database. Its job credential
+// can read only those sources and write only its canonical landing branch.
 
 import { sql } from "kysely";
 import { jobCaller } from "../deployments/job.ts";
@@ -23,6 +11,8 @@ import type { StoredJob } from "./jobs.ts";
 import { startWorkflow } from "./trigger.ts";
 import { landingBranch, landingSlugOf } from "../../shared/timelines.ts";
 import { QUEUE_MERGE_SCRIPT } from "./queue-script.ts";
+import { COMPACT_SCRIPT } from "./compact-script.ts";
+import type { SourceSnapshot } from "../../shared/code-source.ts";
 
 /** The exit code the merge step ends with when the merge conflicts. */
 export const CONFLICT_EXIT = 42;
@@ -31,38 +21,12 @@ export const LANDING_JOB = "land";
 
 /** What marks a job as a landing merge: only the Worker writes it into a spec. */
 export interface LandingJobSpec extends StoredJob {
-  landing: { slug: string };
+  landing: { slug: string; sourceId: string };
 }
 
 export interface QueueMergeJobSpec extends StoredJob {
   queue: { id: string; attempt: number };
 }
-
-/** The merge step: POSIX shell under `bash -eo pipefail`, like every step. */
-export const MERGE_SCRIPT = String.raw`# Through Gitmatrix's git proxy, with the job's own credential: it reads this
-# repository and pushes only to this landing's branch.
-remote="$GITMATRIX_URL/$GITMATRIX_REPOSITORY.git"
-export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
-export GIT_CONFIG_VALUE_0="Authorization: Bearer $GITMATRIX_TOKEN"
-deepen=""
-if [ -f "$(git rev-parse --git-dir)/shallow" ]; then deepen=--unshallow; fi
-git fetch --quiet $deepen "$remote" "+refs/heads/$GITMATRIX_LANDING_MAIN:refs/remotes/landing/main"
-if ! git cat-file -e "$GITMATRIX_LANDING_BASE^{commit}"; then
-  echo "Main's commit $GITMATRIX_LANDING_BASE is gone (was main rewritten?). Land again."
-  exit 1
-fi
-git checkout --quiet -B gitmatrix-landing "$GITMATRIX_LANDING_BASE"
-if ! git -c user.name="$GITMATRIX_LANDING_NAME" -c user.email="$GITMATRIX_LANDING_EMAIL" \
-  merge --no-ff --no-edit -m "$GITMATRIX_LANDING_MESSAGE" "$GITMATRIX_COMMIT"; then
-  echo
-  echo "Merging the checkpoint into $GITMATRIX_LANDING_MAIN conflicts in:"
-  git diff --name-only --diff-filter=U | sed 's/^/  /'
-  git merge --abort || true
-  exit ${CONFLICT_EXIT}
-fi
-git push --quiet --force "$remote" "HEAD:refs/heads/$GITMATRIX_LANDING_BRANCH"
-echo "Merged as $(git rev-parse HEAD)."
-`;
 
 /**
  * Record and start a landing's merge run under `runId` (chosen and saved by
@@ -84,7 +48,15 @@ export async function startMergeRun(
     author: { name: string; email: string };
     actor: { id: string; agentId: string | null } | null;
   } & (
-    | { landingId: string; slug: string; queueId?: never; attempt?: never }
+    | {
+        landingId: string;
+        slug: string;
+        source: SourceSnapshot;
+        logicalBase: SourceSnapshot;
+        old: string | null;
+        queueId?: never;
+        attempt?: never;
+      }
     | { queueId: string; attempt: number; landingId?: never; slug?: never }
   ),
 ): Promise<{ number: number }> {
@@ -92,6 +64,7 @@ export async function startMergeRun(
   if (!productionOnly(env, "workflow", `the merge run of ${options.queueId ?? options.landingId}`))
     throw new PreviewModeError("workflow", "Previews don't run CI, so nothing lands in one.");
   const kdb = db(env.DB);
+  const sourceId = "source" in options ? options.source.sourceId : "canonical";
   const spec: LandingJobSpec | QueueMergeJobSpec = {
     needs: [],
     if: null,
@@ -104,18 +77,34 @@ export async function startMergeRun(
       GITMATRIX_LANDING_MESSAGE: options.message,
       GITMATRIX_LANDING_NAME: options.author.name,
       GITMATRIX_LANDING_EMAIL: options.author.email,
-      ...(options.queueId
-        ? { GITMATRIX_QUEUE_ID: options.queueId, GITMATRIX_QUEUE_ATTEMPT: String(options.attempt) }
-        : {}),
+      ...("source" in options
+        ? {
+            GITMATRIX_LANDING_SOURCE: options.source.sourceId,
+            GITMATRIX_LANDING_TIMELINE: options.slug,
+            GITMATRIX_LANDING_SOURCE_TREE: options.source.tree,
+            GITMATRIX_LANDING_LOGICAL_COMMIT: options.logicalBase.commit,
+            GITMATRIX_LANDING_LOGICAL_TREE: options.logicalBase.tree,
+            GITMATRIX_LANDING_OLD: options.old ?? "",
+            GITMATRIX_LANDING_DATE: "2000-01-01T00:00:00Z",
+          }
+        : {
+            GITMATRIX_QUEUE_ID: options.queueId,
+            GITMATRIX_QUEUE_ATTEMPT: String(options.attempt),
+          }),
     },
     secrets: [],
     timeoutMinutes: 20,
-    steps: [{ name: "Merge into main", run: options.queueId ? QUEUE_MERGE_SCRIPT : MERGE_SCRIPT }],
+    steps: [
+      {
+        name: options.queueId ? "Merge into main" : "Materialize compact tree",
+        run: options.queueId ? QUEUE_MERGE_SCRIPT : COMPACT_SCRIPT,
+      },
+    ],
     concurrency: null,
     paths: [],
-    ...(options.queueId
-      ? { queue: { id: options.queueId, attempt: options.attempt } }
-      : { landing: { slug: options.slug! } }),
+    ...("source" in options
+      ? { landing: { slug: options.slug, sourceId } }
+      : { queue: { id: options.queueId, attempt: options.attempt } }),
   };
   // Named after the run, so recording it twice records it once.
   const jobId = `${options.runId}m`;
@@ -125,6 +114,7 @@ export async function startMergeRun(
       .columns([
         "id",
         "repo_id",
+        "source_id",
         "number",
         "commit_oid",
         "ref",
@@ -142,6 +132,7 @@ export async function startMergeRun(
           .select([
             eb.val(options.runId).as("id"),
             eb.val(repo.id).as("repo_id"),
+            eb.val(sourceId).as("source_id"),
             eb(eb.fn.coalesce(eb.fn.max("number"), eb.lit(0)), "+", eb.lit(1)).as("number"),
             eb.val(options.commit).as("commit_oid"),
             eb.val(options.branch).as("ref"),
@@ -171,6 +162,7 @@ export async function startMergeRun(
         id: jobId,
         run_id: options.runId,
         repo_id: repo.id,
+        source_id: sourceId,
         name: LANDING_JOB,
         spec: JSON.stringify(spec),
         status: "pending",
@@ -244,6 +236,7 @@ export type LandingJobAccess =
   | {
       ok: true;
       slug: string;
+      sourceId: string;
       repo: { id: string; artifacts_name: string; artifacts_remote: string };
     }
   | { ok: false; status: 401 | 403; error: string };
@@ -268,6 +261,7 @@ export async function landingJob(
     };
   const row = await db(d1)
     .selectFrom("ci_jobs as j")
+    .innerJoin("ci_runs as r", "r.id", "j.run_id")
     .innerJoin("repos as p", "p.id", "j.repo_id")
     .innerJoin("accounts as o", "o.id", "p.owner_id")
     .select([
@@ -279,12 +273,19 @@ export async function landingJob(
       "p.artifacts_remote",
     ])
     .where("j.id", "=", job.jobId)
+    .where("p.deleted_at", "is", null)
+    .where("j.status", "=", "running")
+    .where("r.status", "=", "running")
     .executeTakeFirst();
   const spec = row ? (JSON.parse(row.spec) as Partial<LandingJobSpec>) : null;
   const slug = spec?.landing?.slug;
   if (
     !row ||
     !slug ||
+    !spec?.landing?.sourceId ||
+    spec.landing.sourceId === "canonical" ||
+    spec.landing.sourceId !== job.sourceId ||
+    job.ref !== landingBranch(slug) ||
     landingSlugOf(landingBranch(slug)) !== slug ||
     job.jobName !== LANDING_JOB ||
     row.owner !== owner ||
@@ -299,6 +300,7 @@ export async function landingJob(
   return {
     ok: true,
     slug,
+    sourceId: spec!.landing!.sourceId,
     repo: {
       id: row.id,
       artifacts_name: row.artifacts_name,

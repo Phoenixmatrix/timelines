@@ -5,6 +5,19 @@ The React app and Worker live in `apps/website`; the Rust `gm` CLI lives in
 `apps/cli`. Gitmatrix hosts its own source. GitHub is a one-way backup, not the
 publication target.
 
+## Timeline work and canonical history
+
+Timelines keep full progress history in one owned work repository per timeline
+and canonical repository (`work_<id>`, physical `refs/heads/work`). Landing
+applies the approved tree change onto current main as a gated single-parent
+commit, or records a no-op; WIP commits are not uploaded to canonical.
+Source-qualified provenance keeps steps, previews and historical reads linked
+to that work. Git uses `/<owner>/<repo>@<slug>.git`. Ended work is read-only
+and expires by default after 30 days landed or 90 days abandoned, configurable
+in Data retention independently of Tracker details, published wiki and previews.
+See the [current timeline contract](apps/website/README.md#timelines) and
+[CLI binding, sync and legacy migration](apps/cli/README.md#timelines).
+
 ## Downloading and installing packages
 
 Authenticate `gm` with your Gitmatrix server before accessing private packages.
@@ -137,10 +150,12 @@ Details: `apps/cli/README.md` ("Steps: context for every commit") and
 
 ## Data retention
 
-Gitmatrix deletes nothing new until someone turns a retention category on,
-except expired sign-in state (auth hygiene), which it always cleans up. Account administrators choose per account in **Settings → Data retention**;
-site administrators set site categories (shared caches, the registry,
-sign-in state, usage records) and defaults for every account in
+Most retention categories are opt-in. **Timeline work Git repositories** is
+enabled by default: 30 days after landing, 90 after abandonment. Expired
+sign-in state (auth hygiene) is always cleaned up. Account administrators can
+change both durations or disable that policy in **Settings → Data retention**.
+Site administrators set site categories (shared caches, the registry, sign-in
+state, usage records) and defaults for every account in
 **Settings → Site data retention**. Each category says what it never
 deletes. **Clean up now** previews any categories (a dry run with counts,
 bytes and estimated storage cost) before deleting, and every run, scheduled
@@ -211,6 +226,11 @@ setup's output show each environment's `ai`. It starts the app while seeding and
 unless it was already running. `up` runs the app in the foreground; use its printed
 loopback origin, not a remembered port. CI runners start on demand from the same
 worktree's binary, with two runner slots.
+
+For the CI Sandbox execution boundary, stop the local supervisor and run
+`vp run agent up --sandbox`. Docker must be available; jobs then run in actual
+Sandbox containers with the same scoped origin, credentials and disposable
+workspace. The default `up`, `ready` and `test` still use local Linux runners.
 
 In another terminal in that source worktree:
 

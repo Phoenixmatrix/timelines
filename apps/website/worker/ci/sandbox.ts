@@ -5,11 +5,11 @@
 // idles on the bill.
 
 import { DurableObject } from "cloudflare:workers";
-import type { CiClaimedJob } from "../../shared/api.ts";
+import type { CiClaimedJob, CiJobReport } from "../../shared/api.ts";
 import { upstreamToken } from "../artifacts.ts";
 import { batch, db, nowIso } from "../schema.ts";
 import { jobPayload, loadJob, report, type StoredJob } from "./jobs.ts";
-import { mintJobToken, withConfigDir } from "./registry.ts";
+import { mintJobToken, revokeJobTokens, withConfigDir } from "./registry.ts";
 import {
   clearStorage,
   pendingRetirement,
@@ -21,6 +21,7 @@ import {
   type PurgeReport,
 } from "../durable/contract.ts";
 import { durableStub } from "../durable/registry.ts";
+import { ciSource } from "./source.ts";
 
 const WORKDIR = "/workspace/repo";
 /** Package tools' configuration (npmrc, docker/config.json…), outside the checkout. */
@@ -71,7 +72,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
 
   async #clear(reason: string): Promise<PurgeReport> {
     const container = this.ctx.container;
-    if (container?.running) await container.destroy().catch(() => {});
+    if (container?.running) await container.destroy();
     return clearStorage(this.ctx.storage, reason);
   }
 
@@ -113,28 +114,38 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
       return;
     }
     const spec = JSON.parse(job.spec) as StoredJob;
-    // Packages publish to the public URL the registry answers on.
-    const origin = String(Reflect.get(this.env, "PUBLIC_URL") || "http://localhost:5180");
-    const credential = await mintJobToken(d1, jobId, spec.timeoutMinutes);
-    const payload = await jobPayload(d1, job, { origin, token: credential });
-
-    // A retried step starts over: claim (again) and clear the earlier attempt.
+    // Claim before preparing checkout. Cancellation may have won since loadJob;
+    // in that case no runner may start using a source whose claim was released.
     const kdb = db(d1);
-    await batch(d1, [
-      kdb
-        .updateTable("ci_jobs")
-        .set({ status: "running", claimed_by: "sandbox", started_at: nowIso() })
-        .where("id", "=", jobId)
-        .where("status", "in", ["queued", "running"]),
-      kdb.deleteFrom("ci_logs").where("job_id", "=", jobId),
-      kdb
-        .updateTable("ci_steps")
-        .set({ status: "pending", exit_code: null, started_at: null, finished_at: null })
-        .where("job_id", "=", jobId),
-    ]);
-
-    const deadline = Date.now() + spec.timeoutMinutes * 60_000;
+    const claimed = await kdb
+      .updateTable("ci_jobs")
+      .set({ status: "running", claimed_by: "sandbox", started_at: nowIso() })
+      .where("id", "=", jobId)
+      .where("status", "in", ["queued", "running"])
+      .where(
+        "run_id",
+        "in",
+        kdb.selectFrom("ci_runs").select("id").where("status", "in", ["queued", "running"]),
+      )
+      .executeTakeFirst();
+    if (claimed.numUpdatedRows === 0n) return;
+    let done: CiJobReport["done"];
     try {
+      // Packages publish to the public URL the registry answers on.
+      const origin = String(Reflect.get(this.env, "PUBLIC_URL") || "http://localhost:5180");
+      const credential = await mintJobToken(d1, jobId, spec.timeoutMinutes);
+      const payload = await jobPayload(d1, job, { origin, token: credential });
+
+      // A retried step starts over and clears the earlier attempt.
+      await batch(d1, [
+        kdb.deleteFrom("ci_logs").where("job_id", "=", jobId),
+        kdb
+          .updateTable("ci_steps")
+          .set({ status: "pending", exit_code: null, started_at: null, finished_at: null })
+          .where("job_id", "=", jobId),
+      ]);
+
+      const deadline = Date.now() + spec.timeoutMinutes * 60_000;
       const say = (text: string) => report(this.env, jobId, { logs: [{ step: SETUP_STEP, text }] });
       await say(`Starting a ${spec.instance} sandbox (image ${spec.image})…\n`);
       // A container already running belongs to an earlier attempt (a run in progress
@@ -142,7 +153,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
       // its processes may still be writing. Replace it rather than build on top.
       if (container.running) {
         await say("Replacing the sandbox an earlier attempt left running…\n");
-        await container.destroy().catch(() => {});
+        await container.destroy();
         for (const until = Date.now() + 60_000; container.running && Date.now() < until;)
           await new Promise((resolve) => setTimeout(resolve, 500));
       }
@@ -157,7 +168,8 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
       await this.#ready(container, start);
 
       await say(`Checking out ${payload.ref} at ${payload.commit.slice(0, 12)}…\n`);
-      const token = await upstreamToken(this.env, job.artifacts_name, "read");
+      const source = await ciSource(this.env, job.repo_id, job.source_id, { runId: job.run_id });
+      const token = await upstreamToken(this.env, source.artifacts_name, "read");
       const gitEnv = {
         ...BASE_ENV,
         GIT_CONFIG_COUNT: "1",
@@ -173,22 +185,21 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
         `git clone --quiet --depth 50 --single-branch --branch "$BRANCH" "$REMOTE" ${WORKDIR}`,
         `cd ${WORKDIR}`,
         `git checkout --quiet "$COMMIT" 2>/dev/null || { git fetch --quiet --depth 1 origin "$COMMIT" && git checkout --quiet "$COMMIT"; }`,
+        `git remote remove origin`,
         `git log -1 --format='%h %s'`,
       ].join(" && ");
       const code = await this.#exec(container, jobId, SETUP_STEP, checkout, {
         cwd: "/",
         env: {
           ...gitEnv,
-          BRANCH: payload.ref,
-          REMOTE: job.artifacts_remote,
+          BRANCH: job.source_id === "canonical" ? payload.ref : source.default_branch,
+          REMOTE: source.artifacts_remote,
           COMMIT: payload.commit,
         },
         deadline,
       });
       if (code !== 0) {
-        await report(this.env, jobId, {
-          done: { status: "failed", exitCode: code, error: "Checkout failed." },
-        });
+        done = { status: "failed", exitCode: code, error: "Checkout failed." };
         return;
       }
 
@@ -210,7 +221,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
           deadline,
         });
       }
-      await this.#steps(
+      done = await this.#steps(
         container,
         jobId,
         { ...payload, env: withConfigDir(payload.env, CONFIG_DIR) },
@@ -222,13 +233,36 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
         // run out, the workflow marks it failed with this message.
         throw error;
       }
-      await report(this.env, jobId, { done: { status: "cancelled" } });
+      done = { status: "cancelled" };
     } finally {
-      await container.destroy().catch(() => {});
+      // A terminal report releases source claims. Confirm every process stopped
+      // first, including background children and cancelled or failed attempts.
+      await container.destroy();
+      if (done) await report(this.env, jobId, { done });
+      else {
+        // Preserve Workflow retries, but never leave a stopped attempt claiming
+        // to run. Cancellation may have won while destruction was in flight.
+        await revokeJobTokens(d1, jobId);
+        await d1
+          .prepare(`UPDATE ci_jobs SET
+          status=CASE WHEN EXISTS (SELECT 1 FROM ci_runs r WHERE r.id=ci_jobs.run_id
+            AND r.status IN ('queued','running')) THEN 'queued' ELSE 'cancelled' END,
+          finished_at=CASE WHEN EXISTS (SELECT 1 FROM ci_runs r WHERE r.id=ci_jobs.run_id
+            AND r.status IN ('queued','running')) THEN NULL ELSE ? END,
+          claimed_by=NULL,source_completion_pending=0
+          WHERE id=? AND status='running'`)
+          .bind(nowIso(), jobId)
+          .run();
+      }
     }
   }
 
-  async #steps(container: Container, jobId: string, job: CiClaimedJob, deadline: number) {
+  async #steps(
+    container: Container,
+    jobId: string,
+    job: CiClaimedJob,
+    deadline: number,
+  ): Promise<NonNullable<CiJobReport["done"]>> {
     for (const step of job.steps) {
       const { cancelled } = await report(this.env, jobId, {
         steps: [{ position: step.position, status: "running" }],
@@ -244,17 +278,14 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
         steps: [{ position: step.position, status: ok ? "succeeded" : "failed", exitCode: code }],
       });
       if (!ok) {
-        await report(this.env, jobId, {
-          done: {
-            status: "failed",
-            exitCode: code,
-            error: code === 124 ? "The job timed out." : `${step.name} exited with ${code}.`,
-          },
-        });
-        return;
+        return {
+          status: "failed",
+          exitCode: code,
+          error: code === 124 ? "The job timed out." : `${step.name} exited with ${code}.`,
+        };
       }
     }
-    await report(this.env, jobId, { done: { status: "succeeded", exitCode: 0 } });
+    return { status: "succeeded", exitCode: 0 };
   }
 
   /** Wait until the container accepts exec. */

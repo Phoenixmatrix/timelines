@@ -1,14 +1,13 @@
 //! `gm timeline`: parallel lines of work (TIMELINES-RESEARCH.md).
 //!
-//! A timeline is an account-wide record in the tracker with a bookmark
-//! `timeline/<slug>` in each repository it touches (CORE-69's API under
-//! /api/tracker/:owner/timelines). This module starts, lists, shows and
-//! abandons them, and binds a checkout to one:
+//! A timeline is an account-wide tracker record with one owned work repository
+//! per canonical repository. Canonical origin stays unchanged; bound operations
+//! fetch and push the source-addressed Gitmatrix endpoint.
 //!
 //! - `use` writes `timeline: <slug>` to `.gitmatrix/agent.local.yml` (which new
-//!   worktrees copy) and moves `@` onto the timeline's bookmark. A bound
-//!   checkout treats that bookmark as its trunk: `gm push` goes there, `gm sync`
-//!   follows it, and pushing to main is refused (network.rs).
+//!   worktrees copy) and moves `@` onto the source's work ref. A bound checkout
+//!   treats it as trunk. Ended sources retain the push guard until an explicit
+//!   new timeline or `use main`.
 //! - `merge` merges main or another timeline into the bound one with
 //!   `gm merge`, so the merge is an ordinary change to push.
 //!
@@ -24,10 +23,9 @@
 //!   checkpoint (CORE-84) in each of its repositories; `--write` asks for them
 //!   at the bookmarks' tips now, and `--page` prints one in full.
 //!
-//! - `land` queues the head checkpoint to land (CORE-77): a CI job merges it
-//!   into each repository's current main, the repository's gates run on the
-//!   merge, and only then does main advance to it. It says why not when the
-//!   timeline can't land yet (no approval, not green, new commits).
+//! - `land` queues the head checkpoint for a compact, one-parent tree landing
+//!   onto canonical main after its gates pass. Progress objects stay in the
+//!   source. Late sync follows exact integration receipts, preserving local edits.
 //!
 //! `GM_TIMELINE` overrides the binding for one command (`profile::timeline`).
 
@@ -57,7 +55,7 @@ pub enum TimelineCommand {
     Use(UseArgs),
     /// Merge main or another timeline into this checkout's timeline, below the working copy
     Merge(MergeArgs),
-    /// End a timeline (default: this checkout's) and delete its bookmarks; its events stay
+    /// End a timeline and archive its work sources; keep this checkout's push guard
     Abandon(AbandonArgs),
     /// Record a checkpoint: the timeline's pushed commits now, with a summary, for a person to approve
     Checkpoint(CheckpointArgs),
@@ -67,11 +65,38 @@ pub enum TimelineCommand {
     Revive(ReviveArgs),
     /// The wiki pages a timeline affects, written at its checkpoints (or now, with --write)
     Pages(PagesArgs),
-    /// Land a timeline (default: this checkout's): merge its head checkpoint into main, test the merge, then advance main; or say why it can't land yet
+    /// Land the approved source tree compactly onto main after gates pass
     Land(LandArgs),
     /// Rename a timeline (default: this checkout's), or flag it experimental or clear the flag
     #[command(visible_alias = "flag")]
     Update(UpdateArgs),
+    /// Convert a legacy timeline to owned work sources; renew its checkpoint and approval afterward
+    Migrate(MigrateArgs),
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum MigrationResolution {
+    /// Cancel a stopped landing that has not advanced any canonical repository
+    CancelUnadvanced,
+    /// Preserve successful partial receipts and abandon the entire legacy timeline
+    AcceptPartialAndAbandon,
+}
+
+#[derive(Args)]
+pub struct MigrateArgs {
+    /// Timeline slug (default: this checkout's).
+    pub slug: Option<String>,
+    /// Resolve a stopped legacy landing instead of converting; inspect `timeline show` first.
+    #[arg(long, value_enum, requires_all = ["expected_version", "note"])]
+    pub resolve: Option<MigrationResolution>,
+    /// Exact landing version observed by the operator; stale versions are rejected.
+    #[arg(long, requires = "resolve")]
+    pub expected_version: Option<u64>,
+    /// Audit reason for resolving the legacy landing.
+    #[arg(long, requires = "resolve")]
+    pub note: Option<String>,
+    #[command(flatten)]
+    pub owner: Owner,
 }
 
 #[derive(Args)]
@@ -146,7 +171,7 @@ pub enum Policy {
 
 #[derive(Args)]
 pub struct StartArgs {
-    /// Lowercase letters and digits joined by hyphens; its bookmark is timeline/<slug>.
+    /// Lowercase letters and digits joined by hyphens; work lives in an owned source.
     pub slug: String,
     /// A readable name (default: the slug).
     #[arg(long)]
@@ -273,6 +298,7 @@ pub fn run(ctx: &Ctx, command: &TimelineCommand) -> Result<Shown> {
         TimelineCommand::Pages(a) => pages(ctx, a),
         TimelineCommand::Land(a) => land(ctx, a),
         TimelineCommand::Update(a) => update(ctx, a),
+        TimelineCommand::Migrate(a) => migrate(ctx, a),
     }
 }
 
@@ -925,6 +951,7 @@ fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
                 &reference,
                 page,
                 Some(&id),
+                set["sourceId"].as_str().unwrap_or("canonical"),
             );
         }
         let sets = view["knowledge"].as_array().cloned().unwrap_or_default();
@@ -962,10 +989,23 @@ fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
             )
         })
         .collect();
+    let sources: Vec<&str> = detail["timeline"]["repos"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            r["source"]["sourceId"].as_str().ok_or_else(|| {
+                GmError::new(
+                    "source_migration_required",
+                    "Timeline page reads require explicit source metadata.",
+                )
+            })
+        })
+        .collect::<Result<_>>()?;
     if let Some(page) = &args.page {
         let mut last = None;
-        for name in &names {
-            match one_page(&config, name, &reference, page, None) {
+        for (name, source) in names.iter().zip(&sources) {
+            match one_page(&config, name, &reference, page, None, source) {
                 Ok(shown) => return Ok(shown),
                 Err(e) if e.code == "not_found" => last = Some(e),
                 Err(e) => return Err(e),
@@ -986,8 +1026,11 @@ fn pages(ctx: &Ctx, args: &PagesArgs) -> Result<Shown> {
     }
     let mut repos = Vec::new();
     let mut text = String::new();
-    for name in &names {
-        let path = format!("/repos/{name}/knowledge/overlay/pages?ref={reference}");
+    for (name, source) in names.iter().zip(&sources) {
+        let path = format!(
+            "/repos/{name}/knowledge/overlay/pages?ref={reference}&source={}",
+            query(source)
+        );
         if args.write {
             let set = remote::api(&config, "POST", &path, None)?;
             text.push_str(&set_text(name, &set));
@@ -1024,11 +1067,13 @@ fn one_page(
     reference: &str,
     page: &str,
     set: Option<&str>,
+    source: &str,
 ) -> Result<Shown> {
     let mut path = format!(
         "/repos/{repo}/knowledge/overlay/page?ref={reference}&slug={}",
         query(page)
     );
+    path.push_str(&format!("&source={}", query(source)));
     if let Some(set) = set {
         path.push_str(&format!("&set={}", query(set)));
     }
@@ -1331,6 +1376,124 @@ fn main_revision(ws: &Workspace) -> Result<String> {
         .to_string())
 }
 
+/// Source identity is obtained from the canonical account API, never a provider URL.
+pub(crate) struct WorkSource {
+    pub id: String,
+    pub url: String,
+    pub ended: bool,
+}
+
+pub(crate) fn work_source(ctx: &Ctx, config: &Config, slug: &str) -> Result<WorkSource> {
+    slug_arg(slug)?;
+    let owner = owner(ctx, config, None)?;
+    let record = fetch_record(config, &owner, slug)?;
+    let name = server::current_repo(ctx)?;
+    let entry = record["repos"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| {
+            format!(
+                "{}/{}",
+                r["owner"].as_str().unwrap_or(""),
+                r["name"].as_str().unwrap_or("")
+            ) == name
+        })
+        .ok_or_else(|| {
+            GmError::not_found(
+                "timeline_not_here",
+                "This timeline does not include this repository.",
+            )
+        })?;
+    let source = &entry["source"];
+    let id = source["sourceId"].as_str().filter(|id| {
+        id.starts_with("work_") && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }).filter(|_| source["kind"] == "timeline-work" && source["ref"] == "refs/heads/work"
+        && source["repoId"] == entry["id"] && source["timelineId"] == record["id"])
+        .ok_or_else(|| GmError::new("source_migration_required", "Timeline has no validated owned work source.")
+            .hint("Migrate the timeline before using it; canonical timeline bookmarks are not a write fallback.")
+            .exit(exit::CONFLICT))?;
+    let detail = remote::api(config, "GET", &format!("/repos/{name}?source={id}"), None)?;
+    let expected = format!(
+        "{}/{name}@{slug}.git",
+        config.server().trim_end_matches('/')
+    );
+    if record["slug"] != slug
+        || detail["source"] != *source
+        || detail["cloneUrl"].as_str() != Some(expected.as_str())
+    {
+        return Err(GmError::new(
+            "invalid_source",
+            "The server's Git URL or source identity does not match this timeline.",
+        ));
+    }
+    let checkout = git2::Repository::discover(&ctx.cwd)?;
+    if let Ok(pinned) = checkout
+        .config()?
+        .get_string(&format!("gitmatrix.source-{slug}"))
+        && pinned != id
+    {
+        return Err(GmError::new(
+            "invalid_source",
+            "This timeline no longer matches the checkout's pinned source.",
+        ));
+    }
+    Ok(WorkSource {
+        id: id.to_string(),
+        url: expected,
+        ended: ended(&record).is_some(),
+    })
+}
+
+pub(crate) fn source_query(ctx: &Ctx, config: &Config) -> Result<String> {
+    match current() {
+        Some(slug) => Ok(format!("source={}", work_source(ctx, config, &slug)?.id)),
+        None => Ok("source=canonical".into()),
+    }
+}
+
+pub(crate) fn fetch_work(ctx: &Ctx, config: &Config, slug: &str) -> Result<WorkSource> {
+    let source = work_source(ctx, config, slug)?;
+    let root = require_checkout(ctx, "fetch timeline source")?;
+    let refspec = format!("+refs/heads/work:refs/remotes/gm-work/timeline/{slug}");
+    let output = remote::git(
+        config,
+        &root,
+        &["fetch", "--quiet", "--no-tags", &source.url, &refspec],
+    )?;
+    if !output.status.success() {
+        let repo = git2::Repository::discover(&root)?;
+        let commit = repo
+            .find_reference(&format!("refs/remotes/gm-work/timeline/{slug}"))
+            .ok()
+            .and_then(|r| r.target())
+            .unwrap_or(git2::Oid::ZERO_SHA1);
+        let name = server::current_repo(ctx)?;
+        match remote::api(
+            config,
+            "GET",
+            &format!(
+                "/repos/{name}/sources/{}/lineage?commit={commit}",
+                source.id
+            ),
+            None,
+        ) {
+            Ok(lineage) if lineage["status"] == "expired" => {
+                return Err(GmError::new("source_expired", "The timeline work source has expired its retention period.")
+                    .hint("Local work is preserved. Explicitly recover it into a new timeline or use main."));
+            }
+            Err(error) if error.code == "source_expired" => return Err(error),
+            _ => {}
+        }
+        return Err(remote::git_failure("Fetch timeline source", &output)
+            .hint("The source may have expired its retention period. Local work is preserved; inspect `gm timeline show`."));
+    }
+    git2::Repository::discover(&root)?
+        .config()?
+        .set_str(&format!("gitmatrix.source-{slug}"), &source.id)?;
+    Ok(source)
+}
+
 /// Bind (or unbind) the checkout in its local file.
 fn bind(root: &Path, slug: Option<&str>) -> Result<()> {
     let mut local = profile::local_at(root)?.unwrap_or_default();
@@ -1406,7 +1569,7 @@ fn use_timeline(ctx: &Ctx, slug: &str, explicit_owner: Option<String>) -> Result
         .and_then(|prev| {
             let repo = git2::Repository::discover(&ctx.cwd).ok()?;
             let tip = repo
-                .find_reference(&format!("refs/remotes/origin/timeline/{prev}"))
+                .find_reference(&format!("refs/remotes/gm-work/timeline/{prev}"))
                 .ok()?
                 .peel_to_commit()
                 .ok()?
@@ -1415,13 +1578,20 @@ fn use_timeline(ctx: &Ctx, slug: &str, explicit_owner: Option<String>) -> Result
         });
 
     // Fetch, so the bookmark (and main) are current, then find where @ goes.
-    network::fetch(ctx)?;
+    if let Some(slug) = &slug {
+        fetch_work(ctx, &config, slug)?;
+    }
+    // Explicitly leaving an expired source must not require fetching that source.
+    let output = remote::git(&config, &root, &["fetch", "origin", "--prune", "--quiet"])?;
+    if !output.status.success() {
+        return Err(remote::git_failure("Fetch", &output));
+    }
     let (target, target_name, old_wc, stale) = {
         let ws = Workspace::open(&ctx.cwd)?;
         let (target, name) = match &slug {
             Some(slug) => {
                 let name = format!("timeline/{slug}");
-                let refname = format!("refs/remotes/origin/{name}");
+                let refname = format!("refs/remotes/gm-work/{name}");
                 let oid = ws
                     .repo
                     .find_reference(&refname)
@@ -1438,7 +1608,7 @@ fn use_timeline(ctx: &Ctx, slug: &str, explicit_owner: Option<String>) -> Result
                             repo_names(record.as_ref())
                         ))
                     })?;
-                (oid, format!("origin/{name}"))
+                (oid, format!("gm-work/{name}"))
             }
             None => {
                 let main = main_revision(&ws)?;
@@ -1654,6 +1824,9 @@ fn merge(ctx: &Ctx, args: &MergeArgs) -> Result<Shown> {
         }
     }
     network::fetch(ctx)?;
+    if !from_main {
+        fetch_work(ctx, &Config::load(), &args.from)?;
+    }
     let (revision, label) = {
         let ws = Workspace::open(&ctx.cwd)?;
         if !ws.on_timeline() {
@@ -1674,7 +1847,7 @@ fn merge(ctx: &Ctx, args: &MergeArgs) -> Result<Shown> {
             let name = format!("timeline/{}", args.from);
             if ws
                 .repo
-                .find_reference(&format!("refs/remotes/origin/{name}"))
+                .find_reference(&format!("refs/remotes/gm-work/{name}"))
                 .is_err()
             {
                 return Err(GmError::not_found(
@@ -1683,7 +1856,7 @@ fn merge(ctx: &Ctx, args: &MergeArgs) -> Result<Shown> {
                 )
                 .hint("`gm timeline list` shows the timelines and the repositories they touch."));
             }
-            (format!("origin/{name}"), name)
+            (format!("gm-work/{name}"), name)
         }
     };
     let message = if args.message.is_empty() {
@@ -1732,10 +1905,10 @@ fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
             .exit(exit::CONFLICT));
         }
         let text = format!(
-            "dry run: nothing was changed\nWould abandon timeline {slug} and delete timeline/{slug} in {}{}.\nOnly its accountable person or the agent that started it may; the server checks.",
+            "dry run: nothing was changed\nWould abandon timeline {slug} and archive its work sources in {}{}.\nOnly its accountable person or the agent that started it may; the server checks.",
             repo_names(Some(&record)),
             if bound_here {
-                ", then work on main here"
+                "; this checkout keeps its ended-source push guard"
             } else {
                 ""
             }
@@ -1745,7 +1918,7 @@ fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
                 "dry_run": true,
                 "owner": owner,
                 "timeline": record,
-                "unbind": bound_here,
+                "unbind": false,
             }),
             text,
         });
@@ -1756,23 +1929,107 @@ fn abandon(ctx: &Ctx, args: &AbandonArgs) -> Result<Shown> {
         &format!("{}/{slug}/abandon", base(&owner)),
         Some(&json!({})),
     )?;
+    if result["cancelled"] == true {
+        return Ok(Shown {
+            text: format!(
+                "Cancelled reserved timeline {slug}; its owned source cleanup is scheduled."
+            ),
+            value: json!({
+                "dry_run": false,
+                "owner": owner,
+                "cancelled": true,
+                "slug": result["slug"],
+                "bookmarks": result["bookmarks"],
+            }),
+        });
+    }
     let mut text = format!(
         "Abandoned timeline {slug}; its events stay.\n{}",
         bookmarks_text(&result["bookmarks"])
     );
-    let mut value = json!({
+    let value = json!({
         "dry_run": false,
         "owner": owner,
         "timeline": result["timeline"],
         "bookmarks": result["bookmarks"],
     });
-    // A checkout left bound to it would refuse to push or sync: back to main.
     if bound_here {
-        let used = use_timeline(ctx, "main", None)?;
-        text.push_str(&used.text);
-        value["use"] = used.value;
+        text.push_str("This checkout remains bound and cannot push. Explicitly start a new timeline or `gm timeline use main`.");
     }
     Ok(Shown { value, text })
+}
+
+fn migrate(ctx: &Ctx, args: &MigrateArgs) -> Result<Shown> {
+    let config = Config::load();
+    let owner = owner(ctx, &config, args.owner.owner.clone())?;
+    let slug = named_or_current(&args.slug, "migrate")?;
+    if let Some(resolution) = args.resolve {
+        let action = match resolution {
+            MigrationResolution::CancelUnadvanced => "cancel-unadvanced",
+            MigrationResolution::AcceptPartialAndAbandon => "accept-partial-and-abandon",
+        };
+        let note = args.note.as_deref().unwrap_or("").trim();
+        if note.is_empty() {
+            return Err(GmError::usage(
+                "Legacy landing resolution requires a nonempty --note.",
+            ));
+        }
+        let version = args
+            .expected_version
+            .ok_or_else(|| GmError::usage("Pass the observed landing --expected-version."))?;
+        let body = json!({"expectedVersion": version, "action": action, "note": note});
+        if ctx.dry_run {
+            return Ok(Shown {
+                value: json!({"dry_run":true,"timeline":slug,"request":body}),
+                text: format!(
+                    "Would resolve {slug}'s stopped legacy landing with {action} at version {version}. No conversion requested."
+                ),
+            });
+        }
+        let value = remote::api(
+            &config,
+            "POST",
+            &format!("{}/{slug}/migration/resolve", base(&owner)),
+            Some(&body),
+        )?;
+        let next = match resolution {
+            MigrationResolution::CancelUnadvanced => format!(
+                "Run `gm timeline migrate {slug}` to convert, then renew checkpoint and approval."
+            ),
+            MigrationResolution::AcceptPartialAndAbandon => format!(
+                "Successful partial receipts were preserved and the legacy timeline abandoned. Run `gm timeline migrate {slug}` for historical conversion; start a fresh timeline for new work."
+            ),
+        };
+        return Ok(Shown {
+            value,
+            text: format!("Resolved legacy landing. {next}"),
+        });
+    }
+    if ctx.dry_run {
+        return Ok(Shown {
+            value: json!({"dry_run": true, "timeline": slug}),
+            text: format!(
+                "Would migrate {slug} to owned work sources; unresolved landings block conversion."
+            ),
+        });
+    }
+    let value = remote::api(
+        &config,
+        "POST",
+        &format!("{}/{slug}/migrate", base(&owner)),
+        Some(&json!({})),
+    )?;
+    let next = if ended(&value).is_some() {
+        "Historical source provenance is recorded. Start a fresh timeline for new work.".to_string()
+    } else {
+        format!(
+            "Run `gm timeline use {slug}` to fetch its owned source, then create a new checkpoint and renew approval."
+        )
+    };
+    Ok(Shown {
+        value,
+        text: format!("Migrated {slug}. {next}"),
+    })
 }
 
 // ---- update ----------------------------------------------------------------------

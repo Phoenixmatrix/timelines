@@ -4,6 +4,7 @@
 // tracker, next to the issues and leases later steps change with them.
 
 import type { KnowledgePageSet } from "./api.ts";
+import type { CodeSource, SourceSnapshot, SourceDependency } from "./code-source.ts";
 import type { DoneIn, Issue } from "./tracker.ts";
 
 export type TimelinePolicy = "auto" | "approval";
@@ -15,7 +16,7 @@ export const TIMELINE_POLICIES: readonly TimelinePolicy[] = ["auto", "approval"]
  * - `waiting`: a checkpoint awaits approval;
  * - `landing`: queued to land;
  * - `partly_landed`: some repositories advanced, the rest retrying;
- * - `landed`, `abandoned`: ended, kept forever.
+ * - `landed`, `abandoned`: ended, retained under the ended-timeline policy.
  */
 export type TimelineStatus =
   | "active"
@@ -33,6 +34,10 @@ export interface TimelineRepo {
   name: string;
   /** The branch holding the timeline's work: `timeline/<slug>`. */
   bookmark: string;
+  /** Absent only on legacy records, which cannot accept active work. */
+  source?: CodeSource;
+  logicalBase?: SourceSnapshot;
+  dependencies?: SourceDependency[];
 }
 
 export interface Timeline {
@@ -62,6 +67,7 @@ export interface Timeline {
   pushedAt: string | null;
   /** When it landed or was abandoned; absent on older records and open timelines. */
   endedAt?: string | null;
+  migrationState?: "frozen" | "ready";
 }
 
 export type TimelineEventKind =
@@ -108,7 +114,7 @@ export type TimelineEvent = TimelineEventBase &
       }
     | {
         kind: "abandon";
-        /** Each bookmark's last commit when it was deleted (null if it was already gone). */
+        /** Each source's last commit when archived (null if already unavailable). */
         lastCommits: Record<string, string | null>;
       }
     | {
@@ -155,7 +161,13 @@ export type TimelineEvent = TimelineEventBase &
       }
   );
 
-export type LandingOutcome = "queued" | "conflict" | "failed" | "partly_landed" | "landed";
+export type LandingOutcome =
+  | "queued"
+  | "conflict"
+  | "failed"
+  | "blocked_dependency"
+  | "partly_landed"
+  | "landed";
 
 /**
  * One repository in a checkpoint: the timeline's commit there and the main
@@ -174,6 +186,9 @@ export interface CheckpointRepo {
    * each with the commit it last had; capped at CHECKPOINT_CHANGES.
    */
   changes: { changeId: string; commit: string }[];
+  source?: SourceSnapshot;
+  logicalBase?: SourceSnapshot;
+  dependencies?: SourceDependency[];
 }
 
 /** Change ids kept per repository in a checkpoint. */
@@ -253,7 +268,7 @@ export interface CheckpointPreview {
 
 /** A checkpoint with what's known about it now: CI, previews, approval. */
 export interface CheckpointView extends CheckpointState {
-  timeline: { id: string; slug: string; name: string; policy: TimelinePolicy };
+  timeline: Pick<Timeline, "id" | "slug" | "name" | "policy" | "status">;
   runs: CheckpointRun[];
   previews: CheckpointPreview[];
   /**
@@ -319,6 +334,13 @@ export interface TimelineChange {
   bookmarks: BookmarkResult[];
 }
 
+/** A failed, not-yet-published creation was fenced and its owned allocations drained. */
+export interface TimelineCreationCancellation {
+  cancelled: true;
+  slug: string;
+  bookmarks: [];
+}
+
 export interface CreateTimeline {
   slug: string;
   name?: string;
@@ -352,7 +374,14 @@ export interface UpdateTimeline {
  * - `failed`: the gates failed, the checkpoint moved on, or it ran out of retries;
  * - `landed`: every main advanced; the timeline is landed.
  */
-export type LandingState = "merging" | "testing" | "advancing" | "conflict" | "failed" | "landed";
+export type LandingState =
+  | "merging"
+  | "testing"
+  | "advancing"
+  | "conflict"
+  | "failed"
+  | "blocked_dependency"
+  | "landed";
 
 /** One repository of a landing. */
 export interface LandingRepo {
@@ -367,12 +396,25 @@ export interface LandingRepo {
   merge: string | null;
   /** Merges tried: a main that moved before it advanced is merged again. */
   attempt: number;
-  state: "merging" | "testing" | "tested" | "advanced" | "conflict" | "failed";
+  state:
+    | "merging"
+    | "testing"
+    | "tested"
+    | "advanced"
+    | "conflict"
+    | "failed"
+    | "blocked_dependency";
   /** The CI runs that merged and tested this attempt. */
   mergeRun: { id: string; number: number } | null;
   gateRun: { id: string; number: number } | null;
   /** Why it stopped (conflicting files, failing jobs, a main that moved). */
   reason: string | null;
+  source?: SourceSnapshot;
+  logicalBase?: SourceSnapshot;
+  dependencies?: SourceDependency[];
+  casIntent?: { base: string; candidate: string; tree: string };
+  resultTree?: string;
+  noop?: boolean;
 }
 
 export interface Landing {

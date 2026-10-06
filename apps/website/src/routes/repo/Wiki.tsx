@@ -8,7 +8,7 @@ import { Mermaid } from "../../components/Mermaid.tsx";
 import { FileRow, RailSection, railClass } from "../../components/Rail.tsx";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
-import { blobUrl, repoPath } from "../../lib/refs.ts";
+import { blobUrl, repoPath, sourceUrl } from "../../lib/refs.ts";
 import { scopeOf, withScope } from "../../lib/timelineScope.ts";
 import { setLabel } from "../../components/TimelinePages.tsx";
 import { useRepo } from "./RepoLayout.tsx";
@@ -30,7 +30,10 @@ export async function wikiLoader({ request, params }: LoaderFunctionArgs) {
     api<WikiPage>(`${base}/wiki/page?slug=${encodeURIComponent(slug)}`).catch(missing),
     timeline
       ? api<KnowledgeTimelinePage>(
-          `${base}/overlay/page?ref=${encodeURIComponent(`timeline/${timeline}`)}&slug=${encodeURIComponent(slug)}${set ? `&set=${encodeURIComponent(set)}` : ""}`,
+          sourceUrl(
+            `${base}/overlay/page?ref=${encodeURIComponent(`timeline/${timeline}`)}&slug=${encodeURIComponent(slug)}${set ? `&set=${encodeURIComponent(set)}` : ""}`,
+            url.searchParams.get("source"),
+          ),
         ).catch(missing)
       : null,
   ]);
@@ -118,7 +121,19 @@ const diagramTitle = (page: WikiPage) =>
   page.slug === "architecture" ? "Component map" : "How the files connect";
 
 /** On this page (from xl), the files the page was written from, and when. */
-function PageRail({ page, owner, name }: { page: WikiPage; owner: string; name: string }) {
+function PageRail({
+  page,
+  owner,
+  name,
+  sourceId,
+  sourceLocations,
+}: {
+  page: WikiPage;
+  owner: string;
+  name: string;
+  sourceId: string;
+  sourceLocations?: KnowledgeTimelinePage["sourceLocations"];
+}) {
   const headings = useMemo(() => outline(page.body), [page.body]);
   const contents = page.diagram
     ? [...headings, { depth: 2 as const, text: diagramTitle(page), id: "diagram" }]
@@ -144,9 +159,22 @@ function PageRail({ page, owner, name }: { page: WikiPage; owner: string; name: 
       {page.sources.length > 0 && (
         <RailSection title="Sources" count={page.sources.length}>
           <ul className="m-0 list-none p-0">
-            {page.sources.map((path) => (
-              <FileRow key={path} to={blobUrl(owner, name, page.generatedIn, path)} path={path} />
-            ))}
+            {page.sources.map((path) => {
+              const location = sourceLocations?.find((source) => source.path === path);
+              return (
+                <FileRow
+                  key={path}
+                  to={blobUrl(
+                    owner,
+                    name,
+                    location?.commit ?? page.generatedIn,
+                    path,
+                    location?.sourceId ?? sourceId,
+                  )}
+                  path={path}
+                />
+              );
+            })}
           </ul>
         </RailSection>
       )}
@@ -163,6 +191,7 @@ function PageRail({ page, owner, name }: { page: WikiPage; owner: string; name: 
 export function Wiki() {
   const { catalog, page: mainPage, timelinePage } = useLoaderData<typeof wikiLoader>();
   const page: WikiPage | null = timelinePage?.outcome === "written" ? timelinePage : mainPage;
+  const sourceId = timelinePage?.outcome === "written" ? timelinePage.sourceId : "canonical";
   const repo = useRepo();
   const status = useKnowledgeStatus(repo.owner.slug, repo.name, catalog.status);
   const { hash } = useLocation();
@@ -225,6 +254,8 @@ export function Wiki() {
             owner={repo.owner.slug}
             name={repo.name}
             refName={page.generatedIn}
+            sourceId={sourceId}
+            sourceLocations={timelinePage?.sourceLocations}
           />
         ) : (
           <div className="mk-empty max-w-[44rem]">
@@ -243,7 +274,13 @@ export function Wiki() {
           aria-label="About this page"
           className={`md:col-start-2 xl:col-start-3 xl:row-start-1 ${railClass}`}
         >
-          <PageRail page={page} owner={repo.owner.slug} name={repo.name} />
+          <PageRail
+            page={page}
+            owner={repo.owner.slug}
+            name={repo.name}
+            sourceId={sourceId}
+            sourceLocations={timelinePage?.sourceLocations}
+          />
         </aside>
       )}
     </div>

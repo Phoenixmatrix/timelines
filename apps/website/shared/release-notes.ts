@@ -1,4 +1,5 @@
 import type { CommitSummary } from "./api.ts";
+import type { SourceSnapshot } from "./code-source.ts";
 import type { IssueStatus, IssueType } from "./tracker.ts";
 
 /** A tracker issue as release notes see it: what shipped, when, and the proof. */
@@ -25,6 +26,7 @@ export interface LinkedIssue extends ShippedIssue {
 }
 
 export interface RangeCommit extends CommitSummary {
+  source?: SourceSnapshot;
   /** Issue keys the message mentions, in order; resolved ones appear in `issues`. */
   issueKeys: string[];
   /** The merge on the first-parent line that landed this commit; null on the line itself. */
@@ -36,6 +38,8 @@ export interface RangeCommit extends CommitSummary {
  * whose other parent was the timeline's checkpoint.
  */
 export interface LandedTimeline {
+  kind?: "compact" | "merge";
+  source?: SourceSnapshot;
   /** The timeline record a `timeline/<slug>` branch names; null for other branches or none. */
   id: string | null;
   /** The branch it merged, like `timeline/search`, when git or the push log name it. */
@@ -67,7 +71,10 @@ export function landedTimelineSlug(timeline: LandedTimeline | null): string | nu
 
 /** How an entry names its timeline: the branch, else the landing merge. */
 export function timelineLabel(timeline: LandedTimeline): string {
-  return timeline.branch ?? `merge ${timeline.landing.slice(0, 7)}`;
+  return (
+    timeline.branch ??
+    `${timeline.kind === "compact" ? "landing" : "merge"} ${timeline.landing.slice(0, 7)}`
+  );
 }
 
 /** Colons cannot occur in Git tag names, so daily update IDs cannot collide with tags. */
@@ -102,6 +109,7 @@ export interface ReleaseNoteChange {
  * landing's commits that cite none.
  */
 export interface ReleaseNoteEntry {
+  provenance?: { source: SourceSnapshot; commits: string[]; receiptId: string }[];
   id: string;
   release: string;
   releaseKind: ReleaseKind;

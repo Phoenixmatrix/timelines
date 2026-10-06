@@ -188,7 +188,11 @@ export function TrackerTimelines() {
       merge && repo ? (
         <Link
           className="mk-mono text-micro text-ink-faint no-underline hover:underline max-sm:hidden"
-          to={commitPanelUrl(repo.owner, repo.name, merge.commit)}
+          to={
+            repo.source && repo.source.sourceId !== "canonical"
+              ? commitsUrl(repo.owner, repo.name, merge.commit, "", repo.source.sourceId)
+              : commitPanelUrl(repo.owner, repo.name, merge.commit)
+          }
           title={`${repo.owner}/${repo.name} at ${merge.commit}`}
           onClick={(event) => event.stopPropagation()}
         >
@@ -234,9 +238,9 @@ export function TrackerTimelines() {
         <section className="mk-card max-w-[44rem]">
           <h2 className="mk-card-title">No timelines yet</h2>
           <p className="mk-card-desc max-w-[48ch]">
-            A timeline is a line of work that forks from main into a bookmark{" "}
-            <code className="mk-mono">timeline/&lt;slug&gt;</code> in each repository it touches,
-            merges with other timelines and lands on main. Forks, merges, landings and abandoned
+            A timeline keeps its progress in an owned work repository for each repository it
+            touches, using <code className="mk-mono">work</code> rather than a canonical branch. Its
+            reviewed delta lands as a compact commit on main. Forks, merges, landings and abandoned
             timelines in {data.owner.displayName}'s tracker are drawn here. Any writer can fork one:
           </p>
           <pre className="mk-mono mt-3 mb-0 overflow-x-auto rounded-control bg-sunken p-3 text-mono">
@@ -542,6 +546,11 @@ function describe(
       return { verb: event.intoId === null ? "Landed on" : "Merged into", other: of(event.intoId) };
     case "abandon":
       return { verb: "Abandoned", other: undefined };
+    case "landing":
+      return {
+        verb: `Checkpoint #${event.number}: ${event.outcome === "blocked_dependency" ? "blocked by dependency" : event.outcome.replaceAll("_", " ")}${event.note ? ` — ${event.note}` : ""}`,
+        other: undefined,
+      };
     default:
       return { verb: event.kind[0]!.toUpperCase() + event.kind.slice(1), other: undefined };
   }
@@ -682,27 +691,49 @@ function TimelineDetails({
       <h3 className="mt-4 mb-1 text-body-sm font-semibold text-ink-muted">Code</h3>
       <ul className="m-0 list-none p-0">
         {timeline.repos.map((repo) => {
-          const gone = timeline.status === "abandoned";
+          const gone = timeline.status === "abandoned" || timeline.status === "landed";
           const last = lastCommits[repo.id];
           return (
             <li key={repo.id} className="flex flex-wrap items-baseline gap-x-3 py-0.5 text-body-sm">
               <span className="min-w-0 truncate text-ink">
                 {repo.owner}/{repo.name}
               </span>
-              {gone ? (
+              {!repo.source && !gone ? (
+                <span className="text-ink-muted">Source migration required</span>
+              ) : gone ? (
                 last ? (
-                  <Link className={link} to={commitPanelUrl(repo.owner, repo.name, last)}>
+                  <Link
+                    className={link}
+                    to={
+                      repo.source && repo.source.sourceId !== "canonical"
+                        ? treeUrl(repo.owner, repo.name, last, "", repo.source.sourceId)
+                        : commitPanelUrl(repo.owner, repo.name, last)
+                    }
+                  >
                     last commit <span className="mk-mono">{shortOid(last)}</span>
                   </Link>
+                ) : repo.source?.kind === "timeline-work" ? (
+                  <Link
+                    className={link}
+                    to={commitsUrl(repo.owner, repo.name, repo.bookmark, "", repo.source.sourceId)}
+                  >
+                    Archived progress history
+                  </Link>
                 ) : (
-                  <span className="text-ink-faint">bookmark deleted</span>
+                  <span className="text-ink-faint">Historical bookmark deleted</span>
                 )
               ) : (
                 <>
-                  <Link className={link} to={treeUrl(repo.owner, repo.name, repo.bookmark)}>
+                  <Link
+                    className={link}
+                    to={treeUrl(repo.owner, repo.name, repo.bookmark, "", repo.source?.sourceId)}
+                  >
                     <span className="mk-mono">{repo.bookmark}</span>
                   </Link>
-                  <Link className={link} to={commitsUrl(repo.owner, repo.name, repo.bookmark)}>
+                  <Link
+                    className={link}
+                    to={commitsUrl(repo.owner, repo.name, repo.bookmark, "", repo.source?.sourceId)}
+                  >
                     Commits
                   </Link>
                 </>
@@ -745,7 +776,17 @@ function TimelineDetails({
                       {" "}
                       <Link
                         className="mk-mono text-micro text-ink-faint no-underline hover:underline"
-                        to={commitPanelUrl(repo.owner, repo.name, event.commit)}
+                        to={
+                          repo.source && repo.source.sourceId !== "canonical"
+                            ? commitsUrl(
+                                repo.owner,
+                                repo.name,
+                                event.commit,
+                                "",
+                                repo.source.sourceId,
+                              )
+                            : commitPanelUrl(repo.owner, repo.name, event.commit)
+                        }
                       >
                         {shortOid(event.commit)}
                       </Link>

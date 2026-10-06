@@ -34,6 +34,7 @@ function seeded() {
     readFileSync(fileURLToPath(new URL("../../seed/0001_dev.sql", import.meta.url).href), "utf8"),
   );
   sqlite.exec(`
+    INSERT INTO retention_site_policies(category,enabled) VALUES ('timeline-work-sources',0);
     INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES
       ('r_app', 'acc_orbit', 'app', 'private', 'a', 'https://a'),
       ('r_lib', 'acc_orbit', 'lib', 'private', 'b', 'https://b'),

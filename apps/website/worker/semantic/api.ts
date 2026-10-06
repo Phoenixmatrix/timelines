@@ -5,6 +5,7 @@ import { RepoReader } from "../objects.ts";
 import { fail } from "../api/http.ts";
 import type { FileAnalysis } from "../../shared/semantic/types.ts";
 import { parseFeedQuery, semanticFeed, SemanticRequestError, type AnalysisCache } from "./feed.ts";
+import { resolveSource } from "../timelines/sources.ts";
 
 /** Per-file analyses keyed by content: they contain no actor data, so any caller may share them. */
 export function semanticCache(): AnalysisCache {
@@ -31,12 +32,14 @@ export function semanticCache(): AnalysisCache {
 export async function semanticResponse(c: Context<AppEnv>, row: RepoRow): Promise<Response> {
   c.header("cache-control", "private, no-store");
   c.header("vary", "Cookie, Authorization");
+  const { repo, source } = await resolveSource(c.env, row, c.req.query("source"));
   const objects = new RepoReader(
     c.env,
-    row.artifacts_name,
-    row.artifacts_remote,
+    repo.artifacts_name,
+    repo.artifacts_remote,
     c.get("timing"),
     (work) => c.executionCtx.waitUntil(work),
+    source.kind === "timeline-work" ? source.ref : undefined,
   );
   try {
     const query = parseFeedQuery(c.req.query());
@@ -48,6 +51,7 @@ export async function semanticResponse(c: Context<AppEnv>, row: RepoRow): Promis
         row.id,
         `/${encodeURIComponent(row.owner_slug)}/${encodeURIComponent(row.name)}`,
         query,
+        source.sourceId,
       ),
     );
   } catch (error) {

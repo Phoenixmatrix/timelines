@@ -3,6 +3,7 @@ import { XIcon } from "@phosphor-icons/react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useLocation } from "react-router";
 import { timelineLabel, type ReleaseNoteEntry } from "../../shared/release-notes.ts";
+import { commitsUrl } from "../lib/refs.ts";
 import { LinkedText } from "../refs/RefLink.tsx";
 import { CommitLink } from "./CommitLink.tsx";
 import { link, Tip } from "./ui.tsx";
@@ -163,6 +164,28 @@ export function ReleaseNoteDetails({
                   )}
                 </section>
               )}
+              {entry.provenance?.map((provenance) => (
+                <section key={provenance.receiptId} className="mt-4">
+                  <h4 className="mt-0 mb-2 text-body-sm font-semibold">Source receipt</h4>
+                  <p className="m-0 text-body-sm break-all text-ink-muted">
+                    <code className="mk-mono">{provenance.receiptId}</code>
+                  </p>
+                  {repo && (
+                    <Link
+                      className={`${link} text-body-sm`}
+                      to={commitsUrl(
+                        repo.owner,
+                        repo.name,
+                        provenance.source.commit,
+                        "",
+                        provenance.source.sourceId,
+                      )}
+                    >
+                      Approved progress history ({provenance.commits.length} commits)
+                    </Link>
+                  )}
+                </section>
+              ))}
             </div>
           )}
         </Dialog.Popup>

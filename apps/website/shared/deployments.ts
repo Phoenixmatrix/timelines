@@ -55,6 +55,7 @@ export function branchEnvironment(branch: string): string | null {
 
 export interface Deployment {
   id: number;
+  sourceId?: string;
   environment: string;
   /** The timeline's slug, as recorded; null outside timelines. */
   timeline: string | null;
@@ -86,7 +87,7 @@ export interface Deployment {
   revived: boolean;
   /** The earlier record of the same checkpoint it stands in for, when there was one. */
   rebuiltFrom: number | null;
-  /** When Gitmatrix expired it, and the run (number) that tore it down. */
+  /** When Gitmatrix expired it, and the cleanup run number if scheduled; neither proves completion. */
   tornDownAt: string | null;
   teardownRun: number | null;
   createdAt: string;

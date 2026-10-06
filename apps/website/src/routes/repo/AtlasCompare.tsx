@@ -317,9 +317,12 @@ function Comparison({
   const fromRef = head?.from.snapshot;
   const fromCommit = fromRef ? commitOf(fromRef) : null;
   const toCommit = commitOf(to);
+  const fromSourceId = fromRef?.vector[0]?.sourceId ?? "canonical";
+  const toSourceId = to.vector[0]?.sourceId ?? "canonical";
   const changesHref = (path?: string) => {
     const query = new URLSearchParams();
     if (toCommit) query.set("ref", toCommit);
+    query.set("source", toSourceId);
     if (path) query.set("path", path);
     return `${repoPath(repo.owner, repo.name, "changes")}?${query}`;
   };
@@ -498,7 +501,10 @@ function Comparison({
           </p>
           <p className="m-0 flex flex-wrap gap-x-3 gap-y-1 text-body-sm">
             {toCommit && (
-              <Link to={commitsUrl(repo.owner, repo.name, toCommit)} className="text-ink underline">
+              <Link
+                to={commitsUrl(repo.owner, repo.name, toCommit, "", toSourceId)}
+                className="text-ink underline"
+              >
                 Commits up to {short(toCommit)}
               </Link>
             )}
@@ -544,6 +550,8 @@ function Comparison({
                   repo={repo}
                   fromCommit={fromCommit}
                   toCommit={toCommit}
+                  fromSourceId={fromSourceId}
+                  toSourceId={toSourceId}
                   changesHref={changesHref}
                   olderHref={inOlder(change.id)}
                   onPick={onPick}
@@ -581,6 +589,8 @@ function ChangeItem({
   repo,
   fromCommit,
   toCommit,
+  fromSourceId,
+  toSourceId,
   changesHref,
   olderHref,
   onPick,
@@ -589,6 +599,8 @@ function ChangeItem({
   repo: AtlasRepo;
   fromCommit: string | null;
   toCommit: string | null;
+  fromSourceId: string;
+  toSourceId: string;
   changesHref: (path?: string) => string;
   olderHref: string;
   onPick: (entity: AtlasEntitySummary) => void;
@@ -667,13 +679,16 @@ function ChangeItem({
           </Link>
         )}
         {path && change.to && toCommit && (
-          <Link to={blobUrl(repo.owner, repo.name, toCommit, path)} className="text-ink underline">
+          <Link
+            to={blobUrl(repo.owner, repo.name, toCommit, path, toSourceId)}
+            className="text-ink underline"
+          >
             Source at {short(toCommit)}
           </Link>
         )}
         {path && change.from && fromCommit && change.fields.includes("source") && (
           <Link
-            to={blobUrl(repo.owner, repo.name, fromCommit, path)}
+            to={blobUrl(repo.owner, repo.name, fromCommit, path, fromSourceId)}
             className="text-ink underline"
           >
             Before, at {short(fromCommit)}
@@ -681,7 +696,7 @@ function ChangeItem({
         )}
         {path && !change.to && fromCommit && (
           <Link
-            to={blobUrl(repo.owner, repo.name, fromCommit, path)}
+            to={blobUrl(repo.owner, repo.name, fromCommit, path, fromSourceId)}
             className="text-ink underline"
           >
             Last source, at {short(fromCommit)}
@@ -689,7 +704,13 @@ function ChangeItem({
         )}
         {path && change.classes.includes("source") && (change.to ? toCommit : fromCommit) && (
           <Link
-            to={commitsUrl(repo.owner, repo.name, (change.to ? toCommit : fromCommit)!, path)}
+            to={commitsUrl(
+              repo.owner,
+              repo.name,
+              (change.to ? toCommit : fromCommit)!,
+              path,
+              change.to ? toSourceId : fromSourceId,
+            )}
             className="text-ink underline"
           >
             History

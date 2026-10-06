@@ -225,8 +225,11 @@ export async function semanticFeed(
   repo: string,
   base: string,
   query: FeedQuery,
+  sourceId = "canonical",
 ): Promise<SemanticFeedResponse> {
-  let cursor = query.cursor ? decodeCursor(query.cursor, repo, query) : null;
+  const scope = sourceId === "canonical" ? repo : `${repo}/${sourceId}`;
+  const sourceQuery = sourceId === "canonical" ? "" : `?source=${encodeURIComponent(sourceId)}`;
+  let cursor = query.cursor ? decodeCursor(query.cursor, scope, query) : null;
   const head = cursor?.head ?? (await objects.resolve(query.ref));
   const response: SemanticFeedResponse = {
     version: ANALYSIS_VERSION,
@@ -242,7 +245,7 @@ export async function semanticFeed(
   }
   cursor ??= {
     version: ANALYSIS_VERSION,
-    repo,
+    repo: scope,
     ref: query.ref,
     path: query.path,
     kind: query.kind,
@@ -390,7 +393,7 @@ export async function semanticFeed(
         continue;
       const sourceLink = (oid: string | null, source: typeof change.before) =>
         oid && source
-          ? `${base}/blob/${oid}/${source.path.split("/").map(encodeURIComponent).join("/")}#L${source.start.line}`
+          ? `${base}/blob/${oid}/${source.path.split("/").map(encodeURIComponent).join("/")}${sourceQuery}#L${source.start.line}`
           : null;
       const entry: SemanticFeedEntry = {
         ...change,
@@ -407,7 +410,7 @@ export async function semanticFeed(
               : null,
         },
         links: {
-          commit: `${base}/commits/${commit.hash}`,
+          commit: `${base}/commits/${commit.hash}${sourceQuery}`,
           before: sourceLink(parentId, change.before),
           after: sourceLink(commit.hash, change.after),
         },

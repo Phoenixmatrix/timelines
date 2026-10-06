@@ -164,6 +164,7 @@ function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
     ? {
         defaultBranch: scope.repo.defaultBranch,
         branches: scope.repo.branches.map((b) => b.shortName),
+        source: scope.repo.source,
       }
     : null;
   const { words, open, ended } = useMemo(() => {
@@ -183,7 +184,18 @@ function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
     return (
       <li key={slug ?? "main"}>
         <Link
-          to={switchScope(location, slug, repoRefs)}
+          to={switchScope(
+            location,
+            slug,
+            repoRefs
+              ? {
+                  ...repoRefs,
+                  targetSource: scope.timelines
+                    ?.find((timeline) => timeline.slug === slug)
+                    ?.repos.find((repo) => repo.id === scope.repo?.id)?.source,
+                }
+              : null,
+          )}
           onClick={close}
           aria-current={current ? "true" : undefined}
           className="mk-menu-item min-w-0 text-ink no-underline max-sm:min-h-11"
@@ -366,7 +378,11 @@ export function TimelineBanner() {
   const missing = Boolean(scope.timelines && !timeline);
   const ended = timeline?.status === "landed" || timeline?.status === "abandoned";
   const repoRefs = repo
-    ? { defaultBranch: repo.defaultBranch, branches: repo.branches.map((b) => b.shortName) }
+    ? {
+        defaultBranch: repo.defaultBranch,
+        branches: repo.branches.map((b) => b.shortName),
+        source: repo.source,
+      }
     : null;
   const hint = missing
     ? `${scope.owner} has no timeline ${slug}.`
@@ -388,7 +404,9 @@ export function TimelineBanner() {
           <p className="m-0 min-w-0 flex-1 text-body-sm sm:truncate">
             <span className="text-ink-muted">Timeline </span>
             <strong className="font-semibold text-ink">{timeline?.name ?? slug}</strong>
-            <span className="mk-mono ml-2 text-ink-faint max-md:hidden">{scopeBookmark(slug)}</span>
+            <span className="mk-mono ml-2 text-ink-faint max-md:hidden">
+              {repo?.source?.kind === "timeline-work" ? "work" : scopeBookmark(slug)}
+            </span>
             {timeline && timeline.status !== "active" && (
               <span className="text-ink-muted"> · {STATUS_LABEL[timeline.status]}</span>
             )}

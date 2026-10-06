@@ -41,6 +41,9 @@ export function toEntry(row: EntryRow, trackers: ViewerTrackers): ReleaseNoteEnt
       team: { id: row.team_id!, key: row.team_key! },
     };
   }
+  const provenance = JSON.parse(row.provenance ?? "[]") as NonNullable<
+    ReleaseNoteEntry["provenance"]
+  >;
   return {
     id: row.id,
     release: row.release,
@@ -53,8 +56,14 @@ export function toEntry(row: EntryRow, trackers: ViewerTrackers): ReleaseNoteEnt
     labels: JSON.parse(row.labels) as string[],
     workspaceIds: JSON.parse(row.workspace_ids) as string[],
     commits: JSON.parse(row.commits) as string[],
+    provenance,
     timeline: row.landing_oid
-      ? { id: row.timeline_id, branch: row.timeline_branch, landing: row.landing_oid }
+      ? {
+          id: row.timeline_id,
+          branch: row.timeline_branch,
+          landing: row.landing_oid,
+          ...(provenance.length ? { kind: "compact" as const, source: provenance[0]!.source } : {}),
+        }
       : null,
     changes: JSON.parse(row.changes) as ReleaseNoteChange[],
     lastCommitAt: row.shipped_at,
