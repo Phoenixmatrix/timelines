@@ -351,6 +351,12 @@ durably saved the repository as `advanced`, before any subsequent repository mov
 Setting that barrier before an optimistic save can deadlock recovery after a
 version conflict or interrupted RPC. The real partial-retry/cancel assertions
 remain unchanged; unit regressions exercise both failed-save paths.
+Its secret-scoped `tick` action drives the existing recovery state machine while
+waiting, since local development does not run the hourly cron after an interrupted
+background invocation. Only active landings advance: failed gates and blocked
+outcomes are never restarted. The separate automatic-landing journey still checks
+CI-triggered progress without fixture ticks. Inventory probes dispose their
+Artifacts repository handles even when they only check existence.
 
 Automatic E2E provisions only Artifacts and omits Workers AI, Vectorize and AI Search
 bindings. It verifies that fixture pushes/status reads do not start knowledge builds;

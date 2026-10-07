@@ -117,13 +117,16 @@ export async function runSourceLandingE2E(
     };
     const stopped = (slug: string) =>
       poll(
-        () => current(slug),
+        async () => {
+          await control(slug, "tick");
+          return current(slug);
+        },
         (value) => ["landed", "failed", "conflict", "blocked_dependency"].includes(value.state),
         slug,
       );
     const waitBarrier = async (slug: string) => {
       const state = await poll(
-        () => control(slug, "inspect"),
+        () => control(slug, "tick"),
         (value) => value.barrier?.hit === 1,
         `${slug} boundary`,
       );
