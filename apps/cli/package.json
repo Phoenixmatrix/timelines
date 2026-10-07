@@ -5,7 +5,7 @@
   "description": "gm, the Gitmatrix CLI (Rust). Scripts wrap cargo so `vp run -r` covers it.",
   "scripts": {
     "build": "cargo build --release",
-    "test": "cargo test",
+    "test": "cargo test && node --test assets/claude-code-mod/tests/*.test.ts",
     "check": "cargo fmt --check && cargo clippy --all-targets -- -D warnings",
     "install-bin": "cargo install --path . --locked"
   }

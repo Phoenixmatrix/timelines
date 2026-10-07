@@ -2,6 +2,7 @@ pub mod agent_setup;
 pub mod agents;
 pub mod ask;
 pub mod ci;
+pub mod claude_mod;
 pub mod deploy;
 pub mod hooks;
 pub mod local;

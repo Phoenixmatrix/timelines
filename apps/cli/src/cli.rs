@@ -892,6 +892,18 @@ pub enum AgentCommand {
         #[arg(long = "deny-skill")]
         deny_skills: Vec<String>,
     },
+    /// Install the Claude Code mod: a card above the prompt with the gitmatrix issue the session works on, toggled by ctrl+x g or /gm-work. Rerun to update.
+    Mod {
+        /// The chord that toggles the card (default: the one already bound, else ctrl+x g)
+        #[arg(long, value_name = "CHORD", conflicts_with = "remove")]
+        key: Option<String>,
+        /// Report what's out of date without changing anything (exit 4 if stale)
+        #[arg(long, conflicts_with = "remove")]
+        check: bool,
+        /// Uninstall the mod and its keybinding
+        #[arg(long)]
+        remove: bool,
+    },
     /// Your agents and advisory capabilities, optionally from an owner's tracker
     List {
         #[arg(long)]

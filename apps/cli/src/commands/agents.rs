@@ -281,6 +281,14 @@ pub fn agent(ctx: &Ctx, command: &AgentCommand) -> Result<Shown> {
                 deny_skills: deny_skills.clone(),
             },
         ),
+        AgentCommand::Mod { key, check, remove } => super::claude_mod::run(
+            ctx,
+            &super::claude_mod::Options {
+                key: key.clone(),
+                check: *check,
+                remove: *remove,
+            },
+        ),
         AgentCommand::Detect { capabilities: args } => {
             let value = serde_json::to_value(capabilities::detect(args, None, &ctx.cwd)?)?;
             Ok(Shown {

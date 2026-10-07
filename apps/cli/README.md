@@ -583,6 +583,36 @@ gm agent setup --check                           # exit 4 if instructions or ski
   `flag`, `checkout`, `project`, `default`, `scope` or `none`); `--all-teams`
   ignores every default. `gm tracker status` shows `defaultTeam`.
 
+### The Claude Code work card: `gm agent mod`
+
+`gm agent mod` installs a Claude Code mod that shows, in a small card above the
+prompt, the gitmatrix issue the session works on: key and title, status,
+priority, the lease's time left, the checkout's timeline and the latest
+checkpoint. `ctrl+x g` (or `/gm-work`) toggles it; it stays within 46 columns
+and 5 rows, so it fits a pane of a four-way split, and never covers the prompt.
+
+```bash
+gm agent mod                     # install or update; once per machine
+gm agent mod --key 'ctrl+x w'    # another chord (rerun keeps the one bound)
+gm agent mod --check             # exit 4 if the installed mod is stale
+gm agent mod --remove            # uninstall it and its chord
+```
+
+- **Where.** The mod goes in Claude Code's user skills folder,
+  `~/.claude/skills/gitmatrix-work` (under `CLAUDE_CONFIG_DIR` when set), which
+  Claude Code loads by itself in every new session. The chord is merged into
+  `keybindings.json`; other bindings are kept, and a chord already bound to
+  something else is refused (`key_taken`). Mods can't declare keybinding
+  actions, so the chord borrows `app:toggleDiffPreSession`, idle outside the
+  diff panel, and the mod's hidden button answers it.
+- **Which issue.** The session's own `gm issue next`, `claim`, `resume`,
+  `checkpoint` and `renew` focus the card on that issue; `complete` and
+  `release` clear it. Otherwise it shows the newest in-progress issue this
+  checkout's agent holds a live claim on. It refreshes every minute while
+  shown and after each gm command the session runs (`vp run agent gm` aside).
+- **Source.** `assets/claude-code-mod` is the mod as a plugin folder; gm embeds
+  it. Its README says how to develop it.
+
 ### Autonomous human interventions
 
 `gm agent setup --intervention autonomous` teaches the agent to minimize

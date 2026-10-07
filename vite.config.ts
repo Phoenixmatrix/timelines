@@ -15,7 +15,9 @@ export default defineConfig({
     ignorePatterns: ["**/.cloudflare/**", "**/src/styles/matrixkit.css"],
   },
   lint: {
-    ignorePatterns: ["**/.cloudflare/**"],
+    // The Claude Code mod is typed by Claude Code's own declarations, laid in
+    // its .claude-plugin/types when Claude Code loads it; see its README.md.
+    ignorePatterns: ["**/.cloudflare/**", "apps/cli/assets/claude-code-mod/**"],
     jsPlugins: [{ name: "vite-plus", specifier: "vite-plus/oxlint-plugin" }],
     rules: { "vite-plus/prefer-vite-plus-imports": "error" },
     options: { typeAware: true, typeCheck: true },
