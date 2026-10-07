@@ -346,6 +346,12 @@ Local runners keep deadline and cancellation supervision after stdout/stderr EOF
 Silent running steps use a five-second cancellation heartbeat. The live cancellation
 scenario requires the held process to disconnect without the test releasing it.
 
+The source-landing fault fixture stops at `after-receipt` only once Tracker has
+durably saved the repository as `advanced`, before any subsequent repository moves.
+Setting that barrier before an optimistic save can deadlock recovery after a
+version conflict or interrupted RPC. The real partial-retry/cancel assertions
+remain unchanged; unit regressions exercise both failed-save paths.
+
 Automatic E2E provisions only Artifacts and omits Workers AI, Vectorize and AI Search
 bindings. It verifies that fixture pushes/status reads do not start knowledge builds;
 explicit AI rebuild/search requests return 503 in this isolated non-AI mode.

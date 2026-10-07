@@ -184,6 +184,7 @@ function fixture(count = 2) {
     sqlite,
     env,
     deps,
+    tracker,
     refs,
     graphs,
     writes,
@@ -261,6 +262,59 @@ describe("compact landing state", () => {
       status: "complete",
     });
   });
+  test.each(["conflict", "interrupted"] as const)(
+    "receipt barrier waits for durable Tracker progress after a %s save",
+    async (failure) => {
+      const f = fixture();
+      try {
+        Object.assign(f.env, { DEV_MODE: "true", AGENT_ID: "landing-recovery-test" });
+        f.current.slug = "source-landing-12345678-retry-partial";
+        for (const [index, repo] of f.current.repos.entries()) {
+          repo.owner = "orbit";
+          repo.name = `queue-${String(index).padStart(8, "0")}`;
+        }
+        f.sqlite.exec(`CREATE TABLE dev_landing_barriers
+          (timeline_id TEXT PRIMARY KEY, point TEXT, repo_id TEXT, hit INTEGER DEFAULT 0, released INTEGER DEFAULT 0);
+          INSERT INTO dev_landing_barriers(timeline_id,point,repo_id)
+          VALUES('timeline','after-receipt','repo0')`);
+        const save = f.tracker.saveLanding;
+        let failed = false;
+        f.tracker.saveLanding = async (next, version) => {
+          if (!failed && next.repos[0]!.state === "advanced") {
+            failed = true;
+            if (failure === "interrupted") throw new Error("Tracker save interrupted");
+            // Another progress invocation won an optimistic save without yet
+            // recording the already-published repository as advanced.
+            f.current.version++;
+          }
+          return save(next, version);
+        };
+        await f.run();
+        const paused = await f.run();
+        expect(failed).toBe(true);
+        expect(paused.state).toBe("advancing");
+        expect(paused.repos.map((repo) => repo.state)).toEqual(["advanced", "tested"]);
+        expect(f.writes).toEqual(["repo0"]);
+        expect(f.sqlite.prepare("SELECT hit FROM dev_landing_barriers").get()).toEqual({ hit: 1 });
+        expect(f.sqlite.prepare("SELECT status FROM source_integration_receipts").get()).toEqual({
+          status: "integrated",
+        });
+        f.sqlite.exec("UPDATE dev_landing_barriers SET released=1");
+        expect((await f.run()).state).toBe("landed");
+        expect(f.writes).toEqual(["repo0", "repo1"]);
+        expect(
+          f.sqlite
+            .prepare("SELECT repo_id,status FROM source_integration_receipts ORDER BY repo_id")
+            .all(),
+        ).toEqual([
+          { repo_id: "repo0", status: "complete" },
+          { repo_id: "repo1", status: "complete" },
+        ]);
+      } finally {
+        f.sqlite.close();
+      }
+    },
+  );
   test("a tombstone before provider submission releases the known-unsubmitted admission", async () => {
     const f = fixture(1);
     const base = f.current.repos[0]!.base!;

@@ -29,7 +29,7 @@ const hitOnEntry = new WeakMap<Landing, boolean>();
 export async function landingFixtureBarrier(
   env: Env,
   landing: Landing,
-  point?: LandingFixturePoint,
+  point?: Exclude<LandingFixturePoint, "after-receipt">,
   repoId?: string,
 ): Promise<boolean> {
   if (
@@ -50,11 +50,32 @@ export async function landingFixtureBarrier(
       .bind(landing.timelineId, point, repoId ?? null)
       .run();
   const barrier = await env.DB.prepare(
-    "SELECT hit,released FROM dev_landing_barriers WHERE timeline_id=?",
+    "SELECT point,repo_id,hit,released FROM dev_landing_barriers WHERE timeline_id=?",
   )
     .bind(landing.timelineId)
-    .first<{ hit: number; released: number }>();
+    .first<{
+      point: LandingFixturePoint;
+      repo_id: string | null;
+      hit: number;
+      released: number;
+    }>();
   const hit = barrier?.hit === 1;
   if (!point) hitOnEntry.set(landing, hit);
-  return hit && (barrier.released === 0 || hitOnEntry.get(landing) === false);
+  if (hit) return barrier.released === 0 || hitOnEntry.get(landing) === false;
+  // Stop only after Tracker durably records the integrated repository. Arming
+  // before that optimistic save can freeze recovery on a version conflict or
+  // interrupted RPC. Every invocation checks here before advancing another repo.
+  const advanced =
+    !point && barrier?.point === "after-receipt" && barrier.released === 0
+      ? landing.repos.find(
+          (repo) => repo.state === "advanced" && (!barrier.repo_id || barrier.repo_id === repo.id),
+        )
+      : undefined;
+  if (!advanced) return false;
+  const armed = await env.DB.prepare(
+    "UPDATE dev_landing_barriers SET hit=1 WHERE timeline_id=? AND point='after-receipt' AND (repo_id IS NULL OR repo_id=?) AND released=0",
+  )
+    .bind(landing.timelineId, advanced.id)
+    .run();
+  return armed.meta.changes > 0;
 }
