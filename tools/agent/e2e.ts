@@ -37,6 +37,7 @@ import { runSourceAuthE2E } from "./source-auth-e2e.ts";
 import { runSourceLandingE2E } from "./source-landing-e2e.ts";
 import { runSourceSyncE2E } from "./source-sync-e2e.ts";
 import { availableMemory, gib } from "./heavy.ts";
+import { expandE2EScenarios, type ScenarioName } from "./ready-e2e.ts";
 
 type Evidence = {
   scenario: string;
@@ -48,7 +49,13 @@ type Evidence = {
 };
 
 /** Real clients against the isolated server. A failed scenario always fails the command. */
-export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promise<void> {
+export async function runE2E(
+  ctx: HarnessContext,
+  fixtures: SeedManifest,
+  selected?: readonly string[],
+): Promise<void> {
+  const selection =
+    selected === undefined ? undefined : new Set<string>(expandE2EScenarios(selected));
   assert.equal(fixtures.origin, ctx.origin, "Fixture/server identity mismatch");
   const work = join(ctx.work, `e2e-${randomUUID()}`);
   await mkdir(work, { recursive: true, mode: 0o700 });
@@ -61,7 +68,11 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
   const report: Evidence[] = [];
   let observations: unknown[] = [];
   const record = (value: unknown) => observations.push(JSON.parse(redact(JSON.stringify(value))));
-  async function scenario(name: string, body: () => Promise<void>) {
+  async function scenario(name: ScenarioName, body: () => Promise<void>) {
+    if (selection && !selection.has(name)) {
+      console.log(JSON.stringify({ event: "e2e-scenario-skipped", scenario: name }));
+      return;
+    }
     const started = Date.now();
     observations = [];
     try {

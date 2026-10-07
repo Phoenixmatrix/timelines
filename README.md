@@ -274,18 +274,48 @@ development; harness dev endpoints additionally require an environment capabilit
 ### Completion gate
 
 ```bash
-vp run ready                 # uncached quality gates + non-AI live E2E
-vp run agent test            # fresh non-AI live E2E only
+vp run ready                 # uncached checks selected from this change's blast radius
+vp run ready --dry-run       # explain changed paths, selected gates and E2E without running them
+vp run ready --all           # full local suite, regardless of changed paths
+vp run ready --base <ref>    # compare with another integration branch's merge base
+vp run agent test            # fresh, complete non-AI live E2E only
 vp run agent test-ai         # explicit paid verification of the AI stages your change maps to
 ```
 
-`ready` runs formatting/lint checks, Rust format/clippy, all website and harness
-TypeScript projects, recursive unit/integration tests, recursive builds, then the
-non-AI real-service end-to-end suite. Test commands always execute; Cargo may reuse
-compiled outputs, not test results. Missing credentials, required provider outages
-or an unavailable browser fail the command. The website's `vp test` includes
-browser-mode tests in headless Chromium; UI behaviour belongs there, and E2E
-keeps a few real-stack journeys (apps/website/README.md, "Testing").
+`ready` compares against the merge base with local `origin/main`, including committed,
+staged, unstaged and untracked files. Renames include both old and new paths. It does
+not fetch: sync the source workspace first. `--base` changes the integration baseline,
+not the requirement to verify all your unlanded work.
+
+The root formatting/lint/type-aware `vp check` always runs, generating missing Worker
+bindings first. Other uncached gates follow workspace dependencies, including the
+harness and preview tools' relative imports of website contracts:
+
+| Change                                                                                         | Selected coverage                                                                                                             |
+| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| CLI source/assets                                                                              | Rust format/clippy, tests/build and full non-AI E2E; no unrelated website tests/build                                         |
+| Website source                                                                                 | Website and dependent harness/preview checks/tests, website build and non-AI E2E; no unrelated Rust checks/release build      |
+| Frontend-only (`src/`, `public/`)                                                              | Website coverage above; browser E2E journeys with their prerequisite scenarios, without unrelated backend scenarios or mirror |
+| Shared formats                                                                                 | Package checks/tests plus dependent website/harness/preview coverage and E2E                                                  |
+| Shared test helpers                                                                            | Package and consumer checks/tests, without production builds or E2E                                                           |
+| Tests only                                                                                     | Their workspace's checks/tests; no builds or live E2E                                                                         |
+| Known root/workspace README, AGENTS, CONTRIBUTING or CHANGELOG                                 | Root check only; Markdown runtime assets are not exempt                                                                       |
+| Global/task/dependency configuration, shared harness, unknown paths or failed change discovery | Full suite                                                                                                                    |
+
+Unchanged workspaces are skipped, not reported as tested. The selection and its
+reasons print before execution and are saved as `selection.json` beside the gate
+logs under `.gitmatrix-agent/artifacts/gates-<timestamp>/`. `--all` restores complete
+workspace checks, tests/builds and all non-AI CLI/API/browser/mirror E2E.
+`agent check` accepts the same flags; `agent test` remains the complete live suite.
+CI/CD gates are unchanged. Update the workspace policy in `tools/agent/ready-plan.ts`
+when adding workspaces or cross-workspace imports, and the scenario inventory,
+browser coverage and prerequisite map in `ready-e2e.ts` when adding E2E journeys.
+
+Selected test commands always execute; Cargo may reuse compiled outputs, not test
+results. Missing credentials, required provider outages or an unavailable browser
+fail selected gates, never cause them to be skipped. The website's `vp test` includes
+browser-mode tests in headless Chromium; UI behaviour belongs there, and E2E keeps
+real-stack journeys (apps/website/README.md, "Testing").
 
 The usage and retention browser journeys close each persona/viewport context after
 its assertions and trace finish, before opening the next. Keep that lifetime bounded:

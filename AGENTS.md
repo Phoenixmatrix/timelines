@@ -46,12 +46,15 @@ release. Add a tool name to select part of the graph. For example, run
 - Use fresh browser contexts: cookies are not isolated by port. `agent seed`
   reconciles fixtures; `agent reset` destroys and recreates them. Inspect data
   with `agent inspect` or scoped tracker/issue commands.
-- Before completion, run **`vp run ready`**. It runs uncached static gates,
-  every workspace's tests/builds and fresh real CLI/API/browser/mirror E2E,
-  without AI inference or AI resource provisioning. E2E runs **only here**:
-  server CI skips it (too expensive per push), so `ready` is the only place
-  it runs before code lands. For changes to knowledge, wiki, embeddings, AI
-  Search, the assistant, release notes, avatars or the Atlas, follow
+- Before completion, run **`vp run ready`**. It selects uncached checks,
+  workspace tests/builds and non-AI E2E from changed paths and dependencies.
+  `--dry-run` explains the selection; `--all` forces the complete suite.
+  Unknown/global/shared harness changes fall back to full coverage. Frontend
+  changes keep browser journeys and prerequisites; `agent test` stays full.
+  Server CI skips E2E (too expensive per push), so selected live journeys must
+  pass locally before code lands. CI/CD gates are otherwise unchanged.
+  For changes to knowledge, wiki, embeddings, AI Search, the assistant,
+  release notes, avatars or the Atlas, follow
   `.agents/skills/gitmatrix-ai-verification/SKILL.md` and explicitly run
   `vp run agent test-ai`: it runs only the stages your changed paths map to
   (`--dry-run` shows them). Run it once, deliberately: after a failure, fix
