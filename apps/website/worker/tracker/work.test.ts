@@ -69,6 +69,8 @@ function world() {
       ('r-secret', '${oid(21)}', 'CORE-1', NULL, 'linked', 'orbit', 'work', 'CORE-1 hidden mention', '2026-09-03T10:00:00.000Z', 'refs/heads/main', '2026-09-03T10:01:00.000Z'),
       ('r-engine', '${oid(22)}', 'CORE-1', NULL, 'linked', 'other', 'x', 'Other tracker work', '2026-09-03T11:00:00.000Z', 'refs/heads/main', '2026-09-03T11:01:00.000Z'),
       ('r-engine', '${oid(23)}', 'CORE-1', NULL, 'ambiguous', NULL, NULL, 'Ambiguous CORE-1', '2026-09-03T12:00:00.000Z', 'refs/heads/main', '2026-09-03T12:01:00.000Z');
+    -- One pushed to a timeline's work source: it opens there (CORE-296).
+    UPDATE commit_issue_mentions SET source_id = 'work_search' WHERE commit_oid = '${oid(19)}';
     INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, title, status, created_at, landing_id) VALUES
       ('run20', 'r-engine', 20, '${oid(20)}', 'refs/heads/main', 'push', 'CORE-1: Tune ranking weights', 'succeeded', '2026-09-03T09:02:00.000Z', NULL);
     INSERT INTO deployments (repo_id, environment, timeline_slug, timeline_id, checkpoint_id, commit_oid, url, status, run_id, created_at) VALUES
@@ -365,6 +367,7 @@ describe("an issue's linked work", () => {
         oid: oid(19),
         committedAt: null,
         ref: null,
+        href: `/orbit/engine?source=work_search&commit=${oid(19)}`,
         runs: [],
         packages: [],
       }),

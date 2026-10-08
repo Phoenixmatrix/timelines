@@ -77,8 +77,8 @@ export async function recordPush(
     (want, haves) => fetchNewCommits(env, repo, want, haves),
     repo.source_id ?? "canonical",
   );
-  // The issues their messages mention (CORE-22).
-  await indexPushedMentions(env, repo.id, logged);
+  // The issues their messages mention (CORE-22), as this source's (CORE-296).
+  await indexPushedMentions(env, repo.id, logged, { sourceId: repo.source_id ?? "canonical" });
   return logged;
 }
 

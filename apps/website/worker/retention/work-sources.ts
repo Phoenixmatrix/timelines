@@ -90,6 +90,12 @@ async function deleteClaimedSource(env: Env, source: ClaimedSource): Promise<voi
       if (!isArtifactsError(error, "NOT_FOUND")) throw error;
     }
   }
+  // Its commits' mentions go with it; the compact landing commit keeps main's (CORE-296).
+  await env.DB.prepare(
+    "DELETE FROM commit_issue_mentions WHERE source_id = ?1 AND repo_id = (SELECT repo_id FROM timeline_work_sources WHERE source_id = ?1)",
+  )
+    .bind(source.source_id)
+    .run();
   const finished =
     claim.value.state === "purged"
       ? claim

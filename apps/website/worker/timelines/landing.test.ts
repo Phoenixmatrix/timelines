@@ -154,7 +154,8 @@ function fixture(count = 2) {
     },
   } as unknown as Env;
   const writes: string[] = [],
-    starts: string[] = [];
+    starts: string[] = [],
+    messages = new Map<string, string>();
   const deps: LandingDeps = {
     refs: async (repo) => new Map(refs.get(repo.artifacts_name)),
     parents: async (repo, commit) => graphs.get(repo.artifacts_name)?.get(commit)?.parents ?? null,
@@ -168,8 +169,9 @@ function fixture(count = 2) {
         if (change.ref === "refs/heads/main") writes.push(repo.id);
         return { ref: change.ref, ok: true };
       }),
-    startMerge: async (repo) => {
+    startMerge: async (repo, merge) => {
       starts.push(repo.id);
+      messages.set(repo.id, merge.message);
     },
     startGates: async () => ({ skipped: "no pipeline" }),
     runOutcome: async () => null,
@@ -186,6 +188,7 @@ function fixture(count = 2) {
     graphs,
     writes,
     starts,
+    messages,
     get current() {
       return current;
     },
@@ -210,6 +213,12 @@ describe("compact landing state", () => {
   test("moving B is rematerialized before any CAS on A", async () => {
     const f = fixture();
     const b = f.current.repos[1]!;
+    // The compact commit carries the keys B's work source mentions (CORE-296).
+    f.sqlite.exec(`INSERT INTO commit_issue_mentions
+        (repo_id, commit_oid, issue_key, resolution, source_id) VALUES
+        ('${b.id}', '${b.commit}', 'CORE-9', 'linked', '${b.source!.sourceId}'),
+        ('${b.id}', '${b.commit}', 'APP-2', 'ambiguous', '${b.source!.sourceId}'),
+        ('${b.id}', '${b.base}', 'OLD-1', 'linked', 'canonical')`);
     f.graphs.get(b.id)!.set(oid(99), {
       parents: [b.base!],
       treeHash: oid(103),
@@ -220,6 +229,7 @@ describe("compact landing state", () => {
     await f.run();
     expect(f.writes).toEqual([]);
     expect(f.starts).toContain(b.id);
+    expect(f.messages.get(b.id)).toMatch(/\nIssues: APP-2 CORE-9$/);
     expect(f.current.repos[1]!.base).toBe(oid(99));
   });
   test("concurrent progress waits for the admitted CAS instead of failing a live publication", async () => {

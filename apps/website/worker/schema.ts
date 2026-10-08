@@ -984,6 +984,8 @@ export interface Database {
     committed_at: string | null;
     first_ref: string | null;
     pushed_at: Generated<string>;
+    /** The code source whose push recorded it: `canonical`, or a timeline's work source (CORE-296). */
+    source_id: Generated<string>;
   };
   /** Repositories whose recent history was read for mentions (CORE-22). */
   commit_mention_backfills: {

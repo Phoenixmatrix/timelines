@@ -509,7 +509,8 @@ repos.get("/:owner/:name/history", async (c) => {
 // One commit's diff against its first parent (CORE-234: a step's work).
 // Bounded: DIFF_LIMITS caps files listed, files patched, blob size and tree reads.
 repos.get("/:owner/:name/commits/:oid/diff", async (c) => {
-  const loaded = await loadRepo(c);
+  // A timeline's commit may live only in its work source (`?source=`, CORE-296).
+  const loaded = await loadSourceRepo(c);
   if (loaded instanceof Response) return loaded;
   const oid = c.req.param("oid");
   if (!isCommitId(oid) || oid.length !== 40)

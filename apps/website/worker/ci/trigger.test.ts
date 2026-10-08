@@ -408,6 +408,11 @@ jobs:
       ["work", "push", 0, oid(3)],
       ["work", "manual", 1, oid(3)],
     ]);
+    // Its jobs name the source's timeline, though the ref is just `work` (CORE-296).
+    const run = runs(t).find((r) => r.trigger === "push")!;
+    const job = await loadJob(t.env.DB, t.jobs(run.id)[0]!.id);
+    const payload = await jobPayload(t.env.DB, job!, { origin: "https://gm.test", token: "x" });
+    expect(payload.env.GITMATRIX_TIMELINE).toBe("search");
     refs.branches = [];
   });
 

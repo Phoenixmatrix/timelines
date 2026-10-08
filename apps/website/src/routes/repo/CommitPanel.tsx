@@ -42,7 +42,7 @@ import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { packagePath } from "../../lib/packages.ts";
 import { useRememberPlace } from "../../lib/recentPlaces.ts";
 import { LinkedText } from "../../refs/RefLink.tsx";
-import { blobUrl, commitsUrl, repoPath, treeUrl } from "../../lib/refs.ts";
+import { blobUrl, commitsUrl, repoPath, sourceUrl, treeUrl } from "../../lib/refs.ts";
 import {
   confirmIssueKeys,
   issueKeysIn,
@@ -58,6 +58,11 @@ type Loaded<T> =
   | { state: "loading" }
   | { state: "done"; value: T }
   | { state: "failed"; error: string; status: number | null };
+
+/** The work source the page is in, if not main's: its commits are read there (CORE-296). */
+function workSource(repo: RepoDetail): string | undefined {
+  return repo.source?.kind === "timeline-work" ? repo.source.sourceId : undefined;
+}
 
 /** GET `path` (null: not yet), cancelled when the path changes or the panel closes. */
 function useApi<T>(path: string | null): Loaded<T> {
@@ -182,19 +187,22 @@ function CommitBody({
   const { name } = repo;
   const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
   const ready = oid && active ? oid : null;
+  const inSource = (path: string) => sourceUrl(path, workSource(repo));
 
-  const diff = useApi<CommitDiff>(ready && `${base}/commits/${ready}/diff`);
+  const diff = useApi<CommitDiff>(ready && inSource(`${base}/commits/${ready}/diff`));
   // A commit too large to diff still has a message: read it from the log.
   const tooLarge = diff.state === "failed" && diff.status === 413;
-  const logged = useApi<CommitsResponse>(ready && tooLarge ? `${base}/commits?ref=${ready}` : null);
-  const runs = useApi<CiRunList>(ready && `${base}/ci?commit=${ready}`);
+  const logged = useApi<CommitsResponse>(
+    ready && tooLarge ? inSource(`${base}/commits?ref=${ready}`) : null,
+  );
+  const runs = useApi<CiRunList>(ready && inSource(`${base}/ci?commit=${ready}`));
   const published = useApi<Published>(
     ready && `/packages/-/published?repo=${encodeURIComponent(`${owner}/${name}`)}&commit=${ready}`,
   );
   const deployments = useApi<DeploymentList>(
-    ready && `${base}/deployments?commit=${ready}&limit=20`,
+    ready && inSource(`${base}/deployments?commit=${ready}&limit=20`),
   );
-  const why = useApi<WhyResponse>(ready && `${base}/why?commit=${ready}`);
+  const why = useApi<WhyResponse>(ready && inSource(`${base}/why?commit=${ready}`));
   const steps = useApi<StepPage>(ready && `${base}/steps?commits=${ready}&limit=1`);
 
   const summary =
@@ -469,11 +477,14 @@ function Message({
         </div>
       </dl>
       <p className="m-0 mt-4 flex flex-wrap gap-2">
-        <Link className="mk-btn mk-btn--sm" to={treeUrl(owner, name, oid)}>
+        <Link className="mk-btn mk-btn--sm" to={treeUrl(owner, name, oid, "", workSource(repo))}>
           <FolderOpenIcon weight="bold" aria-hidden />
           Browse files at this commit
         </Link>
-        <Link className="mk-btn mk-btn--ghost mk-btn--sm" to={commitsUrl(owner, name, oid)}>
+        <Link
+          className="mk-btn mk-btn--ghost mk-btn--sm"
+          to={commitsUrl(owner, name, oid, "", workSource(repo))}
+        >
           History from here
         </Link>
       </p>
@@ -869,7 +880,7 @@ function Files({
                         {at ? (
                           <Link
                             className="min-w-0 flex-1 truncate mk-mono text-mono text-ink no-underline hover:underline"
-                            to={blobUrl(owner, name, at, file.path)}
+                            to={blobUrl(owner, name, at, file.path, workSource(repo))}
                             title={
                               file.status === "deleted"
                                 ? `${file.path} before this commit`
