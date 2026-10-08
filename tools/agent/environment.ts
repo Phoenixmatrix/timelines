@@ -27,11 +27,19 @@ export interface Environment {
   expires: number;
   secret: string;
   dispatchSecret: string;
-  resources: Record<Resource, "pending" | "created" | "deleted"> & {
+  resources: Record<Exclude<Resource, "artifacts">, "pending" | "created" | "deleted"> & {
+    /** `orphaned`: Cloudflare refuses to delete a namespace with no listable repos (CORE-302). */
+    artifacts: "pending" | "created" | "deleted" | "orphaned";
     // Missing in pre-Gateway v1 journals: no gateway is owned or eligible for deletion.
     gateway?: "pending" | "created" | "deleted";
   };
-  status: "provisioning" | "ready" | "deleting" | "deleted";
+  /**
+   * `orphaned`: everything is deleted except a namespace Cloudflare refuses to
+   * delete. It holds no slot; cleanup keeps retrying it and keeps its journal.
+   */
+  status: "provisioning" | "ready" | "deleting" | "deleted" | "orphaned";
+  /** Why an orphaned resource is still there, for whoever cleans it up later. */
+  orphan?: { namespace: string; at: string; reason: string };
   server?: { pid: number; start: string };
   /**
    * Whether this environment has paid AI (Workers AI, AI Gateway, Vectorize,
@@ -39,6 +47,11 @@ export interface Environment {
    * before the field derive it from their resources.
    */
   ai?: boolean;
+}
+
+/** Done with: nothing of it is live, so it holds none of the environment slots. */
+function retired(env: Environment): boolean {
+  return env.status === "deleted" || env.status === "orphaned";
 }
 
 /** Whether the environment binds paid AI: Knowledge builds and other model calls run. */
@@ -74,7 +87,10 @@ export function validateEnvironment(value: Environment): void {
   if (!/^[a-f0-9]{64}$/.test(value.secret) || !/^[a-f0-9]{64}$/.test(value.dispatchSecret))
     throw new Error("Invalid environment capability.");
   for (const key of ["artifacts", "vectors", "search"] as const)
-    if (!["pending", "created", "deleted"].includes(value.resources[key]))
+    if (
+      !["pending", "created", "deleted"].includes(value.resources[key]) &&
+      !(key === "artifacts" && value.resources[key] === "orphaned")
+    )
       throw new Error("Invalid resource ownership journal.");
   if (
     Object.hasOwn(value.resources, "gateway") &&
@@ -211,7 +227,7 @@ async function recordAt(path: string): Promise<Environment | null> {
 async function persist(env: Environment): Promise<void> {
   validateEnvironment(env);
   const previous = await recordAt(join(registry, "environments", `${env.id}.json`));
-  if (previous?.status === "deleted" || previous?.status === "deleting") {
+  if (previous && (retired(previous) || previous.status === "deleting")) {
     if (env.status === "ready") env.status = previous.status;
     for (const resource of ["artifacts", "vectors", "search", "gateway"] as const)
       if (previous.resources[resource] === "deleted") env.resources[resource] = "deleted";
@@ -222,14 +238,10 @@ async function persist(env: Environment): Promise<void> {
     try {
       await safeLocalDirectory(env);
       const local = await recordAt(join(env.dir, "environment.json"));
-      if (
-        !local ||
-        local.id === env.id ||
-        (local.status === "deleted" && env.status === "provisioning")
-      )
+      if (!local || local.id === env.id || (retired(local) && env.status === "provisioning"))
         await privateJson(join(env.dir, "environment.json"), env);
     } catch (error) {
-      if (env.status !== "deleting" && env.status !== "deleted") throw error;
+      if (env.status !== "deleting" && !retired(env)) throw error;
       console.error(
         JSON.stringify({
           event: "cleanup.local-state-skipped",
@@ -300,6 +312,10 @@ function absent(error: unknown): boolean {
   return /\b404\b|resource not found|namespace not found|index not found|instance not found|gateway not found/i.test(
     String(error),
   );
+}
+/** Cloudflare's refusal to delete a namespace that still counts a repository (CORE-302). */
+function refusedNotEmpty(error: unknown): boolean {
+  return /namespace is not empty/i.test(String(error));
 }
 async function deleteIfPresent(env: Environment, args: string[]): Promise<void> {
   try {
@@ -374,10 +390,9 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
       } else if (resource === "vectors") {
         await deleteIfPresent(env, ["vectorize", "delete", env.id, "--force"]);
       } else {
-        for (;;) {
-          let repos: { name: string }[];
+        const listed = async () => {
           try {
-            repos = await cfJson(env, [
+            return await cfJson<{ name: string }[]>(env, [
               "artifacts",
               "namespaces",
               "repos",
@@ -388,10 +403,13 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
               "100",
             ]);
           } catch (error) {
-            if (absent(error)) break;
+            if (absent(error)) return null;
             throw error;
           }
-          if (!repos.length) break;
+        };
+        for (;;) {
+          const repos = await listed();
+          if (!repos?.length) break;
           for (const repo of repos)
             await deleteIfPresent(env, [
               "artifacts",
@@ -404,7 +422,32 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
               "--force",
             ]);
         }
-        await deleteIfPresent(env, ["artifacts", "namespaces", "delete", env.id, "--force"]);
+        try {
+          await deleteIfPresent(env, ["artifacts", "namespaces", "delete", env.id, "--force"]);
+          delete env.orphan;
+        } catch (error) {
+          // A known Artifacts bug: the namespace counts a repository that no list
+          // shows. Rather than hold a slot forever, orphan it once nothing listable
+          // is left: the journal keeps it, and every cleanup retries it.
+          if (!refusedNotEmpty(error) || (await listed())?.length) throw error;
+          env.resources.artifacts = "orphaned";
+          env.orphan ??= {
+            namespace: env.id,
+            at: new Date().toISOString(),
+            reason: redact(String(error)).slice(0, 500),
+          };
+          await persist(env);
+          console.error(
+            JSON.stringify({
+              event: "environment.orphaned",
+              id: env.id,
+              namespace: env.id,
+              message:
+                "Cloudflare refuses to delete this Artifacts namespace although it lists no repositories; it no longer counts toward the environment limit and cleanup retries it.",
+            }),
+          );
+          continue;
+        }
       }
       env.resources[resource] = "deleted";
       await persist(env);
@@ -442,9 +485,9 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
     }
   }
   await rm(join(registry, "workspaces", env.id), { recursive: true, force: true });
-  env.status = "deleted";
+  env.status = env.resources.artifacts === "orphaned" ? "orphaned" : "deleted";
   await persist(env);
-  console.log(JSON.stringify({ event: "environment.deleted", id: env.id }));
+  console.log(JSON.stringify({ event: `environment.${env.status}`, id: env.id }));
 }
 
 export async function cleanupExpired(): Promise<void> {
@@ -455,7 +498,11 @@ export async function cleanupExpired(): Promise<void> {
         await rm(join(registry, "environments", `${env.id}.json`));
         continue;
       }
-      if (env.status === "deleted" || (env.status !== "deleting" && env.expires > Date.now()))
+      // An orphaned namespace is retried on every sweep, expired or not.
+      if (
+        env.status === "deleted" ||
+        (env.status !== "deleting" && env.status !== "orphaned" && env.expires > Date.now())
+      )
         continue;
       try {
         await destroyEnvironment(env);
@@ -516,8 +563,7 @@ export async function createEnvironment(
     const existing = await inventory();
     if (!ephemeral) {
       const current = existing.find(
-        (e) =>
-          e.root === root && e.dir === join(root, ".gitmatrix-agent") && e.status !== "deleted",
+        (e) => e.root === root && e.dir === join(root, ".gitmatrix-agent") && !retired(e),
       );
       if (current) {
         if (current.status !== "ready")
@@ -530,7 +576,7 @@ export async function createEnvironment(
         return current;
       }
     }
-    if (existing.filter((e) => e.status !== "deleted").length >= MAX_ENVIRONMENTS)
+    if (existing.filter((e) => !retired(e)).length >= MAX_ENVIRONMENTS)
       throw new Error(
         `At most ${MAX_ENVIRONMENTS} live agent environments per user. Destroy unused environments first.`,
       );
@@ -782,5 +828,6 @@ export async function listEnvironments(): Promise<unknown[]> {
       status: e.status,
       ai: aiEnabled(e),
       resources: e.resources,
+      ...(e.orphan ? { orphan: e.orphan } : {}),
     }));
 }

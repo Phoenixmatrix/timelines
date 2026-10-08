@@ -616,6 +616,51 @@ describe("repository deletion", () => {
     expect(left(await repoInventory(w.env, "r_doomed"))).toEqual(NOTHING_LEFT);
   });
 
+  test("a step being retried shows its attempt and last provider error until it succeeds", async () => {
+    const w = await setup();
+    await requestDeletion(w.env, cleanRow, "ann");
+    const remove = w.env.ARTIFACTS.delete.bind(w.env.ARTIFACTS);
+    let failures = 2;
+    w.env.ARTIFACTS.delete = async (name: string) => {
+      if (failures-- > 0)
+        throw Object.assign(new Error("An internal error occurred."), { code: "INTERNAL_ERROR" });
+      return remove(name);
+    };
+    const seen: unknown[] = [];
+    // Workflows retries a failed step, telling the work its attempt.
+    const step: PurgeStep = {
+      async do(name, _config, work) {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            return await work({ attempt });
+          } catch (error) {
+            if (attempt === 6) throw error;
+            if (name === "artifacts:delete")
+              seen.push((await deletionStatus(w.env, "r_doomed"))!.progress.retry);
+          }
+        }
+      },
+      sleep: async () => w.finishTeardowns(),
+    };
+    expect(await runPurge(w.env, "r_doomed", step, { waitUntil: () => {} })).toBe("done");
+    expect(seen).toEqual([
+      expect.objectContaining({
+        step: "artifacts:delete",
+        attempt: 1,
+        error: "An internal error occurred.",
+      }),
+      expect.objectContaining({
+        step: "artifacts:delete",
+        attempt: 2,
+        error: "An internal error occurred.",
+      }),
+    ]);
+    const status = (await deletionStatus(w.env, "r_doomed"))!;
+    expect(status.progress.retry).toBeUndefined();
+    expect(status.progress.artifacts).toEqual({ deleted: true });
+    expect(left(await repoInventory(w.env, "r_doomed"))).toEqual(NOTHING_LEFT);
+  });
+
   test("the cron restarts a purge whose Workflow died, never one still alive", async () => {
     const w = await setup();
     await requestDeletion(w.env, cleanRow, "ann");

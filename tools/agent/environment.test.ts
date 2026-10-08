@@ -530,3 +530,70 @@ await test("legacy AI journals require recreation for use but remain valid for c
     await rm(root, { recursive: true, force: true });
   }
 });
+
+await test("a namespace Cloudflare refuses to delete with no listable repos is orphaned, not held (CORE-302)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-orphan-"));
+  try {
+    const directory = join(home, ".local/state/gitmatrix-agent/environments");
+    const bin = join(home, "bin");
+    await Promise.all([directory, bin].map((path) => mkdir(path, { recursive: true })));
+    const calls = join(home, "calls");
+    const refuse = join(home, "refuse");
+    await writeFile(refuse, "");
+    // Lists nothing, but refuses the namespace while `refuse` exists.
+    await writeFile(
+      join(bin, "cf"),
+      `#!${process.execPath}\nconst fs=require('node:fs'); const args=process.argv.slice(2); if(args[0]==='auth'){console.log(JSON.stringify({authenticated:true,tokenValid:true,accounts:[{id:'${"a".repeat(32)}'}]}));process.exit(0)} fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n'); if(args[0]==='artifacts'&&args[2]==='delete'&&fs.existsSync(${JSON.stringify(refuse)})){console.error('Namespace is not empty');process.exit(1)} console.log(args.includes('list')?'[]':'{}');\n`,
+      { mode: 0o700 },
+    );
+    // Every slot taken by an expired environment whose namespace won't go.
+    const journals: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const env = owned(join(home, `worktree-${i}`));
+      env.id = `gma-mga0000${i}-${String(i).repeat(12)}`;
+      env.dir = join(env.root, ".gitmatrix-agent");
+      env.created -= 172_800_000;
+      env.expires -= 172_800_000;
+      env.resources = { artifacts: "created", vectors: "deleted", search: "deleted" };
+      await mkdir(env.dir, { recursive: true });
+      await writeFile(join(env.dir, "environment.json"), JSON.stringify(env));
+      journals.push(join(directory, `${env.id}.json`));
+      await writeFile(journals[i]!, JSON.stringify(env));
+    }
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const run = (code: string) =>
+      command(process.execPath, ["--input-type=module", "-e", code], {
+        env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` },
+      });
+    await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
+    for (const journal of journals) {
+      const env = JSON.parse(await readFile(journal, "utf8")) as Environment;
+      assert.equal(env.status, "orphaned");
+      assert.equal(env.resources.artifacts, "orphaned");
+      assert.equal(env.orphan?.namespace, env.id);
+      assert.match(env.orphan?.reason ?? "", /not empty/);
+    }
+    // Reported, but holding no slot: a fifth environment can be set up.
+    const output = await run(
+      `import {createEnvironment, listEnvironments} from ${JSON.stringify(module)}; const listed = await listEnvironments(); const env = await createEnvironment(${JSON.stringify(join(home, "worktree-0"))}); console.log(JSON.stringify({listed, env}));`,
+    );
+    const { listed, env } = JSON.parse(output.trim().split("\n").at(-1)!) as {
+      listed: { id: string; status: string; orphan?: { namespace: string } }[];
+      env: Environment;
+    };
+    assert.equal(listed.filter((e) => e.status === "orphaned" && e.orphan).length, 4);
+    assert.equal(env.status, "ready");
+    assert(!journals.includes(join(directory, `${env.id}.json`)));
+    // Once Cloudflare lets go, the next sweep finishes the deletion; journals stay.
+    await rm(refuse);
+    await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
+    for (const journal of journals) {
+      const done = JSON.parse(await readFile(journal, "utf8")) as Environment;
+      assert.equal(done.status, "deleted");
+      assert.equal(done.resources.artifacts, "deleted");
+      assert.equal(done.orphan, undefined);
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});

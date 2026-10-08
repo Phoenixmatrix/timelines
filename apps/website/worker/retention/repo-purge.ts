@@ -15,7 +15,11 @@ export class RepoPurge extends WorkflowEntrypoint<Env, RepoPurgeParams> {
   async run(event: Readonly<WorkflowEvent<RepoPurgeParams>>, step: WorkflowStep) {
     const steps: PurgeStep = {
       do: (name, config, work) =>
-        step.do(name, config, work as () => Promise<Rpc.Serializable<unknown>>) as Promise<never>,
+        step.do(
+          name,
+          config,
+          work as (ctx: { attempt: number }) => Promise<Rpc.Serializable<unknown>>,
+        ) as Promise<never>,
       sleep: (name, duration) => step.sleep(name, duration as WorkflowSleepDuration),
     };
     return runPurge(this.env, event.payload.repoId, steps, {
