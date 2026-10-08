@@ -437,6 +437,26 @@ describe("durable independent merge queue", () => {
     expect(s.entry.status).toBe("landed");
     expect(t.deps.merge).toHaveBeenCalledTimes(2);
   });
+  test("a running gate whose start lost its answer is still reported on the entry", async () => {
+    const t = setup();
+    t.behavior.gates = "running";
+    const gates = t.deps.gates;
+    // The run row commits, then the Workflow start's response is lost (CORE-256).
+    t.deps.gates = vi.fn<QueueDeps["gates"]>(async (repo, s) => {
+      await gates(repo, s);
+      throw new Error("Workflow start response lost");
+    });
+    await t.admit(2);
+    for (let i = 0; i < 3; i++) await t.progress();
+    const s = await t.state(2);
+    const run = t.sqlite.prepare("SELECT number FROM ci_runs WHERE id=?").get(s.gateRunId!) as {
+      number: number;
+    };
+    expect(s.entry.status).toBe("testing");
+    expect(s.entry.gateRun).toBe(run.number);
+    expect(t.deps.gates).toHaveBeenCalledTimes(1);
+    expect(t.deps.recover).toHaveBeenCalledWith(s.gateRunId);
+  });
   test("concurrent recovery never starts a merge while a paid scheduling claim is in flight", async () => {
     const t = setup();
     await t.admit(2);

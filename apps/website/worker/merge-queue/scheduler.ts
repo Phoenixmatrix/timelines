@@ -637,6 +637,9 @@ async function step(env: Env, repo: PushedRepo, s: StoredQueue, deps: QueueDeps)
       return "skipped" in started;
     }
     if (result.status === "queued" || result.status === "running") {
+      // A start whose answer or save was lost still shows its run (CORE-256).
+      if (e.gateRun !== result.number)
+        await saveQueue(env.DB, s, { ...s, entry: { ...e, gateRun: result.number } });
       await deps.recover(s.gateRunId!);
       return false;
     }
