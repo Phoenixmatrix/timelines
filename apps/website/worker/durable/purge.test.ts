@@ -181,6 +181,15 @@ describe("retire(reason, name)", () => {
         retiring_at: null,
       });
     });
+
+    test(`${name}: wakes when asked, and a purge before then cancels it`, async () => {
+      const { object, ctx } = await build();
+      await ctx.storage.deleteAlarm(); // Its own wake-ups come sooner; a fresh instance has none.
+      const asked = Date.now();
+      await object.retire("probe", `${name}-1`, 600_000);
+      expect(await ctx.storage.getAlarm()).toBeGreaterThanOrEqual(asked + 600_000);
+      expect((await object.purge("probe")).alarm).toBeNull();
+    });
   }
 
   test("KnowledgeCoordinator: waits for a running build, then purges", async () => {
