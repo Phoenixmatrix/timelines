@@ -3,7 +3,8 @@
 // query language over it, facet counts, and opened/closed activity buckets.
 // Everything here is pure, so it is tested without a browser.
 //
-//   is:ready is:waiting is:not_ready is:human_only is:blocked is:claimed is:leased is:open is:closed
+//   is:ready is:waiting is:not_ready is:human_only is:blocked is:container is:claimed is:leased
+//   is:open is:closed   (is:container: To do with open sub-issues, CORE-108)
 //   status:backlog|todo|in_progress|done|done_in_timeline|canceled
 //   team:CORE  ws:packages  assignee:jun|me|none  tag:perf  type:bug  p:1
 //   (tag: is the issue's tags from the tracker's tag catalog; label: still works)
@@ -24,6 +25,7 @@ import {
   actorName,
   claimHolder,
   hasActiveClaim,
+  isOpen,
   leasedAncestor,
   issuePickup,
   ISSUE_PICKUPS,
@@ -41,6 +43,7 @@ export type IssueState =
   | "claimed"
   | "leased"
   | "blocked"
+  | "container"
   | "ready"
   | "in_progress"
   | "todo"
@@ -58,6 +61,7 @@ export const STATE_LABEL: Record<IssueState, string> = {
   claimed: "Claimed",
   leased: "Leased",
   blocked: "Blocked",
+  container: "Sub-issues",
   todo: "To do",
   backlog: "Backlog",
   done: "Done",
@@ -80,6 +84,8 @@ const STATE_RANK: Record<IssueState, number> = {
   done_in_timeline: 4,
   ready: 5,
   todo: 6,
+  // The work is in its sub-issues: next, but not itself to pick up.
+  container: 6.5,
   blocked: 7,
   not_ready: 7.1,
   human_only: 7.2,
@@ -106,6 +112,71 @@ export interface IssueIndex {
   agentIds: Set<string>;
   /** Members and agents, to show who's accountable for an actor or claim. */
   people: Pick<Snapshot, "members" | "agents">;
+}
+
+/** An issue's sub-issues, from the index. */
+export function childrenOf(issue: Issue, index: IssueIndex): Issue[] {
+  return (index.children.get(issue.id) ?? []).flatMap((id) => index.byId.get(id) ?? []);
+}
+
+/**
+ * How far a parent is through its sub-issues (CORE-108). Canceled ones aren't
+ * part of the work; done in a timeline stays open until it lands, as readiness
+ * counts it.
+ */
+export function subIssueProgress(children: readonly Issue[]): {
+  done: number;
+  total: number;
+  open: Issue[];
+} {
+  const open = children.filter(isOpen);
+  const done = children.filter((child) => child.status === "done").length;
+  return { done, total: done + open.length, open };
+}
+
+/** A container's badge: "Sub-issues · 2/5 done". */
+export function subIssueLabel(progress: { done: number; total: number }): string {
+  return `${STATE_LABEL.container} · ${progress.done}/${progress.total} done`;
+}
+
+/**
+ * Why an issue isn't ready, in one line (CORE-108), or null when it is ready
+ * or finished. One wording for every readiness state, wherever it's shown.
+ */
+export function whyNotReady(
+  issue: Issue,
+  index: IssueIndex,
+  snapshot: Pick<Snapshot, "requests" | "members" | "agents">,
+): string | null {
+  const keys = (issues: readonly Issue[]) => issues.map((item) => item.key).join(", ");
+  switch (index.state.get(issue.id)) {
+    case "waiting": {
+      const asks = snapshot.requests.filter((r) => r.issueId === issue.id && r.status === "open");
+      const who = [...new Set(asks.map((r) => actorName(snapshot, r.routeTo)))];
+      return `Waiting on ${who.join(", ") || "a person"} to answer ${asks.length > 1 ? `${asks.length} requests` : "a request"}`;
+    }
+    case "claimed":
+      return issue.claim ? `Claimed by ${claimLabel(index, issue.claim)}` : null;
+    case "leased":
+      return `Covered by ${index.leasedBy.get(issue.id)?.key}'s lease`;
+    case "not_ready":
+      return "Pickup is paused until a person enables it";
+    case "human_only":
+      return "Only people can pick up this issue";
+    case "blocked":
+      return `Blocked by ${keys(index.openBlockers.get(issue.id) ?? [])}`;
+    case "container": {
+      const { open, total } = subIssueProgress(childrenOf(issue, index));
+      return `${open.length} of ${total} ${total === 1 ? "sub-issue" : "sub-issues"} still open`;
+    }
+    case "backlog":
+      return "In Backlog: move it to To do to queue it";
+    case "in_progress":
+      return "In progress, but nobody holds a claim on it";
+    // Ready, or finished (done, canceled, done in a timeline): nothing to explain.
+    default:
+      return null;
+  }
 }
 
 /** Who holds a claim, in words: "builder for Ann Lee", or "Ann Lee (laptop)". */
@@ -151,9 +222,11 @@ export function buildIndex(snapshot: Snapshot, serverTime: string): IssueIndex {
     else if (issue.status === "done" || issue.status === "canceled") value = issue.status;
     else if (why === "not_ready" || why === "human_only") value = why;
     else if (why === "blocked") value = "blocked";
+    // Open sub-issues: the work is in those (CORE-108).
+    else if (why === "container") value = "container";
     else if (why === "leased_above") value = "leased";
     else if (why === "ready") value = "ready";
-    // Containers (open sub-issues) and everything else show their status.
+    // Everything else (backlog, in progress without a claim) shows its status.
     else value = issue.status;
     state.set(issue.id, value);
   }
@@ -557,7 +630,7 @@ export const PROGRESS_GROUPS = [
   {
     key: "next",
     label: "Up next",
-    states: ["ready", "todo", "blocked", "not_ready", "human_only"],
+    states: ["ready", "todo", "container", "blocked", "not_ready", "human_only"],
   },
   { key: "backlog", label: "Backlog", states: ["backlog"] },
   { key: "closed", label: "Closed", states: ["done", "canceled"] },
@@ -630,6 +703,7 @@ const STATE_TOKEN: Record<IssueState, { key: QueryKey; value: string }> = {
   claimed: { key: "is", value: "claimed" },
   leased: { key: "is", value: "leased" },
   blocked: { key: "is", value: "blocked" },
+  container: { key: "is", value: "container" },
   in_progress: { key: "status", value: "in_progress" },
   todo: { key: "status", value: "todo" },
   backlog: { key: "status", value: "backlog" },

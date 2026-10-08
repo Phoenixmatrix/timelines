@@ -24,7 +24,7 @@ import {
 import { TIMELINE_POLICIES, type TimelinePolicy } from "../../../shared/timelines.ts";
 import { popMotion, SelectField } from "../../components/ui.tsx";
 import { useRefMarkdown } from "../../refs/remark.tsx";
-import type { IssueIndex } from "./query.ts";
+import { childrenOf, subIssueLabel, subIssueProgress, type IssueIndex } from "./query.ts";
 import { Actor } from "./Actor.tsx";
 
 /** Exclusive ownership uses a flag; an outline means the lease is inherited. */
@@ -39,6 +39,19 @@ export function ClaimIcon({
     <FlagIcon
       weight={inherited ? "bold" : "fill"}
       className={`shrink-0 ${inherited ? "text-ink-faint" : "text-ink"} ${className}`}
+      aria-hidden
+    />
+  );
+}
+
+/**
+ * A container (CORE-108): its work is in its sub-issues. Not actionable, so
+ * neutral ink, and a hollow square so it reads apart from the status dots.
+ */
+export function ContainerMark({ className = "" }: { className?: string }) {
+  return (
+    <span
+      className={`size-2 shrink-0 rounded-[2px] border border-ink-muted ${className}`}
       aria-hidden
     />
   );
@@ -330,6 +343,7 @@ const STATE_DOT: Record<string, string> = {
 function StateBadge({
   state,
   title,
+  to,
   children,
 }: {
   state?:
@@ -338,22 +352,23 @@ function StateBadge({
     | "claimed"
     | "leased"
     | "blocked"
+    | "container"
     | "done_in_timeline"
     | "human_only"
     | "not_ready";
   title?: string;
+  /** Where the work behind this state is: a container's sub-issues, a blocked issue's blockers. */
+  to?: string;
   children: ReactNode;
 }) {
-  return (
-    <span
-      className="inline-flex shrink-0 items-center gap-1.5 text-micro whitespace-nowrap text-ink-muted"
-      data-state={state}
-      title={title}
-    >
+  const content = (
+    <>
       {state === "done_in_timeline" ? (
         <DoneInTimelineIcon />
       ) : state === "claimed" || state === "leased" ? (
         <ClaimIcon inherited={state === "leased"} />
+      ) : state === "container" ? (
+        <ContainerMark />
       ) : (
         <span
           className={`size-2 shrink-0 rounded-full ${(state && STATE_DOT[state]) ?? "bg-ink-faint"}`}
@@ -361,6 +376,22 @@ function StateBadge({
         />
       )}
       {children}
+    </>
+  );
+  const className =
+    "inline-flex shrink-0 items-center gap-1.5 text-micro whitespace-nowrap text-ink-muted";
+  return to ? (
+    <Link
+      to={to}
+      className={`${className} rounded-control underline decoration-line underline-offset-[0.2em] hover:text-ink hover:decoration-signal-line`}
+      data-state={state}
+      title={title}
+    >
+      {content}
+    </Link>
+  ) : (
+    <span className={className} data-state={state} title={title}>
+      {content}
     </span>
   );
 }
@@ -368,11 +399,18 @@ export function IssueState({
   issue,
   snapshot,
   index,
+  lensHref,
 }: {
   issue: Issue;
   snapshot: Snapshot;
   /** Lookups by id instead of scans, for issues rendered in a list. */
   index?: IssueIndex;
+  /**
+   * The relationship lens centred on this issue, where its blockers and
+   * sub-issues are: a blocked or container badge leads there (CORE-108).
+   * Only where the badge isn't inside another link.
+   */
+  lensHref?: string;
 }) {
   const blocked = blockers(issue, snapshot, index);
   if (issue.waiting) {
@@ -421,11 +459,29 @@ export function IssueState({
     );
   if (blocked.length)
     return (
-      <StateBadge state="blocked" title={blocked.map((item) => item.key).join(", ")}>
+      <StateBadge
+        state="blocked"
+        to={lensHref}
+        title={`Blocked by ${blocked.map((item) => item.key).join(", ")}`}
+      >
         Blocked · {blocked.length}
       </StateBadge>
     );
   const why = index ? index.state.get(issue.id) : stateOf(issue, snapshot);
+  if (why === "container") {
+    const progress = subIssueProgress(
+      index ? childrenOf(issue, index) : snapshot.issues.filter((i) => i.parentId === issue.id),
+    );
+    return (
+      <StateBadge
+        state="container"
+        to={lensHref}
+        title={`Open sub-issues: ${progress.open.map((item) => item.key).join(", ")}`}
+      >
+        {subIssueLabel(progress)}
+      </StateBadge>
+    );
+  }
   if (why === "leased") {
     const above =
       index?.leasedBy.get(issue.id) ??
@@ -444,13 +500,19 @@ export function IssueState({
   return <StateBadge>{statusLabel(issue)}</StateBadge>;
 }
 /** Readiness shared with the server and gm, for a page without a list index. */
-function stateOf(issue: Issue, snapshot: Snapshot): "ready" | "leased" | null {
+function stateOf(issue: Issue, snapshot: Snapshot): "ready" | "leased" | "container" | null {
   const why = readiness(
     issue,
     readinessIndex(snapshot.issues, snapshot.links),
     snapshot.serverTime,
   );
-  return why === "ready" ? "ready" : why === "leased_above" ? "leased" : null;
+  return why === "ready"
+    ? "ready"
+    : why === "leased_above"
+      ? "leased"
+      : why === "container"
+        ? "container"
+        : null;
 }
 export function MultiCheck({
   label,

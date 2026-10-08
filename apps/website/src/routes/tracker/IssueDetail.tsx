@@ -43,7 +43,7 @@ import {
   typeLabel,
   types,
 } from "./ui.tsx";
-import type { IssueIndex } from "./query.ts";
+import { whyNotReady, type IssueIndex } from "./query.ts";
 import { RequestCard } from "./Requests.tsx";
 import { DoneInTimelineCallout, LockedStatusHint, lockedIn } from "./DoneInTimeline.tsx";
 import { useViewer } from "../../lib/session.ts";
@@ -293,6 +293,12 @@ export function IssueDetail({
       : leasedAncestor(issue, readinessIndex(snapshot.issues, snapshot.links), snapshot.serverTime);
   const activeClaim = covering !== null;
   const unresolvedBlockers = blockers(issue, snapshot, index);
+  const notReady = whyNotReady(issue, index, snapshot);
+  // The relationship lens centred on this issue: its blockers above, its sub-issues below.
+  const [issuePath, issueSearch = ""] = href(issue.id).split("?");
+  const lensParams = new URLSearchParams(issueSearch);
+  lensParams.set("view", "graph");
+  const lensHref = `${issuePath}?${lensParams}`;
   const invalidStatus =
     draft.fields.status !== issue.status &&
     (activeClaim ||
@@ -998,7 +1004,7 @@ export function IssueDetail({
             Back to issues
           </Link>
           <span className="mk-mono text-ink-muted">{issue.key}</span>
-          <IssueState issue={issue} snapshot={snapshot} index={index} />
+          <IssueState issue={issue} snapshot={snapshot} index={index} lensHref={lensHref} />
         </div>
         {editing && mode === "title" ? (
           <div className="mt-2">{editor}</div>
@@ -1021,6 +1027,12 @@ export function IssueDetail({
         )}
         <DoneInTimelineCallout issue={issue} snapshot={snapshot} />
         <dl className={`${META} mt-3`}>
+          {notReady && (
+            <>
+              <dt className="text-ink-faint">Why not ready</dt>
+              <dd className="m-0 min-w-0">{notReady}</dd>
+            </>
+          )}
           <dt className="text-ink-faint">Created by</dt>
           <dd className="m-0 min-w-0">
             <AuditIdentity actor={issue.createdBy} snapshot={snapshot} />

@@ -9,10 +9,12 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import type { Issue } from "../../../shared/tracker.ts";
 import { timeAgo } from "../../lib/format.ts";
-import { ClaimIcon, DoneInTimelineIcon, typeLabel } from "./ui.tsx";
+import { ClaimIcon, ContainerMark, DoneInTimelineIcon, typeLabel } from "./ui.tsx";
 import {
+  childrenOf,
   claimLabel,
   STATE_LABEL,
+  subIssueProgress,
   type GroupKey,
   type IssueGroup,
   type IssueIndex,
@@ -49,7 +51,10 @@ const TEAM = "hidden @2xl:block";
 const TYPE = "hidden @4xl:block";
 const ASSIGNEE = "hidden @5xl:block";
 
-const STATE_DOT: Record<Exclude<IssueState, "claimed" | "leased" | "done_in_timeline">, string> = {
+const STATE_DOT: Record<
+  Exclude<IssueState, "claimed" | "leased" | "done_in_timeline" | "container">,
+  string
+> = {
   waiting: "bg-signal",
   ready: "bg-online",
   blocked: "bg-danger-text",
@@ -62,9 +67,10 @@ const STATE_DOT: Record<Exclude<IssueState, "claimed" | "leased" | "done_in_time
   canceled: "bg-line",
 };
 
-/** Ordinary states use dots; ownership and done-in-timeline have distinct icons. */
+/** Ordinary states use dots; ownership, containers and done-in-timeline have their own shapes. */
 export function StateDot({ state, className = "" }: { state: IssueState; className?: string }) {
   if (state === "done_in_timeline") return <DoneInTimelineIcon className={`size-3 ${className}`} />;
+  if (state === "container") return <ContainerMark className={className} />;
   if (state === "claimed" || state === "leased")
     return <ClaimIcon inherited={state === "leased"} className={`size-3 ${className}`} />;
   return (
@@ -81,6 +87,7 @@ export function StateLegend({ className = "" }: { className?: string }) {
     "claimed",
     "leased",
     "todo",
+    "container",
     "backlog",
     "human_only",
     "not_ready",
@@ -113,26 +120,31 @@ export function StateLabel({
   const state = index.state.get(issue.id) ?? "todo";
   const blockers = index.openBlockers.get(issue.id)?.length ?? 0;
   const holder = state === "claimed" && issue.claim ? issue.claim : null;
+  const progress = state === "container" ? subIssueProgress(childrenOf(issue, index)) : null;
   const detail =
     state === "blocked"
       ? ` · ${blockers}`
-      : holder
-        ? ` · ${claimLabel(index, holder)}`
-        : state === "leased"
-          ? ` · ${index.leasedBy.get(issue.id)?.key}`
-          : state === "done_in_timeline" && issue.doneIn
-            ? ` · ${issue.doneIn.slug}`
-            : "";
+      : progress
+        ? ` · ${progress.done}/${progress.total} done`
+        : holder
+          ? ` · ${claimLabel(index, holder)}`
+          : state === "leased"
+            ? ` · ${index.leasedBy.get(issue.id)?.key}`
+            : state === "done_in_timeline" && issue.doneIn
+              ? ` · ${issue.doneIn.slug}`
+              : "";
   return (
     <span
       className="inline-flex max-w-full min-w-0 items-center gap-1.5"
       title={
         state === "blocked"
-          ? index.openBlockers
+          ? `Blocked by ${index.openBlockers
               .get(issue.id)
               ?.map((b) => b.key)
-              .join(", ")
-          : `${STATE_LABEL[state]}${detail}`
+              .join(", ")}`
+          : progress
+            ? `Open sub-issues: ${progress.open.map((child) => child.key).join(", ")}`
+            : `${STATE_LABEL[state]}${detail}`
       }
     >
       <StateDot state={state} />

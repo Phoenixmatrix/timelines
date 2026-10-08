@@ -100,6 +100,7 @@ const RANK: Record<IssueState, number> = {
   in_progress: 4,
   ready: 5,
   todo: 6,
+  container: 6,
   human_only: 6,
   not_ready: 7,
   backlog: 7,

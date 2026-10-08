@@ -425,7 +425,7 @@ Signing in and approving `gm auth login` (`/signin`, `/device`) are their own pa
 
 ### Board and the backlog digest
 
-The board keeps one lane per status, each virtualized; Done and Canceled fold to a vertical count until opened. A backlog of thousands is groomed, not read, so the Backlog lane is a digest rather than a card stack: its total, one line on staleness ("N% untouched for 90+ days"), a group-by segmented control (priority, team, tag, age), and count rows with a thin bar each. One group opens at a time to show its twelve most important issues (priority, then longest waiting) as one-line rows with their age, and "All N in the list" opens the same filter in the event log. To do stays a queue: its header splits ready from blocked, and ready work leads.
+The board keeps one lane per status, each virtualized; Done and Canceled fold to a vertical count until opened. A backlog of thousands is groomed, not read, so the Backlog lane is a digest rather than a card stack: its total, one line on staleness ("N% untouched for 90+ days"), a group-by segmented control (priority, team, tag, age), and count rows with a thin bar each. One group opens at a time to show its twelve most important issues (priority, then longest waiting) as one-line rows with their age, and "All N in the list" opens the same filter in the event log. To do stays a queue: its header splits ready, blocked and in sub-issues (a parent whose work is in its open sub-issues), so the counts explain the lane, and ready work leads.
 
 ### Relationship lens
 
@@ -441,7 +441,7 @@ The Knowledge tab is the Semantic Code Atlas: the repository as capability terri
 
 ### Status by shape
 
-When a state can't take a status hue, it takes a shape. A claimed issue (an agent holds a lease) uses a filled ink flag; an inherited lease uses an outlined faint-ink flag. In progress remains a filled ink dot, ready green, blocked red, waiting faint ink; agent checkpoints use the same filled flag. The shared claim mark appears in lists, boards, the relationship lens, legends and issue details. Compact state columns reserve 12px for icons, and hidden state words and tooltips retain ownership context. Data hues never mark a status.
+When a state can't take a status hue, it takes a shape. A claimed issue (an agent holds a lease) uses a filled ink flag; an inherited lease uses an outlined faint-ink flag. In progress remains a filled ink dot, ready green, blocked red, waiting faint ink; agent checkpoints use the same filled flag. A container, a To do issue whose work is in its open sub-issues (CORE-108), isn't actionable, so it takes neither green nor amber: a hollow 8px square in muted ink, labelled "Sub-issues · 2/5 done" (done over sub-issues that aren't canceled). Its tooltip lists the open sub-issue keys, as a blocked badge lists its blockers, and in the issue header both badges link to the relationship lens centred on the issue, where those issues sit. Issue details add a "Why not ready" line for every state that isn't ready ("1 of 3 sub-issues still open", "Blocked by CORE-12", "Covered by CORE-4's lease"), in one wording from `whyNotReady` in `shared/tracker-query.ts`; `is:container` finds containers. The shared claim mark appears in lists, boards, the relationship lens, legends and issue details. Compact state columns reserve 12px for icons, and hidden state words and tooltips retain ownership context. Data hues never mark a status.
 
 ## Do's and Don'ts
 

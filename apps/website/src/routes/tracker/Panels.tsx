@@ -8,8 +8,11 @@ import type { Issue } from "../../../shared/tracker.ts";
 import { StateDot } from "./Log.tsx";
 import { DoneInTimelineIcon } from "./ui.tsx";
 import {
+  childrenOf,
   filterToken,
   queryTokenSet,
+  subIssueLabel,
+  subIssueProgress,
   withoutKeys,
   type Facets,
   type FacetValue,
@@ -226,6 +229,11 @@ function Lane({
                   <span className="inline-flex min-w-0 items-center gap-1">
                     Claimed ·
                     <Actor who={claimAttribution(index.people, issue.claim)} compact />
+                  </span>
+                )}
+                {state === "container" && (
+                  <span title="The work is in its sub-issues">
+                    {subIssueLabel(subIssueProgress(childrenOf(issue, index)))}
                   </span>
                 )}
                 {state === "ready" && <span>Ready</span>}
@@ -537,12 +545,15 @@ export function IssueBoard({
                 {items.length.toLocaleString()}
               </span>
               {lane.value === "todo" && (
-                // To do is a queue: what can be picked up now leads, and the split says how much.
+                // To do is a queue: what can be picked up now leads, and the split says how
+                // much; work waiting in sub-issues is counted too, so nothing goes unexplained.
                 <span className="text-micro font-normal text-ink-muted tabular-nums">
-                  {items.filter((i) => index.state.get(i.id) === "ready").length.toLocaleString()}{" "}
-                  ready ·{" "}
-                  {items.filter((i) => index.state.get(i.id) === "blocked").length.toLocaleString()}{" "}
-                  blocked
+                  {(["ready", "blocked", "container"] as const)
+                    .map(
+                      (state) =>
+                        `${items.filter((i) => index.state.get(i.id) === state).length.toLocaleString()} ${state === "container" ? "in sub-issues" : state}`,
+                    )
+                    .join(" · ")}
                 </span>
               )}
               {closed && (

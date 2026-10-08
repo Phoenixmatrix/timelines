@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import type { Issue, Link, Snapshot } from "../../../shared/tracker.ts";
+import type { HumanRequest, Issue, Link, Snapshot } from "../../../shared/tracker.ts";
 import {
   activityOf,
   buildIndex,
@@ -9,8 +9,12 @@ import {
   parseQuery,
   queryTokenSet,
   sortIssues,
+  STATE_LABEL,
+  subIssueLabel,
+  subIssueProgress,
   toggleToken,
   tokenize,
+  whyNotReady,
   withoutKeys,
 } from "./query.ts";
 
@@ -206,7 +210,7 @@ describe("done in a timeline", () => {
 });
 
 describe("graph states", () => {
-  it("shows containers by status and issues under another lease as leased", () => {
+  it("shows containers as their own state and issues under another lease as leased", () => {
     const later = new Date(NOW + 3_600_000).toISOString();
     const snap = snapshot([
       issue("CORE-1", {
@@ -222,12 +226,106 @@ describe("graph states", () => {
     expect(["core-1", "core-2", "core-3", "core-4"].map((id) => index.state.get(id))).toEqual([
       "claimed",
       "leased",
-      "todo",
+      "container",
       "ready",
     ]);
     expect(index.leasedBy.get("core-2")?.key).toBe("CORE-1");
     const leased = compile("is:leased", index, "m-priya", NOW);
     expect(snap.issues.filter((i) => leased.matches(i)).map((i) => i.key)).toEqual(["CORE-2"]);
+  });
+
+  it("finds containers with is:container, and a parent stops being one once its sub-issues close", () => {
+    const keys = (issues: Issue[], q: string) => {
+      const snap = snapshot(issues);
+      const index = buildIndex(snap, snap.serverTime);
+      const compiled = compile(q, index, "m-priya", NOW);
+      return issues.filter((i) => compiled.matches(i)).map((i) => i.key);
+    };
+    const open = [
+      issue("CORE-1"),
+      issue("CORE-2", { parentId: "core-1" }),
+      issue("CORE-3", { parentId: "core-1", status: "done" }),
+      issue("CORE-4"),
+    ];
+    expect(keys(open, "is:container")).toEqual(["CORE-1"]);
+    expect(keys(open, "state:container")).toEqual(["CORE-1"]);
+    expect(keys(open, "-is:container is:ready")).toEqual(["CORE-2", "CORE-4"]);
+    // Readiness is unchanged: a blocked parent reports blocked first.
+    const blockedParent = snapshot(open, [blocks("core-4", "core-1")]);
+    expect(buildIndex(blockedParent, blockedParent.serverTime).state.get("core-1")).toBe("blocked");
+    const closed = [
+      issue("CORE-1"),
+      issue("CORE-2", { parentId: "core-1", status: "done" }),
+      issue("CORE-3", { parentId: "core-1", status: "canceled" }),
+    ];
+    expect(keys(closed, "is:container")).toEqual([]);
+    expect(keys(closed, "is:ready")).toEqual(["CORE-1"]);
+  });
+
+  it("counts sub-issue progress without canceled ones, and done in a timeline as still open", () => {
+    const progress = subIssueProgress([
+      issue("CORE-2", { status: "done" }),
+      issue("CORE-3", { status: "canceled" }),
+      issue("CORE-4", { status: "done_in_timeline" }),
+      issue("CORE-5", { status: "in_progress" }),
+      issue("CORE-6"),
+    ]);
+    expect(progress.open.map((i) => i.key)).toEqual(["CORE-4", "CORE-5", "CORE-6"]);
+    expect([progress.done, progress.total]).toEqual([1, 4]);
+    expect(subIssueLabel(progress)).toBe("Sub-issues · 1/4 done");
+    expect(STATE_LABEL.container).toBe("Sub-issues");
+  });
+
+  it("says why every non-ready issue isn't ready, in one line", () => {
+    const later = new Date(NOW + 3_600_000).toISOString();
+    const issues = [
+      issue("CORE-1"),
+      issue("CORE-2", { waiting: 1 }),
+      issue("CORE-3", { claim: { actorId: "m-jun", agent: "laptop", expiresAt: later } }),
+      issue("CORE-4", { parentId: "core-3" }),
+      issue("CORE-5", { pickup: "not_ready" }),
+      issue("CORE-6", { pickup: "human_only" }),
+      issue("CORE-7"),
+      issue("CORE-8"),
+      issue("CORE-9", { parentId: "core-8", status: "done" }),
+      issue("CORE-10", { parentId: "core-8" }),
+      issue("CORE-11", { parentId: "core-8", status: "canceled" }),
+      issue("CORE-12", { status: "backlog" }),
+      issue("CORE-13", { status: "in_progress" }),
+      issue("CORE-14", { status: "done" }),
+      issue("CORE-15", { status: "canceled" }),
+    ];
+    const asked: HumanRequest = {
+      id: "r1",
+      issueId: "core-2",
+      kind: "question",
+      prompt: "Which region?",
+      choices: [],
+      secret: null,
+      status: "open",
+      askedBy: "m-jun",
+      routeTo: "m-priya",
+      answer: null,
+      answeredBy: null,
+      answeredAt: null,
+      createdAt: ago(1),
+    };
+    const snap = { ...snapshot(issues, [blocks("core-1", "core-7")]), requests: [asked] };
+    const index = buildIndex(snap, snap.serverTime);
+    const why = (key: string) => whyNotReady(index.byKey.get(key.toLowerCase())!, index, snap);
+    expect(why("CORE-1")).toBeNull();
+    expect(why("CORE-2")).toBe("Waiting on Priya Raman to answer a request");
+    expect(why("CORE-3")).toMatch(/^Claimed by Jun Park/);
+    expect(why("CORE-4")).toBe("Covered by CORE-3's lease");
+    expect(why("CORE-5")).toBe("Pickup is paused until a person enables it");
+    expect(why("CORE-6")).toBe("Only people can pick up this issue");
+    expect(why("CORE-7")).toBe("Blocked by CORE-1");
+    expect(why("CORE-8")).toBe("1 of 2 sub-issues still open");
+    expect(why("CORE-12")).toBe("In Backlog: move it to To do to queue it");
+    expect(why("CORE-13")).toBe("In progress, but nobody holds a claim on it");
+    // Finished work has nothing to explain.
+    expect(why("CORE-14")).toBeNull();
+    expect(why("CORE-15")).toBeNull();
   });
 });
 

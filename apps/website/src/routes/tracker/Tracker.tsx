@@ -1099,7 +1099,7 @@ function Workbench({ data }: { data: TrackerView }) {
             >
               {parsedUnknown.length
                 ? `${parsedUnknown[0]} isn't a filter. Use is:, status:, team:, ws:, assignee:, tag:, type:, p:, since:, until:, parent:, requires:, eligible:.`
-                : "is:ready is:blocked · status: · team: · ws: · assignee:me · tag: · type: · p:1 · since:7d · parent:KEY · requires:ux · eligible:me · words match key, title and tags; - excludes"}
+                : "is:ready is:blocked is:container · status: · team: · ws: · assignee:me · tag: · type: · p:1 · since:7d · parent:KEY · requires:ux · eligible:me · words match key, title and tags; - excludes"}
             </p>
             {defaultTeamEntry && (
               <DefaultTeamNote

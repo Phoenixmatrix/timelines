@@ -130,7 +130,7 @@ Settings retain the account named by `?owner=` when opening timelines, even when
 
 Warm charcoal steps separate the stage, rail, recessed fields, detail panes and raised controls. Bright ink carries content; muted ink carries metadata; faint ink carries hints. Use the established line tokens for separators rather than introducing independent gray values.
 
-**The State Meaning Rule.** Amber means action or selection, green means ready/evidence, neutral flags mean claim/checkpoint, and danger tokens mean blocked work or a conflict requiring attention.
+**The State Meaning Rule.** Amber means action or selection, green means ready/evidence, neutral flags mean claim/checkpoint, a neutral hollow square means work waiting in sub-issues (a container), and danger tokens mean blocked work or a conflict requiring attention.
 
 ## Typography
 
@@ -176,7 +176,7 @@ Same-origin absolute links in tracker Markdown use client-side navigation; exter
 
 ### Issue selection and handoff
 
-A selected issue row uses a subtle amber wash. Readiness combines a text label and a state mark: a filled ink flag for a direct claim, an outlined faint-ink flag for an inherited lease (see "Status by shape" in the root DESIGN.md). Parent hierarchy, blockers and related links are separately labelled. Checkpoints carry the same filled flag and evidence a green dot; the latest checkpoint sits near the issue header. The list, relationship lens and Atlas are recorded in the root DESIGN.md.
+A selected issue row uses a subtle amber wash. Readiness combines a text label and a state mark: a filled ink flag for a direct claim, an outlined faint-ink flag for an inherited lease, a hollow muted-ink square for a container whose work is in its open sub-issues (see "Status by shape" in the root DESIGN.md). Issue details say why an issue isn't ready in one line. Parent hierarchy, blockers and related links are separately labelled. Checkpoints carry the same filled flag and evidence a green dot; the latest checkpoint sits near the issue header. The list, relationship lens and Atlas are recorded in the root DESIGN.md.
 
 ### Conflict comparison
 
