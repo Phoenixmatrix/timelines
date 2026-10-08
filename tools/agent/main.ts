@@ -392,6 +392,7 @@ async function liveTest(
     run = { selection, outcomes: {} };
   }
   const started = Date.now();
+  const executionStarted = performance.now();
   let artifacts = join(
     root,
     ".gitmatrix-agent",
@@ -400,14 +401,14 @@ async function liveTest(
   );
   const timings: { stage: string; elapsedMs: number; outcome: string }[] = [];
   const timed = async <T>(stage: string, action: () => Promise<T>): Promise<T> => {
-    const began = Date.now();
+    const began = performance.now();
     let outcome = "failed";
     try {
       const result = await action();
       outcome = "passed";
       return result;
     } finally {
-      timings.push({ stage, elapsedMs: Date.now() - began, outcome });
+      timings.push({ stage, elapsedMs: Math.round(performance.now() - began), outcome });
     }
   };
   let env: Environment | undefined;
@@ -470,7 +471,7 @@ async function liveTest(
       success: failures.length === 0,
       mode: ai ? "ai" : "non-ai",
       id: env?.id ?? null,
-      elapsedMs: Date.now() - started,
+      elapsedMs: Math.round(performance.now() - executionStarted),
       cleanup: env?.status ?? "provision-not-completed",
       resources: env ? Object.keys(env.resources).filter((name) => ai || name === "artifacts") : [],
       ...(!ai ? { scenarios: readyE2E?.scenarios ?? "all", mirror: readyE2E?.mirror ?? true } : {}),
@@ -533,9 +534,44 @@ async function retainReports(artifacts: string): Promise<void> {
       throw error;
     }
     if (name === "e2e.json") {
-      report = (report as { scenario: string; status: string; elapsedMs: number }[]).map(
-        ({ scenario, status, elapsedMs }) => ({ scenario, status, elapsedMs }),
-      );
+      report = (
+        report as {
+          scenario: string;
+          status: string;
+          elapsedMs: number;
+          observations?: unknown[];
+        }[]
+      ).map(({ scenario, status, elapsedMs, observations }) => ({
+        scenario,
+        status,
+        elapsedMs,
+        phases: (Array.isArray(observations) ? observations : [])
+          .flatMap((value) => {
+            if (!value || typeof value !== "object") return [];
+            const phase = value as Record<string, unknown>;
+            if (
+              phase.event !== "e2e.phase" ||
+              typeof phase.name !== "string" ||
+              !/^source-landing\.(fixture|failing-gate|moving-before-cas|before-cas|after-cas|before-finalize|retry-partial|cancel-partial|unknown-rewrite|unknown-base-reset|cleanup)$/.test(
+                phase.name,
+              ) ||
+              typeof phase.elapsedMs !== "number" ||
+              !Number.isFinite(phase.elapsedMs) ||
+              phase.elapsedMs < 0 ||
+              (phase.outcome !== "passed" && phase.outcome !== "failed")
+            )
+              return [];
+            return [
+              {
+                event: "e2e.phase",
+                name: phase.name,
+                elapsedMs: phase.elapsedMs,
+                outcome: phase.outcome,
+              },
+            ];
+          })
+          .slice(0, 11),
+      }));
     }
     await privateJson(join(destination, name), JSON.parse(redact(JSON.stringify(report))));
   }
@@ -549,24 +585,64 @@ async function gates(options: ReadyOptions): Promise<void> {
   if (options.dryRun) return;
   const directory = join(root, ".gitmatrix-agent", "artifacts", `gates-${Date.now()}`);
   await privateJson(join(directory, "selection.json"), selection);
-  for (const { name, binary, args: commandArgs, cwd } of plan.gates) {
-    console.log(JSON.stringify({ event: "gate.start", name }));
-    const run = () =>
-      command(binary, commandArgs, {
-        cwd: cwd === "website" ? website : root,
-        timeout: 1_800_000,
-        log: join(directory, `${name}.log`),
-      });
-    await run();
-    console.log(JSON.stringify({ event: "gate.pass", name }));
+  const started = performance.now();
+  const timings: {
+    name: string;
+    elapsedMs: number | null;
+    wallMs: number;
+    outcome: "passed" | "failed";
+  }[] = [];
+  let success = false;
+  let failure: unknown;
+  try {
+    for (const { name, binary, args: commandArgs, cwd } of plan.gates) {
+      const gateStarted = performance.now();
+      let elapsedMs: number | null = null;
+      let outcome: "passed" | "failed" = "failed";
+      console.log(JSON.stringify({ event: "gate.start", name }));
+      const run = async () => {
+        const executionStarted = performance.now();
+        try {
+          return await command(binary, commandArgs, {
+            cwd: cwd === "website" ? website : root,
+            timeout: 1_800_000,
+            log: join(directory, `${name}.log`),
+          });
+        } finally {
+          elapsedMs = performance.now() - executionStarted;
+        }
+      };
+      try {
+        await run();
+        outcome = "passed";
+      } finally {
+        const timing = { name, elapsedMs, wallMs: performance.now() - gateStarted, outcome };
+        timings.push(timing);
+        console.log(
+          JSON.stringify({ event: outcome === "passed" ? "gate.pass" : "gate.fail", ...timing }),
+        );
+      }
+    }
+    if (e2e) await liveTest(false, undefined, e2e);
+    success = true;
+  } catch (error) {
+    failure = error;
   }
-  if (e2e) await liveTest(false, undefined, e2e);
-  await privateJson(join(directory, "completion.json"), {
-    success: true,
-    gates: plan.gates.map(({ name }) => name),
-    e2e,
-    completed: new Date().toISOString(),
-  });
+  try {
+    await privateJson(join(directory, "completion.json"), {
+      success,
+      gates: plan.gates.map(({ name }) => name),
+      timings,
+      elapsedMs: performance.now() - started,
+      e2e,
+      completed: new Date().toISOString(),
+    });
+  } catch (error) {
+    // Evidence I/O must not replace the original gate or E2E failure.
+    if (success) throw error;
+    console.error(redact(`Could not retain gate completion evidence: ${String(error)}`));
+  }
+  if (!success) throw failure;
 }
 
 async function destroyCurrent(): Promise<void> {

@@ -619,6 +619,19 @@ export interface CiStep {
   finishedAt: string | null;
 }
 
+/** Positive evidence from an executed candidate job; this job did not execute. */
+export interface CiJobVerification {
+  runId: string;
+  runNumber: number;
+  jobId: string;
+  queueId: string;
+  attempt: number;
+  commit: string;
+  sourceId: "canonical";
+  contract: "context-invariant-v1";
+  executionIdentity: string;
+}
+
 export interface CiJob {
   id: string;
   name: string;
@@ -633,6 +646,7 @@ export interface CiJob {
   /** When retention removed this job's log text; null while it's kept. */
   logsRemovedAt: string | null;
   steps: CiStep[];
+  verifiedBy?: CiJobVerification | null;
 }
 
 export interface CiRunDetail extends CiRunSummary {

@@ -27,6 +27,12 @@ import { timelineQuietMs } from "../timelines/quiet.ts";
 import { QUIET_RELEASE } from "./workflow-events.ts";
 import { isQueueSourceBranch } from "../../shared/merge-queue.ts";
 import { ciSource } from "./source.ts";
+import {
+  candidateProofs,
+  type CandidateVerification,
+  type VerificationProof,
+} from "./verification.ts";
+import { durableStub } from "../durable/registry.ts";
 
 export interface CiRepo {
   id: string;
@@ -111,6 +117,9 @@ export async function startRun(
     landingId?: string;
     /** With trigger "landing": the admitted queue entry whose candidate it tests. */
     queueId?: string;
+    queueAttempt?: number;
+    /** Only queue recovery supplies this; direct pushes and reruns execute normally. */
+    verification?: CandidateVerification;
     /** Who pushed or started it: a person, or an agent acting for one. */
     actor: Pick<Actor, "id" | "agent"> | null;
     waitUntil: Waiter;
@@ -145,10 +154,19 @@ export async function startRun(
     repo.source_id && repo.source_id !== "canonical" ? "refs/heads/work" : undefined,
   );
   try {
-    if (options.queueId && options.runId) {
+    if (options.runId && (options.queueId || options.verification)) {
       const recorded = await db(env.DB)
         .selectFrom("ci_runs")
-        .select(["id", "number", "repo_id", "source_id", "queue_id", "ref", "commit_oid"])
+        .select([
+          "id",
+          "number",
+          "repo_id",
+          "source_id",
+          "queue_id",
+          "queue_attempt",
+          "ref",
+          "commit_oid",
+        ])
         // Candidate identity includes its physical source, even for identical OIDs.
         .where("id", "=", options.runId)
         .executeTakeFirst();
@@ -156,7 +174,8 @@ export async function startRun(
         if (
           recorded.repo_id !== repo.id ||
           recorded.source_id !== (repo.source_id ?? "canonical") ||
-          recorded.queue_id !== options.queueId ||
+          recorded.queue_id !== (options.queueId ?? null) ||
+          recorded.queue_attempt !== (options.queueAttempt ?? null) ||
           recorded.ref !== options.branch ||
           recorded.commit_oid !== options.commit
         )
@@ -269,6 +288,7 @@ export async function startRun(
           "preview_teardown_of",
           "landing_id",
           "queue_id",
+          "queue_attempt",
           "step",
           "quiet_until",
         ])
@@ -300,6 +320,7 @@ export async function startRun(
                 .val(options.trigger === "landing" ? (options.landingId ?? null) : null)
                 .as("landing_id"),
               eb.val(options.queueId ?? null).as("queue_id"),
+              eb.val(options.queueAttempt ?? null).as("queue_attempt"),
               eb.val(step ? 1 : 0).as("step"),
               eb.val(error ? null : quietUntil).as("quiet_until"),
             ])
@@ -315,11 +336,42 @@ export async function startRun(
                   ),
               ),
             ),
-        ),
+        )
+        .onConflict((oc) => oc.column("id").doNothing()),
     ];
     const tree = (await reader.commit(options.commit))?.treeHash;
+    const proofRequest =
+      options.verification &&
+      options.trigger === "push" &&
+      (repo.source_id ?? "canonical") === "canonical" &&
+      env.CI_RUNNER === "sandbox"
+        ? options.verification
+        : null;
+    let identity: string | null = null;
+    if (proofRequest) {
+      try {
+        identity = await durableStub(env, "CiSandbox", runId, {
+          repo: repo.id,
+        }).verificationIdentity();
+      } catch {
+        // Unknown runtime identity requires execution, never inferred equivalence.
+      }
+    }
+    const proofs = proofRequest
+      ? await candidateProofs(
+          env.DB,
+          {
+            repoId: repo.id,
+            runId,
+            branch: options.branch,
+            commit: options.commit,
+          },
+          proofRequest,
+          identity,
+        )
+      : new Map<string, VerificationProof>();
     for (const job of pipeline?.jobs ?? []) {
-      const jobId = crypto.randomUUID().replaceAll("-", "");
+      const jobId = `${runId}-${job.name}`;
       let run = jobRuns(job, context);
       let unchanged: string | null = null;
       const spec: StoredJob = {
@@ -334,9 +386,12 @@ export async function startRun(
         steps: job.steps,
         concurrency: job.concurrency ?? null,
         paths: job.paths ?? [],
+        verification: job.verification ?? null,
       };
+      const proof = run && proofs.get(job.name);
+      const verifiedBy = proof && proof.spec === JSON.stringify(spec) ? proof.proof : null;
       // On a push, a job whose paths match the last commit it passed on is skipped.
-      if (run && options.trigger === "push" && spec.paths?.length && tree) {
+      if (run && !verifiedBy && options.trigger === "push" && spec.paths?.length && tree) {
         const base = await lastPassed(
           env.DB,
           repo.id,
@@ -363,24 +418,33 @@ export async function startRun(
         }
       }
       statements.push(
-        kdb.insertInto("ci_jobs").values({
-          id: jobId,
-          run_id: runId,
-          repo_id: repo.id,
-          source_id: repo.source_id ?? "canonical",
-          name: job.name,
-          spec: JSON.stringify(spec),
-          status: run ? "pending" : "skipped",
-          runner: env.CI_RUNNER,
-          ...(unchanged ? { error: unchanged } : {}),
-        }),
-        ...job.steps.map((step, position) =>
-          kdb.insertInto("ci_steps").values({
-            job_id: jobId,
-            position,
-            name: step.name,
+        kdb
+          .insertInto("ci_jobs")
+          .values({
+            id: jobId,
+            run_id: runId,
+            repo_id: repo.id,
+            source_id: repo.source_id ?? "canonical",
+            name: job.name,
+            spec: JSON.stringify(spec),
             status: run ? "pending" : "skipped",
-          }),
+            runner: env.CI_RUNNER,
+            // Pending evidence is only a proposal. The Workflow publishes it as
+            // skipped/verified after dependency and runtime checks at consumption.
+            verified_by: verifiedBy ? JSON.stringify(verifiedBy) : null,
+            ...(unchanged ? { error: unchanged } : {}),
+          })
+          .onConflict((oc) => oc.column("id").doNothing()),
+        ...job.steps.map((step, position) =>
+          kdb
+            .insertInto("ci_steps")
+            .values({
+              job_id: jobId,
+              position,
+              name: step.name,
+              status: run ? "pending" : "skipped",
+            })
+            .onConflict((oc) => oc.doNothing()),
         ),
       );
     }
@@ -423,17 +487,23 @@ export async function startRun(
       try {
         await startWorkflow(env, runId);
       } catch (cause) {
-        // Without its Workflow nothing would ever move the run on: fail it now.
-        await kdb
-          .updateTable("ci_runs")
-          .set({
-            status: "failed",
-            config_error: `The run could not be started: ${String(cause)}`,
-            finished_at: nowIso(),
-          })
-          .where("id", "=", runId)
-          .execute();
-        throw cause;
+        // Concurrent queue recovery may have created this exact Workflow already.
+        const recovered =
+          (options.queueId || options.verification) &&
+          (await env.CI_RUN.get(runId).catch(() => null));
+        if (!recovered) {
+          // Without its Workflow nothing would ever move the run on: fail it now.
+          await kdb
+            .updateTable("ci_runs")
+            .set({
+              status: "failed",
+              config_error: `The run could not be started: ${String(cause)}`,
+              finished_at: nowIso(),
+            })
+            .where("id", "=", runId)
+            .execute();
+          throw cause;
+        }
       }
     }
     const row = await kdb

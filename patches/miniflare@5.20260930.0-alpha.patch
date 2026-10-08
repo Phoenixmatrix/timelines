@@ -33,8 +33,8 @@ index 7a556761f2992280a8ab15adf8bec759ae3a4266..ee8e80cca54283950f20de4decb03633
 +  // capability it holds, such as an Artifacts repo from ARTIFACTS.get(). While
 +  // the session holds one or has a call in flight (an import beyond its main
 +  // stub), a side-effect-free round trip every 10 s keeps it open: the remote
-+  // answers that its binding has no such method. Sessions holding nothing are
-+  // left alone, so leaked sessions still close.
++  // answers that its binding has no such method. The owner must dispose the
++  // root when finished, stopping this timer and closing its transport.
 +  let keepAlive = setInterval(() => {
 +    session.getStats().imports > 1 && Promise.resolve(stub.__gitmatrixKeepAlive).then(
 +      (value) => value?.[Symbol.dispose]?.(),
@@ -52,7 +52,7 @@ index 7a556761f2992280a8ab15adf8bec759ae3a4266..ee8e80cca54283950f20de4decb03633
        return p === "fetch" ? makeFetch(
          remoteProxyConnectionString,
          bindingName,
-@@ -2579,6 +2598,105 @@ function makeRemoteProxyStub(remoteProxyConnectionString, bindingName, metadata,
+@@ -2579,6 +2598,156 @@ function makeRemoteProxyStub(remoteProxyConnectionString, bindingName, metadata,
    });
  }
  
@@ -73,51 +73,100 @@ index 7a556761f2992280a8ab15adf8bec759ae3a4266..ee8e80cca54283950f20de4decb03633
 +      await new Promise((resolve) => setTimeout(resolve, 250 * tries));
 +    }
 +}
++// Roots are caller-owned: scalar calls release them after materialization,
++// while get transfers both the root and its repo capability to GitmatrixRepo.
++async function gitmatrixCall(fresh, method, args) {
++  let root = fresh();
++  try {
++    return await root[method](...args);
++  } finally {
++    root[Symbol.dispose]();
++  }
++}
++async function gitmatrixAcquire(fresh, args) {
++  let root = fresh();
++  try {
++    return { root, repo: await root.get(...args) };
++  } catch (error) {
++    root[Symbol.dispose]();
++    throw error;
++  }
++}
++function gitmatrixDispose(owned) {
++  if (!owned?.root) return;
++  let { root, repo } = owned;
++  owned.root = owned.repo = void 0;
++  try {
++    repo[Symbol.dispose]?.();
++  } finally {
++    root[Symbol.dispose]();
++  }
++}
 +// A create that dropped may still have happened. Its retry then finds the repo
 +// (and nothing else could have made it: names are fresh), so it reads back what
 +// create returns, with a new token in place of the lost one. "Already exists"
 +// without a drop is an ordinary error.
-+async function gitmatrixCreate(first, fresh, name, opts) {
++async function gitmatrixCreate(fresh, name, opts) {
 +  let dropped = false;
-+  return gitmatrixRetry(async (again) => {
++  return gitmatrixRetry(async () => {
 +    try {
-+      return await (again ? fresh() : first()).create(name, opts);
++      return await gitmatrixCall(fresh, "create", [name, opts]);
 +    } catch (error) {
 +      dropped ||= gitmatrixDropped(error);
 +      if (!dropped || !/repo already exists/.test(String(error?.message))) throw error;
-+      let repo = await fresh().get(name), info = await repo.info(), token = await repo.createToken("write");
++      let owned = await gitmatrixAcquire(fresh, [name]);
 +      try {
-+        repo[Symbol.dispose]?.();
-+      } catch {
++        let info = await owned.repo.info(), token = await owned.repo.createToken("write");
++        return {
++          id: info.id,
++          name: info.name,
++          description: info.description,
++          defaultBranch: info.defaultBranch,
++          remote: info.remote,
++          token: token.plaintext
++        };
++      } finally {
++        gitmatrixDispose(owned);
 +      }
-+      return {
-+        id: info.id,
-+        name: info.name,
-+        description: info.description,
-+        defaultBranch: info.defaultBranch,
-+        remote: info.remote,
-+        token: token.plaintext
-+      };
 +    }
 +  });
 +}
 +var GitmatrixRepo = class extends cfw.RpcTarget {
-+  #repo;
++  #owned;
 +  #reopen;
-+  constructor(repo, reopen) {
-+    super(), this.#repo = repo, this.#reopen = reopen;
++  #reopening;
++  #disposed = false;
++  constructor(owned, reopen) {
++    super(), this.#owned = owned, this.#reopen = reopen;
++  }
++  #repo() {
++    if (this.#disposed) throw new Error("Artifacts repo has been disposed");
++    return this.#owned.repo;
++  }
++  async #replace(previous) {
++    this.#repo();
++    if (this.#owned !== previous) return;
++    if (!this.#reopening)
++      this.#reopening = (async () => {
++        let owned = await this.#reopen();
++        if (this.#disposed) {
++          gitmatrixDispose(owned);
++          throw new Error("Artifacts repo has been disposed");
++        }
++        let old = this.#owned;
++        this.#owned = owned;
++        gitmatrixDispose(old);
++      })().finally(() => {
++        this.#reopening = void 0;
++      });
++    await this.#reopening;
 +  }
 +  #read(method, args) {
++    let previous = this.#owned;
 +    return gitmatrixRetry(async (again) => {
-+      if (again) {
-+        let repo = await this.#reopen();
-+        try {
-+          this.#repo[Symbol.dispose]?.();
-+        } catch {
-+        }
-+        this.#repo = repo;
-+      }
-+      return this.#repo[method](...args);
++      if (again) await this.#replace(previous);
++      previous = this.#owned;
++      return this.#repo()[method](...args);
 +    });
 +  }
 +  info(...args) {
@@ -142,27 +191,29 @@ index 7a556761f2992280a8ab15adf8bec759ae3a4266..ee8e80cca54283950f20de4decb03633
 +    return this.#read("log", args);
 +  }
 +  createToken(...args) {
-+    return this.#repo.createToken(...args);
++    return this.#repo().createToken(...args);
 +  }
 +  revokeToken(...args) {
-+    return this.#repo.revokeToken(...args);
++    return this.#repo().revokeToken(...args);
 +  }
 +  fork(...args) {
-+    return this.#repo.fork(...args);
++    return this.#repo().fork(...args);
 +  }
 +  [Symbol.dispose]() {
-+    this.#repo[Symbol.dispose]?.();
++    if (this.#disposed) return;
++    this.#disposed = true;
++    gitmatrixDispose(this.#owned);
 +  }
 +};
 +
  // src/workers/shared/remote-proxy-client.worker.ts
  var Client = class extends WorkerEntrypoint {
    fetch(request) {
-@@ -2630,6 +2748,21 @@ var Client = class extends WorkerEntrypoint {
+@@ -2630,6 +2799,25 @@ var Client = class extends WorkerEntrypoint {
        get: (target, prop) => {
          if (Reflect.has(target, prop))
            return Reflect.get(target, prop);
-+        if (ctx.props.binding === "ARTIFACTS" && (prop === "get" || prop === "list" || prop === "create")) {
++        if (ctx.props.binding === "ARTIFACTS" && (prop === "get" || prop === "list" || prop === "create" || prop === "import" || prop === "delete")) {
 +          let fresh = () => makeRemoteProxyStub(
 +            ctx.props.remoteProxyConnectionString,
 +            ctx.props.binding,
@@ -171,11 +222,15 @@ index 7a556761f2992280a8ab15adf8bec759ae3a4266..ee8e80cca54283950f20de4decb03633
 +            env[SharedBindings.MAYBE_SERVICE_LOOPBACK]
 +          );
 +          if (prop === "create")
-+            return (name, opts) => gitmatrixCreate(getStub, fresh, name, opts);
-+          return (...args) => gitmatrixRetry(async (again) => {
-+            let result = await (again ? fresh() : getStub())[prop](...args);
-+            return prop === "get" ? new GitmatrixRepo(result, () => fresh().get(...args)) : result;
-+          });
++            return (name, opts) => gitmatrixCreate(fresh, name, opts);
++          if (prop === "get")
++            return (...args) => gitmatrixRetry(async () => new GitmatrixRepo(
++              await gitmatrixAcquire(fresh, args),
++              () => gitmatrixAcquire(fresh, args)
++            ));
++          if (prop === "list")
++            return (...args) => gitmatrixRetry(() => gitmatrixCall(fresh, prop, args));
++          return (...args) => gitmatrixCall(fresh, prop, args);
 +        }
          let rpcProperty, isRpcPropertyResolved = !1;
          function getRpcProperty() {

@@ -5,18 +5,16 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { chromium, expect } from "@playwright/test";
 import type { CiRunDetail, CiRunSummary } from "../../apps/website/shared/api.ts";
 import type { RetentionSettings } from "../../apps/website/shared/retention.ts";
 import type { Timeline } from "../../apps/website/shared/timelines.ts";
 import type { QueueGm, RepoInventory } from "./queue-e2e.ts";
 import type { HarnessContext, SeedManifest } from "./types.ts";
 
-/** Real owned Git/provider resources; the clock override applies only to this persona's run. */
-export async function runSourceRetentionE2E(
+/** Shared real API/native-Git setup; each caller owns a fresh retention repository. */
+export async function sourceRetentionFixture(
   ctx: HarnessContext,
   fixtures: SeedManifest,
-  gm: QueueGm,
   record: (value: unknown) => void,
 ) {
   const owner = "sam";
@@ -79,6 +77,18 @@ export async function runSourceRetentionE2E(
             : resolve(stdout.trim()),
       );
     });
+  return { owner, secret, name, repo, api, timelines, root, json, git };
+}
+
+/** Real owned Git/provider resources; the clock override applies only to this persona's run. */
+export async function runSourceRetentionE2E(
+  ctx: HarnessContext,
+  fixtures: SeedManifest,
+  gm: QueueGm,
+  record: (value: unknown) => void,
+) {
+  const { owner, secret, name, repo, api, timelines, root, json, git } =
+    await sourceRetentionFixture(ctx, fixtures, record);
   const retain = async (
     daysAhead: number,
     categories = { "timeline-work-sources": { landedDays: 30, abandonedDays: 90 } } as Record<
@@ -502,30 +512,6 @@ export async function runSourceRetentionE2E(
   await json(`${timelines}/${parent.slug}`);
   await retain(181, { "tracker-activity": { eventDays: 365, endedTimelineDays: 180 } });
   await json(`${timelines}/${parent.slug}`, "GET", undefined, [404]);
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ baseURL: ctx.origin });
-  const page = await context.newPage();
-  try {
-    await page.goto("/signin");
-    await page.getByRole("button", { name: /Continue as sam/i }).click();
-    await page.waitForURL((url) => url.pathname !== "/signin");
-    await page.goto(`/${repo}?source=${parent.sourceId}`);
-    await expect(page.getByText(/code source has expired/i).first()).toBeVisible({
-      timeout: 15_000,
-    });
-    await page.screenshot({
-      path: join(ctx.artifacts, "source-retention-expired.png"),
-      fullPage: true,
-    });
-  } catch (error) {
-    await page
-      .screenshot({ path: join(ctx.artifacts, "source-retention-failure.png"), fullPage: true })
-      .catch(() => {});
-    throw error;
-  } finally {
-    await context.close();
-    await browser.close();
-  }
   const live = await create("tombstone");
   await readable(live.sourceId, oid);
   const reservation = await hook<{ sourceId: string; state: string }>({

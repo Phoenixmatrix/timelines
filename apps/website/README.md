@@ -2414,6 +2414,39 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
                       streams logs, reports the end, exits ─▶ step.waitForEvent resumes
 ```
 
+### Candidate verification reuse
+
+A job may explicitly declare `verification: context-invariant-v1`. This is the
+pipeline author's assertion that its result is independent of branch, trigger and
+other run context, not automatic reuse merely because two runs have the same Git
+OID. Leave it off context-sensitive jobs, especially deployment.
+
+Reuse requires successful **actual sandbox execution** for the exact current
+canonical repository, candidate commit, queue attempt and job specification. The
+producer must also match the current known resolved container image digest and
+Worker `CI_VERSION` metadata. A tag or configuration fingerprint is not an image
+identity. Local runners, custom images, jobs with secrets and jobs with concurrency
+controls are ineligible. Missing or unknown identity, failed verification or a
+changed candidate, attempt, specification, image or Worker version falls back to
+normal execution.
+
+A proposed proof at run creation is not yet public verification. The workflow
+revalidates it when consuming the gate, including after recovery, against the
+current runtime identity and only after the main run's prerequisites succeed.
+Rejected proposals cannot leave a positive `verifiedBy`; a failed prerequisite
+still blocks its dependent. Completed accepted gates retain their consumption-time
+provenance. Reuse neither removes independent main jobs nor bypasses the DAG:
+all main jobs remain, and deploy still executes.
+
+An accepted reused job has public status `skipped` plus `verifiedBy`, displayed as
+**Verified (not executed)** rather than ordinary **Skipped**. Its provenance links
+to the producer run/job with the candidate commit and queue attempt. It has no
+fabricated execution output or duration; inspect the producer for actual logs.
+`gm runs show`, `gm runs wait` and JSON output preserve this distinction rather
+than claiming the consumer executed or finished before the remaining main jobs.
+
+### Runners and pipeline operation
+
 - **Runners.** Deployed, jobs run in Cloudflare Sandbox containers (image
   `ci/Dockerfile`: Node 24, pnpm, Vite+, Rust, git, and Chromium's headless
   shell; see "CI image" below). Under `vp dev` they run on
@@ -2436,10 +2469,12 @@ CiRun: jobs in dependency stages, in parallel within a stage, dependents of fail
   credentials, raw logs or browser storage. Setup logs print cache/evidence paths.
   Checkout credentials are deleted before terminal reporting, on success or failure.
 - **This repository's pipeline.** Check, test and build start independently on
-  `standard-4` Sandboxes; all must pass. Non-AI E2E runs only where
-  `runner == "local"` (it is too expensive per push), so `vp run ready` is its
-  gate. No job consumes another's artifacts, and keeping them in one stage avoids
-  a scheduler barrier. Real AI verification is an explicit agent command.
+  `standard-4` Sandboxes; all must pass. The four gates `check`, `test`, `build`
+  and `cli` explicitly opt into `verification: context-invariant-v1`; deploy does
+  not, and remains real execution. Non-AI E2E runs only where `runner == "local"`
+  (it is too expensive per push), so `vp run ready` is its gate. No job consumes
+  another's artifacts, and keeping them in one stage avoids a scheduler barrier.
+  Real AI verification is an explicit agent command.
   Checkpoints of a timeline get a preview of the app
   ([Gitmatrix's own previews](#gitmatrixs-own-previews)). Each push to a
   timeline also gets a [step run](#step-runs) of just `step-check` (`vp check`:

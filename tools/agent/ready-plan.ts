@@ -78,12 +78,11 @@ const task = (name: string, target: string) => gate(name, ["run", "--no-cache", 
 
 function fullGates(): ReadyPlan["gates"] {
   return [
-    bindings(),
+    task("website-types", "website#typecheck"),
     gate("check", ["check"]),
     task("cli-check", "cli#check"),
     task("types", "@gitmatrix/agent#typecheck"),
     task("preview-types", "@gitmatrix/preview#typecheck"),
-    task("website-types", "website#typecheck"),
     task("formats-types", "@gitmatrix/formats#typecheck"),
     task("testing-types", "@gitmatrix/testing#typecheck"),
     gate("tests", ["run", "-r", "--concurrency-limit", "1", "--no-cache", "test"]),
@@ -103,6 +102,23 @@ function documentation(path: string): boolean {
 
 function testOnly(path: string): boolean {
   return /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(path) || /^apps\/cli\/tests\/.*\.rs$/.test(path);
+}
+
+const STYLESHEETS: Record<string, true> = {
+  "apps/website/src/styles/app.css": true,
+  "apps/website/src/styles/tokens.css": true,
+  "apps/website/src/styles/matrixkit.css": true,
+};
+
+// Freeze all at-rule inputs, not just single-line @imports. Escaped spellings
+// are deliberately unaudited; changed imports/plugins/sources widen coverage.
+function stylesheetInputs(text: string): string | null {
+  if (text.includes("\\")) return null;
+  const tokens =
+    text.match(
+      /\/\*[\s\S]*?\*\/|"[^"]*"|'[^']*'|@(?:[^;{}"'/]|\/(?!\*)|\/\*[\s\S]*?\*\/|"[^"]*"|'[^']*')*(?:[;{]|$)|url\((?:[^)"']|"[^"]*"|'[^']*')*\)/gi,
+    ) ?? [];
+  return JSON.stringify(tokens.filter((token) => token.startsWith("@") || /^url\(/i.test(token)));
 }
 
 /** Read-only planning. Failed discovery always selects full coverage, never an empty change set. */
@@ -153,6 +169,41 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     );
   }
   if (options.all) return full("--all explicitly requested.");
+  let stylesheetOnly =
+    plan.changed.length > 0 && plan.changed.every((path) => Object.hasOwn(STYLESHEETS, path));
+  if (stylesheetOnly) {
+    try {
+      // Check every boundary independently: an index deletion restored in the
+      // worktree, or an import change later reverted, must not look content-only.
+      for (const range of [[plan.base!, "HEAD"], ["--cached", "HEAD"], []]) {
+        if (
+          await git([
+            "diff",
+            ...range,
+            "--name-only",
+            "--no-renames",
+            "-z",
+            "--diff-filter=ADRTUXB",
+            "--",
+          ])
+        )
+          stylesheetOnly = false;
+      }
+      for (const path of plan.changed) {
+        const versions = await Promise.all([
+          git(["show", `${plan.base}:${path}`]),
+          git(["show", `HEAD:${path}`]),
+          git(["show", `:${path}`]),
+          readFile(join(root, path), "utf8"),
+        ]);
+        const inputs = versions.map(stylesheetInputs);
+        if (inputs[0] === null || inputs.some((input) => input !== inputs[0]))
+          stylesheetOnly = false;
+      }
+    } catch {
+      stylesheetOnly = false;
+    }
+  }
 
   const affected = new Set<Workspace>();
   const production = new Set<Workspace>();
@@ -206,8 +257,10 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     );
   }
   // Relative TS imports are not represented by package.json (including preview's typecheck launcher).
-  dependencies.get("tools/agent")!.add("apps/website");
-  dependencies.get("tools/preview")!.add("apps/website");
+  if (!stylesheetOnly) {
+    dependencies.get("tools/agent")!.add("apps/website");
+    dependencies.get("tools/preview")!.add("apps/website");
+  }
   dependencies.get("tools/preview")!.add("tools/agent");
   const propagate = (selected: Set<Workspace>) => {
     let added = true;
@@ -235,14 +288,19 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
   } catch {
     hasBindings = false;
   }
-  if (!hasBindings || production.has("apps/website")) {
+  const websiteTypes =
+    affected.has("apps/website") && manifests.get("apps/website")!.scripts?.typecheck;
+  if (websiteTypes) {
+    plan.gates.push(task("website-types", `${manifests.get("apps/website")!.name}#typecheck`));
+    plan.reasons.push("Website typecheck generates bindings before root check and consumer types.");
+  } else if (!hasBindings) {
     plan.gates.push(bindings());
-    plan.reasons.push(
-      !hasBindings
-        ? "Generate missing bindings required by root type-aware vp check."
-        : "Refresh bindings before checking the affected website.",
-    );
+    plan.reasons.push("Generate missing bindings required by root type-aware vp check.");
   }
+  if (stylesheetOnly)
+    plan.reasons.push(
+      "Content-only audited stylesheets: retain whole website tests/build/types and frontend E2E; omit unrelated implicit agent/preview consumers.",
+    );
   plan.gates.push(gate("check", ["check"]));
   const labels: Record<Workspace, string> = {
     "apps/cli": "cli",
@@ -258,7 +316,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     const manifest = manifests.get(workspace)!;
     const label = labels[workspace];
     if (workspace === "apps/cli") plan.gates.push(task("cli-check", "cli#check"));
-    if (manifest.scripts?.typecheck)
+    if (manifest.scripts?.typecheck && workspace !== "apps/website")
       plan.gates.push(
         task(
           workspace === "tools/agent" ? "types" : `${label}-types`,

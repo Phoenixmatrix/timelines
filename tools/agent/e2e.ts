@@ -33,6 +33,7 @@ import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 import { runQueueE2E } from "./queue-e2e.ts";
 import { runSourceMigrationE2E } from "./source-migration-e2e.ts";
 import { runSourceRetentionE2E } from "./source-retention-e2e.ts";
+import { runSourceExpiredE2E } from "./source-expired-e2e.ts";
 import { runSourceAuthE2E } from "./source-auth-e2e.ts";
 import { runSourceLandingE2E } from "./source-landing-e2e.ts";
 import { runSourceSyncE2E } from "./source-sync-e2e.ts";
@@ -73,21 +74,21 @@ export async function runE2E(
       console.log(JSON.stringify({ event: "e2e-scenario-skipped", scenario: name }));
       return;
     }
-    const started = Date.now();
+    const started = performance.now();
     observations = [];
     try {
       await body();
       report.push({
         scenario: name,
         status: "passed",
-        elapsedMs: Date.now() - started,
+        elapsedMs: Math.round(performance.now() - started),
         observations,
       });
     } catch (error) {
       report.push({
         scenario: name,
         status: "failed",
-        elapsedMs: Date.now() - started,
+        elapsedMs: Math.round(performance.now() - started),
         observations,
         error: redact(String(error)),
         // A renderer killed for memory fails whatever it was waiting on (CORE-306).
@@ -5062,6 +5063,9 @@ export async function runE2E(
   );
   await scenario("source-retention-expiry-orphan-and-canonical-purge", () =>
     runSourceRetentionE2E(ctx, fixtures, gm, record),
+  );
+  await scenario("browser-expired-source-without-timeline-history", () =>
+    runSourceExpiredE2E(ctx, fixtures, gm, record),
   );
 
   await scenario("browser-chronicle-scrub-range-span-and-links", async () => {

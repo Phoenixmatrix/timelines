@@ -14,7 +14,8 @@
 import { QUIET_RELEASE } from "./workflow-events.ts";
 import { recordStepRun } from "../steps/runs.ts";
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
-import type { CiJobStatus } from "../../shared/api.ts";
+import { sql } from "kysely";
+import type { CiJobStatus, CiJobVerification } from "../../shared/api.ts";
 import { batch, db, nowIso } from "../schema.ts";
 import { releaseHeld, UNCHANGED } from "./coalesce.ts";
 import { concurrencyGate } from "./concurrency.ts";
@@ -24,6 +25,7 @@ import { sandbox } from "./sandbox.ts";
 import { startWorkflow, type RunParams } from "./trigger.ts";
 import { afterRun, settled } from "../timelines/landing.ts";
 import { afterQueueRun } from "../merge-queue/index.ts";
+import { prerequisitesSatisfied } from "./verification.ts";
 
 interface PlannedJob {
   id: string;
@@ -35,7 +37,11 @@ interface PlannedJob {
   concurrency: string | null;
   /** Skipped because its paths match the last commit it passed: it counts as passed. */
   unchanged: boolean;
+  /** A proposal to check at consumption, never an admission decision. */
+  verification: boolean;
 }
+
+type JobOutcome = CiJobStatus | "verified";
 
 const DB_STEP = { retries: { limit: 5, delay: "2 seconds", backoff: "exponential" } } as const;
 /** How long a local job may wait for a runner, on top of its own timeout. */
@@ -112,7 +118,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
         .execute();
       const results = await kdb
         .selectFrom("ci_jobs")
-        .select(["id", "name", "status", "runner", "spec", "error"])
+        .select(["id", "name", "status", "runner", "spec", "error", "verified_by"])
         .where("run_id", "=", runId)
         .execute();
       return results.map((row): PlannedJob => {
@@ -126,11 +132,12 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
           timeoutMinutes: spec.timeoutMinutes,
           concurrency: spec.concurrency ?? null,
           unchanged: row.status === "skipped" && (row.error ?? "").startsWith(UNCHANGED),
+          verification: row.verified_by !== null,
         };
       });
     });
 
-    const outcome = new Map<string, CiJobStatus>();
+    const outcome = new Map<string, JobOutcome>();
     const byName = new Map(jobs.map((j) => [j.name, j]));
     for (const stage of stages(jobs.map((j) => ({ name: j.name, needs: j.needs }) as JobSpec))) {
       await Promise.all(
@@ -242,15 +249,108 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
     step: WorkflowStep,
     runId: string,
     job: PlannedJob,
-    outcome: Map<string, CiJobStatus>,
-  ): Promise<CiJobStatus> {
+    outcome: Map<string, JobOutcome>,
+  ): Promise<JobOutcome> {
     const d1 = this.env.DB;
     const kdb = db(d1);
+    // The plan is durable, but it must never cache proof admission. This step is
+    // the gate's consumption point: once committed, replay preserves that result
+    // just as it preserves a completed sandbox execution across later deployments.
+    const admission = job.verification
+      ? await step.do(`verification:${job.name}`, DB_STEP, async () => {
+          const row = await kdb
+            .selectFrom("ci_jobs")
+            .select(["status", "verified_by"])
+            .where("id", "=", job.id)
+            .executeTakeFirstOrThrow();
+          if (!row.verified_by) {
+            if (row.status === "skipped" && job.unchanged) return "succeeded" as const;
+            return ["pending", "queued", "running"].includes(row.status) ? null : row.status;
+          }
+          if (row.status === "skipped") return "verified" as const;
+          const run = await kdb
+            .selectFrom("ci_runs")
+            .select("status")
+            .where("id", "=", runId)
+            .executeTakeFirstOrThrow();
+          const blocked = job.needs.find((need) => !prerequisitesSatisfied([need], outcome));
+          const cancelled = run.status === "cancelled" || row.status === "cancelled";
+          let identity: string | null = null;
+          if (!blocked && !cancelled && row.status === "pending") {
+            try {
+              identity = await sandbox(this.env, job.id).verificationIdentity();
+            } catch {
+              // Unknown identity executes normally; it is not evidence of equivalence.
+            }
+          }
+          const proof = JSON.parse(row.verified_by) as CiJobVerification;
+          const accepted = identity !== null && identity === proof.executionIdentity;
+          const status = cancelled ? "cancelled" : blocked || accepted ? "skipped" : "pending";
+          await batch(d1, [
+            kdb
+              .updateTable("ci_jobs")
+              .set({
+                status,
+                verified_by: accepted ? row.verified_by : null,
+                error: cancelled
+                  ? "Cancelled before candidate verification was consumed."
+                  : blocked
+                    ? `Skipped because ${blocked} did not succeed.`
+                    : null,
+              })
+              .where("id", "=", job.id)
+              .where("status", "=", "pending")
+              .where(
+                "run_id",
+                "in",
+                kdb.selectFrom("ci_runs").select("id").where("status", "in", ["queued", "running"]),
+              ),
+            kdb
+              .updateTable("ci_jobs")
+              .set({
+                status: "cancelled",
+                verified_by: null,
+                error: "Cancelled before candidate verification was consumed.",
+              })
+              .where("id", "=", job.id)
+              .where("verified_by", "is not", null)
+              .where((eb) =>
+                eb.or([
+                  eb("status", "=", "cancelled"),
+                  eb(
+                    "run_id",
+                    "in",
+                    eb.selectFrom("ci_runs").select("id").where("status", "=", "cancelled"),
+                  ),
+                ]),
+              ),
+            kdb
+              .updateTable("ci_steps")
+              .set({
+                status: sql<"pending" | "skipped">`CASE WHEN EXISTS (
+              SELECT 1 FROM ci_jobs WHERE id = ${job.id} AND status = 'pending'
+            ) THEN 'pending' ELSE 'skipped' END`,
+              })
+              .where("job_id", "=", job.id),
+          ]);
+          const consumed = await kdb
+            .selectFrom("ci_jobs")
+            .select(["status", "verified_by"])
+            .where("id", "=", job.id)
+            .executeTakeFirstOrThrow();
+          return consumed.status === "skipped" && consumed.verified_by
+            ? ("verified" as const)
+            : consumed.status === "pending"
+              ? null
+              : consumed.status;
+        })
+      : null;
+    if (admission) return admission;
     // A job skipped as unchanged stands in for a pass, so what needs it still runs.
     if (job.status !== "pending") return job.unchanged ? "succeeded" : job.status;
 
     // Like GitHub Actions: a job runs only when everything it needs succeeded.
-    const blocked = job.needs.find((need) => outcome.get(need) !== "succeeded");
+    const blocked = job.needs.find((need) => !prerequisitesSatisfied([need], outcome));
     const start = await step.do(`start:${job.name}`, DB_STEP, async () => {
       const run = (
         await kdb.selectFrom("ci_runs").select("status").where("id", "=", runId).executeTakeFirst()

@@ -72,6 +72,7 @@ jobs:
           vp test run --project unit ${since:+--changed=$since} --passWithNoTests
 
   check:
+    verification: context-invariant-v1
     instance: standard-4
     steps:
       - name: Install
@@ -87,6 +88,7 @@ jobs:
           && vp run --no-cache @gitmatrix/preview#typecheck
 
   test:
+    verification: context-invariant-v1
     instance: standard-4
     timeout_minutes: 30
     steps:
@@ -112,6 +114,7 @@ jobs:
         run: vp run --filter '!cli' --concurrency-limit 1 --no-cache test
 
   build:
+    verification: context-invariant-v1
     instance: standard-4
     # Building the CI image needs Docker, which a Sandbox doesn't have.
     env:
@@ -127,6 +130,7 @@ jobs:
   # gm, the Rust CLI: skipped while apps/cli is unchanged since it last passed,
   # and then counts as passed for deploy.
   cli:
+    verification: context-invariant-v1
     instance: standard-4
     paths: [apps/cli]
     steps:
@@ -161,14 +165,10 @@ jobs:
     secrets: [CLOUDFLARE_API_TOKEN]
     env:
       CLOUDFLARE_ACCOUNT_ID: "0e28c6400ae60277d5330899f4db57e4"
+      GITMATRIX_CLI_PROVISION_ARM64: "1"
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
-      - name: Install ARM64 cross compiler
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-          rustup target add aarch64-unknown-linux-gnu
       - name: Publish gm if it changed
         run: node tools/agent/publish-cli.ts
       - name: Deploy what changed

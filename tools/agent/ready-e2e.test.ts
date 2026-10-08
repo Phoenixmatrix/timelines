@@ -21,7 +21,7 @@ await test("frontend selection preserves browser journeys but omits unrelated E2
     "browser-personas-persisted-product-state",
     "browser-atlas-smoke",
     "browser-timeline-scope-round-trip",
-    "source-retention-expiry-orphan-and-canonical-purge",
+    "browser-expired-source-without-timeline-history",
     "browser-chronicle-scrub-range-span-and-links",
   ]) {
     assert(selection.scenarios.includes(required), `Browser journey omitted: ${required}`);
@@ -31,6 +31,7 @@ await test("frontend selection preserves browser journeys but omits unrelated E2
     "ci-cancellation-and-job-token-lifetime",
     "registry-retention-keeps-installs-working",
     "retention-concurrent-with-pushes-builds-and-chats",
+    "source-retention-expiry-orphan-and-canonical-purge",
   ]) {
     assert(!selection.scenarios.includes(unrelated), unrelated);
   }
@@ -57,6 +58,56 @@ await test("browser prerequisites expand transitively in execution order without
     "usage-metering-collects-per-account",
     "browser-usage-and-costs-account-and-site",
   ]);
+});
+
+await test("audited route selection keeps every traversing journey and its prerequisites", () => {
+  const usage = "apps/website/src/routes/UsageCosts.tsx";
+  const retention = "apps/website/src/routes/DataRetention.tsx";
+  const both = expandE2EScenarios([
+    "browser-usage-and-costs-account-and-site",
+    "browser-data-retention-account-and-site",
+  ]);
+  assert.deepEqual(selectReadyE2E([usage], false), { scenarios: both, mirror: false });
+  assert.deepEqual(selectReadyE2E([retention], false), {
+    scenarios: expandE2EScenarios(["browser-data-retention-account-and-site"]),
+    mirror: false,
+  });
+  assert.deepEqual(selectReadyE2E([retention, usage, usage], false), {
+    scenarios: both,
+    mirror: false,
+  });
+  // Selection consumes diff paths, never filesystem existence: a deleted mapped
+  // endpoint still selects its witnesses; an unknown rename endpoint widens.
+  assert.deepEqual(selectReadyE2E([usage], false).scenarios, both);
+  const broad = selectReadyE2E(["apps/website/src/App.tsx"], false);
+  for (const path of [
+    "apps/website/src/routes/RenamedUsageCosts.tsx",
+    "apps/website/src/appRoutes.tsx",
+    "apps/website/src/components/SettingsPage.tsx",
+    "apps/website/src/components/UsageReportView.tsx",
+    "apps/website/src/components/RetentionView.tsx",
+    "apps/website/src/lib/retention-links.ts",
+    "apps/website/src/app.css",
+    "apps/website/src/tokens.css",
+    "apps/website/public/favicon.svg",
+  ]) {
+    assert.deepEqual(selectReadyE2E([usage, path], false), broad, path);
+    assert.deepEqual(selectReadyE2E([path, retention], false), broad, path);
+  }
+  assert.deepEqual(selectReadyE2E([usage, "apps/website/worker/api/repos.ts"], false), {
+    scenarios: null,
+    mirror: true,
+  });
+});
+
+await test("expired browser fixture is independently selectable while full inventory keeps backend matrix", () => {
+  assert.deepEqual(expandE2EScenarios(["browser-expired-source-without-timeline-history"]), [
+    "browser-expired-source-without-timeline-history",
+  ]);
+  assert(e2eScenarioNames.includes("source-retention-expiry-orphan-and-canonical-purge"));
+  assert(e2eScenarioNames.includes("browser-expired-source-without-timeline-history"));
+  // The empty run test below observes one actual execution/skip dispatch per
+  // inventory entry, so inventory-only registration cannot satisfy this contract.
 });
 
 await test("unaudited scenario dependencies widen to the full suite", () => {

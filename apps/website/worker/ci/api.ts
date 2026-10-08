@@ -181,6 +181,10 @@ async function runDetail(
       startedAt: job.started_at,
       finishedAt: job.finished_at,
       logsRemovedAt: job.logs_removed_at,
+      verifiedBy:
+        job.status === "skipped" && job.verified_by
+          ? (JSON.parse(job.verified_by) as NonNullable<CiJob["verifiedBy"]>)
+          : null,
       steps: stepRows
         .filter((s) => s.job_id === job.id)
         .map((s) => ({

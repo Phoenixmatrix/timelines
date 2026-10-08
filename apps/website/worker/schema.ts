@@ -871,6 +871,7 @@ export interface Database {
     landing_id: Generated<string | null>;
     /** Independent default-branch merge queue identity, not a timeline landing. */
     queue_id: Generated<string | null>;
+    queue_attempt: Generated<number | null>;
     /** 1 for a step run (CORE-235): the light run for a timeline push, never full CI. */
     step: Generated<number>;
     /** A timeline push run waits until then for its quiet period (CORE-238); null starts now. */
@@ -896,6 +897,9 @@ export interface Database {
     concurrency_claimed_at: Generated<string | null>;
     /** When retention removed its log text (CORE-200). */
     logs_removed_at: Generated<string | null>;
+    execution_identity: Generated<string | null>;
+    /** Pending candidate proposal; public verification only once consumed as skipped. */
+    verified_by: Generated<string | null>;
   };
   ci_steps: {
     job_id: string;

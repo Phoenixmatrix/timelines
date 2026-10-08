@@ -203,6 +203,7 @@ export default defineConfig(({ mode, isPreview }) => {
             }),
         // CI/CD.
         CI_RUNNER: bindings.text<Runner>(runner),
+        CI_VERSION: bindings.versionMetadata(),
         // Local runners start on demand: the CI Workflow pings the dev server,
         // which runs `gm runner --once` per queued job (vite/ci-runners.ts).
         ...(runner === "local" && dev && publicUrl

@@ -62,6 +62,11 @@ async function fixture(
       );
     await put(".gitignore", ".cloudflare/\n");
     await put("apps/website/.cloudflare/types/index.d.ts", "// generated\n");
+    for (const name of ["app", "tokens", "matrixkit"])
+      await put(
+        `apps/website/src/styles/${name}.css`,
+        '@import "./base.css";\n.a { color: red; }\n',
+      );
     await git(["add", "."]);
     await git(["commit", "-m", "baseline"]);
     await git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
@@ -127,15 +132,15 @@ await test("website production changes propagate implicit TS consumers without R
     assert.equal(plan.full, false);
     assert.equal(plan.e2e, true);
     assert.deepEqual(targets(plan), [
+      "website#typecheck",
       "@gitmatrix/agent#typecheck",
       "@gitmatrix/agent#test",
       "@gitmatrix/preview#typecheck",
       "@gitmatrix/preview#test",
-      "website#typecheck",
       "website#test",
       "website#build",
     ]);
-    assert.deepEqual(names(plan).slice(0, 2), ["bindings", "check"]);
+    assert.deepEqual(names(plan).slice(0, 2), ["website-types", "check"]);
   });
 });
 
@@ -267,12 +272,11 @@ await test("unknown/global paths, task manifests and shared harness changes fail
         path,
       );
       assert.deepEqual(names(plan), [
-        "bindings",
+        "website-types",
         "check",
         "cli-check",
         "types",
         "preview-types",
-        "website-types",
         "formats-types",
         "testing-types",
         "tests",
@@ -296,6 +300,82 @@ await test("unknown/global paths, task manifests and shared harness changes fail
       ]);
     });
   }
+});
+
+await test("content-only audited stylesheets retain every website gate and E2E", async () => {
+  for (const name of ["app", "tokens", "matrixkit"]) {
+    await fixture(async (root, _git, put) => {
+      await put(
+        `apps/website/src/styles/${name}.css`,
+        '@import "./base.css";\n.a { color: blue; }\n',
+      );
+      await rm(join(root, "apps/website/.cloudflare"), { recursive: true });
+      const plan = await readinessPlan(root, options);
+      assert.deepEqual(names(plan), ["website-types", "check", "website-tests", "website-build"]);
+      assert.deepEqual(targets(plan), ["website#typecheck", "website#test", "website#build"]);
+      assert.equal(plan.e2e, true);
+    });
+  }
+});
+
+await test("stylesheet names, imports, configuration and mixed inputs widen conservatively", async () => {
+  for (const change of [
+    "add",
+    "delete",
+    "rename",
+    "import",
+    "multiline-import",
+    "comment-import",
+    "mixed",
+    "config",
+    "index-delete",
+    "committed-import",
+  ]) {
+    await fixture(async (root, git, put) => {
+      const path = "apps/website/src/styles/app.css";
+      await put(path, '@import "./base.css";\n.a { color: blue; }\n');
+      if (change === "add") {
+        await git(["rm", "--cached", path]);
+        await git(["commit", "-m", "remove stylesheet"]);
+        await git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        await put(path);
+      } else if (change === "delete") await rm(join(root, path));
+      else if (change === "rename")
+        await rename(join(root, path), join(root, "apps/website/src/styles/new.css"));
+      else if (change === "import") await put(path, '@import "./new.css";\n.a { color: blue; }\n');
+      else if (change === "multiline-import")
+        await put(path, '@import\n"./new.css";\n.a { color: blue; }\n');
+      else if (change === "comment-import")
+        await put(path, '/* @import "./base.css"; */\n.a { color: blue; }\n');
+      else if (change === "mixed") await put("apps/website/src/routes/Home.tsx");
+      else if (change === "config") await put("apps/website/vite.config.ts");
+      else if (change === "index-delete") {
+        await git(["rm", "--cached", path]);
+      } else {
+        await put(path, '@import "./new.css";\n.a { color: blue; }\n');
+        await git(["add", path]);
+        await git(["commit", "-m", "change import"]);
+        await put(path, '@import "./base.css";\n.a { color: blue; }\n');
+      }
+      const plan = await readinessPlan(root, options);
+      assert.ok(targets(plan).includes("@gitmatrix/agent#test"), change);
+      assert.ok(targets(plan).includes("@gitmatrix/preview#test"), change);
+      assert.equal(plan.e2e, true, change);
+    });
+  }
+});
+
+await test("full and website profiles generate bindings exactly once before their consumers", async () => {
+  await fixture(async (root, _git, put) => {
+    await rm(join(root, "apps/website/.cloudflare"), { recursive: true });
+    await put("apps/website/worker/index.test.ts");
+    for (const all of [false, true]) {
+      const plan = await readinessPlan(root, { ...options, all });
+      assert.deepEqual(names(plan).slice(0, 2), ["website-types", "check"]);
+      assert.equal(names(plan).filter((name) => name === "website-types").length, 1);
+      assert.ok(!names(plan).includes("bindings"));
+    }
+  });
 });
 
 await test("runtime markdown and fixtures are not discarded as documentation or tests", async () => {

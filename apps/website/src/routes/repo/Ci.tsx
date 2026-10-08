@@ -3,6 +3,7 @@ import {
   GitBranchIcon,
   PackageIcon,
   PlayIcon,
+  ShieldCheckIcon,
   StopIcon,
 } from "@phosphor-icons/react";
 import { Suspense, useEffect, useRef, useState } from "react";
@@ -528,8 +529,8 @@ function useJobLog(owner: string, name: string, job: CiJob) {
   const active = isActive(job.status);
 
   useEffect(() => {
-    // Retention removed the text: there's nothing to fetch.
-    if ((log.done && !active) || job.logsRemovedAt) return;
+    // Reused verification has no execution output; retention also leaves nothing to fetch.
+    if (job.verifiedBy || (log.done && !active) || job.logsRemovedAt) return;
     let stopped = false;
     const timer = setTimeout(
       async () => {
@@ -556,7 +557,7 @@ function useJobLog(owner: string, name: string, job: CiJob) {
       stopped = true;
       clearTimeout(timer);
     };
-  }, [owner, name, job.id, job.logsRemovedAt, log, active]);
+  }, [owner, name, job.id, job.verifiedBy, job.logsRemovedAt, log, active]);
 
   return log;
 }
@@ -629,50 +630,90 @@ function JobPanel({ job }: { job: CiJob }) {
   const repo = useRepo();
   const log = useJobLog(repo.owner.slug, repo.name, job);
   const setup = log.byStep.get(SETUP_STEP) ?? "";
+  const verification = job.verifiedBy;
   return (
-    <section className="min-w-0 overflow-hidden rounded-pane bg-pane">
+    <section
+      aria-label={`${job.name} job`}
+      className="min-w-0 overflow-hidden rounded-pane bg-pane"
+    >
       <header className="flex flex-wrap items-center gap-3 border-b border-line-soft px-4 py-3">
-        <CiStatusIcon status={job.status} className="size-5" />
+        {verification ? (
+          <ShieldCheckIcon className="size-5 shrink-0 text-online" aria-hidden />
+        ) : (
+          <CiStatusIcon status={job.status} className="size-5" />
+        )}
         <h3 className="m-0 text-title">{job.name}</h3>
         <span className="text-body-sm text-ink-faint">
-          {ciLabel(job.status)}
-          {job.startedAt && ` · ${duration(job.startedAt, job.finishedAt)}`}
-          {job.claimedBy && ` · ${job.runner === "sandbox" ? "Cloudflare Sandbox" : job.claimedBy}`}
+          {verification ? "Verified" : ciLabel(job.status)}
+          {!verification && job.startedAt && ` · ${duration(job.startedAt, job.finishedAt)}`}
+          {!verification &&
+            job.claimedBy &&
+            ` · ${job.runner === "sandbox" ? "Cloudflare Sandbox" : job.claimedBy}`}
         </span>
       </header>
-      {job.error && (
-        <p className="m-0 border-b border-line-soft bg-danger-wash px-4 py-2.5 text-body-sm text-danger-text">
-          {job.error}
-        </p>
+      {verification ? (
+        <div className="space-y-3 px-4 py-3 text-body-sm text-ink-muted">
+          <p className="m-0">
+            Verified by{" "}
+            <Link
+              to={`${repoPath(repo.owner.slug, repo.name, "ci", String(verification.runNumber))}?job=${encodeURIComponent(verification.jobId)}`}
+              className="text-ink underline hover:text-signal"
+            >
+              run #{verification.runNumber}, producer job
+            </Link>
+            . This job did not run; its steps were skipped and it has no execution logs or duration.
+          </p>
+          <dl className="m-0 space-y-2">
+            <div>
+              <dt className="text-ink-faint">Verified commit</dt>
+              <dd className="mk-mono m-0 break-all">{verification.commit}</dd>
+            </div>
+            <div>
+              <dt className="text-ink-faint">Queue attempt</dt>
+              <dd className="m-0 break-words">
+                <span className="mk-mono break-all">{verification.queueId}</span>
+                {" · "}attempt {verification.attempt}
+              </dd>
+            </div>
+          </dl>
+        </div>
+      ) : (
+        <>
+          {job.error && (
+            <p className="m-0 border-b border-line-soft bg-danger-wash px-4 py-2.5 text-body-sm text-danger-text">
+              {job.error}
+            </p>
+          )}
+          {job.logsRemovedAt && (
+            <p className="m-0 border-b border-line-soft bg-sunken px-4 py-2.5 text-body-sm text-ink-muted">
+              Logs removed by retention on {fullDate(job.logsRemovedAt)}.
+            </p>
+          )}
+          {(setup || job.startedAt) && (
+            <StepLog
+              title="Set up"
+              status={setupStatus(job)}
+              exitCode={null}
+              time=""
+              text={setup}
+              open={false}
+              removed={job.logsRemovedAt !== null}
+            />
+          )}
+          {job.steps.map((step) => (
+            <StepLog
+              key={step.position}
+              title={step.name}
+              status={step.status}
+              exitCode={step.exitCode}
+              time={duration(step.startedAt, step.finishedAt)}
+              text={log.byStep.get(step.position) ?? ""}
+              open={step.status === "running" || step.status === "failed"}
+              removed={job.logsRemovedAt !== null}
+            />
+          ))}
+        </>
       )}
-      {job.logsRemovedAt && (
-        <p className="m-0 border-b border-line-soft bg-sunken px-4 py-2.5 text-body-sm text-ink-muted">
-          Logs removed by retention on {fullDate(job.logsRemovedAt)}.
-        </p>
-      )}
-      {(setup || job.startedAt) && (
-        <StepLog
-          title="Set up"
-          status={setupStatus(job)}
-          exitCode={null}
-          time=""
-          text={setup}
-          open={false}
-          removed={job.logsRemovedAt !== null}
-        />
-      )}
-      {job.steps.map((step) => (
-        <StepLog
-          key={step.position}
-          title={step.name}
-          status={step.status}
-          exitCode={step.exitCode}
-          time={duration(step.startedAt, step.finishedAt)}
-          text={log.byStep.get(step.position) ?? ""}
-          open={step.status === "running" || step.status === "failed"}
-          removed={job.logsRemovedAt !== null}
-        />
-      ))}
     </section>
   );
 }
@@ -694,6 +735,7 @@ export function CiRun() {
   });
 
   const chosen =
+    run.jobs.find((j) => j.id === params.get("job")) ??
     run.jobs.find((j) => j.name === params.get("job")) ??
     run.jobs.find((j) => j.status === "running") ??
     run.jobs.find((j) => j.status === "failed") ??
@@ -897,10 +939,18 @@ export function CiRun() {
                     }
                     className="flex w-full cursor-pointer items-center gap-2 rounded-control border-0 bg-transparent px-3 py-2 text-left text-ink hover:bg-raised aria-[current=true]:bg-raised"
                   >
-                    <CiStatusIcon status={job.status} />
+                    {job.verifiedBy ? (
+                      <ShieldCheckIcon className="size-4 shrink-0 text-online" aria-hidden />
+                    ) : (
+                      <CiStatusIcon status={job.status} />
+                    )}
                     <span className="min-w-0 flex-1 truncate font-semibold">{job.name}</span>
                     <span className="mk-mono text-mono text-ink-faint">
-                      {duration(job.startedAt, job.finishedAt)}
+                      {job.verifiedBy
+                        ? "Verified"
+                        : job.status === "skipped"
+                          ? ciLabel(job.status)
+                          : duration(job.startedAt, job.finishedAt)}
                     </span>
                   </button>
                   {job.needs.length > 0 && (

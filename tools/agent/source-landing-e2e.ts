@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Landing, TimelineDetail, TimelineRepo } from "../../apps/website/shared/timelines.ts";
 import type { HarnessContext, SeedManifest } from "./types.ts";
-import type { CiRunDetail } from "../../apps/website/shared/api.ts";
+import type { CiRunDetail, CiRunList } from "../../apps/website/shared/api.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import {
   queueFixture,
@@ -52,6 +52,21 @@ export async function runSourceLandingE2E(
   const owned: Fixture[] = [];
   const slugs: string[] = [];
   const tag = randomUUID().slice(0, 8);
+  let phase: { name: string; started: number } | undefined;
+  const finishPhase = (outcome: "passed" | "failed") => {
+    if (!phase) return;
+    record({
+      event: "e2e.phase",
+      name: `source-landing.${phase.name}`,
+      elapsedMs: performance.now() - phase.started,
+      outcome,
+    });
+    phase = undefined;
+  };
+  const beginPhase = (name: string) => {
+    finishPhase("passed");
+    phase = { name, started: performance.now() };
+  };
   const path = (slug: string) => `/api/tracker/orbit/timelines/${slug}`;
   async function poll<T>(
     read: () => Promise<T>,
@@ -59,11 +74,11 @@ export async function runSourceLandingE2E(
     label: string,
     timeout = 300_000,
   ): Promise<T> {
-    const deadline = Date.now() + timeout;
+    const deadline = performance.now() + timeout;
     for (;;) {
       const value = await read();
       if (done(value)) return value;
-      assert(Date.now() < deadline, `Landing fixture timed out: ${label}`);
+      assert(performance.now() < deadline, `Landing fixture timed out: ${label}`);
       await delay(1000);
     }
   }
@@ -75,6 +90,7 @@ export async function runSourceLandingE2E(
   };
   let failure: unknown;
   try {
+    beginPhase("fixture");
     const a = await queueFixture(ctx, fixtures, record);
     owned.push(a);
     const b = await queueFixture(ctx, fixtures, record);
@@ -99,6 +115,7 @@ export async function runSourceLandingE2E(
       );
       await f.git(["push", "origin", "HEAD:main"]);
     }
+    finishPhase("passed");
     const control = (slug: string, action: string, extra: object = {}) =>
       a.json<Control>(
         "/api/dev/landing-fixtures",
@@ -125,18 +142,72 @@ export async function runSourceLandingE2E(
         slug,
       );
     const waitBarrier = async (slug: string) => {
-      const state = await poll(
-        () => control(slug, "tick"),
-        (value) => value.barrier?.hit === 1,
-        `${slug} boundary`,
-      );
-      return state.barrier?.point === "after-receipt"
-        ? poll(
-            () => current(slug),
-            (value) => value.repos.some((repo) => repo.state === "advanced"),
-            `${slug} durable receipt save`,
-          )
-        : current(slug);
+      let lastControl: Control | undefined;
+      try {
+        const state = await poll(
+          async () => (lastControl = await control(slug, "tick")),
+          (value) => value.barrier?.hit === 1,
+          `${slug} boundary`,
+        );
+        return state.barrier?.point === "after-receipt"
+          ? await poll(
+              () => current(slug),
+              (value) => value.repos.some((repo) => repo.state === "advanced"),
+              `${slug} durable receipt save`,
+            )
+          : await current(slug);
+      } catch (error) {
+        // Preserve the failed wait, but retain the state cleanup is about to erase.
+        // These reads never tick, release a barrier, or restart a failed landing.
+        const capture = async <T>(kind: string, read: () => Promise<T>): Promise<T | undefined> => {
+          try {
+            const value = await read();
+            record({ event: "source-landing.boundary-failure", scenario: slug, kind, value });
+            return value;
+          } catch (diagnosticError) {
+            record({
+              event: "source-landing.boundary-failure",
+              scenario: slug,
+              kind,
+              error: String(diagnosticError),
+            });
+            return undefined;
+          }
+        };
+        record({
+          event: "source-landing.boundary-failure",
+          scenario: slug,
+          kind: "last-tick",
+          value: lastControl ?? null,
+          error: String(error),
+        });
+        const snapshot = await capture("landing", () =>
+          a.json<{ landing: Landing | null }>(`${path(slug)}/landing`),
+        );
+        await capture("control", () => control(slug, "inspect", { diagnostics: true }));
+        for (const f of owned) {
+          const list = await capture(`${f.repo}:ci`, () => f.json<CiRunList>(`${f.api}/ci`));
+          const repo = snapshot?.landing?.repos.find(
+            (value) => `${value.owner}/${value.name}` === f.repo,
+          );
+          const numbers = new Set(
+            [repo?.mergeRun?.number, repo?.gateRun?.number].filter(
+              (number): number is number => number !== undefined && number > 0,
+            ),
+          );
+          for (const run of list?.runs ?? [])
+            if (
+              run.landing &&
+              (run.landing.timeline === slug || run.landing.id === snapshot?.landing?.id)
+            )
+              numbers.add(run.number);
+          for (const number of numbers)
+            await capture(`${f.repo}:ci:${number}`, () =>
+              f.json<CiRunDetail>(`${f.api}/ci/runs/${number}`),
+            );
+        }
+        throw error;
+      }
     };
     const resume = async (slug: string) => {
       await control(slug, "release");
@@ -287,6 +358,7 @@ export async function runSourceLandingE2E(
       return landed;
     }
     // Both gates execute against real compact candidates. A green A is insufficient.
+    beginPhase("failing-gate");
     const failing = await start("failing-gate", undefined, true);
     const failed = await stopped(failing.slug);
     assert.equal(failed.state, "failed");
@@ -295,6 +367,7 @@ export async function runSourceLandingE2E(
     await a.json(`${path(failing.slug)}/abandon`, "POST", {}, [200]);
     record({ scenario: failing.slug, state: failed.state, unchangedMains: failing.before });
 
+    beginPhase("moving-before-cas");
     const moving = await start("moving-before-cas", "prepared");
     const prepared = await waitBarrier(moving.slug);
     assert(prepared.repos.every((repo) => repo.state === "tested"));
@@ -320,6 +393,7 @@ export async function runSourceLandingE2E(
     assert.equal(newB.attempt, oldB.attempt + 1);
 
     for (const point of ["before-cas", "after-cas", "before-finalize"] as const) {
+      beginPhase(point);
       const s = await start(point, point);
       const paused = await waitBarrier(s.slug);
       const ledger = (await control(s.slug, "inspect")).receipts;
@@ -344,6 +418,7 @@ export async function runSourceLandingE2E(
     }
 
     for (const cancel of [false, true]) {
+      beginPhase(cancel ? "cancel-partial" : "retry-partial");
       const s = await start(cancel ? "cancel-partial" : "retry-partial", "after-receipt");
       const paused = await waitBarrier(s.slug);
       const fixedA = paused.repos.find((repo) => repo.id === s.first.id)!;
@@ -412,6 +487,7 @@ export async function runSourceLandingE2E(
     }
 
     for (const resetToBase of [false, true]) {
+      beginPhase(resetToBase ? "unknown-base-reset" : "unknown-rewrite");
       const unknown = await start(
         resetToBase ? "unknown-base-reset" : "unknown-rewrite",
         "after-cas",
@@ -462,11 +538,14 @@ export async function runSourceLandingE2E(
         uncertain.merge,
       );
     }
+    finishPhase("passed");
   } catch (error) {
+    finishPhase("failed");
     failure = error;
   }
   // Cleanup always runs; it reports its own failures and the scenario's.
   {
+    beginPhase("cleanup");
     const errors: unknown[] = [];
     for (const slug of slugs) {
       try {
@@ -513,6 +592,7 @@ export async function runSourceLandingE2E(
         errors.push(error);
       }
     }
+    finishPhase(errors.length ? "failed" : "passed");
     // Name what failed; when the scenario failed too, keep its error first.
     const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
     if (errors.length) {
