@@ -15,7 +15,7 @@ index 4110cf463ffdba5a547f3e14434d7fff4133da27..1fac2b86525db9c8842d36c8b77737bc
      const fullPath = sysPath2.resolve(path84);
      isDirectory3 = isDirectory3 != null ? isDirectory3 : this._watched.has(path84) || this._watched.has(fullPath);
 diff --git a/dist/src/workers/shared/remote-proxy-client.worker.js b/dist/src/workers/shared/remote-proxy-client.worker.js
-index 7a556761f2992280a8ab15adf8bec759ae3a4266..f6e331e4315ffd85ee410a1240b87c5938578d13 100644
+index 7a556761f2992280a8ab15adf8bec759ae3a4266..57fb7b8b929d64bc22ff9bdd5f1e54ab2ddde6ae 100644
 --- a/dist/src/workers/shared/remote-proxy-client.worker.js
 +++ b/dist/src/workers/shared/remote-proxy-client.worker.js
 @@ -2561,13 +2561,32 @@ function makeRemoteProxyStub(remoteProxyConnectionString, bindingName, metadata,
@@ -52,3 +52,101 @@ index 7a556761f2992280a8ab15adf8bec759ae3a4266..f6e331e4315ffd85ee410a1240b87c59
        return p === "fetch" ? makeFetch(
          remoteProxyConnectionString,
          bindingName,
+@@ -2579,6 +2598,77 @@ function makeRemoteProxyStub(remoteProxyConnectionString, bindingName, metadata,
+   });
+ }
+ 
++// Gitmatrix (CORE-305): even kept alive, about 1 in 100 to 500 fresh calls
++// through the remote proxy fails with close 1006. Each ARTIFACTS call opens
++// its own session, so a read that failed that way is retried on a new one
++// (a repo handle is opened again there). Writes are never retried: their
++// outcome is unknown.
++function gitmatrixDropped(error) {
++  return /Peer closed WebSocket: 1006/.test(String(error?.message ?? error));
++}
++async function gitmatrixRetry(attempt) {
++  for (let tries = 1; ; tries++)
++    try {
++      return await attempt(tries > 1);
++    } catch (error) {
++      if (tries >= 3 || !gitmatrixDropped(error)) throw error;
++      await new Promise((resolve) => setTimeout(resolve, 250 * tries));
++    }
++}
++var GitmatrixRepo = class extends cfw.RpcTarget {
++  #repo;
++  #reopen;
++  constructor(repo, reopen) {
++    super(), this.#repo = repo, this.#reopen = reopen;
++  }
++  #read(method, args) {
++    return gitmatrixRetry(async (again) => {
++      if (again) {
++        let repo = await this.#reopen();
++        try {
++          this.#repo[Symbol.dispose]?.();
++        } catch {
++        }
++        this.#repo = repo;
++      }
++      return this.#repo[method](...args);
++    });
++  }
++  info(...args) {
++    return this.#read("info", args);
++  }
++  listTokens(...args) {
++    return this.#read("listTokens", args);
++  }
++  readBlob(...args) {
++    return this.#read("readBlob", args);
++  }
++  readTree(...args) {
++    return this.#read("readTree", args);
++  }
++  readCommit(...args) {
++    return this.#read("readCommit", args);
++  }
++  readFile(...args) {
++    return this.#read("readFile", args);
++  }
++  log(...args) {
++    return this.#read("log", args);
++  }
++  createToken(...args) {
++    return this.#repo.createToken(...args);
++  }
++  revokeToken(...args) {
++    return this.#repo.revokeToken(...args);
++  }
++  fork(...args) {
++    return this.#repo.fork(...args);
++  }
++  [Symbol.dispose]() {
++    this.#repo[Symbol.dispose]?.();
++  }
++};
++
+ // src/workers/shared/remote-proxy-client.worker.ts
+ var Client = class extends WorkerEntrypoint {
+   fetch(request) {
+@@ -2630,6 +2720,19 @@ var Client = class extends WorkerEntrypoint {
+       get: (target, prop) => {
+         if (Reflect.has(target, prop))
+           return Reflect.get(target, prop);
++        if (ctx.props.binding === "ARTIFACTS" && (prop === "get" || prop === "list")) {
++          let fresh = () => makeRemoteProxyStub(
++            ctx.props.remoteProxyConnectionString,
++            ctx.props.binding,
++            void 0,
++            ctx.props.cfTraceId,
++            env[SharedBindings.MAYBE_SERVICE_LOOPBACK]
++          );
++          return (...args) => gitmatrixRetry(async (again) => {
++            let result = await (again ? fresh() : getStub())[prop](...args);
++            return prop === "get" ? new GitmatrixRepo(result, () => fresh().get(...args)) : result;
++          });
++        }
+         let rpcProperty, isRpcPropertyResolved = !1;
+         function getRpcProperty() {
+           return isRpcPropertyResolved || (rpcProperty = Reflect.get(getStub(), prop), isRpcPropertyResolved = !0), rpcProperty;
