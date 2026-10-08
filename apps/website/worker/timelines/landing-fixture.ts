@@ -14,8 +14,16 @@ export function landingFixtureEnabled(env: Env): boolean {
   return Reflect.get(env, "DEV_MODE") === "true" && typeof id === "string" && !!id.trim();
 }
 
+/**
+ * Whether the barrier had been hit when each step began: the step's first,
+ * pointless check records it (CORE-307).
+ */
+const hitOnEntry = new WeakMap<Landing, boolean>();
+
 /** Durable stop at a real boundary. No provider result or receipt is fabricated.
- * Once hit, every competing progress invocation stays stopped until explicit release.
+ * Once hit, every competing progress invocation stays stopped until explicit release,
+ * and a step that began before the hit stays stopped after it: what it read may
+ * predate the change the fixture makes while holding (a rewritten main).
  * Production and non-fixture timelines return before any storage access.
  */
 export async function landingFixtureBarrier(
@@ -42,9 +50,11 @@ export async function landingFixtureBarrier(
       .bind(landing.timelineId, point, repoId ?? null)
       .run();
   const barrier = await env.DB.prepare(
-    "SELECT hit FROM dev_landing_barriers WHERE timeline_id=? AND released=0",
+    "SELECT hit,released FROM dev_landing_barriers WHERE timeline_id=?",
   )
     .bind(landing.timelineId)
-    .first<{ hit: number }>();
-  return barrier?.hit === 1;
+    .first<{ hit: number; released: number }>();
+  const hit = barrier?.hit === 1;
+  if (!point) hitOnEntry.set(landing, hit);
+  return hit && (barrier.released === 0 || hitOnEntry.get(landing) === false);
 }
