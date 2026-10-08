@@ -59,6 +59,7 @@ import { SettingsPage } from "../../components/SettingsPage.tsx";
 import { FormError, popMotion, SelectField, Tip, useToast } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { useViewer } from "../../lib/session.ts";
+import { useMediaQuery } from "../../lib/useMediaQuery.ts";
 import { timelineQuery, type trackerLoader } from "./loaders.ts";
 import { TrackerAdmin } from "./Admin.tsx";
 import { CreateIssue } from "./CreateIssue.tsx";
@@ -163,6 +164,9 @@ function scopeLabel(query: string, now: number): string | null {
   };
   return `${fmt(since)} → ${fmt(until)}`;
 }
+
+/** Tailwind's lg: where the inspector sits beside the list or lens rather than replacing it. */
+const WIDE = "(min-width: 64rem)";
 
 export function Tracker() {
   const data = useLoaderData<typeof trackerLoader>();
@@ -506,16 +510,21 @@ function Workbench({ data }: { data: TrackerView }) {
     return activityOf(inScope, now);
   }, [snapshot.issues, compiled, now]);
   const scoped = scopeLabel(query, now);
+  const wide = useMediaQuery(WIDE);
   // The graph view is about relationships: an issue there is the lens's
-  // centre, and its details open beside it only when asked for.
+  // centre. Where the inspector fits beside the lens, its details open as in
+  // the list until closed (details=0); narrower, they would replace the lens,
+  // so they wait for Details (details=1).
+  const graphDetails = params.get("details");
   const showInspector =
     !!(selected || route.issue) &&
     view !== "chronicle" &&
-    (view !== "graph" || params.has("details"));
+    (view !== "graph" || (graphDetails === null ? wide : graphDetails !== "0"));
   const closeHref = (() => {
     if (view !== "graph" || !selected) return href();
     const next = new URLSearchParams(params);
-    next.delete("details");
+    if (wide) next.set("details", "0");
+    else next.delete("details");
     return `${base}/issues/${encodeURIComponent(selected.id)}?${next}`;
   })();
   // A query that already names one state makes the state column repeat itself.
