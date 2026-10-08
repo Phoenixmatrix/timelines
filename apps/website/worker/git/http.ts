@@ -43,10 +43,20 @@ const FORWARDED_RESPONSE_HEADERS = ["content-type", "cache-control", "expires", 
 export const gitHttp = new Hono<AppEnv>();
 gitHttp.onError((error, c) => {
   if (error instanceof TrackerError) return c.text(`${error.message}\n`, error.status);
-  // Provider exceptions may contain private remotes or credentials.
-  console.error("Git storage request failed.");
+  // Provider exceptions may contain private remotes or credentials: log only
+  // their scrubbed kind and message, enough to tell what failed (CORE-308).
+  console.error(`Git storage request failed: ${scrubbedError(error)}`);
   return c.text("Storage operation failed.\n", 500);
 });
+
+/** An error's name and message without URLs or anything shaped like a credential. */
+export function scrubbedError(error: unknown): string {
+  const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return text
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, "[url]")
+    .replace(/[A-Za-z0-9_+/=-]{24,}/g, "[redacted]")
+    .slice(0, 300);
+}
 
 gitHttp.get("/:owner/:repo{[^/]+\\.git}/info/refs", async (c) => {
   const service = c.req.query("service");

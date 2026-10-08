@@ -16,7 +16,7 @@ import { queueMergeJob } from "../ci/queue-auth.ts";
 import { queueCandidateBranch } from "../../shared/merge-queue.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { gitBackend, run, serve } from "../testing/git-http.ts";
-import { gitHttp, landingPushRefusal, queuePushRefusal } from "./http.ts";
+import { gitHttp, landingPushRefusal, queuePushRefusal, scrubbedError } from "./http.ts";
 import { FLUSH, pkt } from "./pktline.ts";
 import { afterPush } from "./effects.ts";
 import { steps } from "../steps/api.ts";
@@ -659,4 +659,25 @@ test("native clones select current work HEAD and hide inherited canonical branch
   expect(clone.status, clone.stderr).toBe(0);
   expect(git(destination, "rev-parse", "HEAD")).toBe(latest);
   expect(t.ref("refs/heads/main")).toBe(t.main);
+});
+
+describe("scrubbedError (CORE-308)", () => {
+  test("keeps what failed and drops remotes and credentials", () => {
+    expect(
+      scrubbedError(
+        new Error(
+          "Peer closed WebSocket: 1006 WebSocket disconnected without sending Close frame.",
+        ),
+      ),
+    ).toBe(
+      "Error: Peer closed WebSocket: 1006 WebSocket disconnected without sending Close frame.",
+    );
+    const leaked = scrubbedError(
+      new TypeError(
+        "fetch https://u:secret@acct.artifacts.cloudflare.net/ns/repo.git failed with Bearer art_v1_0123456789abcdefABCDEF0123",
+      ),
+    );
+    expect(leaked).toBe("TypeError: fetch [url] failed with Bearer [redacted]");
+    expect(scrubbedError("word ".repeat(200))).toHaveLength(300);
+  });
 });
