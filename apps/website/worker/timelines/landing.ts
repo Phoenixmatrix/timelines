@@ -775,12 +775,38 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
   return complete(ctx, landing);
 }
 
+/** Issue keys a compact commit carries, at most: what main's mention index reads from one commit. */
+const LANDED_KEYS = 20;
+
+/**
+ * The issue keys the work source's commits mention (CORE-296). The compact
+ * commit names them, so main's mention index keeps linking the issues to the
+ * work after the source's own commits (and their mentions) expire.
+ */
+export async function landedIssueKeys(
+  d1: D1Database,
+  repoId: string,
+  sourceId: string,
+): Promise<string[]> {
+  const rows = await db(d1)
+    .selectFrom("commit_issue_mentions")
+    .select("issue_key")
+    .distinct()
+    .where("repo_id", "=", repoId)
+    .where("source_id", "=", sourceId)
+    .orderBy("issue_key")
+    .limit(LANDED_KEYS)
+    .execute();
+  return rows.map((row) => row.issue_key);
+}
+
 /** Start the trusted materializer without ever staging the source commit canonically. */
 async function startMerge(ctx: Context, landing: Landing, repoId: string, tip: string | null) {
   const repo = landing.repos.find((r) => r.id === repoId)!;
   const r = ctx.rows.get(repoId)!;
   const branch = landingBranch(landing.slug);
   if (!repo.source || !repo.logicalBase) throw new Error("migration_required");
+  const keys = await landedIssueKeys(ctx.env.DB, repoId, repo.source.sourceId);
   await ctx.deps.startMerge(r, {
     runId: repo.mergeRun!.id,
     landingId: landing.id,
@@ -793,7 +819,7 @@ async function startMerge(ctx: Context, landing: Landing, repoId: string, tip: s
     old: tip,
     mainBranch: r.default_branch,
     title: `Land ${landing.slug} (checkpoint #${landing.checkpointNumber}): compact into ${r.default_branch}`,
-    message: `Land timeline ${landing.slug} (checkpoint #${landing.checkpointNumber})\n\nSource: ${repo.source.sourceId}\nCheckpoint: ${landing.checkpointId}`,
+    message: `Land timeline ${landing.slug} (checkpoint #${landing.checkpointNumber})\n\nSource: ${repo.source.sourceId}\nCheckpoint: ${landing.checkpointId}${keys.length ? `\nIssues: ${keys.join(" ")}` : ""}`,
     author: { name: "Gitmatrix", email: "landing@gitmatrix.invalid" },
     actor: { id: landing.requestedBy.accountableId, agentId: landing.requestedBy.agentId },
   });

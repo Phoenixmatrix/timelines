@@ -45,8 +45,12 @@ const COMMITS = 60;
 const enc = encodeURIComponent;
 const repoHref = (repo: WorkRepo, ...rest: string[]) =>
   `/${repo.owner}/${repo.name}${rest.length ? `/${rest.join("/")}` : ""}`;
-/** The commit panel (CORE-22): the repository's page with `?commit=<full sha>`. */
-const commitHref = (repo: WorkRepo, oid: string) => `${repoHref(repo)}?commit=${oid}`;
+/**
+ * The commit panel (CORE-22): the repository's page with `?commit=<full sha>`,
+ * in the work source that has the commit when it isn't main's (CORE-296).
+ */
+const commitHref = (repo: WorkRepo, oid: string, source = "canonical") =>
+  `${repoHref(repo)}?${source === "canonical" ? "" : `source=${enc(source)}&`}commit=${oid}`;
 
 function shorten(text: string, max = 280): string {
   const plain = text.trim().replace(/\s+/g, " ");
@@ -367,6 +371,7 @@ export async function linkedWork(
       "m.committed_at",
       "m.first_ref",
       "m.pushed_at",
+      "m.source_id",
       "r.name",
       "o.slug as owner_slug",
     ])
@@ -399,7 +404,7 @@ export async function linkedWork(
       committedAt: row.committed_at,
       ref: row.first_ref,
       pushedAt: row.pushed_at,
-      href: commitHref(repo, row.commit_oid),
+      href: commitHref(repo, row.commit_oid, row.source_id),
       runs: mentionRuns
         .filter((r) => r.repo_id === row.repo_id && r.commit_oid === row.commit_oid)
         .map((r) => workRun(r, repo))

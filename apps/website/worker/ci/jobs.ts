@@ -71,9 +71,6 @@ export async function jobPayload(
   const spec = JSON.parse(job.spec) as StoredJob;
   const secrets = await secretsFor(d1, job.repo_id, spec.secrets);
   const setup = registrySetup(registry.origin, job.full_name.split("/")[0] ?? "", registry.token);
-  // The preview contract (CORE-79): a preview run names its timeline,
-  // checkpoint and action; a push to a timeline's bookmark names the timeline.
-  const timeline = job.timeline_slug ?? timelineSlugOf(`refs/heads/${job.ref}`);
   const owned =
     job.source_id === "canonical"
       ? null
@@ -86,6 +83,10 @@ export async function jobPayload(
   if (job.source_id !== "canonical" && !owned)
     throw new Error("Job's exact work source is unavailable.");
   const timelineSlug = owned?.timeline_slug ?? null;
+  // The preview contract (CORE-79): a preview run names its timeline,
+  // checkpoint and action; a push to a timeline's bookmark, or to its work
+  // source (whose ref is just `work`, CORE-296), names the timeline.
+  const timeline = job.timeline_slug ?? timelineSlug ?? timelineSlugOf(`refs/heads/${job.ref}`);
   const gitUrl = `${registry.origin}/${job.full_name}${timelineSlug ? `@${encodeURIComponent(timelineSlug)}` : ""}.git`;
   return {
     id: job.id,

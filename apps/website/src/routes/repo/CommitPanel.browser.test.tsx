@@ -10,7 +10,7 @@
 
 import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
-import type { CiRunList, CiRunSummary } from "../../../shared/api.ts";
+import type { CiRunList, CiRunSummary, RepoDetail } from "../../../shared/api.ts";
 import type { Deployment, DeploymentList } from "../../../shared/deployments.ts";
 import type { CommitDiff } from "../../../shared/diff.ts";
 import type { Published } from "../../../shared/packages.ts";
@@ -355,6 +355,42 @@ test("?commit= opens every section over the page; Escape closes back to it", asy
     (url) => url.pathname === "/orbit/engine" && !url.searchParams.has("commit"),
   );
   await expect.element(page.getByRole("region", { name: "Repository files" })).toBeVisible();
+});
+
+test("on a work source's page it reads the commit from that source (CORE-296)", async () => {
+  const { server, head } = await world();
+  // The page is the repository's timeline work source: the layout reads it from `?source=`.
+  const detail = await server.call<RepoDetail>("GET", "/api/repos/orbit/engine");
+  server.on("GET", "/api/repos/:owner/:name", ({ url }) =>
+    url.searchParams.get("source") === "work_1"
+      ? {
+          ...detail,
+          source: {
+            sourceId: "work_1",
+            repoId: detail.id,
+            kind: "timeline-work",
+            timelineId: "tl_1",
+            ref: "refs/heads/work",
+          },
+          sourceState: "ready",
+        }
+      : detail,
+  );
+  const mark = server.requests.length;
+  renderApp(`/orbit/engine?source=work_1&commit=${head}`);
+  const dialog = panel(head);
+  await expect.element(dialog.getByText("Rank results by recency").first()).toBeVisible();
+  await expect
+    .element(dialog.getByRole("link", { name: "Browse files at this commit" }))
+    .toHaveAttribute("href", `/orbit/engine/tree/${head}?source=work_1`);
+  const read = (suffix: string) =>
+    server
+      .since(mark, "/api/repos/orbit/engine/")
+      .filter((r) => r.url.pathname.endsWith(suffix))
+      .map((r) => r.url.searchParams.get("source"));
+  expect(read(`/commits/${head}/diff`)).toContain("work_1");
+  await expect.poll(() => read("/why")).toContain("work_1");
+  await expect.poll(() => read("/ci")).toContain("work_1");
 });
 
 test("a SHA link opens it in place, parents open inside, and closing goes Back to the page", async () => {

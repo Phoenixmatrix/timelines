@@ -119,7 +119,7 @@ describe("indexing mentions on push", () => {
     const b = g.commit("NOVA-3 docs, ZED-5 isn't ours", null, a);
     const env = { DB: w.db } as Env;
     const logged = await recordRefs(w.db, "app", new Map([["refs/heads/main", b]]), null, g.read);
-    await indexPushedMentions(env, "app", logged, w.lookup);
+    await indexPushedMentions(env, "app", logged, { lookup: w.lookup });
     expect(w.mentions()).toEqual([
       {
         repo_id: "app",
@@ -151,6 +151,26 @@ describe("indexing mentions on push", () => {
     // once (orbit, subscribed, isn't asked again as Ann's org); zed never.
     expect(w.lookups.map((l) => l.owner)).toEqual(["orbit", "ann", "nova"]);
     expect(w.lookups[1]!.keys).not.toContain("CORE-1");
+  });
+
+  test("a work source's push records its mentions as that source's (CORE-296)", async () => {
+    const w = world();
+    const g = graph();
+    const main = g.commit("Base", null);
+    const work = g.commit("CORE-1: Rank results in the timeline", null, main);
+    const env = { DB: w.db } as Env;
+    const logged = await recordRefs(
+      w.db,
+      "app",
+      new Map([["refs/heads/work", work]]),
+      null,
+      g.read,
+      "work_1",
+    );
+    await indexPushedMentions(env, "app", logged, { sourceId: "work_1", lookup: w.lookup });
+    expect(
+      w.sqlite.prepare("SELECT commit_oid, issue_key, source_id FROM commit_issue_mentions").all(),
+    ).toEqual([{ commit_oid: work, issue_key: "CORE-1", source_id: "work_1" }]);
   });
 
   test("is idempotent: a commit seen again keeps where and when it was first seen", async () => {

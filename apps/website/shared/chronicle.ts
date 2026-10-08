@@ -498,7 +498,10 @@ export interface WorkMention {
   /** The branch or tag whose push first made it reachable; null when found in history. */
   ref: string | null;
   pushedAt: string;
-  /** Opens the commit panel: `/<owner>/<repo>?commit=<oid>`. */
+  /**
+   * Opens the commit panel: `/<owner>/<repo>?commit=<oid>`, with `source=<id>`
+   * for a commit in a timeline's work source (CORE-296).
+   */
   href: string;
   runs: WorkRun[];
   packages: WorkPackage[];

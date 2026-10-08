@@ -173,6 +173,11 @@ describe("owned source retention", () => {
 
   test("legacy end evidence survives detail removal before independent Git expiry", async () => {
     const f = fixture();
+    // Its commits' mentions go with the source; main's stay (CORE-296).
+    f.sql
+      .exec(`INSERT INTO commit_issue_mentions (repo_id, commit_oid, issue_key, resolution, source_id)
+      VALUES ('repo', 'w1', 'CORE-9', 'linked', 'work_owned'),
+             ('repo', 'c1', 'CORE-9', 'linked', 'canonical')`);
     f.sql.exec(
       "UPDATE timeline_work_sources SET archive_disposition=NULL WHERE source_id='work_owned'",
     );
@@ -220,6 +225,9 @@ describe("owned source retention", () => {
     );
     expect(f.state()).toBe("purged");
     expect(f.names.has("owned")).toBe(false);
+    expect(f.sql.prepare("SELECT commit_oid, source_id FROM commit_issue_mentions").all()).toEqual([
+      { commit_oid: "c1", source_id: "canonical" },
+    ]);
     f.sql.close();
     f.durable.db.close();
   });

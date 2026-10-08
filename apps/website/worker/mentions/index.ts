@@ -18,6 +18,11 @@
 // otherwise the key is ambiguous and recorded unresolved. A key no tracker
 // knows (an external tracker's, `UTF-8`) isn't recorded. Only Gitmatrix
 // trackers are ever consulted.
+//
+// A mention belongs to the code source whose push recorded it (CORE-296): a
+// timeline's work source until its compact commit lands, and it goes with the
+// source when retention purges it. The compact commit names the source's keys
+// (worker/timelines/landing.ts), so main's own mention outlives the work.
 
 import { sql } from "kysely";
 import type { ShippedIssue } from "../../shared/release-notes.ts";
@@ -188,6 +193,7 @@ export async function indexMentions(
   repoId: string,
   commits: MentionCommit[],
   lookup: IssueLookup,
+  sourceId = "canonical",
 ): Promise<{ linked: number; ambiguous: number }> {
   const byOid = new Map<string, MentionCommit & { keys: string[] }>();
   for (const commit of commits) {
@@ -224,6 +230,7 @@ export async function indexMentions(
             commit.committedAt === null ? null : new Date(commit.committedAt * 1000).toISOString(),
           first_ref: commit.ref,
           pushed_at: new Date().toISOString(),
+          source_id: sourceId,
         },
       ];
     }),
@@ -252,7 +259,7 @@ export async function indexMentions(
   };
 }
 
-/** After a push: index the commits each logged update read. Never throws. */
+/** After a push to `sourceId`: index the commits each logged update read. Never throws. */
 export async function indexPushedMentions(
   env: Env,
   repoId: string,
@@ -265,7 +272,10 @@ export async function indexPushedMentions(
       committedAt?: number | null;
     }[];
   }[],
-  lookup: IssueLookup = trackerLookup(env),
+  {
+    sourceId = "canonical",
+    lookup = trackerLookup(env),
+  }: { sourceId?: string; lookup?: IssueLookup } = {},
 ): Promise<void> {
   const commits: MentionCommit[] = updates.flatMap((update) =>
     (update.commits ?? []).map((commit) => ({
@@ -278,7 +288,7 @@ export async function indexPushedMentions(
   );
   if (!commits.some((c) => c.message)) return;
   try {
-    await indexMentions(env.DB, repoId, commits, lookup);
+    await indexMentions(env.DB, repoId, commits, lookup, sourceId);
   } catch (error) {
     console.error("Mentions: indexing a push failed", { repo: repoId, error });
   }
