@@ -552,11 +552,16 @@ async function gates(options: ReadyOptions): Promise<void> {
   await privateJson(join(directory, "selection.json"), selection);
   for (const { name, binary, args: commandArgs, cwd } of plan.gates) {
     console.log(JSON.stringify({ event: "gate.start", name }));
-    await command(binary, commandArgs, {
-      cwd: cwd === "website" ? website : root,
-      timeout: 1_800_000,
-      log: join(directory, `${name}.log`),
-    });
+    const run = () =>
+      command(binary, commandArgs, {
+        cwd: cwd === "website" ? website : root,
+        timeout: 1_800_000,
+        log: join(directory, `${name}.log`),
+      });
+    // Admission can wait longer than a gate may execute. Nested test runners
+    // inherit the held-lock marker rather than reacquiring inside their deadline.
+    if (name === "tests" || name === "website-tests") await heavyLock(name, run);
+    else await run();
     console.log(JSON.stringify({ event: "gate.pass", name }));
   }
   if (e2e) await heavyLock("live E2E", () => liveTest(false, undefined, e2e));

@@ -409,6 +409,10 @@ worker. If Chromium is still killed for memory ("Browser connection was
 closed"), the website's tests run the browser files it abandoned once more,
 one at a time; a failed assertion is never retried. A failed E2E scenario
 records the memory available when it failed.
+For full-suite and website test gates, `ready` acquires this lock before starting
+the 30-minute execution deadline. Waiting for another run uses the lock's separate
+90-minute admission deadline; nested test runners inherit ownership instead of
+acquiring the lock again.
 Locally, E2E runs on the trusted Linux host with Cloudflare login and user-systemd
 prerequisites. Local runners retain repo/job-scoped Cargo output caches outside
 checkouts; concurrent jobs lease separate slots. Tests still run every time.
