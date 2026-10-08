@@ -527,6 +527,9 @@ export async function releaseQuiet(
   return waiting.length;
 }
 
+/** Pauses before retrying a push's run start (CORE-305). */
+const START_RETRY_MS = [1_000, 4_000] as const;
+
 export async function onPush(
   env: Env,
   repo: CiRepo,
@@ -593,16 +596,28 @@ export async function onPush(
     // repository opts in; it never stands in for the push's own run.
     const triggers = isTimeline(repo, row.ref) ? (["push", "step"] as const) : (["push"] as const);
     for (const trigger of triggers) {
-      try {
-        await startRun(env, repo, {
-          branch: row.ref,
-          commit: row.oid,
-          trigger,
-          actor,
-          waitUntil,
-        });
-      } catch (error) {
-        console.error("CI: could not start a run", { repo: repo.id, ref: row.ref, trigger, error });
+      // A transient provider error is retried in place; startRun finds a run
+      // an earlier attempt started, so a retry never starts a second one.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await startRun(env, repo, {
+            branch: row.ref,
+            commit: row.oid,
+            trigger,
+            actor,
+            waitUntil,
+          });
+          break;
+        } catch (error) {
+          const pause = START_RETRY_MS[attempt];
+          const detail = { repo: repo.id, ref: row.ref, trigger, error };
+          if (pause === undefined) {
+            console.error("CI: could not start a run", detail);
+            break;
+          }
+          console.warn("CI: starting a run failed; retrying it", detail);
+          await new Promise((resolve) => setTimeout(resolve, pause));
+        }
       }
     }
   }

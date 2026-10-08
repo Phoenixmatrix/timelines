@@ -136,7 +136,7 @@ function fakeArtifacts() {
     },
     get: async (name: string) => {
       if (!repos.has(name)) throw missing();
-      return { createToken: async () => ({ plaintext: "t" }) };
+      return { createToken: async () => ({ plaintext: "t" }), [Symbol.dispose]() {} };
     },
     delete: async (name: string) => repos.delete(name),
     list: async (options: { limit?: number; cursor?: string }) => {

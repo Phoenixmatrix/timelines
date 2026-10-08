@@ -8,7 +8,7 @@ import { recordStepRun } from "../steps/runs.ts";
 import { timelineQuietMs } from "../timelines/quiet.ts";
 import { onPush, releaseQuiet, startRun, startWorkflow } from "./trigger.ts";
 
-const files = vi.hoisted(() => ({ ciYml: "" }));
+const files = vi.hoisted(() => ({ ciYml: "", failReads: 0 }));
 const refs = vi.hoisted(() => ({
   branches: [] as { shortName: string; oid: string }[],
   headBranch: "main",
@@ -23,6 +23,10 @@ vi.mock("../objects.ts", () => ({
       return path === ".gitmatrix/ci.yml" ? { type: "blob", hash: "ci" } : null;
     }
     async blob() {
+      if (files.failReads > 0) {
+        files.failReads--;
+        throw new Error("Peer closed WebSocket: 1006");
+      }
       return { bytes: new TextEncoder().encode(files.ciYml) };
     }
     async close() {}
@@ -74,7 +78,7 @@ function setup() {
     sqlite
       .prepare("SELECT id, name, status FROM ci_jobs WHERE run_id = ? ORDER BY name")
       .all(runId) as { id: string; name: string; status: string }[];
-  return { sqlite, env, start, jobs, created };
+  return { sqlite, env, repo, start, jobs, created };
 }
 
 beforeEach(() => {
@@ -404,6 +408,21 @@ jobs:
       ["work", "push", 0, oid(3)],
       ["work", "manual", 1, oid(3)],
     ]);
+    refs.branches = [];
+  });
+
+  test("a push whose run start hits a transient provider error is retried, once (CORE-305)", async () => {
+    files.ciYml = STEPS;
+    files.failReads = 1;
+    const t = setup();
+    refs.branches = [{ shortName: "main", oid: oid(2) }];
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await onPush(t.env, t.repo, { id: "ann" }, () => {});
+    expect(runs(t).map((r) => [r.ref, r.trigger, r.step, r.commit_oid])).toEqual([
+      ["main", "push", 0, oid(2)],
+    ]);
+    expect(warn).toHaveBeenCalledWith("CI: starting a run failed; retrying it", expect.anything());
+    warn.mockRestore();
     refs.branches = [];
   });
 

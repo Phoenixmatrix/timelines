@@ -143,6 +143,8 @@ function setup() {
       if (behavior.trackerFails) throw new Error("Tracker unavailable");
       return { id: "remediation" };
     }),
+    // Retries in place are tested on their own below.
+    stepRetryMs: [],
   };
   async function admit(n: number) {
     const commit = oid(n),
@@ -729,6 +731,37 @@ describe("durable independent merge queue", () => {
       }
     },
   );
+  test("a transient step failure is retried in place instead of failing the entry", async () => {
+    const t = setup();
+    t.deps.stepRetryMs = [0, 0];
+    vi.mocked(t.deps.merge).mockImplementationOnce(async () => {
+      throw new Error("Peer closed WebSocket: 1006");
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await t.admit(2);
+    await t.settle(2);
+    expect((await t.state(2)).entry).toMatchObject({ status: "landed", failure: null });
+    expect(t.deps.merge).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+  test("a step that keeps failing fails the entry after its retries", async () => {
+    const t = setup();
+    t.deps.stepRetryMs = [0, 0];
+    vi.mocked(t.deps.merge).mockImplementation(async () => {
+      throw new Error("Peer closed WebSocket: 1006");
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await t.admit(2);
+    await t.settle(2);
+    expect(t.deps.merge).toHaveBeenCalledTimes(3);
+    expect((await t.state(2)).entry).toMatchObject({
+      status: "failed",
+      failure: { stage: "merge", kind: "infrastructure" },
+    });
+    warn.mockRestore();
+    error.mockRestore();
+  });
   test("cyclic Git ancestry never invents coverage", async () => {
     const t = setup();
     t.parents.set(oid(2), [oid(3)]);

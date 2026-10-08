@@ -44,6 +44,8 @@ export interface QueueDeps {
     state: StoredQueue,
     failure: QueueFailure,
   ) => Promise<{ id: string }>;
+  /** Pauses before retrying a failed step in place (default: the scheduler's). */
+  stepRetryMs?: readonly number[];
 }
 export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
   const live = async <T>(repo: PushedRepo, work: () => Promise<T>): Promise<T> => {

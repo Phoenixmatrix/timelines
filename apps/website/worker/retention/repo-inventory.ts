@@ -162,15 +162,18 @@ export async function repoInventory(env: Env, repoId: string): Promise<RepoInven
   }
 
   let exists: boolean | null = null;
-  if (artifactsName) {
+  // A read: a transient provider error (in local development, a dropped
+  // remote binding session) is retried before it fails the inventory.
+  for (let attempt = 1; artifactsName && exists === null; attempt++) {
     try {
-      await env.ARTIFACTS.get(artifactsName);
+      using _repo = await env.ARTIFACTS.get(artifactsName);
       exists = true;
     } catch (error) {
       // Through the development remote proxy the error keeps its message, not its code.
       if (isArtifactsError(error, "NOT_FOUND") || /Repository not found/i.test(String(error)))
         exists = false;
-      else throw error;
+      else if (attempt === 3) throw error;
+      else await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
     }
   }
 

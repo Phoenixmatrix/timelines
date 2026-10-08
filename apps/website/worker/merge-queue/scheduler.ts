@@ -13,6 +13,11 @@ import { getQueue, listQueue, saveQueue, type StoredQueue } from "./store.ts";
 const ACTIVE = ["merging", "testing", "advancing"] as const;
 const MAX_ATTEMPTS = 5;
 const MAX_AGE = 4 * 60 * 60 * 1000;
+/**
+ * Retries of a failed step before it fails the entry (CORE-305): a provider
+ * hiccup, or in local development a dropped remote binding session.
+ */
+const STEP_RETRY_MS = [1_000, 4_000] as const;
 const freshId = () => crypto.randomUUID().replaceAll("-", "");
 
 async function repoFor(env: Env, id: string): Promise<PushedRepo | undefined> {
@@ -770,6 +775,8 @@ export async function progressQueue(
         );
     }
   }
+  const retryMs = deps.stepRetryMs ?? STEP_RETRY_MS;
+  let retries = 0;
   for (let count = 0; count < 32; count++) {
     const rows = await listQueue(env.DB, repoId);
     if (!(await repoFor(env, repoId))) return;
@@ -802,10 +809,21 @@ export async function progressQueue(
         );
       if (!moved) return;
     } catch (error) {
+      // An uncertain main CAS must remain advancing until its reread succeeds.
+      if (state.entry.status === "advancing") {
+        console.error("Queue progression deferred", state.entry.id, error);
+        return;
+      }
+      // Steps are safe to repeat: a transient provider error (or in local
+      // development a dropped remote binding session) is retried in place.
+      const pause = retryMs[retries++];
+      if (pause !== undefined) {
+        console.warn("Queue step failed; retrying it", state.entry.id, error);
+        await new Promise((resolve) => setTimeout(resolve, pause));
+        continue;
+      }
+      // Past its retries, an infrastructure error is an honest terminal failure.
       console.error("Queue progression deferred", state.entry.id, error);
-      // Before advancing, infrastructure errors are honest terminal failures;
-      // an uncertain main CAS must remain advancing until its reread succeeds.
-      if (state.entry.status === "advancing") return;
       const current = await getQueue(env.DB, repoId, state.entry.id);
       if (current?.version === state.version)
         await failure(
