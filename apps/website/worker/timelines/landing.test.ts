@@ -288,6 +288,49 @@ describe("compact landing state", () => {
       status: "complete",
     });
   });
+  test.each(["a successful CAS", "reconciling a timed-out CAS"] as const)(
+    "main rewritten after %s is re-read before recording an integration",
+    async (path) => {
+      const f = fixture(1),
+        write = f.deps.writeRefs.bind(f.deps),
+        parents = f.deps.parents.bind(f.deps);
+      const rewrite = () => {
+        f.graphs.get("repo0")!.set(oid(91), {
+          parents: [],
+          treeHash: oid(101),
+          hash: oid(91),
+          message: "unrelated rewrite",
+        });
+        f.refs.get("repo0")!.set("refs/heads/main", oid(91));
+      };
+      if (path === "a successful CAS") {
+        f.deps.writeRefs = async (repo, changes) => {
+          const result = await write(repo, changes);
+          if (changes[0]!.ref === "refs/heads/main") rewrite();
+          return result;
+        };
+      } else {
+        f.deps.writeRefs = async (repo, changes) => {
+          await write(repo, changes);
+          throw new Error("timeout after provider success");
+        };
+        await f.run();
+        // The rewrite lands while reconciling walks the history it read (the
+        // first walk validates dependencies).
+        let walks = 0;
+        f.deps.parents = async (repo, commit) => {
+          if (commit === f.current.repos[0]!.merge && ++walks === 2) rewrite();
+          return parents(repo, commit);
+        };
+      }
+      const landing = await f.run();
+      expect(landing.state).toBe("failed");
+      expect(landing.reason).toMatch(/outcome is unknown/);
+      expect(f.sqlite.prepare("SELECT status FROM source_integration_receipts").get()).toEqual({
+        status: "intent",
+      });
+    },
+  );
   test.each(["before", "after"] as const)(
     "publication %s the main observation preserves prepared candidates and gates",
     async (timing) => {

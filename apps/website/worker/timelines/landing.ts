@@ -247,6 +247,17 @@ function couldnt(what: string, error: unknown): string {
   return `Couldn't start the ${what} (${why}). Land again to retry.`;
 }
 
+/**
+ * Whether main still holds `commit`, re-read just before a receipt records it.
+ * What a step observed (`seen`) can be seconds old by then, after a slow walk
+ * of history or a CAS, and main may have been rewritten meanwhile.
+ */
+async function stillOnMain(deps: LandingDeps, r: PushedRepo, commit: string, seen: string) {
+  const main = (await deps.refs(r)).get(`refs/heads/${r.default_branch}`);
+  if (!main) return false;
+  return main === seen || (await revisionClosure(main, (oid) => deps.parents(r, oid))).has(commit);
+}
+
 /** Save a step; null when someone else moved the landing first. */
 async function save(ctx: Context, from: Landing, next: Landing): Promise<Landing | null> {
   const reply = await trackerObject(ctx.env, ctx.ownerId).saveLanding(
@@ -586,6 +597,7 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
       if (main !== pending.base) stale ??= pending;
       continue;
     }
+    let seen = main;
     let integrated = (await revisionClosure(main, (oid) => deps.parents(r, oid))).has(
       intent.canonical_commit,
     );
@@ -605,13 +617,17 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
       const acknowledgedMain = (await deps.refs(r)).get(`refs/heads/${r.default_branch}`);
       if (!acknowledgedMain)
         throw new Error("Canonical main disappeared after CAS acknowledgement");
-      if (acknowledgedMain !== main)
+      if (acknowledgedMain !== main) {
+        seen = acknowledgedMain;
         integrated = (await revisionClosure(acknowledgedMain, (oid) => deps.parents(r, oid))).has(
           intent.canonical_commit,
         );
+      }
     }
     if (integrated) {
       if (await landingFixtureBarrier(ctx.env, landing, "after-cas", pending.id)) return null;
+      // Main moved off it since: take the step again from what main is now.
+      if (!(await stillOnMain(deps, r, intent.canonical_commit, seen))) return landing;
       await recordIntegrated(ctx.env, landing, pending);
       deps.mainMoved(r, actorOf(landing));
       await landingFixtureBarrier(ctx.env, landing, "after-receipt", pending.id);
@@ -730,6 +746,7 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
       ) {
         await recordCasOutcome(ctx, operationId, "accepted");
         if (await landingFixtureBarrier(ctx.env, landing, "after-cas", repo.id)) return null;
+        if (!(await stillOnMain(deps, r, repo.merge!, current))) return landing;
         await recordIntegrated(ctx.env, landing, repo);
         deps.mainMoved(r, actorOf(landing));
         await landingFixtureBarrier(ctx.env, landing, "after-receipt", repo.id);
@@ -746,6 +763,7 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
     }
     await recordCasOutcome(ctx, operationId, "accepted");
     if (await landingFixtureBarrier(ctx.env, landing, "after-cas", repo.id)) return null;
+    if (!(await stillOnMain(deps, r, repo.merge!, repo.merge!))) return landing;
     await recordIntegrated(ctx.env, landing, repo);
     deps.mainMoved(r, actorOf(landing));
     await landingFixtureBarrier(ctx.env, landing, "after-receipt", repo.id);
