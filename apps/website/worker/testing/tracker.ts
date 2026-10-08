@@ -2,11 +2,13 @@
 
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import type { SqlDatabase } from "../tracker/store.ts";
+import { boundVariables } from "./durable.ts";
 
 /** Durable Object SQL storage's exec(), enough for TrackerStore. */
 export function trackerSql(db: DatabaseSync): SqlDatabase {
   return {
     exec<T extends Record<string, SqlStorageValue>>(query: string, ...bindings: SqlStorageValue[]) {
+      boundVariables(bindings);
       if (query.includes("CREATE TABLE")) {
         db.exec(query);
         return {

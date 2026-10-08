@@ -150,3 +150,12 @@ export function run(sql: SqlDatabase, query: Compilable<any>): void {
 export function json<T = unknown>(column: string, path: string): RawBuilder<T> {
   return raw<T>`json_extract(${raw.ref(column)}, ${raw.lit(path)})`;
 }
+
+/**
+ * `values` for an `in`, bound as one JSON array. A Durable Object's SQLite takes
+ * at most 100 bound variables per statement, so a list of keys or ids, which
+ * can run to hundreds, must not bind one each (CORE-310).
+ */
+export function jsonList(values: readonly string[]): RawBuilder<string> {
+  return raw<string>`(SELECT value FROM json_each(${JSON.stringify(values)}))`;
+}

@@ -53,7 +53,17 @@ import {
 import { tighteningEffect } from "../../shared/tracker-query.ts";
 import type { QueueFailure } from "../../shared/merge-queue.ts";
 import { sql as raw } from "kysely";
-import { all, first, json, one, run, TIMELINE_TABLES, tracker, type SqlDatabase } from "./sql.ts";
+import {
+  all,
+  first,
+  json,
+  jsonList,
+  one,
+  run,
+  TIMELINE_TABLES,
+  tracker,
+  type SqlDatabase,
+} from "./sql.ts";
 import { auditActor, initializeAudit, indexAuditEvent, issueHistory } from "./audit.ts";
 import { matchRank, matches, type MatchColumns, type SearchQuery } from "../search/query.ts";
 import {
@@ -794,7 +804,10 @@ export class TrackerStore {
     if (!keys.length) return [];
     return all(
       this.sql,
-      tracker.selectFrom("issues").select("data").where(json("data", "$.key"), "in", keys),
+      tracker
+        .selectFrom("issues")
+        .select("data")
+        .where(json("data", "$.key"), "in", jsonList(keys)),
     ).map((row) => this.shipped(JSON.parse(row.data) as Issue));
   }
   /**
@@ -810,7 +823,9 @@ export class TrackerStore {
       tracker
         .selectFrom("issues")
         .select("data")
-        .where((eb) => eb.or([eb(json("data", "$.key"), "in", refs), eb("id", "in", refs)])),
+        .where((eb) =>
+          eb.or([eb(json("data", "$.key"), "in", jsonList(refs)), eb("id", "in", jsonList(refs))]),
+        ),
     ).map((row) => {
       const { id, key, title, status } = JSON.parse(row.data) as Issue;
       return { id, key, title, status };
