@@ -30,6 +30,7 @@ import { decide } from "../knowledge/models.ts";
 import { db, nowIso } from "../schema.ts";
 import {
   confirmPurged,
+  RETIRE_DELAY_MS,
   storageReport,
   type Purgeable,
   type PurgeReport,
@@ -528,8 +529,8 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
   }
 
   /** Purge from the agent's own scheduler (its alarm), after the turn in progress. */
-  async retire(reason: string, name: string): Promise<void> {
-    await this.schedule(1, "retireNow", { reason, name });
+  async retire(reason: string, name: string, delayMs = RETIRE_DELAY_MS): Promise<void> {
+    await this.schedule(Math.max(1, Math.ceil(delayMs / 1_000)), "retireNow", { reason, name });
   }
 
   /** The scheduled half of retire(). */

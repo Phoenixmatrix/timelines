@@ -6,9 +6,11 @@
 //                        (containers, multipart uploads), delete all storage.
 //                        Idempotent, and it checks its own work: it throws
 //                        unless no table, key or alarm is left.
-//   retire(reason, name) later: the instance purges itself from its alarm
-//                        once its in-flight work ends (or after RETIRE_MAX_WAIT_MS),
-//                        and records that in the registry.
+//   retire(reason, name, delayMs?)
+//                        later: the instance purges itself from its alarm,
+//                        due in delayMs (RETIRE_DELAY_MS), once its in-flight
+//                        work ends (or after RETIRE_MAX_WAIT_MS), and records
+//                        that in the registry.
 //   storageReport()      what the instance holds, for the registry's sizes.
 //
 // Callers never call these by hand-built stubs: worker/durable/registry.ts
@@ -35,10 +37,12 @@ export interface PurgeReport extends StorageReport {
 /** The RPC surface the registry relies on; the conformance test checks every class has it. */
 export interface Purgeable {
   purge(reason: string): Promise<PurgeReport>;
-  retire(reason: string, name: string): Promise<void>;
+  retire(reason: string, name: string, delayMs?: number): Promise<void>;
   storageReport(): Promise<StorageReport>;
 }
 
+/** How soon a retiring instance's alarm wakes it, unless retire() is given a delay. */
+export const RETIRE_DELAY_MS = 1_000;
 /** A retiring instance waits at most this long for in-flight work before purging anyway. */
 export const RETIRE_MAX_WAIT_MS = 3 * 60 * 60_000;
 const RETIRE_KEY = "gitmatrix:retire";
@@ -116,7 +120,7 @@ export async function scheduleRetirement(
   storage: DurableObjectStorage,
   reason: string,
   name: string,
-  delayMs = 1_000,
+  delayMs = RETIRE_DELAY_MS,
 ): Promise<void> {
   const existing = await storage.get<Retirement>(RETIRE_KEY);
   if (!existing) await storage.put(RETIRE_KEY, { reason, name, at: Date.now() });

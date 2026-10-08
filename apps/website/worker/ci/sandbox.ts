@@ -77,8 +77,8 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
   }
 
   /** Purge once the job in progress (if any) has ended. */
-  retire(reason: string, name: string): Promise<void> {
-    return scheduleRetirement(this.ctx.storage, reason, name);
+  retire(reason: string, name: string, delayMs?: number): Promise<void> {
+    return scheduleRetirement(this.ctx.storage, reason, name, delayMs);
   }
 
   storageReport() {

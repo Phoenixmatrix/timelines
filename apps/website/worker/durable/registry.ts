@@ -251,17 +251,18 @@ export async function purgeIdleChat(
 
 /**
  * Ask an instance to purge itself once its in-flight work ends (from its
- * alarm), which it then records. For instances that may be mid-build or
- * mid-job; purgeInstance for the rest.
+ * alarm, due in `delayMs`), which it then records. For instances that may be
+ * mid-build or mid-job; purgeInstance for the rest.
  */
 export async function retireInstance(
   env: Env,
   cls: DurableClass,
   name: string,
   reason: string,
+  delayMs?: number,
 ): Promise<void> {
   const stub = await contractStub(env, cls, name);
-  await stub.retire(reason, name);
+  await stub.retire(reason, name, delayMs);
   recorded.delete(key(cls, name));
   await recordRetiring(env, cls, name);
 }

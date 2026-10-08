@@ -49,8 +49,8 @@ export class UploadDO extends DurableObject<Env> implements Purgeable {
     return clearStorage(this.ctx.storage, reason);
   }
 
-  retire(reason: string, name: string): Promise<void> {
-    return scheduleRetirement(this.ctx.storage, reason, name);
+  retire(reason: string, name: string, delayMs?: number): Promise<void> {
+    return scheduleRetirement(this.ctx.storage, reason, name, delayMs);
   }
 
   storageReport() {

@@ -682,8 +682,8 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     resetSoon(this.ctx);
     return report;
   }
-  retire(reason: string, name: string): Promise<void> {
-    return scheduleRetirement(this.ctx.storage, reason, name);
+  retire(reason: string, name: string, delayMs?: number): Promise<void> {
+    return scheduleRetirement(this.ctx.storage, reason, name, delayMs);
   }
   storageReport() {
     return storageReport(this.ctx.storage);
