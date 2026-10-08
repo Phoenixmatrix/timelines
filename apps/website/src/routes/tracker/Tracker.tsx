@@ -584,6 +584,7 @@ function Workbench({ data }: { data: TrackerView }) {
   else managementParams.set("manage", "true");
   const managementHref = `${base}?${managementParams}`;
   const hasTeam = snapshot.teams.some((team) => !team.archived);
+  const otherTrackers = data.trackers.filter((tracker) => tracker.slug !== owner);
   const parsedUnknown = compiled.parsed.unknown;
   const workspaceToken = tokenize(query)
     .find((token) => token.toLowerCase().startsWith("ws:"))
@@ -942,6 +943,39 @@ function Workbench({ data }: { data: TrackerView }) {
         <fieldset className="m-0 border-0 p-0" disabled={busy || uncertain}>
           <TrackerAdmin snapshot={effective} mutate={mutate} busy={busy || uncertain} />
         </fieldset>
+      ) : !hasTeam && otherTrackers.length > 0 ? (
+        // Each account has its own tracker, and /tracker may open an empty one
+        // (yours) while your organizations' hold the work (CORE-118).
+        <section className="mk-card max-w-xl" aria-labelledby="tracker-empty">
+          <h2 id="tracker-empty" className="mk-card-title">
+            No teams in this tracker yet
+          </h2>
+          <p className="mk-card-desc max-w-[52ch]">
+            You and each organization you belong to have separate trackers. This one has no teams,
+            so it has no issues. Your work may be in another:
+          </p>
+          <ul
+            className="m-0 mt-4 flex list-none flex-wrap gap-2 p-0"
+            aria-label="Your other trackers"
+          >
+            {otherTrackers.map((tracker) => (
+              <li key={tracker.id}>
+                <Link
+                  className="mk-btn no-underline"
+                  to={`/tracker/${encodeURIComponent(tracker.slug)}`}
+                >
+                  Open {tracker.displayName}
+                </Link>
+              </li>
+            ))}
+          </ul>
+          {snapshot.canAdmin && (
+            <p className="m-0 mt-4 text-body-sm text-ink-muted">
+              To track work here instead, a team gives each issue an owner and a readable key.{" "}
+              <Link to={managementHref}>Create a team in this tracker</Link>
+            </p>
+          )}
+        </section>
       ) : !hasTeam ? (
         <section className="mk-card max-w-xl">
           <h2 className="mk-card-title">Start with a team</h2>
