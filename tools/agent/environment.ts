@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { HarnessContext } from "./types.ts";
+import { withFileLock } from "./heavy.ts";
 
 const TTL = 24 * 60 * 60 * 1000;
 const MAX_ENVIRONMENTS = 4;
@@ -262,39 +263,8 @@ async function processStart(pid: number): Promise<string | null> {
 export async function registryLock<T>(action: () => Promise<T>): Promise<T> {
   await mkdir(registry, { recursive: true, mode: 0o700 });
   // Kernel locks release on crashes, including the gap before an owner record
-  // could be written. The helper holds the lock until its stdin closes.
-  const child = spawn(
-    "flock",
-    [
-      "--exclusive",
-      "--wait",
-      "300",
-      join(registry, "registry.lock"),
-      process.execPath,
-      "-e",
-      'process.stdout.write("locked\\n"); process.stdin.resume(); process.stdin.on("end", () => process.exit(0));',
-    ],
-    { stdio: ["pipe", "pipe", "pipe"] },
-  );
-  let diagnostic = "";
-  child.stderr.on("data", (chunk: Buffer) => {
-    diagnostic += chunk.toString();
-  });
-  const closed = Promise.withResolvers<void>();
-  child.once("close", () => closed.resolve());
-  const ready = Promise.withResolvers<void>();
-  child.once("error", ready.reject);
-  child.once("exit", (code) =>
-    ready.reject(new Error(`Registry lock failed (${code}): ${diagnostic}`)),
-  );
-  child.stdout.once("data", () => ready.resolve());
-  await ready.promise;
-  try {
-    return await action();
-  } finally {
-    child.stdin.end();
-    await closed.promise;
-  }
+  // could be written.
+  return withFileLock(join(registry, "registry.lock"), 300, action);
 }
 
 async function inventory(): Promise<Environment[]> {

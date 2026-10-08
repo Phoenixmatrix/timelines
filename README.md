@@ -356,6 +356,17 @@ Every Vitest pool is capped at two workers. `.cargo/config.toml` defaults Cargo 
 four compiler workers for local commands, and source CI explicitly uses the same
 limit. Manual recursive commands can use `vp run -r --concurrency-limit 1 build`
 or `vp run -r --concurrency-limit 1 test` to keep the same memory budget.
+
+Agents share the host, so the heavy test work holds one machine-wide lock
+(`~/.local/state/gitmatrix-agent/heavy.lock`, CORE-306): the website's tests
+(`vp run test`, which `ready` and CI run through `tools/agent/website-tests.ts`)
+and the live E2E (`ready`, `agent test`, `agent test-ai`). A second run waits
+and says whose run it waits for (`heavy.wait`); checks, builds and single test
+files run freely. With under 4 GiB available the browser-mode tests use one
+worker. If Chromium is still killed for memory ("Browser connection was
+closed"), the website's tests run the browser files it abandoned once more,
+one at a time; a failed assertion is never retried. A failed E2E scenario
+records the memory available when it failed.
 Locally, E2E runs on the trusted Linux host with Cloudflare login and user-systemd
 prerequisites. Local runners retain repo/job-scoped Cargo output caches outside
 checkouts; concurrent jobs lease separate slots. Tests still run every time.

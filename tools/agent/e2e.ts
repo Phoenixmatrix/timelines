@@ -36,6 +36,7 @@ import { runSourceRetentionE2E } from "./source-retention-e2e.ts";
 import { runSourceAuthE2E } from "./source-auth-e2e.ts";
 import { runSourceLandingE2E } from "./source-landing-e2e.ts";
 import { runSourceSyncE2E } from "./source-sync-e2e.ts";
+import { availableMemory, gib } from "./heavy.ts";
 
 type Evidence = {
   scenario: string;
@@ -43,6 +44,7 @@ type Evidence = {
   elapsedMs: number;
   observations: unknown[];
   error?: string;
+  availableMemory?: string;
 };
 
 /** Real clients against the isolated server. A failed scenario always fails the command. */
@@ -77,6 +79,8 @@ export async function runE2E(ctx: HarnessContext, fixtures: SeedManifest): Promi
         elapsedMs: Date.now() - started,
         observations,
         error: redact(String(error)),
+        // A renderer killed for memory fails whatever it was waiting on (CORE-306).
+        availableMemory: gib(await availableMemory()),
       });
       throw new Error(`${name}: ${redact(String(error))}`);
     } finally {
