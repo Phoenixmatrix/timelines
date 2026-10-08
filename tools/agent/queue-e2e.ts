@@ -5,7 +5,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { QueueEntry } from "../../apps/website/shared/merge-queue.ts";
-import type { CiRunDetail, RepoDetail } from "../../apps/website/shared/api.ts";
+import type { CiRunDetail, CiRunList, RepoDetail } from "../../apps/website/shared/api.ts";
 import type { DeploymentList } from "../../apps/website/shared/deployments.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import type { StepPage, StepVersions } from "../../apps/website/shared/steps.ts";
@@ -35,6 +35,7 @@ export interface QueueFixture {
   show(id: string): Promise<QueueEntry>;
   wait(id: string, done?: (entry: QueueEntry) => boolean): Promise<QueueEntry>;
   landed(id: string): Promise<QueueEntry>;
+  idle(): Promise<void>;
 }
 
 /** Owned fixture only: credentials travel in environment/headers, never URLs or evidence. */
@@ -186,7 +187,24 @@ export async function queueFixture(
     await git(["merge-base", "--is-ancestor", entry.candidate, "origin/main"]);
     return entry;
   }
-  return { repo, root, api, json, git, tip, show, wait, landed };
+  // The environment has two runner slots (GITMATRIX_CI_RUNNERS), shared by
+  // every repository: a step that times a gate first lets this fixture's
+  // earlier runs (deploys of each landing) finish (CORE-266).
+  async function idle() {
+    const deadline = Date.now() + 600_000;
+    while (true) {
+      const busy = (await json<CiRunList>(`${api}/ci`)).runs.filter(
+        (run) => run.status === "queued" || run.status === "running",
+      );
+      if (!busy.length) return;
+      assert(
+        Date.now() < deadline,
+        `${repo}: runs still busy: ${busy.map((run) => `#${run.number} ${run.trigger} ${run.status}`).join(", ")}`,
+      );
+      await delay(1_000);
+    }
+  }
+  return { repo, root, api, json, git, tip, show, wait, landed, idle };
 }
 
 export async function runQueueE2E(
@@ -430,6 +448,7 @@ export async function runQueueE2E(
     retried: heldId,
     directMain: await f.tip(),
   });
+  await f.idle();
   // A separate repository keeps lifecycle CI out of the original fixture's assertions.
   await runActiveQueueDeletion(ctx, fixtures, gm, record);
 }
@@ -489,6 +508,7 @@ async function runActiveQueueDeletion(
       }
     }
   };
+  await f.idle(); // The base push's deploy.
   const directory = join(f.root, "doomed");
   await gm(["clone", f.repo, directory]);
   await writeFile(
