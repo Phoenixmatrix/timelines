@@ -333,6 +333,23 @@ describe("leases across timelines", () => {
     expect(f.next(f.ann, "search")).toBe("a");
   });
 
+  test("moving a leased issue without its token asks for the lease (CORE-260)", () => {
+    const f = fixture();
+    const token = f.claim(f.ann);
+    const cancel = (data: Record<string, unknown>) =>
+      f.mutate(f.ann, undefined, {
+        kind: "issue.update",
+        id: "a",
+        expectedVersion: f.issue("a").version,
+        data: { status: "canceled", closeReason: "duplicate", ...data },
+      });
+    expect(() => cancel({})).toThrow(
+      expect.objectContaining({ status: 409, code: "lease_required" }),
+    );
+    cancel({ leaseToken: token });
+    expect(f.issue("a")).toMatchObject({ status: "canceled" });
+  });
+
   test("normal leases still expire, renew and end on main", () => {
     const f = fixture();
     const token = f.claim(f.ann);
