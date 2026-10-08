@@ -79,7 +79,10 @@ export function ChronicleList({
             <span className="size-2 rounded-full border border-line" aria-hidden />
           )}
           <span className="font-mono text-mono text-ink-muted">{issue.key}</span>
-          <span className="min-w-0 flex-1 truncate text-body-sm font-semibold text-ink">
+          <span
+            className="min-w-0 flex-1 truncate text-body-sm font-semibold text-ink"
+            title={issue.title}
+          >
             {issue.title}
           </span>
         </Link>

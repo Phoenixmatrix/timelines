@@ -531,6 +531,13 @@ export function ChronicleTimeline({
                 aria-label={`${issue.key} ${issue.title}: ${state ? STATE_LABEL[state] : "not created yet"} as of ${moment(at)}; ${issue.spans.length} work span${issue.spans.length === 1 ? "" : "s"}`}
                 className={`absolute left-0 flex items-center gap-2 border-b border-line-soft px-3 no-underline hover:bg-raised ${selected ? "bg-signal-wash text-ink" : "text-ink-muted"}`}
                 style={{ top: tops[i], height: ROW_HEIGHT, width: labelWidth }}
+                // The whole row shows the full title, as the lanes do.
+                onPointerMove={(event) => {
+                  if (!lanes.current) return;
+                  const p = local(event, lanes.current);
+                  setHover({ x: p.x, y: p.y, issue });
+                }}
+                onPointerLeave={() => setHover(null)}
               >
                 <span className="flex w-3 shrink-0 justify-center">
                   {state ? (
@@ -670,8 +677,9 @@ export function ChronicleTimeline({
             top: hover.y + 36 + 18,
           }}
           aria-hidden
+          data-chronicle-tooltip
         >
-          <div className="truncate font-semibold text-ink">{tooltip.title}</div>
+          <div className="font-semibold text-ink [overflow-wrap:anywhere]">{tooltip.title}</div>
           {tooltip.lines.map((line) => (
             <div key={line} className="text-micro text-ink-muted">
               {line}

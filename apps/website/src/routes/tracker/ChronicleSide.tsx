@@ -75,7 +75,9 @@ export function RangeSummary({
                 className="flex min-h-8 items-center gap-2 rounded-plate px-2 text-body-sm no-underline hover:bg-raised max-sm:min-h-11"
               >
                 <span className="font-mono text-mono text-ink-muted">{issue.key}</span>
-                <span className="min-w-0 flex-1 truncate text-ink">{issue.title}</span>
+                <span className="min-w-0 flex-1 truncate text-ink" title={issue.title}>
+                  {issue.title}
+                </span>
               </Link>
             </li>
           );
