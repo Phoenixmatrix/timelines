@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -116,9 +115,9 @@ await test("available memory is read from MemAvailable", () => {
 });
 
 await test("a held file lock makes the next holder wait, and is told so", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "heavy-lock-"));
+  const directory = await mkdtemp(join(tmpdir(), "file-lock-"));
   try {
-    const path = join(directory, "heavy.lock");
+    const path = join(directory, "test.lock");
     const order: string[] = [];
     const first = Promise.withResolvers<void>();
     const holding = withFileLock(path, 30, async () => {
@@ -143,38 +142,6 @@ await test("a held file lock makes the next holder wait, and is told so", async 
     await Promise.all([holding, second]);
     assert.equal(waited, true);
     assert.deepEqual(order, ["first", "first done", "second"]);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-await test("without flock the heavy lock runs the work unlocked, as in a container", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "heavy-unlocked-"));
-  const resultPath = join(directory, "executed");
-  try {
-    const child = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { writeFile } from "node:fs/promises";
-         import { heavyLock } from ${JSON.stringify(new URL("./heavy.ts", import.meta.url).href)};
-         await heavyLock("test", () => writeFile(${JSON.stringify(resultPath)}, "ran"));`,
-      ],
-      {
-        env: {
-          ...process.env,
-          HOME: directory,
-          USERPROFILE: directory,
-          PATH: "/nonexistent",
-          GITMATRIX_HEAVY_LOCK_HELD: "",
-        },
-        encoding: "utf8",
-        timeout: 10_000,
-      },
-    );
-    assert.equal(child.status, 0, child.stderr);
-    assert.equal(await readFile(resultPath, "utf8"), "ran");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

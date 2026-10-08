@@ -1,23 +1,13 @@
-// One heavy test run at a time on this host (CORE-306). Several agents share
-// a trusted host; when their browser-mode tests and live E2E overlap, the
-// kernel kills Chromium renderers and the runs fail on memory, not on code.
-// The website's tests and the live E2E each hold this lock while they run;
-// anything else (checks, builds, single test files) runs freely.
+// Host helpers for heavy test runs (CORE-306): how much memory is available,
+// to say so when Chromium dies under pressure, and an exclusive kernel file
+// lock (the environment registry's). Heavy runs themselves no longer queue
+// behind each other: agents run them in parallel (CORE-108).
 //
 // Dependency-free, so CI's Sandbox containers can load it before an install
-// finishes; without `flock` (not a Linux host) the work runs unlocked.
+// finishes.
 
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
-
-/** Where agent harness state lives (environment.ts's `registry`). */
-export const stateDirectory = join(homedir(), ".local", "state", "gitmatrix-agent");
-/** Set for the lock holder's children, so nested heavy work doesn't wait on itself. */
-const HELD = "GITMATRIX_HEAVY_LOCK_HELD";
-/** A live E2E can take most of an hour on a loaded host; a stuck holder still ends. */
-const HEAVY_WAIT_SECONDS = 90 * 60;
+import { readFile } from "node:fs/promises";
 
 /** Bytes the kernel says can be allocated without swapping (MemAvailable), if known. */
 export function parseMemAvailable(meminfo: string): number | null {
@@ -87,58 +77,5 @@ export async function withFileLock<T>(
   } finally {
     held.child.stdin.end();
     await held.closed.promise;
-  }
-}
-
-/** Run heavy test work alone on this host, saying who it waits for. */
-export async function heavyLock<T>(label: string, action: () => Promise<T>): Promise<T> {
-  if (process.env[HELD]) return action();
-  const owner = join(stateDirectory, "heavy.owner.json");
-  const run = async () => {
-    process.env[HELD] = label;
-    // Who holds it is for a waiting run's message only.
-    await writeFile(
-      owner,
-      JSON.stringify({ pid: process.pid, label, cwd: process.cwd(), since: new Date() }),
-      { mode: 0o600 },
-    ).catch(() => {});
-    try {
-      return await action();
-    } finally {
-      delete process.env[HELD];
-    }
-  };
-  // A CI container may have no writable home or no flock: there's no one to share with.
-  const unlocked = (why: string) => {
-    console.error(JSON.stringify({ event: "heavy.unlocked", label, note: why }));
-    return run();
-  };
-  try {
-    await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
-  } catch {
-    return unlocked(`${stateDirectory} can't be created`);
-  }
-  let started = false;
-  try {
-    return await withFileLock(
-      join(stateDirectory, "heavy.lock"),
-      HEAVY_WAIT_SECONDS,
-      () => {
-        started = true;
-        return run();
-      },
-      async () =>
-        console.error(
-          JSON.stringify({
-            event: "heavy.wait",
-            label,
-            holder: JSON.parse((await readFile(owner, "utf8").catch(() => "null")) || "null"),
-            note: "Another heavy test run holds this host (CORE-306); waiting for it.",
-          }),
-        ),
-    );
-  } catch (error) {
-    if (started || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    return unlocked("flock is unavailable");
   }
 }

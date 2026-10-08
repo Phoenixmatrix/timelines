@@ -29,7 +29,6 @@ import { seed } from "./seed.ts";
 import { runE2E } from "./e2e.ts";
 import { runProviderE2E, type AiRun } from "./provider-e2e.ts";
 import { ATLAS_PROVIDER_CONFIG } from "./atlas-provider-e2e.ts";
-import { heavyLock } from "./heavy.ts";
 import { parseReadyOptions, readinessPlan, type ReadyOptions } from "./ready-plan.ts";
 import { selectReadyE2E, type ReadyE2ESelection } from "./ready-e2e.ts";
 import {
@@ -558,13 +557,10 @@ async function gates(options: ReadyOptions): Promise<void> {
         timeout: 1_800_000,
         log: join(directory, `${name}.log`),
       });
-    // Admission can wait longer than a gate may execute. Nested test runners
-    // inherit the held-lock marker rather than reacquiring inside their deadline.
-    if (name === "tests" || name === "website-tests") await heavyLock(name, run);
-    else await run();
+    await run();
     console.log(JSON.stringify({ event: "gate.pass", name }));
   }
-  if (e2e) await heavyLock("live E2E", () => liveTest(false, undefined, e2e));
+  if (e2e) await liveTest(false, undefined, e2e);
   await privateJson(join(directory, "completion.json"), {
     success: true,
     gates: plan.gates.map(({ name }) => name),
@@ -612,9 +608,8 @@ try {
     const options = parseSetupOptions(args);
     await destroyCurrent();
     await setup(options);
-  } else if (operation === "test") await heavyLock("live E2E", () => liveTest());
-  else if (operation === "test-ai")
-    await heavyLock("live AI E2E", () => liveTest(true, parseTestAiOptions(args)));
+  } else if (operation === "test") await liveTest();
+  else if (operation === "test-ai") await liveTest(true, parseTestAiOptions(args));
   else if (operation === "check") await gates(parseReadyOptions(args));
   else {
     const env = await loadEnvironment(root);

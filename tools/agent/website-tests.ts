@@ -2,15 +2,15 @@
 // them (CORE-306). Browser-mode tests share one headless Chromium; on a host
 // short of memory the kernel can kill a renderer, and Vitest then reports
 // "Browser connection was closed" and abandons every file it hadn't finished.
-// So the run holds the host's heavy-test lock, and after such a crash, and
-// only then, runs the abandoned browser files once more, one at a time. A
-// failed assertion anywhere still fails, and is never retried.
+// So after such a crash, and only then, the run tries the abandoned browser
+// files once more, one at a time. A failed assertion anywhere still fails, and
+// is never retried.
 
 import { spawn } from "node:child_process";
 import { glob, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { availableMemory, gib, heavyLock } from "./heavy.ts";
+import { availableMemory, gib } from "./heavy.ts";
 
 /** What Vitest prints when the browser (or a renderer) under its tests dies. */
 export const CRASH =
@@ -86,46 +86,44 @@ const log = (event: Record<string, unknown>) => console.error(JSON.stringify(eve
 
 async function main(): Promise<number> {
   const filters = process.argv.slice(2);
-  return heavyLock("website tests", async () => {
-    const scratch = await mkdtemp(join(tmpdir(), "gitmatrix-website-tests-"));
-    try {
-      const reportPath = join(scratch, "report.json");
-      log({ event: "website-tests.start", available: gib(await availableMemory()) });
-      const first = await vp([
-        "test",
-        "run",
-        "--reporter=default",
-        "--reporter=json",
-        `--outputFile.json=${reportPath}`,
-        ...filters,
-      ]);
-      // A filtered run reports as it is; only the whole suite knows what was abandoned.
-      if (first.code === 0 || filters.length) return first.code;
-      const report = await readFile(reportPath, "utf8")
-        .then((text) => JSON.parse(text) as JsonReport)
-        .catch(() => null);
-      const browserFiles: string[] = [];
-      for await (const file of glob("src/**/*.browser.test.tsx")) browserFiles.push(resolve(file));
-      const rerun = abandoned(report, first.output, browserFiles);
-      if (!rerun?.length) return first.code;
+  const scratch = await mkdtemp(join(tmpdir(), "gitmatrix-website-tests-"));
+  try {
+    const reportPath = join(scratch, "report.json");
+    log({ event: "website-tests.start", available: gib(await availableMemory()) });
+    const first = await vp([
+      "test",
+      "run",
+      "--reporter=default",
+      "--reporter=json",
+      `--outputFile.json=${reportPath}`,
+      ...filters,
+    ]);
+    // A filtered run reports as it is; only the whole suite knows what was abandoned.
+    if (first.code === 0 || filters.length) return first.code;
+    const report = await readFile(reportPath, "utf8")
+      .then((text) => JSON.parse(text) as JsonReport)
+      .catch(() => null);
+    const browserFiles: string[] = [];
+    for await (const file of glob("src/**/*.browser.test.tsx")) browserFiles.push(resolve(file));
+    const rerun = abandoned(report, first.output, browserFiles);
+    if (!rerun?.length) return first.code;
+    log({
+      event: "website-tests.crashed",
+      available: gib(await availableMemory()),
+      rerun: rerun.length,
+      note: "Chromium died under memory pressure (CORE-306); running the browser files it abandoned once more, one at a time.",
+    });
+    const second = await vp(["test", "run", "--project", "browser", "--maxWorkers=1", ...rerun]);
+    if (second.code !== 0 && CRASH.test(second.output))
       log({
-        event: "website-tests.crashed",
+        event: "website-tests.crashed-again",
         available: gib(await availableMemory()),
-        rerun: rerun.length,
-        note: "Chromium died under memory pressure (CORE-306); running the browser files it abandoned once more, one at a time.",
+        note: "The host is still short of memory; free some before running the tests again.",
       });
-      const second = await vp(["test", "run", "--project", "browser", "--maxWorkers=1", ...rerun]);
-      if (second.code !== 0 && CRASH.test(second.output))
-        log({
-          event: "website-tests.crashed-again",
-          available: gib(await availableMemory()),
-          note: "The host is still short of memory; free some before running the tests again.",
-        });
-      return second.code;
-    } finally {
-      await rm(scratch, { recursive: true, force: true });
-    }
-  });
+    return second.code;
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
 }
 
 if (import.meta.main) process.exitCode = await main();
