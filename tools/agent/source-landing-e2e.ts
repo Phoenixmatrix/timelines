@@ -73,6 +73,7 @@ export async function runSourceLandingE2E(
     await f.git(["-c", "core.hooksPath=/dev/null", "commit", "-m", `Landing fixture ${file}`]);
     return f.git(["rev-parse", "HEAD"]);
   };
+  let failure: unknown;
   try {
     const a = await queueFixture(ctx, fixtures, record);
     owned.push(a);
@@ -458,7 +459,11 @@ export async function runSourceLandingE2E(
         uncertain.merge,
       );
     }
-  } finally {
+  } catch (error) {
+    failure = error;
+  }
+  // Cleanup always runs; it reports its own failures and the scenario's.
+  {
     const errors: unknown[] = [];
     for (const slug of slugs) {
       try {
@@ -505,6 +510,17 @@ export async function runSourceLandingE2E(
         errors.push(error);
       }
     }
-    assert.equal(errors.length, 0, `Landing fixture cleanup failed for ${errors.length} resources`);
+    // Name what failed; when the scenario failed too, keep its error first.
+    const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    if (errors.length) {
+      const cleanup = `Landing fixture cleanup failed for ${errors.length} resources: ${errors
+        .map(message)
+        .join("; ")}`;
+      throw new AggregateError(
+        failure === undefined ? errors : [failure, ...errors],
+        failure === undefined ? cleanup : `Scenario failed: ${message(failure)}. ${cleanup}`,
+      );
+    }
+    if (failure !== undefined) throw failure;
   }
 }

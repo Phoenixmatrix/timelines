@@ -70,7 +70,16 @@ export interface LandingDeps {
   mainMoved(repo: PushedRepo, actor: RunActor): void;
   /** Bookmarks and the landing branch went: the push log and timeline activity. */
   refsDeleted(repo: PushedRepo, actor: RunActor): Promise<void>;
+  /** Pauses before retrying a failed step in place (default STEP_RETRY_MS). */
+  stepRetryMs?: readonly number[];
 }
+
+/**
+ * Retries of a failed step before it's left to the next look (CORE-305): a
+ * provider hiccup, or in local development a dropped remote binding session,
+ * would otherwise strand a landing until a run ends or the hourly cron.
+ */
+const STEP_RETRY_MS = [1_000, 4_000] as const;
 
 type RunActor = Pick<Actor, "id" | "agent">;
 
@@ -870,19 +879,30 @@ export async function progress(
       landing.repos.map((repo) => repo.id),
     ),
   };
+  const retryMs = deps.stepRetryMs ?? STEP_RETRY_MS;
+  let retries = 0;
   for (let i = 0; i < MAX_STEPS && LANDING_ACTIVE.includes(landing.state); i++) {
     let next: Landing | null;
     try {
       next = await step(ctx, landing);
     } catch (error) {
-      // Each step is safe to repeat: the next look (a run's end, the cron,
-      // `gm timeline land`) picks it up. Whoever asked gets the landing as it is.
+      // Each step is safe to repeat: retried here after a pause, then left to
+      // the next look (a run's end, the cron, `gm timeline land`). Whoever
+      // asked gets the landing as it is.
+      const latest = await trackerObject(env, ownerId).landing(landing.slug);
+      const current = latest.ok && latest.value?.id === landing.id ? latest.value : landing;
+      const pause = retryMs[retries++];
+      if (pause !== undefined && LANDING_ACTIVE.includes(current.state)) {
+        console.warn("Landing: a step failed; retrying it", { landing: landing.id, error });
+        await new Promise((resolve) => setTimeout(resolve, pause));
+        landing = current;
+        continue;
+      }
       console.error("Landing: a step failed; the next look retries it", {
         landing: landing.id,
         error,
       });
-      const latest = await trackerObject(env, ownerId).landing(landing.slug);
-      return latest.ok && latest.value?.id === landing.id ? latest.value : landing;
+      return current;
     }
     if (!next) {
       // Someone else moved it, or there's nothing to do until a run ends.

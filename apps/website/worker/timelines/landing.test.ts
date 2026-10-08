@@ -175,6 +175,8 @@ function fixture(count = 2) {
     runOutcome: async () => null,
     mainMoved() {},
     refsDeleted: async () => {},
+    // Most tests change the world between looks; retries in place are tested below.
+    stepRetryMs: [],
   };
   return {
     sqlite,
@@ -367,6 +369,49 @@ describe("compact landing state", () => {
       expect(repo.mergeRun).toEqual(prepared[index]!.mergeRun);
       expect(repo.gateRun).toEqual(prepared[index]!.gateRun);
     }
+  });
+  test("a transient step failure is retried in place instead of waiting for the next look", async () => {
+    const f = fixture();
+    for (const [index, repo] of f.current.repos.entries())
+      repo.gateRun = { id: `gate${index}`, number: 2 };
+    f.deps.stepRetryMs = [0, 0];
+    const parents = f.deps.parents.bind(f.deps);
+    let interrupted = false;
+    f.deps.parents = async (repo, commit) => {
+      if (repo.id === "repo1" && f.writes.includes("repo0") && !interrupted) {
+        interrupted = true;
+        throw new Error("Peer closed WebSocket: 1006");
+      }
+      return parents(repo, commit);
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect((await f.run()).state).toBe("landed");
+    expect(interrupted).toBe(true);
+    expect(f.writes).toEqual(["repo0", "repo1"]);
+    expect(warn).toHaveBeenCalledWith("Landing: a step failed; retrying it", expect.anything());
+    warn.mockRestore();
+  });
+  test("a step that keeps failing is left to the next look after its retries", async () => {
+    const f = fixture();
+    for (const [index, repo] of f.current.repos.entries())
+      repo.gateRun = { id: `gate${index}`, number: 2 };
+    f.deps.stepRetryMs = [0, 0];
+    let attempts = 0;
+    f.deps.parents = async () => {
+      attempts++;
+      throw new Error("Peer closed WebSocket: 1006");
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect((await f.run()).state).not.toBe("landed");
+    expect(attempts).toBe(3);
+    expect(f.writes).toEqual([]);
+    expect(error).toHaveBeenCalledWith(
+      "Landing: a step failed; the next look retries it",
+      expect.anything(),
+    );
+    warn.mockRestore();
+    error.mockRestore();
   });
   test("confirmed missing source evidence still blocks before any canonical publication", async () => {
     const f = fixture();
