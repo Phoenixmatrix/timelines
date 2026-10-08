@@ -318,6 +318,8 @@ test("requirements: set at creation, from the issue's tags, and tightening a cla
     .element(editor.getByRole("list", { name: "Requirements" }))
     .toMatchTextContent("tag:uxmodel:claude-*");
   await userEvent.click(dialog.getByRole("button", { name: "Create and edit" }));
+  // Creating ends by opening the new issue: let that navigation land before navigating away.
+  await app.waitForUrl((url) => url.pathname.startsWith("/tracker/orbit/issues/"));
   await expect
     .poll(async () => {
       const created = await server.call<{ issues: { title: string; requires?: unknown }[] }>(

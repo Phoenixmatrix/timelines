@@ -484,6 +484,10 @@ vp run agent maintenance status
   Cleanup deletes AI Search instances/namespace, the AI Gateway, Vectorize index,
   and Artifacts repositories/namespace independently. Failed deletions stay journaled and are
   retried; unrelated resources are never discovered and deleted by prefix alone.
+  An Artifacts namespace Cloudflare refuses to delete ("Namespace is not empty")
+  while listing no repositories is **orphaned**: `status` reports it with the
+  reason, it no longer counts toward the four, and every cleanup retries it; its
+  journal is kept.
   AI environments created before Gateway ownership was introduced must be destroyed
   and recreated with `setup --ai`; their legacy journals remain valid for cleanup.
 - Foreground apps stop at expiry. Process-group shutdown is PID-start-time fenced;

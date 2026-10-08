@@ -47,7 +47,7 @@ export type TrackerReply<T> =
   | { ok: true; value: T }
   | {
       ok: false;
-      status: 400 | 401 | 403 | 404 | 409 | 410 | 413;
+      status: TrackerError["status"];
       error: string;
       code: string;
       details: TrackerError["details"];

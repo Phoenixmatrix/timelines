@@ -95,7 +95,12 @@ export const STEP = {
 
 /** The part of a Workflow step the purge uses (tests pass their own). */
 export interface PurgeStep {
-  do<T>(name: string, config: typeof STEP, work: () => Promise<T>): Promise<T>;
+  /** `work` gets the Workflow's attempt number, where it has one. */
+  do<T>(
+    name: string,
+    config: typeof STEP,
+    work: (ctx?: { attempt: number }) => Promise<T>,
+  ): Promise<T>;
   sleep(name: string, duration: string): Promise<void>;
 }
 
@@ -130,6 +135,11 @@ export interface Progress {
   };
   artifacts?: { deleted: boolean };
   rows?: Record<string, number>;
+  /**
+   * A step being retried: which, its attempt, and the last failure (CORE-302),
+   * so a purge stalled on a provider says where and why. Gone once it succeeds.
+   */
+  retry?: { step: string; attempt: number; at: string; error?: string };
 }
 
 export interface DeletionRow {
@@ -365,6 +375,7 @@ export async function runPurge(
   hooks: PurgeHooks,
 ): Promise<Phase | "missing"> {
   const limits = hooks.limits ?? PURGE_LIMITS;
+  step = reportingRetries(env, repoId, step);
   const start = await step.do("load", STEP, async () => {
     const row = await loadDeletion(env, repoId);
     return row ? { phase: row.phase as Phase, orphan: row.source === "orphan-sweep" } : null;
@@ -411,6 +422,45 @@ export async function runPurge(
     phase = next;
   }
   return "done";
+}
+
+/**
+ * Each step's failures and retries in the deletion's progress (CORE-302): a purge
+ * whose provider calls fail or hang shows the step, its attempt and the last error
+ * instead of sitting silently in its phase. The first attempt of a step writes
+ * nothing unless it fails.
+ */
+function reportingRetries(env: Env, repoId: string, step: PurgeStep): PurgeStep {
+  // Reporting is best effort: it never fails the step it describes.
+  const report = (retry: Progress["retry"]) => saveProgress(env, repoId, { retry }).catch(() => {});
+  return {
+    do(name, config, work) {
+      let tries = 0;
+      return step.do(name, config, async (ctx) => {
+        const attempt = ctx?.attempt ?? ++tries;
+        if (attempt > 1) await report({ step: name, attempt, at: nowIso() });
+        try {
+          const result = await work(ctx);
+          await clearRetry(env, repoId).catch(() => {});
+          return result;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          await report({ step: name, attempt, at: nowIso(), error: message.slice(0, 500) });
+          throw error;
+        }
+      });
+    },
+    sleep: (name, duration) => step.sleep(name, duration),
+  };
+}
+
+/** A step succeeded: whatever retry the progress showed is over (a no-op when none). */
+async function clearRetry(env: Env, repoId: string): Promise<void> {
+  await env.DB.prepare(
+    "UPDATE repo_deletions SET progress = json_remove(progress, '$.retry'), updated_at = ?2 WHERE repo_id = ?1 AND json_extract(progress, '$.retry') IS NOT NULL",
+  )
+    .bind(repoId, nowIso())
+    .run();
 }
 
 // stop: nothing new may start, and what runs stops.

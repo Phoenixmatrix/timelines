@@ -4,7 +4,12 @@ import type { TimelineRepo } from "../../shared/timelines.ts";
 import type { RepoRow } from "../db.ts";
 import { db, type Database } from "../schema.ts";
 import { fail } from "../tracker/store.ts";
-import { isArtifactsError, lsRefs, forgetUpstreamTokens } from "../artifacts.ts";
+import {
+  isArtifactsError,
+  isTransientArtifactsError,
+  lsRefs,
+  forgetUpstreamTokens,
+} from "../artifacts.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { TrackerError } from "../tracker/store.ts";
 import type { TrackerReply } from "../tracker/object.ts";
@@ -116,15 +121,44 @@ export async function resolveTimelineSource(env: Env, repo: RepoRow, entry: Time
   return resolved;
 }
 
-/** Native fork allocation: the Tracker reserves the name before any provider side effect. */
+/** Waits before each retry of a transient provider failure while initializing a source. */
+export const SOURCE_RETRY_DELAYS_MS = [500, 2000] as const;
+
+/**
+ * Native fork allocation: the Tracker reserves the name before any provider side effect.
+ * Initialization resumes from the reservation, so a transient Artifacts failure (the
+ * fork may even have succeeded) is retried here; if it persists, the caller gets a
+ * retryable 503 rather than a 500 (CORE-302).
+ */
 export async function ensureWorkSource(
   env: Env,
   repo: RepoRow,
   input: WorkSourceInput,
+  wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
 ): Promise<InitializedWorkSource> {
-  const reply = await trackerObject(env, repo.owner_id).initializeWorkSource(repo, input);
-  if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
-  return reply.value;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const reply = await trackerObject(env, repo.owner_id).initializeWorkSource(repo, input);
+      if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
+      return reply.value;
+    } catch (error) {
+      if (error instanceof TrackerError || !isTransientArtifactsError(error)) throw error;
+      const delay = SOURCE_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined)
+        throw new TrackerError(
+          503,
+          "source_unavailable",
+          "Code storage failed while creating the timeline's work source. Try again shortly.",
+        );
+      console.warn("Timelines: retrying a work source after a transient provider failure", {
+        repoId: repo.id,
+        timelineId: input.timelineId,
+        attempt: attempt + 1,
+        error: String(error),
+      });
+      await wait(delay);
+    }
+  }
 }
 
 /** Runs inside the account Tracker's single-flight initializer. */

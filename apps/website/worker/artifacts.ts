@@ -103,6 +103,25 @@ export async function lsRefs(
 
 const MISSING_REMOTE_REPO = /^ArtifactsError: Repository not found: [A-Za-z0-9][A-Za-z0-9._-]*\.$/;
 
+/** Artifacts failures that say nothing about the request: retrying the same call may succeed. */
+const TRANSIENT_CODES: readonly ArtifactsErrorCode[] = [
+  "INTERNAL_ERROR",
+  "UPSTREAM_UNAVAILABLE",
+  "FORK_IN_PROGRESS",
+];
+// Remote bindings keep only the message: the provider's internal error, or the
+// dropped connection of local development's remote binding (CORE-302).
+const TRANSIENT_REMOTE =
+  /^ArtifactsError: An internal error occurred|Peer closed WebSocket|Network connection lost/;
+
+/** Whether `error` is a transient Artifacts or transport failure, worth retrying idempotent work. */
+export function isTransientArtifactsError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  if ("code" in error && typeof error.code === "string")
+    return (TRANSIENT_CODES as readonly string[]).includes(error.code);
+  return error instanceof Error && TRANSIENT_REMOTE.test(error.message);
+}
+
 export function isArtifactsError(error: unknown, code: ArtifactsErrorCode): boolean {
   if (typeof error !== "object" || error === null) return false;
   if ("code" in error) return error.code === code;

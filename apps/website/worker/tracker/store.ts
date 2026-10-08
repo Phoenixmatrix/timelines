@@ -90,7 +90,7 @@ const timelineUses = Object.keys(TIMELINE_USES) as IssueTimelineUse[];
 const pickups = Object.keys(ISSUE_PICKUPS) as IssuePickup[];
 
 export class TrackerError extends Error {
-  public status: 400 | 401 | 403 | 404 | 409 | 410 | 413;
+  public status: 400 | 401 | 403 | 404 | 409 | 410 | 413 | 503;
   public code: string;
   public details: {
     currentVersion?: number;
