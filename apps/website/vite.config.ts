@@ -1,4 +1,5 @@
 import { cloudflare } from "@cloudflare/vite-plugin";
+import { readFileSync } from "node:fs";
 import tailwindcss from "@tailwindcss/vite";
 import type { Plugin } from "vite-plus";
 import react from "@vitejs/plugin-react";
@@ -12,6 +13,19 @@ const local = developmentEnvironment(process.env);
 const browserProvider = process.env.VITEST
   ? (await import("vite-plus/test/browser-playwright")).playwright
   : undefined;
+
+// Browser-mode tests share one Chromium. When the host is short of memory
+// (other agents' runs, CORE-306), one page at a time keeps the kernel from
+// killing its renderer; tools/agent/website-tests.ts handles a crash anyway.
+const LOW_MEMORY = 4 * 2 ** 30;
+function availableMemory(): number {
+  try {
+    const kib = /^MemAvailable:\s+(\d+) kB$/m.exec(readFileSync("/proc/meminfo", "utf8"))?.[1];
+    return kib ? Number(kib) * 1024 : Infinity;
+  } catch {
+    return Infinity;
+  }
+}
 
 // Remote bindings authenticate through the plugin's bundled wrangler unless this
 // is set; with it, they reuse the `cf auth login` session instead.
@@ -68,7 +82,7 @@ export default defineConfig({
   // and browser-mode tests that render the app in headless Chromium against
   // mocked and in-memory APIs.
   test: {
-    maxWorkers: 2,
+    maxWorkers: process.env.VITEST && availableMemory() < LOW_MEMORY ? 1 : 2,
     projects: [
       {
         extends: true,

@@ -29,6 +29,7 @@ import { seed } from "./seed.ts";
 import { runE2E } from "./e2e.ts";
 import { runProviderE2E, type AiRun } from "./provider-e2e.ts";
 import { ATLAS_PROVIDER_CONFIG } from "./atlas-provider-e2e.ts";
+import { heavyLock } from "./heavy.ts";
 import {
   AI_STAGES,
   appendHistory,
@@ -550,7 +551,7 @@ async function gates(): Promise<void> {
     });
     console.log(JSON.stringify({ event: "gate.pass", name }));
   }
-  await liveTest();
+  await heavyLock("live E2E", () => liveTest());
   await privateJson(join(directory, "completion.json"), {
     success: true,
     gates: steps.map(([name]) => name),
@@ -597,8 +598,9 @@ try {
     const options = parseSetupOptions(args);
     await destroyCurrent();
     await setup(options);
-  } else if (operation === "test") await liveTest();
-  else if (operation === "test-ai") await liveTest(true, parseTestAiOptions(args));
+  } else if (operation === "test") await heavyLock("live E2E", () => liveTest());
+  else if (operation === "test-ai")
+    await heavyLock("live AI E2E", () => liveTest(true, parseTestAiOptions(args)));
   else if (operation === "check") await gates();
   else {
     const env = await loadEnvironment(root);
