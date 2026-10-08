@@ -8,6 +8,7 @@ import { dev } from "./api/dev.ts";
 import { repos } from "./api/repos.ts";
 import { sshAuth, sshKeys } from "./api/ssh.ts";
 import { invites } from "./api/invites.ts";
+import { errorDetails } from "./api/http.ts";
 import { agents } from "./api/agents.ts";
 import { tokens } from "./api/tokens.ts";
 import { sessionActor, tokenCredential, type AppEnv } from "./auth.ts";
@@ -153,7 +154,7 @@ api.onError((error, c) => {
   if (isArtifactsError(error, "MEMORY_LIMIT")) {
     return c.json({ error: "That object is too large to show here." }, 413);
   }
-  console.error(error);
+  console.error("Unhandled API error", errorDetails(error));
   return c.json({ error: "Something went wrong on our side." }, 500);
 });
 

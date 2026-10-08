@@ -7,6 +7,22 @@ export function fail(c: Context<AppEnv>, status: ContentfulStatusCode, error: st
   return c.json({ error }, status);
 }
 
+/**
+ * An error as a log line can show it: its name, message and code as well as
+ * the stack. Logged bare, an Artifacts RPC error showed only stack frames, so a
+ * production 500 said where it failed but not why (CORE-309).
+ */
+export function errorDetails(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) return { error: String(error) };
+  const code = (error as { code?: unknown }).code;
+  return {
+    name: error.name,
+    message: error.message,
+    ...(code !== undefined ? { code } : {}),
+    stack: error.stack,
+  };
+}
+
 export function requireActor(c: Context<AppEnv>): Actor | Response {
   const actor = c.get("actor");
   return actor ?? fail(c, 401, "Sign in to do that.");
