@@ -19,6 +19,10 @@ const internal = Object.assign(new Error("An internal error occurred."), {
 const dropped = new Error(
   "Peer closed WebSocket: 1006 WebSocket disconnected without sending Close frame.",
 );
+// What the fork's own retry sees through the Tracker RPC: a message, no code (CORE-315).
+const forking = new Error(
+  'ArtifactsError: Repository "w-da0f379bf5db4b8d88e87718d34a0a87" is currently being forked from "artifacts:ns/r-b26f220bed22454f916e". The fork is still in progress and the repository is not yet available. Retry after 5 seconds.',
+);
 
 // A function beforeEach returns is its teardown: don't return the mock.
 beforeEach(() => {
@@ -36,9 +40,24 @@ describe("ensureWorkSource", () => {
       waits.push(ms);
     });
     expect(source).toEqual(initialized.value);
-    expect(waits).toEqual([...SOURCE_RETRY_DELAYS_MS]);
+    expect(waits).toEqual(SOURCE_RETRY_DELAYS_MS.slice(0, 2));
     expect(rpc.initializeWorkSource).toHaveBeenCalledTimes(3);
     for (const call of rpc.initializeWorkSource.mock.calls) expect(call).toEqual([repo, input]);
+  });
+
+  test("a fork still in progress after a dropped connection is waited for, as long as it asks", async () => {
+    rpc.initializeWorkSource
+      .mockRejectedValueOnce(dropped)
+      .mockRejectedValueOnce(forking)
+      .mockRejectedValueOnce(forking)
+      .mockResolvedValueOnce(initialized);
+    const waits: number[] = [];
+    const source = await ensureWorkSource({} as Env, repo, input, async (ms) => {
+      waits.push(ms);
+    });
+    expect(source).toEqual(initialized.value);
+    expect(waits).toEqual([...SOURCE_RETRY_DELAYS_MS]);
+    expect(waits.at(-1)).toBeGreaterThanOrEqual(5_000);
   });
 
   test("a failure that persists is a retryable 503, not a 500", async () => {
@@ -79,6 +98,7 @@ test("transient Artifacts errors: provider failures and dropped remote connectio
   expect(isTransientArtifactsError(new Error("ArtifactsError: An internal error occurred."))).toBe(
     true,
   );
+  expect(isTransientArtifactsError(forking)).toBe(true);
   expect(isTransientArtifactsError({ code: "NOT_FOUND" })).toBe(false);
   expect(isTransientArtifactsError({ code: "INVALID_INPUT" })).toBe(false);
   expect(isTransientArtifactsError(new Error("Repository was deleted."))).toBe(false);

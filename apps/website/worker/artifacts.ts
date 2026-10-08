@@ -109,10 +109,11 @@ const TRANSIENT_CODES: readonly ArtifactsErrorCode[] = [
   "UPSTREAM_UNAVAILABLE",
   "FORK_IN_PROGRESS",
 ];
-// Remote bindings keep only the message: the provider's internal error, or the
-// dropped connection of local development's remote binding (CORE-302).
+// Remote bindings and Durable Object RPC keep only the message: the provider's
+// internal error, a fork still in progress (CORE-315), or the dropped connection
+// of local development's remote binding (CORE-302).
 const TRANSIENT_REMOTE =
-  /^ArtifactsError: An internal error occurred|Peer closed WebSocket|Network connection lost/;
+  /^ArtifactsError: An internal error occurred|^ArtifactsError: Repository "[^"]+" is currently being forked|Peer closed WebSocket|Network connection lost/;
 
 /** Whether `error` is a transient Artifacts or transport failure, worth retrying idempotent work. */
 export function isTransientArtifactsError(error: unknown): boolean {

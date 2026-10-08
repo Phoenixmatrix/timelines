@@ -121,8 +121,11 @@ export async function resolveTimelineSource(env: Env, repo: RepoRow, entry: Time
   return resolved;
 }
 
-/** Waits before each retry of a transient provider failure while initializing a source. */
-export const SOURCE_RETRY_DELAYS_MS = [500, 2000] as const;
+/**
+ * Waits before each retry of a transient provider failure while initializing a
+ * source. The last is as long as a fork still in progress asks (CORE-315).
+ */
+export const SOURCE_RETRY_DELAYS_MS = [500, 2000, 5000] as const;
 
 /**
  * Native fork allocation: the Tracker reserves the name before any provider side effect.
