@@ -548,6 +548,79 @@ describe("compact landing state", () => {
     await f.run();
     expect(f.writes).toEqual(["repo0"]);
   });
+  test("a step that read main before a fixture barrier was hit does not act on it after release", async () => {
+    // CORE-307: the E2E holds A after its CAS, force-rewrites main, then releases.
+    // A progress request already reading main must not record the stale integration.
+    const f = fixture();
+    try {
+      Object.assign(f.env, { DEV_MODE: "true", AGENT_ID: "landing-barrier-test" });
+      f.current.slug = "source-landing-12345678-unknown-rewrite";
+      for (const [index, repo] of f.current.repos.entries()) {
+        repo.owner = "orbit";
+        repo.name = `queue-${String(index).padStart(8, "0")}`;
+      }
+      f.sqlite.exec(`CREATE TABLE dev_landing_barriers
+        (timeline_id TEXT PRIMARY KEY, point TEXT, repo_id TEXT, hit INTEGER DEFAULT 0, released INTEGER DEFAULT 0);
+        INSERT INTO dev_landing_barriers(timeline_id,point,repo_id) VALUES('timeline','after-cas','repo0')`);
+      // The first request publishes A, then pauses before its after-cas boundary.
+      const write = f.deps.writeRefs.bind(f.deps);
+      const published = Promise.withResolvers<void>();
+      const finishCas = Promise.withResolvers<void>();
+      f.deps.writeRefs = async (repo, changes) => {
+        const result = await write(repo, changes);
+        if (changes[0]!.ref === "refs/heads/main") {
+          published.resolve();
+          await finishCas.promise;
+        }
+        return result;
+      };
+      const casRequest = f.run();
+      await published.promise;
+      // A second request reconciles A against main with the published candidate (after
+      // validating each source against main), and that answer is slow.
+      const refs = f.deps.refs.bind(f.deps);
+      const reading = Promise.withResolvers<void>();
+      const finishRead = Promise.withResolvers<void>();
+      let mainReads = 0;
+      f.deps.refs = async (repo) => {
+        const observed = await refs(repo);
+        if (repo.artifacts_name === "repo0" && ++mainReads === 2) {
+          expect(observed.get("refs/heads/main")).toBe(f.current.repos[0]!.merge);
+          f.deps.refs = refs;
+          reading.resolve();
+          await finishRead.promise;
+        }
+        return observed;
+      };
+      const staleRequest = f.run();
+      await reading.promise;
+      finishCas.resolve();
+      await casRequest;
+      expect(f.sqlite.prepare("SELECT hit, released FROM dev_landing_barriers").get()).toEqual({
+        hit: 1,
+        released: 0,
+      });
+      // The fixture rewrites main and releases the barrier while the read is in flight.
+      f.graphs
+        .get("repo0")!
+        .set(oid(95), { parents: [], treeHash: oid(105), hash: oid(95), message: "force rewrite" });
+      f.refs.get("repo0")!.set("refs/heads/main", oid(95));
+      f.sqlite.exec("UPDATE dev_landing_barriers SET released=1");
+      finishRead.resolve();
+      await staleRequest;
+      expect(f.sqlite.prepare("SELECT status FROM source_integration_receipts").all()).toEqual([
+        { status: "intent" },
+      ]);
+      // A request after the release reads main afresh and refuses the unknown outcome.
+      expect((await f.run()).state).toBe("failed");
+      expect(f.sqlite.prepare("SELECT status FROM source_integration_receipts").all()).toEqual([
+        { status: "intent" },
+      ]);
+      expect(f.writes).toEqual(["repo0"]);
+    } finally {
+      f.sqlite.close();
+    }
+  });
   test("no-op records complete membership without adding a commit", async () => {
     const f = fixture(1),
       repo = f.current.repos[0]!;
