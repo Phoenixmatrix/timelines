@@ -1836,6 +1836,13 @@ export class TrackerStore {
           `${issue.key} is leased by ${issue.claim!.agent}, and its lease covers ${covered.key}; changing its status or parent needs that lease's token.`,
           409,
         );
+      // Moving a leased issue without its token is a missing lease, not a malformed field (CORE-260).
+      if (covered && token === undefined)
+        fail(
+          "lease_required",
+          `${issue.key} is leased by ${issue.claim!.agent}; changing its status or parent needs that lease's token.`,
+          409,
+        );
       const supplied = text(token, "leaseToken", 200);
       const row = first(
         this.sql,

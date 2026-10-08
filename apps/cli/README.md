@@ -250,8 +250,9 @@ Use `--owner orbit` to override the saved tracker. `gm schema issue update` and
 IDs, not display keys. `null` clears nullable fields. Description/acceptance file flags
 accept `-` for stdin (one field at a time); patch and batch JSON accept `@file` or `-`.
 `--dry-run` previews intent without sending/enqueuing mutations. Local preview is not
-an authoritative permission, graph or lease validation. Tracker changes are **not**
-reversed by `gm undo`.
+an authoritative permission, graph or lease validation. Changing the status or parent
+of an issue whose lease gm kept (its own or an ancestor's) goes online with that lease's
+token, never through the offline outbox. Tracker changes are **not** reversed by `gm undo`.
 
 Tag issues by the expertise their scope requires, using repeated `--tag` flags
 (`--label` is the old spelling and still works). Tags come from the tracker's

@@ -825,6 +825,70 @@ impl Replica {
         if !offline {
             self.sync()?;
         }
+        self.receipt(&request, &operation, offline)
+    }
+    /// An update that moves a leased issue (its status or parent) goes online with
+    /// the covering lease's token, never through the outbox: lease tokens are never
+    /// persisted (CORE-260). Earlier queued intent is sent first, in order.
+    fn submit_fenced(
+        &self,
+        ctx: &Ctx,
+        offline: bool,
+        mutation: Value,
+        (fence, kept): (String, Kept),
+    ) -> Result<Shown> {
+        if offline {
+            return Err(GmError::usage(format!(
+                "Changing {}'s status or parent needs its lease, which only works online.",
+                kept.issue
+            )));
+        }
+        let mut mutations = vec![mutation];
+        issue_tags_alias(&mut mutations)?;
+        validate_batch(&mutations)?;
+        let mut request = self.request(json!(mutations));
+        let operation = request["operationId"].as_str().unwrap().to_string();
+        let mut preview = self.view()?;
+        project(&mut preview, &request["mutations"][0])?;
+        if ctx.dry_run {
+            return Ok(Shown(
+                json!({"dryRun":true,"request":request,"fencedBy":kept.issue,"validation":"Local shape/reference preview only; sent online with the kept lease token, which is never shown or persisted."}),
+            ));
+        }
+        self.sync()?;
+        request["mutations"][0]["data"]["leaseToken"] = json!(kept.token);
+        // A lease taken before gm switched identity is used as the identity holding it.
+        let config = if kept.identity == self.config.identity()? {
+            self.config.clone()
+        } else {
+            self.config.acting_as(&kept.identity)?
+        };
+        let reply = remote::api(&config, "POST", &self.path("mutate"), Some(&request))
+            .inspect_err(|e| {
+                if e.code == "conflict" && e.message.starts_with("Claim expired, was superseded") {
+                    drop_lease(&self.config, &fence);
+                }
+            })?;
+        if !reply["events"].is_array() || !reply["results"].is_array() {
+            return Err(GmError::new(
+                "uncertain_ack",
+                "Server reply was not a mutation receipt. Inspect the issue online before retrying.",
+            ));
+        }
+        let mut snapshot = self.snapshot()?;
+        for event in reply["events"].as_array().unwrap() {
+            apply_event(&mut snapshot, event)?;
+        }
+        self.set("snapshot", &serde_json::to_string(&snapshot)?)?;
+        self.receipts
+            .borrow_mut()
+            .push((operation.clone(), reply["results"].clone()));
+        self.pull()?;
+        self.refresh_view()?;
+        self.receipt(&request, &operation, false)
+    }
+    /// What a submitted operation changed, as the replica now sees it.
+    fn receipt(&self, request: &Value, operation: &str, offline: bool) -> Result<Shown> {
         let view = self.view()?;
         let entities: Vec<Value> = request["mutations"]
             .as_array()
@@ -1383,6 +1447,37 @@ fn issue_patch(snapshot: &Value, p: &IssuePatch) -> Result<Value> {
         data["labels"] = json!(edited_tags(&row["labels"], &p.tags, &p.drop_tags));
     }
     Ok(json!({"kind":"issue.update","id":row["id"],"expectedVersion":row["version"],"data":data}))
+}
+/// The kept lease fencing an update that moves an issue (its status or parent):
+/// the issue's own, else the nearest leased ancestor's, as the tracker requires.
+/// Edits that don't move it need none.
+fn fencing_lease(
+    snapshot: &Value,
+    mutation: &Value,
+    kept: impl Fn(&str) -> Option<Kept>,
+) -> Option<(String, Kept)> {
+    let issues = snapshot["issues"].as_array()?;
+    let find = |id: &str| issues.iter().find(|i| i["id"] == id);
+    let row = find(mutation["id"].as_str()?)?;
+    let data = &mutation["data"];
+    let moves = data.get("status").is_some_and(|s| *s != row["status"])
+        || data.get("parentId").is_some_and(|p| *p != row["parentId"]);
+    if !moves {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut next = Some(row);
+    while let Some(issue) = next {
+        let id = issue["id"].as_str()?;
+        if !seen.insert(id) {
+            break;
+        }
+        if let Some(lease) = kept(id) {
+            return Some((id.to_owned(), lease));
+        }
+        next = issue["parentId"].as_str().and_then(find);
+    }
+    None
 }
 /// An issue's tags with `add` appended (unless already there, ignoring case) and
 /// `drop` removed (ignoring case), in their original order.
@@ -2464,7 +2559,16 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 mutation["data"]["pickup"] = json!(a.pickup);
                 mutation
             }
-            IssueCommand::Update(p) => issue_patch(&snapshot, p)?,
+            IssueCommand::Update(p) => {
+                let mutation = issue_patch(&snapshot, p)?;
+                if let Some(fence) =
+                    fencing_lease(&snapshot, &mutation, |id| kept_lease(&r.config, id))
+                {
+                    locked_status(&snapshot, &mutation)?;
+                    return r.submit_fenced(ctx, args.scope.offline, mutation, fence);
+                }
+                mutation
+            }
             IssueCommand::Link { from, to, kind } => {
                 json!({"kind":"link.add","id":uid(),"data":{"fromId":id(&snapshot,"issues",from)?,"toId":id(&snapshot,"issues",to)?,"kind":kind}})
             }
@@ -3063,6 +3167,46 @@ mod tests {
 
     fn snapshot() -> Value {
         json!({"owner":{"slug":"orbit"},"teams":[],"workspaces":[],"labels":[],"issues":[],"links":[],"comments":[],"subscriptions":[],"cursor":0,"serverTime":"2026-10-01T00:00:00Z"})
+    }
+    #[test]
+    fn moving_a_leased_issue_uses_the_covering_kept_lease() {
+        let mut s = snapshot();
+        s["issues"] = json!([
+            {"id":"p","key":"ENG-1","status":"in_progress","parentId":null,"version":1},
+            {"id":"c","key":"ENG-2","status":"todo","parentId":"p","version":1},
+            {"id":"o","key":"ENG-3","status":"todo","parentId":null,"version":1}
+        ]);
+        let kept = |id: &str| {
+            (id == "p").then(|| Kept {
+                token: "secret".into(),
+                identity: remote::Identity::Person,
+                issue: "ENG-1".into(),
+                expires_at: None,
+            })
+        };
+        let update = |id: &str, data: Value| json!({"kind":"issue.update","id":id,"expectedVersion":1,"data":data});
+        let fence = |m: Value| fencing_lease(&s, &m, kept).map(|(id, k)| (id, k.token));
+        // CORE-260: its own lease, and a parent's for a sub-issue.
+        assert_eq!(
+            fence(update(
+                "p",
+                json!({"status":"canceled","closeReason":"duplicate"})
+            )),
+            Some(("p".into(), "secret".into()))
+        );
+        assert_eq!(
+            fence(update("c", json!({"status":"done"}))),
+            Some(("p".into(), "secret".into()))
+        );
+        assert_eq!(
+            fence(update("o", json!({"parentId":"p"}))),
+            None,
+            "nothing kept covers it"
+        );
+        // Edits that don't move the issue stay in the outbox, without a token.
+        assert_eq!(fence(update("p", json!({"title":"Renamed"}))), None);
+        assert_eq!(fence(update("p", json!({"status":"in_progress"}))), None);
+        assert_eq!(fence(update("c", json!({"parentId":"p"}))), None);
     }
     #[test]
     fn tag_catalog_retains_removed_and_timeline_only_definitions() {
