@@ -125,7 +125,12 @@ export async function runSourceAuthE2E(
             sanitized(stdout + stderr);
             if (denied) {
               assert(error, "Unauthorized native Git operation unexpectedly succeeded");
-            } else assert(!error, `Native Git ${args[0]} failed (${error?.code})`);
+            } else
+              assert(
+                !error,
+                // Checked above to hold no credential or provider remote.
+                `Native Git ${args[0]} failed (${error?.code}): ${stderr.trim().slice(-2000)}`,
+              );
             resolve(stdout.trim());
           } catch (failure) {
             reject(failure);
