@@ -179,3 +179,34 @@ test("editor-defined tags persist, survive final removal, and can be reused with
     "Performance",
   ]);
 });
+
+test("capture tags wrap below the fields without moving the heading or tracker picker", async () => {
+  const server = await TestServer.start({ world: true });
+  await mutate(server, [
+    {
+      kind: "team.create",
+      id: "capture-team",
+      data: { key: "ENG", name: "Engineering", memberIds: ["acc_marco"] },
+    },
+  ]);
+  renderApp("/tracker/orbit?captureTeam=capture-team");
+  const heading = page.getByRole("heading", { name: "Issues", level: 1 });
+  const owner = page.getByRole("combobox", { name: "Tracker owner" });
+  const title = page.getByRole("textbox", { name: "New issue title", exact: true });
+  await expect.element(title).toBeVisible();
+  const centre = (box: DOMRect) => box.top + box.height / 2;
+  const before = {
+    heading: centre(heading.element().getBoundingClientRect()),
+    owner: centre(owner.element().getBoundingClientRect()),
+    title: centre(title.element().getBoundingClientRect()),
+  };
+  expect(Math.abs(before.heading - before.title)).toBeLessThanOrEqual(1);
+  expect(Math.abs(before.owner - before.title)).toBeLessThanOrEqual(1);
+  await title.fill("(latency) Investigate slow startup");
+  await expect
+    .element(page.getByRole("button", { name: "Define tag “latency”", exact: true }))
+    .toBeVisible();
+  expect(centre(heading.element().getBoundingClientRect())).toBeCloseTo(before.heading, 0);
+  expect(centre(owner.element().getBoundingClientRect())).toBeCloseTo(before.owner, 0);
+  expect(centre(title.element().getBoundingClientRect())).toBeCloseTo(before.title, 0);
+});
