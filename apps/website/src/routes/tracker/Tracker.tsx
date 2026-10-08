@@ -842,8 +842,11 @@ function Workbench({ data }: { data: TrackerView }) {
       aria-busy={navigation.state !== "idle"}
       data-shortcuts={shortcuts}
     >
-      <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <h1 className={`m-0 ${admin ? "text-headline" : "text-title-lg"}`}>
+      {/* Top-aligned: the capture's tag row wraps below its fields without moving the rest. */}
+      <header className="flex flex-wrap items-start gap-x-3 gap-y-2">
+        <h1
+          className={`m-0 flex min-h-(--size-field) items-center ${admin ? "text-headline" : "text-title-lg"}`}
+        >
           {admin ? "Teams and workspaces" : "Issues"}
         </h1>
         <SelectField
@@ -864,7 +867,7 @@ function Workbench({ data }: { data: TrackerView }) {
           </div>
         )}
         {admin && <span className="flex-1" />}
-        <div className="ml-auto flex items-center gap-1">
+        <div className="ml-auto flex min-h-(--size-field) items-center gap-1">
           {!admin && (
             <Link
               className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
