@@ -1,7 +1,8 @@
 diff --git a/dist/src/index.js b/dist/src/index.js
+index 4110cf463ffdba5a547f3e14434d7fff4133da27..1fac2b86525db9c8842d36c8b77737bc5bd0fdb9 100644
 --- a/dist/src/index.js
 +++ b/dist/src/index.js
-@@ -121016,6 +121016,11 @@
+@@ -121016,6 +121016,11 @@ var FSWatcher = class extends import_events.EventEmitter {
     * @param item      base path of item/directory
     */
    _remove(directory, item, isDirectory3) {
@@ -13,3 +14,41 @@ diff --git a/dist/src/index.js b/dist/src/index.js
      const path84 = sysPath2.join(directory, item);
      const fullPath = sysPath2.resolve(path84);
      isDirectory3 = isDirectory3 != null ? isDirectory3 : this._watched.has(path84) || this._watched.has(fullPath);
+diff --git a/dist/src/workers/shared/remote-proxy-client.worker.js b/dist/src/workers/shared/remote-proxy-client.worker.js
+index 7a556761f2992280a8ab15adf8bec759ae3a4266..f6e331e4315ffd85ee410a1240b87c5938578d13 100644
+--- a/dist/src/workers/shared/remote-proxy-client.worker.js
++++ b/dist/src/workers/shared/remote-proxy-client.worker.js
+@@ -2561,13 +2561,32 @@ function makeRemoteProxyStub(remoteProxyConnectionString, bindingName, metadata,
+   if (url.protocol = url.protocol === "https:" ? "wss:" : "ws:", url.searchParams.set("MF-Binding", bindingName), metadata)
+     for (let [key, value] of Object.entries(metadata))
+       value !== void 0 && url.searchParams.set(key, value);
+-  let stub = newWebSocketRpcSession(url.href), headers = metadata ? new Headers(
++  let session = new RpcSession$1(new WebSocketTransport(new WebSocket(url.href))), stub = session.getRemoteMain(), headers = metadata ? new Headers(
+     Object.entries(metadata).filter(
+       (entry) => entry[1] !== void 0
+     )
+   ) : void 0;
++  // Gitmatrix (CORE-305): the remote proxy drops a session whose WebSocket
++  // stays quiet (close 1006, no close frame), failing the next call on every
++  // capability it holds, such as an Artifacts repo from ARTIFACTS.get(). While
++  // the session holds one or has a call in flight (an import beyond its main
++  // stub), a side-effect-free round trip every 10 s keeps it open: the remote
++  // answers that its binding has no such method. Sessions holding nothing are
++  // left alone, so leaked sessions still close.
++  let keepAlive = setInterval(() => {
++    session.getStats().imports > 1 && Promise.resolve(stub.__gitmatrixKeepAlive).then(
++      (value) => value?.[Symbol.dispose]?.(),
++      () => {
++      }
++    );
++  }, 1e4), stopKeepAlive = () => clearInterval(keepAlive);
++  stub.onRpcBroken(stopKeepAlive);
+   return new Proxy(stub, {
+     get(_, p) {
++      if (p === Symbol.dispose)
++        return () => {
++          stopKeepAlive(), stub[Symbol.dispose]();
++        };
+       return p === "fetch" ? makeFetch(
+         remoteProxyConnectionString,
+         bindingName,
