@@ -225,6 +225,34 @@ describe("forking", () => {
     expect(t.app.pushes).toEqual([]);
   });
 
+  test("a fork whose connection dropped is made again under a fresh name, not waited on", async () => {
+    const t = await setup();
+    const original = t.git.artifacts.get;
+    const attempted: string[] = [];
+    vi.spyOn(t.git.artifacts, "get").mockImplementation(async (name) => {
+      const resource = await original(name);
+      if (name !== "r-app") return resource;
+      return {
+        ...resource,
+        fork: async (newName, options) => {
+          attempted.push(newName);
+          // The first fork's connection drops; Artifacts may leave it in progress for good.
+          if (attempted.length === 1)
+            throw new Error("Peer closed WebSocket: 1006 WebSocket disconnected");
+          return resource.fork(newName, options);
+        },
+      };
+    });
+    const created = await t.call("ben", "POST", "", { slug: "search", repos: ["orbit/app"] });
+    expect(created.status).toBe(201);
+    expect(attempted).toHaveLength(2);
+    expect(attempted[1]).not.toBe(attempted[0]);
+    expect(
+      t.sqlite.prepare("SELECT artifacts_name, state FROM timeline_work_sources").all(),
+    ).toEqual([{ artifacts_name: attempted[1], state: "ready" }]);
+    expect(t.work().refs.get("refs/heads/work")).toBe(oid(1));
+  });
+
   test("an unknown provider outcome fences the reservation instead of creating another fork", async () => {
     const t = await setup(() =>
       Object.assign(new Error("ArtifactsError: Internal error"), { remote: true }),

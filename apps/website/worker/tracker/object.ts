@@ -450,6 +450,9 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   getWorkSource(sourceId: string) {
     return this.reply(() => this.timelines.getWorkSource(sourceId));
   }
+  renameWorkSource(sourceId: string, version: number) {
+    return this.reply(() => this.timelines.renameWorkSource(sourceId, version));
+  }
   async transitionWorkSource(
     sourceId: string,
     version: number,

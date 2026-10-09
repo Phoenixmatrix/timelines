@@ -115,6 +115,16 @@ const TRANSIENT_CODES: readonly ArtifactsErrorCode[] = [
 const TRANSIENT_REMOTE =
   /^ArtifactsError: An internal error occurred|^ArtifactsError: Repository "[^"]+" is currently being forked|Peer closed WebSocket|Network connection lost/;
 
+/**
+ * Whether `error` is a dropped connection to the provider (local
+ * development's remote binding): the call's outcome is unknown.
+ */
+export function isDroppedConnection(error: unknown): boolean {
+  return (
+    error instanceof Error && /Peer closed WebSocket|Network connection lost/.test(error.message)
+  );
+}
+
 /** Whether `error` is a transient Artifacts or transport failure, worth retrying idempotent work. */
 export function isTransientArtifactsError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;

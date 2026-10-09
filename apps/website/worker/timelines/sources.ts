@@ -6,6 +6,7 @@ import { db, type Database } from "../schema.ts";
 import { fail } from "../tracker/store.ts";
 import {
   isArtifactsError,
+  isDroppedConnection,
   isTransientArtifactsError,
   lsRefs,
   forgetUpstreamTokens,
@@ -182,7 +183,7 @@ export async function initializeWorkSource(
     await env.DB.prepare(`INSERT INTO timeline_work_sources
       (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,version,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,work_ref,initial_token_revoked,created_at,updated_at,archived_at,error,initial_source_id,initial_commit,initial_tree,initial_ref)
       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM repos WHERE id=? AND deleted_at IS NULL)
-      ON CONFLICT(source_id) DO UPDATE SET artifacts_remote=excluded.artifacts_remote,state=excluded.state,version=excluded.version,initial_token_revoked=excluded.initial_token_revoked,updated_at=excluded.updated_at,archived_at=excluded.archived_at,error=excluded.error
+      ON CONFLICT(source_id) DO UPDATE SET artifacts_name=excluded.artifacts_name,artifacts_remote=excluded.artifacts_remote,state=excluded.state,version=excluded.version,initial_token_revoked=excluded.initial_token_revoked,updated_at=excluded.updated_at,archived_at=excluded.archived_at,error=excluded.error
       WHERE timeline_work_sources.version <= excluded.version AND (timeline_work_sources.state NOT IN ('purging','purged') OR excluded.state=timeline_work_sources.state OR excluded.state='purged')`)
       .bind(
         row.source_id,
@@ -213,9 +214,10 @@ export async function initializeWorkSource(
       )
       .run();
     await env.DB.prepare(
-      `UPDATE timeline_work_sources SET artifacts_remote=?,state=?,version=?,initial_token_revoked=?,updated_at=?,archived_at=?,error=? WHERE source_id=? AND version<=? AND state NOT IN ('purging','purged')`,
+      `UPDATE timeline_work_sources SET artifacts_name=?,artifacts_remote=?,state=?,version=?,initial_token_revoked=?,updated_at=?,archived_at=?,error=? WHERE source_id=? AND version<=? AND state NOT IN ('purging','purged')`,
     )
       .bind(
+        row.artifacts_name,
         row.artifacts_remote,
         row.state,
         row.version,
@@ -280,8 +282,20 @@ export async function initializeWorkSource(
       await project();
       fail("not_found", "Repository deletion fenced source creation.", 404);
     }
-    using origin = await env.ARTIFACTS.get(parent.repo.artifacts_name);
-    const forked = await origin.fork(row.artifacts_name, { readOnly: false });
+    let forked: ArtifactsCreateRepoResult;
+    try {
+      using origin = await env.ARTIFACTS.get(parent.repo.artifacts_name);
+      forked = await origin.fork(row.artifacts_name, { readOnly: false });
+    } catch (error) {
+      // A fork whose connection dropped can stay "in progress" for good (an
+      // Artifacts fault seen in development): rather than wait on it, fork
+      // again under a fresh name, leaving the old one to the orphan sweep.
+      if (!isDroppedConnection(error)) throw error;
+      row = unwrap(await tracker.renameWorkSource(row.source_id, row.version));
+      await project();
+      using origin = await env.ARTIFACTS.get(parent.repo.artifacts_name);
+      forked = await origin.fork(row.artifacts_name, { readOnly: false });
+    }
     row.artifacts_remote = forked.remote;
   }
   using owned = await env.ARTIFACTS.get(row.artifacts_name);

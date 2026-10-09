@@ -328,6 +328,34 @@ export class TimelineStore {
     }
     return source;
   }
+  /**
+   * A fresh provider name for a source still being created (CORE-108). A fork
+   * whose connection dropped can stay "in progress" for good, so its creator
+   * forks again under a new name; the old one is then an ordinary orphan (no
+   * row names it), which the orphan sweep deletes once it can.
+   */
+  renameWorkSource(sourceId: string, expectedVersion: number): WorkSourceRow {
+    return this.transaction(() => {
+      const row = this.getWorkSource(sourceId);
+      this.assertCreationOpen(row.timeline_id);
+      if (row.state !== "creating")
+        fail("invalid_state", "Only a source being created can take a new name.", 409);
+      if (row.version !== expectedVersion)
+        fail("version_conflict", "Source allocation changed.", 409);
+      row.artifacts_name = `w-${crypto.randomUUID().replaceAll("-", "")}`;
+      row.artifacts_remote = null;
+      row.version++;
+      row.updated_at = this.now();
+      run(
+        this.sql,
+        tracker
+          .updateTable("timeline_source_allocations")
+          .set({ data: JSON.stringify(row) })
+          .where("source_id", "=", sourceId),
+      );
+      return row;
+    });
+  }
   transitionWorkSource(
     sourceId: string,
     expectedVersion: number,
