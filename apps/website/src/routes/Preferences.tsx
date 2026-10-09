@@ -90,14 +90,18 @@ export function Preferences() {
                 }
               }}
             />
-            Enable tracker keyboard shortcuts
+            Enable character navigation shortcuts
           </label>
           <p
             id="keyboard-shortcuts-help"
             className="mt-1 mb-0 max-w-[65ch] text-body-sm text-ink-muted"
           >
-            c captures an issue, / filters, j and k move, and Escape closes the issue. Off while
-            typing in a field. This preference applies only to this browser.
+            In the tracker, c or n captures an issue, / filters, j selects the next issue, k the
+            previous issue, and Escape closes it. In Story, j is Next and k is Previous. Across the
+            app, g then i opens issues, g then p packages, and g then h home. Character navigation
+            is off by default and stays off while typing or using a dialog. Press ? or use the
+            rail’s Keyboard shortcuts button for help at any time outside a text field or dialog.
+            This preference applies only to this browser.
           </p>
           <FormError message={shortcutsError} />
         </section>

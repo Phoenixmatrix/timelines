@@ -1,10 +1,12 @@
 import { Hono } from "hono";
-import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vite-plus/test";
 import type { AvatarOptions, SessionResponse } from "../../shared/api.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { accounts } from "../api/accounts.ts";
+import { durableStorage } from "../testing/durable.ts";
+import { Tracker } from "../tracker/object.ts";
 import {
   avatarPrompts,
   avatars,
@@ -14,6 +16,7 @@ import {
   MAX_GENERATION_CALLS,
 } from "./api.ts";
 
+vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
 const ben: Actor = { id: "ben", slug: "ben", displayName: "Ben", isSiteAdmin: false };
 const annsAgent: Actor = { ...ann, agent: { id: "agt", name: "bot" } };
@@ -74,10 +77,22 @@ function setup({
       throw new Error("8007: Input prompt contains NSFW content.");
     return { image: btoa(String.fromCharCode(...JPEG)) };
   });
+  const trackers = new Map<string, Tracker>();
   const env = {
     DB: d1(sqlite),
     AVATARS: store,
     AI: ai === "none" ? undefined : { run },
+    TRACKER: {
+      getByName: (id: string) => {
+        if (!trackers.has(id)) {
+          const { sql, db, transactionSync } = durableStorage();
+          onTestFinished(() => db.close());
+          const ctx = { storage: { sql, transactionSync } } as unknown as DurableObjectState;
+          trackers.set(id, new Tracker(ctx, env));
+        }
+        return trackers.get(id);
+      },
+    },
   } as unknown as Env;
   let actor: Actor | null = ann;
   const app = new Hono<AppEnv>();

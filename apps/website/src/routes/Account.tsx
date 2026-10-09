@@ -68,6 +68,36 @@ export function Account() {
           {account.bio}
         </p>
       )}
+      {account.teams !== null && (
+        <section className="mt-6" aria-label="Tracker">
+          <Link
+            to={`/tracker/${encodeURIComponent(account.slug)}`}
+            className={`${link} font-semibold`}
+          >
+            Issues
+          </Link>
+          {account.teams.length > 0 ? (
+            <ul
+              className="m-0 mt-2 flex list-none flex-wrap gap-x-4 gap-y-2 p-0"
+              aria-label="Teams"
+            >
+              {account.teams.map((team) => (
+                <li key={team.id}>
+                  <Link
+                    to={`/tracker/${encodeURIComponent(account.slug)}?${new URLSearchParams({ q: `is:open team:${team.key.toLowerCase()}` })}`}
+                    className={`${link} inline-flex min-h-11 items-center gap-2`}
+                  >
+                    <span className="font-mono text-mono">{team.key}</span>
+                    <bdi>{team.name}</bdi>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-2 mb-0 text-body-sm text-ink-muted">No active teams yet.</p>
+          )}
+        </section>
+      )}
 
       <div className="mt-8 grid gap-6 md:grid-cols-[1fr_15rem]">
         <section>

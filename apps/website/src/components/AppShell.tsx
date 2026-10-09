@@ -41,6 +41,7 @@ import { scopeOf } from "../lib/timelineScope.ts";
 import { Monogram } from "./Monogram.tsx";
 import { GitmatrixLogo } from "./GitmatrixLogo.tsx";
 import { TimelineBanner, TimelineSwitcher } from "./TimelineScope.tsx";
+import { KeyboardShortcuts } from "./KeyboardShortcuts.tsx";
 import { Tip, Toasts } from "./ui.tsx";
 
 function Place({
@@ -249,6 +250,7 @@ export function AppShell() {
     return (
       <>
         <Outlet />
+        <KeyboardShortcuts showButton={false} />
         <Toasts />
       </>
     );
@@ -262,12 +264,26 @@ export function AppShell() {
         >
           <nav
             aria-label="Places"
-            className="mk-rail sticky top-0 z-20 shrink-0 max-sm:w-full max-sm:flex-row max-sm:flex-wrap max-sm:gap-1 max-sm:px-3 max-sm:py-2 max-sm:[--size-dock:44px] sm:fixed sm:inset-y-0 sm:left-0"
+            className="mk-rail app-rail sticky top-0 z-20 shrink-0 sm:fixed sm:inset-y-0 sm:left-0"
+            onFocusCapture={(event) => {
+              const rail = event.currentTarget;
+              // Portalled menus/dialogs are not rail tiles. On phones, native
+              // focus can leave a partially visible tile clipped; reveal it
+              // within this scrollport without moving the document vertically.
+              if (!rail.contains(event.target) || rail.scrollWidth <= rail.clientWidth) return;
+              const bounds = rail.getBoundingClientRect();
+              const target = event.target.getBoundingClientRect();
+              const left = bounds.left + rail.clientLeft;
+              const right = left + rail.clientWidth;
+              if (target.left < left) rail.scrollLeft += target.left - left;
+              else if (target.right > right) rail.scrollLeft += target.right - right;
+            }}
           >
             <Place to="/" label="Home" end>
               {() => <GitmatrixLogo markOnly className="size-8" />}
             </Place>
             <SearchButton />
+            <KeyboardShortcuts />
             {viewer && (
               <Place
                 to={owner ? `/tracker/${encodeURIComponent(owner)}` : "/tracker"}

@@ -138,7 +138,9 @@ Figtree Variable is self-hosted for ordinary text, labels and headings. Geist Mo
 
 ## Layout
 
-The global navigation is a narrow vertical rail on desktop and a sticky horizontal rail below 640px. Shared spacing is compact within a control group and generous between sections.
+The global navigation is a narrow vertical rail on desktop and one sticky horizontal row below 640px. On phones the rail scrolls horizontally without widening the document; no controls wrap, shrink below 44px or disappear. Its 48px row plus 8px top/bottom padding define both its height and the document's scroll padding, so native anchors and focused issue return links clear the actual rail. The timeline scope banner scrolls with the page on phones and does not add a sticky offset. Shared spacing is compact within a control group and generous between sections.
+
+Focusing a partially clipped rail control reveals its full target within the rail's actual scrollport, not the viewport width (which may include a document scrollbar). This adjustment changes only the rail's horizontal scroll position; it does not scroll the page vertically or capture focus inside portalled menus/dialogs.
 
 The tracker-specific approved composition is recorded in `.impeccable/surfaces/src-routes-tracker-tracker-tsx.md`: capture and scope controls above a 42/58 selection/detail split, independently scrolling above 760px. The board and dependency graph remain in the selection pane. On phones the selected issue replaces the collection; filters and account actions progressively disclose. Tracker controls retain 44px touch targets through 760px, and the return link clears the sticky navigation. This split is a surface decision, not a requirement for unrelated pages.
 
@@ -175,6 +177,15 @@ Navigation uses links; view toggles use pressed buttons. Workspace names are und
 Same-origin absolute links in tracker Markdown use client-side navigation; external links, modified clicks, relative links and fragments retain browser behavior. Tracker search treats bare numbers and full issue keys as exact ticket lookups, even when quoted; other words and quoted phrases search keys, titles and tags. Keep filter and exclusion semantics intact.
 
 Tag pills sit under the saved views (CORE-253): every `tag:` and `-tag:` term the query holds shows as a pressed pill that removes it, followed by the most used tags in what the query shows, each adding its term in one click, up to six pills in all. They are pressed buttons like the saved views, not the inert tag chips on issues, and the query stays the only source of truth. Controls under the query box must not move while a press is down: its help line collapses only after the pointer is released, so a press that blurs the box still lands.
+
+Navigation follow-ups (CORE-262–265) retain the existing visual system:
+
+- Browser-tab titles identify the current route and available resource context: account/repository, issue key and live title, timeline/release, package, CI run or file path. Navigation and error states must replace stale resource titles rather than leave private context behind.
+- The rail's keyboard-help control follows Search; `?` opens the same accessible shortcut dialog, including on focused sign-in/device pages without a rail button. `g i` (issues), `g p` (packages), `g h` (home) and Story `j`/`k` (next/down and previous/up) honor the character-navigation opt-in. Typing, composition, modified keys and active dialogs must not trigger character navigation.
+- The single-row phone rail preserves every destination, timeline scope, assistant and account control. Horizontal touch scrolling and keyboard focus reveal overflowed controls; desktop navigation remains vertical.
+- Account pages expose tracker/issues and only accessible team destinations. Repository About links to Issues with the actual ready count and to Releases with repository/timeline context. Repository subscriptions are discovery associations, not tracker access grants; unavailable trackers and empty associations must not invent links or counts.
+
+These are implementation contracts, not new runtime-verification claims; the browser regressions cover navigation behavior and phone geometry, with execution recorded separately.
 
 ### Issue selection and handoff
 

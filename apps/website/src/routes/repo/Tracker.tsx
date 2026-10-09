@@ -6,6 +6,7 @@ import { requireViewer } from "../../lib/session.ts";
 import { buildIndex, sortIssues } from "../tracker/query.ts";
 import { useRepo } from "./RepoLayout.tsx";
 import { link } from "../../components/ui.tsx";
+import { scopeOf } from "../../lib/timelineScope.ts";
 
 interface RepoWorkspace {
   trackerOwner: string;
@@ -21,12 +22,18 @@ type ReadyPreview =
   | { ok: true; workspaces: Record<string, WorkspaceWork> }
   | { ok: false; error: string };
 
-async function readyPreview(owner: string, request: Request): Promise<ReadyPreview> {
+async function readyPreview(
+  owner: string,
+  request: Request,
+  repoOwner: string,
+): Promise<ReadyPreview> {
   try {
     // Repository subscriptions never grant access: this endpoint checks tracker membership itself.
-    const snapshot = await api<Snapshot>(`/tracker/${encodeURIComponent(owner)}/snapshot`, {
-      signal: request.signal,
-    });
+    const timeline = owner === repoOwner ? scopeOf(new URL(request.url).search) : null;
+    const snapshot = await api<Snapshot>(
+      `/tracker/${encodeURIComponent(owner)}/snapshot${timeline ? `?${new URLSearchParams({ timeline })}` : ""}`,
+      { signal: request.signal },
+    );
     const index = buildIndex(snapshot, snapshot.serverTime);
     const work = new Map<string, WorkspaceWork>(
       snapshot.workspaces.map((w) => [
@@ -64,17 +71,17 @@ async function readyPreview(owner: string, request: Request): Promise<ReadyPrevi
 
 export async function repoTrackerLoader({ request, params }: LoaderFunctionArgs) {
   await requireViewer(request);
-  const { workspaces } = await load<{ workspaces: RepoWorkspace[] }>(
+  const { workspaces, canManage } = await load<{ workspaces: RepoWorkspace[]; canManage: boolean }>(
     `/repos/${encodeURIComponent(params.owner!)}/${encodeURIComponent(params.repo!)}/tracker`,
     request,
   );
   const previews = Object.fromEntries(
     [...new Set(workspaces.map((workspace) => workspace.trackerOwner))].map((owner) => [
       owner,
-      readyPreview(owner, request),
+      readyPreview(owner, request, params.owner!),
     ]),
   );
-  return { workspaces, previews };
+  return { workspaces, previews, canManage };
 }
 const COUNTS = [
   { key: "ready", label: "ready", query: "is:ready", dot: "bg-online" },
@@ -84,7 +91,7 @@ const COUNTS = [
 ] as const;
 
 export function RepoTracker() {
-  const { workspaces, previews } = useLoaderData<typeof repoTrackerLoader>();
+  const { workspaces, previews, canManage } = useLoaderData<typeof repoTrackerLoader>();
   const revalidator = useRevalidator();
   const repo = useRepo();
   return (
@@ -99,7 +106,7 @@ export function RepoTracker() {
         workspaces.map((workspace) => {
           const base = `/tracker/${encodeURIComponent(workspace.trackerOwner)}`;
           const scoped = (q: string) =>
-            `?${new URLSearchParams({ q: `ws:${workspace.slug} ${q}`.trim() })}`;
+            `?${new URLSearchParams({ q: `ws:${workspace.slug} ${q}`.trim(), ...(workspace.trackerOwner !== repo.owner.slug ? { tl: "main" } : {}) })}`;
           return (
             <section
               key={`${workspace.trackerOwner}:${workspace.workspaceId}`}
@@ -203,12 +210,20 @@ export function RepoTracker() {
         })
       ) : (
         <div className="mk-empty max-w-[44rem]">
-          No subscribed workspaces are visible. A repository and tracker administrator can connect a
-          workspace from{" "}
-          <Link className={link} to={`/tracker/${encodeURIComponent(repo.owner.slug)}?manage=true`}>
-            tracker management
-          </Link>
-          .
+          No subscribed workspaces are visible.
+          {canManage && (
+            <>
+              {" "}
+              Connect a workspace from{" "}
+              <Link
+                className={link}
+                to={`/tracker/${encodeURIComponent(repo.owner.slug)}?manage=true`}
+              >
+                tracker management
+              </Link>
+              .
+            </>
+          )}
         </div>
       )}
     </section>

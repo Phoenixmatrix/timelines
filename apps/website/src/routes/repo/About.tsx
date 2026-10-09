@@ -1,9 +1,21 @@
 // The Code tab's right rail: what the knowledge graph says this repository
 // is, and how CI on the default branch is doing.
 
-import { BookOpenTextIcon, MapTrifoldIcon, PackageIcon } from "@phosphor-icons/react";
+import {
+  BookOpenTextIcon,
+  ListChecksIcon,
+  MapTrifoldIcon,
+  PackageIcon,
+  TagIcon,
+} from "@phosphor-icons/react";
 import { useState, type ReactNode } from "react";
-import type { CiRunList, CiRunSummary, GraphNodeDetail, RepoDetail } from "../../../shared/api.ts";
+import type {
+  CiRunList,
+  CiRunSummary,
+  GraphNodeDetail,
+  RepoDetail,
+  RepoIssueSummary,
+} from "../../../shared/api.ts";
 import { CiStatusIcon, ciLabel, duration } from "../../components/CiStatus.tsx";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { RailSection } from "../../components/Rail.tsx";
@@ -34,10 +46,12 @@ export function About({
   repo,
   knowledge,
   ci,
+  issues,
 }: {
   repo: RepoDetail;
   knowledge: GraphNodeDetail | null;
   ci: CiRunList | null;
+  issues: RepoIssueSummary | null;
 }) {
   const [more, setMore] = useState(false);
   const owner = repo.owner.slug;
@@ -121,6 +135,21 @@ export function About({
             icon={<PackageIcon weight="bold" aria-hidden />}
           >
             Packages published from here
+          </ExploreLink>
+          {issues && issues.ready !== null && (
+            <ExploreLink
+              to={repoPath(owner, repo.name, "tracker")}
+              icon={<ListChecksIcon weight="bold" aria-hidden />}
+            >
+              Issues · <span className="font-mono text-mono tabular-nums">{issues.ready}</span>{" "}
+              ready
+            </ExploreLink>
+          )}
+          <ExploreLink
+            to={repoPath(owner, repo.name, "releases")}
+            icon={<TagIcon weight="bold" aria-hidden />}
+          >
+            Releases
           </ExploreLink>
         </ul>
       </RailSection>

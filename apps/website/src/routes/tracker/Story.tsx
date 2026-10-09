@@ -21,6 +21,8 @@ import { PersonLink } from "../../components/PersonLink.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { commitPanelUrl } from "../../lib/commitPanel.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
+import { sourceUrl } from "../../lib/refs.ts";
+import { readTrackerShortcuts } from "./preferences.ts";
 
 /** The filters' "no filter" value. */
 const ALL = "*";
@@ -53,16 +55,21 @@ interface StoryRow {
   merge: boolean;
 }
 
-/** Where a repository's part of the timeline ends: its bookmark while open,
- * the last commit once abandoned, the landed head once landed. */
+/** Owned sources retain their work ref after landing; abandon pins its last
+ * commit. Historical canonical merge events pin the contributing parent's tip. */
 function headOf(detail: TimelineDetail, repo: TimelineRepo): string {
   for (const event of [...detail.events].reverse()) {
     if (event.kind === "abandon" && event.lastCommits?.[repo.id])
       return event.lastCommits[repo.id]!;
-    if (event.kind === "merge" && event.fromId === detail.timeline.id && event.repoId === repo.id)
+    if (
+      repo.source?.kind !== "timeline-work" &&
+      event.kind === "merge" &&
+      event.fromId === detail.timeline.id &&
+      event.repoId === repo.id
+    )
       return event.parent;
   }
-  return repo.bookmark;
+  return repo.source?.ref.replace(/^refs\/heads\//, "") ?? repo.bookmark;
 }
 
 function useStory(detail: TimelineDetail, repo: TimelineRepo | undefined) {
@@ -86,9 +93,10 @@ function useStory(detail: TimelineDetail, repo: TimelineRepo | undefined) {
       while (at) {
         const query = new URLSearchParams({ at });
         if (cursor) query.set("cursor", cursor);
-        const page: HistoryPage = await api<HistoryPage>(`${base}/history?${query}`, {
-          signal: abort.signal,
-        });
+        const page: HistoryPage = await api<HistoryPage>(
+          sourceUrl(`${base}/history?${query}`, repo.source?.sourceId),
+          { signal: abort.signal },
+        );
         let reachedFork = false;
         for (const commit of page.commits) {
           if (commit.oid === fork) {
@@ -145,6 +153,7 @@ export function Story() {
   const detail = useLoaderData() as TimelineDetail;
   const { timeline } = detail;
   const [params, setParams] = useLiveSearchParams();
+  const shortcuts = readTrackerShortcuts();
   const repo =
     timeline.repos.find((r) => `${r.owner}/${r.name}` === params.get("repo")) ?? timeline.repos[0];
   const { rows, error, loading, more } = useStory(detail, repo);
@@ -193,25 +202,39 @@ export function Story() {
   };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
-      const target = event.target as HTMLElement | null;
+      if (
+        event.defaultPrevented ||
+        event.isComposing ||
+        event.keyCode === 229 ||
+        event.repeat ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.shiftKey ||
+        document.querySelector('[role="dialog"], [role="alertdialog"], dialog[open]')
+      )
+        return;
+      const target = event.target instanceof Element ? event.target : null;
       if (
         target?.closest(
-          "input, textarea, select, [contenteditable=true], [role=combobox], [role=listbox]",
+          "input, textarea, select, [contenteditable]:not([contenteditable=false]), [role=combobox], [role=listbox], [role=menu]",
         )
       )
         return;
+      if ((event.key === "j" || event.key === "k") && !readTrackerShortcuts()) return;
       const { shown, open, set, selected, heading } = position.current;
       const at = heading ?? selected;
       const index = shown.findIndex((row) => row.commit.oid === at);
-      // Newest first: "next" is the step after this one in time, one row up.
+      // Next/Previous follow the visible newest-first list, down/up respectively.
       const go = (row: StoryRow | undefined) => {
         if (!row) return;
         position.current.heading = row.commit.oid;
         open(row);
       };
-      if (event.key === "j" || event.key === "ArrowLeft") go(shown[index < 0 ? 0 : index + 1]);
-      else if (event.key === "k" || event.key === "ArrowRight") go(shown[index - 1]);
+      if (event.key === "k" || event.key === "ArrowLeft" || event.key === "ArrowUp")
+        go(shown[index < 0 ? 0 : index - 1]);
+      else if (event.key === "j" || event.key === "ArrowRight" || event.key === "ArrowDown")
+        go(shown[index < 0 ? 0 : index + 1]);
       else if (event.key === "Escape" && at) {
         position.current.heading = null;
         set({ step: null });
@@ -310,13 +333,21 @@ export function Story() {
               key={current.commit.oid}
               repo={repo}
               row={current}
-              onPrevious={index + 1 < shown.length ? () => open(shown[index + 1]) : null}
-              onNext={index > 0 ? () => open(shown[index - 1]) : null}
+              shortcuts={shortcuts}
+              onPrevious={index > 0 ? () => open(shown[index - 1]) : null}
+              onNext={index + 1 < shown.length ? () => open(shown[index + 1]) : null}
               onClose={() => set({ step: null })}
             />
           ) : (
             <p className="m-0 self-start rounded-pane bg-pane p-4 text-body-sm text-ink-faint max-lg:hidden">
-              Open a step to see its context and diff. <kbd>j</kbd>/<kbd>k</kbd> step through.
+              Open a step to see its context and diff. Right / Down goes to the next visible step;
+              Left / Up goes to the previous visible step.
+              {shortcuts && (
+                <>
+                  {" "}
+                  <kbd>j</kbd> is Next; <kbd>k</kbd> is Previous.
+                </>
+              )}
             </p>
           )}
         </div>
@@ -384,12 +415,14 @@ function StepRow({ row, active, onOpen }: { row: StoryRow; active: boolean; onOp
 function StepDetail({
   repo,
   row,
+  shortcuts,
   onPrevious,
   onNext,
   onClose,
 }: {
   repo: TimelineRepo;
   row: StoryRow;
+  shortcuts: boolean;
   onPrevious: (() => void) | null;
   onNext: (() => void) | null;
   onClose: () => void;
@@ -425,7 +458,8 @@ function StepDetail({
           className="mk-btn mk-btn--ghost mk-btn--sm"
           disabled={!onPrevious}
           onClick={() => onPrevious?.()}
-          aria-keyshortcuts="j"
+          aria-keyshortcuts={shortcuts ? "k ArrowLeft ArrowUp" : "ArrowLeft ArrowUp"}
+          title={shortcuts ? "Previous step (k, Left or Up)" : "Previous step (Left or Up)"}
         >
           <CaretLeftIcon aria-hidden /> Previous
         </button>
@@ -434,7 +468,8 @@ function StepDetail({
           className="mk-btn mk-btn--ghost mk-btn--sm"
           disabled={!onNext}
           onClick={() => onNext?.()}
-          aria-keyshortcuts="k"
+          aria-keyshortcuts={shortcuts ? "j ArrowRight ArrowDown" : "ArrowRight ArrowDown"}
+          title={shortcuts ? "Next step (j, Right or Down)" : "Next step (Right or Down)"}
         >
           Next <CaretRightIcon aria-hidden />
         </button>
@@ -466,7 +501,7 @@ function StepDetail({
         </time>
         <Link
           className={`${link} mk-mono`}
-          to={commitPanelUrl(repo.owner, repo.name, version)}
+          to={sourceUrl(commitPanelUrl(repo.owner, repo.name, version), repo.source?.sourceId)}
           title={`Open commit ${shortOid(version)} in ${repo.owner}/${repo.name}`}
         >
           {shortOid(version)}
@@ -491,7 +526,7 @@ function StepDetail({
         </div>
       )}
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]">
-        <Diff base={base} oid={version} />
+        <Diff base={base} oid={version} sourceId={repo.source?.sourceId} />
         <Context step={step} />
       </div>
     </section>
@@ -572,7 +607,7 @@ function Context({ step }: { step: Step | null }) {
   );
 }
 
-function Diff({ base, oid }: { base: string; oid: string }) {
+function Diff({ base, oid, sourceId }: { base: string; oid: string; sourceId?: string }) {
   const [state, setState] = useState<{ diff: CommitDiff | null; error: string | null }>({
     diff: null,
     error: null,
@@ -580,7 +615,7 @@ function Diff({ base, oid }: { base: string; oid: string }) {
   useEffect(() => {
     const abort = new AbortController();
     setState({ diff: null, error: null });
-    api<CommitDiff>(`${base}/commits/${oid}/diff`, { signal: abort.signal })
+    api<CommitDiff>(sourceUrl(`${base}/commits/${oid}/diff`, sourceId), { signal: abort.signal })
       .then((diff) => setState({ diff, error: null }))
       .catch((error: unknown) => {
         if (!abort.signal.aborted)
@@ -590,7 +625,7 @@ function Diff({ base, oid }: { base: string; oid: string }) {
           });
       });
     return () => abort.abort();
-  }, [base, oid]);
+  }, [base, oid, sourceId]);
   if (state.error) return <p className="mk-error m-0">{state.error}</p>;
   if (!state.diff) return <p className="m-0 text-body-sm text-ink-faint">Reading the diff…</p>;
   const { files, truncated } = state.diff;
