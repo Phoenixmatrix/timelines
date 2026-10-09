@@ -2395,6 +2395,25 @@ describe("shipped issues for release notes", () => {
     expect(f.store.issuesByKey([])).toEqual([]);
   });
 
+  test("a release naming hundreds of keys looks them up in one statement (CORE-310)", () => {
+    const f = shipping();
+    // More than a Durable Object's 100 bound variables: each key must not bind one.
+    const many = [
+      ...Array.from({ length: 497 }, (_, i) => `ZED-${i + 1}`),
+      "ENG-1",
+      "ENG-3",
+      "ENG-4",
+    ];
+    expect(
+      f.store
+        .issuesByKey(many)
+        .map((issue) => issue.key)
+        .sort(),
+    ).toEqual(["ENG-1", "ENG-3", "ENG-4"]);
+    const refs = f.store.issueRefs([...many.slice(0, 497), "ENG-1", "ENG-2", "ENG-4"]);
+    expect(refs.map((issue) => issue.key).sort()).toEqual(["ENG-1", "ENG-2", "ENG-4"]);
+  });
+
   test("completed in a window counts the latest completion of issues still done", () => {
     const f = shipping();
     const keys = (since: string, until: string) =>

@@ -275,7 +275,13 @@ async function releaseNotesJob(
       });
     message.ack();
   } catch (error) {
-    console.error("Release notes: generation failed", repoId, error);
+    // Logs keep an error's stack but not always its message: name it (CORE-310).
+    console.error(
+      "Release notes: generation failed",
+      repoId,
+      error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      error,
+    );
     const failed = await d
       .updateTable("release_note_state")
       .set((eb) => ({

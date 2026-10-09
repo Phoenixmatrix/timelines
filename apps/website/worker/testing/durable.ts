@@ -3,9 +3,15 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import type { SqlDatabase } from "../tracker/sql.ts";
 
+/** A Durable Object's SQLite binds at most 100 variables per statement; so do these (CORE-310). */
+export function boundVariables(bindings: readonly unknown[]): void {
+  if (bindings.length > 100) throw new Error("too many SQL variables: SQLITE_ERROR");
+}
+
 export function durableStorage(db = new DatabaseSync(":memory:")) {
   const sql: SqlDatabase = {
     exec<T extends Record<string, SqlStorageValue>>(query: string, ...bindings: SqlStorageValue[]) {
+      boundVariables(bindings);
       if (query.includes("CREATE TABLE")) {
         db.exec(query);
         return {
