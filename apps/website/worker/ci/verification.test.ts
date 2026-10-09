@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
 import { d1, migratedDatabase } from "../testing/d1.ts";
-import { startRun, startWorkflow } from "./trigger.ts";
+import { onPush, startRun, startWorkflow } from "./trigger.ts";
 import { candidateProofs, executionIdentity, prerequisitesSatisfied } from "./verification.ts";
 import { CiRun } from "./workflow.ts";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
@@ -18,6 +18,10 @@ const fixture = vi.hoisted(() => ({
   identity: "sandbox-v1:version:image" as string | null,
   execute: async (_jobId: string): Promise<void> => {},
   readIdentity: async (): Promise<void> => {},
+  refs: [] as { shortName: string; oid: string }[],
+}));
+vi.mock("../artifacts.ts", () => ({
+  listRefs: async () => ({ branches: fixture.refs, headBranch: "main" }),
 }));
 vi.mock("../durable/registry.ts", () => ({
   durableStub: () => ({ verificationIdentity: async () => fixture.identity }),
@@ -94,6 +98,7 @@ async function setup(config = yaml) {
   fixture.yaml = config.replaceAll("steps: [true]", "steps: ['true']");
   fixture.identity = "sandbox-v1:version:image";
   fixture.readIdentity = async () => {};
+  fixture.refs = [{ shortName: "main", oid: commit }];
   const sqlite = migratedDatabase();
   databases.push(sqlite);
   sqlite.exec(`INSERT INTO accounts(id,kind,slug,display_name) VALUES('owner','user','owner','Owner');
@@ -154,7 +159,7 @@ async function setup(config = yaml) {
       "INSERT INTO merge_queue(repo_id,id,status,attempts,gate_run_id,candidate,data,created_at,updated_at) VALUES('repo','queue','landed',2,'gates',?,?,'now','now')",
     )
     .run(commit, JSON.stringify(state));
-  return { sqlite, env, start, state, workflows };
+  return { sqlite, env, repo, start, state, workflows };
 }
 
 function workflow(t: Awaited<ReturnType<typeof setup>>) {
@@ -229,6 +234,84 @@ const gatePipeline = `jobs:
 `;
 
 describe("landed candidate verification", () => {
+  test.each(["advancing", "landed"])(
+    "push observers defer a %s queue candidate to its verification owner",
+    async (status) => {
+      const t = await setup(gatePipeline);
+      t.state.entry.status = status;
+      t.sqlite
+        .prepare("UPDATE merge_queue SET status=?,data=?")
+        .run(status, JSON.stringify(t.state));
+      await onPush(t.env, t.repo, null, () => {});
+      expect(t.sqlite.prepare("SELECT ref,oid FROM ci_refs").all()).toEqual([
+        { ref: "main", oid: commit },
+      ]);
+      expect(t.sqlite.prepare("SELECT ref FROM ci_runs ORDER BY number").all()).toEqual([
+        { ref: "queue/candidate" },
+      ]);
+      t.state.entry.status = "landed";
+      t.sqlite
+        .prepare("UPDATE merge_queue SET status='landed',data=?")
+        .run(JSON.stringify(t.state));
+      await t.start();
+      const w = workflow(t);
+      await w.run();
+      expect(w.executed).toEqual(["production-deploy"]);
+      expect((await detail(t)).jobs.find((job) => job.name === "check")).toMatchObject({
+        status: "skipped",
+        claimedBy: null,
+        exitCode: null,
+        verifiedBy: {
+          runId: "gates",
+          runNumber: 1,
+          jobId: "gates-check",
+          queueId: "queue",
+          attempt: 2,
+          commit,
+          sourceId: "canonical",
+          contract: "context-invariant-v1",
+          executionIdentity: fixture.identity,
+        },
+      });
+    },
+  );
+
+  test.each([
+    "different commit",
+    "different branch",
+    "completed deployment",
+    "failed queue",
+    "different repository",
+  ])("ordinary push execution is not withheld by a %s", async (boundary) => {
+    const t = await setup(gatePipeline);
+    const state = {
+      ...t.state,
+      entry: {
+        ...t.state.entry,
+        candidate: boundary === "different commit" ? "b".repeat(40) : commit,
+        branch: boundary === "different branch" ? "another" : "main",
+        status: boundary === "failed queue" ? "failed" : "landed",
+        deployStatus: boundary === "completed deployment" ? "succeeded" : "queued",
+      },
+    };
+    t.sqlite
+      .prepare("UPDATE merge_queue SET status=?,candidate=?,data=?")
+      .run(state.entry.status, state.entry.candidate, JSON.stringify(state));
+    if (boundary === "different repository") {
+      t.sqlite.exec(`INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
+          VALUES('other','owner','other','private','other','https://other');
+          UPDATE merge_queue SET repo_id='other';`);
+    }
+    await onPush(t.env, t.repo, null, () => {});
+    expect(
+      t.sqlite
+        .prepare(
+          "SELECT j.status,j.verified_by FROM ci_jobs j JOIN ci_runs r ON r.id=j.run_id WHERE r.ref='main' AND j.name='check'",
+        )
+        .all(),
+    ).toEqual([{ status: "pending", verified_by: null }]);
+  });
+
   test.each(["sandbox-v1:new-version:image", "sandbox-v1:version:new-image", null])(
     "recovery rechecks runtime identity after D1 creation: %s",
     async (identity) => {
