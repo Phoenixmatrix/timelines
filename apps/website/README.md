@@ -2453,6 +2453,14 @@ fabricated execution output or duration; inspect the producer for actual logs.
 `gm runs show`, `gm runs wait` and JSON output preserve this distinction rather
 than claiming the consumer executed or finished before the remaining main jobs.
 
+After changing admission or runtime identity, verify reuse with a subsequent
+normal queue submission once the Worker deployment has succeeded. The pipeline
+shipping that change is created by the previously deployed implementation and
+may execute every gate normally. Check the producer's actual sandbox success,
+the consumer's `verifiedBy` links and absence of execution claims, and the real
+main deployment result; queue admission or a green pipeline alone proves none
+of those reuse properties.
+
 ### Runners and pipeline operation
 
 - **Runners.** Deployed, jobs run in Cloudflare Sandbox containers (image
