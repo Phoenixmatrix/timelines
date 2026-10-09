@@ -24,6 +24,7 @@ import type { Actor, RepoRow } from "../db.ts";
 import { uploadCommand, workAdvertisement, protocolBytes } from "./source-protocol.ts";
 import { pkt, FLUSH } from "./pktline.ts";
 import { TrackerError } from "../tracker/store.ts";
+import { errorDetails } from "../api/http.ts";
 
 // Git smart HTTP: https://git-scm.com/docs/http-protocol
 //   GET  /:owner/:repo.git/info/refs?service=git-upload-pack|git-receive-pack
@@ -217,7 +218,7 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
         // Staging skips CI/AI/preview work, not provenance. Finish this bounded
         // metadata read before the CLI uploads context for the staged commits.
         await recordPush(c.env, repo, actor).catch((error) =>
-          console.error("Queue source push log: recording failed", error),
+          console.error("Queue source push log: recording failed", errorDetails(error)),
         );
       }
       if (pack) c.executionCtx.waitUntil(recordPushedBytes(c.env, repo.id, pack.done));

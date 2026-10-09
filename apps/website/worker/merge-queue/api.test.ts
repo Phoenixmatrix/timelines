@@ -14,6 +14,8 @@ import * as ai from "./ai.ts";
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
 const boundary = vi.hoisted(() => ({
   refs: new Map<string, string>(),
+  /** Ref reads that fail before one succeeds, as storage briefly can. */
+  refFailures: 0,
   cancel: vi.fn(async () => {}),
 }));
 vi.mock("./scheduler.ts", () => ({
@@ -22,7 +24,16 @@ vi.mock("./scheduler.ts", () => ({
   sweepQueue: async () => {},
 }));
 vi.mock("./deps.ts", () => ({
-  queueDeps: () => ({ refs: async () => new Map(boundary.refs), cancel: boundary.cancel }),
+  queueDeps: () => ({
+    refs: async () => {
+      if (boundary.refFailures > 0) {
+        boundary.refFailures--;
+        throw new Error("Artifacts token request failed");
+      }
+      return new Map(boundary.refs);
+    },
+    cancel: boundary.cancel,
+  }),
 }));
 const databases: DatabaseSync[] = [];
 afterEach(() => {
@@ -31,6 +42,7 @@ afterEach(() => {
 });
 beforeEach(() => {
   boundary.refs.clear();
+  boundary.refFailures = 0;
   boundary.cancel.mockClear();
 });
 const commit = "a".repeat(40);
@@ -83,6 +95,26 @@ describe("queue HTTP authority and transitions", () => {
     boundary.refs.set(`refs/heads/${queueSourceBranch(commit)}`, "b".repeat(40));
     expect((await t.call("", "POST", { commit })).status).toBe(409);
     boundary.refs.set(`refs/heads/${queueSourceBranch(commit)}`, commit);
+    expect((await t.call("", "POST", { commit })).status).toBe(201);
+  });
+  test("a storage read failing right after the source push is retried, then answered as retryable", async () => {
+    // CORE-309: production answered an opaque 500 and admitted nothing.
+    const t = setup();
+    boundary.refs.set(`refs/heads/${queueSourceBranch(commit)}`, commit);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    boundary.refFailures = 2;
+    const unavailable = await t.call("", "POST", { commit });
+    expect(unavailable.status).toBe(503);
+    expect(await unavailable.json()).toEqual({
+      error: "Couldn't read the queue source branch from storage. Admission is safe to retry.",
+    });
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM merge_queue").get()).toEqual({ n: 0 });
+    // The log says why, not only where.
+    expect(logged).toHaveBeenCalledWith(
+      "Queue admission: the queue source branch could not be read",
+      expect.objectContaining({ name: "Error", message: "Artifacts token request failed" }),
+    );
+    boundary.refFailures = 1;
     expect((await t.call("", "POST", { commit })).status).toBe(201);
   });
   test.each([

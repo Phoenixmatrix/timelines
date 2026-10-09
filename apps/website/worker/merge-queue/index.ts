@@ -7,7 +7,8 @@ import {
   type QueueStatus,
 } from "../../shared/merge-queue.ts";
 import type { AppEnv } from "../auth.ts";
-import { fail, requireActor } from "../api/http.ts";
+import { errorDetails, fail, requireActor } from "../api/http.ts";
+import { forgetUpstreamTokens } from "../artifacts.ts";
 import { loadRepo } from "../api/repos.ts";
 import { queueMergeJob } from "../ci/queue-auth.ts";
 import { db } from "../schema.ts";
@@ -134,7 +135,27 @@ queueApi.post("/", async (c) => {
     );
     return c.json({ entry: existing.entry });
   }
-  const refs = await queueDeps(c.env, (work) => c.executionCtx.waitUntil(work)).refs(repo.row);
+  // Admission follows the source push at once, and a storage token or ref read
+  // can fail there for a moment (CORE-309): read again with fresh tokens, then
+  // answer with a retryable 503 rather than an opaque 500.
+  const deps = queueDeps(c.env, (work) => c.executionCtx.waitUntil(work));
+  let refs: Map<string, string>;
+  try {
+    refs = await deps.refs(repo.row).catch(() => {
+      forgetUpstreamTokens(repo.row.artifacts_name);
+      return deps.refs(repo.row);
+    });
+  } catch (error) {
+    console.error(
+      "Queue admission: the queue source branch could not be read",
+      errorDetails(error),
+    );
+    return fail(
+      c,
+      503,
+      "Couldn't read the queue source branch from storage. Admission is safe to retry.",
+    );
+  }
   if (refs.get(`refs/heads/${queueSourceBranch(body.commit)}`) !== body.commit)
     return fail(c, 409, "Push the exact commit to its queue source branch before admission.");
   const now = new Date().toISOString();
