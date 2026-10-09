@@ -74,6 +74,14 @@ test("refKind classifies a whole ref", () => {
   expect(refKind("hello")).toBeNull();
 });
 
+test("explicit hashes do not inherit prose-scanning heuristics", () => {
+  expect(refKind("afeaaab")).toBe("commit");
+  expect(refKind("1234567")).toBe("commit");
+  expect(refKind("abcdef")).toBeNull();
+  expect(refKind("a".repeat(41))).toBeNull();
+  expect(scanRefs("afeaaab 1234567", { commits: true })).toEqual([]);
+});
+
 test("issueUrlParts and goPath", () => {
   expect(issueUrlParts("https://h.test/tracker/orbit/issues/ENG-2")).toEqual({
     origin: "https://h.test",

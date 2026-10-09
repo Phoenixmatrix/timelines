@@ -5,6 +5,7 @@ import type { RefContext, RefResolution, ResolveRefsResponse } from "../../share
 import type { Mutation } from "../../shared/tracker.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
+import { invalidateRefs } from "../objects.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { fakeRemotes } from "../testing/remote.ts";
 import { trackerSql, transactional } from "../testing/tracker.ts";
@@ -72,6 +73,8 @@ function setup(publicUrl?: string) {
   const git = fakeRemotes();
   git.add("https://remote.test/engine", { "refs/heads/main": HEAD, "refs/heads/other": OTHER });
   git.add("https://remote.test/secret", { "refs/heads/main": "9".repeat(40) });
+  invalidateRefs("a-engine");
+  invalidateRefs("a-secret");
   vi.stubGlobal("fetch", git.fetch);
   vi.stubGlobal("caches", {
     default: { match: async () => undefined, put: async () => {}, delete: async () => false },
@@ -105,6 +108,7 @@ function setup(publicUrl?: string) {
   });
   app.route("/api/refs", refs);
   return {
+    git,
     tracker,
     getByName,
     as(next: Actor | null) {
@@ -274,6 +278,30 @@ describe("repositories and commits", () => {
       "3f2a9c1": null,
       abc1234: null,
       ["a".repeat(40)]: null,
+    });
+  });
+
+  test("explicit letters-only and numeric SHA prefixes resolve without bypassing repository access", async () => {
+    const letters = "afeaaab".padEnd(40, "d");
+    const digits = "1234567".padEnd(40, "8");
+    world.git.add("https://remote.test/engine", {
+      "refs/heads/main": letters,
+      "refs/heads/numeric": digits,
+    });
+    world.git.add("https://remote.test/secret", { "refs/heads/main": letters });
+    expect(
+      summary(await world.resolve(["afeaaab", "1234567"], { owner: "orbit", repo: "engine" })),
+    ).toEqual({
+      afeaaab: `/orbit/engine?commit=${letters}`,
+      "1234567": `/orbit/engine?commit=${digits}`,
+    });
+    expect(summary(await world.resolve(["afeaaab"]))).toEqual({ afeaaab: null });
+    expect(summary(await world.resolve(["afeaaab"], { owner: "vault", repo: "secret" }))).toEqual({
+      afeaaab: null,
+    });
+    world.as(ben);
+    expect(summary(await world.resolve(["afeaaab"], { owner: "vault", repo: "secret" }))).toEqual({
+      afeaaab: `/vault/secret?commit=${letters}`,
     });
   });
 

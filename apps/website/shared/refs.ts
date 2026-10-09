@@ -121,6 +121,8 @@ const ISSUE_URL =
 const ISSUE_URL_EXACT = new RegExp(`^${ISSUE_URL.source}$`);
 /** 7–40 hex digits standing alone. Short ones need a letter and a digit (below). */
 const SHA = /(?<![A-Za-z0-9_./-])[0-9a-f]{7,40}(?![A-Za-z0-9_-])/g;
+/** Explicit lookup does not apply the prose scanner's word/number heuristic. */
+const SHA_EXACT = /^[0-9a-f]{7,40}$/;
 /** An account slug, a slash and a repository name, not part of a longer path. */
 const REPO =
   /(?<![A-Za-z0-9_.@/:-])([a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,38})\/((?!\.)[A-Za-z0-9._-]{1,100})(?![A-Za-z0-9_/@-])/g;
@@ -201,7 +203,8 @@ export function scanRefs(text: string, options: ScanOptions = {}): RefSpan[] {
 
 /** What kind of ref a whole string is, or null when it isn't one. */
 export function refKind(ref: string): RefKind | null {
-  const spans = scanRefs(ref, { commits: true });
+  if (SHA_EXACT.test(ref)) return "commit";
+  const spans = scanRefs(ref);
   return spans.length === 1 && spans[0]!.start === 0 && spans[0]!.end === ref.length
     ? spans[0]!.kind
     : null;

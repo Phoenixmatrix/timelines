@@ -757,12 +757,14 @@ fenced) is never touched, and nothing inside another address is a ref.
   can't open is `unresolved` with `ours: true` and reads as plain text; other
   domains stay the links they were.
 - **Hashes** need a repository in context the viewer can read. A full hash
-  must name a commit; a short one (7 to 39 hex digits, at least one letter and
-  one digit) must prefix exactly one commit among the branch and tag tips, the
-  repository's CI runs and its latest 200 default-branch commits (Artifacts
-  can't expand an abbreviation). A hash opens the commit panel: inside the
-  repository, the current page with `?commit=<full hash>` (other parameters
-  kept), elsewhere `/<owner>/<repo>?commit=<full hash>`.
+  must name a commit; a short one (7 to 39 lowercase hex digits) must prefix
+  exactly one commit among the branch and tag tips, the repository's CI runs
+  and its latest 200 default-branch commits (Artifacts can't expand an
+  abbreviation). Prose scanning requires both a letter and a digit in short
+  hashes to avoid linking words and numbers; explicit lookups also accept
+  letters-only and numeric abbreviations. A hash opens the commit panel:
+  inside the repository, the current page with `?commit=<full hash>` (other
+  parameters kept), elsewhere `/<owner>/<repo>?commit=<full hash>`.
 - **`owner/repo`** must be readable; **`pkg@version`** looks in
   `context.owner`'s feeds the registry lets the viewer read (the same name in
   two formats is `ambiguous`).

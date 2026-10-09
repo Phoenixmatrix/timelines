@@ -55,8 +55,8 @@ async function setup() {
   isolateRecents();
   const server = await TestServer.start({ world: true });
   await server.repo("orbit", "engine");
-  // A letter up front: a short hash of digits alone reads as a number, not a commit.
-  const head = `a${commitId().slice(1)}`;
+  // A letters-only short SHA exercises explicit resolution, not prose scanning.
+  const head = `afeaaab${commitId().slice(7)}`;
   await server.push("orbit/engine", "main", head);
   cannedFiles(server, head);
   await server.call("POST", "/api/tracker/orbit/mutate", {
