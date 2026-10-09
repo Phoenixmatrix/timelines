@@ -1154,6 +1154,10 @@ public verification until runtime consumption revalidates them and dependencies
 permit the gate. No consumer logs or execution duration are invented: read the
 producer's output instead. Independent main jobs and deploy remain, dependencies
 still gate execution, and `wait` reports the actual whole-run result.
+Path filtering can still produce ordinary **Skipped** jobs: this repository's
+`cli` gate selects changes under `apps/cli`. A skipped candidate job is not
+verification evidence. Check the **Verified** label or non-null `verifiedBy`,
+not the `skipped` status alone.
 See the [CI/CD contract](../website/README.md#candidate-verification-reuse).
 
 ## Local CI storage
