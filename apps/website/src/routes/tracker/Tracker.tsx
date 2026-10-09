@@ -25,6 +25,7 @@
  */
 
 import { IssueTagChip } from "../../components/Chips.tsx";
+import { TagPills } from "./TagPills.tsx";
 import { Menu } from "@base-ui/react/menu";
 import {
   ArrowClockwiseIcon,
@@ -291,6 +292,33 @@ function Workbench({ data }: { data: TrackerView }) {
   const [draft, setDraft] = useState(query);
   const [queryFocused, setQueryFocused] = useState(false);
   useEffect(() => setDraft(query), [query]);
+  // A press anywhere blurs the query box on pointerdown. Hiding its help line right
+  // then would shift the toolbar under the pointer and lose the click (a tag pill,
+  // a saved view), so while a press is down the help line waits for its release.
+  const pressing = useRef(false);
+  useEffect(() => {
+    const down = () => (pressing.current = true);
+    const up = () => (pressing.current = false);
+    window.addEventListener("pointerdown", down, true);
+    window.addEventListener("pointerup", up, true);
+    window.addEventListener("pointercancel", up, true);
+    return () => {
+      window.removeEventListener("pointerdown", down, true);
+      window.removeEventListener("pointerup", up, true);
+      window.removeEventListener("pointercancel", up, true);
+    };
+  }, []);
+  const blurQuery = () => {
+    if (!pressing.current) return setQueryFocused(false);
+    // After the click the release dispatches, unless focus came back meanwhile.
+    const done = new AbortController();
+    const settle = () => {
+      done.abort();
+      setTimeout(() => setQueryFocused(document.activeElement === queryRef.current), 0);
+    };
+    window.addEventListener("pointerup", settle, { signal: done.signal });
+    window.addEventListener("pointercancel", settle, { signal: done.signal });
+  };
   const effective = useMemo(() => ({ ...snapshot, serverTime: time }), [snapshot, time]);
   const href = (id?: string) =>
     `${base}${id ? `/issues/${encodeURIComponent(id)}` : ""}${params.size ? `?${params}` : ""}`;
@@ -1041,7 +1069,7 @@ function Workbench({ data }: { data: TrackerView }) {
                   autoComplete="off"
                   onChange={(event) => setDraft(event.target.value)}
                   onFocus={() => setQueryFocused(true)}
-                  onBlur={() => setQueryFocused(false)}
+                  onBlur={blurQuery}
                   onKeyDown={(event) => {
                     if (event.key === "Escape") setDraft(query);
                   }}
@@ -1152,6 +1180,7 @@ function Workbench({ data }: { data: TrackerView }) {
                 {count}
               </span>
             </div>
+            <TagPills query={query} common={facets.tag} onQuery={setQuery} />
             <details className="rounded-pane bg-pane px-3 py-1 open:pb-3 lg:hidden">
               <summary className="flex min-h-10 cursor-pointer list-none items-center gap-2 font-semibold [&::-webkit-details-marker]:hidden">
                 <FunnelSimpleIcon weight="bold" aria-hidden />

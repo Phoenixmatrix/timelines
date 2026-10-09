@@ -422,6 +422,10 @@ describe("query language", () => {
     expect(toggleToken("is:open label:ux", "tag", "ux")).toBe("is:open");
     expect(toggleToken("is:open", "tag", "ux")).toBe("is:open tag:ux");
     expect(toggleToken('label:"needs design"', "tag", "needs design")).toBe("");
+    // A tag pill (CORE-253) removes every copy, and an exclusion only as an exclusion.
+    expect(toggleToken("tag:ux is:open TAG:UX", "tag", "ux")).toBe("is:open");
+    expect(toggleToken("is:open -label:data", "tag", "data", true)).toBe("is:open");
+    expect(toggleToken("is:open -tag:data", "tag", "data")).toBe("is:open -tag:data tag:data");
     expect(queryTokenSet("label:UX -labels:data").has("tag:ux")).toBe(true);
     expect(withoutKeys("label:ux tag:data team:core", ["tag"])).toBe("team:core");
     const facets = facetsOf(issues, compile("label:ux", index, "", NOW), index, snap);

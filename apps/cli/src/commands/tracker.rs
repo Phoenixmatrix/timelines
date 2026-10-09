@@ -2117,9 +2117,11 @@ fn listing(
                             .to_lowercase()
                             .contains(s)
                 })
+                && tag_filter_matches(i, &args.tags)
                 && (!only_ready || ready(snapshot, i, now))
         })
         .collect();
+    let unknown_tags = unknown_filter_tags(snapshot, &args.tags, owner);
     matching.sort_by(|a, b| {
         a["priority"]
             .as_u64()
@@ -2127,9 +2129,52 @@ fn listing(
             .then_with(|| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()))
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
-    Ok(Shown(
-        json!({"team":choice.describe(owner, true),"issues":matching.iter().take(args.limit as usize).map(|i| named(snapshot, i)).collect::<Vec<_>>(),"total":matching.len(),"truncated":matching.len()>args.limit as usize,"offline":offline,"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"timeline":snapshot["timeline"],"next":"Acquire an online claim before starting exclusive work."}),
-    ))
+    let mut shown = json!({"team":choice.describe(owner, true),"issues":matching.iter().take(args.limit as usize).map(|i| named(snapshot, i)).collect::<Vec<_>>(),"total":matching.len(),"truncated":matching.len()>args.limit as usize,"offline":offline,"readinessAdvisory":true,"cursor":snapshot["cursor"],"cachedAt":snapshot["serverTime"],"timeline":snapshot["timeline"],"next":"Acquire an online claim before starting exclusive work."});
+    if !unknown_tags.is_empty() {
+        shown["unknownTags"] = json!(unknown_tags);
+    }
+    Ok(Shown(shown))
+}
+/// Any of the wanted tags and none of the excluded ones, case-insensitively: the
+/// web's `tag:a tag:b -tag:c` (CORE-253). An issue's tags are stored as `labels`.
+fn tag_filter_matches(issue: &Value, filter: &TagFilter) -> bool {
+    let has = |tag: &String| {
+        issue["labels"].as_array().is_some_and(|l| {
+            l.iter()
+                .filter_map(Value::as_str)
+                .any(|t| t.eq_ignore_ascii_case(tag))
+        })
+    };
+    (filter.tags.is_empty() || filter.tags.iter().any(has)) && !filter.exclude_tags.iter().any(has)
+}
+/// Lowercase and without repeats: the tracker refuses duplicate entries.
+fn dedup_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags.iter().map(|t| t.to_lowercase()) {
+        if !out.contains(&tag) {
+            out.push(tag);
+        }
+    }
+    out
+}
+/// Filter tags the catalog doesn't have, warned on stderr with the closest name:
+/// a typo would otherwise just match nothing.
+fn unknown_filter_tags(snapshot: &Value, filter: &TagFilter, owner: &str) -> Vec<Value> {
+    let catalog: Vec<String> = snapshot["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect();
+    let named = [filter.tags.as_slice(), filter.exclude_tags.as_slice()].concat();
+    let unknown = requirements::unknown_tags(&named, &catalog);
+    for u in &unknown {
+        eprintln!(
+            "gm: warning: {}, so it matches no issue; `gm issue tags` lists the catalog.",
+            requirements::unknown_tag_warning(u, owner)
+        );
+    }
+    unknown
 }
 fn context(snapshot: &Value, reference: &str, limit: usize, offline: bool) -> Result<Shown> {
     let issue = resolve(snapshot, "issues", reference)?;
@@ -2703,12 +2748,21 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 all_teams,
                 workspace,
                 under,
+                tags,
                 ttl,
                 delegation,
             } => {
                 let mut data =
                     json!({"agent":session(agent)?,"ttlSeconds":ttl.unwrap_or(defaults.ttl)});
                 delegate(&snapshot, delegation, &mut data)?;
+                // Tags narrow whatever scope applies, configured or given (CORE-253).
+                unknown_filter_tags(&snapshot, tags, &r.owner);
+                if !tags.tags.is_empty() {
+                    data["tags"] = json!(dedup_tags(&tags.tags));
+                }
+                if !tags.exclude_tags.is_empty() {
+                    data["excludeTags"] = json!(dedup_tags(&tags.exclude_tags));
+                }
                 // No scope given: this checkout's, else the project's (.gitmatrix/agents.yml),
                 // else your default team.
                 let configured = team.is_none() && workspace.is_none() && under.is_none();
@@ -3362,6 +3416,68 @@ mod tests {
                 .unwrap()
                 .0["total"],
             0
+        );
+    }
+    #[test]
+    fn tag_filters_match_any_wanted_tag_and_exclude_case_insensitively() {
+        let mut s = snapshot();
+        s["labels"] = json!(["ux", "frontend", "backend"]);
+        for (id, tags) in [
+            ("ui", json!(["UX"])),
+            ("web", json!(["frontend", "backend"])),
+            ("api", json!(["backend"])),
+            ("bare", json!([])),
+        ] {
+            project(
+                &mut s,
+                &json!({"kind":"issue.create","id":id,"data":{"title":id,"labels":tags}}),
+            )
+            .unwrap();
+        }
+        let ids = |flags: &[&str]| {
+            use clap::Parser;
+            let parsed = crate::cli::Cli::try_parse_from(
+                ["gm", "issue", "list", "--all-teams"]
+                    .iter()
+                    .chain(flags)
+                    .copied(),
+            )
+            .unwrap();
+            let Some(crate::cli::Command::Issue(IssueArgs {
+                command: IssueCommand::List(args),
+                ..
+            })) = parsed.command
+            else {
+                panic!("expected issue list");
+            };
+            let choice = choose_team(None, true, None, false, None);
+            let shown = listing(&s, &args, &choice, "orbit", false, false)
+                .unwrap()
+                .0;
+            let mut ids: Vec<String> = shown["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["id"].as_str().unwrap().to_owned())
+                .collect();
+            ids.sort();
+            (ids, shown["unknownTags"].clone())
+        };
+        assert_eq!(ids(&["--tag", "ux"]).0, ["ui"]);
+        assert_eq!(ids(&["--tag", "Ux", "--tag", "frontend"]).0, ["ui", "web"]);
+        assert_eq!(
+            ids(&["--label", "backend", "--exclude-tag", "FRONTEND"]).0,
+            ["api"]
+        );
+        assert_eq!(ids(&["--exclude-tag", "backend"]).0, ["bare", "ui"]);
+        assert_eq!(ids(&[]).0, ["api", "bare", "ui", "web"]);
+        let (none, unknown) = ids(&["--tag", "uxx"]);
+        assert!(none.is_empty());
+        assert_eq!(unknown, json!([{"tag": "uxx", "suggestion": "ux"}]));
+        assert_eq!(ids(&["--tag", "ux"]).1, Value::Null);
+        assert_eq!(
+            dedup_tags(&["UX".into(), "ux".into(), "data".into()]),
+            ["ux", "data"]
         );
     }
     #[test]

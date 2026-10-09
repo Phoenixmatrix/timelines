@@ -288,8 +288,21 @@ pub struct ListIssues {
     pub r#type: Option<String>,
     #[arg(long)]
     pub search: Option<String>,
+    #[command(flatten)]
+    pub tags: TagFilter,
     #[arg(long, default_value_t=50, value_parser=clap::value_parser!(u16).range(1..=500))]
     pub limit: u16,
+}
+/// Narrow by the tracker's tags (CORE-253), as the web's `tag:a tag:b -tag:c`.
+#[derive(Args, Default)]
+pub struct TagFilter {
+    /// Only issues with this tag; repeat for any of several. Case-insensitive;
+    /// `gm issue tags` lists the catalog. (`--label` is the old name of this flag.)
+    #[arg(long = "tag", alias = "label", value_name = "TAG")]
+    pub tags: Vec<String>,
+    /// Leave out issues with this tag (repeat).
+    #[arg(long = "exclude-tag", value_name = "TAG")]
+    pub exclude_tags: Vec<String>,
 }
 #[derive(Args)]
 pub struct Note {
@@ -452,6 +465,10 @@ pub enum IssueCommand {
         /// Only work under this issue (a project or other parent).
         #[arg(long)]
         under: Option<String>,
+        /// Only pick work with these tags, never with excluded ones; the rest of the
+        /// scope still applies.
+        #[command(flatten)]
+        tags: TagFilter,
         /// Lease seconds; defaults to .gitmatrix/agents.yml's, else 900.
         #[arg(long, value_parser=clap::value_parser!(u32).range(30..=86400))]
         ttl: Option<u32>,

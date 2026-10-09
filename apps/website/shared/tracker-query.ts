@@ -336,16 +336,18 @@ export function canonicalToken(token: string): string {
   return key ? `${match[1]}${key}:${match[3]}` : token;
 }
 
-/** Add `key:value` to the query, or remove it when present (in any spelling). */
-export function toggleToken(query: string, key: QueryKey, value: string): string {
+/**
+ * Add `key:value` (`-key:value` when negated) to the query, or remove it when
+ * present, every copy and in any spelling.
+ */
+export function toggleToken(query: string, key: QueryKey, value: string, negated = false): string {
   const tokens = tokenize(query);
-  const token = filterToken(key, value);
-  const at = tokens.findIndex(
-    (t) => canonicalToken(filterTokenOf(t)).toLowerCase() === token.toLowerCase(),
+  const token = filterToken(key, value, negated);
+  const kept = tokens.filter(
+    (t) => canonicalToken(filterTokenOf(t)).toLowerCase() !== token.toLowerCase(),
   );
-  if (at !== -1) tokens.splice(at, 1);
-  else tokens.push(token);
-  return tokens.join(" ");
+  if (kept.length === tokens.length) kept.push(token);
+  return kept.join(" ");
 }
 /** The query's filters as filterToken writes them, lowercase: what a facet shows as pressed. */
 export function queryTokenSet(query: string): Set<string> {

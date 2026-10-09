@@ -174,6 +174,8 @@ Navigation uses links; view toggles use pressed buttons. Workspace names are und
 
 Same-origin absolute links in tracker Markdown use client-side navigation; external links, modified clicks, relative links and fragments retain browser behavior. Tracker search treats bare numbers and full issue keys as exact ticket lookups, even when quoted; other words and quoted phrases search keys, titles and tags. Keep filter and exclusion semantics intact.
 
+Tag pills sit under the saved views (CORE-253): every `tag:` and `-tag:` term the query holds shows as a pressed pill that removes it, followed by the most used tags in what the query shows, each adding its term in one click, up to six pills in all. They are pressed buttons like the saved views, not the inert tag chips on issues, and the query stays the only source of truth. Controls under the query box must not move while a press is down: its help line collapses only after the pointer is released, so a press that blurs the box still lands.
+
 ### Issue selection and handoff
 
 A selected issue row uses a subtle amber wash. Readiness combines a text label and a state mark: a filled ink flag for a direct claim, an outlined faint-ink flag for an inherited lease, a hollow muted-ink square for a container whose work is in its open sub-issues (see "Status by shape" in the root DESIGN.md). Issue details say why an issue isn't ready in one line. Parent hierarchy, blockers and related links are separately labelled. Checkpoints carry the same filled flag and evidence a green dot; the latest checkpoint sits near the issue header. The list, relationship lens and Atlas are recorded in the root DESIGN.md.

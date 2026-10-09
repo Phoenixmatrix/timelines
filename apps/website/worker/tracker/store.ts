@@ -1958,6 +1958,10 @@ export class TrackerStore {
         underId?: string;
         /** The caller holds underId's lease: its own subtree is open to it. */
         own?: Issue;
+        /** Lowercase: only issues with any of these tags (CORE-253). */
+        tags?: string[];
+        /** Lowercase: never issues with any of these tags. */
+        excludeTags?: string[];
       },
       holder: { actorId: string; accountableId: string },
     ) => {
@@ -1995,6 +1999,11 @@ export class TrackerStore {
         }
         return false;
       };
+      // Any of the wanted tags, none of the excluded ones: the web's `tag:a tag:b -tag:c`.
+      const tagged = (issue: Issue) => {
+        const has = (tag: string) => issue.labels.some((l) => l.toLowerCase() === tag);
+        return (!scope.tags?.length || scope.tags.some(has)) && !scope.excludeTags?.some(has);
+      };
       const dependents = new Map<string, string[]>();
       for (const link of this.all<Link>("link"))
         if (link.kind === "blocks")
@@ -2018,6 +2027,7 @@ export class TrackerStore {
           (!scope.teamId || issue.teamId === scope.teamId) &&
           (!scope.workspaceId || issue.workspaceIds.includes(scope.workspaceId)) &&
           (!scope.underId || under(issue)) &&
+          tagged(issue) &&
           writable(issue),
       );
       // Ready work the agent doesn't meet the requirements of is passed over, and counted.
@@ -2582,15 +2592,23 @@ export class TrackerStore {
             "underId",
             "underToken",
             "forActorId",
+            "tags",
+            "excludeTags",
           ]);
           const ttl = data.ttlSeconds === undefined ? 900 : data.ttlSeconds;
           if (!Number.isInteger(ttl) || Number(ttl) < 30 || Number(ttl) > 86400)
             fail("invalid_input", "ttlSeconds must be an integer from 30 to 86400.");
           const agent = text(data.agent, "agent", 200);
+          const lower = (value: unknown, name: string) =>
+            strings(value, name, 50).map((tag) => tag.toLowerCase());
           const scope = {
             ...(data.teamId === undefined ? {} : { teamId: id(data.teamId) }),
             ...(data.workspaceId === undefined ? {} : { workspaceId: id(data.workspaceId) }),
             ...(data.underId === undefined ? {} : { underId: id(data.underId) }),
+            ...(data.tags === undefined ? {} : { tags: lower(data.tags, "tags") }),
+            ...(data.excludeTags === undefined
+              ? {}
+              : { excludeTags: lower(data.excludeTags, "excludeTags") }),
           };
           if (scope.teamId) this.get<Team>("team", scope.teamId);
           if (scope.workspaceId) this.get<Workspace>("workspace", scope.workspaceId);

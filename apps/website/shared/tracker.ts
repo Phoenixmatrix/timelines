@@ -601,6 +601,10 @@ export type Mutation =
         /** With underId: that issue's lease token, to pick inside your own leased subtree. */
         underToken?: string;
         forActorId?: string;
+        /** Only issues with any of these tags (CORE-253); case-insensitive. */
+        tags?: string[];
+        /** Never issues with any of these tags. */
+        excludeTags?: string[];
       };
     }
   | { kind: "issue.renew"; id: string; data: { leaseToken: string; ttlSeconds?: number } }
