@@ -662,6 +662,37 @@ export async function onPush(
     } else if (known.size === 0 && row.ref !== refs.headBranch) continue;
     // A landing's merge is tested by the landing itself (timelines/landing.ts).
     if (landingSlugOf(row.ref) || isQueueSourceBranch(row.ref)) continue;
+    // A queue's advancing fence owns this exact canonical main delivery. Keep
+    // ci_refs current, but do not let an ordinary observer create an unverified
+    // run before queue recovery reserves and starts its evidence-bearing run.
+    if (
+      (repo.source_id ?? "canonical") === "canonical" &&
+      (await kdb
+        .selectFrom("merge_queue")
+        .select("id")
+        .where("repo_id", "=", repo.id)
+        .where("candidate", "=", row.oid)
+        .where("status", "in", ["advancing", "landed"])
+        .where((eb) =>
+          eb(eb.fn<string>("json_extract", ["data", eb.val("$.entry.branch")]), "=", row.ref),
+        )
+        .where((eb) =>
+          eb.or([
+            eb("status", "=", "advancing"),
+            eb(
+              eb.fn.coalesce(
+                eb.fn<string>("json_extract", ["data", eb.val("$.entry.deployStatus")]),
+                eb.val("queued"),
+              ),
+              "not in",
+              ["succeeded", "failed", "cancelled"],
+            ),
+          ]),
+        )
+        .limit(1)
+        .executeTakeFirst())
+    )
+      continue;
     // A push to a timeline also gets its light step run (CORE-235), when the
     // repository opts in; it never stands in for the push's own run.
     const triggers = isTimeline(repo, row.ref) ? (["push", "step"] as const) : (["push"] as const);

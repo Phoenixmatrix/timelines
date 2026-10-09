@@ -2430,6 +2430,12 @@ controls are ineligible. Missing or unknown identity, failed verification or a
 changed candidate, attempt, specification, image or Worker version falls back to
 normal execution.
 
+The persisted queue owns main CI for its exact canonical candidate from the
+advancing fence through pending deployment. Ordinary moved-ref observers still
+update `ci_refs`, but defer that delivery to queue recovery rather than creating
+an unverified pipeline first. Other repositories, sources, branches and commits,
+and queues whose deployment is already terminal, retain ordinary push behavior.
+
 A proposed proof at run creation is not yet public verification. The workflow
 revalidates it when consuming the gate, including after recovery, against the
 current runtime identity and only after the main run's prerequisites succeed.

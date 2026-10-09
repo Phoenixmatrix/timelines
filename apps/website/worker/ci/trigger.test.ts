@@ -392,6 +392,12 @@ jobs:
         'allocation','canonical','${oid(1)}','${oid(1)}','refs/heads/main',
         'canonical','${oid(1)}','${oid(1)}','refs/heads/main','2026-10-05','2026-10-05');
     `);
+    // A canonical queue's same branch/OID must not suppress a physical work source.
+    t.sqlite
+      .prepare(
+        "INSERT INTO merge_queue(repo_id,id,status,attempts,candidate,data,created_at,updated_at) VALUES('repo','canonical-queue','landed',1,?,?,'now','now')",
+      )
+      .run(oid(3), JSON.stringify({ entry: { branch: "work", deployStatus: "queued" } }));
     // CI has never seen this source: a fork copies every canonical branch.
     refs.branches = [
       { shortName: "main", oid: oid(1) },
