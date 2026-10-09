@@ -12,7 +12,7 @@ import type {
   TreeResponse,
   Visibility,
 } from "../../shared/api.ts";
-import type { AppEnv } from "../auth.ts";
+import { tokenCredential, type AppEnv } from "../auth.ts";
 import { noteAgentPresence, readAgentPresence } from "../agent-presence.ts";
 import { isArtifactsError, newArtifactsName } from "../artifacts.ts";
 import { launchPurge, requestDeletion } from "../retention/repo-deletion.ts";
@@ -40,6 +40,10 @@ import { getWorkSource, resolveSource, workGitPath } from "../timelines/sources.
 import { TrackerError } from "../tracker/store.ts";
 import { sourceLineage } from "../ref-log/lineage.ts";
 import type { CodeSource } from "../../shared/code-source.ts";
+import { authorize } from "../tracker/api.ts";
+import { trackerObject } from "../tracker/stub.ts";
+import { recoverSourcePush } from "../git/source-push.ts";
+import { deliverRecoveredSourcePush } from "../git/source-push-delivery.ts";
 
 const REPO_NAME = /^(?!\.)[A-Za-z0-9._-]{1,100}$/;
 const MAX_TEXT_BYTES = 1024 * 1024;
@@ -125,6 +129,91 @@ repos.get("/:owner/:name/sources/:sourceId/lineage", async (c) => {
   const result = await sourceLineage(c.env, loaded.row, c.req.param("sourceId"), commit);
   return result ? c.json(result) : fail(c, 404, "No such code source.");
 });
+
+async function sourcePushRoute(c: Context<AppEnv>, action: "list" | "inspect" | "recover") {
+  const actor = requireActor(c);
+  if (actor instanceof Response) return actor;
+  if (action === "recover") {
+    const credential = await tokenCredential(c);
+    if (credential.kind === "token" && credential.scope !== "write")
+      return fail(c, 403, "This token is read-only.");
+  }
+  const loaded = await loadRepo(c, action === "recover" ? "write" : "read");
+  if (loaded instanceof Response) return loaded;
+  c.header("cache-control", "private, no-store");
+  try {
+    const access = await authorize(c, false);
+    if (access.owner.id !== loaded.row.owner_id) return fail(c, 404, "No matching source.");
+    const sourceId = c.req.param("sourceId")!;
+    const source = await getWorkSource(c.env, loaded.row.id, sourceId);
+    if (!source || source.owner_id !== loaded.row.owner_id || sourceId === "canonical")
+      return fail(c, 404, "No matching owned source.");
+    const tracker = trackerObject(c.env, loaded.row.owner_id);
+    if (action === "list") {
+      const result = await tracker.sourcePushes(loaded.row.id);
+      if (!result.ok) return c.json({ error: result.error, code: result.code }, result.status);
+      return c.json({
+        sourceId,
+        operations: result.value.filter((operation) => operation.sourceId === sourceId),
+      });
+    }
+    const operationId = c.req.param("operationId")!;
+    if (action === "inspect") {
+      const result = await tracker.sourcePush(operationId, loaded.row.id, sourceId);
+      if (!result.ok) return c.json({ error: result.error, code: result.code }, result.status);
+      return c.json(result.value);
+    }
+    let input: unknown;
+    try {
+      input = await c.req.json();
+    } catch {
+      return fail(c, 400, "Expected an empty JSON object.");
+    }
+    if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length)
+      return fail(c, 400, "Expected an empty JSON object.");
+    const result = await recoverSourcePush(
+      c.env,
+      loaded.row,
+      sourceId,
+      operationId,
+      access.actorId,
+      access.principalId,
+    );
+    if (
+      source.state === "ready" &&
+      source.artifacts_remote &&
+      (result.state === "accepted" || result.syncRequired)
+    ) {
+      const physical = {
+        ...loaded.row,
+        source_id: sourceId,
+        artifacts_name: source.artifacts_name,
+        artifacts_remote: source.artifacts_remote,
+        default_branch: source.work_ref.replace(/^refs\/heads\//, ""),
+      };
+      await deliverRecoveredSourcePush(
+        c.env,
+        physical,
+        operationId,
+        result.state === "accepted" ? null : actor,
+        (work) => c.executionCtx.waitUntil(work),
+      );
+    }
+    return c.json(result);
+  } catch (error) {
+    if (error instanceof TrackerError)
+      return c.json({ error: error.message, code: error.code }, error.status);
+    throw error;
+  }
+}
+
+repos.get("/:owner/:name/sources/:sourceId/pushes", (c) => sourcePushRoute(c, "list"));
+repos.get("/:owner/:name/sources/:sourceId/pushes/:operationId", (c) =>
+  sourcePushRoute(c, "inspect"),
+);
+repos.post("/:owner/:name/sources/:sourceId/pushes/:operationId/recover", (c) =>
+  sourcePushRoute(c, "recover"),
+);
 
 function cleanPath(raw: string | undefined): string | null {
   const segments = (raw ?? "").split("/").filter(Boolean);

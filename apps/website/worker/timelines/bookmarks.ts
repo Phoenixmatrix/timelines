@@ -42,6 +42,7 @@ export async function writeRefs(
   env: Env,
   repo: { artifacts_name: string; artifacts_remote: string },
   writes: RefWrite[],
+  pack: Uint8Array = EMPTY_PACK,
 ): Promise<RefWriteResult[]> {
   if (!writes.length) return [];
   const authorization = `Bearer ${await upstreamToken(env, repo.artifacts_name, "write")}`;
@@ -61,9 +62,9 @@ export async function writeRefs(
   const commands = receivePackCommands(updates, capabilities);
   let body = commands;
   if (needsPack(updates)) {
-    body = new Uint8Array(commands.length + EMPTY_PACK.length);
+    body = new Uint8Array(commands.length + pack.length);
     body.set(commands);
-    body.set(EMPTY_PACK, commands.length);
+    body.set(pack, commands.length);
   }
   const response = await fetch(`${repo.artifacts_remote}/git-receive-pack`, {
     method: "POST",

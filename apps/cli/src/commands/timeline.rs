@@ -72,6 +72,10 @@ pub enum TimelineCommand {
     Update(UpdateArgs),
     /// Convert a legacy timeline to owned work sources; renew its checkpoint and approval afterward
     Migrate(MigrateArgs),
+    /// List pending source pushes, or inspect one exact operation (including terminal outcomes)
+    Pushes(PushesArgs),
+    /// Recover one interrupted source push without changing this checkout; never force-push
+    RecoverPush(RecoverPushArgs),
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -97,6 +101,32 @@ pub struct MigrateArgs {
     pub note: Option<String>,
     #[command(flatten)]
     pub owner: Owner,
+}
+
+#[derive(Args)]
+pub struct PushSelection {
+    /// Timeline slug (default: this checkout's binding).
+    #[arg(long)]
+    pub timeline: Option<String>,
+    /// Canonical repository owner/name (default: this checkout's origin).
+    #[arg(long)]
+    pub repo: Option<String>,
+}
+
+#[derive(Args)]
+pub struct PushesArgs {
+    /// Exact operation ID; omit to list pending operations.
+    pub operation: Option<String>,
+    #[command(flatten)]
+    pub selection: PushSelection,
+}
+
+#[derive(Args)]
+pub struct RecoverPushArgs {
+    /// Exact operation ID from `gm timeline pushes`; retries are idempotent.
+    pub operation: String,
+    #[command(flatten)]
+    pub selection: PushSelection,
 }
 
 #[derive(Args)]
@@ -299,6 +329,8 @@ pub fn run(ctx: &Ctx, command: &TimelineCommand) -> Result<Shown> {
         TimelineCommand::Land(a) => land(ctx, a),
         TimelineCommand::Update(a) => update(ctx, a),
         TimelineCommand::Migrate(a) => migrate(ctx, a),
+        TimelineCommand::Pushes(a) => source_push(ctx, &a.selection, a.operation.as_deref(), false),
+        TimelineCommand::RecoverPush(a) => source_push(ctx, &a.selection, Some(&a.operation), true),
     }
 }
 
@@ -1386,8 +1418,18 @@ pub(crate) struct WorkSource {
 pub(crate) fn work_source(ctx: &Ctx, config: &Config, slug: &str) -> Result<WorkSource> {
     slug_arg(slug)?;
     let owner = owner(ctx, config, None)?;
-    let record = fetch_record(config, &owner, slug)?;
     let name = server::current_repo(ctx)?;
+    selected_work_source(ctx, config, slug, &owner, &name)
+}
+
+fn selected_work_source(
+    ctx: &Ctx,
+    config: &Config,
+    slug: &str,
+    owner: &str,
+    name: &str,
+) -> Result<WorkSource> {
+    let record = fetch_record(config, owner, slug)?;
     let entry = record["repos"]
         .as_array()
         .into_iter()
@@ -1427,10 +1469,11 @@ pub(crate) fn work_source(ctx: &Ctx, config: &Config, slug: &str) -> Result<Work
             "The server's Git URL or source identity does not match this timeline.",
         ));
     }
-    let checkout = git2::Repository::discover(&ctx.cwd)?;
-    if let Ok(pinned) = checkout
-        .config()?
-        .get_string(&format!("gitmatrix.source-{slug}"))
+    if server::current_repo(ctx).ok().as_deref() == Some(name)
+        && let Ok(checkout) = git2::Repository::discover(&ctx.cwd)
+        && let Ok(pinned) = checkout
+            .config()?
+            .get_string(&format!("gitmatrix.source-{slug}"))
         && pinned != id
     {
         return Err(GmError::new(
@@ -1443,6 +1486,101 @@ pub(crate) fn work_source(ctx: &Ctx, config: &Config, slug: &str) -> Result<Work
         url: expected,
         ended: ended(&record).is_some(),
     })
+}
+
+// Recovery is API-only: do not open a Workspace, fetch, rewrite bindings or push.
+fn source_push(
+    ctx: &Ctx,
+    selection: &PushSelection,
+    operation: Option<&str>,
+    recover: bool,
+) -> Result<Shown> {
+    if let Some(operation) = operation
+        && (operation.is_empty()
+            || !operation
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+    {
+        return Err(GmError::usage(
+            "Use an exact push operation ID from `gm timeline pushes`.",
+        ));
+    }
+    let slug = selection.timeline.clone().or_else(current).ok_or_else(|| {
+        GmError::usage("This checkout doesn't work in a timeline.")
+            .hint("Pass --timeline SLUG and, outside a checkout, --repo OWNER/NAME.")
+    })?;
+    slug_arg(&slug)?;
+    let name = match &selection.repo {
+        Some(name) => std::borrow::Cow::Borrowed(name.as_str()),
+        None => std::borrow::Cow::Owned(server::current_repo(ctx)?),
+    };
+    let (repo_owner, repo_name) = name
+        .split_once('/')
+        .ok_or_else(|| GmError::usage("Name a canonical repository as OWNER/NAME."))?;
+    if [repo_owner, repo_name].into_iter().any(|part| {
+        part.is_empty()
+            || part == "."
+            || part == ".."
+            || !part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    }) {
+        return Err(GmError::usage("Name a canonical repository as OWNER/NAME."));
+    }
+    let config = Config::load();
+    let account = if selection.repo.is_some() {
+        repo_owner.to_owned()
+    } else {
+        owner(ctx, &config, None)?
+    };
+    let source = selected_work_source(ctx, &config, &slug, &account, &name)?;
+    let mut path = format!("/repos/{name}/sources/{}/pushes", source.id);
+    if let Some(operation) = operation {
+        path.push('/');
+        path.push_str(operation);
+    }
+    if recover {
+        path.push_str("/recover");
+        if ctx.dry_run {
+            return Ok(Shown {
+                value: json!({"dry_run": true, "sourceId": source.id, "operationId": operation,
+                    "timeline": slug, "repo": name, "request": {}}),
+                text: format!(
+                    "Would recover push {} on {name} / {slug}. No provider or local changes were made.",
+                    operation.unwrap_or("")
+                ),
+            });
+        }
+    }
+    let body = recover.then(|| json!({}));
+    let mut value = remote::api(
+        &config,
+        if recover { "POST" } else { "GET" },
+        &path,
+        body.as_ref(),
+    )?;
+    let text = if recover {
+        let next = if value["syncRequired"] == true {
+            format!(
+                "Recovery introduced a same-tree fence commit. In the checkout bound to {slug} for {name}, run `gm sync` before retrying publication. Do not force-push."
+            )
+        } else {
+            "The established push outcome is recorded. No local changes were made; inspect the outcome before retrying publication.".to_string()
+        };
+        value["next"] = json!(next);
+        format!(
+            "Push {}: {}\nSource: {}\nRecovery: {}\nProven head: {}\nFence commit: {}\n{next}",
+            value["operationId"].as_str().unwrap_or("?"),
+            value["state"].as_str().unwrap_or("?"),
+            source.id,
+            value["recoveryId"].as_str().unwrap_or("none"),
+            value["head"].as_str().unwrap_or("none"),
+            value["fenceCommit"].as_str().unwrap_or("none")
+        )
+    } else {
+        serde_json::to_string_pretty(&value)?
+    };
+    Ok(Shown { value, text })
 }
 
 pub(crate) fn source_query(ctx: &Ctx, config: &Config) -> Result<String> {

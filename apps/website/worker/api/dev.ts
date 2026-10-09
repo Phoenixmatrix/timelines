@@ -38,6 +38,7 @@ import { sourceRetentionFixture } from "./dev-source-retention.ts";
 import { sourceAuthFixture } from "./dev-source-auth.ts";
 import { landingFixtures } from "./dev-landing-fixtures.ts";
 import { knowledgeFixtures } from "./dev-knowledge-fixtures.ts";
+import { sourcePushFixtures } from "./dev-source-push-fixtures.ts";
 
 // DEVELOPMENT ONLY: empty, named repositories exercising the persona permissions.
 // The harness populates their bounded, pinned contents through the real CLI.
@@ -110,6 +111,7 @@ dev.use("*", async (c, next) => {
       "/source-retention",
       "/source-auth",
       "/landing-fixtures",
+      "/source-push-fixtures",
       "/knowledge-fixtures",
       "/chronicle",
     ].some((path) => c.req.path.endsWith(path))
@@ -129,6 +131,7 @@ dev.post("/source-fixtures", sourceFixtures);
 dev.post("/source-retention", sourceRetentionFixture);
 dev.post("/source-auth", sourceAuthFixture);
 dev.post("/landing-fixtures", landingFixtures);
+dev.post("/source-push-fixtures", sourcePushFixtures);
 dev.post("/knowledge-fixtures", knowledgeFixtures);
 
 // The Durable Object purge contract in the real runtime (CORE-197): every

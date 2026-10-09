@@ -1,8 +1,13 @@
+import { encodeCommit, hashObject, PackWriter } from "@gitmatrix/formats/git";
 import { lsRefs } from "../artifacts.ts";
 import { db, nowIso } from "../schema.ts";
 import { writeRefs } from "../timelines/bookmarks.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { getWorkSource } from "../timelines/sources.ts";
+import { TrackerError } from "../tracker/store.ts";
+import type { TrackerReply } from "../tracker/object.ts";
+import type { SourcePush, SourcePushRecovery } from "../tracker/timelines.ts";
+import { sourcePushFixtureBoundary } from "./source-push-fixture.ts";
 
 type SourceRepo = {
   id: string;
@@ -92,12 +97,33 @@ export async function reconcileSourcePushes(env: Env, repoId: string, sourceId?:
     if (!authoritative.ok) throw new Error(authoritative.error);
     if (authoritative.value.state !== "accepted" && authoritative.value.state !== "rejected")
       continue;
-    const result = await tracker.finishSourcePush(row.id, authoritative.value.state);
+    const proof = authoritative.value.recovery;
+    const result =
+      proof?.outcome && proof.head
+        ? await tracker.settleSourcePushRecovery(row.id, proof.outcome, proof.head)
+        : await tracker.finishSourcePush(row.id, authoritative.value.state);
     if (!result.ok) throw new Error(result.error);
     settled.push(row.id);
   }
   for (const operation of pending.value) {
     if (sourceId && operation.sourceId !== sourceId) continue;
+    if (operation.state === "accepted" || operation.state === "rejected") {
+      if (!settled.includes(operation.operationId)) {
+        const proof = operation.recovery;
+        const result =
+          proof?.outcome && proof.head
+            ? await tracker.settleSourcePushRecovery(
+                operation.operationId,
+                proof.outcome,
+                proof.head,
+              )
+            : await tracker.finishSourcePush(operation.operationId, operation.state);
+        if (!result.ok) throw new Error(result.error);
+        settled.push(operation.operationId);
+      }
+      continue;
+    }
+    if (operation.recovery) continue; // An unresolved CAS is not rejection proof.
     if (operation.state === "projecting") {
       const result = await tracker.rejectUnprojectedSourcePush(
         operation.operationId,
@@ -129,4 +155,201 @@ export async function reconcileSourcePushes(env: Env, repoId: string, sourceId?:
     settled.push(operation.operationId);
   }
   return settled;
+}
+
+function unwrapPush<T>(reply: TrackerReply<T>): T {
+  if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
+  return reply.value;
+}
+
+function recoveryResult(operation: SourcePush & { state: string }) {
+  if (operation.state !== "accepted" && operation.state !== "rejected")
+    throw new TrackerError(
+      409,
+      "source_busy",
+      "Recovery is not proven; retry this exact operation.",
+    );
+  return {
+    sourceId: operation.sourceId,
+    operationId: operation.operationId,
+    state: operation.state,
+    // A pre-forward rejection proves no write, not that the client's old OID
+    // was the provider head. Do not present that unobserved head as proof.
+    head:
+      operation.recovery?.head ??
+      (operation.state === "accepted" ? operation.commands[0]?.new : null) ??
+      null,
+    recoveryId: operation.recovery?.id ?? null,
+    fenceCommit: operation.recovery?.commit ?? null,
+    syncRequired: operation.recovery?.outcome === "rejected",
+  };
+}
+
+/** Explicit recovery never treats the unchanged old ref as rejection proof. */
+export async function recoverSourcePush(
+  env: Env,
+  canonical: { id: string; owner_id: string },
+  sourceId: string,
+  operationId: string,
+  actorId: string,
+  accountableId: string,
+) {
+  const tracker = trackerObject(env, canonical.owner_id);
+  let operation = unwrapPush(await tracker.sourcePush(operationId, canonical.id, sourceId));
+  const readOperation = async () =>
+    unwrapPush(await tracker.sourcePush(operationId, canonical.id, sourceId));
+  const finish = async () => {
+    if (operation.recovery?.outcome) {
+      unwrapPush(
+        await tracker.settleSourcePushRecovery(
+          operationId,
+          operation.recovery.outcome,
+          operation.recovery.head!,
+        ),
+      );
+    } else if (operation.state === "accepted" || operation.state === "rejected") {
+      unwrapPush(await tracker.finishSourcePush(operationId, operation.state));
+    }
+    return recoveryResult(await readOperation());
+  };
+  if (operation.state === "accepted" || operation.state === "rejected") return finish();
+  if (operation.state === "projecting") {
+    unwrapPush(await tracker.rejectUnprojectedSourcePush(operationId, canonical.id, sourceId));
+    operation = await readOperation();
+    return finish();
+  }
+  const source = await getWorkSource(env, canonical.id, sourceId);
+  if (
+    !source ||
+    source.owner_id !== canonical.owner_id ||
+    source.state !== "ready" ||
+    !source.artifacts_remote ||
+    source.timeline_id !== operation.timelineId
+  )
+    throw new TrackerError(409, "source_expired", "Recovery requires the active owned source.");
+  const [command] = operation.commands;
+  if (
+    operation.commands.length !== 1 ||
+    !command ||
+    command.ref !== source.work_ref ||
+    !command.new
+  )
+    throw new TrackerError(409, "recovery_conflict", "Operation is not an owned work-ref update.");
+  const repo = {
+    id: canonical.id,
+    source_id: sourceId,
+    artifacts_name: source.artifacts_name,
+    artifacts_remote: source.artifacts_remote,
+  };
+  const readHead = async () =>
+    (await lsRefs(env, repo.artifacts_name, repo.artifacts_remote, [source.work_ref])).find(
+      (ref) => ref.name === source.work_ref,
+    )?.oid ?? null;
+  let head = await readHead();
+  if (!operation.recovery && head === command.new) {
+    await retainProgress(env, repo, operationId, command.new);
+    unwrapPush(await tracker.finishSourcePush(operationId, "accepted"));
+    operation = await readOperation();
+    return finish();
+  }
+  if (!operation.recovery) {
+    if (!head || head !== command.old || command.old === command.new)
+      throw new TrackerError(
+        409,
+        "recovery_conflict",
+        "The provider head is neither the admitted old nor new commit; the source remains fenced.",
+      );
+    using artifacts = await env.ARTIFACTS.get(repo.artifacts_name);
+    const base = await artifacts.readCommit(head);
+    if (!base)
+      throw new TrackerError(409, "recovery_conflict", "Recovery base commit is unavailable.");
+    const id = crypto.randomUUID();
+    const createdAt = nowIso();
+    const identity = {
+      name: "Gitmatrix source recovery",
+      email: "source-recovery@gitmatrix.com",
+      time: Math.floor(Date.parse(createdAt) / 1000),
+    };
+    const bytes = encodeCommit({
+      tree: base.treeHash,
+      parents: [head],
+      author: identity,
+      committer: identity,
+      message: `Fence interrupted source push ${operationId}\n\nRecovery: ${id}\n`,
+    });
+    const intent: SourcePushRecovery = {
+      id,
+      base: head,
+      tree: base.treeHash,
+      commit: hashObject("commit", bytes),
+      content: new TextDecoder().decode(bytes),
+      actorId,
+      accountableId,
+      createdAt,
+      priorState: operation.state,
+    };
+    // First persisted intent wins. Every contender must use the returned marker.
+    operation = unwrapPush(
+      await tracker.beginSourcePushRecovery(operationId, canonical.id, sourceId, intent),
+    );
+    if (operation.state === "accepted" || operation.state === "rejected") return finish();
+  } else {
+    // Recheck lifecycle before replaying provider work, not just on first intent.
+    operation = unwrapPush(
+      await tracker.beginSourcePushRecovery(
+        operationId,
+        canonical.id,
+        sourceId,
+        operation.recovery,
+      ),
+    );
+    if (operation.state === "accepted" || operation.state === "rejected") return finish();
+  }
+  const recovery = operation.recovery!;
+  head = await readHead();
+  if (head === recovery.base) {
+    const bytes = new TextEncoder().encode(recovery.content);
+    if (hashObject("commit", bytes) !== recovery.commit)
+      throw new TrackerError(409, "recovery_conflict", "Persisted recovery marker does not match.");
+    const writer = new PackWriter();
+    writer.header(1);
+    writer.add("commit", bytes);
+    const chunks = writer.finish();
+    const pack = new Uint8Array(chunks.reduce((size, chunk) => size + chunk.length, 0));
+    let offset = 0;
+    for (const chunk of chunks) {
+      pack.set(chunk, offset);
+      offset += chunk.length;
+    }
+    try {
+      await writeRefs(
+        env,
+        repo,
+        [{ ref: source.work_ref, old: recovery.base, new: recovery.commit }],
+        pack,
+      );
+    } catch {
+      // A lost response is not a failed CAS. Only the fresh ref proof below settles it.
+    }
+    head = await readHead();
+  }
+  if (head !== recovery.commit && head !== command.new)
+    throw new TrackerError(
+      409,
+      "source_busy",
+      "Recovery has no terminal ref proof; retry this exact operation. The source remains fenced.",
+    );
+  const outcome = head === recovery.commit ? "rejected" : "accepted";
+  if (outcome === "rejected")
+    await sourcePushFixtureBoundary(
+      env,
+      canonical.id,
+      sourceId,
+      operationId,
+      "after-recovery-fence",
+    );
+  await retainProgress(env, repo, operationId, head);
+  unwrapPush(await tracker.settleSourcePushRecovery(operationId, outcome, head));
+  operation = await readOperation();
+  return finish();
 }

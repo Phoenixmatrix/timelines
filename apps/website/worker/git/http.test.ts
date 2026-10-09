@@ -20,6 +20,8 @@ import { gitHttp, landingPushRefusal, queuePushRefusal, scrubbedError } from "./
 import { FLUSH, pkt } from "./pktline.ts";
 import { afterPush } from "./effects.ts";
 import { steps } from "../steps/api.ts";
+import { encodeCommit, hashObject, PackWriter } from "@gitmatrix/formats/git";
+import { writeRefs } from "../timelines/bookmarks.ts";
 
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
 vi.mock("./effects.ts", () => ({ afterPush: vi.fn() }));
@@ -680,4 +682,42 @@ describe("scrubbedError (CORE-308)", () => {
     expect(leaked).toBe("TypeError: fetch [url] failed with Bearer [redacted]");
     expect(scrubbedError("word ".repeat(200))).toHaveLength(300);
   });
+});
+
+test("one-object recovery pack preserves the tree and permanently defeats a late old-to-new CAS", async () => {
+  const t = await setup();
+  const tree = git(t.work, "rev-parse", `${t.main}^{tree}`);
+  const identity = { name: "Recovery", email: "recovery@example.test", time: 1700000000 };
+  const content = encodeCommit({
+    tree,
+    parents: [t.main],
+    author: identity,
+    committer: identity,
+    message: "Unique recovery marker\n",
+  });
+  const marker = hashObject("commit", content);
+  const writer = new PackWriter();
+  writer.header(1);
+  writer.add("commit", content);
+  const chunks = writer.finish();
+  const pack = Buffer.concat(chunks);
+  const repo = { artifacts_name: "r-app", artifacts_remote: "https://artifacts.test/app.git" };
+  // Upload the original target without advancing the work ref, just as a
+  // receive-pack can have its objects before attempting its ref transaction.
+  git(t.work, "push", "--quiet", "origin", "HEAD:refs/gitmatrix/progress/original");
+  expect(
+    await writeRefs(t.env, repo, [{ ref: "refs/heads/work", old: null, new: t.main }]),
+  ).toMatchObject([{ ok: true }]);
+  expect(
+    await writeRefs(t.env, repo, [{ ref: "refs/heads/work", old: t.main, new: marker }], pack),
+  ).toMatchObject([{ ok: true }]);
+  const remote = join(t.root, "app.git");
+  expect(git(remote, "rev-parse", `${marker}^{tree}`)).toBe(tree);
+  expect(git(remote, "rev-parse", `${marker}^`)).toBe(t.main);
+  expect(
+    await writeRefs(t.env, repo, [{ ref: "refs/heads/work", old: t.main, new: t.merge }]),
+  ).toMatchObject([{ ok: false }]);
+  expect(t.ref("refs/heads/work")).toBe(marker);
+  expect(t.ref("refs/heads/main")).toBe(t.main);
+  t.sqlite.close();
 });

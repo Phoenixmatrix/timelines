@@ -773,6 +773,11 @@ fn status_error(status: u16, value: &Value) -> GmError {
                 .hint("Run `gm timeline migrate`, then renew checkpoint and approval.")
                 .exit(exit::CONFLICT)
         }
+        409 if value.get("code").and_then(Value::as_str) == Some("source_busy") => {
+            GmError::new("source_busy", message)
+                .hint("Inspect `gm timeline pushes`; retry recovery with the same exact operation ID. Do not force-push.")
+                .exit(exit::CONFLICT)
+        }
         // Retention (CORE-203) says when and why it removed an issue or timeline.
         404 if value.get("code").and_then(Value::as_str) == Some("removed_by_retention") => {
             GmError::not_found("removed_by_retention", message)
@@ -969,18 +974,56 @@ fn has_http_error(stderr: &str, status: &str) -> bool {
     })
 }
 
+/// Only emit recognized transport facts, never URLs, remote bodies or trace text.
+fn git_diagnostic(stderr: &str) -> String {
+    let mut facts = Vec::new();
+    for line in stderr.split(['\r', '\n']) {
+        if !line.starts_with("fatal: ") && !line.starts_with("error: ") {
+            continue;
+        }
+        if let Some((_, detail)) = line
+            .split_once("The requested URL returned error: ")
+            .or_else(|| line.split_once("RPC failed; HTTP "))
+            && let Some(status) = detail.split_ascii_whitespace().next()
+            && status.len() == 3
+            && status.bytes().all(|b| b.is_ascii_digit())
+            && matches!(status.as_bytes()[0], b'4' | b'5')
+        {
+            let fact = format!("HTTP {status}");
+            if !facts.contains(&fact) {
+                facts.push(fact);
+            }
+        }
+        for fact in [
+            "early EOF",
+            "Could not resolve host",
+            "Failed to connect",
+            "Couldn't connect",
+            "Connection timed out",
+            "Operation timed out",
+            "Connection reset by peer",
+            "SSL certificate problem",
+            "TLS connection was non-properly terminated",
+            "remote end hung up unexpectedly",
+            "unexpected disconnect",
+            "HTTP/2 stream",
+        ] {
+            if line.contains(fact) && !facts.iter().any(|existing| existing == fact) {
+                facts.push(fact.to_string());
+            }
+        }
+    }
+    if facts.is_empty() {
+        "Git transport failed; no safe diagnostic was available".to_string()
+    } else {
+        facts.join("; ")
+    }
+}
+
 /// Turn a failed git network command into a useful error.
 pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let remote: Vec<&str> = stderr
-        .lines()
-        .filter_map(|l| l.strip_prefix("remote: "))
-        .collect();
-    let detail = if remote.is_empty() {
-        stderr.trim().lines().last().unwrap_or("").to_string()
-    } else {
-        remote.join(" ")
-    };
+    let detail = git_diagnostic(&stderr);
     if stderr.contains("non-fast-forward")
         || stderr.contains("fetch first")
         || stderr.contains("stale info")
@@ -1006,8 +1049,8 @@ pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
         .exit(exit::AUTH);
     }
     if has_http_error(&stderr, "403")
-        || detail.contains("does not have write access")
-        || detail.contains("read-only")
+        || stderr.contains("does not have write access")
+        || stderr.contains("read-only")
     {
         return GmError::new("forbidden", format!("{action} was refused: {detail}"))
             .exit(exit::AUTH);
@@ -1022,17 +1065,7 @@ pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
         return GmError::new("server_unreachable", format!("{action} failed: {detail}"))
             .hint("Is the Gitmatrix dev server running (`vp dev` in apps/website)?");
     }
-    GmError::new(
-        "git_failed",
-        format!(
-            "{action} failed: {}",
-            if detail.is_empty() {
-                stderr.trim().to_string()
-            } else {
-                detail
-            }
-        ),
-    )
+    GmError::new("git_failed", format!("{action} failed: {detail}"))
 }
 
 #[cfg(test)]
@@ -1052,6 +1085,43 @@ mod failure_tests {
                 stderr: stderr.as_bytes().to_vec(),
             },
         )
+    }
+
+    #[test]
+    fn transport_status_survives_generic_final_line_without_echoing_secrets() {
+        for status in ["409", "500", "502"] {
+            let error = failure(&format!(
+                "remote: private server body token=secret\n\
+                 fatal: unable to access 'https://user:password@example.test/repo?token=secret': The requested URL returned error: {status}\n\
+                 fatal: the remote end hung up unexpectedly\n"
+            ));
+            assert_eq!(error.code, "git_failed");
+            assert!(error.message.contains(&format!("HTTP {status}")));
+            assert!(error.message.contains("remote end hung up unexpectedly"));
+            for secret in ["password", "secret", "example.test", "private server body"] {
+                assert!(!error.message.contains(secret));
+            }
+        }
+    }
+
+    #[test]
+    fn bodies_traces_and_unrecognized_errors_are_not_reprinted() {
+        for stderr in [
+            "remote: HTTP 500 password=secret\nfatal: unknown secret",
+            "=> Send header: Authorization: Bearer secret\nfatal: unknown secret",
+            "fatal: Authentication failed for 'https://user:secret@example.test/'",
+            "fatal: unable to access 'https://user:secret@example.test/': Could not resolve host: private.internal",
+        ] {
+            let error = failure(stderr);
+            assert!(!error.message.contains("secret"));
+            assert!(!error.message.contains("private.internal"));
+            assert!(!error.message.contains("example.test"));
+        }
+        assert!(
+            !failure("remote: HTTP 500\nfatal: unknown")
+                .message
+                .contains("HTTP 500")
+        );
     }
 
     #[test]

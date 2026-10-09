@@ -245,8 +245,12 @@ export async function drainDeletedRepoSources(env: Env, repoId: string): Promise
   if (consumer)
     throw new Error("Repository CI consumers still require acknowledgment before source deletion.");
   await reconcileLandingOperations(env, repoId);
+  // Also acknowledge terminal projections when D1 committed but the Tracker's
+  // completion response was lost. This never replays a proven provider write.
   const pushes = await env.DB.prepare(`SELECT id FROM source_operations WHERE repo_id=?
-    AND kind='push' AND state IN ('admitted','ambiguous') LIMIT 1`)
+    AND kind='push' AND (state IN ('admitted','ambiguous')
+      OR json_extract(data,'$.recovery.projected')=0
+      OR json_extract(data,'$.projectionPending')=1) LIMIT 1`)
     .bind(repoId)
     .first();
   if (pushes) await reconcileSourcePushes(env, repoId);
