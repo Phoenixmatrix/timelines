@@ -298,14 +298,53 @@ async function inventory(): Promise<Environment[]> {
 function cfEnv(env: Pick<Environment, "account">): NodeJS.ProcessEnv {
   return { ...process.env, CLOUDFLARE_ACCOUNT_ID: env.account };
 }
-async function cf(env: Environment, args: string[]): Promise<string> {
-  return command("cf", [...args, ...(env.profile ? ["--profile", env.profile] : [])], {
-    env: cfEnv(env),
-    timeout: 180_000,
-  });
+/** Pauses before retrying a cleanup call that Cloudflare refused for authentication (CORE-316). */
+const AUTH_RETRY_MS = [1_000, 3_000];
+function authRefused(error: unknown): boolean {
+  return /\b401\b|Authentication error/i.test(String(error));
 }
-async function cfJson<T>(env: Environment, args: string[]): Promise<T> {
-  return JSON.parse(await cf(env, args)) as T;
+/** Whether `cf` still holds a valid login: a refusal then was transient, not a logout. */
+async function loginValid(env: Environment): Promise<boolean> {
+  try {
+    const identity = JSON.parse(
+      await command("cf", ["auth", "whoami", ...(env.profile ? ["--profile", env.profile] : [])], {
+        env: cfEnv(env),
+      }),
+    ) as { authenticated?: boolean; tokenValid?: boolean };
+    return identity.authenticated === true && identity.tokenValid === true;
+  } catch {
+    return false;
+  }
+}
+/**
+ * One `cf` call. Cleanup (`retryAuth`) retries a 401 a moment later while the
+ * login is still valid: Cloudflare has refused a valid token briefly, failing
+ * sweeps that then worked seconds later. A real logout is never retried.
+ */
+async function cf(env: Environment, args: string[], retryAuth = false): Promise<string> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await command("cf", [...args, ...(env.profile ? ["--profile", env.profile] : [])], {
+        env: cfEnv(env),
+        timeout: 180_000,
+      });
+    } catch (error) {
+      const wait = AUTH_RETRY_MS[attempt];
+      if (!retryAuth || wait === undefined || !authRefused(error) || !(await loginValid(env)))
+        throw error;
+      console.warn(
+        JSON.stringify({
+          event: "environment.cleanup_auth_retry",
+          id: env.id,
+          attempt: attempt + 1,
+        }),
+      );
+      await delay(wait);
+    }
+  }
+}
+async function cfJson<T>(env: Environment, args: string[], retryAuth = false): Promise<T> {
+  return JSON.parse(await cf(env, args, retryAuth)) as T;
 }
 function absent(error: unknown): boolean {
   // Only explicit resource absence is idempotent, never permission/network failures.
@@ -319,7 +358,7 @@ function refusedNotEmpty(error: unknown): boolean {
 }
 async function deleteIfPresent(env: Environment, args: string[]): Promise<void> {
   try {
-    await cf(env, args);
+    await cf(env, args, true);
   } catch (error) {
     if (!absent(error)) throw error;
   }
@@ -361,14 +400,11 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
         for (;;) {
           let instances: { id: string }[];
           try {
-            instances = await cfJson(env, [
-              "ai-search",
-              "list",
-              "--name",
-              env.id,
-              "--per-page",
-              "100",
-            ]);
+            instances = await cfJson(
+              env,
+              ["ai-search", "list", "--name", env.id, "--per-page", "100"],
+              true,
+            );
           } catch (error) {
             if (absent(error)) break;
             throw error;
@@ -392,16 +428,11 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
       } else {
         const listed = async () => {
           try {
-            return await cfJson<{ name: string }[]>(env, [
-              "artifacts",
-              "namespaces",
-              "repos",
-              "list",
-              "--namespace",
-              env.id,
-              "--limit",
-              "100",
-            ]);
+            return await cfJson<{ name: string }[]>(
+              env,
+              ["artifacts", "namespaces", "repos", "list", "--namespace", env.id, "--limit", "100"],
+              true,
+            );
           } catch (error) {
             if (absent(error)) return null;
             throw error;
