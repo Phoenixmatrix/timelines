@@ -334,6 +334,16 @@ opt-in. Update the workspace policy in `tools/agent/ready-plan.ts` when adding
 workspaces or cross-workspace imports, and the scenario inventory, browser coverage
 and prerequisite map in `ready-e2e.ts` when adding E2E journeys.
 
+Measured decisions from 2026-10-09 (single local runs, not portable benchmarks):
+
+- Keep the combined website test invocation: it took 133.2 s; separate unit and
+  browser invocations took 178.4 s and did not demonstrate an improvement.
+- Keep all nine recovery fault cases: the shared two-repository fixture took
+  4.7 s of the 467.4 s recovery matrix, so setup was not its dominant cost.
+- Use the focused expiry/history-removed browser fixture in frontend selection
+  (12.9 s), while retaining the broad backend retention scenario (76.4 s) in full
+  readiness. These are different coverage scopes, not interchangeable tests.
+
 Selected test commands always execute; Cargo may reuse compiled outputs, not test
 results. Missing credentials, required provider outages or an unavailable browser
 fail selected gates, never cause them to be skipped. The website's `vp test` includes
