@@ -597,3 +597,66 @@ await test("a namespace Cloudflare refuses to delete with no listable repos is o
     await rm(home, { recursive: true, force: true });
   }
 });
+
+for (const login of ["valid", "logged out"] as const)
+  await test(`cleanup ${login === "valid" ? "retries" : "doesn't retry"} a 401 when the login is ${login} (CORE-316)`, async () => {
+    const home = await mkdtemp(join(tmpdir(), "gitmatrix-auth-"));
+    try {
+      const root = join(home, "worktree");
+      const directory = join(home, ".local/state/gitmatrix-agent/environments");
+      const bin = join(home, "bin");
+      await mkdir(directory, { recursive: true });
+      await mkdir(root, { recursive: true });
+      await mkdir(bin);
+      const env = owned(root);
+      env.resources = { artifacts: "created", vectors: "deleted", search: "deleted" };
+      env.status = "deleting";
+      const journal = join(directory, `${env.id}.json`);
+      await writeFile(journal, JSON.stringify(env));
+      const calls = join(home, "calls");
+      const refuse = join(home, "refuse");
+      await writeFile(refuse, "once");
+      // Cloudflare refuses the first listing as unauthenticated, as it did briefly in two sweeps.
+      await writeFile(
+        join(bin, "cf"),
+        `#!${process.execPath}\nconst fs=require('node:fs'); const args=process.argv.slice(2); fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');
+if(args[0]==='auth'){console.log(JSON.stringify({authenticated:${login === "valid"},tokenValid:${login === "valid"}}));process.exit(0)}
+if(args.includes('repos') && fs.existsSync(${JSON.stringify(refuse)})){fs.rmSync(${JSON.stringify(refuse)});console.error('[10000] Authentication error\\n401 Unauthorized');process.exit(1)}
+console.log('[]');\n`,
+        { mode: 0o700 },
+      );
+      const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+      const run = command(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`,
+        ],
+        { env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` } },
+      );
+      const listed = async () =>
+        (await readFile(calls, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as string[])
+          .filter((args) => args.includes("repos")).length;
+      if (login === "valid") {
+        await run;
+        assert.equal(
+          (JSON.parse(await readFile(journal, "utf8")) as Environment).status,
+          "deleted",
+        );
+        assert.equal(await listed(), 2, "the refused listing is retried once");
+      } else {
+        await assert.rejects(run, /Authentication error/);
+        assert.equal(
+          (JSON.parse(await readFile(journal, "utf8")) as Environment).status,
+          "deleting",
+        );
+        assert.equal(await listed(), 1, "a real logout is not retried");
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
