@@ -1,19 +1,24 @@
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 
-// Deploy what changed on main since the deployed Worker version, from CI.
+// Deploy what changed on main since the deployed Worker versions, from CI.
 //
 // Every deploy tags its Worker version with the commit it was built from
 // (`workers/tag`); the next run diffs from that commit. Migrations apply
 // before the Worker deploys. The CI image can't be rebuilt here (a Sandbox
 // has no Docker), so the deploy reuses the deployed version's image and a
 // changed ci/Dockerfile fails the job after everything else has shipped.
+//
+// The public site (apps/site, CORE-115) is a Worker of its own, assets only,
+// on timelines.fward.dev: it deploys the same way, from its own tag.
 
 const WORKER = "gitmatrix";
 const root = resolve(import.meta.dirname, "../..");
 const website = join(root, "apps/website");
 /** The website's own cf: pinned, patched, and not on PATH in CI. */
 const cf = join(website, "node_modules/.bin/cf");
+const SITE_WORKER = "gitmatrix-site";
+const site = join(root, "apps/site");
 
 /** Migration directories (relative to apps/website) and the D1 binding they target. */
 const MIGRATIONS = [
@@ -53,12 +58,28 @@ export function plan(changed: string[]): Plan {
       !inert(path) &&
       !path.startsWith("apps/website/ci/") &&
       !MIGRATIONS.some((m) => path.startsWith(m.prefix)) &&
-      (path.startsWith("apps/website/") ||
-        path.startsWith("packages/") ||
-        path.startsWith("patches/") ||
-        ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"].includes(path)),
+      (path.startsWith("apps/website/") || path.startsWith("packages/") || shared(path)),
   );
   return { worker, image, migrations };
+}
+
+/** Shared inputs: a change here can change any Worker's build. */
+function shared(path: string): boolean {
+  return (
+    path.startsWith("patches/") ||
+    ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"].includes(path)
+  );
+}
+
+/** Whether changed paths reach the public site: its sources (docs included) or shared inputs. */
+export function sitePlan(changed: string[]): boolean {
+  return changed.some(
+    (path) =>
+      (path.startsWith("apps/site/") &&
+        !/\.test\.tsx?$/.test(path) &&
+        path !== "apps/site/README.md") ||
+      shared(path),
+  );
 }
 
 function run(command: string, args: string[], cwd = root, env?: NodeJS.ProcessEnv): string {
@@ -127,6 +148,59 @@ function deploy(planOnly: boolean): void {
   // CI's checkout is shallow (the last 50 commits), and the deployed commit is
   // almost always among them; if it isn't, knownCommit fails and everything deploys.
   const head = run("git", ["rev-parse", "HEAD"]);
+  deployWebsite(head, planOnly);
+  deploySite(head, planOnly);
+}
+
+/** The commit the site's live version was built from; null when it has never deployed. */
+function siteTag(): string | null {
+  let listed: string;
+  try {
+    listed = execFileSync(cf, ["workers", "deployments", "list", "--worker", SITE_WORKER], {
+      cwd: site,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    const output = String((error as { stdout?: string; stderr?: string }).stderr ?? "");
+    if (/does not exist|\[10007\]/.test(output)) return null;
+    throw error;
+  }
+  const { deployments } = JSON.parse(listed) as {
+    deployments: { versions: { version_id: string; percentage: number }[] }[];
+  };
+  const current = deployments[0]?.versions.toSorted((a, b) => b.percentage - a.percentage)[0];
+  if (!current) return null;
+  const version = JSON.parse(
+    run(cf, ["workers", "versions", "get", current.version_id, "--worker-id", SITE_WORKER], site),
+  ) as { annotations?: Record<string, string> };
+  return version.annotations?.["workers/tag"] ?? null;
+}
+
+/** Build the site and deploy its assets-only Worker when anything it's built from changed. */
+function deploySite(head: string, planOnly: boolean): void {
+  const tag = siteTag();
+  if (tag === head) {
+    console.log(JSON.stringify({ event: "deploy.site.skipped", reason: "already-deployed", head }));
+    return;
+  }
+  const base = knownCommit(tag) ? tag : null;
+  const todo = base
+    ? sitePlan(run("git", ["diff", "--name-only", base, head]).split("\n").filter(Boolean))
+    : true;
+  console.log(JSON.stringify({ event: "deploy.site.plan", base, head, site: todo }));
+  if (planOnly || !todo) return;
+  stream("vp", ["run", "--no-cache", "site#build"]);
+  const subject = run("git", ["log", "-1", "--format=%s", head]);
+  stream(
+    join(site, "node_modules/.bin/cf"),
+    ["deploy", "--prebuilt", "--tag", head, "--message", subject.slice(0, 100)],
+    site,
+  );
+  console.log(JSON.stringify({ event: "deploy.site", head }));
+}
+
+function deployWebsite(head: string, planOnly: boolean): void {
   const current = deployed();
   if (current.tag === head) {
     console.log(JSON.stringify({ event: "deploy.skipped", reason: "already-deployed", head }));

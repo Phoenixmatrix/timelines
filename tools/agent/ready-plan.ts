@@ -47,6 +47,7 @@ const WORKSPACES = [
   "tools/agent",
   "tools/preview",
   "apps/website",
+  "apps/site",
   "packages/formats",
   "packages/testing",
   "packages/utils",
@@ -85,6 +86,7 @@ function fullGates(): ReadyPlan["gates"] {
     task("preview-types", "@gitmatrix/preview#typecheck"),
     task("formats-types", "@gitmatrix/formats#typecheck"),
     task("testing-types", "@gitmatrix/testing#typecheck"),
+    task("site-types", "site#typecheck"),
     gate("tests", ["run", "-r", "--concurrency-limit", "1", "--no-cache", "test"]),
     gate("build", ["run", "-r", "--concurrency-limit", "1", "--no-cache", "build"]),
   ];
@@ -262,6 +264,8 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     dependencies.get("tools/preview")!.add("apps/website");
   }
   dependencies.get("tools/preview")!.add("tools/agent");
+  // The site's gm reference is checked against gm's manifest (apps/cli/src/meta.rs).
+  dependencies.get("apps/site")!.add("apps/cli");
   const propagate = (selected: Set<Workspace>) => {
     let added = true;
     while (added) {
@@ -307,6 +311,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     "tools/agent": "agent",
     "tools/preview": "preview",
     "apps/website": "website",
+    "apps/site": "site",
     "packages/formats": "formats",
     "packages/testing": "testing",
     "packages/utils": "utils",

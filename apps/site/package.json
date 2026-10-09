@@ -1,0 +1,21 @@
+{
+  "name": "site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build && node scripts/build-output.ts",
+    "preview": "astro preview",
+    "test": "node --test src/*.test.ts",
+    "typecheck": "astro sync && node ../../tools/agent/typecheck.ts -p tsconfig.json",
+    "gm-reference": "node scripts/gm-reference.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/build-output-utils": "0.8.4",
+    "@cloudflare/config": "0.22.0",
+    "@types/node": "catalog:",
+    "astro": "catalog:",
+    "cf": "catalog:",
+    "typescript": "catalog:"
+  }
+}

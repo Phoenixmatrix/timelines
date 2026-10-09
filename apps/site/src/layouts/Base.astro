@@ -1,0 +1,70 @@
+---
+// Every page of the public site (CORE-115): header, footer, theme and metadata.
+import "../styles/tokens.css";
+import "../styles/site.css";
+import { APP_URL } from "../site.ts";
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+const path = Astro.url.pathname;
+const current = (prefix: string) =>
+  (prefix === "/docs/" ? path.startsWith("/docs/") && !path.startsWith("/docs/gm") : path.startsWith(prefix))
+    ? "page"
+    : undefined;
+---
+
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={new URL(path, Astro.site)} />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="theme-color" content="#1c1a17" />
+    <script is:inline>
+      // Dark is the home theme; follow a light system preference before first paint.
+      if (matchMedia("(prefers-color-scheme: light)").matches)
+        document.documentElement.dataset.theme = "light";
+    </script>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="wrap site-header">
+      <a class="lockup" href="/" aria-label="Gitmatrix home">
+        <svg viewBox="0 0 1494 315" width="124" height="26" aria-hidden="true" focusable="false">
+          <use href="/brand/gitmatrix.svg#mark" class="mark"></use>
+          <use href="/brand/gitmatrix.svg#wordmark"></use>
+        </svg>
+      </a>
+      <nav class="site-nav" aria-label="Site">
+        <a href="/docs/" aria-current={current("/docs/")}>Docs</a>
+        <a class="docs-link-ref" href="/docs/gm/" aria-current={current("/docs/gm")}>gm reference</a>
+        <a class="button button-quiet" href={APP_URL}>Sign in</a>
+      </nav>
+    </header>
+    <main id="main">
+      <slot />
+    </main>
+    <footer class="site-footer">
+      <div class="wrap">
+        <span>Gitmatrix, a git host built for agent-driven development.</span>
+        <nav aria-label="Footer">
+          <a href="/docs/getting-started/">Get started</a>
+          <a href="/docs/gm/">gm reference</a>
+          <a href={APP_URL}>Open Gitmatrix</a>
+        </nav>
+      </div>
+    </footer>
+  </body>
+</html>

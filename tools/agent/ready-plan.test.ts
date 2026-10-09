@@ -17,6 +17,7 @@ const options: ReadyOptions = { all: false, dryRun: false, base: "origin/main" }
 const workspaces = [
   "apps/cli",
   "apps/website",
+  "apps/site",
   "tools/agent",
   "tools/preview",
   "packages/formats",
@@ -144,14 +145,33 @@ await test("website production changes propagate implicit TS consumers without R
   });
 });
 
-await test("CLI changes select its whole Rust package, not website builds or workspace tests", async () => {
+await test("CLI changes select its whole Rust package and the site's gm reference, not the website", async () => {
   for (const path of ["apps/cli/src/main.rs", "apps/cli/assets/prompt.md", "apps/cli/Cargo.toml"]) {
     await fixture(async (root, _git, put) => {
       await put(path);
       const plan = await readinessPlan(root, options);
       assert.equal(plan.full, false, path);
       assert.equal(plan.e2e, true, path);
-      assert.deepEqual(targets(plan), ["cli#check", "cli#test", "cli#build"], path);
+      assert.deepEqual(
+        targets(plan),
+        ["cli#check", "cli#test", "cli#build", "site#typecheck", "site#test", "site#build"],
+        path,
+      );
+    });
+  }
+});
+
+await test("public site changes select only the site, without E2E", async () => {
+  for (const path of [
+    "apps/site/src/pages/index.astro",
+    "apps/site/src/content/docs/concepts/timelines.md",
+  ]) {
+    await fixture(async (root, _git, put) => {
+      await put(path);
+      const plan = await readinessPlan(root, options);
+      assert.equal(plan.full, false, path);
+      assert.equal(plan.e2e, false, path);
+      assert.deepEqual(targets(plan), ["site#typecheck", "site#test", "site#build"], path);
     });
   }
 });
@@ -279,6 +299,7 @@ await test("unknown/global paths, task manifests and shared harness changes fail
         "preview-types",
         "formats-types",
         "testing-types",
+        "site-types",
         "tests",
         "build",
       ]);

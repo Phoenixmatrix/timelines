@@ -1,0 +1,82 @@
+---
+import Docs from "../../../layouts/Docs.astro";
+import manifest from "../../../data/gm-commands.json";
+import { REFERENCE } from "../../../docs.ts";
+import { commandSlug, groupCommands, paramLabel, type GmManifest } from "../../../gm-reference.ts";
+
+const { commands, global_options: globals } = manifest as GmManifest;
+const groups = groupCommands(commands);
+---
+
+<Docs
+  title="gm commands"
+  description={`Every gm command, its arguments and examples: ${commands.length} commands, generated from gm itself.`}
+  href={REFERENCE.href}
+>
+  <p>
+    This reference comes from <code>gm cli commands</code>, the same manifest agents read. For one
+    command's arguments and its JSON output shape, run <code>gm schema &lt;command&gt;</code>; to find a
+    command by what you want to do, run <code>gm cli search "&lt;task&gt;"</code>.
+  </p>
+  <ul class="reference-groups" aria-label="Command groups">
+    {groups.map((group) => <li><a href={`#group-${group.name}`}>{group.name}</a></li>)}
+  </ul>
+  {
+    groups.map((group) => (
+      <section aria-labelledby={`group-${group.name}`}>
+        <h2 id={`group-${group.name}`}>gm {group.name}</h2>
+        {group.commands.map((command) => (
+          <div class="command" id={commandSlug(command.command)}>
+            <h3>
+              <a href={`#${commandSlug(command.command)}`}>{command.command}</a>
+              {command.mutates && <span class="mutates">changes state</span>}
+            </h3>
+            <p class="summary">{command.summary}</p>
+            {command.git && (
+              <p class="summary">
+                Like <code>{command.git}</code>
+              </p>
+            )}
+            <pre class="usage"><code>{command.usage}</code></pre>
+            {(command.arguments.length > 0 || command.options.length > 0) && (
+              <dl>
+                {[...command.arguments, ...command.options].map((param) => (
+                  <>
+                    <dt>{paramLabel(param)}</dt>
+                    <dd>
+                      {param.description}
+                      {param.required && " Required."}
+                      {param.default !== undefined && ` Default: ${param.default}.`}
+                    </dd>
+                  </>
+                ))}
+              </dl>
+            )}
+            {command.examples.length > 0 && (
+              <pre><code>{command.examples.join("\n")}</code></pre>
+            )}
+          </div>
+        ))}
+      </section>
+    ))
+  }
+  <section aria-labelledby="global-options">
+    <h2 id="global-options">Global options</h2>
+    <p>These work with every command.</p>
+    <div class="command">
+      <dl>
+        {
+          globals.map((param) => (
+            <>
+              <dt>{paramLabel(param)}</dt>
+              <dd>
+                {param.description}
+                {param.default !== undefined && ` Default: ${param.default}.`}
+              </dd>
+            </>
+          ))
+        }
+      </dl>
+    </div>
+  </section>
+</Docs>

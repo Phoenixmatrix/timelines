@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { plan } from "./deploy.ts";
+import { plan, sitePlan } from "./deploy.ts";
 
 const dirs = (paths: string[]) => plan(paths).migrations.map((m) => m.dir);
 
@@ -43,4 +43,28 @@ await test("the CI image's build context is the image, not the Worker", () => {
     image: true,
     migrations: [],
   });
+});
+
+await test("the public site deploys for its own sources, docs and shared inputs only", () => {
+  for (const path of [
+    "apps/site/src/pages/index.astro",
+    "apps/site/src/content/docs/concepts/timelines.md",
+    "apps/site/src/data/gm-commands.json",
+    "apps/site/cloudflare.config.ts",
+    "pnpm-lock.yaml",
+    "patches/cf@1.0.0-beta.7.patch",
+  ]) {
+    assert.equal(sitePlan([path]), true, path);
+  }
+  for (const path of [
+    "apps/site/src/gm-reference.test.ts",
+    "apps/site/README.md",
+    "apps/website/src/routes/SignIn.tsx",
+    "apps/cli/src/meta.rs",
+    "AGENTS.md",
+  ]) {
+    assert.equal(sitePlan([path]), false, path);
+  }
+  // The site is its own Worker: its changes never redeploy the website.
+  assert.equal(plan(["apps/site/src/pages/index.astro"]).worker, false);
 });

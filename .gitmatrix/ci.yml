@@ -85,7 +85,7 @@ jobs:
       - name: All application and harness type contracts
         run: >-
           vp run --no-cache website#typecheck && vp run --no-cache @gitmatrix/agent#typecheck
-          && vp run --no-cache @gitmatrix/preview#typecheck
+          && vp run --no-cache @gitmatrix/preview#typecheck && vp run --no-cache site#typecheck
 
   test:
     verification: context-invariant-v1

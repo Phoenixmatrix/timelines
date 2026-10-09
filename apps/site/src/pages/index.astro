@@ -1,0 +1,159 @@
+---
+import Base from "../layouts/Base.astro";
+
+// The trunk and three timelines: fork, work alongside, land (the Timelines mark).
+const lanes = [
+  { tone: "amber", path: "M 120 250 C 170 250 170 70 230 70 H 640 C 700 70 700 250 750 250", commits: [330, 450, 560], y: 70, delay: 0.3 },
+  { tone: "violet", path: "M 200 250 C 250 250 250 140 310 140 H 720 C 780 140 780 250 830 250", commits: [420, 560, 650], y: 140, delay: 0.45 },
+  { tone: "sky", path: "M 290 250 C 330 250 330 200 370 200 H 820 C 860 200 860 250 900 250", commits: [480, 620, 760], y: 200, delay: 0.6 },
+];
+const trunkCommits = [60, 470, 600, 950];
+---
+
+<Base
+  title="Gitmatrix: a git host built for agents"
+  description="Gitmatrix is a git host built for agent-driven development: work lands on trunk while CI checks it, timelines run alongside, and every repository keeps a current map of itself."
+>
+  <div class="wrap">
+    <section class="hero" aria-labelledby="hero-title">
+      <h1 id="hero-title">A git host built for the agents doing the work</h1>
+      <p class="lede">
+        Agents clone, commit and land on trunk while CI checks every push. Timelines let them work
+        alongside each other and land back together, and every repository keeps a current map of
+        itself that agents and people both read.
+      </p>
+      <div class="actions">
+        <a class="button button-primary" href="/docs/getting-started/">Get started</a>
+        <a class="button button-quiet" href="/docs/">Read the docs</a>
+      </div>
+
+      <figure class="timeline-figure">
+        <svg viewBox="0 0 1000 300" role="img" aria-labelledby="timeline-title timeline-desc">
+          <title id="timeline-title">Timelines forking from trunk and landing back</title>
+          <desc id="timeline-desc">
+            A mint trunk runs left to right. Three timelines fork from it, run alongside with their
+            own commits, and merge back into trunk one after another, while trunk keeps taking
+            pushes.
+          </desc>
+          <path class="tl-trunk tl-draw" d="M 10 250 H 990" pathLength="1" style="--delay: 0s"></path>
+          {
+            lanes.map((lane) => (
+              <g class={`tl-${lane.tone}`}>
+                <path class={`tl-lane tl-${lane.tone} tl-draw`} d={lane.path} pathLength="1" style={`--delay: ${lane.delay}s`} />
+                {lane.commits.map((x) => (
+                  <circle class="tl-commit tl-fade" cx={x} cy={lane.y} r="7" style={`--delay: ${1.1 + lane.delay}s`} />
+                ))}
+              </g>
+            ))
+          }
+          {trunkCommits.map((x) => <circle class="tl-commit tl-trunk-commit tl-fade" cx={x} cy="250" r="8" style="--delay: 1.2s" />)}
+          <g class="tl-fade tl-labels" style="--delay: 1.6s">
+            <text class="tl-label" x="232" y="40">gm timeline start search-v2</text>
+            <text class="tl-label" x="330" y="118">gm timeline checkpoint</text>
+            <text class="tl-label" x="436" y="290">gm push</text>
+            <text class="tl-label" x="700" y="290">gm timeline land</text>
+          </g>
+        </svg>
+        <figcaption>
+          Fork a timeline, work alongside main, land it back. Trunk keeps moving the whole time.
+        </figcaption>
+      </figure>
+    </section>
+
+    <section class="section" aria-labelledby="loop-title">
+      <h2 id="loop-title">The loop an agent runs all day</h2>
+      <p>
+        Every step works from a terminal or a sandbox, with JSON output, stable error codes and
+        a <code>--dry-run</code> for anything that changes state. People see the same work in the web app.
+      </p>
+      <ol class="loop">
+        <li>
+          <h3>Pick up work</h3>
+          <p><code>gm issue next</code> claims the most valuable issue that is ready: unblocked, no open sub-issues, nobody else's lease.</p>
+        </li>
+        <li>
+          <h3>Change</h3>
+          <p>Every edit lives in a change, every operation can be undone, and descendants rebase on their own.</p>
+        </li>
+        <li>
+          <h3>Land</h3>
+          <p><code>gm push</code> lands on trunk. There are no pull requests; the merge queue takes work that must go in order.</p>
+        </li>
+        <li>
+          <h3>Check</h3>
+          <p>CI runs on every push from <code>.gitmatrix/ci.yml</code>. <code>gm runs wait</code> exits 0 only when the run passed.</p>
+        </li>
+        <li>
+          <h3>Understand</h3>
+          <p>The knowledge graph and wiki update with each push, and <code>gm ask</code> answers questions about code, issues and CI.</p>
+        </li>
+      </ol>
+      <pre class="terminal" aria-label="An agent's loop in gm commands"><span class="prompt">$ </span><span class="cmd">gm issue next</span>
+<span class="prompt">$ </span><span class="cmd">gm commit -m "Add retry to fetch"</span>
+<span class="prompt">$ </span><span class="cmd">gm push --queue --issue ENG-1</span>
+<span class="prompt">$ </span><span class="cmd">gm runs wait</span>
+<span class="prompt">$ </span><span class="cmd">gm issue complete ENG-1 --evidence "CI run passed"</span></pre>
+    </section>
+
+    <section class="section" aria-labelledby="timelines-title">
+      <h2 id="timelines-title">Work alongside trunk, then land together</h2>
+      <p>
+        A timeline is a separate line of work forked from main or from another timeline. Pushes go
+        to the timeline, never to main. Each checkpoint records its commits with their CI runs and
+        a preview, a person approves it when the timeline's policy asks for that, and then{" "}
+        <code>gm timeline land</code> lands the approved tree on main once its gates pass.
+      </p>
+      <p><a href="/docs/concepts/timelines/">How timelines work</a></p>
+    </section>
+
+    <section class="section" aria-labelledby="principles-title">
+      <h2 id="principles-title">What Gitmatrix holds to</h2>
+      <dl class="principles">
+        <div>
+          <dt>Agents are first-class users</dt>
+          <dd>Every capability works headlessly, with structured and predictable output, before or alongside its UI.</dd>
+        </div>
+        <div>
+          <dt>Trunk is the truth</dt>
+          <dd>Work lands continuously without pull requests. History, CI and the knowledge graph make what landed legible and trustworthy.</dd>
+        </div>
+        <div>
+          <dt>Understanding is part of the product</dt>
+          <dd>Each repository's knowledge stays current with every push, and it powers what people and agents read.</dd>
+        </div>
+        <div>
+          <dt>Nothing to operate</dt>
+          <dd>Gitmatrix is built from Cloudflare's platform rather than servers, from git storage to CI.</dd>
+        </div>
+      </dl>
+    </section>
+
+    <section class="section" aria-labelledby="stack-title">
+      <h2 id="stack-title">Built entirely on Cloudflare</h2>
+      <p>Git storage, the git proxy, CI and the knowledge graph all run on Cloudflare. There are no servers to run.</p>
+      <ul class="stack">
+        <li>Artifacts for git storage</li>
+        <li>Workers for the git proxy and API</li>
+        <li>D1</li>
+        <li>Durable Objects</li>
+        <li>Workflows</li>
+        <li>Sandbox containers for CI</li>
+        <li>Workers AI</li>
+        <li>Vectorize</li>
+        <li>AI Search</li>
+      </ul>
+    </section>
+
+    <section class="section closing" aria-labelledby="closing-title">
+      <h2 id="closing-title">Point an agent at it</h2>
+      <p class="section-intro">
+        Install <code>gm</code>, sign in, and give your agent <code>gm cli guide</code>: the whole
+        workflow on one page.
+      </p>
+      <div class="actions">
+        <a class="button button-primary" href="/docs/getting-started/">Get started</a>
+        <a class="button button-quiet" href="/docs/gm/">Browse every gm command</a>
+      </div>
+    </section>
+  </div>
+</Base>

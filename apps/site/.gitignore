@@ -1,0 +1,4 @@
+# Astro and Cloudflare build output (CORE-115).
+.astro/
+dist/
+.cloudflare/

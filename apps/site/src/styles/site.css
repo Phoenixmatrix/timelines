@@ -1,0 +1,644 @@
+/* The public site (CORE-115): MatrixKit Neo tokens (tokens.css), laid out for
+ * reading rather than working. One column, left aligned; amber is for actions
+ * only, mint and the Timelines colors for the identity. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: dark;
+  background: var(--stage);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 100%;
+  line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
+  text-rendering: optimizeLegibility;
+}
+html[data-theme="light"] {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+main {
+  flex: 1;
+}
+
+a {
+  color: inherit;
+  text-decoration-color: var(--signal-line);
+  text-underline-offset: 0.2em;
+}
+a:hover {
+  text-decoration-thickness: 2px;
+}
+:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.skip {
+  position: absolute;
+  left: -999px;
+}
+.skip:focus {
+  left: 16px;
+  top: 12px;
+  z-index: 10;
+  background: var(--signal);
+  color: var(--signal-ink);
+  padding: 8px 12px;
+  border-radius: var(--radius-control);
+}
+
+/* Measure: ~66 characters of body text; wide blocks may break out of it. */
+.wrap {
+  width: min(100% - 32px, 1120px);
+  margin-inline: auto;
+}
+
+/* ── Header and footer ─────────────────────────────────────────────── */
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-block: 18px;
+}
+.lockup {
+  display: block;
+  color: var(--ink);
+}
+.lockup svg {
+  display: block;
+  height: 26px;
+  width: auto;
+}
+.lockup .mark {
+  color: var(--brand);
+}
+.site-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px 20px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  font-size: 0.9375rem;
+}
+.site-nav a:not(.button) {
+  color: var(--ink-muted);
+  text-decoration: none;
+}
+.site-nav a:not(.button):hover,
+.site-nav a[aria-current="page"] {
+  color: var(--ink);
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--size-control);
+  padding: 0 16px;
+  border-radius: var(--radius-control);
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.button-primary {
+  background: var(--signal);
+  color: var(--signal-ink);
+}
+.button-primary:hover {
+  background: var(--signal-hover);
+}
+.button-quiet {
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.button-quiet:hover {
+  background: var(--surface);
+}
+
+.site-footer {
+  margin-top: 96px;
+  border-top: 1px solid var(--line-soft);
+  padding-block: 28px 40px;
+  color: var(--ink-faint);
+  font-size: 0.875rem;
+}
+.site-footer .wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  justify-content: space-between;
+}
+.site-footer nav {
+  display: flex;
+  gap: 20px;
+}
+.site-footer a {
+  color: var(--ink-muted);
+  text-decoration: none;
+}
+.site-footer a:hover {
+  color: var(--ink);
+}
+
+/* ── Landing ───────────────────────────────────────────────────────── */
+
+.hero {
+  padding-block: 72px 24px;
+}
+.hero h1 {
+  max-width: 15ch;
+  margin: 0;
+  font-size: clamp(2.5rem, 1.6rem + 4.2vw, 5rem);
+  font-weight: 730;
+  letter-spacing: -0.035em;
+  line-height: 1;
+  text-wrap: balance;
+}
+.hero .lede {
+  max-width: 58ch;
+  margin: 28px 0 0;
+  color: var(--ink-muted);
+  font-size: clamp(1.0625rem, 1rem + 0.35vw, 1.25rem);
+  text-wrap: pretty;
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 32px;
+}
+
+/* The timeline drawing: the Timelines mark's idea at full width. */
+.timeline-figure {
+  margin: 56px 0 0;
+}
+.timeline-figure svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+.timeline-figure figcaption {
+  margin-top: 12px;
+  color: var(--ink-faint);
+  font-size: 0.9375rem;
+}
+.tl-trunk,
+.tl-lane {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.tl-trunk {
+  stroke: var(--timelines-mint);
+  stroke-width: 10;
+}
+.tl-lane {
+  stroke-width: 8;
+}
+.tl-amber {
+  stroke: var(--timelines-amber);
+  color: var(--timelines-amber);
+}
+.tl-violet {
+  stroke: var(--timelines-violet);
+  color: var(--timelines-violet);
+}
+.tl-sky {
+  stroke: var(--timelines-sky);
+  color: var(--timelines-sky);
+}
+.tl-commit {
+  fill: var(--stage);
+  stroke: currentColor;
+  stroke-width: 4;
+}
+.tl-trunk-commit {
+  color: var(--timelines-mint);
+}
+.tl-label {
+  fill: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 15px;
+}
+.tl-tick {
+  stroke: var(--line);
+  stroke-width: 1.5;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .tl-draw {
+    stroke-dasharray: 1;
+    stroke-dashoffset: 1;
+    animation: tl-draw 1.4s cubic-bezier(0.65, 0, 0.35, 1) forwards;
+    animation-delay: var(--delay, 0s);
+  }
+  .tl-fade {
+    opacity: 0;
+    animation: tl-fade 0.5s ease-out forwards;
+    animation-delay: var(--delay, 1.2s);
+  }
+}
+@keyframes tl-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes tl-fade {
+  to {
+    opacity: 1;
+  }
+}
+
+.section {
+  margin-top: 112px;
+}
+.section h2 {
+  max-width: 24ch;
+  margin: 0;
+  font-size: clamp(1.75rem, 1.4rem + 1.4vw, 2.5rem);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+  text-wrap: balance;
+}
+.section > p,
+.section-intro {
+  max-width: 62ch;
+  margin: 16px 0 0;
+  color: var(--ink-muted);
+}
+
+/* The loop is a real sequence, so it is numbered. */
+.loop {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+  gap: 32px 28px;
+  margin: 40px 0 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+}
+.loop li {
+  counter-increment: step;
+  border-top: 2px solid var(--line);
+  padding-top: 16px;
+}
+.loop li::before {
+  content: counter(step);
+  display: block;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+}
+.loop h3 {
+  margin: 6px 0 0;
+  font-size: 1.125rem;
+  font-weight: 650;
+}
+.loop p {
+  margin: 8px 0 0;
+  color: var(--ink-muted);
+  font-size: 0.9375rem;
+}
+.loop code {
+  color: var(--ink);
+}
+
+.terminal {
+  margin: 48px 0 0;
+  overflow-x: auto;
+  border-radius: var(--radius-pane);
+  background: var(--sunken);
+  box-shadow: inset 0 0 0 1px var(--line-soft);
+  padding: 20px 22px;
+  font-size: 0.875rem;
+  line-height: 1.7;
+}
+.terminal .prompt {
+  color: var(--ink-faint);
+  user-select: none;
+}
+.terminal .cmd {
+  color: var(--ink);
+}
+.terminal .out {
+  color: var(--ink-muted);
+}
+
+.principles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
+  gap: 36px 56px;
+  margin: 40px 0 0;
+}
+.principles dt {
+  font-size: 1.125rem;
+  font-weight: 650;
+}
+.principles dd {
+  margin: 8px 0 0;
+  color: var(--ink-muted);
+}
+
+.stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 12px;
+  margin: 28px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.stack li {
+  padding: 6px 12px;
+  border-radius: var(--radius-full);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--ink-muted);
+  font-size: 0.9375rem;
+}
+
+.closing {
+  padding-top: 48px;
+  border-top: 1px solid var(--line-soft);
+}
+
+/* ── Docs ──────────────────────────────────────────────────────────── */
+
+.docs {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 56px;
+  padding-top: 32px;
+}
+.docs-nav {
+  position: sticky;
+  top: 24px;
+  align-self: start;
+  font-size: 0.9375rem;
+}
+.docs-nav h2 {
+  margin: 0 0 8px;
+  color: var(--ink-faint);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+.docs-nav ul {
+  margin: 0 0 24px;
+  padding: 0;
+  list-style: none;
+}
+.docs-nav a {
+  display: block;
+  padding: 5px 10px;
+  margin-left: -10px;
+  border-radius: var(--radius-control);
+  color: var(--ink-muted);
+  text-decoration: none;
+}
+.docs-nav a:hover {
+  color: var(--ink);
+  background: var(--surface);
+}
+.docs-nav a[aria-current="page"] {
+  color: var(--ink);
+  background: var(--signal-wash);
+}
+
+.prose {
+  max-width: 72ch;
+  min-width: 0;
+}
+.prose h1 {
+  margin: 0;
+  font-size: clamp(2rem, 1.6rem + 1.6vw, 2.75rem);
+  font-weight: 720;
+  letter-spacing: -0.03em;
+  line-height: 1.08;
+}
+.prose .description {
+  margin: 14px 0 0;
+  color: var(--ink-muted);
+  font-size: 1.125rem;
+}
+.prose h2 {
+  margin: 48px 0 0;
+  font-size: 1.5rem;
+  font-weight: 680;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.prose h3 {
+  margin: 32px 0 0;
+  font-size: 1.125rem;
+  font-weight: 650;
+}
+.prose p,
+.prose ul,
+.prose ol {
+  margin: 14px 0 0;
+}
+.prose li + li {
+  margin-top: 4px;
+}
+.prose :not(pre) > code {
+  padding: 1px 5px;
+  border-radius: var(--radius-plate);
+  background: var(--surface);
+  font-size: 0.875em;
+}
+.prose pre {
+  margin: 18px 0 0;
+  overflow-x: auto;
+  border-radius: var(--radius-pane);
+  box-shadow: inset 0 0 0 1px var(--line-soft);
+  padding: 16px 18px;
+  font-size: 0.875rem;
+  line-height: 1.65;
+}
+.prose table {
+  margin-top: 18px;
+  border-collapse: collapse;
+  font-size: 0.9375rem;
+}
+.prose th,
+.prose td {
+  padding: 8px 14px 8px 0;
+  border-bottom: 1px solid var(--line-soft);
+  text-align: left;
+  vertical-align: top;
+}
+.prose blockquote {
+  margin: 18px 0 0;
+  padding-left: 16px;
+  border-left: 3px solid var(--line);
+  color: var(--ink-muted);
+}
+
+.pager {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 64px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 0.9375rem;
+}
+.pager a {
+  text-decoration: none;
+}
+.pager span {
+  display: block;
+  color: var(--ink-faint);
+  font-size: 0.8125rem;
+}
+.pager .next {
+  margin-left: auto;
+  text-align: right;
+}
+
+/* Shiki's css-variables theme, mapped onto the tokens. */
+:root {
+  --astro-code-foreground: var(--ink);
+  --astro-code-background: var(--sunken);
+  --astro-code-token-constant: var(--data-teal);
+  --astro-code-token-string: var(--timelines-mint);
+  --astro-code-token-comment: var(--ink-faint);
+  --astro-code-token-keyword: var(--data-violet);
+  --astro-code-token-parameter: var(--ink-muted);
+  --astro-code-token-function: var(--timelines-sky);
+  --astro-code-token-string-expression: var(--timelines-mint);
+  --astro-code-token-punctuation: var(--ink-muted);
+  --astro-code-token-link: var(--signal);
+}
+
+/* ── gm reference ──────────────────────────────────────────────────── */
+
+.reference-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 24px 0 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+}
+.reference-groups a {
+  color: var(--ink-muted);
+}
+.command {
+  margin-top: 40px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line-soft);
+  scroll-margin-top: 24px;
+}
+.command h3 {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 1.0625rem;
+  font-weight: 600;
+}
+.command h3 a {
+  text-decoration: none;
+}
+.command .summary {
+  margin: 8px 0 0;
+}
+.command .usage {
+  margin: 12px 0 0;
+}
+.command dl {
+  display: grid;
+  grid-template-columns: fit-content(42%) minmax(0, 1fr);
+  gap: 6px 18px;
+  margin: 14px 0 0;
+  font-size: 0.9375rem;
+}
+.command dt {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  /* Option values like <backlog|todo|…> have no spaces to wrap at. */
+  overflow-wrap: anywhere;
+}
+.command dd {
+  margin: 0;
+  color: var(--ink-muted);
+}
+.command .mutates {
+  margin-left: 10px;
+  color: var(--ink-faint);
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+@media (max-width: 860px) {
+  .docs {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+    padding-top: 12px;
+  }
+  .docs-nav {
+    position: static;
+  }
+  .docs-nav ul {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 14px;
+    margin-bottom: 16px;
+  }
+  .docs-nav a {
+    margin-left: 0;
+    padding-inline: 0;
+  }
+  .docs-nav a[aria-current="page"] {
+    background: none;
+    text-decoration: underline;
+    text-decoration-color: var(--signal-line);
+  }
+  .command dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .command dd {
+    margin-bottom: 8px;
+  }
+}
+
+/* Below this width the drawing's commands would be too small to read; the
+ * caption still says what it shows. */
+@media (max-width: 640px) {
+  .tl-labels {
+    display: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .hero {
+    padding-top: 40px;
+  }
+  .site-nav .docs-link-ref {
+    display: none;
+  }
+}

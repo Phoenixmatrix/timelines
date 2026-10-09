@@ -1,0 +1,61 @@
+---
+// A docs page: the sidebar, the page, and the pages before and after it.
+import Base from "./Base.astro";
+import { docSections, neighbours } from "../docs.ts";
+
+interface Props {
+  title: string;
+  description: string;
+  href: string;
+}
+
+const { title, description, href } = Astro.props;
+const sections = await docSections();
+const { previous, next } = neighbours(sections, href);
+---
+
+<Base title={`${title} · Gitmatrix docs`} description={description}>
+  <div class="wrap docs">
+    <nav class="docs-nav" aria-label="Docs">
+      {
+        sections.map((section) => (
+          <>
+            <h2>{section.title}</h2>
+            <ul>
+              {section.links.map((link) => (
+                <li>
+                  <a href={link.href} aria-current={link.href === href ? "page" : undefined}>
+                    {link.title}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </>
+        ))
+      }
+    </nav>
+    <article class="prose">
+      <h1>{title}</h1>
+      <p class="description">{description}</p>
+      <slot />
+      <nav class="pager" aria-label="Previous and next pages">
+        {
+          previous && (
+            <a href={previous.href} rel="prev">
+              <span>Previous</span>
+              {previous.title}
+            </a>
+          )
+        }
+        {
+          next && (
+            <a class="next" href={next.href} rel="next">
+              <span>Next</span>
+              {next.title}
+            </a>
+          )
+        }
+      </nav>
+    </article>
+  </div>
+</Base>
