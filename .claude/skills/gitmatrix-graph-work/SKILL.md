@@ -60,7 +60,7 @@ restricting pickup. Policy is global across timelines, not a branch-local overri
    with `--secret owner/repo:NAME`. Read the responses with
    `gm request list --issue <issue> --status all`; once all are resolved,
    `gm issue resume <issue>` takes the lease back up.
-7. **Submit, monitor, then finish.** Ship first (`vp run ready`, then `gm push && gm runs wait`); independent main work
+7. **Submit, monitor, then finish.** Ship first (sync the source workspace and run `vp install`; inspect `vp run ready --dry-run`, then run `vp run ready`, the automatically selective required gate. Do not routinely add blanket check/test/build runs, `vp run agent test` or `--all`; use `--all` only when comprehensive verification is deliberately required. Selection covers all unlanded committed, staged, unstaged and untracked work against the merge base with local `origin/main` and does not fetch. Use `--base` only for the actual integration branch, never to hide work. Accept automatic full fallback for broad or unknown changes. Preserve required real consumer smoke checks, explicit AI verification and deployment-boundary checks in `AGENTS.md`; see `README.md#completion-gate` for coverage. Then follow the queue or timeline shipping workflow below and verify actual landing and required CI/deployment before completing the issue); independent main work
    uses the explicit queue workflow below. Only after acceptance is shipped and
    verified, `gm issue complete <issue> --evidence 'Landed <commit>, queue <id>; gate run #N green; deployment/run #M verified; tests: …'`.
    Cite only evidence actually observed; omit deployment claims when not verified.
