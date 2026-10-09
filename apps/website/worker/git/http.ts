@@ -17,6 +17,7 @@ import { readReceivePackCommands, receivePackReport, type ReceiveCommand } from 
 import { resolveSource, getWorkSource, workGitPath } from "../timelines/sources.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { retainProgress, reconcileSourcePushes } from "./source-push.ts";
+import { sourcePushFixtureBoundary } from "./source-push-fixture.ts";
 import { lsRefs } from "../artifacts.ts";
 import { jobCaller } from "../deployments/job.ts";
 import { ciSource } from "../ci/source.ts";
@@ -324,6 +325,7 @@ async function workPush(
     void request.body.cancel();
     return c.text(`${admitted.error}\n`, admitted.status);
   }
+  let forwarding = false;
   try {
     for (const command of commands)
       if (command.old) await retainProgress(c.env, repo, operationId, command.old);
@@ -334,6 +336,23 @@ async function workPush(
       "git-receive-pack",
       request.body,
       true,
+      async () => {
+        await sourcePushFixtureBoundary(
+          c.env,
+          repo.id,
+          repo.source_id,
+          operationId,
+          "before-provider",
+        );
+        forwarding = true;
+        await sourcePushFixtureBoundary(
+          c.env,
+          repo.id,
+          repo.source_id,
+          operationId,
+          "before-forward",
+        );
+      },
     );
     // Consume the response before checking durable state. A 200 is not a Git acknowledgement.
     const response = respond(upstream);
@@ -352,6 +371,13 @@ async function workPush(
     );
     if (!accepted && !rejected) throw new Error("Ambiguous source push outcome.");
     if (accepted) {
+      await sourcePushFixtureBoundary(
+        c.env,
+        repo.id,
+        repo.source_id,
+        operationId,
+        "after-provider",
+      );
       for (const command of commands) await retainProgress(c.env, repo, operationId, command.new);
       await recordPush(c.env, repo, actor);
     }
@@ -363,7 +389,7 @@ async function workPush(
     if (accepted) afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
     return new Response(bytes, { status: response.status, headers: response.headers });
   } catch (error) {
-    await tracker.finishSourcePush(operationId, "ambiguous");
+    await tracker.finishSourcePush(operationId, forwarding ? "ambiguous" : "rejected");
     throw error;
   }
 }
@@ -497,6 +523,7 @@ async function forward(
   endpoint: string,
   body: ReadableStream<Uint8Array> | null,
   decoded = false,
+  onForward?: () => Promise<void>,
 ): Promise<Response | { refused: Response }> {
   const needed = service === "git-receive-pack" ? "write" : "read";
   const headers = new Headers();
@@ -517,6 +544,8 @@ async function forward(
       "authorization",
       `Bearer ${await upstreamToken(c.env, repo.artifacts_name, needed)}`,
     );
+    // Token acquisition cannot write the ref; fetch invocation can.
+    await onForward?.();
     return fetch(upstreamUrl, {
       method: c.req.method,
       headers,

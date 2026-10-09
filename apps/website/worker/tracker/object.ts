@@ -8,6 +8,7 @@ import {
   type NewTimeline,
   type PushActivity,
   type SourcePush,
+  type SourcePushRecovery,
 } from "./timelines.ts";
 import type { MutationRequest } from "../../shared/tracker.ts";
 import type { ChronicleOptions } from "./chronicle.ts";
@@ -519,22 +520,71 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     }
   }
   async finishSourcePush(operationId: string, outcome: "accepted" | "rejected" | "ambiguous") {
-    const result = this.reply(() => this.timelines.finishSourcePush(operationId, outcome));
+    const result = this.reply(() => this.timelines.finishSourcePush(operationId, outcome, true));
     if (result.ok) {
       const operation = this.timelines.sourcePush(operationId);
       await this.env.DB.prepare(
-        "UPDATE source_operations SET state=?,updated_at=? WHERE id=? AND repo_id=? AND source_id=? AND state IN ('admitted','ambiguous')",
+        "UPDATE source_operations SET state=?,data=?,updated_at=? WHERE id=? AND repo_id=? AND source_id=? AND (state IN ('admitted','ambiguous') OR state=?)",
       )
         .bind(
           operation.state,
+          JSON.stringify(operation),
           new Date().toISOString(),
           operationId,
           operation.repoId,
           operation.sourceId,
+          operation.state,
         )
         .run();
+      if (operation.state === "accepted" || operation.state === "rejected")
+        this.timelines.projectSourcePush(operationId);
     }
     return result;
+  }
+  reserveSourcePushDelivery(
+    operationId: string,
+    repoId: string,
+    sourceId: string,
+    runIds: Partial<Record<"push" | "step", string>>,
+  ) {
+    return this.reply(() =>
+      this.timelines.reserveSourcePushDelivery(operationId, repoId, sourceId, runIds),
+    );
+  }
+  completeSourcePushDelivery(
+    operationId: string,
+    trigger: "push" | "step",
+    runId: string,
+    result: { skipped: string } | { runId: string },
+  ) {
+    return this.reply(() =>
+      this.timelines.completeSourcePushDelivery(operationId, trigger, runId, result),
+    );
+  }
+  beginSourcePushRecovery(
+    operationId: string,
+    repoId: string,
+    sourceId: string,
+    intent: SourcePushRecovery,
+  ) {
+    return this.reply(() =>
+      this.timelines.beginSourcePushRecovery(operationId, repoId, sourceId, intent),
+    );
+  }
+  async settleSourcePushRecovery(
+    operationId: string,
+    outcome: "accepted" | "rejected",
+    head: string,
+  ) {
+    const settled = this.reply(() =>
+      this.timelines.settleSourcePushRecovery(operationId, outcome, head),
+    );
+    if (!settled.ok) return settled;
+    // The authoritative terminal outcome is immutable, but still holds the
+    // timeline fence until its D1 projection has succeeded. Replay repairs it.
+    const projected = await this.finishSourcePush(operationId, outcome);
+    if (!projected.ok) return projected;
+    return this.reply(() => this.timelines.projectSourcePushRecovery(operationId));
   }
   sourcePushes(repoId?: string) {
     return this.reply(() => this.timelines.sourcePushes(repoId));

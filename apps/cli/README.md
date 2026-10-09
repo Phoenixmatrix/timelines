@@ -853,6 +853,24 @@ gm timeline use main                            # back to main
   A stopped partial landing requires `--resolve accept-partial-and-abandon`
   with the same version/note; it preserves successful receipts and abandons the
   timeline. Resolution does not itself convert: run plain `migrate` afterward.
+- **`pushes [OPERATION] [--timeline SLUG] [--repo OWNER/NAME]`** lists pending
+  writes for the timeline's exact owned source, or inspects one retained operation,
+  including its terminal outcome, original commands, attribution and recovery audit.
+- **`recover-push OPERATION [--timeline SLUG] [--repo OWNER/NAME]`** recovers
+  that exact interrupted write; retry the same ID after a lost response. Selection
+  defaults to the current timeline binding and canonical checkout origin; explicit
+  selection also works outside a checkout and never changes bindings. The server
+  must prove acceptance or permanently fence the old write before rejecting it:
+  an unchanged old head is not proof of rejection. Recovery may append a unique,
+  same-tree fence commit to the owned source, never canonical. The result reports
+  `state`, `sourceId`, `operationId`, `recoveryId`, the proven `head`, `fenceCommit`,
+  and `syncRequired`. When sync is required, run normal **`gm sync` in the matching
+  timeline checkout before retrying publication**; never force-push to undo the
+  marker. Neither command changes local commits, files, refs or bindings.
+  `--dry-run` resolves the source but performs no recovery. Unproven recovery
+  remains an error, not a success; ended/expired sources are never reactivated.
+  Ordinary Git failures retain recognized HTTP status and transport diagnostics,
+  without printing credential-bearing URLs, traces or raw server bodies.
 
 Landing applies the approved B→T tree delta (explicit logical base to approved
 work) onto pinned canonical O. It gates one-parent compact candidates for all

@@ -1,3 +1,4 @@
+import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type {
@@ -18,6 +19,14 @@ import { tracker as trackerRoutes } from "../tracker/api.ts";
 import { timelines } from "./api.ts";
 import { TrackerError } from "../tracker/store.ts";
 import { reconcileSourcePushes, retainProgress } from "../git/source-push.ts";
+import { repos as repoRoutes } from "../api/repos.ts";
+import { recoverSourcePush } from "../git/source-push.ts";
+import { gitHttp } from "../git/http.ts";
+import { FLUSH, pkt } from "../git/pktline.ts";
+import { mintJobToken } from "../ci/registry.ts";
+import { deliverRecoveredSourcePush } from "../git/source-push-delivery.ts";
+import { drainDeletedRepoSources } from "../retention/work-sources.ts";
+import { onPush } from "../ci/trigger.ts";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -31,7 +40,14 @@ vi.mock("cloudflare:workers", () => ({
 }));
 // Preview runs (CORE-79) are started through CI's startRun: seen here, not run.
 const startRun = vi.hoisted(() => vi.fn());
-vi.mock(import("../ci/trigger.ts"), async (original) => ({ ...(await original()), startRun }));
+vi.mock(import("../ci/trigger.ts"), async (original) => {
+  const module = await original();
+  return {
+    ...module,
+    startRun: (...args: Parameters<typeof module.startRun>) =>
+      args[2].sourceRecovery ? module.startRun(...args) : startRun(...args),
+  };
+});
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
@@ -41,6 +57,9 @@ afterEach(() => {
 });
 
 async function setup(missingRepoError?: (name: string) => Error) {
+  vi.stubGlobal("caches", {
+    default: { match: async () => undefined, put: async () => {}, delete: async () => false },
+  });
   const sqlite = migratedDatabase();
   // Ann owns Orbit; Ben and Cat are members, and Ben can write to both its
   // repositories; Dan is outside. Ben's agent bot acts for him.
@@ -109,12 +128,15 @@ async function setup(missingRepoError?: (name: string) => Error) {
   });
   server.route("/api/tracker/:owner/timelines", timelines);
   server.route("/api", trackerRoutes);
+  server.route("/api/repos", repoRoutes);
+  server.route("/", gitHttp);
   const tokens = {
     ann: (await issueToken(env.DB, "ann", "t", "write")).secret,
     ben: (await issueToken(env.DB, "ben", "t", "write")).secret,
     cat: (await issueToken(env.DB, "cat", "t", "write")).secret,
     dan: (await issueToken(env.DB, "dan", "t", "write")).secret,
     bot: (await issueToken(env.DB, "ben", "t", "write", undefined, "agt_bot")).secret,
+    reader: (await issueToken(env.DB, "ben", "read-only", "read")).secret,
   };
   const pending: Promise<unknown>[] = [];
   const executionCtx = {
@@ -147,9 +169,23 @@ async function setup(missingRepoError?: (name: string) => Error) {
         "SELECT artifacts_name, source_id FROM timeline_work_sources WHERE timeline_slug = ? AND repo_id = ?",
       )
       .get(slug, repoId) as { artifacts_name: string; source_id: string };
-    return { ...git.getByName(row.artifacts_name), sourceId: row.source_id };
+    return Object.assign(git.getByName(row.artifacts_name), { sourceId: row.source_id });
   };
-  return { sqlite, git, app, lib, call, raw, work, env, trackers, contexts };
+  return {
+    sqlite,
+    git,
+    app,
+    lib,
+    call,
+    raw,
+    work,
+    env,
+    trackers,
+    contexts,
+    server,
+    tokens,
+    executionCtx,
+  };
 }
 
 describe("recent timeline presence", () => {
@@ -1009,7 +1045,10 @@ test.each(["accepted", "rejected"] as const)(
       "projection interrupted",
     );
     failed.mockRestore();
-    expect(tracker.sourcePushes("app")).toMatchObject({ ok: true, value: [] });
+    expect(tracker.sourcePushes("app")).toMatchObject({
+      ok: true,
+      value: [{ state: outcome, projectionPending: true }],
+    });
     expect(
       t.sqlite.prepare("SELECT state FROM source_operations WHERE id=?").get(operation.operationId),
     ).toEqual({ state: "admitted" });
@@ -1138,5 +1177,701 @@ test("cancelled creation retains ambiguous allocation inventory across restart u
   expect(t.app.refs.get("refs/heads/main")).toBe(oid(1));
   expect(t.lib.refs.get("refs/heads/main")).toBe(oid(2));
   expect((await t.call("ben", "POST", "/ambiguous-creation/abandon")).status).toBe(200);
+  t.sqlite.close();
+});
+
+async function pendingRecovery() {
+  const t = await setup();
+  const created = await t.call("ben", "POST", "", { slug: "recovery", repos: ["orbit/app"] });
+  const timeline = (created.body as TimelineChange).timeline;
+  const sourceId = timeline.repos[0]!.source!.sourceId;
+  const tracker = t.trackers.get("orbit")!;
+  const operation = {
+    operationId: crypto.randomUUID(),
+    timelineId: timeline.id,
+    repoId: "app",
+    sourceId,
+    commands: [{ ref: "refs/heads/work", old: oid(1), new: oid(7) }],
+    actorId: "agt_bot",
+    accountableId: "ben",
+  };
+  expect(await tracker.beginSourcePush(operation)).toMatchObject({ ok: true });
+  expect(await tracker.finishSourcePush(operation.operationId, "ambiguous")).toMatchObject({
+    ok: true,
+  });
+  const path = `/repos/orbit/app/sources/${sourceId}/pushes`;
+  return { ...t, tracker, operation, sourceId, path, remote: t.work("recovery") };
+}
+
+test("source recovery API scopes inspection and rejects read-only, wrong-source and canonical writes", async () => {
+  const t = await pendingRecovery();
+  const recover = `${t.path}/${t.operation.operationId}/recover`;
+  expect((await t.raw("cat", "POST", recover, {})).status).toBe(403);
+  expect((await t.raw("reader", "POST", recover, {})).status).toBe(403);
+  expect((await t.raw("dan", "POST", recover, {})).status).toBe(404);
+  expect((await t.raw("ben", "POST", recover.replace(t.sourceId, "canonical"), {})).status).toBe(
+    404,
+  );
+  expect((await t.raw("ben", "POST", recover.replace(t.sourceId, "work_missing"), {})).status).toBe(
+    404,
+  );
+  expect((await t.raw("ben", "GET", `${t.path}/missing`)).status).toBe(404);
+  expect((await t.raw("ben", "GET", t.path)).body.operations).toMatchObject([
+    {
+      operationId: t.operation.operationId,
+      state: "ambiguous",
+      actorId: "agt_bot",
+    },
+  ]);
+  const other = await t.call("ben", "POST", "", { slug: "other-source", repos: ["orbit/app"] });
+  const otherId = (other.body as TimelineChange).timeline.repos[0]!.source!.sourceId;
+  expect((await t.raw("ben", "POST", recover.replace(t.sourceId, otherId), {})).status).toBe(404);
+  expect((await t.raw("ben", "GET", t.path.replace(t.sourceId, otherId))).body.operations).toEqual(
+    [],
+  );
+  const anonymous = await t.server.request(`/api${recover}`, { method: "POST", body: "{}" }, t.env);
+  expect(anonymous.status).toBe(401);
+  expect(t.tracker.sourcePush(t.operation.operationId, "app", t.sourceId)).toMatchObject({
+    ok: true,
+    value: { state: "ambiguous", commands: t.operation.commands },
+  });
+  t.sqlite.close();
+});
+
+test("concurrent recovery uses one durable same-tree marker and preserves original attribution", async () => {
+  const t = await pendingRecovery();
+  const recover = `${t.path}/${t.operation.operationId}/recover`;
+  const replies = await Promise.all([
+    t.raw("ben", "POST", recover, {}),
+    t.raw("bot", "POST", recover, {}),
+  ]);
+  for (const reply of replies)
+    expect(reply).toMatchObject({
+      status: 200,
+      body: { state: "rejected", syncRequired: true, sourceId: t.sourceId },
+    });
+  expect(replies[0].body.recoveryId).toBe(replies[1].body.recoveryId);
+  const marker = replies[0].body.fenceCommit;
+  expect(t.remote.refs.get("refs/heads/work")).toBe(marker);
+  expect(t.remote.parents.get(marker)).toEqual([oid(1)]);
+  const inspected = await t.raw("ben", "GET", `${t.path}/${t.operation.operationId}`);
+  expect(inspected.body).toMatchObject({
+    actorId: "agt_bot",
+    accountableId: "ben",
+    commands: t.operation.commands,
+    recovery: {
+      priorState: "ambiguous",
+      commit: marker,
+      base: oid(1),
+      tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+      outcome: "rejected",
+      projected: true,
+    },
+  });
+  const writes = t.remote.pushes.length;
+  expect((await t.raw("ben", "POST", recover, {})).body).toEqual(replies[0].body);
+  expect(t.remote.pushes).toHaveLength(writes);
+  expect(await t.tracker.finishSourcePush(t.operation.operationId, "accepted")).toMatchObject({
+    ok: false,
+    code: "operation_settled",
+  });
+  expect(t.tracker.sourcePushes("app")).toMatchObject({ ok: true, value: [] });
+  expect(
+    t.sqlite
+      .prepare("SELECT commit_oid FROM source_progress_members WHERE source_id=?")
+      .all(t.sourceId),
+  ).toEqual(expect.arrayContaining([{ commit_oid: marker }, { commit_oid: oid(1) }]));
+  expect([...t.app.refs]).toEqual([["refs/heads/main", oid(1)]]);
+  t.sqlite.close();
+});
+
+test("unchanged old head stays fenced after a refused marker; replay keeps its intent across tracker restart", async () => {
+  const t = await pendingRecovery();
+  t.remote.refuse = "temporary provider refusal";
+  const recover = `${t.path}/${t.operation.operationId}/recover`;
+  expect(await t.raw("ben", "POST", recover, {})).toMatchObject({
+    status: 409,
+    body: { code: "source_busy" },
+  });
+  const first = (await t.raw("ben", "GET", `${t.path}/${t.operation.operationId}`)).body;
+  expect(first.state).toBe("ambiguous");
+  expect(first.recovery.commit).not.toBe(oid(1));
+  expect(await t.tracker.finishSourcePush(t.operation.operationId, "rejected")).toMatchObject({
+    ok: false,
+    code: "recovery_active",
+  });
+  t.trackers.set("orbit", new Tracker(t.contexts.get("orbit")!, t.env));
+  delete t.remote.refuse;
+  const replay = await t.raw("ben", "POST", recover, {});
+  expect(replay).toMatchObject({
+    status: 200,
+    body: {
+      state: "rejected",
+      fenceCommit: first.recovery.commit,
+      recoveryId: first.recovery.id,
+    },
+  });
+  t.sqlite.close();
+});
+
+test("original provider CAS winning the recovery race is accepted, not fenced away", async () => {
+  const t = await pendingRecovery();
+  const fetch = t.git.fetch;
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (
+      String(input).endsWith("/git-receive-pack") &&
+      init?.body instanceof Uint8Array &&
+      new TextDecoder().decode(init.body).includes("refs/heads/work")
+    ) {
+      t.remote.commits.add(oid(7));
+      t.remote.parents.set(oid(7), [oid(1)]);
+      t.remote.refs.set("refs/heads/work", oid(7));
+    }
+    return fetch(input, init);
+  });
+  expect(
+    await t.raw("ben", "POST", `${t.path}/${t.operation.operationId}/recover`, {}),
+  ).toMatchObject({ status: 200, body: { state: "accepted", head: oid(7), syncRequired: false } });
+  expect(t.remote.refs.get("refs/heads/work")).toBe(oid(7));
+  t.sqlite.close();
+});
+
+test("lost marker response is resolved from its ref, and projection failure replays without provider writes", async () => {
+  const t = await pendingRecovery();
+  const fetch = t.git.fetch;
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const response = await fetch(input, init);
+    if (
+      String(input).endsWith("/git-receive-pack") &&
+      init?.body instanceof Uint8Array &&
+      new TextDecoder().decode(init.body).includes("refs/heads/work")
+    )
+      throw new Error("provider response lost");
+    return response;
+  });
+  const prepare = t.env.DB.prepare.bind(t.env.DB);
+  const failure = vi.spyOn(t.env.DB, "prepare").mockImplementation((query) => {
+    if (query.startsWith("UPDATE source_operations SET state="))
+      throw new Error("projection interrupted");
+    return prepare(query);
+  });
+  await expect(
+    recoverSourcePush(
+      t.env,
+      { id: "app", owner_id: "orbit" },
+      t.sourceId,
+      t.operation.operationId,
+      "ben",
+      "ben",
+    ),
+  ).rejects.toThrow("projection interrupted");
+  expect(t.tracker.sourcePushes("app")).toMatchObject({
+    ok: true,
+    value: [
+      {
+        state: "rejected",
+        recovery: { outcome: "rejected", projected: false },
+      },
+    ],
+  });
+  expect(await t.tracker.beginSourcePush({ ...t.operation, operationId: "next" })).toMatchObject({
+    ok: false,
+    code: "source_busy",
+  });
+  failure.mockRestore();
+  const writes = t.remote.pushes.length;
+  t.trackers.set("orbit", new Tracker(t.contexts.get("orbit")!, t.env));
+  expect(
+    await t.raw("ben", "POST", `${t.path}/${t.operation.operationId}/recover`, {}),
+  ).toMatchObject({ status: 200, body: { state: "rejected", syncRequired: true } });
+  expect(t.remote.pushes).toHaveLength(writes);
+  expect(t.trackers.get("orbit")!.sourcePushes("app")).toMatchObject({ ok: true, value: [] });
+  t.sqlite.close();
+});
+
+test("provider accepted with a lost original response recovers without a marker", async () => {
+  const t = await pendingRecovery();
+  t.remote.commits.add(oid(7));
+  t.remote.parents.set(oid(7), [oid(1)]);
+  t.remote.refs.set("refs/heads/work", oid(7));
+  expect(
+    await t.raw("ben", "POST", `${t.path}/${t.operation.operationId}/recover`, {}),
+  ).toMatchObject({
+    status: 200,
+    body: {
+      state: "accepted",
+      head: oid(7),
+      recoveryId: null,
+      fenceCommit: null,
+      syncRequired: false,
+    },
+  });
+  t.sqlite.close();
+});
+
+test("failure before forwarding is proven rejected, not ambiguous", async () => {
+  const t = await setup();
+  await t.call("ben", "POST", "", { slug: "pre-forward", repos: ["orbit/app"] });
+  const remote = t.work("pre-forward");
+  const prepare = t.env.DB.prepare.bind(t.env.DB);
+  const failure = vi.spyOn(t.env.DB, "prepare").mockImplementation((query) => {
+    if (query.includes('insert into "source_progress_members"'))
+      throw new Error("retention interrupted");
+    return prepare(query);
+  });
+  const bytes = `${pkt(`${oid(1)} ${oid(7)} refs/heads/work\0report-status\n`)}${FLUSH}`;
+  const response = await t.server.request(
+    "/orbit/app@pre-forward.git/git-receive-pack",
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${t.tokens.ben}`,
+        "content-type": "application/x-git-receive-pack-request",
+      },
+      body: bytes,
+    },
+    t.env,
+    t.executionCtx,
+  );
+  failure.mockRestore();
+  expect(response.status).toBe(500);
+  const operations = t.sqlite
+    .prepare("SELECT state FROM source_operations WHERE source_id=?")
+    .all(remote.sourceId);
+  expect(operations).toEqual([{ state: "rejected" }]);
+  expect(remote.refs.get("refs/heads/work")).toBe(oid(1));
+  t.sqlite.close();
+});
+
+test("recovery cannot reactivate an archived source or guess an unexpected provider head", async () => {
+  const t = await pendingRecovery();
+  const recover = `${t.path}/${t.operation.operationId}/recover`;
+  const writes = t.remote.pushes.length;
+  t.sqlite
+    .prepare("UPDATE timeline_work_sources SET state='archived' WHERE source_id=?")
+    .run(t.sourceId);
+  expect(await t.raw("ben", "POST", recover, {})).toMatchObject({
+    status: 409,
+    body: { code: "source_expired" },
+  });
+  expect(t.remote.pushes).toHaveLength(writes);
+  t.sqlite
+    .prepare("UPDATE timeline_work_sources SET state='ready' WHERE source_id=?")
+    .run(t.sourceId);
+  t.remote.refs.set("refs/heads/work", oid(99));
+  expect(await t.raw("ben", "POST", recover, {})).toMatchObject({
+    status: 409,
+    body: { code: "recovery_conflict" },
+  });
+  expect(t.remote.pushes).toHaveLength(writes);
+  expect((await t.raw("ben", "GET", t.path)).body.operations).toHaveLength(1);
+  t.sqlite.close();
+});
+
+test("future source writes cannot restore a recovery base and revive a delayed CAS", async () => {
+  const t = await pendingRecovery();
+  const recovered = await t.raw("ben", "POST", `${t.path}/${t.operation.operationId}/recover`, {});
+  expect(recovered.status).toBe(200);
+  expect(
+    await t.tracker.beginSourcePush({
+      ...t.operation,
+      operationId: "restore-base",
+      commands: [{ ref: "refs/heads/work", old: recovered.body.head, new: oid(1) }],
+    }),
+  ).toMatchObject({ ok: false, code: "recovery_fence" });
+  expect(
+    await t.tracker.beginSourcePush({
+      ...t.operation,
+      operationId: "synced-work",
+      commands: [{ ref: "refs/heads/work", old: recovered.body.head, new: oid(8) }],
+    }),
+  ).toMatchObject({ ok: true });
+  t.sqlite.close();
+});
+
+test("marker-written recovery resumes after failed progress retention without choosing another marker", async () => {
+  const t = await pendingRecovery();
+  const fetch = t.git.fetch;
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const response = await fetch(input, init);
+    if (
+      String(input).endsWith("/git-receive-pack") &&
+      init?.body instanceof Uint8Array &&
+      new TextDecoder().decode(init.body).includes("refs/heads/work")
+    )
+      t.remote.refuse = "progress retention interrupted";
+    return response;
+  });
+  await expect(
+    recoverSourcePush(
+      t.env,
+      { id: "app", owner_id: "orbit" },
+      t.sourceId,
+      t.operation.operationId,
+      "ben",
+      "ben",
+    ),
+  ).rejects.toThrow("retain progress");
+  const marker = t.remote.refs.get("refs/heads/work");
+  expect(marker).not.toBe(oid(1));
+  expect(t.tracker.sourcePushes("app")).toMatchObject({
+    ok: true,
+    value: [{ state: "ambiguous", recovery: { commit: marker } }],
+  });
+  t.trackers.set("orbit", new Tracker(t.contexts.get("orbit")!, t.env));
+  delete t.remote.refuse;
+  vi.stubGlobal("fetch", fetch);
+  expect(
+    await t.raw("ben", "POST", `${t.path}/${t.operation.operationId}/recover`, {}),
+  ).toMatchObject({ status: 200, body: { state: "rejected", head: marker, fenceCommit: marker } });
+  expect(t.remote.refs.get("refs/heads/work")).toBe(marker);
+  expect(
+    t.sqlite
+      .prepare("SELECT commit_oid FROM source_progress_members WHERE source_id=?")
+      .all(t.sourceId),
+  ).toContainEqual({ commit_oid: marker });
+  t.sqlite.close();
+});
+
+test("terminal recovery on an ended source returns its established outcome without reactivation", async () => {
+  const t = await pendingRecovery();
+  const path = `${t.path}/${t.operation.operationId}/recover`;
+  const first = await t.raw("ben", "POST", path, {});
+  expect(first.status).toBe(200);
+  expect((await t.call("ben", "POST", "/recovery/abandon", {})).status).toBe(200);
+  const ended = (await t.call("ben", "GET", "/recovery")).body.timeline;
+  const writes = t.remote.pushes.length;
+  expect((await t.raw("ben", "POST", path, {})).body).toEqual(first.body);
+  expect((await t.call("ben", "GET", "/recovery")).body.timeline.status).toBe(ended.status);
+  expect(t.remote.pushes).toHaveLength(writes);
+  t.sqlite.close();
+});
+
+test("historical recovery replay keeps the latest source head and delivers current CI observation", async () => {
+  const t = await pendingRecovery();
+  const path = `${t.path}/${t.operation.operationId}/recover`;
+  const first = await t.raw("ben", "POST", path, {});
+  expect(first.status).toBe(200);
+  const next = {
+    ...t.operation,
+    operationId: "later-work",
+    commands: [{ ref: "refs/heads/work", old: first.body.head, new: oid(8) }],
+  };
+  expect(await t.tracker.beginSourcePush(next)).toMatchObject({ ok: true });
+  t.remote.commits.add(oid(8));
+  t.remote.parents.set(oid(8), [first.body.head]);
+  t.remote.refs.set("refs/heads/work", oid(8));
+  expect(await t.tracker.finishSourcePush(next.operationId, "accepted")).toMatchObject({
+    ok: true,
+  });
+  await onPush(t.env, recoveryRepo(t), null, () => {});
+  expect((await t.raw("ben", "POST", path, {})).body).toEqual(first.body);
+  expect(t.remote.refs.get("refs/heads/work")).toBe(oid(8));
+  expect(
+    t.contexts
+      .get("orbit")!
+      .storage.sql.exec(
+        "SELECT oid FROM timeline_heads WHERE timeline_id=? AND repo_id=?",
+        t.operation.timelineId,
+        "app",
+      )
+      .toArray(),
+  ).toEqual([{ oid: oid(8) }]);
+  expect(
+    t.sqlite
+      .prepare("SELECT oid FROM repo_refs WHERE source_id=? AND ref='refs/heads/work'")
+      .get(t.sourceId),
+  ).toEqual({ oid: oid(8) });
+  expect(
+    t.sqlite.prepare("SELECT oid FROM ci_refs WHERE source_id=? AND ref='work'").get(t.sourceId),
+  ).toEqual({ oid: oid(8) });
+  t.sqlite.close();
+});
+
+test("CI job credentials cannot inspect or recover source operations", async () => {
+  const t = await pendingRecovery();
+  t.sqlite
+    .prepare(`INSERT INTO ci_runs
+    (id,repo_id,number,commit_oid,ref,trigger,status,source_id)
+    VALUES ('recovery-run','app',1,?,'work','push','running',?)`)
+    .run(oid(1), t.sourceId);
+  t.sqlite
+    .prepare(`INSERT INTO ci_jobs
+    (id,run_id,repo_id,name,spec,status,runner,source_id)
+    VALUES ('recovery-job','recovery-run','app','build','{"steps":[]}','running','sandbox',?)`)
+    .run(t.sourceId);
+  const token = await mintJobToken(t.env.DB, "recovery-job", 30);
+  for (const method of ["GET", "POST"]) {
+    const path = method === "GET" ? t.path : `${t.path}/${t.operation.operationId}/recover`;
+    const response = await t.server.request(
+      `/api${path}`,
+      {
+        method,
+        headers: { authorization: `Bearer ${token}` },
+        ...(method === "POST" ? { body: "{}" } : {}),
+      },
+      t.env,
+    );
+    expect(response.status).toBe(401);
+  }
+  expect(t.tracker.sourcePush(t.operation.operationId, "app", t.sourceId)).toMatchObject({
+    ok: true,
+    value: { state: "ambiguous" },
+  });
+  t.sqlite.close();
+});
+
+function recoveryRepo(t: { sqlite: DatabaseSync; sourceId: string }) {
+  const source = t.sqlite
+    .prepare("SELECT artifacts_name, artifacts_remote FROM timeline_work_sources WHERE source_id=?")
+    .get(t.sourceId) as { artifacts_name: string; artifacts_remote: string };
+  return {
+    ...source,
+    id: "app",
+    owner_id: "orbit",
+    owner_slug: "orbit",
+    name: "app",
+    default_branch: "work",
+    source_id: t.sourceId,
+  };
+}
+
+function recoveryPipeline(env: Env) {
+  const artifacts = env.ARTIFACTS;
+  const get = artifacts.get.bind(artifacts);
+  const config = new Blob([
+    "on:\n  push:\n    branches: [work]\n  step: {}\njobs:\n  gate:\n    on: [push, step]\n    steps: [echo recovery]\n",
+  ]);
+  Object.assign(env, {
+    ARTIFACTS: {
+      ...artifacts,
+      get: async (name: string) => {
+        const repository = await get(name);
+        return {
+          ...repository,
+          readCommit: async (hash: string) => {
+            const commit = await repository.readCommit(hash);
+            return commit && { ...commit, treeHash: oid(90) };
+          },
+          readTree: async (hash: string) =>
+            hash === oid(90)
+              ? [{ name: ".gitmatrix", type: "tree", hash: oid(91), mode: "040000" }]
+              : [{ name: "ci.yml", type: "blob", hash: oid(92), mode: "100644" }],
+          readBlob: async () => config,
+        };
+      },
+    },
+  });
+  const started = new Set<string>();
+  Object.assign(env, {
+    CI_RUN: {
+      create: async ({ id }: { id: string }) => {
+        if (started.has(id)) throw new Error("Workflow already exists");
+        started.add(id);
+        return {};
+      },
+      get: async (id: string) => {
+        if (!started.has(id)) throw new Error("Workflow not found");
+        return { status: async () => ({ status: "running" }) };
+      },
+    },
+  });
+  return { started };
+}
+
+test("deletion drains a proven recovery whose terminal D1 projection failed", async () => {
+  const t = await pendingRecovery();
+  const prepare = t.env.DB.prepare.bind(t.env.DB);
+  const failure = vi.spyOn(t.env.DB, "prepare").mockImplementation((query) => {
+    if (query.startsWith("UPDATE source_operations SET state="))
+      throw new Error("projection interrupted");
+    return prepare(query);
+  });
+  await expect(
+    recoverSourcePush(
+      t.env,
+      { id: "app", owner_id: "orbit" },
+      t.sourceId,
+      t.operation.operationId,
+      "ben",
+      "ben",
+    ),
+  ).rejects.toThrow("projection interrupted");
+  failure.mockRestore();
+  t.sqlite.exec("UPDATE repos SET deleted_at=CURRENT_TIMESTAMP WHERE id='app'");
+  expect(
+    (await t.raw("ben", "POST", `${t.path}/${t.operation.operationId}/recover`, {})).status,
+  ).toBe(404);
+  const transport = vi.fn(async () => {
+    throw new Error("No provider ref replay after tombstone");
+  });
+  vi.stubGlobal("fetch", transport);
+  await drainDeletedRepoSources(t.env, "app");
+  await drainDeletedRepoSources(t.env, "app");
+  expect(transport).not.toHaveBeenCalled();
+  expect(t.tracker.sourcePushes("app")).toMatchObject({ ok: true, value: [] });
+  expect(
+    t.sqlite.prepare("SELECT state FROM source_operations WHERE id=?").get(t.operation.operationId),
+  ).toEqual({ state: "rejected" });
+  expect(
+    t.sqlite.prepare("SELECT state FROM timeline_work_sources WHERE source_id=?").get(t.sourceId),
+  ).toEqual({ state: "purged" });
+  t.sqlite.close();
+});
+
+test("recovery retries CI admission after cursor observation, across restart, without duplicate completed runs", async () => {
+  const t = await pendingRecovery();
+  const pipeline = recoveryPipeline(t.env);
+  const result = await recoverSourcePush(
+    t.env,
+    { id: "app", owner_id: "orbit" },
+    t.sourceId,
+    t.operation.operationId,
+    "ben",
+    "ben",
+  );
+  const physical = recoveryRepo(t);
+  const prepare = t.env.DB.prepare.bind(t.env.DB);
+  const failure = vi.spyOn(t.env.DB, "prepare").mockImplementation((query) => {
+    if (query.includes('insert into "ci_runs"')) throw new Error("CI admission interrupted");
+    return prepare(query);
+  });
+  await expect(
+    deliverRecoveredSourcePush(t.env, physical, t.operation.operationId, null, () => {}),
+  ).rejects.toThrow("CI admission interrupted");
+  failure.mockRestore();
+  expect(
+    t.sqlite.prepare("SELECT oid FROM ci_refs WHERE source_id=? AND ref='work'").get(t.sourceId),
+  ).toEqual({ oid: result.head });
+  expect(t.sqlite.prepare("SELECT COUNT(*) AS n FROM ci_runs").get()).toEqual({ n: 0 });
+  const pending = t.tracker.sourcePush(t.operation.operationId, "app", t.sourceId);
+  if (!pending.ok) throw new Error(pending.error);
+  expect(pending.value.delivery?.runs.push.state).toBe("pending");
+  t.trackers.set("orbit", new Tracker(t.contexts.get("orbit")!, t.env));
+  await deliverRecoveredSourcePush(t.env, physical, t.operation.operationId, null, () => {});
+  expect(pipeline.started.size).toBe(2);
+  expect(t.sqlite.prepare("SELECT id FROM ci_runs ORDER BY step").all()).toEqual([
+    { id: pending.value.delivery!.runs.push.id },
+    { id: pending.value.delivery!.runs.step.id },
+  ]);
+  t.sqlite.exec("UPDATE ci_runs SET status='succeeded'");
+  const next = {
+    ...t.operation,
+    operationId: "later-delivery",
+    commands: [{ ref: "refs/heads/work", old: result.head, new: oid(8) }],
+  };
+  expect(await t.trackers.get("orbit")!.beginSourcePush(next)).toMatchObject({ ok: true });
+  t.remote.commits.add(oid(8));
+  t.remote.parents.set(oid(8), [result.head!]);
+  t.remote.refs.set("refs/heads/work", oid(8));
+  expect(
+    await t.trackers.get("orbit")!.finishSourcePush(next.operationId, "accepted"),
+  ).toMatchObject({ ok: true });
+  await onPush(t.env, physical, null, () => {});
+  const count = t.sqlite.prepare("SELECT COUNT(*) AS n FROM ci_runs").get();
+  t.sqlite.exec("UPDATE ci_runs SET status='succeeded'");
+  await deliverRecoveredSourcePush(t.env, physical, t.operation.operationId, null, () => {});
+  expect(t.sqlite.prepare("SELECT COUNT(*) AS n FROM ci_runs").get()).toEqual(count);
+  expect(
+    t.sqlite.prepare("SELECT oid FROM ci_refs WHERE source_id=? AND ref='work'").get(t.sourceId),
+  ).toEqual({ oid: oid(8) });
+  t.sqlite.close();
+});
+
+test("recovery resumes a persisted queued CI run after Workflow startup failure", async () => {
+  const t = await pendingRecovery();
+  const pipeline = recoveryPipeline(t.env);
+  await recoverSourcePush(
+    t.env,
+    { id: "app", owner_id: "orbit" },
+    t.sourceId,
+    t.operation.operationId,
+    "ben",
+    "ben",
+  );
+  const physical = recoveryRepo(t);
+  const create = vi
+    .spyOn(t.env.CI_RUN, "create")
+    .mockRejectedValueOnce(new Error("Workflow startup interrupted"));
+  await expect(
+    deliverRecoveredSourcePush(t.env, physical, t.operation.operationId, null, () => {}),
+  ).rejects.toThrow("Workflow startup interrupted");
+  expect(t.sqlite.prepare("SELECT status FROM ci_runs").all()).toEqual([{ status: "queued" }]);
+  t.trackers.set("orbit", new Tracker(t.contexts.get("orbit")!, t.env));
+  await deliverRecoveredSourcePush(t.env, physical, t.operation.operationId, null, () => {});
+  expect(pipeline.started.size).toBe(2);
+  expect(t.sqlite.prepare("SELECT COUNT(*) AS n FROM ci_runs").get()).toEqual({ n: 2 });
+  create.mockRestore();
+  t.sqlite.close();
+});
+
+test("recovery replays lost CI acknowledgement after the Workflow completed using the same run IDs", async () => {
+  const t = await pendingRecovery();
+  recoveryPipeline(t.env);
+  await recoverSourcePush(
+    t.env,
+    { id: "app", owner_id: "orbit" },
+    t.sourceId,
+    t.operation.operationId,
+    "ben",
+    "ben",
+  );
+  const ack = vi.spyOn(t.tracker, "completeSourcePushDelivery").mockImplementationOnce(() => {
+    throw new Error("Delivery acknowledgement lost");
+  });
+  await expect(
+    deliverRecoveredSourcePush(t.env, recoveryRepo(t), t.operation.operationId, null, () => {}),
+  ).rejects.toThrow("Delivery acknowledgement lost");
+  const first = t.sqlite.prepare("SELECT id FROM ci_runs").get();
+  t.sqlite.exec("UPDATE ci_runs SET status='succeeded'");
+  ack.mockRestore();
+  t.trackers.set("orbit", new Tracker(t.contexts.get("orbit")!, t.env));
+  await deliverRecoveredSourcePush(t.env, recoveryRepo(t), t.operation.operationId, null, () => {});
+  expect(t.sqlite.prepare("SELECT id FROM ci_runs WHERE step=0").get()).toEqual(first);
+  expect(t.sqlite.prepare("SELECT COUNT(*) AS n FROM ci_runs").get()).toEqual({ n: 2 });
+  t.sqlite.close();
+});
+
+test("first recovery delivery adopts completed ordinary runs rather than rerunning gates", async () => {
+  const t = await pendingRecovery();
+  const pipeline = recoveryPipeline(t.env);
+  await recoverSourcePush(
+    t.env,
+    { id: "app", owner_id: "orbit" },
+    t.sourceId,
+    t.operation.operationId,
+    "ben",
+    "ben",
+  );
+  const physical = recoveryRepo(t);
+  await onPush(t.env, physical, null, () => {});
+  const runs = t.sqlite.prepare("SELECT id FROM ci_runs ORDER BY step").all();
+  expect(runs).toHaveLength(2);
+  t.sqlite.exec("UPDATE ci_runs SET status='succeeded'");
+  await deliverRecoveredSourcePush(t.env, physical, t.operation.operationId, null, () => {});
+  expect(t.sqlite.prepare("SELECT id FROM ci_runs ORDER BY step").all()).toEqual(runs);
+  expect(pipeline.started.size).toBe(2);
+  const inspected = t.tracker.sourcePush(t.operation.operationId, "app", t.sourceId);
+  if (!inspected.ok) throw new Error(inspected.error);
+  expect(inspected.value.delivery?.runs).toMatchObject({
+    push: { id: runs[0]!.id, state: "started" },
+    step: { id: runs[1]!.id, state: "started" },
+  });
+  t.sqlite.close();
+});
+
+test("deletion cannot mistake an unresolved recovery intent for terminal projection repair", async () => {
+  const t = await pendingRecovery();
+  t.remote.refuse = "marker CAS unavailable";
+  expect(
+    (await t.raw("ben", "POST", `${t.path}/${t.operation.operationId}/recover`, {})).status,
+  ).toBe(409);
+  t.sqlite.exec("UPDATE repos SET deleted_at=CURRENT_TIMESTAMP WHERE id='app'");
+  const writes = t.remote.pushes.length;
+  await expect(drainDeletedRepoSources(t.env, "app")).rejects.toThrow("still draining");
+  expect(t.remote.pushes).toHaveLength(writes);
+  expect(
+    t.sqlite.prepare("SELECT state FROM timeline_work_sources WHERE source_id=?").get(t.sourceId),
+  ).toEqual({ state: "ready" });
   t.sqlite.close();
 });

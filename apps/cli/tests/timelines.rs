@@ -115,6 +115,7 @@ impl Api {
         let work = remote.parent().unwrap().join("source.git");
         let worker = thread::spawn(move || {
             let mut status = "none";
+            let mut recovered = false;
             for stream in listener.incoming() {
                 if halt.load(Ordering::Acquire) {
                     break;
@@ -157,6 +158,38 @@ impl Api {
                         200,
                         json!({"source": record(status)["repos"][0]["source"],
                             "cloneUrl": format!("http://{address}/orbit/engine@search.git")}),
+                    ),
+                    ("GET", "/api/repos/orbit/engine/sources/work_search/pushes") => {
+                        let operations = if recovered { json!([]) } else {
+                            json!([{"operationId": "push_1", "state": "ambiguous",
+                                "commands": [{"old": "a".repeat(40), "new": "b".repeat(40), "ref": "refs/heads/work"}],
+                                "actorId": "agt_bot", "accountableId": "ann"}])
+                        };
+                        (200, json!({"sourceId": "work_search", "operations": operations}))
+                    }
+                    ("GET", "/api/repos/orbit/engine/sources/work_search/pushes/push_1") => (
+                        200, json!({"operationId": "push_1", "sourceId": "work_search",
+                            "state": if recovered { "rejected" } else { "ambiguous" },
+                            "actorId": "agt_bot", "accountableId": "ann",
+                            "recovery": if recovered { json!({"recoveryId": "recovery_1"}) } else { Value::Null }})
+                    ),
+                    ("POST", "/api/repos/orbit/engine/sources/work_search/pushes/push_1/recover") => {
+                        assert_eq!(body, json!({}));
+                        recovered = true;
+                        (200, json!({"operationId": "push_1", "sourceId": "work_search",
+                            "state": "rejected", "head": "c".repeat(40), "recoveryId": "recovery_1",
+                            "fenceCommit": "c".repeat(40), "syncRequired": true}))
+                    }
+                    ("POST", "/api/repos/orbit/engine/sources/work_search/pushes/push_accepted/recover") => (
+                        200, json!({"operationId": "push_accepted", "sourceId": "work_search",
+                            "state": "accepted", "head": "b".repeat(40), "recoveryId": null,
+                            "fenceCommit": null, "syncRequired": false})
+                    ),
+                    ("POST", "/api/repos/orbit/engine/sources/work_search/pushes/push_busy/recover") => (
+                        409, json!({"code": "source_busy", "error": "Recovery is not proven; retry the same operation."})
+                    ),
+                    ("POST", "/api/repos/orbit/engine/sources/work_search/pushes/push_denied/recover") => (
+                        403, json!({"code": "forbidden", "error": "Source recovery requires write access."})
                     ),
                     ("GET", p) if p.starts_with("/api/repos/orbit/engine/sources/work_search/lineage?") => {
                         (200, lineage_reply.lock().clone().unwrap_or(json!({"status":"pending"})))
@@ -1304,4 +1337,154 @@ fn bound_checkout_rejects_a_different_persisted_source_before_push() {
     );
     assert_eq!(s.err(&["push"]), "invalid_source");
     assert_eq!(s.remote(&["rev-parse", "timeline/search"]), before);
+}
+
+#[test]
+fn push_recovery_preserves_local_work_and_retains_exact_audited_outcome() {
+    let s = Sandbox::new();
+    s.ok(&["timeline", "start", "search"]);
+    s.commit("private.txt", "Unpublished local source work");
+    fs::write(s.work().join("private.txt"), "dirty local content\n").unwrap();
+    let refs = git(&s.work(), &["show-ref"]);
+    let config = fs::read(s.work().join(".git/config")).unwrap();
+    let binding = s.binding();
+    let canonical = s.remote(&["show-ref"]);
+    let pending = s.ok(&["timeline", "pushes"]);
+    assert_eq!(pending["sourceId"], "work_search");
+    assert_eq!(pending["operations"][0]["operationId"], "push_1");
+    assert_eq!(pending["operations"][0]["state"], "ambiguous");
+    assert_eq!(pending["operations"][0]["accountableId"], "ann");
+    let result = s.ok(&["timeline", "recover-push", "push_1"]);
+    assert_eq!(result["state"], "rejected");
+    assert_eq!(result["recoveryId"], "recovery_1");
+    assert_eq!(result["syncRequired"], true);
+    assert_eq!(result["head"], result["fenceCommit"]);
+    assert_eq!(s.ok(&["timeline", "recover-push", "push_1"]), result);
+    assert_eq!(s.ok(&["timeline", "pushes"])["operations"], json!([]));
+    let retained = s.ok(&["timeline", "pushes", "push_1"]);
+    assert_eq!(retained["state"], "rejected");
+    assert_eq!(retained["recovery"]["recoveryId"], "recovery_1");
+    assert_eq!(git(&s.work(), &["show-ref"]), refs);
+    assert_eq!(fs::read(s.work().join(".git/config")).unwrap(), config);
+    assert_eq!(s.binding(), binding);
+    assert_eq!(
+        fs::read_to_string(s.work().join("private.txt")).unwrap(),
+        "dirty local content\n"
+    );
+    assert_eq!(s.remote(&["show-ref"]), canonical);
+}
+
+#[test]
+fn explicit_push_selection_dry_run_and_errors_never_rebind_or_guess_an_operation() {
+    let s = Sandbox::new();
+    let selection = ["--timeline", "search", "--repo", "orbit/engine"];
+    let binding = s.binding();
+    assert_eq!(s.err(&["timeline", "pushes"]), "invalid_argument");
+    let mut args = vec!["timeline", "recover-push", "push_1"];
+    args.extend(selection);
+    args.push("--dry-run");
+    assert_eq!(s.ok(&args)["dry_run"], true);
+    assert!(s.api.requests("POST").is_empty());
+    let pending = s.ok(&[
+        "timeline",
+        "pushes",
+        "--timeline",
+        "search",
+        "--repo",
+        "orbit/engine",
+    ]);
+    assert_eq!(pending["operations"][0]["state"], "ambiguous");
+    let (outside_code, outside, _) = s.run_with(
+        &[
+            "-C",
+            s.root.to_str().unwrap(),
+            "timeline",
+            "pushes",
+            "push_1",
+            "--timeline",
+            "search",
+            "--repo",
+            "orbit/engine",
+        ],
+        &[("GM_TIMELINE", "unrelated")],
+    );
+    assert_eq!(outside_code, 0, "{outside}");
+    assert_eq!(outside["state"], "ambiguous");
+    assert_eq!(outside["sourceId"], "work_search");
+    for (operation, code) in [
+        ("push_busy", "source_busy"),
+        ("push_denied", "forbidden"),
+        ("push_missing", "not_found"),
+    ] {
+        let mut args = vec!["timeline", "recover-push", operation];
+        args.extend(selection);
+        assert_eq!(s.err(&args), code);
+    }
+    let accepted = s.ok(&[
+        "timeline",
+        "recover-push",
+        "push_accepted",
+        "--timeline",
+        "search",
+        "--repo",
+        "orbit/engine",
+    ]);
+    assert_eq!(accepted["state"], "accepted");
+    assert_eq!(accepted["syncRequired"], false);
+    assert!(accepted["fenceCommit"].is_null());
+    let posts = s.api.requests("POST").len();
+    assert_eq!(
+        s.err(&[
+            "timeline",
+            "recover-push",
+            "../push_1",
+            "--timeline",
+            "search"
+        ]),
+        "invalid_argument"
+    );
+    assert_eq!(
+        s.err(&["timeline", "recover-push", "push_1", "--timeline", "main"]),
+        "invalid_argument"
+    );
+    assert_eq!(
+        s.err(&[
+            "timeline",
+            "recover-push",
+            "push_1",
+            "--timeline",
+            "search",
+            "--repo",
+            "orbit/engine/extra"
+        ]),
+        "invalid_argument"
+    );
+    assert_eq!(
+        s.err(&[
+            "timeline",
+            "recover-push",
+            "push_1",
+            "--timeline",
+            "search",
+            "--repo",
+            "orbit/other"
+        ]),
+        "timeline_not_here"
+    );
+    git(
+        &s.work(),
+        &["config", "gitmatrix.source-search", "work_other"],
+    );
+    assert_eq!(
+        s.err(&["timeline", "recover-push", "push_1", "--timeline", "search"]),
+        "invalid_source"
+    );
+    assert_eq!(s.api.requests("POST").len(), posts);
+    s.api.legacy.store(true, Ordering::Release);
+    assert_eq!(
+        s.err(&["timeline", "recover-push", "push_1", "--timeline", "search"]),
+        "source_migration_required"
+    );
+    assert_eq!(s.api.requests("POST").len(), posts);
+    assert_eq!(s.binding(), binding);
 }

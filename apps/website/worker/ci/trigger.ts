@@ -125,8 +125,19 @@ export async function startRun(
     waitUntil: Waiter;
     /** The run's id, when the caller recorded it before starting it (a landing does). */
     runId?: string;
+    /** Exact, Tracker-persisted native-source recovery delivery, independent of ci_refs. */
+    sourceRecovery?: boolean;
   },
 ): Promise<{ runId: string; number: number } | { skipped: string; teardownUnmanaged?: boolean }> {
+  if (
+    options.sourceRecovery &&
+    (!options.runId ||
+      !repo.source_id ||
+      repo.source_id === "canonical" ||
+      options.branch !== "work" ||
+      (options.trigger !== "push" && options.trigger !== "step"))
+  )
+    throw new Error("Source recovery CI requires an exact owned-source run identity.");
   // CI_RUN is production's Workflow: a preview records no runs at all.
   if (!productionOnly(env, "workflow", `a ${options.trigger} run of ${options.branch}`))
     return { skipped: "Previews don't run CI." };
@@ -154,6 +165,43 @@ export async function startRun(
     repo.source_id && repo.source_id !== "canonical" ? "refs/heads/work" : undefined,
   );
   try {
+    if (options.sourceRecovery) {
+      const recorded = await db(env.DB)
+        .selectFrom("ci_runs")
+        .select([
+          "id",
+          "number",
+          "repo_id",
+          "source_id",
+          "ref",
+          "commit_oid",
+          "step",
+          "status",
+          "trigger",
+          "preview_action",
+          "landing_id",
+          "queue_id",
+        ])
+        .where("id", "=", options.runId!)
+        .executeTakeFirst();
+      if (recorded) {
+        if (
+          recorded.repo_id !== repo.id ||
+          recorded.source_id !== repo.source_id ||
+          recorded.ref !== options.branch ||
+          recorded.commit_oid !== options.commit ||
+          recorded.step !== (options.trigger === "step" ? 1 : 0) ||
+          recorded.trigger !== (options.trigger === "step" ? "manual" : "push") ||
+          recorded.preview_action !== null ||
+          recorded.landing_id !== null ||
+          recorded.queue_id !== null
+        )
+          throw new Error("The saved recovery CI run does not match its source operation.");
+        if (recorded.status === "queued" || recorded.status === "running")
+          await startRecoveredWorkflow(env, recorded.id);
+        return { runId: recorded.id, number: recorded.number };
+      }
+    }
     if (options.runId && (options.queueId || options.verification)) {
       const recorded = await db(env.DB)
         .selectFrom("ci_runs")
@@ -185,15 +233,17 @@ export async function startRun(
     }
     // A run of this commit already in flight on the branch answers for it.
     const step = options.trigger === "step";
-    const existing = await activeRun(
-      env.DB,
-      repo.id,
-      options.branch,
-      options.commit,
-      preview && { action: preview.action, checkpoint: preview.checkpoint },
-      repo.source_id ?? "canonical",
-      step,
-    );
+    const existing = options.sourceRecovery
+      ? null
+      : await activeRun(
+          env.DB,
+          repo.id,
+          options.branch,
+          options.commit,
+          preview && { action: preview.action, checkpoint: preview.checkpoint },
+          repo.source_id ?? "canonical",
+          step,
+        );
     if (existing) {
       // Queue callers persist their run identity before I/O. A different run
       // on the same object cannot stand in for that attempt's gate evidence.
@@ -227,7 +277,9 @@ export async function startRun(
     const runId = options.runId ?? crypto.randomUUID().replaceAll("-", "");
     // A timeline's full CI waits for its pushes to pause (CORE-238).
     const quietMs =
-      options.trigger === "push" && isTimeline(repo, options.branch) ? timelineQuietMs(env) : 0;
+      !options.sourceRecovery && options.trigger === "push" && isTimeline(repo, options.branch)
+        ? timelineQuietMs(env)
+        : 0;
     const released =
       quietMs > 0 &&
       (
@@ -451,7 +503,7 @@ export async function startRun(
     await batch(env.DB, statements);
     // Under load, a push waits in a held run: when a run on its branch finishes,
     // the newest held run starts and covers the older ones.
-    const limit = pipeline?.coalesceAfter;
+    const limit = options.sourceRecovery ? undefined : pipeline?.coalesceAfter;
     // A newer push covers the timeline's runs still waiting out their quiet period.
     if (!error && quietUntil)
       await coverQuiet(env.DB, repo.id, options.branch, runId, repo.source_id);
@@ -483,7 +535,9 @@ export async function startRun(
         return { runId, number: held?.number ?? 0 };
       }
     }
-    if (!error) {
+    if (!error && options.sourceRecovery) {
+      await startRecoveredWorkflow(env, runId);
+    } else if (!error) {
       try {
         await startWorkflow(env, runId);
       } catch (cause) {
@@ -511,9 +565,24 @@ export async function startRun(
       .select("number")
       .where("id", "=", runId)
       .executeTakeFirst();
+    if (options.sourceRecovery && !row)
+      throw new Error("Recovery CI admission did not persist its run.");
     return { runId, number: row?.number ?? 0 };
   } finally {
     await reader.close();
+  }
+}
+
+/** Preserve the queued run on transient startup failure; replay uses this same ID. */
+async function startRecoveredWorkflow(env: Env, runId: string) {
+  try {
+    await startWorkflow(env, runId);
+  } catch (error) {
+    // A lost create response or concurrent replay may already have started it.
+    const existing = await env.CI_RUN.get(runId)
+      .then((workflow) => workflow.status())
+      .catch(() => null);
+    if (!existing) throw error;
   }
 }
 

@@ -150,6 +150,34 @@ export interface SourcePush {
   commands: { ref: string; old: string | null; new: string | null }[];
   actorId: string | null;
   accountableId: string | null;
+  recovery?: SourcePushRecovery;
+  projectionPending?: boolean;
+  delivery?: {
+    head: string;
+    runs: Record<
+      "push" | "step",
+      {
+        id: string;
+        state: "pending" | "started" | "skipped";
+        reason?: string;
+      }
+    >;
+  };
+}
+
+export interface SourcePushRecovery {
+  id: string;
+  base: string;
+  tree: string;
+  commit: string;
+  content: string;
+  actorId: string;
+  accountableId: string;
+  createdAt: string;
+  priorState: string;
+  outcome?: "accepted" | "rejected";
+  head?: string;
+  projected?: boolean;
 }
 
 /** An event before it's stored: the store numbers it. */
@@ -422,7 +450,13 @@ export class TimelineStore {
     let query = tracker
       .selectFrom("timeline_source_operations")
       .selectAll()
-      .where("state", "in", ["projecting", "admitted", "ambiguous"]);
+      .where((eb) =>
+        eb.or([
+          eb("state", "in", ["projecting", "admitted", "ambiguous"]),
+          sql<boolean>`json_extract(data, '$.recovery.projected') = 0`,
+          sql<boolean>`json_extract(data, '$.projectionPending') = 1`,
+        ]),
+      );
     if (repoId) query = query.where("repo_id", "=", repoId);
     return all(this.sql, query).map((row) => ({
       ...(JSON.parse(row.data) as SourcePush),
@@ -506,6 +540,25 @@ export class TimelineStore {
         fail("invalid_ref", "Only the owned work ref may be updated; it cannot be deleted.", 409);
       if (this.sourcePushes().some((operation) => operation.timelineId === timeline.id))
         fail("source_busy", "A source mutation awaits reconciliation.", 409);
+      // Never permit ABA after recovery: an outstanding original or recovery
+      // CAS could become live again if a later force rewrite restored its base.
+      for (const command of input.commands) {
+        const fenced = first(
+          this.sql,
+          tracker
+            .selectFrom("timeline_source_operations")
+            .select("id")
+            .where("repo_id", "=", input.repoId)
+            .where("source_id", "=", input.sourceId)
+            .where(json<string>("data", "$.recovery.base"), "=", command.new!),
+        );
+        if (fenced)
+          fail(
+            "recovery_fence",
+            "This commit is a fenced recovery base; sync and preserve the recovery history.",
+            409,
+          );
+      }
       run(
         this.sql,
         tracker.insertInto("timeline_source_operations").values({
@@ -527,7 +580,117 @@ export class TimelineStore {
       return { operationId: input.operationId };
     });
   }
-  finishSourcePush(operationId: string, outcome: "accepted" | "rejected" | "ambiguous"): void {
+  beginSourcePushRecovery(
+    operationId: string,
+    repoId: string,
+    sourceId: string,
+    intent: SourcePushRecovery,
+  ): SourcePush & { state: string } {
+    return this.transaction(() => {
+      const operation = this.sourcePush(operationId, repoId, sourceId);
+      if (operation.state === "accepted" || operation.state === "rejected") return operation;
+      const timeline = this.byId(operation.timelineId);
+      this.writableSourceTimeline(timeline);
+      const source = this.getWorkSource(sourceId);
+      if (
+        source.state !== "ready" ||
+        source.repo_id !== repoId ||
+        source.timeline_id !== timeline.id ||
+        !timeline.repos.some((repo) => repo.id === repoId && repo.source?.sourceId === sourceId)
+      )
+        fail("source_expired", "Recovery requires the active owned source.", 409);
+      if (operation.recovery) return operation;
+      if (operation.state === "projecting")
+        fail("source_busy", "Admission must be reconciled before recovery.", 409);
+      const [command] = operation.commands;
+      if (
+        operation.commands.length !== 1 ||
+        !command ||
+        command.ref !== source.work_ref ||
+        command.old !== intent.base ||
+        command.old === command.new ||
+        !OID.test(intent.base) ||
+        !OID.test(intent.tree) ||
+        !OID.test(intent.commit)
+      )
+        fail("recovery_conflict", "Recovery does not match the admitted command.", 409);
+      operation.recovery = { ...intent, priorState: operation.state, projected: false };
+      const { state: _state, ...data } = operation;
+      run(
+        this.sql,
+        tracker
+          .updateTable("timeline_source_operations")
+          .set({ data: JSON.stringify(data) })
+          .where("id", "=", operationId),
+      );
+      timeline.updatedAt = this.now();
+      timeline.version++;
+      this.save(timeline, "timeline.push.recovery.started", intent.actorId);
+      return operation;
+    });
+  }
+
+  settleSourcePushRecovery(operationId: string, outcome: "accepted" | "rejected", head: string) {
+    return this.transaction(() => {
+      const operation = this.sourcePush(operationId);
+      const recovery = operation.recovery;
+      if (!recovery) fail("recovery_conflict", "No durable recovery intent.", 409);
+      if (operation.state === "accepted" || operation.state === "rejected") {
+        if (operation.state !== outcome || recovery.head !== head)
+          fail("operation_settled", "Push already settled.", 409);
+        return;
+      }
+      const [command] = operation.commands;
+      if (
+        operation.commands.length !== 1 ||
+        !command ||
+        head !== (outcome === "accepted" ? command.new : recovery.commit)
+      )
+        fail("recovery_conflict", "Recovery proof does not match its outcome.", 409);
+      recovery.outcome = outcome;
+      recovery.head = head;
+      const timeline = this.byId(operation.timelineId);
+      this.setHead(timeline.id, operation.repoId, head);
+      timeline.pushedAt = this.now();
+      timeline.updatedAt = this.now();
+      timeline.version++;
+      const actorId = outcome === "accepted" ? operation.actorId : recovery.actorId;
+      const accountableId =
+        outcome === "accepted" ? operation.accountableId : recovery.accountableId;
+      if (actorId && actorId !== accountableId && !timeline.agentIds.includes(actorId))
+        timeline.agentIds.push(actorId);
+      this.status(timeline);
+      this.save(timeline, "timeline.push.recovery", recovery.actorId);
+      const { state: _state, ...data } = operation;
+      run(
+        this.sql,
+        tracker
+          .updateTable("timeline_source_operations")
+          .set({ state: outcome, data: JSON.stringify(data) })
+          .where("id", "=", operationId),
+      );
+    });
+  }
+
+  projectSourcePushRecovery(operationId: string) {
+    const operation = this.sourcePush(operationId);
+    if (!operation.recovery?.outcome) fail("source_busy", "Recovery is not proven.", 409);
+    operation.recovery.projected = true;
+    const { state: _state, ...data } = operation;
+    run(
+      this.sql,
+      tracker
+        .updateTable("timeline_source_operations")
+        .set({ data: JSON.stringify(data) })
+        .where("id", "=", operationId),
+    );
+  }
+
+  finishSourcePush(
+    operationId: string,
+    outcome: "accepted" | "rejected" | "ambiguous",
+    projecting = false,
+  ): void {
     this.transaction(() => {
       const row = first(
         this.sql,
@@ -538,6 +701,8 @@ export class TimelineStore {
       if (row.state === "accepted" || row.state === "rejected")
         fail("operation_settled", "Push already settled.", 409);
       const input = JSON.parse(row.data) as SourcePush;
+      if (input.recovery && outcome !== "ambiguous")
+        fail("recovery_active", "Complete the durable recovery before settling this push.", 409);
       if (outcome === "accepted") {
         const timeline = this.byId(input.timelineId);
         for (const command of input.commands) this.setHead(timeline.id, input.repoId, command.new);
@@ -553,14 +718,87 @@ export class TimelineStore {
         this.status(timeline);
         this.save(timeline, "timeline.push", input.actorId);
       }
+      input.projectionPending = projecting && outcome !== "ambiguous";
       run(
         this.sql,
         tracker
           .updateTable("timeline_source_operations")
-          .set({ state: outcome })
+          .set({ state: outcome, data: JSON.stringify(input) })
           .where("id", "=", operationId),
       );
     });
+  }
+  projectSourcePush(operationId: string) {
+    const operation = this.sourcePush(operationId);
+    if (operation.state !== "accepted" && operation.state !== "rejected") return;
+    operation.projectionPending = false;
+    const { state: _state, ...data } = operation;
+    run(
+      this.sql,
+      tracker
+        .updateTable("timeline_source_operations")
+        .set({ data: JSON.stringify(data) })
+        .where("id", "=", operationId),
+    );
+  }
+  reserveSourcePushDelivery(
+    operationId: string,
+    repoId: string,
+    sourceId: string,
+    runIds: Partial<Record<"push" | "step", string>>,
+  ) {
+    return this.transaction(() => {
+      const operation = this.sourcePush(operationId, repoId, sourceId);
+      if (operation.delivery) return operation.delivery;
+      if (operation.state !== "accepted" && operation.state !== "rejected")
+        fail("source_busy", "Push outcome must be proven before CI delivery.", 409);
+      const head =
+        operation.recovery?.head ??
+        (operation.state === "accepted" ? operation.commands[0]?.new : null);
+      if (!head) fail("invalid_state", "A rejected push without a marker has no CI delivery.", 409);
+      const source = this.getWorkSource(sourceId);
+      if (source.state !== "ready" || source.repo_id !== repoId)
+        fail("source_expired", "CI delivery requires the active owned source.", 409);
+      operation.delivery = {
+        head,
+        runs: {
+          push: { id: runIds.push ?? crypto.randomUUID().replaceAll("-", ""), state: "pending" },
+          step: { id: runIds.step ?? crypto.randomUUID().replaceAll("-", ""), state: "pending" },
+        },
+      };
+      const { state: _state, ...data } = operation;
+      run(
+        this.sql,
+        tracker
+          .updateTable("timeline_source_operations")
+          .set({ data: JSON.stringify(data) })
+          .where("id", "=", operationId),
+      );
+      return operation.delivery;
+    });
+  }
+
+  completeSourcePushDelivery(
+    operationId: string,
+    trigger: "push" | "step",
+    runId: string,
+    result: { skipped: string } | { runId: string },
+  ) {
+    const operation = this.sourcePush(operationId);
+    const deliveryRun = operation.delivery?.runs[trigger];
+    if (!deliveryRun || deliveryRun.id !== runId || ("runId" in result && result.runId !== runId))
+      fail("operation_conflict", "CI delivery does not match the persisted recovery run.", 409);
+    if (deliveryRun.state !== "pending") return;
+    deliveryRun.state = "skipped" in result ? "skipped" : "started";
+    if ("skipped" in result) deliveryRun.reason = result.skipped;
+    const { state: _state, ...data } = operation;
+    run(
+      this.sql,
+      tracker
+        .updateTable("timeline_source_operations")
+        .set({ data: JSON.stringify(data) })
+        .where("id", "=", operationId),
+    );
   }
   resolveLegacyLanding(
     timelineId: string,

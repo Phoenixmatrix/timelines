@@ -50,6 +50,7 @@ export const e2eScenarioNames = [
   "retention-concurrent-with-pushes-builds-and-chats",
   "source-authorization-native-and-canonical-separation",
   "source-multi-repository-landing-and-durable-recovery",
+  "source-push-recovery-fences-late-writes",
   "source-late-sync-lineage-conflicts-guard-and-expiry",
   "source-finite-legacy-migration-and-partial-revert",
   "source-retention-expiry-orphan-and-canonical-purge",
@@ -90,6 +91,7 @@ const prerequisites: Partial<Record<ScenarioName, readonly ScenarioName[]>> = {
   "browser-timeline-scope-round-trip": [],
   "source-retention-expiry-orphan-and-canonical-purge": [],
   "browser-expired-source-without-timeline-history": [],
+  "source-push-recovery-fences-late-writes": [],
   // Chronicle seeds its own history but links to an existing pushed CI commit.
   "browser-chronicle-scrub-range-span-and-links": ["ci-push-triggered-local-dag-and-provenance"],
 };

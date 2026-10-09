@@ -4,6 +4,7 @@
 
 import { FLUSH, pkt } from "../git/pktline.ts";
 import { ZERO_OID } from "../mirror/protocol.ts";
+import { packCommits } from "../git/pack.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -106,6 +107,21 @@ export function fakeRemotes() {
             ? "empty"
             : "other";
       remote.pushes.push({ commands, pack });
+      let unpack = "ok";
+      if (pack === "other") {
+        const received = await packCommits(rest);
+        const count =
+          rest.length >= 12
+            ? new DataView(rest.buffer, rest.byteOffset, rest.byteLength).getUint32(8)
+            : -1;
+        if (received.length !== count) unpack = "eof";
+        else
+          for (const commit of received) {
+            remote.commits.add(commit.oid);
+            commits.add(commit.oid);
+            remote.parents.set(commit.oid, commit.parents);
+          }
+      }
       const updates = commands.map((command) => {
         const [old, next, ref] = command.split(" ") as [string, string, string];
         return { old, next, ref };
@@ -118,7 +134,7 @@ export function fakeRemotes() {
         return null;
       };
       const failed = updates.map(reason);
-      const unpack = updates.some((u) => u.next !== ZERO_OID) && pack !== "empty" ? "eof" : "ok";
+      if (updates.some((u) => u.next !== ZERO_OID) && pack === "none") unpack = "eof";
       // Atomic: all of them or none.
       const ok = unpack === "ok" && failed.every((f) => f === null);
       if (ok)
@@ -203,8 +219,10 @@ export function fakeRemotes() {
                 hash,
                 treeHash: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
                 parents: [...(remote?.parents.get(hash) ?? [])],
+                message: "Fixture commit",
               }
             : null,
+        readTree: async (): Promise<ArtifactsTreeEntry[]> => [],
         [Symbol.dispose]() {},
       };
     },

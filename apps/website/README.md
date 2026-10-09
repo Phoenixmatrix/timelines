@@ -579,25 +579,28 @@ For direct HTTP clients, use the environment's printed origin and a scoped token
 never substitute the canonical server. `/api/dev/tokens`, `/api/dev/seed` and
 `/api/dev/environment` require the harness capability in isolated environments.
 
-| Route                                                                                     | Does                                                              |
-| ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `POST /api/dev/tokens` `{persona, scope?, name?}`                                         | Mint a dev token; capability required in isolated environments    |
-| `POST /api/dev/seed`                                                                      | Reconcile empty sample repositories (dev only)                    |
-| `GET /api/session`                                                                        | Who the token or cookie belongs to                                |
-| `GET /api/personas`, `GET /api/users`, `GET /api/accounts/:slug`                          | People and orgs                                                   |
-| `GET /api/search?q=&categories=&limit=&cursor=`                                           | Global search: see [Global search](#global-search)                |
-| `GET /api/repos`, `POST /api/repos` `{owner, name, visibility, description?, importUrl?}` | List, create or import                                            |
-| `GET\|PATCH\|DELETE /api/repos/:owner/:name`                                              | Detail with branches and tags, update, delete                     |
-| `GET /api/repos/:owner/:name/tree?ref=&path=`                                             | Folder listing, latest commit, README                             |
-| `GET /api/repos/:owner/:name/blob?ref=&path=`                                             | File contents                                                     |
-| `GET /api/repos/:owner/:name/commits?ref=&page=`                                          | History, 30 per page                                              |
-| `GET /api/repos/:owner/:name/semantic?ref=&cursor=&limit=&path=&kind=&language=`          | Individual syntax changes with source links and analysis coverage |
-| `GET\|PUT\|DELETE /api/repos/:owner/:name/collaborators[/:user]` `{role}`                 | Manage access (admin)                                             |
-| `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                         | Your tokens                                                       |
-| `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie; DELETE also ends an email sign-in         |
-| `/api/identity/*`                                                                         | Better Auth: email codes, device login (`/device/*`)              |
-| `POST /api/tokens/device` (Bearer: device session)                                        | Trade a one-time device session for a gm token                    |
-| `GET\|POST /api/invites`, `DELETE /api/invites/:email`                                    | Invitations (site admins)                                         |
+| Route                                                                                     | Does                                                                           |
+| ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `POST /api/dev/tokens` `{persona, scope?, name?}`                                         | Mint a dev token; capability required in isolated environments                 |
+| `POST /api/dev/seed`                                                                      | Reconcile empty sample repositories (dev only)                                 |
+| `GET /api/session`                                                                        | Who the token or cookie belongs to                                             |
+| `GET /api/personas`, `GET /api/users`, `GET /api/accounts/:slug`                          | People and orgs                                                                |
+| `GET /api/search?q=&categories=&limit=&cursor=`                                           | Global search: see [Global search](#global-search)                             |
+| `GET /api/repos`, `POST /api/repos` `{owner, name, visibility, description?, importUrl?}` | List, create or import                                                         |
+| `GET\|PATCH\|DELETE /api/repos/:owner/:name`                                              | Detail with branches and tags, update, delete                                  |
+| `GET /api/repos/:owner/:name/tree?ref=&path=`                                             | Folder listing, latest commit, README                                          |
+| `GET /api/repos/:owner/:name/blob?ref=&path=`                                             | File contents                                                                  |
+| `GET /api/repos/:owner/:name/commits?ref=&page=`                                          | History, 30 per page                                                           |
+| `GET /api/repos/:owner/:name/semantic?ref=&cursor=&limit=&path=&kind=&language=`          | Individual syntax changes with source links and analysis coverage              |
+| `GET /api/repos/:owner/:name/sources/:sourceId/pushes`                                    | Pending owned-source push operations, including incomplete recovery projection |
+| `GET /api/repos/:owner/:name/sources/:sourceId/pushes/:operationId`                       | Exact retained operation, including terminal outcome and recovery audit        |
+| `POST /api/repos/:owner/:name/sources/:sourceId/pushes/:operationId/recover` `{}`         | Prove acceptance or durably CAS-fence an interrupted owned-source push         |
+| `GET\|PUT\|DELETE /api/repos/:owner/:name/collaborators[/:user]` `{role}`                 | Manage access (admin)                                                          |
+| `GET\|POST /api/tokens`, `DELETE /api/tokens/:id`                                         | Your tokens                                                                    |
+| `POST\|DELETE /api/session` `{accountId}`                                                 | Browser persona cookie; DELETE also ends an email sign-in                      |
+| `/api/identity/*`                                                                         | Better Auth: email codes, device login (`/device/*`)                           |
+| `POST /api/tokens/device` (Bearer: device session)                                        | Trade a one-time device session for a gm token                                 |
+| `GET\|POST /api/invites`, `DELETE /api/invites/:email`                                    | Invitations (site admins)                                                      |
 
 ## Global search
 
@@ -1443,13 +1446,60 @@ wire types.
   progress and pre-rewrite predecessors are rooted, not just checkpoints;
   durable mutation intents fence pushes against admitted landings and keep
   ambiguous provider outcomes fenced until reconciliation.
-  Only a complete negotiated Git `report-status`/`report-status-v2`, consistent
-  with the observed work ref, settles a push. HTTP failures, incomplete or
-  contradictory reports, and mismatched refs remain ambiguous even when the
-  old tip is still visible.
+  A complete negotiated Git `report-status`/`report-status-v2`, consistent with
+  the observed work ref, settles a normal push. A current request can also prove
+  rejection when failure precedes any provider forwarding (including token
+  acquisition and predecessor retention). After forwarding starts, HTTP failures,
+  incomplete or contradictory reports, and mismatched refs remain ambiguous even
+  when the old tip is still visible.
   CI retains the immutable `sourceId` and exact commit, with `timelineSlug`
   identifying its public Git address. Local and Sandbox runners validate the
   trusted origin, canonical repository, slug and source-ID pin before checkout.
+- **Interrupted push recovery** (CORE-321) is explicit: inspect with
+  `gm timeline pushes [OPERATION]`, then use `gm timeline recover-push OPERATION`.
+  Both support `--timeline SLUG --repo OWNER/NAME` without changing local bindings.
+  The API list returns `{sourceId, operations}`; exact inspection returns the
+  retained operation's ID, state, original commands/attribution and, when present,
+  its recovery intent/outcome. Reads require repository access and tracker membership;
+  recovery also requires write access and a write-scoped credential. Jobs, wrong-source
+  requests and canonical targets cannot recover. Expired/ended sources are not reactivated.
+  A successful recovery returns
+  `{sourceId, operationId, state: "accepted" | "rejected", head, recoveryId,
+fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
+  that later work cannot advance it. Unproven states return non-2xx (normally
+  `409 source_busy`); retry the same operation rather than creating another one.
+  Observing the requested new head proves acceptance. Observing only the old
+  head never proves rejection: recovery first persists one unique same-tree
+  commit (parented by that old head) and its actor/accountable attribution, then
+  uploads only that commit and CASes the work ref from old to marker. Concurrent
+  attempts use that same persisted intent. If the original wins the race, its
+  new head proves acceptance; if the marker wins, the old-to-new original CAS
+  is fenced and the operation is rejected. Unexpected heads fail closed.
+  Marker history is retained with source progress; canonical refs are untouched.
+  Neither recovery nor later source writes may restore a persisted recovery
+  base OID on that source: doing so could revive a delayed CAS (the ABA problem).
+  This exact-OID restriction does not otherwise prohibit normal work rewrites.
+  Terminal outcomes are immutable; replay repairs a failed projection without
+  another provider write, including deletion's reconciler after a repository
+  tombstone hides the public endpoint. Unresolved recovery intents still block
+  deletion. The timeline remains mutation-fenced until proof,
+  progress retention and projection complete. Original operation commands and
+  attribution are retained alongside the recovery's prior state and audit.
+  Recovery persists an exact-head CI delivery obligation with stable push and
+  step run IDs before observing refs or starting runs.
+  Existing matching CI runs are adopted, including their completed outcomes;
+  recovery is not an implicit rerun of failed or successful gates. A failed admission or
+  Workflow startup returns an error; retrying the same operation resumes those
+  IDs across restarts, independently of `ci_refs`. Completed runs and explicit
+  no-pipeline/disabled-step outcomes are acknowledged durably and never recreated
+  by historical replay. Recovery runs do not wait out quiet/coalescing periods
+  or cover newer source work. Ref-log and Knowledge observations use current
+  provider refs, not the obligation's historical head.
+  Replaying an old terminal operation after later work preserves its historical
+  response without rewinding the live source head or observing stale refs.
+  When `syncRequired` is true, run normal `gm sync` before retrying publication,
+  preserving the marker in the synchronized history or making a new commit.
+  Recovery never edits the local checkout and never force-pushes.
 - **The graph** (`/tracker/:owner/timelines`, linked from Issues and Release
   notes; CORE-81) draws main down the middle and a lane per timeline, newest
   first: forks, merges between timelines, landings on main, abandoned lanes

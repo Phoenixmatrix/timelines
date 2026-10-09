@@ -39,6 +39,7 @@ import { runSourceLandingE2E } from "./source-landing-e2e.ts";
 import { runSourceSyncE2E } from "./source-sync-e2e.ts";
 import { availableMemory, gib } from "./heavy.ts";
 import { expandE2EScenarios, type ScenarioName } from "./ready-e2e.ts";
+import { runSourcePushRecoveryE2E } from "./source-push-recovery-e2e.ts";
 
 type Evidence = {
   scenario: string;
@@ -5054,6 +5055,9 @@ export async function runE2E(
   );
   await scenario("source-multi-repository-landing-and-durable-recovery", () =>
     runSourceLandingE2E(ctx, fixtures, gm, record),
+  );
+  await scenario("source-push-recovery-fences-late-writes", () =>
+    runSourcePushRecoveryE2E(ctx, fixtures, gm, record),
   );
   await scenario("source-late-sync-lineage-conflicts-guard-and-expiry", () =>
     runSourceSyncE2E(ctx, fixtures, gm, record),

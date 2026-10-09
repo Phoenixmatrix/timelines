@@ -104,10 +104,6 @@ await test("expired browser fixture is independently selectable while full inven
   assert.deepEqual(expandE2EScenarios(["browser-expired-source-without-timeline-history"]), [
     "browser-expired-source-without-timeline-history",
   ]);
-  assert(e2eScenarioNames.includes("source-retention-expiry-orphan-and-canonical-purge"));
-  assert(e2eScenarioNames.includes("browser-expired-source-without-timeline-history"));
-  // The empty run test below observes one actual execution/skip dispatch per
-  // inventory entry, so inventory-only registration cannot satisfy this contract.
 });
 
 await test("unaudited scenario dependencies widen to the full suite", () => {

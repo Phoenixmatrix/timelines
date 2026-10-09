@@ -4186,6 +4186,76 @@
       "usage": "gm timeline migrate [OPTIONS] [SLUG]"
     },
     {
+      "arguments": [
+        {
+          "description": "Exact operation ID; omit to list pending operations",
+          "flag": false,
+          "multiple": false,
+          "name": "operation",
+          "required": false
+        }
+      ],
+      "command": "gm timeline pushes",
+      "examples": [
+        "gm timeline pushes",
+        "gm timeline pushes OPERATION --timeline search-v2 --repo orbit/engine"
+      ],
+      "mutates": false,
+      "options": [
+        {
+          "description": "Timeline slug (default: this checkout's binding)",
+          "flag": false,
+          "multiple": false,
+          "name": "--timeline",
+          "required": false
+        },
+        {
+          "description": "Canonical repository owner/name (default: this checkout's origin)",
+          "flag": false,
+          "multiple": false,
+          "name": "--repo",
+          "required": false
+        }
+      ],
+      "summary": "List pending source pushes, or inspect one exact operation (including terminal outcomes)",
+      "usage": "gm timeline pushes [OPTIONS] [OPERATION]"
+    },
+    {
+      "arguments": [
+        {
+          "description": "Exact operation ID from `gm timeline pushes`; retries are idempotent",
+          "flag": false,
+          "multiple": false,
+          "name": "operation",
+          "required": true
+        }
+      ],
+      "command": "gm timeline recover-push",
+      "examples": [
+        "gm timeline recover-push OPERATION",
+        "gm timeline recover-push OPERATION --timeline search-v2 --repo orbit/engine"
+      ],
+      "mutates": true,
+      "options": [
+        {
+          "description": "Timeline slug (default: this checkout's binding)",
+          "flag": false,
+          "multiple": false,
+          "name": "--timeline",
+          "required": false
+        },
+        {
+          "description": "Canonical repository owner/name (default: this checkout's origin)",
+          "flag": false,
+          "multiple": false,
+          "name": "--repo",
+          "required": false
+        }
+      ],
+      "summary": "Recover one interrupted source push without changing this checkout; never force-push",
+      "usage": "gm timeline recover-push [OPTIONS] <OPERATION>"
+    },
+    {
       "arguments": [],
       "command": "gm context sync",
       "examples": [

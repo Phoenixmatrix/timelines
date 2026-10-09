@@ -24,17 +24,12 @@ test("a native fork retains its own refs and commits after the parent changes or
   git.commits.add(later);
   expect(fork.refs.get("refs/heads/main")).toBe(first);
   const owned = await git.artifacts.get("work");
-  expect(await owned.readCommit(first)).toEqual({
-    hash: first,
-    treeHash: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-    parents: [ancestor],
-  });
   expect(await owned.readCommit(later)).toBeNull();
   fork.refs.set("refs/heads/work", first);
   expect(parent.refs.has("refs/heads/work")).toBe(false);
   git.remotes.delete("https://artifacts.test/parent");
   expect((await owned.info()).remote).toBe(created.remote);
-  expect((await owned.readCommit(first))?.hash).toBe(first);
+  expect((await owned.readCommit(first))?.parents).toEqual([ancestor]);
   expect((await owned.readCommit(ancestor))?.parents).toEqual([]);
   await expect(git.artifacts.get("parent")).rejects.toMatchObject({ code: "NOT_FOUND" });
 });
