@@ -630,7 +630,6 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
       if (!(await stillOnMain(deps, r, intent.canonical_commit, seen))) return landing;
       await recordIntegrated(ctx.env, landing, pending);
       deps.mainMoved(r, actorOf(landing));
-      await landingFixtureBarrier(ctx.env, landing, "after-receipt", pending.id);
       return save(ctx, landing, withRepo(landing, pending.id, { state: "advanced", reason: null }));
     }
     if (intent.status !== "intent")
@@ -749,7 +748,6 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
         if (!(await stillOnMain(deps, r, repo.merge!, current))) return landing;
         await recordIntegrated(ctx.env, landing, repo);
         deps.mainMoved(r, actorOf(landing));
-        await landingFixtureBarrier(ctx.env, landing, "after-receipt", repo.id);
         return save(ctx, landing, withRepo(landing, repo.id, { state: "advanced", reason: null }));
       }
       const rejected = await recordCasOutcome(ctx, operationId, "rejected");
@@ -766,7 +764,6 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
     if (!(await stillOnMain(deps, r, repo.merge!, repo.merge!))) return landing;
     await recordIntegrated(ctx.env, landing, repo);
     deps.mainMoved(r, actorOf(landing));
-    await landingFixtureBarrier(ctx.env, landing, "after-receipt", repo.id);
     return save(ctx, landing, withRepo(landing, repo.id, { state: "advanced", reason: null }));
   }
 

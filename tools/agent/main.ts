@@ -30,6 +30,8 @@ import { runE2E } from "./e2e.ts";
 import { runProviderE2E, type AiRun } from "./provider-e2e.ts";
 import { ATLAS_PROVIDER_CONFIG } from "./atlas-provider-e2e.ts";
 import { heavyLock } from "./heavy.ts";
+import { parseReadyOptions, readinessPlan, type ReadyOptions } from "./ready-plan.ts";
+import { selectReadyE2E, type ReadyE2ESelection } from "./ready-e2e.ts";
 import {
   AI_STAGES,
   appendHistory,
@@ -61,7 +63,9 @@ const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
   vp run agent gm -- <args>       Use this worktree's binary, server, credentials and replica
   vp run agent exec -- <command>  Run another tool with isolated Git/XDG/GM settings
   vp run agent inspect [db|registry] [SQL]  Read local data; defaults to table inventory
-  vp run agent check              Uncached quality gates plus fresh non-AI CLI/API/browser/mirror E2E
+  vp run agent check [--all] [--dry-run] [--base <ref>]
+                                  Change-aware uncached readiness (also vp run ready); --all runs every gate
+                                  and non-AI E2E, --dry-run explains selection without running or provisioning
   vp run agent test               Fresh non-AI E2E; no AI resources or inference
   vp run agent test-ai [--stage <id>[,<id>]] [--all] [--resume] [--force] [--dry-run] [--base <ref>]
                                   Paid real-provider verification of the stages your changes (against
@@ -377,7 +381,11 @@ async function selectAiStages(options: TestAiOptions): Promise<Selection | null>
   return selection;
 }
 
-async function liveTest(ai = false, options?: TestAiOptions): Promise<void> {
+async function liveTest(
+  ai = false,
+  options?: TestAiOptions,
+  readyE2E?: ReadyE2ESelection,
+): Promise<void> {
   let run: AiRun | undefined;
   if (ai) {
     const selection = await selectAiStages(options ?? parseTestAiOptions([]));
@@ -427,7 +435,10 @@ async function liveTest(ai = false, options?: TestAiOptions): Promise<void> {
       const results = await Promise.allSettled(
         ai
           ? [runProviderE2E(ctx, fixtures, "ai", run)]
-          : [runE2E(ctx, fixtures), runProviderE2E(ctx, fixtures, "mirror")],
+          : [
+              runE2E(ctx, fixtures, readyE2E?.scenarios ?? undefined),
+              ...(readyE2E?.mirror === false ? [] : [runProviderE2E(ctx, fixtures, "mirror")]),
+            ],
       );
       const errors = results.flatMap((result) =>
         result.status === "rejected" ? [result.reason] : [],
@@ -463,6 +474,7 @@ async function liveTest(ai = false, options?: TestAiOptions): Promise<void> {
       elapsedMs: Date.now() - started,
       cleanup: env?.status ?? "provision-not-completed",
       resources: env ? Object.keys(env.resources).filter((name) => ai || name === "artifacts") : [],
+      ...(!ai ? { scenarios: readyE2E?.scenarios ?? "all", mirror: readyE2E?.mirror ?? true } : {}),
       failedStages: timings
         .filter((stage) => stage.outcome === "failed")
         .map((stage) => stage.stage),
@@ -530,31 +542,33 @@ async function retainReports(artifacts: string): Promise<void> {
   }
 }
 
-async function gates(): Promise<void> {
+async function gates(options: ReadyOptions): Promise<void> {
+  const plan = await readinessPlan(root, options);
+  const e2e = plan.e2e ? selectReadyE2E(plan.changed, plan.full) : null;
+  const selection = { ...plan, e2e };
+  console.log(JSON.stringify({ event: "ready.selection", ...selection }, null, 2));
+  if (options.dryRun) return;
   const directory = join(root, ".gitmatrix-agent", "artifacts", `gates-${Date.now()}`);
-  const steps: [string, string, string[]][] = [
-    ["bindings", "cf", ["workers", "types"]],
-    ["check", "vp", ["check"]],
-    ["cli-check", "vp", ["run", "--no-cache", "cli#check"]],
-    ["types", "vp", ["run", "--no-cache", "@gitmatrix/agent#typecheck"]],
-    ["preview-types", "vp", ["run", "--no-cache", "@gitmatrix/preview#typecheck"]],
-    ["website-types", "vp", ["run", "--no-cache", "website#typecheck"]],
-    ["tests", "vp", ["run", "-r", "--concurrency-limit", "1", "--no-cache", "test"]],
-    ["build", "vp", ["run", "-r", "--concurrency-limit", "1", "--no-cache", "build"]],
-  ];
-  for (const [name, binary, commandArgs] of steps) {
+  await privateJson(join(directory, "selection.json"), selection);
+  for (const { name, binary, args: commandArgs, cwd } of plan.gates) {
     console.log(JSON.stringify({ event: "gate.start", name }));
-    await command(binary, commandArgs, {
-      cwd: name === "bindings" ? website : root,
-      timeout: 1_800_000,
-      log: join(directory, `${name}.log`),
-    });
+    const run = () =>
+      command(binary, commandArgs, {
+        cwd: cwd === "website" ? website : root,
+        timeout: 1_800_000,
+        log: join(directory, `${name}.log`),
+      });
+    // Admission can wait longer than a gate may execute. Nested test runners
+    // inherit the held-lock marker rather than reacquiring inside their deadline.
+    if (name === "tests" || name === "website-tests") await heavyLock(name, run);
+    else await run();
     console.log(JSON.stringify({ event: "gate.pass", name }));
   }
-  await heavyLock("live E2E", () => liveTest());
+  if (e2e) await heavyLock("live E2E", () => liveTest(false, undefined, e2e));
   await privateJson(join(directory, "completion.json"), {
     success: true,
-    gates: steps.map(([name]) => name),
+    gates: plan.gates.map(({ name }) => name),
+    e2e,
     completed: new Date().toISOString(),
   });
 }
@@ -601,7 +615,7 @@ try {
   } else if (operation === "test") await heavyLock("live E2E", () => liveTest());
   else if (operation === "test-ai")
     await heavyLock("live AI E2E", () => liveTest(true, parseTestAiOptions(args)));
-  else if (operation === "check") await gates();
+  else if (operation === "check") await gates(parseReadyOptions(args));
   else {
     const env = await loadEnvironment(root);
     const ctx = await context(env);

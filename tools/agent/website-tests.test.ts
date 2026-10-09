@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { heavyLock, parseMemAvailable, withFileLock } from "./heavy.ts";
+import { parseMemAvailable, withFileLock } from "./heavy.ts";
 import { abandoned, type JsonReport } from "./website-tests.ts";
 
 // The tail of a real run whose Chromium was killed under memory pressure (CORE-306).
@@ -148,11 +149,33 @@ await test("a held file lock makes the next holder wait, and is told so", async 
 });
 
 await test("without flock the heavy lock runs the work unlocked, as in a container", async () => {
-  const path = process.env.PATH;
-  process.env.PATH = "/nonexistent";
+  const directory = await mkdtemp(join(tmpdir(), "heavy-unlocked-"));
+  const resultPath = join(directory, "executed");
   try {
-    assert.equal(await heavyLock("test", async () => "ran"), "ran");
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import { writeFile } from "node:fs/promises";
+         import { heavyLock } from ${JSON.stringify(new URL("./heavy.ts", import.meta.url).href)};
+         await heavyLock("test", () => writeFile(${JSON.stringify(resultPath)}, "ran"));`,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: directory,
+          USERPROFILE: directory,
+          PATH: "/nonexistent",
+          GITMATRIX_HEAVY_LOCK_HELD: "",
+        },
+        encoding: "utf8",
+        timeout: 10_000,
+      },
+    );
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(await readFile(resultPath, "utf8"), "ran");
   } finally {
-    process.env.PATH = path;
+    await rm(directory, { recursive: true, force: true });
   }
 });

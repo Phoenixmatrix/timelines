@@ -4,13 +4,15 @@ import { fail, readJson } from "./http.ts";
 import { trackerObject } from "../tracker/stub.ts";
 import { selectRepos } from "../db.ts";
 import { LANDING_FIXTURE_POINTS, landingFixtureEnabled } from "../timelines/landing-fixture.ts";
+import { LANDING_ACTIVE } from "../../shared/timelines.ts";
+import { settled, progress } from "../timelines/landing.ts";
 
 /** Mounted ONLY behind /api/dev's named-agent secret allowlist. */
 export async function landingFixtures(c: Context<AppEnv>) {
   if (!landingFixtureEnabled(c.env)) return fail(c, 404, "Not found.");
   const input = await readJson<{
     slug: string;
-    action: "arm" | "inspect" | "release" | "delete";
+    action: "arm" | "inspect" | "tick" | "release" | "delete";
     point?: string;
     repoId?: string;
   }>(c);
@@ -18,7 +20,7 @@ export async function landingFixtures(c: Context<AppEnv>) {
     typeof input.slug !== "string" ||
     typeof input.action !== "string" ||
     !/^source-landing-[a-f0-9]{8}-[a-z-]+$/.test(input.slug) ||
-    !["arm", "inspect", "release", "delete"].includes(input.action)
+    !["arm", "inspect", "tick", "release", "delete"].includes(input.action)
   )
     return fail(c, 400, "Invalid landing fixture.");
   const detail = await trackerObject(c.env, "acc_orbit").timeline(input.slug, 0, 1);
@@ -67,6 +69,12 @@ export async function landingFixtures(c: Context<AppEnv>) {
     .first();
   // Ledger identities come from the real Tracker landing, never supplied fixture successes.
   const current = await trackerObject(c.env, "acc_orbit").landing(timeline.slug);
+  const landing = current.ok ? current.value : null;
+  if (input.action === "tick" && landing && LANDING_ACTIVE.includes(landing.state)) {
+    // Local development has no hourly cron. Drive the real recovery state
+    // machine without restarting failed gates or manufacturing receipts.
+    await settled(c.env, (deps) => progress(c.env, deps, "acc_orbit", landing));
+  }
   const ledger =
     current.ok && current.value
       ? await c.env.DB.prepare(
