@@ -83,6 +83,29 @@ export async function publish({
   }
   if (!missing.length) return;
 
+  // CI explicitly opts into package installation; standalone callers keep using
+  // their preinstalled cross toolchain. Never provision for native-only releases.
+  if (
+    sourceEnv.GITMATRIX_CLI_PROVISION_ARM64 === "1" &&
+    platform === "linux" &&
+    arch === "x64" &&
+    missing.some((release) => release.target === "aarch64-unknown-linux-gnu")
+  ) {
+    run("apt-get", ["update"], env);
+    run(
+      "apt-get",
+      [
+        "install",
+        "-y",
+        "--no-install-recommends",
+        "gcc-aarch64-linux-gnu",
+        "libc6-dev-arm64-cross",
+      ],
+      env,
+    );
+    run("rustup", ["target", "add", "aarch64-unknown-linux-gnu"], env);
+  }
+
   // Always use a host executable to upload, including when only ARM64 is missing.
   run("cargo", ["build", "--locked", "--release", "--manifest-path", "apps/cli/Cargo.toml"], env);
   const output = sourceEnv.CARGO_TARGET_DIR ?? "apps/cli/target";

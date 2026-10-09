@@ -65,6 +65,8 @@ export interface JobSpec {
   on?: JobTrigger[] | null;
   /** A step job `gm test` also runs on the developer's machine. */
   local?: boolean;
+  /** Explicit promise: side-effect-free verification independent of run/checkout context. */
+  verification?: "context-invariant-v1" | null;
 }
 
 /** What a job can list in its own `on:`. */
@@ -231,6 +233,8 @@ export function parsePipeline(source: string): Pipeline {
       throw new ConfigError(`jobs.${name}.local must be true or false.`);
     if (job.local && !jobOn?.includes("step"))
       throw new ConfigError(`jobs.${name}.local is for step jobs (on: step).`);
+    if (job.verification !== undefined && job.verification !== "context-invariant-v1")
+      throw new ConfigError(`jobs.${name}.verification must be context-invariant-v1.`);
     return {
       name,
       needs: stringList(job.needs, `jobs.${name}.needs`),
@@ -245,6 +249,7 @@ export function parsePipeline(source: string): Pipeline {
       paths,
       on: jobOn,
       local: job.local === true,
+      verification: job.verification === "context-invariant-v1" ? job.verification : null,
     };
   });
 

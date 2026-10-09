@@ -1136,6 +1136,26 @@ not numbers in progress counters or repository URLs. An interrupted pack transfe
 | Packages    | `pkg list/show/versions`, `pkg delete/yank/restore/deprecate/tag`, `pkg sources/grant/revoke`, `pkg published`, `pkg upload`, `pkg setup` |
 | Discovery   | `cli search`, `cli guide`, `cli commands`, `schema`                                                                                       |
 
+## CI results and candidate verification
+
+Use `gm runs show <number>` to inspect a run and `gm runs wait` to wait for the
+commit's complete run; `gm runs logs <number> --job <name>` reads actual job output.
+An explicitly opted-in `verification: context-invariant-v1` gate can be satisfied
+by a successful sandbox job for the same canonical repository, candidate commit,
+queue attempt, specification and current known image digest/Worker version.
+This is an author assertion of context independence, not automatic matching-OID
+caching. Local runners, secrets, custom images and concurrency-controlled jobs do
+not qualify; failed or unknown verification falls back to execution.
+
+`show` and `wait` distinguish **Verified (not executed)** from normal **Skipped**.
+JSON preserves the public `skipped` status plus `verifiedBy` provenance, linking
+the producer run/job, candidate commit and queue attempt. Proposed proofs are not
+public verification until runtime consumption revalidates them and dependencies
+permit the gate. No consumer logs or execution duration are invented: read the
+producer's output instead. Independent main jobs and deploy remain, dependencies
+still gate execution, and `wait` reports the actual whole-run result.
+See the [CI/CD contract](../website/README.md#candidate-verification-reuse).
+
 ## Local CI storage
 
 `gm runner` uses `--workdir`, or `$XDG_CACHE_HOME/gitmatrix/runner` (falling back
@@ -1287,12 +1307,16 @@ source (`git rev-parse HEAD:apps/cli`, `Cargo.lock` included). The same source
 always has the same version, so unrelated pushes and reruns reuse the existing
 artifact, and finding it needs only the checked-out commit, not history. Each
 publish records the commit and CI run it came from. Publication runs in the
-`deploy` job on `main`, after check, test and build pass; it asks the registry
-first for each platform and builds only when an artifact is missing. The x86-64
-CI host publishes `linux-x86_64/gm` and cross-compiles `linux-aarch64/gm` with
-`aarch64-unknown-linux-gnu` and Debian Bookworm's ARM64 GNU toolchain. Both builds
-finish before uploads start; reruns fill missing artifacts without replacing
-ones already published. The native binary uploads both architectures.
+`deploy` job on `main`, after its required gates pass; deploy is not verification
+reuse. Authoritative registry HEAD requests check each platform first, and builds
+run only for missing artifacts. The x86-64 CI host publishes `linux-x86_64/gm` and
+cross-compiles `linux-aarch64/gm` with `aarch64-unknown-linux-gnu` and Debian
+Bookworm's ARM64 GNU toolchain. `GITMATRIX_CLI_PROVISION_ARM64=1` explicitly opts
+into provisioning that toolchain, only after the HEAD results establish that ARM64
+is missing. Complete releases and native-only gaps skip ARM tool setup; failed
+registry checks are not treated as absence. All required builds finish before any
+upload starts; reruns fill missing artifacts without replacing published ones.
+The native binary uploads both architectures.
 
 On a Raspberry Pi running 64-bit Raspberry Pi OS Bookworm or newer, use
 `gm pkg install gm --owner matrixorg` (add `--force` to update). It automatically

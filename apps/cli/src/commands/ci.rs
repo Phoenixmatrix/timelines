@@ -11,6 +11,7 @@ use crate::repo::{Workspace, revset};
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -55,6 +56,7 @@ fn icon(status: &str) -> &'static str {
         "failed" => "✗",
         "cancelled" => "⊘",
         "skipped" => "-",
+        "verified" => "=",
         "running" => "●",
         _ => "○",
     }
@@ -72,7 +74,15 @@ fn run_line(run: &Value) -> String {
     )
 }
 
-fn detail_text(run: &Value) -> String {
+fn job_status(job: &Value) -> &str {
+    if s(job, "status") == "skipped" && job["verifiedBy"].is_object() {
+        "verified"
+    } else {
+        s(job, "status")
+    }
+}
+
+fn detail_text(run: &Value, repo: &str) -> String {
     let mut out = format!(
         "Run #{} {} — {} on {} ({})\n{}\n",
         run["number"],
@@ -86,6 +96,22 @@ fn detail_text(run: &Value) -> String {
         out.push_str(&format!("\nConfiguration error: {error}\n"));
     }
     for job in run["jobs"].as_array().into_iter().flatten() {
+        if job_status(job) == "verified" {
+            let evidence = &job["verifiedBy"];
+            let _ = writeln!(
+                out,
+                "\n= {} (verified; not executed)\n    Producer: run #{} ({}) / job {}\n    Commit: {}\n    Queue: {} / attempt {}\n    Inspect: gm runs show {} -R {repo}",
+                s(job, "name"),
+                evidence["runNumber"],
+                s(evidence, "runId"),
+                s(evidence, "jobId"),
+                s(evidence, "commit"),
+                s(evidence, "queueId"),
+                evidence["attempt"],
+                evidence["runNumber"],
+            );
+            continue;
+        }
         out.push_str(&format!(
             "\n{} {} ({}{})\n",
             icon(s(job, "status")),
@@ -182,7 +208,7 @@ pub fn runs(ctx: &Ctx, command: &RunsCommand) -> Result<Shown> {
             let number = number_or_latest(&config, &repo, *number)?;
             let run = run_detail(&config, &repo, number)?;
             Ok(Shown {
-                text: detail_text(&run),
+                text: detail_text(&run, &repo),
                 value: run,
             })
         }
@@ -523,7 +549,7 @@ fn wait(
         }
         if progress {
             for job in run["jobs"].as_array().into_iter().flatten() {
-                let (name, status) = (s(job, "name").to_string(), s(job, "status").to_string());
+                let (name, status) = (s(job, "name").to_string(), job_status(job).to_string());
                 if seen.get(&name) != Some(&status) {
                     eprintln!("{} #{number} {name}: {status}", icon(&status));
                     seen.insert(name, status);
@@ -534,7 +560,7 @@ fn wait(
         if TERMINAL.contains(&status.as_str()) {
             if status == "succeeded" {
                 return Ok(Shown {
-                    text: detail_text(&run),
+                    text: detail_text(&run, repo),
                     value: run,
                 });
             }
@@ -1560,6 +1586,75 @@ mod tests {
     }
 
     #[test]
+    fn verified_jobs_expose_producer_evidence_without_execution() {
+        let evidence = json!({
+            "runId": "producer-run", "runNumber": 42, "jobId": "producer-job",
+            "queueId": "producer-queue", "attempt": 3,
+            "commit": "fedcba98765432100123456789abcdef01234567",
+            "sourceId": "canonical", "contract": "context-invariant-v1",
+            "executionIdentity": "sha256:producer-identity"
+        });
+        let run = json!({
+            "number": 43, "status": "succeeded", "trigger": "push", "ref": "main",
+            "commit": "0123456789abcdef", "title": "Reused evidence",
+            "jobs": [{
+                "name": "build", "status": "skipped", "verifiedBy": evidence,
+                "claimedBy": null, "startedAt": null, "exitCode": null,
+                "steps": [{"name": "compile", "status": "skipped", "exitCode": null}]
+            }]
+        });
+        let job = &run["jobs"][0];
+        assert_eq!(super::job_status(job), "verified");
+        let text = detail_text(&run, "owner/repo");
+        assert!(text.contains("(verified;"));
+        for field in ["runId", "jobId", "commit", "queueId"] {
+            assert!(text.contains(evidence[field].as_str().unwrap()));
+        }
+        assert!(text.contains(&format!("#{}", evidence["runNumber"])));
+        assert!(text.contains(&format!("attempt {}", evidence["attempt"])));
+        assert!(text.contains("owner/repo"));
+        assert!(!text.contains("compile"));
+        assert!(!text.contains("exit"));
+        assert!(!text.contains("succeeded)"));
+        let shown = super::Shown { value: run, text };
+        let serialized = serde_json::to_value(&shown).unwrap();
+        assert_eq!(serialized, shown.value);
+        assert_eq!(serialized["jobs"][0]["verifiedBy"], evidence);
+        assert_eq!(serialized["jobs"][0]["status"], "skipped");
+        assert!(serialized["jobs"][0]["startedAt"].is_null());
+        assert!(serialized["jobs"][0]["exitCode"].is_null());
+    }
+
+    #[test]
+    fn ordinary_job_statuses_are_not_verification_evidence() {
+        for status in [
+            "skipped",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "running",
+            "queued",
+        ] {
+            let mut job = json!({
+                "name": "ordinary-job", "status": status,
+                "steps": [{"name": "ordinary-step", "status": status, "exitCode": null}]
+            });
+            assert_eq!(super::job_status(&job), status);
+            let before = detail_text(&json!({"jobs": [&job]}), "owner/repo");
+            assert!(before.contains(&format!("({status})")));
+            assert!(before.contains("ordinary-step"));
+            job["verifiedBy"] = serde_json::Value::Null;
+            assert_eq!(super::job_status(&job), status);
+            assert_eq!(detail_text(&json!({"jobs": [&job]}), "owner/repo"), before);
+            job["error"] = json!("verified by producer-run");
+            assert_eq!(super::job_status(&job), status);
+            let text = detail_text(&json!({"jobs": [&job]}), "owner/repo");
+            assert!(text.contains(&format!("({status})")));
+            assert!(text.contains("ordinary-step"));
+        }
+    }
+
+    #[test]
     fn run_detail_says_when_retention_removed_a_log() {
         let run = json!({
             "number": 7, "status": "succeeded", "trigger": "push", "ref": "main",
@@ -1569,7 +1664,7 @@ mod tests {
                 {"name": "test", "status": "succeeded", "logsRemovedAt": null, "steps": []}
             ]
         });
-        let text = detail_text(&run);
+        let text = detail_text(&run, "owner/repo");
         assert!(text.contains("build (succeeded)\n    Logs removed by retention on 2026-10-01.\n"));
         assert_eq!(text.matches("removed by retention").count(), 1);
     }

@@ -15,6 +15,7 @@ export async function landingFixtures(c: Context<AppEnv>) {
     action: "arm" | "inspect" | "tick" | "release" | "delete";
     point?: string;
     repoId?: string;
+    diagnostics?: boolean;
   }>(c);
   if (
     typeof input.slug !== "string" ||
@@ -83,5 +84,31 @@ export async function landingFixtures(c: Context<AppEnv>) {
           .bind(current.value.id)
           .all()
       : { results: [] };
+  if (input.action === "inspect" && input.diagnostics === true && landing) {
+    const runs = await c.env.DB.prepare(
+      "SELECT id,status,config_error,started_at,finished_at FROM ci_runs WHERE landing_id=?",
+    )
+      .bind(landing.id)
+      .all<{ id: string }>();
+    const jobs = await c.env.DB.prepare(
+      "SELECT id,run_id,name,status,error,exit_code,claimed_by,source_completion_pending FROM ci_jobs WHERE run_id IN (SELECT id FROM ci_runs WHERE landing_id=?)",
+    )
+      .bind(landing.id)
+      .all();
+    const workflows = await Promise.all(
+      runs.results.map(async ({ id }) => {
+        try {
+          return { id, ...(await (await c.env.CI_RUN.get(id)).status()) };
+        } catch (error) {
+          return { id, error: String(error) };
+        }
+      }),
+    );
+    return c.json({
+      barrier,
+      receipts: ledger.results,
+      ci: { runs: runs.results, jobs: jobs.results, workflows },
+    });
+  }
   return c.json({ barrier, receipts: ledger.results });
 }

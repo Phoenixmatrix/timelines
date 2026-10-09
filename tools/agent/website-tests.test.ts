@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { parseMemAvailable, withFileLock } from "./heavy.ts";
-import { abandoned, type JsonReport } from "./website-tests.ts";
+import { abandoned, selectedBrowserFiles, type JsonReport } from "./website-tests.ts";
 
 // The tail of a real run whose Chromium was killed under memory pressure (CORE-306).
 const crashed = `
@@ -105,6 +105,56 @@ Error: The chromium page crashed while running tests. This can happen if the bro
 
 await test("with no report, a crash reruns every browser file", () => {
   assert.deepEqual(abandoned(null, crashed, files), files);
+});
+
+await test("explicit browser project inventory preserves crash recovery without outside files", () => {
+  for (const filters of [[], ["--project", "browser"], ["--project=browser"]]) {
+    const selected = selectedBrowserFiles(filters, files);
+    assert.deepEqual(selected, files);
+    const report = { testResults: [passed(files[0]), passed("/w/worker/unit.test.ts")] };
+    assert.deepEqual(abandoned(report, crashed, selected!), files.slice(1));
+    assert.deepEqual(abandoned(null, crashed, selected!), files);
+  }
+});
+
+await test("unknown and arbitrary filters are not broadened by crash recovery", () => {
+  for (const filters of [
+    ["--project", "unit"],
+    ["--project", "browser", "src/a"],
+    ["--project=browser", "--testNamePattern", "one assertion"],
+    ["--project", "*"],
+    ["--project", "browser", "--exclude", "src/b.browser.test.tsx"],
+    ["src/a.browser.test.tsx"],
+    ["--shard", "1/2"],
+    ["--changed"],
+  ])
+    assert.equal(selectedBrowserFiles(filters, files), null, filters.join(" "));
+});
+
+await test("browser selection does not retry assertions alongside a crash message", () => {
+  for (const failureMessages of [
+    ["AssertionError: expected 1 to be 2"],
+    ["Target crashed", "AssertionError: expected 1 to be 2"],
+    [],
+  ]) {
+    const selected = selectedBrowserFiles(["--project", "browser"], files)!;
+    assert.equal(
+      abandoned(
+        {
+          testResults: [
+            {
+              name: files[0],
+              status: "failed",
+              assertionResults: [{ status: "failed", failureMessages }],
+            },
+          ],
+        },
+        crashed,
+        selected,
+      ),
+      null,
+    );
+  }
 });
 
 await test("available memory is read from MemAvailable", () => {

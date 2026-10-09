@@ -53,6 +53,7 @@ export const e2eScenarioNames = [
   "source-late-sync-lineage-conflicts-guard-and-expiry",
   "source-finite-legacy-migration-and-partial-revert",
   "source-retention-expiry-orphan-and-canonical-purge",
+  "browser-expired-source-without-timeline-history",
   "browser-chronicle-scrub-range-span-and-links",
 ] as const;
 
@@ -87,8 +88,8 @@ const prerequisites: Partial<Record<ScenarioName, readonly ScenarioName[]>> = {
   ],
   "browser-atlas-smoke": [],
   "browser-timeline-scope-round-trip": [],
-  // The expired-source browser page is embedded in this independently seeded journey.
   "source-retention-expiry-orphan-and-canonical-purge": [],
+  "browser-expired-source-without-timeline-history": [],
   // Chronicle seeds its own history but links to an existing pushed CI commit.
   "browser-chronicle-scrub-range-span-and-links": ["ci-push-triggered-local-dag-and-provenance"],
 };
@@ -103,9 +104,24 @@ const browserScenarios: readonly ScenarioName[] = [
   "browser-personas-persisted-product-state",
   "browser-atlas-smoke",
   "browser-timeline-scope-round-trip",
-  "source-retention-expiry-orphan-and-canonical-purge",
+  "browser-expired-source-without-timeline-history",
   "browser-chronicle-scrub-range-span-and-links",
 ];
+
+// Audited route-module witnesses, not a dependency graph or a CSS ownership map.
+// appRoutes mounts both account/site exports from each module. Usage's journey
+// covers settings navigation, denied access and site→account; retention's journey
+// also traverses UsageCosts before its settings link and category deep link.
+// DataRetention's account/site, denial and cleanup links are all in that journey.
+// Only appRoutes imports these modules. Their shared imports (SettingsPage, ui,
+// API/session, report/retention views), palette, router and assets stay broad.
+const routeScenarios: Readonly<Record<string, readonly ScenarioName[]>> = {
+  "apps/website/src/routes/UsageCosts.tsx": [
+    "browser-usage-and-costs-account-and-site",
+    "browser-data-retention-account-and-site",
+  ],
+  "apps/website/src/routes/DataRetention.tsx": ["browser-data-retention-account-and-site"],
+};
 
 /** Validate before any E2E side effects; add prerequisites in suite execution order. */
 export function expandE2EScenarios(selected: readonly string[]): ScenarioName[] {
@@ -134,7 +150,7 @@ export function selectReadyE2E(changed: readonly string[], full: boolean): Ready
   const selected: string[] = [];
   for (const path of changed) {
     if (/^apps\/website\/(src|public)\//.test(path)) {
-      selected.push(...browserScenarios);
+      selected.push(...(routeScenarios[path] ?? browserScenarios));
     } else if (
       /^(?:(?:apps\/(?:cli|website)|tools\/(?:agent|preview)|packages\/(?:formats|testing|utils))\/)?(?:README|CHANGELOG|CONTRIBUTING|AGENTS)\.md$/.test(
         path,

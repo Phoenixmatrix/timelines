@@ -287,9 +287,11 @@ staged, unstaged and untracked files. Renames include both old and new paths. It
 not fetch: sync the source workspace first. `--base` changes the integration baseline,
 not the requirement to verify all your unlanded work.
 
-The root formatting/lint/type-aware `vp check` always runs, generating missing Worker
-bindings first. Other uncached gates follow workspace dependencies, including the
-harness and preview tools' relative imports of website contracts:
+The root formatting/lint/type-aware `vp check` always runs. When selected checks
+consume Worker bindings, `ready` generates them once before those consumer checks,
+rather than regenerating them for each workspace. Other uncached gates follow
+workspace dependencies, including the harness and preview tools' relative imports
+of website contracts:
 
 | Change                                                                                         | Selected coverage                                                                                                             |
 | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
@@ -302,14 +304,35 @@ harness and preview tools' relative imports of website contracts:
 | Known root/workspace README, AGENTS, CONTRIBUTING or CHANGELOG                                 | Root check only; Markdown runtime assets are not exempt                                                                       |
 | Global/task/dependency configuration, shared harness, unknown paths or failed change discovery | Full suite                                                                                                                    |
 
+Content-only edits to the three audited stylesheets
+`apps/website/src/styles/{app,tokens,matrixkit}.css` preserve all website unit and
+browser tests, the website build and selected live E2E. They omit only the implicit
+agent/preview TypeScript consumer checks. Changed imports, URLs or at-rules,
+renames, and mixed or unknown changes widen coverage instead of taking that shortcut.
+
+Route-only changes to `UsageCosts.tsx` select both the usage and retention browser
+journeys; `DataRetention.tsx` selects retention. Global styles and shared UI,
+navigation, API/session and routing changes keep broad browser coverage. Frontend
+profiles use the focused real expired-source journey instead of the full backend
+retention matrix: it expires and purges real source data, removes timeline history,
+and checks the explicit expired-source browser state. Full profiles keep both
+journeys.
+
 Unchanged workspaces are skipped, not reported as tested. The selection and its
 reasons print before execution and are saved as `selection.json` beside the gate
 logs under `.gitmatrix-agent/artifacts/gates-<timestamp>/`. `--all` restores complete
 workspace checks, tests/builds and all non-AI CLI/API/browser/mirror E2E.
+Gate `completion.json` records per-gate `elapsedMs`, `wallMs` and `outcome`, plus
+total elapsed time and completion status, including failed cases. These describe
+observed execution, not an assumed speedup from parallel scheduling.
+Gate, E2E lifecycle/scenario and recovery-phase durations use the monotonic clock,
+as do landing-fixture polling deadlines: wall-clock corrections cannot shorten
+or extend those waits. Timestamps and persisted expiry times still use wall time.
 `agent check` accepts the same flags; `agent test` remains the complete live suite.
-CI/CD gates are unchanged. Update the workspace policy in `tools/agent/ready-plan.ts`
-when adding workspaces or cross-workspace imports, and the scenario inventory,
-browser coverage and prerequisite map in `ready-e2e.ts` when adding E2E journeys.
+CI/CD gate coverage is retained; candidate proof reuse requires explicit pipeline
+opt-in. Update the workspace policy in `tools/agent/ready-plan.ts` when adding
+workspaces or cross-workspace imports, and the scenario inventory, browser coverage
+and prerequisite map in `ready-e2e.ts` when adding E2E journeys.
 
 Selected test commands always execute; Cargo may reuse compiled outputs, not test
 results. Missing credentials, required provider outages or an unavailable browser
@@ -371,12 +394,19 @@ status, lifecycle timings, scenario observations, mirror/AI evidence, server log
 browser screenshots and failure traces. Failures before provisioning use
 `.gitmatrix-agent/artifacts/test-<mode>-<timestamp>/`. Treat local traces/logs as
 private even though textual bearer credentials are redacted.
+Landing-boundary failures also retain the last control response, landing state,
+CI jobs and Workflow status before cleanup in these private observations. The
+capability-scoped diagnostic reads do not retry the scenario or change its failure.
 
 Local CI runners set `GITMATRIX_CI_ARTIFACTS_DIR` to a private job-specific directory
 outside the disposable checkout and print its path in setup logs. The harness
 retains only allowlisted sanitized JSON reports there, including failures; it strips
 scenario observations and never copies credentials, raw logs or browser storage.
-`timings.json` separates preparation, provisioning, migrations, startup, seeding,
+Structured phase timings are extracted from observations: up to 11 allowlisted
+source-landing entries (fixture, nine fault cases and cleanup) retain only the
+`e2e.phase` event, sanitized name, `elapsedMs` and `outcome` fields, never the
+surrounding observations.
+E2E `timings.json` separates preparation, provisioning, migrations, startup, seeding,
 scenarios, shutdown and cleanup. Provider reports separate knowledge generation
 from search-index visibility. A failed run is a failed gate; fix the cause rather
 than skipping the scenario.
@@ -386,9 +416,11 @@ path, inspect the evidence, update affected contracts/docs, and stop or destroy
 unneeded environments. Publish source changes with ordinary `gm commit` / `gm push`
 **outside** the scoped `agent gm` wrapper, then check `gm runs wait`.
 `.gitmatrix/ci.yml` starts check, test and build independently on production's
-Cloudflare Sandbox containers; all must pass. Non-AI E2E is too expensive per push,
-so it runs only on local runners (`if: runner == "local"`): `ready` is where it gates
-your work. The jobs exchange no artifacts, so no dependency-stage barrier is needed.
+Cloudflare Sandbox containers; all must pass. Its check, test, build and CLI gates
+explicitly opt into candidate verification reuse (see the website's CI/CD guide);
+deploy remains real execution. Non-AI E2E runs only on local runners
+(`if: runner == "local"`): `ready` is where it gates your work. The jobs exchange no
+artifacts, so no dependency-stage barrier is needed.
 The canonical development server runs one CI job at a time by default;
 `GITMATRIX_CI_RUNNERS` overrides this when the server starts. Isolated agent
 environments keep two slots for their fixture jobs. No running server needs to
@@ -407,6 +439,10 @@ under 4 GiB available the browser-mode tests use one worker. If Chromium is stil
 closed"), the website's tests run the browser files it abandoned once more,
 one at a time; a failed assertion is never retried. A failed E2E scenario
 records the memory available when it failed.
+The same crash-only recovery applies when selecting the whole browser project
+(`--project browser` or `--project=browser`). Arbitrary file/test filters run
+unchanged without guessing a retry inventory; ordinary assertion failures never
+qualify for recovery.
 Locally, E2E runs on the trusted Linux host with Cloudflare login and user-systemd
 prerequisites. Local runners retain repo/job-scoped Cargo output caches outside
 checkouts; concurrent jobs lease separate slots. Tests still run every time.
@@ -605,6 +641,15 @@ The pinned Miniflare patch in `patches/` prevents a disposed registry watcher fr
 reopening after a pending file-stat failure. Without it, `cf d1 ... --local` can
 print a result and never exit. Keep the patch until an upstream version contains
 the fix; verify both successful and failing local commands terminate when upgrading.
+The patch also gives remote Artifacts calls explicit Cap'n Web session ownership:
+scalar results close their session after materialization, and repository handles
+retain it until disposal. Reopened handles own and release their replacement
+sessions. Disposing only a repository capability leaves its root WebSocket and
+keepalive timer alive; native Workers RPC cleanup does not own that custom root.
+`tools/agent/remote-proxy-lifecycle.test.ts` exercises the installed client over
+local Workerd/WebSocket transports, including retained handles, Blob materialization,
+dropped reads, create reconciliation and non-replayed writes. Keep this regression
+when upgrading or retiring the patch; no host port-limit change is required.
 The TypeScript wrapper in `tools/agent/typecheck.ts` spawns the native compiler
 because its exec-replacement launcher fails with `EBUSY` on this WSL host.
 Use `vp env doctor` when runtime/package-manager setup is suspect.

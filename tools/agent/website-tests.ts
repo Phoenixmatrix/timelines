@@ -47,7 +47,8 @@ export function abandoned(
     (file.assertionResults ?? []).some(
       (test) =>
         test.status === "failed" &&
-        !(test.failureMessages ?? []).some((message) => CRASH.test(message)),
+        (!test.failureMessages?.length ||
+          !test.failureMessages.every((message) => CRASH.test(message))),
     ),
   );
   if (failedOnItsOwn) return null;
@@ -64,6 +65,20 @@ export function abandoned(
       .map((file) => resolve(file.name)),
   );
   return browserFiles.filter((file) => !finished.has(resolve(file)));
+}
+
+/** Null means arbitrary Vitest filters: preserve them, but never guess a retry inventory. */
+export function selectedBrowserFiles(
+  filters: readonly string[],
+  inventory: string[],
+): string[] | null {
+  if (
+    !filters.length ||
+    (filters.length === 2 && filters[0] === "--project" && filters[1] === "browser") ||
+    (filters.length === 1 && filters[0] === "--project=browser")
+  )
+    return inventory;
+  return null;
 }
 
 async function vp(args: string[]): Promise<{ code: number; output: string }> {
@@ -89,6 +104,9 @@ async function main(): Promise<number> {
   const scratch = await mkdtemp(join(tmpdir(), "gitmatrix-website-tests-"));
   try {
     const reportPath = join(scratch, "report.json");
+    const inventory: string[] = [];
+    for await (const file of glob("src/**/*.browser.test.tsx")) inventory.push(resolve(file));
+    const browserFiles = selectedBrowserFiles(filters, inventory);
     log({ event: "website-tests.start", available: gib(await availableMemory()) });
     const first = await vp([
       "test",
@@ -98,13 +116,11 @@ async function main(): Promise<number> {
       `--outputFile.json=${reportPath}`,
       ...filters,
     ]);
-    // A filtered run reports as it is; only the whole suite knows what was abandoned.
-    if (first.code === 0 || filters.length) return first.code;
+    // Unknown filters still run unchanged and return their real failure.
+    if (first.code === 0 || browserFiles === null) return first.code;
     const report = await readFile(reportPath, "utf8")
       .then((text) => JSON.parse(text) as JsonReport)
       .catch(() => null);
-    const browserFiles: string[] = [];
-    for await (const file of glob("src/**/*.browser.test.tsx")) browserFiles.push(resolve(file));
     const rerun = abandoned(report, first.output, browserFiles);
     if (!rerun?.length) return first.code;
     log({

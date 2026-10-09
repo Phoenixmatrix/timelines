@@ -101,7 +101,10 @@ await test("complete releases skip every build and upload", async () => {
 await test("registry authorization and service failures never trigger publication", async () => {
   for (const status of [401, 403, 500]) {
     const { calls, options } = harness([404, status]);
-    await assert.rejects(publish(options), new RegExp(`HTTP ${status}`));
+    await assert.rejects(
+      publish({ ...options, env: { ...options.env, GITMATRIX_CLI_PROVISION_ARM64: "1" } }),
+      new RegExp(`HTTP ${status}`),
+    );
     assert.deepEqual(
       calls.map((c) => c.binary),
       ["git"],
@@ -114,6 +117,7 @@ await test("a failed ARM64 build publishes neither artifact", async () => {
   await assert.rejects(
     publish({
       ...options,
+      env: { ...options.env, GITMATRIX_CLI_PROVISION_ARM64: "1" },
       run: (binary, args, env) => {
         if (args.includes("--target")) throw new Error("cross compiler failed");
         return options.run(binary, args, env);
@@ -157,4 +161,161 @@ await test("branches do not query, build or publish releases", async () => {
   await publish({ ...options, env: { ...options.env, GITMATRIX_BRANCH: "feature" } });
   assert.deepEqual(calls, []);
   assert.deepEqual(requests, []);
+});
+
+await test("opted-in CI provisions ARM64 only for missing ARM64 artifacts before builds and uploads", async () => {
+  for (const statuses of [
+    [200, 200],
+    [404, 200],
+    [200, 404],
+    [404, 404],
+  ]) {
+    const { calls, requests, options } = harness(statuses);
+    await publish({
+      ...options,
+      env: { ...options.env, GITMATRIX_CLI_PROVISION_ARM64: "1" },
+      run: (binary, args, env) => {
+        if (binary !== "git") assert.equal(requests.length, 2);
+        return options.run(binary, args, env);
+      },
+    });
+    const armMissing = statuses[1] === 404;
+    const nativeMissing = statuses[0] === 404;
+    const setups = calls.filter((call) => call.binary === "apt-get" || call.binary === "rustup");
+    assert.deepEqual(
+      setups.map(({ binary, args }) => [binary, ...args]),
+      armMissing
+        ? [
+            ["apt-get", "update"],
+            [
+              "apt-get",
+              "install",
+              "-y",
+              "--no-install-recommends",
+              "gcc-aarch64-linux-gnu",
+              "libc6-dev-arm64-cross",
+            ],
+            ["rustup", "target", "add", "aarch64-unknown-linux-gnu"],
+          ]
+        : [],
+    );
+    const gm = "/tmp/cli-release-cache/release/gm";
+    assert.deepEqual(
+      calls.map((call) => call.binary),
+      [
+        "git",
+        ...(armMissing ? ["apt-get", "apt-get", "rustup"] : []),
+        ...(nativeMissing || armMissing ? ["cargo"] : []),
+        ...(armMissing ? ["cargo"] : []),
+        ...(nativeMissing ? [gm] : []),
+        ...(armMissing ? [gm] : []),
+      ],
+    );
+    const uploads = calls.filter((call) => call.args[0] === "pkg");
+    assert.deepEqual(
+      uploads.map((call) => call.args[3]),
+      [
+        ...(nativeMissing ? [`gm/${version}/linux-x86_64/gm`] : []),
+        ...(armMissing ? [`gm/${version}/linux-aarch64/gm`] : []),
+      ],
+    );
+    if (armMissing) {
+      const builds = calls.filter((call) => call.binary === "cargo");
+      assert.equal(builds[0]!.args.includes("--target"), false);
+      assert.deepEqual(builds[1]!.args.slice(-2), ["--target", "aarch64-unknown-linux-gnu"]);
+      assert.equal(
+        uploads.at(-1)!.args[2],
+        "/tmp/cli-release-cache/aarch64-unknown-linux-gnu/release/gm",
+      );
+    }
+  }
+});
+
+await test("provisioning requires exact opt-in and a supported cross-compilation host", async () => {
+  for (const flag of [undefined, "0", "true"]) {
+    const { calls, options } = harness();
+    await publish({ ...options, env: { ...options.env, GITMATRIX_CLI_PROVISION_ARM64: flag } });
+    assert.deepEqual(calls.map((call) => call.binary).slice(0, 3), ["git", "cargo", "cargo"]);
+    assert.equal(
+      calls.some((call) => call.binary === "apt-get" || call.binary === "rustup"),
+      false,
+    );
+  }
+  for (const [platform, arch] of [
+    ["linux", "arm64"],
+    ["darwin", "x64"],
+  ] as const) {
+    const { calls, options } = harness([404]);
+    await publish({
+      ...options,
+      platform,
+      arch,
+      env: { ...options.env, GITMATRIX_CLI_PROVISION_ARM64: "1" },
+    });
+    assert.deepEqual(
+      calls.map((call) => call.binary),
+      ["git", "cargo", "/tmp/cli-release-cache/release/gm"],
+    );
+  }
+});
+
+await test("every provisioning failure aborts before building or publishing", async () => {
+  for (const failure of ["update", "install", "target"]) {
+    const { calls, options } = harness();
+    await assert.rejects(
+      publish({
+        ...options,
+        env: { ...options.env, GITMATRIX_CLI_PROVISION_ARM64: "1" },
+        run: (binary, args, env) => {
+          if ((binary === "apt-get" || binary === "rustup") && args[0] === failure)
+            throw new Error(`setup failed: ${failure}`);
+          return options.run(binary, args, env);
+        },
+      }),
+      new RegExp(`setup failed: ${failure}`),
+    );
+    assert.equal(
+      calls.some((call) => call.binary === "cargo" || call.args[0] === "pkg"),
+      false,
+    );
+  }
+});
+
+await test("HEAD network failures cannot provision or publish even after a missing native artifact", async () => {
+  const { calls, options } = harness([404]);
+  let heads = 0;
+  await assert.rejects(
+    publish({
+      ...options,
+      env: { ...options.env, GITMATRIX_CLI_PROVISION_ARM64: "1" },
+      request: async (input, init) => {
+        if (++heads === 2) throw new Error("network unavailable");
+        return options.request(input, init);
+      },
+    }),
+    /network unavailable/,
+  );
+  assert.deepEqual(
+    calls.map((call) => call.binary),
+    ["git"],
+  );
+});
+
+await test("a native build failure after provisioning cannot publish either artifact", async () => {
+  const { calls, options } = harness();
+  await assert.rejects(
+    publish({
+      ...options,
+      env: { ...options.env, GITMATRIX_CLI_PROVISION_ARM64: "1" },
+      run: (binary, args, env) => {
+        if (binary === "cargo") throw new Error("native build failed");
+        return options.run(binary, args, env);
+      },
+    }),
+    /native build failed/,
+  );
+  assert.deepEqual(
+    calls.map((call) => call.binary),
+    ["git", "apt-get", "apt-get", "rustup"],
+  );
 });

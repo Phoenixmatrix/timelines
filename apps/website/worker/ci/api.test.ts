@@ -85,6 +85,41 @@ describe("CI runs list", () => {
   });
 });
 
+test("run detail exposes verification provenance without executed success or timestamps", async () => {
+  const get = await setup();
+  try {
+    const proof = {
+      runId: "run6",
+      runNumber: 6,
+      jobId: "producer",
+      queueId: oid(6),
+      attempt: 1,
+      commit: oid(1),
+      sourceId: "canonical",
+      contract: "context-invariant-v1",
+      executionIdentity: "sandbox-v1:version:sha256:digest",
+    };
+    get.sqlite
+      .prepare(
+        "INSERT INTO ci_jobs(id,run_id,repo_id,name,spec,status,runner,verified_by) VALUES('verified','run1','repo','check','{\"needs\":[]}','skipped','sandbox',?)",
+      )
+      .run(JSON.stringify(proof));
+    const response = await get("/api/repos/ann/app/ci/runs/1");
+    expect(response.status).toBe(200);
+    const detail = response.json as unknown as CiRunDetail;
+    expect(detail.jobs[0]).toMatchObject({
+      status: "skipped",
+      claimedBy: null,
+      exitCode: null,
+      startedAt: null,
+      finishedAt: null,
+      verifiedBy: proof,
+    });
+  } finally {
+    get.sqlite.close();
+  }
+});
+
 describe("after retention (CORE-200)", () => {
   test("a job's removed log says when, and a removed run says it was removed", async () => {
     const get = await setup();

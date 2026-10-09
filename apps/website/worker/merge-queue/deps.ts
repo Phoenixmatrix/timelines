@@ -91,6 +91,7 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
         startRun(env, repo, {
           runId: s.gateRunId!,
           queueId: s.entry.id,
+          queueAttempt: s.entry.attempts,
           branch: s.entry.candidateBranch,
           commit: s.entry.candidate!,
           trigger: "landing",
@@ -102,6 +103,7 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
       live(repo, () =>
         startRun(env, repo, {
           runId: s.deployRunId!,
+          verification: { queueId: s.entry.id, attempt: s.entry.attempts, gateRunId: s.gateRunId! },
           branch: s.entry.branch,
           commit: s.entry.candidate!,
           trigger: "push",

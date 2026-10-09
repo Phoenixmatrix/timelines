@@ -22,6 +22,7 @@ import {
 } from "../durable/contract.ts";
 import { durableStub } from "../durable/registry.ts";
 import { ciSource } from "./source.ts";
+import { executionIdentity } from "./verification.ts";
 
 const WORKDIR = "/workspace/repo";
 /** Package tools' configuration (npmrc, docker/config.json…), outside the checkout. */
@@ -49,6 +50,14 @@ const FINISHED = new Set(["succeeded", "failed", "cancelled", "skipped"]);
 
 export class CiSandbox extends DurableObject<Env> implements Purgeable {
   #running: Promise<void> | null = null;
+
+  /** Read platform version/image metadata without starting a container. */
+  verificationIdentity(): string | null {
+    return executionIdentity(
+      this.ctx.container?.images.default,
+      Reflect.get(this.env, "CI_VERSION"),
+    );
+  }
 
   /**
    * Run the job, once. Workflows replay a step whose invocation ended while it
@@ -119,7 +128,12 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     const kdb = db(d1);
     const claimed = await kdb
       .updateTable("ci_jobs")
-      .set({ status: "running", claimed_by: "sandbox", started_at: nowIso() })
+      .set({
+        status: "running",
+        claimed_by: "sandbox",
+        started_at: nowIso(),
+        execution_identity: spec.image === "default" ? this.verificationIdentity() : null,
+      })
       .where("id", "=", jobId)
       .where("status", "in", ["queued", "running"])
       .where(
