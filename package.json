@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vp run website#dev",
     "semantic-smoke": "vp run website#semantic-smoke",
-    "prepare": "vp config && vp run site#content-types"
+    "prepare": "vp config --no-agent && vp run site#content-types"
   },
   "devDependencies": {
     "vite-plus": "catalog:"

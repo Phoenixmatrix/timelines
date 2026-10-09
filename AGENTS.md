@@ -32,6 +32,8 @@ release. Add a tool name to select part of the graph. For example, run
 - Follow the root [agent-first workflow](README.md#agent-first-development).
   Each agent uses its own source `gm worktree`, `vp install`, and
   `vp run agent setup`; run the app with `vp run agent up`.
+- `prepare` runs `vp config --no-agent`: it configures hooks without overwriting
+  this repository's readiness guidance with Vite+'s generic agent checklist.
 - AI costs money, so it is **opt-in**. `agent setup` provisions no Workers AI,
   AI Gateway, Vectorize or AI Search and seeds without paid Knowledge builds;
   the UI shows its AI-off states. Use `vp run agent setup --ai` (after
