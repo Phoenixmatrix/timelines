@@ -20,7 +20,8 @@ release. Add a tool name to select part of the graph. For example, run
 ## Review Checklist
 
 - [ ] Run `vp install` after pulling remote changes and before getting started.
-- [ ] Run `vp check` and `vp test` to format, lint, type check and test changes.
+- [ ] Run `vp run ready` for this repository's selected checks and tests; inspect
+      `vp run ready --dry-run` first. Do not routinely add blanket `vp check`/`vp test` runs.
 - [ ] Check if there are `vite.config.ts` tasks or `package.json` scripts necessary for validation, run via `vp run <script>`.
 - [ ] If setup, runtime, or package-manager behavior looks wrong, run `vp env doctor` and include its output when asking for help.
 
@@ -46,13 +47,22 @@ release. Add a tool name to select part of the graph. For example, run
 - Use fresh browser contexts: cookies are not isolated by port. `agent seed`
   reconciles fixtures; `agent reset` destroys and recreates them. Inspect data
   with `agent inspect` or scoped tracker/issue commands.
-- Before completion, run **`vp run ready`**. It selects uncached checks,
-  workspace tests/builds and non-AI E2E from changed paths and dependencies.
-  `--dry-run` explains the selection; `--all` forces the complete suite.
-  Unknown/global/shared harness changes fall back to full coverage. Frontend
-  changes keep browser journeys and prerequisites; `agent test` stays full.
-  Server CI skips E2E (too expensive per push), so selected live journeys must
-  pass locally before code lands. CI/CD gates are otherwise unchanged.
+- Before completion, inspect **`vp run ready --dry-run`**, then run
+  **`vp run ready`**. Plain `ready` is the required, automatically selective
+  gate: it runs uncached checks, workspace tests/builds and non-AI E2E selected
+  from changed paths and dependencies. Do not routinely prepend or append
+  blanket `vp check`, `vp test`, recursive builds or `vp run agent test`;
+  targeted checks for development/debugging are still appropriate.
+  Sync the source workspace and run `vp install` first: selection includes
+  committed, staged, unstaged and untracked work since the merge base with
+  local `origin/main`, not just the last edit, and does not fetch.
+  Use `--all` only for deliberately required comprehensive verification.
+  Use `--base <ref>` only for the actual integration branch, never to hide
+  unlanded changes or force a smaller plan. Unknown/global/shared harness
+  changes automatically fall back to full coverage; accept that selection.
+  Frontend changes keep browser journeys and prerequisites. Server CI skips
+  E2E (too expensive per push), so selected live journeys must pass locally
+  before code lands. See [coverage rules](README.md#completion-gate).
   For changes to knowledge, wiki, embeddings, AI Search, the assistant,
   release notes, avatars or the Atlas, follow
   `.agents/skills/gitmatrix-ai-verification/SKILL.md` and explicitly run
@@ -152,7 +162,7 @@ Work is tracked in Gitmatrix: matrixorg, team CORE. The loop, in brief (the
 4. Need to find something out (where code lives, why CI failed, what an issue
    depends on)? `gm ask "<question>"` asks the Gitmatrix assistant. For human
    input, follow the current claim's `intervention` mode and guidance below.
-5. Ship (`vp run ready`, then `gm push && gm runs wait`). For independent main work, explicitly submit
+5. Ship (sync the source workspace and run `vp install`; inspect `vp run ready --dry-run`, then run `vp run ready`, the automatically selective required gate. Do not routinely add blanket check/test/build runs, `vp run agent test` or `--all`; use `--all` only when comprehensive verification is deliberately required. Selection covers all unlanded committed, staged, unstaged and untracked work against the merge base with local `origin/main` and does not fetch. Use `--base` only for the actual integration branch, never to hide work. Accept automatic full fallback for broad or unknown changes. Preserve required real consumer smoke checks, explicit AI verification and deployment-boundary checks in `AGENTS.md`; see `README.md#completion-gate` for coverage. Then follow the queue or timeline shipping workflow below and verify actual landing and required CI/deployment before completing the issue). For independent main work, explicitly submit
    `gm push --queue --issue <issue>` and checkpoint the returned queue ID,
    source commit and verification still pending. Accepted is not landed or deployed.
    Keep/renew the original lease while its acceptance remains unverified.
