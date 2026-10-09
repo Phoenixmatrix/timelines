@@ -335,7 +335,7 @@ packageExtensionsChecksum: sha256-iNc6ICSBBqrl659PKZa+jBGWRIsFWZb9PmiqJ6jD59Y=
 patchedDependencies:
   '@cloudflare/ai-chat@0.12.1': d56cc8f014b63b7284fe3a593ec04b07394d43d7e6694229b33d31cff9c3e7b1
   cf@1.0.0-beta.7: e8114ba3de4870ba725619e95a949e6998ba9e96794c5ad04d5a0a3ff19b3e4f
-  miniflare@5.20260930.0-alpha: 80845131154cae8dde1b110f2fd157de4e131e6774bc201c0d65b635ff2e7926
+  miniflare@5.20260930.0-alpha: 9204c4096870f4cada5f768c64db4479ea9666544f59b5e20e05837a1ad25128
 
 importers:
 
@@ -4682,7 +4682,7 @@ snapshots:
 
   '@cloudflare/runtime-types@0.1.6(@types/node@24.19.0)':
     dependencies:
-      miniflare: 5.20260930.0-alpha(patch_hash=80845131154cae8dde1b110f2fd157de4e131e6774bc201c0d65b635ff2e7926)(@types/node@24.19.0)
+      miniflare: 5.20260930.0-alpha(patch_hash=9204c4096870f4cada5f768c64db4479ea9666544f59b5e20e05837a1ad25128)(@types/node@24.19.0)
       workerd: 1.20260930.2
     transitivePeerDependencies:
       - '@types/node'
@@ -4701,7 +4701,7 @@ snapshots:
       '@cloudflare/config': 0.22.0
       '@cloudflare/runtime-types': 0.1.6(@types/node@24.19.0)
       '@cloudflare/unenv-preset': 2.16.2(unenv@2.0.0-rc.24)(workerd@1.20260930.2)
-      miniflare: 5.20260930.0-alpha(patch_hash=80845131154cae8dde1b110f2fd157de4e131e6774bc201c0d65b635ff2e7926)(@types/node@24.19.0)
+      miniflare: 5.20260930.0-alpha(patch_hash=9204c4096870f4cada5f768c64db4479ea9666544f59b5e20e05837a1ad25128)(@types/node@24.19.0)
       unenv: 2.0.0-rc.24
       vite: '@voidzero-dev/vite-plus-core@1.0.0-rc.0(@types/node@24.19.0)(esbuild@0.28.1)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1)'
       ws: 8.21.0
@@ -6248,7 +6248,7 @@ snapshots:
       '@cloudflare/config': 0.22.0
       '@cloudflare/runtime-types': 0.1.6(@types/node@24.19.0)
       blake3-wasm: 2.1.5
-      miniflare: 5.20260930.0-alpha(patch_hash=80845131154cae8dde1b110f2fd157de4e131e6774bc201c0d65b635ff2e7926)(@types/node@24.19.0)
+      miniflare: 5.20260930.0-alpha(patch_hash=9204c4096870f4cada5f768c64db4479ea9666544f59b5e20e05837a1ad25128)(@types/node@24.19.0)
       minisearch: 7.2.0
     transitivePeerDependencies:
       - '@types/node'
@@ -7376,7 +7376,7 @@ snapshots:
       js-base64: 3.9.4
       mime-types: 2.1.35
 
-  miniflare@5.20260930.0-alpha(patch_hash=80845131154cae8dde1b110f2fd157de4e131e6774bc201c0d65b635ff2e7926)(@types/node@24.19.0):
+  miniflare@5.20260930.0-alpha(patch_hash=9204c4096870f4cada5f768c64db4479ea9666544f59b5e20e05837a1ad25128)(@types/node@24.19.0):
     dependencies:
       '@cspotcode/source-map-support': 0.8.1
       sharp: 0.35.4(@types/node@24.19.0)
@@ -8247,7 +8247,7 @@ snapshots:
       '@cloudflare/unenv-preset': 2.16.2(unenv@2.0.0-rc.24)(workerd@1.20260930.2)
       blake3-wasm: 2.1.5
       esbuild: 0.28.1
-      miniflare: 5.20260930.0-alpha(patch_hash=80845131154cae8dde1b110f2fd157de4e131e6774bc201c0d65b635ff2e7926)(@types/node@24.19.0)
+      miniflare: 5.20260930.0-alpha(patch_hash=9204c4096870f4cada5f768c64db4479ea9666544f59b5e20e05837a1ad25128)(@types/node@24.19.0)
       path-to-regexp: 6.3.0
       unenv: 2.0.0-rc.24
       workerd: 1.20260930.2

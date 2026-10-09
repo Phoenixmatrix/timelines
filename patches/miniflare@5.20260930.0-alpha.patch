@@ -15,7 +15,7 @@ index 4110cf463ffdba5a547f3e14434d7fff4133da27..1fac2b86525db9c8842d36c8b77737bc
      const fullPath = sysPath2.resolve(path84);
      isDirectory3 = isDirectory3 != null ? isDirectory3 : this._watched.has(path84) || this._watched.has(fullPath);
 diff --git a/dist/src/workers/shared/remote-proxy-client.worker.js b/dist/src/workers/shared/remote-proxy-client.worker.js
-index 7a556761f2992280a8ab15adf8bec759ae3a4266..57fb7b8b929d64bc22ff9bdd5f1e54ab2ddde6ae 100644
+index 7a556761f2992280a8ab15adf8bec759ae3a4266..ee8e80cca54283950f20de4decb0363362a80d9f 100644
 --- a/dist/src/workers/shared/remote-proxy-client.worker.js
 +++ b/dist/src/workers/shared/remote-proxy-client.worker.js
 @@ -2561,13 +2561,32 @@ function makeRemoteProxyStub(remoteProxyConnectionString, bindingName, metadata,
@@ -52,15 +52,15 @@ index 7a556761f2992280a8ab15adf8bec759ae3a4266..57fb7b8b929d64bc22ff9bdd5f1e54ab
        return p === "fetch" ? makeFetch(
          remoteProxyConnectionString,
          bindingName,
-@@ -2579,6 +2598,77 @@ function makeRemoteProxyStub(remoteProxyConnectionString, bindingName, metadata,
+@@ -2579,6 +2598,105 @@ function makeRemoteProxyStub(remoteProxyConnectionString, bindingName, metadata,
    });
  }
  
 +// Gitmatrix (CORE-305): even kept alive, about 1 in 100 to 500 fresh calls
 +// through the remote proxy fails with close 1006. Each ARTIFACTS call opens
 +// its own session, so a read that failed that way is retried on a new one
-+// (a repo handle is opened again there). Writes are never retried: their
-+// outcome is unknown.
++// (a repo handle is opened again there). Other writes are never retried: their
++// outcome is unknown; create is, below.
 +function gitmatrixDropped(error) {
 +  return /Peer closed WebSocket: 1006/.test(String(error?.message ?? error));
 +}
@@ -72,6 +72,34 @@ index 7a556761f2992280a8ab15adf8bec759ae3a4266..57fb7b8b929d64bc22ff9bdd5f1e54ab
 +      if (tries >= 3 || !gitmatrixDropped(error)) throw error;
 +      await new Promise((resolve) => setTimeout(resolve, 250 * tries));
 +    }
++}
++// A create that dropped may still have happened. Its retry then finds the repo
++// (and nothing else could have made it: names are fresh), so it reads back what
++// create returns, with a new token in place of the lost one. "Already exists"
++// without a drop is an ordinary error.
++async function gitmatrixCreate(first, fresh, name, opts) {
++  let dropped = false;
++  return gitmatrixRetry(async (again) => {
++    try {
++      return await (again ? fresh() : first()).create(name, opts);
++    } catch (error) {
++      dropped ||= gitmatrixDropped(error);
++      if (!dropped || !/repo already exists/.test(String(error?.message))) throw error;
++      let repo = await fresh().get(name), info = await repo.info(), token = await repo.createToken("write");
++      try {
++        repo[Symbol.dispose]?.();
++      } catch {
++      }
++      return {
++        id: info.id,
++        name: info.name,
++        description: info.description,
++        defaultBranch: info.defaultBranch,
++        remote: info.remote,
++        token: token.plaintext
++      };
++    }
++  });
 +}
 +var GitmatrixRepo = class extends cfw.RpcTarget {
 +  #repo;
@@ -130,11 +158,11 @@ index 7a556761f2992280a8ab15adf8bec759ae3a4266..57fb7b8b929d64bc22ff9bdd5f1e54ab
  // src/workers/shared/remote-proxy-client.worker.ts
  var Client = class extends WorkerEntrypoint {
    fetch(request) {
-@@ -2630,6 +2720,19 @@ var Client = class extends WorkerEntrypoint {
+@@ -2630,6 +2748,21 @@ var Client = class extends WorkerEntrypoint {
        get: (target, prop) => {
          if (Reflect.has(target, prop))
            return Reflect.get(target, prop);
-+        if (ctx.props.binding === "ARTIFACTS" && (prop === "get" || prop === "list")) {
++        if (ctx.props.binding === "ARTIFACTS" && (prop === "get" || prop === "list" || prop === "create")) {
 +          let fresh = () => makeRemoteProxyStub(
 +            ctx.props.remoteProxyConnectionString,
 +            ctx.props.binding,
@@ -142,6 +170,8 @@ index 7a556761f2992280a8ab15adf8bec759ae3a4266..57fb7b8b929d64bc22ff9bdd5f1e54ab
 +            ctx.props.cfTraceId,
 +            env[SharedBindings.MAYBE_SERVICE_LOOPBACK]
 +          );
++          if (prop === "create")
++            return (name, opts) => gitmatrixCreate(getStub, fresh, name, opts);
 +          return (...args) => gitmatrixRetry(async (again) => {
 +            let result = await (again ? fresh() : getStub())[prop](...args);
 +            return prop === "get" ? new GitmatrixRepo(result, () => fresh().get(...args)) : result;
