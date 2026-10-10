@@ -699,6 +699,105 @@ describe("compact landing state", () => {
 });
 
 describe("exact nested admission", () => {
+  test.each([
+    "proven marker",
+    "pending projection",
+    "intent only",
+    "different marker",
+    "different proven head",
+    "different operation",
+    "different source",
+    "foreign origin",
+  ])("%s: checkpoint admission requires exact recovery-fence provenance", async (mode) => {
+    const f = fixture(1);
+    try {
+      const repo = f.current.repos[0]!;
+      const source = repo.source!;
+      const fence = oid(4);
+      const merge = oid(5);
+      const graph = f.graphs.get(source.sourceId)!;
+      graph.set(fence, {
+        hash: fence,
+        parents: [repo.base!],
+        treeHash: repo.logicalBase!.tree,
+        message: "Recovery fence",
+      });
+      graph.set(merge, {
+        hash: merge,
+        parents: [source.commit, fence],
+        treeHash: source.tree,
+        message: "Merge the recovery fence",
+      });
+      f.refs.get(source.sourceId)!.set(source.ref, merge);
+      vi.mocked(lsRefs).mockImplementation(async (_env, name) =>
+        [...f.refs.get(name)!].map(([name, oid]) => ({ name, oid })),
+      );
+      const recovery: { commit: string; head: string; outcome?: string } = {
+        commit: mode === "different marker" ? source.commit : fence,
+        head: mode === "different proven head" ? source.commit : fence,
+        outcome: "rejected",
+      };
+      if (mode === "intent only") delete recovery.outcome;
+      f.sqlite
+        .prepare(`INSERT INTO source_operations
+          (id,owner_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
+          VALUES('recovery','owner','timeline','repo0',?,'push',?,?,'now','now')`)
+        .run(
+          mode === "different source" ? "foreign" : source.sourceId,
+          mode === "pending projection" ? "ambiguous" : "rejected",
+          JSON.stringify({
+            commands: [{ ref: source.ref, old: repo.base, new: source.commit }],
+            // D1's terminal row is the projection proof; the Tracker's later
+            // acknowledgement flag need not have been copied back into it.
+            projectionPending: true,
+            recovery: { ...recovery, projected: false },
+          }),
+        );
+      f.sqlite
+        .prepare(`INSERT INTO source_progress_members
+          (repo_id,source_id,commit_oid,operation_id,created_at) VALUES('repo0',?,?,?,'now')`)
+        .run(source.sourceId, fence, mode === "different operation" ? "other" : "recovery");
+      f.sqlite
+        .prepare(
+          "INSERT INTO source_revision_origins(repo_id,commit_oid,source_id) VALUES('repo0',?,?)",
+        )
+        .run(fence, mode === "foreign origin" ? "foreign" : source.sourceId);
+      const timeline: Timeline = {
+        id: "timeline",
+        slug: "test",
+        name: "Recovery",
+        policy: "auto",
+        experimental: false,
+        parentId: null,
+        forkPoint: { commits: { repo0: repo.base! }, trackerCursor: 0 },
+        repos: [{ ...repo, bookmark: "timeline/test" }],
+        status: "active",
+        accountableId: "owner",
+        startedBy: "owner",
+        agentIds: [],
+        version: 1,
+        createdAt: "now",
+        updatedAt: "now",
+        pushedAt: null,
+      };
+      const actor = { id: "owner", slug: "owner", displayName: "Owner", isSiteAdmin: false };
+      if (mode === "proven marker") {
+        const [measured] = await measure(f.env, actor, timeline);
+        expect(measured!.source).toMatchObject({
+          sourceId: source.sourceId,
+          commit: merge,
+          tree: source.tree,
+        });
+        expect(measured!.logicalBase).toEqual(repo.logicalBase);
+        expect(measured!.dependencies).toEqual([]);
+      } else {
+        await expect(measure(f.env, actor, timeline)).rejects.toThrow("blocked_dependency");
+      }
+    } finally {
+      f.sqlite.close();
+    }
+  });
+
   test.each(["separate tips", "first merge push", "legacy allocation"])(
     "%s: local Git branches land without importing WIP ancestry",
     async (mode) => {

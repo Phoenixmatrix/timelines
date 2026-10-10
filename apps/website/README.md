@@ -1492,6 +1492,11 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   new head proves acceptance; if the marker wins, the old-to-new original CAS
   is fenced and the operation is rejected. Unexpected heads fail closed.
   Marker history is retained with source progress; canonical refs are untouched.
+  A service-created marker counts as acknowledged same-source ancestry only
+  when retained provenance and the terminal rejection projection match its
+  exact operation, source, commit and proven head (CORE-323). This permits a
+  normal merge of the recovery fence before checkpointing. An intent alone
+  grants nothing; foreign-source dependency and approval checks are unchanged.
   Neither recovery nor later source writes may restore a persisted recovery
   base OID on that source: doing so could revive a delayed CAS (the ABA problem).
   This exact-OID restriction does not otherwise prohibit normal work rewrites.

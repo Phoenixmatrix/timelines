@@ -106,6 +106,13 @@ async function acknowledgedLocalRevision(
             SELECT 1 FROM json_each(o.data,'$.commands') command
             WHERE json_extract(command.value,'$.new')=m.commit_oid)))
         OR EXISTS (
+          SELECT 1 FROM source_operations o
+          WHERE o.id=m.operation_id AND o.repo_id=m.repo_id AND o.source_id=m.source_id
+            AND o.kind='push' AND o.state='rejected'
+            AND json_extract(o.data,'$.recovery.outcome')='rejected'
+            AND json_extract(o.data,'$.recovery.commit')=m.commit_oid
+            AND json_extract(o.data,'$.recovery.head')=m.commit_oid)
+        OR EXISTS (
           SELECT 1 FROM timeline_work_sources s
           WHERE s.repo_id=m.repo_id AND s.source_id=m.source_id
             AND s.allocation_operation_id=m.operation_id AND s.state IN ('ready','archived')))`)
