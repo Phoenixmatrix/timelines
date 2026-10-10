@@ -6,6 +6,7 @@ import type {
   HumanRequest,
   OpenRequest,
   OpenRequests,
+  RequestSummary,
   TrackerList,
   TrackerView,
   TrackerOwner,
@@ -133,6 +134,24 @@ tracker.get("/tracker", async (c) => {
     defaultOwner(c.env.DB, actor.id),
   ]);
   return c.json<TrackerList>({ viewerId: actor.id, trackers, defaultOwnerId });
+});
+/**
+ * How many open requests wait on you, and on anyone, across every tracker you're
+ * in (CORE-301): the rail's Needs you badge, without the requests themselves.
+ */
+tracker.get("/requests/summary", async (c) => {
+  const actor = c.get("actor");
+  if (!actor) return c.json({ error: "Sign in to see what needs you." }, 401);
+  const summary: RequestSummary = { forYou: 0, open: 0 };
+  for (const owner of await accessible(c.env.DB, actor)) {
+    const result = await trackerObject(c.env, owner.id).openRequests();
+    if (!result.ok) return response(c, result);
+    for (const { request } of result.value) {
+      summary.open++;
+      if (request.routeTo === actor.id) summary.forYou++;
+    }
+  }
+  return c.json(summary);
 });
 /** Open requests to people across every tracker you're in: yours first, then the rest. */
 tracker.get("/requests", async (c) => {

@@ -7,6 +7,7 @@ import type { Mutation, OpenRequest, OpenRequests } from "../../shared/tracker.t
 import { Page } from "../components/AppShell.tsx";
 import { api, ApiError, load } from "../lib/api.ts";
 import { requireViewer, useViewer } from "../lib/session.ts";
+import { NEEDS_YOU_CHANGED } from "../lib/needs-you.ts";
 import { RequestCard, type Answer } from "./tracker/Requests.tsx";
 
 export async function needsYouLoader({ request }: LoaderFunctionArgs) {
@@ -29,6 +30,8 @@ export function NeedsYou() {
         json: { operationId: crypto.randomUUID(), mutations: [mutation] },
       });
       await revalidator.revalidate();
+      // The rail's count follows what was just answered or cancelled.
+      window.dispatchEvent(new Event(NEEDS_YOU_CHANGED));
       return { ok: true };
     } catch (cause) {
       return {

@@ -240,7 +240,7 @@ A near-monochrome warm charcoal palette with a single amber action accent, a red
 
 ### Primary
 
-- **Amber Signal** (signal): primary buttons (Clone, Run, Create), pressed filter chips and saved views, the rail's current-place pip, the current repository tab's underline, the focus ring, text caret and selection highlight, the hover and brushed state of the publish-rate bars, and the switch's on state. Text on it is always **Signal Ink**, a dark warm brown, never white.
+- **Amber Signal** (signal): primary buttons (Clone, Run, Create), pressed filter chips and saved views, the rail's current-place pip, the rail's Needs you count (`mk-badge` on the hand whenever the Needs you page holds a request you can see, routed to you or open to anyone in your trackers; 9+ beyond nine; its accessible name says how many, and how many are routed to you), the current repository tab's underline, the focus ring, text caret and selection highlight, the hover and brushed state of the publish-rate bars, and the switch's on state. Text on it is always **Signal Ink**, a dark warm brown, never white.
 - **Amber Hover** (signal-hover): the primary button's hover fill.
 - **Signal Line** (signal-line): the same amber as a line or mark: focus outlines, tab underlines, link underlines in running text, radio dots, select checks, running-CI spinners. In light it deepens to keep contrast against pale panes.
 - **Amber Wash** (signal-wash): a 14% amber tint for selected rows in the version table, pressed facet bars, the brushed span of the rate strip, and info strips (`mk-strip`, only for something that needs you now). It marks "this is chosen" without shouting. Never on tags, statuses or data marks.

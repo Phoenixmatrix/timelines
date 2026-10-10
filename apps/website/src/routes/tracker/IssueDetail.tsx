@@ -47,6 +47,7 @@ import { whyNotReady, type IssueIndex } from "./query.ts";
 import { RequestCard } from "./Requests.tsx";
 import { DoneInTimelineCallout, LockedStatusHint, lockedIn } from "./DoneInTimeline.tsx";
 import { useViewer } from "../../lib/session.ts";
+import { NEEDS_YOU_CHANGED } from "../../lib/needs-you.ts";
 import { Actor } from "./Actor.tsx";
 import { repoPath } from "../../lib/refs.ts";
 import { useRememberPlace } from "../../lib/recentPlaces.ts";
@@ -60,6 +61,13 @@ export type MutationOutcome =
   | { ok: true; events: TrackerEvent[] }
   | { ok: false; error: string; code?: string };
 export type Mutate = (mutations: Mutation[]) => Promise<MutationOutcome>;
+
+/** After answering or cancelling a request, the rail's Needs you count follows (CORE-301). */
+async function settleRequest(outcome: Promise<MutationOutcome>): Promise<MutationOutcome> {
+  const settled = await outcome;
+  window.dispatchEvent(new Event(NEEDS_YOU_CHANGED));
+  return settled;
+}
 type EditMode = "all" | "title" | "description" | "acceptance";
 type Draft = { version: number; fields: IssueFields; base?: IssueFields; mode?: EditMode };
 const fieldNames: Record<keyof IssueFields, string> = {
@@ -1371,11 +1379,11 @@ export function IssueDetail({
                 request={request}
                 name={(id) => actorName(snapshot, id)}
                 onAnswer={(answer) =>
-                  mutate([{ kind: "request.answer", id: request.id, data: answer }])
+                  settleRequest(mutate([{ kind: "request.answer", id: request.id, data: answer }]))
                 }
                 onCancel={
                   request.askedBy === viewer?.id
-                    ? () => mutate([{ kind: "request.cancel", id: request.id }])
+                    ? () => settleRequest(mutate([{ kind: "request.cancel", id: request.id }]))
                     : undefined
                 }
               />

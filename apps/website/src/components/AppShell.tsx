@@ -38,6 +38,7 @@ import { useViewer } from "../lib/session.ts";
 import { packagesPath } from "../lib/packages.ts";
 import { applyTheme, storedTheme, type Theme } from "../lib/theme.ts";
 import { scopeOf } from "../lib/timelineScope.ts";
+import { needsYouBadge, needsYouLabel, useNeedsYou } from "../lib/needs-you.ts";
 import { Monogram } from "./Monogram.tsx";
 import { GitmatrixLogo } from "./GitmatrixLogo.tsx";
 import { TimelineBanner, TimelineSwitcher } from "./TimelineScope.tsx";
@@ -221,6 +222,7 @@ function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
 
 export function AppShell() {
   const viewer = useViewer();
+  const needsYou = useNeedsYou(!!viewer);
   const navigation = useNavigation();
   const location = useLocation();
   const tracker = useMatch("/tracker/:owner/*");
@@ -308,9 +310,21 @@ export function AppShell() {
               </Place>
             )}
             {viewer && (
-              <Place to="/needs-you" label="Needs you">
+              <Place to="/needs-you" label={needsYouLabel(needsYou)}>
                 {(active) => (
-                  <HandWavingIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+                  <>
+                    <HandWavingIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+                    {/* Every request the page shows you (CORE-301): amber, the action color. */}
+                    {needsYou?.open ? (
+                      <span
+                        className="mk-badge absolute -top-1 -right-1"
+                        data-testid="needs-you-count"
+                        aria-hidden
+                      >
+                        {needsYouBadge(needsYou.open)}
+                      </span>
+                    ) : null}
+                  </>
                 )}
               </Place>
             )}

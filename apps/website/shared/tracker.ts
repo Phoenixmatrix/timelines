@@ -21,6 +21,11 @@ export interface OpenRequest {
   /** For a checkpoint's approval: its commits, CI runs, previews and summary. */
   checkpoint?: CheckpointView;
 }
+/** Counts behind the rail's Needs you badge (CORE-301): routed to you, and open to anyone. */
+export interface RequestSummary {
+  forYou: number;
+  open: number;
+}
 export interface OpenRequests {
   requests: OpenRequest[];
   /** Names for the ids the requests mention: a person, or "builder for Ann Lee". */
