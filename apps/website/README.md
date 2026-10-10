@@ -1252,10 +1252,11 @@ read as `agent_decides`.
   In the tracker, `c`/`n` captures an issue, `/` filters, `j`/`k` selects the
   next/previous issue, and Escape closes it. In Story, `j`/`k` invokes
   Next/Previous. Story's buttons, row clicks, arrow/letter keys and close actions
-  share the requested selection, so rapid mixed input does not navigate from
-  the previous render. Help and navigation avoid text entry, composition and other
-  dialogs; help traps focus and Escape restores it. Cmd/Ctrl-K search and
-  Cmd/Ctrl-J assistant shortcuts are unchanged outside help.
+  share the requested selection and acknowledge it against the live URL, so rapid
+  mixed input does not navigate from the previous render. Help and navigation
+  avoid text entry, composition and other dialogs; help traps focus and Escape
+  restores it. Cmd/Ctrl-K search and Cmd/Ctrl-J assistant shortcuts are unchanged
+  outside help.
 - **Settings:** the gear at the bottom of the navigation rail opens a shared
   settings area, starting with **Teams and workspaces** for the current tracker,
   or your default tracker when outside a tracker. A left-hand section navigation

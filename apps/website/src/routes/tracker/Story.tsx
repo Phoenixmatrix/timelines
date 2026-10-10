@@ -198,15 +198,17 @@ export function Story() {
     shown,
     open,
     set,
-    selected,
     heading: undefined as string | null | undefined,
   });
   position.current = {
     shown,
     open,
     set,
-    selected,
-    heading: position.current.heading === selected ? undefined : position.current.heading,
+    heading:
+      position.current.heading !== undefined &&
+      position.current.heading === new URLSearchParams(window.location.search).get("step")
+        ? undefined
+        : position.current.heading,
   };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -230,8 +232,9 @@ export function Story() {
       )
         return;
       if ((event.key === "j" || event.key === "k") && !readTrackerShortcuts()) return;
-      const { shown, open, set, selected, heading } = position.current;
-      const at = heading === undefined ? selected : heading;
+      const { shown, open, set, heading } = position.current;
+      const at =
+        heading === undefined ? new URLSearchParams(window.location.search).get("step") : heading;
       const index = shown.findIndex((row) => row.commit.oid === at);
       // Next/Previous follow the visible newest-first list, down/up respectively.
       if (event.key === "k" || event.key === "ArrowLeft" || event.key === "ArrowUp")
