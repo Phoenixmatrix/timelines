@@ -32,6 +32,7 @@ import {
   receiptFor,
   recordIntent,
   recordIntegrated,
+  RevisionMetadata,
   revisionClosure,
   validateDependencies,
   validateMergeEdges,
@@ -184,6 +185,7 @@ interface Context {
   deps: LandingDeps;
   ownerId: string;
   rows: Map<string, PushedRepo>;
+  metadata: RevisionMetadata;
 }
 
 function recordCasOutcome(
@@ -360,14 +362,16 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
         ctx.env,
         repo,
         await revisionClosure(main, (oid) => deps.parents(r!, oid)),
+        ctx.metadata,
       );
       using work = await ctx.env.ARTIFACTS.get(source.artifacts_name);
+      const readCommit = ctx.metadata.reader(source.artifacts_name, work);
       for (const snapshot of [
         repo.source,
         repo.logicalBase,
         ...repo.dependencies.map((dependency) => dependency.source),
       ]) {
-        const commit = await work.readCommit(snapshot.commit);
+        const commit = await readCommit(snapshot.commit);
         if (!commit || commit.treeHash !== snapshot.tree)
           throw new Error("blocked_dependency: pinned source tree is unavailable or mismatched");
       }
@@ -377,7 +381,7 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
         repo.commit,
         repo.logicalBase.commit,
         repo.dependencies.map((dependency) => dependency.source.commit),
-        async (oid) => (await work.readCommit(oid))?.parents ?? null,
+        async (oid) => (await readCommit(oid))?.parents ?? null,
       );
     } catch (error) {
       // A transport failure defers progress without invalidating prepared candidates.
@@ -685,9 +689,9 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
   if (repo) {
     const r = row(repo)!;
     using artifacts = await ctx.env.ARTIFACTS.get(r.artifacts_name);
-    const candidate = await artifacts.readCommit(repo.merge!);
+    const candidate = await ctx.metadata.reader(r.artifacts_name, artifacts)(repo.merge!);
     if (!candidate) throw new Error("Tested candidate is unavailable");
-    await recordIntent(ctx.env, landing, repo, candidate.treeHash);
+    await recordIntent(ctx.env, landing, repo, candidate.treeHash, ctx.metadata);
     if (!repo.casIntent || repo.casIntent.candidate !== repo.merge)
       return save(
         ctx,
@@ -911,10 +915,25 @@ export async function progress(
     await publishCompleted(env, ownerId, landing);
     return landing;
   }
+  // This look may traverse the same canonical history in many saved steps.
+  // Only immutable successful reads survive those steps; refs and proofs stay fresh.
+  const parents = new Map<string, Map<string, string[]>>();
   const ctx: Context = {
     env,
-    deps,
+    deps: {
+      ...deps,
+      parents: async (repo, oid) => {
+        let commits = parents.get(repo.artifacts_name);
+        if (!commits) parents.set(repo.artifacts_name, (commits = new Map()));
+        const known = commits.get(oid);
+        if (known) return known;
+        const value = await deps.parents(repo, oid);
+        if (value) commits.set(oid, value);
+        return value;
+      },
+    },
     ownerId,
+    metadata: new RevisionMetadata(),
     rows: await repoRows(
       env.DB,
       landing.repos.map((repo) => repo.id),

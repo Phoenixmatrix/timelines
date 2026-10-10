@@ -7,7 +7,7 @@
 // timeline, its owned work source and the flag are the Worker's own, in memory;
 // file listings and CI runs are canned, with source addressing asserted.
 
-import { expect, test } from "vite-plus/test";
+import { expect, onTestFinished, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { CiRunList } from "../../shared/api.ts";
 import type { Timeline, TimelineList } from "../../shared/timelines.ts";
@@ -121,16 +121,35 @@ test("a timeline chosen in the rail scopes code, CI, Knowledge and the timelines
   await expect.element(banner).not.toBeInTheDocument();
 });
 
-test("settings graph navigation keeps its account rather than the default tracker", async () => {
+test("settings graph navigation keeps its account and position while the list loads", async () => {
   const server = await TestServer.start({ world: true });
   const trackers = await server.call<TrackerList>("GET", "/api/tracker");
   const personal = trackers.trackers.find((tracker) => tracker.slug === "marco")!;
   server.on("GET", "/api/tracker", { ...trackers, defaultOwnerId: personal.id });
+  let release!: () => void;
+  const response = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  onTestFinished(() => release());
+  server.on("GET", "/api/tracker/orbit/timelines", async () => {
+    await response;
+    return { timelines: [] };
+  });
 
   const app = renderApp("/settings/ai?owner=orbit");
   await userEvent.click(page.getByRole("button", { name: /^Timeline: main/ }));
   const graph = page.getByRole("link", { name: "Timeline graph", exact: true });
   await expect.element(graph).toHaveAttribute("href", "/tracker/orbit/timelines");
+  await expect.element(page.getByText("Loading timelines…")).toBeVisible();
+  await graph.click({ trial: true });
+  const before = graph.element().getBoundingClientRect();
+  release();
+  await expect.element(page.getByText("Loading timelines…")).not.toBeInTheDocument();
+  await graph.click({ trial: true });
+  const after = graph.element().getBoundingClientRect();
+  // A moving target can receive pointer-down on the link and pointer-up outside it.
+  expect(after.x).toBeCloseTo(before.x);
+  expect(after.y).toBeCloseTo(before.y);
   await userEvent.click(graph);
   await app.waitForUrl((url) => url.pathname === "/tracker/orbit/timelines");
   await expect.element(page.getByRole("heading", { name: "Timelines", exact: true })).toBeVisible();

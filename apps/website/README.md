@@ -1596,6 +1596,18 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   Known foreign work still needs exact reviewed integration. This is
   service-recorded provenance, not proof of where otherwise unknown external
   Git objects were authored.
+  Checkpoint measurement and each landing progress invocation reuse successful
+  immutable commit metadata by physical repository and OID. Overlapping base,
+  dependency and merge-parent closures still traverse every ancestor, but do
+  not repeatedly fetch already-read metadata. The landing receipt reuses the
+  same source metadata; canonical ancestry reads are also shared within that
+  invocation. No cache crosses requests, caches absence or provider errors, or
+  substitutes for fresh source state, origin, acknowledgement and receipt checks.
+  Missing ancestry blocks proof; provider errors remain errors rather than
+  evidence of absence. Repository capabilities retain their existing `using`
+  ownership. `worker/timelines/landing.test.ts` covers 448 revisions with 58
+  overlapping merges, exact receipt membership, old foreign/unacknowledged
+  branches and unavailable ancestry.
 - **Abandoning** is for the accountable person or the agent that started the
   timeline. It ends writes and archives work sources rather than deleting their
   history. Settled partial landings retain successful receipts; abandoning never
@@ -1759,6 +1771,11 @@ the URL says. What each surface does with it:
 
 A landed or abandoned timeline stays selectable: the shell banner says how it
 ended and that its view is read-only, on the tracker and every other page.
+
+The switcher's **Timeline graph** link sits beside its title, above the changing
+list and loading/error messages, so resolving the list does not move a footer
+link during a click. It remains a native link and follows the page's account,
+including an explicitly selected account in Settings.
 
 ## Release notes
 
@@ -2635,6 +2652,10 @@ of those reuse properties.
   write only sanitized reports there. The harness retains allowlisted JSON, not
   credentials, raw logs or browser storage. Setup logs print cache/evidence paths.
   Checkout credentials are deleted before terminal reporting, on success or failure.
+  Failed checkouts retain the last unsuccessful Git operation's stderr, including
+  an exact-commit fetch after a successful shallow clone. Source-landing E2E
+  boundary failures capture failed jobs' CI logs through the redacted recorder,
+  alongside run metadata, before deleting their fixtures.
 - **This repository's pipeline.** Check, test and build start independently on
   `standard-4` Sandboxes; all must pass. The four gates `check`, `test`, `build`
   and `cli` explicitly opt into `verification: context-invariant-v1`; deploy does

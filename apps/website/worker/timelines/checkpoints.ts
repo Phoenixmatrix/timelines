@@ -20,7 +20,12 @@ import {
 import { fail } from "../tracker/store.ts";
 import { checkpointSets } from "../knowledge/pages.ts";
 import { resolveTimelineSource } from "./sources.ts";
-import { admittedReceipts, revisionClosure, validateMergeEdges } from "./integration.ts";
+import {
+  admittedReceipts,
+  RevisionMetadata,
+  revisionClosure,
+  validateMergeEdges,
+} from "./integration.ts";
 import type { SourceDependency } from "../../shared/code-source.ts";
 import { pinSourceRoot } from "../retention/work-sources.ts";
 
@@ -62,21 +67,21 @@ export async function measure(
       const base =
         canonicalRefs.find((ref) => ref.name === `refs/heads/${row.default_branch}`)?.oid ?? null;
       using objects = await env.ARTIFACTS.get(physical.repo.artifacts_name);
-      const snapshot = await objects.readCommit(commit);
+      const metadata = new RevisionMetadata();
+      const readCommit = metadata.reader(physical.repo.artifacts_name, objects);
+      const readParents = async (oid: string) => (await readCommit(oid))?.parents ?? null;
+      const snapshot = await readCommit(commit);
       if (!snapshot || !repo.logicalBase)
         fail("invalid_source", "The source snapshot or logical base is unavailable.", 409);
       const dependencies: SourceDependency[] = [...(repo.dependencies ?? [])];
-      const baseMembers = await revisionClosure(
-        repo.logicalBase.commit,
-        async (oid) => (await objects.readCommit(oid))?.parents ?? null,
-      );
+      const baseMembers = await revisionClosure(repo.logicalBase.commit, readParents);
       const visited = new Set<string>();
       const pending = [commit];
       while (pending.length) {
         const oid = pending.pop()!;
         if (visited.has(oid) || baseMembers.has(oid)) continue;
         visited.add(oid);
-        const value = await objects.readCommit(oid);
+        const value = await readCommit(oid);
         if (!value) fail("blocked_dependency", "A source ancestor is unavailable.", 409);
         pending.push(...value.parents);
         const owner = await db(env.DB)
@@ -117,11 +122,7 @@ export async function measure(
           });
         // This exact imported snapshot covers its full ancestry, including
         // older foreign revisions. Provenance outlives the source's objects.
-        for (const member of await revisionClosure(
-          oid,
-          async (hash) => (await objects.readCommit(hash))?.parents ?? null,
-        ))
-          visited.add(member);
+        for (const member of await revisionClosure(oid, readParents)) visited.add(member);
       }
       // Select only from snapshots actually imported into this source, never
       // from a parent's newer landing tip. Persist this choice in the checkpoint.
@@ -143,10 +144,7 @@ export async function measure(
             uniquelyAdmitted = false;
         const candidates = new Map<string, typeof logicalBase>();
         for (const source of foreign) {
-          const closure = await revisionClosure(
-            source.commit,
-            async (oid) => (await objects.readCommit(oid))?.parents ?? null,
-          );
+          const closure = await revisionClosure(source.commit, readParents);
           if (snapshots.every((snapshot) => closure.has(snapshot.commit)))
             candidates.set(`${source.sourceId}:${source.commit}`, source);
         }
@@ -163,7 +161,7 @@ export async function measure(
           commit,
           logicalBase.commit,
           dependencies.map((dependency) => dependency.source.commit),
-          async (oid) => (await objects.readCommit(oid))?.parents ?? null,
+          readParents,
         );
       } catch (error) {
         if (!(error instanceof Error) || !error.message.startsWith("blocked_dependency:"))
