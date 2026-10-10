@@ -358,18 +358,23 @@ describe("the map view's inspector and controls (CORE-212)", () => {
     const { repo } = await setup();
     await page.viewport(1440, 900);
     const first = renderApp(`${repo.base}?select=${encodeURIComponent(LEDGER)}&view=map`);
-    await expect.element(heading("ledger.ts")).toBeVisible();
+    await expect.element(heading("ledger.ts")).toHaveFocus();
     // 30% of the window, between 23rem and 36rem.
     await expect.poll(inspectorWidth).toBe(432);
     await focusOn(separator());
+    await expect.element(separator()).toHaveFocus();
     await userEvent.keyboard("{ArrowLeft}{ArrowLeft}");
     await expect.poll(inspectorWidth).toBe(464);
     await expect.element(separator()).toHaveAttribute("aria-valuenow", "464");
     // Back after a reload, then Home returns to the default width.
     first.unmount();
     renderApp(`${repo.base}?select=${encodeURIComponent(LEDGER)}&view=map`);
+    // The saved width is applied before the deep link finishes resolving.
+    // Wait for its heading's restore-focus effect before focusing the divider.
+    await expect.element(heading("ledger.ts")).toHaveFocus();
     await expect.poll(inspectorWidth).toBe(464);
     await focusOn(separator());
+    await expect.element(separator()).toHaveFocus();
     await userEvent.keyboard("{Home}");
     await expect.poll(inspectorWidth).toBe(432);
     expect(localStorage.getItem("gitmatrix:atlas-pane")).toBeNull();

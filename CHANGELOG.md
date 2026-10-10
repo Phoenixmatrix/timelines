@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### CORE-330: Atlas inspector reset regression
+
+- The inspector keyboard regression waits for cold-link selection focus on both
+  mounts before focusing the resize divider. A remembered width alone does not
+  mean the asynchronous selection has finished restoring focus. The test retains
+  its exact arrow-resize, remount persistence, Home reset and storage-removal
+  assertions, and checks the divider has focus before sending its keys.
+
 ### CORE-255: owned timeline work and compact canonical landing
 
 - Each timeline owns a separate work Git repository per canonical repository.
