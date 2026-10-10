@@ -60,8 +60,8 @@ export default defineConfig({
   // starts at 63315 (`test.api`), so a second run elsewhere on this machine
   // failed to start instead of taking the next free port.
   server: process.env.VITEST ? {} : { host: local.host, port: local.port, strictPort: true },
-  // Source highlighting loads late; discover its parsers before navigation,
-  // rather than restarting the page when the dependency optimizer finds them.
+  // Source highlighting and audit diffs load late; discover their dependencies
+  // before navigation rather than restarting the page when the optimizer finds them.
   optimizeDeps: {
     include: [
       "@lezer/css",
@@ -75,6 +75,7 @@ export default defineConfig({
       "@lezer/rust",
       "@lezer/xml",
       "@lezer/yaml",
+      "diff",
       "yaml",
     ],
   },
