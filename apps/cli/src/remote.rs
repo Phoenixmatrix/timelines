@@ -694,18 +694,29 @@ pub fn api_with(
     body: Option<&Value>,
     token: Option<&str>,
 ) -> Result<Value> {
-    let url = format!("{}/api{}", config.server(), path);
+    api_at(&config.server(), method, path, body, token)
+}
+
+/// `api_with` against exactly `server`.
+fn api_at(
+    server: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+) -> Result<Value> {
+    let url = format!("{server}/api{path}");
     let agent = agent(&url, false)?;
     let auth = token.map(|t| format!("Bearer {t}"));
     let unreachable = |e: ureq::Error| match e {
         ureq::Error::Timeout(_) => GmError::new(
             "server_timeout",
-            format!("{} didn't answer in time: {e}", config.server()),
+            format!("{server} didn't answer in time: {e}"),
         )
         .hint("The server is slow or stuck; try again shortly."),
         e => GmError::new(
             "server_unreachable",
-            format!("Could not reach {}: {e}", config.server()),
+            format!("Could not reach {server}: {e}"),
         )
         .hint(
             "Is the dev server running? Start it with `vp dev` in apps/website, or set GM_SERVER.",
@@ -1414,17 +1425,10 @@ mod retry_tests {
         (url, seen)
     }
 
-    fn config(url: &str) -> Config {
-        Config {
-            server: Some(url.into()),
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn a_read_retries_gateway_errors_until_the_server_answers() {
         let (url, seen) = serve(vec![503, 502]);
-        let value = api_with(&config(&url), "GET", "/thing", None, None).unwrap();
+        let value = api_at(&url, "GET", "/thing", None, None).unwrap();
         assert_eq!(value["status"], 200);
         assert_eq!(*seen.lock().unwrap(), ["GET", "GET", "GET"]);
     }
@@ -1432,7 +1436,7 @@ mod retry_tests {
     #[test]
     fn a_read_gives_up_after_its_retries_with_the_last_answer() {
         let (url, seen) = serve(vec![504, 503, 502, 200]);
-        let error = api_with(&config(&url), "GET", "/thing", None, None).unwrap_err();
+        let error = api_at(&url, "GET", "/thing", None, None).unwrap_err();
         assert!(error.message.contains("502"), "{}", error.message);
         assert_eq!(seen.lock().unwrap().len(), 3);
     }
@@ -1441,8 +1445,8 @@ mod retry_tests {
     fn writes_and_ordinary_errors_are_never_retried() {
         let (url, seen) = serve(vec![503, 500]);
         let body = serde_json::json!({});
-        assert!(api_with(&config(&url), "POST", "/thing", Some(&body), None).is_err());
-        assert!(api_with(&config(&url), "GET", "/thing", None, None).is_err());
+        assert!(api_at(&url, "POST", "/thing", Some(&body), None).is_err());
+        assert!(api_at(&url, "GET", "/thing", None, None).is_err());
         assert_eq!(*seen.lock().unwrap(), ["POST", "GET"]);
     }
 
@@ -1458,7 +1462,7 @@ mod retry_tests {
                 drop(stream);
             }
         });
-        let error = api_with(&config(&url), "GET", "/thing", None, None).unwrap_err();
+        let error = api_at(&url, "GET", "/thing", None, None).unwrap_err();
         assert_eq!(error.code, "server_unreachable");
         assert_eq!(*accepted.lock().unwrap(), 3);
     }
@@ -1477,7 +1481,7 @@ mod retry_tests {
                 held.push(stream);
             }
         });
-        let error = api_with(&config(&url), "GET", "/thing", None, None).unwrap_err();
+        let error = api_at(&url, "GET", "/thing", None, None).unwrap_err();
         assert_eq!(error.code, "server_timeout");
         assert_eq!(*accepted.lock().unwrap(), 1);
     }
