@@ -1596,6 +1596,14 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   Known foreign work still needs exact reviewed integration. This is
   service-recorded provenance, not proof of where otherwise unknown external
   Git objects were authored.
+  Exact canonical ancestry is separate from source attribution (CORE-335).
+  Checkpoint measurement and landing read the current canonical closure: exact
+  members create no inferred foreign dependency and are covered during native
+  merge validation, regardless of which source first observed them. Equal trees
+  are not ancestry proof. Declared dependencies and foreign logical bases still
+  require their completed exact integration receipts on current canonical history.
+  Previously recorded dependencies are not silently removed: renew the checkpoint
+  after correcting inference, and renew approval where the timeline requires it.
   Checkpoint measurement and each landing progress invocation reuse successful
   immutable commit metadata by physical repository and OID. Overlapping base,
   dependency and merge-parent closures still traverse every ancestor, but do
