@@ -1251,7 +1251,9 @@ read as `agent_decides`.
   focus change, pointer interaction or leaving the window cancels the chord.
   In the tracker, `c`/`n` captures an issue, `/` filters, `j`/`k` selects the
   next/previous issue, and Escape closes it. In Story, `j`/`k` invokes
-  Next/Previous. Help and navigation avoid text entry, composition and other
+  Next/Previous. Story's buttons, row clicks, arrow/letter keys and close actions
+  share the requested selection, so rapid mixed input does not navigate from
+  the previous render. Help and navigation avoid text entry, composition and other
   dialogs; help traps focus and Escape restores it. Cmd/Ctrl-K search and
   Cmd/Ctrl-J assistant shortcuts are unchanged outside help.
 - **Settings:** the gear at the bottom of the navigation rail opens a shared
