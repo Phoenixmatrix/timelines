@@ -2652,6 +2652,10 @@ of those reuse properties.
   write only sanitized reports there. The harness retains allowlisted JSON, not
   credentials, raw logs or browser storage. Setup logs print cache/evidence paths.
   Checkout credentials are deleted before terminal reporting, on success or failure.
+  Failed checkouts retain the last unsuccessful Git operation's stderr, including
+  an exact-commit fetch after a successful shallow clone. Source-landing E2E
+  boundary failures capture failed jobs' CI logs through the redacted recorder,
+  alongside run metadata, before deleting their fixtures.
 - **This repository's pipeline.** Check, test and build start independently on
   `standard-4` Sandboxes; all must pass. The four gates `check`, `test`, `build`
   and `cli` explicitly opt into `verification: context-invariant-v1`; deploy does
