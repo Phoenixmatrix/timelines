@@ -51,7 +51,7 @@ export function Profile() {
 
       <div className="mt-8 flex flex-col gap-6">
         <AvatarCard viewer={viewer} />
-        <Card title="Personal details" className="max-w-xl">
+        <Card title="Personal details">
           <Form method="post" className="mk-card-body" key={viewer.slug}>
             <TextField
               label="Display name"
@@ -82,14 +82,14 @@ export function Profile() {
                 Saved.
               </p>
             )}
-            <div>
+            <div className="mk-form-actions">
               <button className="mk-btn mk-btn--primary" disabled={navigation.state !== "idle"}>
                 Save
               </button>
             </div>
           </Form>
         </Card>
-        <Card title="Assistant skills" className="max-w-xl">
+        <Card title="Assistant skills">
           <div className="mk-card-body">
             <p className="m-0 text-ink-muted">
               Give recurring tasks personal instructions you can use with a slash command in the

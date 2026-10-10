@@ -18,15 +18,17 @@ import { Link, useLocation } from "react-router";
 import { useViewer } from "../lib/session.ts";
 import { Page } from "./AppShell.tsx";
 
-/** One settings area, with account policy separate from personal preferences. */
+/** One settings area: a readable form column, with wide reports kept explicit. */
 export function SettingsPage({
   children,
   owner,
   tracker = false,
+  wide = false,
 }: {
   children: React.ReactNode;
   owner?: string;
   tracker?: boolean;
+  wide?: boolean;
 }) {
   const viewer = useViewer();
   const location = useLocation();
@@ -171,7 +173,7 @@ export function SettingsPage({
 
   return (
     <Page wide>
-      <div className="flex min-w-0 flex-col gap-6 md:flex-row md:gap-8">
+      <div className="settings-layout flex min-w-0 flex-col gap-6 md:flex-row md:gap-8">
         <aside className="hidden w-52 shrink-0 self-start md:sticky md:top-7 md:block">
           <p className="mt-0 mb-5 px-2 text-title">Settings</p>
           {navigation("side")}
@@ -192,7 +194,7 @@ export function SettingsPage({
           </summary>
           <div className="pt-4 pb-2">{navigation("menu")}</div>
         </details>
-        <div className="min-w-0 flex-1">{children}</div>
+        <div className={`min-w-0 flex-1 ${wide || tracker ? "" : "max-w-3xl"}`}>{children}</div>
       </div>
     </Page>
   );
