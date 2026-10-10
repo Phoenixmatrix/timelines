@@ -167,3 +167,75 @@ export async function candidateProofs(
   }
   return proofs;
 }
+
+/** A build planner may compare inputs against an executed, runtime-equivalent job.
+ * This is a baseline, not permission to skip a gate: the consumer must prove ancestry
+ * and classify the complete diff, falling back to execution when either is unknown.
+ */
+export async function previousVerification(d1: D1Database, jobId: string) {
+  const k = db(d1);
+  const target = await k
+    .selectFrom("ci_jobs")
+    .selectAll()
+    .where("id", "=", jobId)
+    .executeTakeFirst();
+  if (
+    !target ||
+    target.source_id !== "canonical" ||
+    target.runner !== "sandbox" ||
+    target.status !== "running" ||
+    !target.execution_identity ||
+    !eligibleVerification(JSON.parse(target.spec))
+  )
+    return null;
+  const previous = await k
+    .selectFrom("ci_jobs as j")
+    .innerJoin("ci_runs as r", "r.id", "j.run_id")
+    .select(["j.id", "r.number", "r.commit_oid"])
+    .where("j.id", "!=", jobId)
+    .where("j.repo_id", "=", target.repo_id)
+    .where("r.repo_id", "=", target.repo_id)
+    .where("j.source_id", "=", "canonical")
+    .where("r.source_id", "=", "canonical")
+    .where("j.name", "=", target.name)
+    .where("j.spec", "=", target.spec)
+    .where("j.execution_identity", "=", target.execution_identity)
+    .where("j.runner", "=", "sandbox")
+    .where("j.claimed_by", "=", "sandbox")
+    .where("j.status", "=", "succeeded")
+    .where("j.exit_code", "=", 0)
+    .where("j.error", "is", null)
+    .where("j.verified_by", "is", null)
+    .where("j.source_completion_pending", "=", 0)
+    .where("j.started_at", "is not", null)
+    .where("j.finished_at", "is not", null)
+    .where("r.status", "=", "succeeded")
+    .where("r.config_error", "is", null)
+    .where("r.covered_by", "is", null)
+    .where("r.started_at", "is not", null)
+    .where("r.finished_at", "is not", null)
+    .orderBy("r.number", "desc")
+    .executeTakeFirst();
+  if (!previous) return null;
+  const spec = JSON.parse(target.spec) as StoredJob;
+  const steps = await k
+    .selectFrom("ci_steps")
+    .selectAll()
+    .where("job_id", "=", previous.id)
+    .orderBy("position")
+    .execute();
+  if (
+    steps.length !== spec.steps.length ||
+    steps.some(
+      (step, position) =>
+        step.position !== position ||
+        step.name !== spec.steps[position]?.name ||
+        step.status !== "succeeded" ||
+        step.exit_code !== 0 ||
+        !step.started_at ||
+        !step.finished_at,
+    )
+  )
+    return null;
+  return { commit: previous.commit_oid, runNumber: previous.number, jobId: previous.id };
+}

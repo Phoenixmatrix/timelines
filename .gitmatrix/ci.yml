@@ -122,10 +122,10 @@ jobs:
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
-      # Fresh clones gain nothing from the task cache, and its file tracking
-      # can fail to spawn native tools (spawn EBUSY).
+      # Use only a runtime-equivalent successful job as a change baseline. The
+      # planner defaults to the full build if evidence/history is unavailable.
       - name: Build (gm's release build runs when deploy publishes a new version)
-        run: vp run --filter '!cli' --concurrency-limit 1 --no-cache build
+        run: node tools/agent/ci-build.ts
 
   # gm, the Rust CLI: skipped while apps/cli is unchanged since it last passed,
   # and then counts as passed for deploy.
