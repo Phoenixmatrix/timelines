@@ -154,9 +154,13 @@ export async function validateMergeEdges(
   base: string,
   dependencies: readonly string[],
   read: ReadParents,
+  canonical: ReadonlySet<string>,
 ) {
   const baseline = await revisionClosure(base, read);
   const covered = new Set(baseline);
+  // Current canonical ancestry is already admitted independently of whichever
+  // work source first observed it. Explicit dependencies are checked separately.
+  for (const oid of canonical) covered.add(oid);
   for (const dependency of dependencies)
     for (const oid of await revisionClosure(dependency, read)) covered.add(oid);
   const local = new Map<string, boolean>();

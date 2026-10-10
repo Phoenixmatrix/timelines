@@ -75,6 +75,14 @@ export async function measure(
         fail("invalid_source", "The source snapshot or logical base is unavailable.", 409);
       const dependencies: SourceDependency[] = [...(repo.dependencies ?? [])];
       const baseMembers = await revisionClosure(repo.logicalBase.commit, readParents);
+      using canonicalObjects = base ? await env.ARTIFACTS.get(row.artifacts_name) : null;
+      const readCanonical = canonicalObjects
+        ? metadata.reader(row.artifacts_name, canonicalObjects)
+        : null;
+      const canonical =
+        base && readCanonical
+          ? await revisionClosure(base, async (oid) => (await readCanonical(oid))?.parents ?? null)
+          : new Set<string>();
       const visited = new Set<string>();
       const pending = [commit];
       while (pending.length) {
@@ -84,6 +92,9 @@ export async function measure(
         const value = await readCommit(oid);
         if (!value) fail("blocked_dependency", "A source ancestor is unavailable.", 409);
         pending.push(...value.parents);
+        // Origins record first observation, not exclusive ownership. An exact
+        // current-canonical ancestor is not an inferred foreign dependency.
+        if (canonical.has(oid)) continue;
         const owner = await db(env.DB)
           .selectFrom("source_revision_origins as origin")
           .innerJoin("timeline_work_sources as s", "s.source_id", "origin.source_id")
@@ -128,11 +139,6 @@ export async function measure(
       // from a parent's newer landing tip. Persist this choice in the checkpoint.
       let logicalBase = repo.logicalBase;
       if (base && dependencies.some((dependency) => !baseMembers.has(dependency.source.commit))) {
-        using canonicalObjects = await env.ARTIFACTS.get(row.artifacts_name);
-        const canonical = await revisionClosure(
-          base,
-          async (oid) => (await canonicalObjects.readCommit(oid))?.parents ?? null,
-        );
         const snapshots = [logicalBase, ...dependencies.map((dependency) => dependency.source)];
         const foreign = snapshots.filter(
           (source) =>
@@ -162,6 +168,7 @@ export async function measure(
           logicalBase.commit,
           dependencies.map((dependency) => dependency.source.commit),
           readParents,
+          canonical,
         );
       } catch (error) {
         if (!(error instanceof Error) || !error.message.startsWith("blocked_dependency:"))

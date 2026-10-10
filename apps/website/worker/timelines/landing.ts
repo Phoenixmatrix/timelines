@@ -358,12 +358,8 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
         stopped(landing, "failed", "Canonical main is unavailable", repo.id),
       );
     try {
-      await validateDependencies(
-        ctx.env,
-        repo,
-        await revisionClosure(main, (oid) => deps.parents(r!, oid)),
-        ctx.metadata,
-      );
+      const canonical = await revisionClosure(main, (oid) => deps.parents(r!, oid));
+      await validateDependencies(ctx.env, repo, canonical, ctx.metadata);
       using work = await ctx.env.ARTIFACTS.get(source.artifacts_name);
       const readCommit = ctx.metadata.reader(source.artifacts_name, work);
       for (const snapshot of [
@@ -382,6 +378,7 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
         repo.logicalBase.commit,
         repo.dependencies.map((dependency) => dependency.source.commit),
         async (oid) => (await readCommit(oid))?.parents ?? null,
+        canonical,
       );
     } catch (error) {
       // A transport failure defers progress without invalidating prepared candidates.

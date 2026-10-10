@@ -950,7 +950,8 @@ describe("exact nested admission", () => {
           await retain("merge-push", merge);
         }
         const read = async (hash: string) => f.graphs.get("work_0")!.get(hash)?.parents ?? null;
-        const validate = () => validateMergeEdges(f.env, source, merge, base, [], read);
+        const canonical = await revisionClosure(base, read);
+        const validate = () => validateMergeEdges(f.env, source, merge, base, [], read, canonical);
         await expect(validate()).resolves.toBeUndefined();
         const membership = f.sqlite
           .prepare(
@@ -1004,12 +1005,12 @@ describe("exact nested admission", () => {
           .run(foreign);
         await retain("import-push", localTip);
         await expect(
-          validateMergeEdges(f.env, source, importedMerge, base, [], read),
+          validateMergeEdges(f.env, source, importedMerge, base, [], read, canonical),
         ).rejects.toThrow("blocked_dependency");
         // Even a linear import keeps its foreign attribution after physical expiry.
-        await expect(validateMergeEdges(f.env, source, localTip, base, [], read)).rejects.toThrow(
-          "blocked_dependency",
-        );
+        await expect(
+          validateMergeEdges(f.env, source, localTip, base, [], read, canonical),
+        ).rejects.toThrow("blocked_dependency");
         expect(
           f.sqlite
             .prepare("SELECT source_id FROM source_revision_origins WHERE commit_oid=?")
@@ -1069,6 +1070,180 @@ describe("exact nested admission", () => {
       } finally {
         f.sqlite.close();
         rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+  test.each([
+    "linear",
+    "merge",
+    "foreign",
+    "equal tree",
+    "declared",
+    "canonical removed",
+    "foreign side",
+    "unacknowledged side",
+  ] as const)("canonical ancestry does not imply foreign source ownership: %s", async (mode) => {
+    const f = fixture(1);
+    try {
+      const repo = f.current.repos[0]!;
+      const base = repo.logicalBase!;
+      const imported = {
+        ...repo.source!,
+        sourceId: "foreign",
+        timelineId: "foreign",
+        commit: oid(80),
+      };
+      const queued = oid(81);
+      const main = oid(82);
+      const local = oid(83);
+      const side = oid(84);
+      const graph = f.graphs.get("work_0")!;
+      const canonicalGraph = f.graphs.get(repo.id)!;
+      const append = (hash: string, parents: string[]) => ({
+        hash,
+        parents,
+        treeHash: imported.tree,
+        message: "snapshot",
+      });
+      graph.set(queued, append(queued, [base.commit]));
+      graph.set(imported.commit, append(imported.commit, [base.commit, queued]));
+      graph.set(local, append(local, [base.commit]));
+      graph.set(
+        repo.commit,
+        append(repo.commit, mode === "linear" ? [imported.commit] : [local, imported.commit]),
+      );
+      canonicalGraph.set(main, append(main, [base.commit]));
+      if (mode === "foreign") canonicalGraph.get(main)!.treeHash = oid(180);
+      if (mode !== "foreign" && mode !== "equal tree") {
+        canonicalGraph.set(queued, graph.get(queued)!);
+        canonicalGraph.set(imported.commit, graph.get(imported.commit)!);
+        canonicalGraph.set(main, append(main, [imported.commit]));
+      }
+      // In the equal-tree case, matching content is deliberately not matching
+      // canonical history and must still require an exact source integration.
+      f.refs.get(repo.id)!.set("refs/heads/main", main);
+      canonicalGraph.set(repo.merge!, append(repo.merge!, [main]));
+      f.sqlite.exec(`INSERT INTO timeline_work_sources
+        (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,
+         allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
+         initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,initial_token_revoked)
+        VALUES('foreign','repo0','foreign','foreign','owner','foreign','https://foreign','ready',
+          'foreign-allocation','canonical','${base.commit}','${base.tree}','refs/heads/main',
+          'canonical','${base.commit}','${base.tree}','refs/heads/main','now','now',1);
+        INSERT INTO source_revision_origins(repo_id,commit_oid,source_id)
+        VALUES('repo0','${imported.commit}','foreign'),('repo0','${queued}','foreign')`);
+      if (mode === "foreign side" || mode === "unacknowledged side") {
+        graph.set(side, append(side, [base.commit]));
+        graph.set(local, append(local, [base.commit, side]));
+        if (mode === "foreign side")
+          f.sqlite
+            .prepare(`INSERT INTO source_revision_origins(repo_id,commit_oid,source_id)
+            VALUES('repo0',?,'foreign')`)
+            .run(side);
+      }
+      if (mode === "declared") repo.dependencies = [{ source: imported, base }];
+      vi.mocked(lsRefs).mockImplementation(async (_env, name) =>
+        [...f.refs.get(name)!].map(([name, oid]) => ({ name, oid })),
+      );
+      const checkpoint = measure(
+        f.env,
+        { id: "owner", slug: "owner", displayName: "Owner", isSiteAdmin: false },
+        { id: "timeline", repos: [repo] } as unknown as Timeline,
+      );
+      if (mode === "unacknowledged side") {
+        await expect(checkpoint).rejects.toThrow("blocked_dependency");
+      } else {
+        const [measured] = await checkpoint;
+        expect(measured!.logicalBase).toEqual(base);
+        expect(measured!.dependencies?.map((dependency) => dependency.source.commit)).toEqual(
+          mode === "foreign" || mode === "equal tree" || mode === "declared"
+            ? [imported.commit]
+            : mode === "foreign side"
+              ? [side]
+              : [],
+        );
+        Object.assign(repo, measured);
+      }
+      if (mode === "canonical removed") f.refs.get(repo.id)!.set("refs/heads/main", base.commit);
+      const result = await f.run();
+      if (mode === "linear" || mode === "merge") {
+        expect(result.state).toBe("landed");
+        expect(f.writes).toEqual([repo.id]);
+        expect(
+          f.sqlite
+            .prepare("SELECT source_id FROM source_revision_origins WHERE commit_oid=?")
+            .get(imported.commit),
+        ).toEqual({ source_id: "foreign" });
+        expect(
+          f.sqlite.prepare("SELECT source_id,status FROM source_integration_receipts").all(),
+        ).toEqual([{ source_id: "work_0", status: "complete" }]);
+      } else {
+        expect(result.state).toBe("blocked_dependency");
+        expect(f.writes).toEqual([]);
+        expect(
+          f.sqlite.prepare("SELECT count(*) AS count FROM source_integration_receipts").get(),
+        ).toEqual({ count: 0 });
+      }
+    } finally {
+      f.sqlite.close();
+    }
+  });
+  test.each(["canonical missing", "canonical error", "source missing", "source error"] as const)(
+    "canonical admission still requires complete available ancestry: %s",
+    async (mode) => {
+      const f = fixture(1);
+      try {
+        const repo = f.current.repos[0]!;
+        const ancestor = oid(80);
+        const commit = {
+          hash: ancestor,
+          parents: [repo.base!],
+          treeHash: oid(102),
+          message: "canonical",
+        };
+        f.graphs.get(repo.id)!.set(ancestor, commit);
+        f.graphs.get("work_0")!.set(ancestor, commit);
+        f.graphs.get("work_0")!.get(repo.commit)!.parents = [ancestor];
+        f.refs.get(repo.id)!.set("refs/heads/main", ancestor);
+        const target = mode.startsWith("canonical") ? repo.id : "work_0";
+        if (mode.endsWith("missing")) f.graphs.get(target)!.delete(ancestor);
+        else {
+          const get = f.env.ARTIFACTS.get.bind(f.env.ARTIFACTS);
+          Object.assign(f.env.ARTIFACTS, {
+            get: async (name: string) => {
+              const artifacts = await get(name);
+              const read = artifacts.readCommit.bind(artifacts);
+              return Object.assign(artifacts, {
+                readCommit: async (hash: string) => {
+                  if (name === target && hash === ancestor)
+                    throw new Error("Artifacts INTERNAL_ERROR");
+                  return read(hash);
+                },
+              });
+            },
+          });
+          const parents = f.deps.parents;
+          f.deps.parents = async (row, hash) => {
+            if (row.artifacts_name === target && hash === ancestor)
+              throw new Error("Artifacts INTERNAL_ERROR");
+            return parents(row, hash);
+          };
+        }
+        vi.mocked(lsRefs).mockImplementation(async (_env, name) =>
+          [...f.refs.get(name)!].map(([name, oid]) => ({ name, oid })),
+        );
+        await expect(
+          measure(f.env, { id: "owner", slug: "owner", displayName: "Owner", isSiteAdmin: false }, {
+            id: "timeline",
+            repos: [repo],
+          } as unknown as Timeline),
+        ).rejects.toThrow(mode.endsWith("error") ? "Artifacts INTERNAL_ERROR" : /unavailable/);
+        expect((await f.run()).state).toBe(
+          mode.endsWith("error") ? "advancing" : "blocked_dependency",
+        );
+        expect(f.writes).toEqual([]);
+      } finally {
+        f.sqlite.close();
       }
     },
   );
@@ -1193,11 +1368,12 @@ describe("exact nested admission", () => {
       merge: ["local", "foreign"],
     };
     const read = async (oid: string) => graph[oid] ?? null;
+    const canonical = await revisionClosure("base", read);
     await expect(
-      validateMergeEdges(f.env, repo.source!, "merge", "base", [], read),
+      validateMergeEdges(f.env, repo.source!, "merge", "base", [], read, canonical),
     ).rejects.toThrow("blocked_dependency");
     await expect(
-      validateMergeEdges(f.env, repo.source!, "merge", "base", ["foreign"], read),
+      validateMergeEdges(f.env, repo.source!, "merge", "base", ["foreign"], read, canonical),
     ).resolves.toBeUndefined();
     await recordIntent(f.env, f.current, repo, oid(102));
     f.sqlite.exec("UPDATE source_integration_receipts SET status='complete'");
