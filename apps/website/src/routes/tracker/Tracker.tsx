@@ -33,6 +33,7 @@ import {
   FunnelSimpleIcon,
   MagnifyingGlassIcon,
   RowsIcon,
+  ScrollIcon,
   StarIcon,
   XIcon,
 } from "@phosphor-icons/react";
@@ -910,12 +911,13 @@ function Workbench({ data }: { data: TrackerView }) {
         <div className="ml-auto flex min-h-(--size-field) items-center gap-1">
           {!admin && (
             <Link
-              className="mk-btn mk-btn--ghost mk-btn--sm no-underline"
+              className="mk-btn min-h-(--size-field) border border-line no-underline"
               to={releasesHref}
               aria-label={
                 releaseTeam ? `Release notes for ${releaseTeam.toUpperCase()}` : "All release notes"
               }
             >
+              <ScrollIcon size={20} aria-hidden />
               Release notes
             </Link>
           )}

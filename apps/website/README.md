@@ -1823,8 +1823,10 @@ Facets count the matching entries. It requires membership in the tracker
 account, and also applies repository visibility and per-entry tracker access.
 `gm release feed [QUERY] [--team KEY] [--owner OWNER]` is the CLI equivalent.
 
-The issue tracker's header shortcut carries its current single-team scope,
-including a saved default team; explicit URL filters take precedence. It drops
+The issue tracker's header exposes **Release notes** as a full-size, bordered
+button with the same scroll icon as the navigation rail and a 44px minimum touch
+target. It carries the current single-team scope, including a saved default team;
+explicit URL filters take precedence. It drops
 issue-only filters so completed work is included. With no single team selected,
 the shortcut opens all account notes. The navigation rail always opens the
 account-wide feed.
