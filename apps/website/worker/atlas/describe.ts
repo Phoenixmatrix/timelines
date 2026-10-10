@@ -164,7 +164,20 @@ interface Prepared {
   concepts: { id: string; name: string; definition: string; files: number }[];
   membership: { files: number; importLinks: number };
   input: unknown;
+  /** What the prose is cached by (`identity` in prepare). */
   inputsHash: string;
+  /** The cache key before components were keyed by their members: adopted, not rewritten. */
+  legacyHash: string;
+  inputParts: Record<string, string>;
+}
+
+/** A short hash per input part: when inputs change, provenance says which. */
+async function inputParts(parts: (readonly [string, unknown])[]) {
+  return Object.fromEntries(
+    await Promise.all(
+      parts.map(async ([key, value]) => [key, (await sha256(JSON.stringify(value))).slice(0, 12)]),
+    ),
+  ) as Record<string, string>;
 }
 
 interface Reply {
@@ -449,6 +462,16 @@ async function prepare(env: Env, ctx: DescribeContext): Promise<Prepared[]> {
         import_links_between_members: membership.importLinks,
       },
     };
+    // What the prose is cached by: the input, with each component as the
+    // members it shares rather than its title and summary. Those are model
+    // output, rewritten whenever any of the component's files is (a README
+    // edit rewords the root component every capability overlaps), so caching
+    // by them made one edit re-describe every capability (as CORE-286 found
+    // for concept definitions).
+    const identity = {
+      ...input,
+      components: components.map((c) => ({ id: c.id, member_files: c.paths })),
+    };
     const interimName =
       typeof entity.data.interimName === "string" ? entity.data.interimName : entity.name;
     prepared.push({
@@ -460,8 +483,26 @@ async function prepare(env: Env, ctx: DescribeContext): Promise<Prepared[]> {
       membership,
       input,
       inputsHash: await sha256(
+        `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:${ctx.repoId}:canonical:${JSON.stringify(identity)}`,
+      ),
+      legacyHash: await sha256(
         `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:${ctx.repoId}:canonical:${JSON.stringify(input)}`,
       ),
+      inputParts: await inputParts([
+        ...input.files.map((f) => [`file:${f.path}`, f] as const),
+        ...identity.components.map((c) => [`component:${c.id}`, c] as const),
+        ...input.concepts.map((c, i) => [`concept:${concepts[i]!.id}`, c] as const),
+        ["areas", input.areas ?? null],
+        ["grouping", input.grouping],
+        [
+          "order",
+          [
+            ...files.map((f) => f.path),
+            ...components.map((c) => c.id),
+            ...concepts.map((c) => c.id),
+          ],
+        ],
+      ]),
     });
   }
   // Largest first: when a cap stops paid work, the biggest regions have words.
@@ -573,6 +614,7 @@ function accept(
       version: DESCRIBE_VERSION,
       model,
       inputsHash: p.inputsHash,
+      inputParts: p.inputParts,
       basis: {
         repoId: ctx.repoId,
         sourceId: "canonical",
@@ -650,13 +692,23 @@ export async function describeRepoCapabilities(
     return null;
   };
 
+  // Prose cached before components were keyed by their members, from exactly
+  // these inputs, is adopted under the new key rather than written again.
+  const adopted = async (p: Prepared): Promise<CachedDescription | null> => {
+    const hit = await cached<CachedDescription>(env.DB, p.legacyHash);
+    if (hit) await remember(env.DB, p.inputsHash, hit, hit.inference.model, 0);
+    return hit;
+  };
+
   // Once paid work stops (a cap, no price, a failing provider), it stays stopped.
   let stopped: Extract<Outcome, { kind: "missing" }> | null = options.infer
     ? null
     : { kind: "missing", reason: options.unavailable ?? "disabled" };
   const outcomes = await pool(prepared, CONCURRENCY, async (p): Promise<Outcome> => {
     const hit =
-      (await cached<CachedDescription>(env.DB, p.inputsHash)) ?? (await previousDescription(p));
+      (await cached<CachedDescription>(env.DB, p.inputsHash)) ??
+      (await adopted(p)) ??
+      (await previousDescription(p));
     if (hit) return { kind: "current", value: hit, cached: true };
     if (stopped || !options.infer) return stopped ?? { kind: "missing", reason: "disabled" };
     const user = JSON.stringify(p.input);

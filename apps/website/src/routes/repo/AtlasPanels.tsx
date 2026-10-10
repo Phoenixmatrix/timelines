@@ -201,22 +201,25 @@ export function AtlasLookup({
           />
         </span>
       </label>
-      <div role="group" aria-label="Kind" className="flex flex-wrap gap-1">
-        {[null, ...LOOKUP_KINDS].map((kind) => (
-          <button
-            key={kind ?? "all"}
-            type="button"
-            aria-pressed={url.kind === kind}
-            className="mk-chip cursor-pointer border-0 aria-pressed:bg-signal-wash aria-pressed:text-ink pointer-coarse:min-h-11"
-            onClick={() => {
-              setShowMatches(true);
-              onKind(kind);
-            }}
-          >
-            {kind ? FILTER_LABEL[kind] : "All"}
-          </button>
-        ))}
-      </div>
+      {/* Narrowing by kind only matters while looking something up (CORE-212). */}
+      {(query || url.kind) && (
+        <div role="group" aria-label="Kind" className="flex flex-wrap gap-1">
+          {[null, ...LOOKUP_KINDS].map((kind) => (
+            <button
+              key={kind ?? "all"}
+              type="button"
+              aria-pressed={url.kind === kind}
+              className="mk-chip cursor-pointer border-0 aria-pressed:bg-signal-wash aria-pressed:text-ink pointer-coarse:min-h-11"
+              onClick={() => {
+                setShowMatches(true);
+                onKind(kind);
+              }}
+            >
+              {kind ? FILTER_LABEL[kind] : "All"}
+            </button>
+          ))}
+        </div>
+      )}
       {query && (
         <div className="flex items-center gap-2">
           <p role="status" className="m-0 min-w-0 flex-1 text-micro text-ink-faint">

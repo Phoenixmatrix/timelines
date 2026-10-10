@@ -196,6 +196,7 @@ export function AtlasTerritory({
   origin,
   emphasis = NO_EMPHASIS,
   emphasisNote = null,
+  changes = false,
 }: {
   territory: Territory;
   selected: string | null;
@@ -216,6 +217,12 @@ export function AtlasTerritory({
   emphasis?: ReadonlySet<string>;
   /** What the outline means, for the hover card. */
   emphasisNote?: string | null;
+  /**
+   * Mark what changed in the build this map shows with a dot (CORE-212). Off
+   * by default: after a broad rebuild nearly everything has one, so it's shown
+   * on request; the hover card and the outline still say it in words.
+   */
+  changes?: boolean;
 }) {
   const wrap = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -281,11 +288,19 @@ export function AtlasTerritory({
   }, [territory]);
 
   // Fly to the selection, once it's on the map.
-  const target = selected ? territory.byId.get(selected) : undefined;
+  const chosen = selected ? territory.byId.get(selected) : undefined;
+  // A file is shown in its area, not alone across the whole map (CORE-212).
+  const target = (chosen && chosen.hex < HEX && areaOf(territory, chosen)) || chosen;
+  // An area's files, once loaded: the zoom is for reading them (CORE-212).
+  const leaves = target ? smallestLeaf(territory, target.id) : 0;
   useEffect(() => {
     if (!target || !size.current.w) return;
     const { w, h } = size.current;
     let k = Math.min(40, (w * 0.55) / target.w, (h * 0.55) / target.h);
+    // An area: close enough that its files' names fit, two short lines each,
+    // even if the area then fills the view; but never more than twice as close
+    // as fitting it, so it never loses its shape.
+    if (leaves) k = Math.min(40, Math.max(k, Math.min(LEGIBLE / leaves, k * 2)));
     // A country: close enough to name its concepts, while its neighbours,
     // where its routes go, stay in view where they can.
     if (target.depth === 0 && !target.hex) {
@@ -298,7 +313,7 @@ export function AtlasTerritory({
       y: h / 2 - (target.y + target.h / 2) * k,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fly when the target's place changes
-  }, [target?.id, target?.x, target?.y, target?.w]);
+  }, [target?.id, target?.x, target?.y, target?.w, leaves]);
   useEffect(() => () => cancelAnimationFrame(flight.current), []);
   // Colours come from the theme's tokens: draw again when the theme changes.
   useEffect(() => {
@@ -419,6 +434,39 @@ export function AtlasTerritory({
       }
       return out;
     };
+    /**
+     * A file's name in up to `most` lines of `max` px (CORE-212). Names have no
+     * spaces to wrap at, so a line ends after the last `.`, `_` or `-` that
+     * fits, or wherever it must; only the last line is cut short.
+     */
+    const nameLines = (text: string, max: number, most = 2): string[] => {
+      const out: string[] = [];
+      let rest = text;
+      while (rest && out.length < most) {
+        if (out.length === most - 1 || ctx.measureText(rest).width <= max) {
+          const last = fitText(rest, max);
+          if (last) out.push(last);
+          break;
+        }
+        let end = 1;
+        while (end < rest.length && ctx.measureText(rest.slice(0, end + 1)).width <= max) end++;
+        // Of the breaks after `.`, `_` or `-` that fit, the one nearest the
+        // middle, so "landing.test.ts" reads "landing." / "test.ts".
+        let cut = end;
+        let best = Infinity;
+        for (let i = 0; i < end; i++)
+          if (".-_".includes(rest[i]!) && i + 1 >= Math.floor(end * 0.4)) {
+            const off = Math.abs(i + 1 - rest.length / 2);
+            if (off < best) {
+              best = off;
+              cut = i + 1;
+            }
+          }
+        out.push(rest.slice(0, cut));
+        rest = rest.slice(cut);
+      }
+      return out;
+    };
     const opened = (c: TerritoryCell) => openAt(c, k);
     const visibleParent = (c: TerritoryCell): boolean => {
       if (!c.parent) return true;
@@ -480,6 +528,7 @@ export function AtlasTerritory({
         if (c.structural) structural.add(c.id);
       }
     const selTop = sel ? topOf(sel).id : null;
+    const focusArea = sel ? areaOf(territory, sel) : undefined;
 
     // World space from here: lines are set in screen pixels over k.
     ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * tx, dpr * ty);
@@ -551,6 +600,19 @@ export function AtlasTerritory({
     ctx.setLineDash([px(4), px(4)]);
     ctx.stroke(scene.isles);
     ctx.setLineDash([]);
+
+    // With an area, or a file in one, selected, the other areas sink under the
+    // sea a little, so its own files lead instead of their empty tiles (CORE-212).
+    if (focusArea) {
+      ctx.fillStyle = color.sea;
+      ctx.globalAlpha = 0.62;
+      const veil = new Path2D();
+      for (const c of territory.cells)
+        if (c.depth === focusArea.depth && c.hex && c.id !== focusArea.id && shown(c))
+          hexPath(veil, c.anchor.x, c.anchor.y, c.hex * 0.9);
+      ctx.fill(veil);
+      ctx.globalAlpha = 1;
+    }
 
     for (const c of territory.cells) {
       if (!emphasis.has(c.id) || !shown(c)) continue;
@@ -747,11 +809,16 @@ export function AtlasTerritory({
     const pill = (c: TerritoryCell, active: boolean) => {
       if (!active && (sx(c.x + c.w) < 0 || sx(c.x) > w || sy(c.y + c.h) < 0 || sy(c.y) > h)) return;
       const sizePx = c.depth === 0 ? 14 : 13;
+      // A country's pill also says how big it is, as its label in the middle used to.
+      const files = c.entity.counts.files;
+      const count = isCountry(c) && files !== undefined ? fileLabel(files) : null;
+      ctx.font = `450 11px ${mono}`;
+      const countPx = count ? ctx.measureText(count).width + 8 : 0;
       ctx.font = `700 ${sizePx}px ${font}`;
-      const name = fitText(c.entity.name, 260);
+      const name = fitText(c.entity.name, 320);
       if (!name) return;
-      const dot = c.changed ? 14 : 0;
-      const wpx = ctx.measureText(name).width + 22 + dot;
+      const dot = changes && c.changed ? 14 : 0;
+      const wpx = ctx.measureText(name).width + 22 + dot + countPx;
       const hpx = 26;
       // Kept on screen, but within the region's own extent.
       const clampTo = (v: number, lo: number, hi: number) =>
@@ -762,7 +829,8 @@ export function AtlasTerritory({
         Math.min(w - wpx / 2 - 6, sx(c.x + c.w) - wpx / 2),
       );
       const y0 = clampTo(
-        sy(c.y + (c.hex ? c.hex * 0.42 : 0)) + (c.hex ? 0 : 6),
+        // A country's sits on its top coast, so its concepts below keep their names.
+        sy(c.y + (c.hex ? c.hex * 0.42 : 0)) + (c.hex ? 0 : isCountry(c) ? -2 : 6),
         hpx / 2 + 44,
         Math.min(h - hpx / 2 - 6, sy(c.y + c.h) - hpx / 2),
       );
@@ -787,7 +855,12 @@ export function AtlasTerritory({
       ctx.stroke();
       if (dot) changedDot(box.x0 + 13, y);
       ctx.fillStyle = color.ink;
-      ctx.fillText(name, x + dot / 2, y + 0.5);
+      ctx.fillText(name, x + dot / 2 - countPx / 2, y + 0.5);
+      if (count) {
+        ctx.font = `450 11px ${mono}`;
+        ctx.fillStyle = color.muted;
+        ctx.fillText(count, box.x1 - 11 - (countPx - 8) / 2, y + 0.5);
+      }
     };
     const opensInto = (c: TerritoryCell) =>
       opened(c) && territory.cells.some((d) => d.parent === c.id && d.size > 0);
@@ -815,10 +888,11 @@ export function AtlasTerritory({
       .sort(
         (a, b) => a.depth - b.depth || (b.entity.counts.files ?? 0) - (a.entity.counts.files ?? 0),
       );
-    // Regions whose insides are named get a pill; what's inside, the names in line.
-    for (const c of order) if (opensInto(c)) pill(c, false);
+    // Countries, and regions whose insides are named, get a pill; what's inside,
+    // the names in line (CORE-212: a country's name no longer covers its concepts).
+    for (const c of order) if (opensInto(c) || isCountry(c)) pill(c, false);
     for (const c of order) {
-      if (opensInto(c)) continue;
+      if (opensInto(c) || isCountry(c)) continue;
       const leaf = c.depth > 0 && c.hex > 0 && c.hex < HEX;
       // Room for a name across the middle of its hexagon, or of its country's.
       const room = c.hex ? c.hex * SQ3 * k * 0.86 : Math.min(c.w * k * 0.7, 240);
@@ -835,7 +909,9 @@ export function AtlasTerritory({
             : 12.5;
       const weight = leaf ? 500 : c.depth === 0 ? 700 : 600;
       ctx.font = `${weight} ${sizePx}px ${font}`;
-      const name = lines(leaf ? shortName(c) : c.entity.name, Math.max(40, room), leaf ? 2 : 3);
+      const name = leaf
+        ? nameLines(shortName(c), Math.max(40, room))
+        : lines(c.entity.name, Math.max(40, room), 3);
       if (!name.length) continue;
       const counts = !leaf && (c.hex ? c.hex * k >= 52 : true);
       const line = sizePx * 1.18;
@@ -866,7 +942,9 @@ export function AtlasTerritory({
         break;
       }
       if (!spot) continue;
-      const related = !lit.size || lit.has(topOf(c).id);
+      const related =
+        (!lit.size || lit.has(topOf(c).id)) &&
+        (!focusArea || c.depth < focusArea.depth || isInside(territory, c, focusArea.id));
       const top = spot.y - height / 2 + line / 2;
       name.forEach((n, i) =>
         text(
@@ -890,13 +968,13 @@ export function AtlasTerritory({
           10.5,
           mono,
         );
-      if (c.changed) changedDot(spot.x - width / 2 - 9, top);
+      if (changes && c.changed) changedDot(spot.x - width / 2 - 9, top);
     }
     // Changed concepts and regions too small for a label still show their
     // dot; files and symbols only once they're named.
     for (const c of order) {
       const r = c.hex || HEX;
-      if (!c.changed || opensInto(c) || r * k < 3 || r < HEX) continue;
+      if (!changes || !c.changed || opensInto(c) || r * k < 3 || r < HEX) continue;
       if (c.hex && c.hex * k >= (c.hex < HEX && c.depth > 0 ? SHOW.named : SHOW.concepts) * 0.85)
         continue;
       if (!c.hex) continue;
@@ -964,6 +1042,7 @@ export function AtlasTerritory({
     emphasis,
     hovered,
     overview,
+    changes,
   ]);
 
   /** Centre the view on a point of the minimap. */
@@ -1119,6 +1198,28 @@ export function AtlasTerritory({
 }
 
 /** Whether `cell` lies inside the region `id`. */
+/** A capability's own land: concepts on it, its name in a pill above (CORE-212). */
+const isCountry = (c: TerritoryCell) => c.depth === 0 && !c.hex && !c.structural;
+
+/** How large, on screen, the radius of an area's files must be to read their names (CORE-212). */
+const LEGIBLE = 46;
+
+/** The radius of the smallest file hexagon directly inside `id`, or 0 when none is loaded. */
+function smallestLeaf(territory: Territory, id: string): number {
+  let least = 0;
+  for (const c of territory.cells)
+    if (c.parent === id && c.hex > 0 && c.hex < HEX && (!least || c.hex < least)) least = c.hex;
+  return least;
+}
+
+/** The area a selection is, or is in; none for a capability. */
+function areaOf(territory: Territory, cell: TerritoryCell): TerritoryCell | undefined {
+  if (cell.depth === 0 || !cell.hex) return undefined;
+  if (cell.hex >= HEX) return cell;
+  const parent = cell.parent ? territory.byId.get(cell.parent) : undefined;
+  return parent && parent.depth > 0 && parent.hex >= HEX ? parent : undefined;
+}
+
 function isInside(territory: Territory, cell: TerritoryCell, id: string): boolean {
   for (
     let c: TerritoryCell | undefined = cell;

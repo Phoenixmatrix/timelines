@@ -13,7 +13,17 @@
 // view; it never switches silently.
 
 import { ArrowClockwiseIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type RefObject,
+} from "react";
 import {
   data as routeResponse,
   Link,
@@ -51,6 +61,7 @@ import { scopeOf } from "../../lib/timelineScope.ts";
 import { useViewer } from "../../lib/session.ts";
 import { usePalette } from "../../palette/Palette.tsx";
 import { useMediaQuery } from "../../lib/useMediaQuery.ts";
+import { CHANGES_KEY, PANE_KEY, useRemembered } from "./atlasPrefs.ts";
 import { AtlasCompare } from "./AtlasCompare.tsx";
 import { AtlasInspector } from "./AtlasInspector.tsx";
 import { AtlasTimeline } from "./AtlasTimeline.tsx";
@@ -524,6 +535,8 @@ function Territory({
   // ---- the view: the map, or the outline (the default on narrow screens) --------------
   const narrow = useMediaQuery(NARROW);
   narrowNow.current = narrow;
+  const [showChanges, setShowChanges] = useRemembered(CHANGES_KEY, false);
+  const [paneWidth, setPaneWidth] = useRemembered<number | null>(PANE_KEY, null);
   const view: AtlasView = url.view ?? (narrow ? "outline" : "map");
   const routes = useMapRoutes(
     reader,
@@ -532,6 +545,7 @@ function Territory({
   );
   const tree = useRef<HTMLDivElement>(null);
   const root = useRef<HTMLDivElement>(null);
+  const split = useRef<HTMLDivElement>(null);
   const inspectorBox = useRef<HTMLDivElement>(null);
   const outlinePlace = useRef<OutlinePlace | null>(null);
   // Leaving: say where the reader is, for the view a landing puts in this
@@ -609,15 +623,12 @@ function Territory({
       onPick={select}
     />
   );
+  const compare = (
+    <AtlasCompare repo={ref} base={base} snapshot={snapshot} selected={selected} onPick={select} />
+  );
+  // What's selected comes first; comparing snapshots is a step further (CORE-212).
   const selection = (
     <>
-      <AtlasCompare
-        repo={ref}
-        base={base}
-        snapshot={snapshot}
-        selected={selected}
-        onPick={select}
-      />
       {timeline && (
         <AtlasTimeline
           key={timeline}
@@ -669,6 +680,7 @@ function Territory({
           />
         )}
       </div>
+      {compare}
       {selected && view === "outline" && narrow && (
         <button
           type="button"
@@ -705,6 +717,17 @@ function Territory({
               </button>
             ))}
           </div>
+          {view === "map" && (
+            <button
+              type="button"
+              aria-pressed={showChanges}
+              title="Mark regions and files that changed in the build this map shows"
+              className="mk-btn mk-btn--ghost mk-btn--sm aria-pressed:bg-signal-wash aria-pressed:text-ink pointer-coarse:min-h-11"
+              onClick={() => setShowChanges(!showChanges)}
+            >
+              Show changes
+            </button>
+          )}
           <KnowledgeBar repo={ref} base={base} status={status} overlays={data.overlays} />
         </div>
       </div>
@@ -742,7 +765,11 @@ function Territory({
       </p>
 
       {view === "map" ? (
-        <div className="grid gap-3 lg:h-[max(34rem,calc(100dvh-16rem))] lg:grid-cols-[minmax(0,1fr)_23rem]">
+        <div
+          ref={split}
+          className="grid gap-3 lg:h-[max(34rem,calc(100dvh-16rem))] lg:grid-cols-[minmax(0,1fr)_auto_var(--atlas-pane)] lg:gap-0"
+          style={{ "--atlas-pane": paneWidth ? `${paneWidth}px` : PANE_DEFAULT } as CSSProperties}
+        >
           <div className="h-[62dvh] min-h-[22rem] lg:h-auto lg:min-h-0">
             <AtlasTerritory
               territory={territory}
@@ -752,6 +779,7 @@ function Territory({
               routes={routes}
               emphasis={timeline ? touched : undefined}
               emphasisNote={touchedNote}
+              changes={showChanges}
               label={`Capability map: ${capabilities} capabilities${
                 overview.regions.length > capabilities ? " and structural groups" : ""
               }.${
@@ -759,6 +787,7 @@ function Territory({
               } The outline beside it has the same regions, and more.`}
             />
           </div>
+          <PaneDivider split={split} width={paneWidth} onWidth={setPaneWidth} />
           <aside
             aria-label="Regions"
             className="flex min-h-0 min-w-0 flex-col gap-3 overflow-y-auto rounded-pane bg-pane p-3"
@@ -778,7 +807,10 @@ function Territory({
           <Legend />
         </div>
       ) : (
-        <div className="grid items-start gap-3 lg:grid-cols-[minmax(0,1fr)_23rem]">
+        <div
+          className="grid items-start gap-3 lg:grid-cols-[minmax(0,1fr)_var(--atlas-pane)]"
+          style={{ "--atlas-pane": paneWidth ? `${paneWidth}px` : PANE_DEFAULT } as CSSProperties}
+        >
           <section
             aria-label="Outline"
             className="flex min-w-0 flex-col gap-3 rounded-pane bg-pane p-3"
@@ -1024,6 +1056,75 @@ function Lookup({
 const Contents = AtlasContents;
 
 /** What the map's shapes mean, and what they don't. */
+/** The inspector's width until it's dragged: grows with the screen (CORE-212). */
+const PANE_DEFAULT = "clamp(23rem, 30vw, 36rem)";
+const PANE_MIN = 320;
+
+/**
+ * The line between the map and the inspector: drag it, or focus it and use
+ * the arrow keys, to give the inspector more or less room; Home goes back to
+ * the default width (CORE-212).
+ */
+function PaneDivider({
+  split,
+  width,
+  onWidth,
+}: {
+  split: RefObject<HTMLDivElement | null>;
+  width: number | null;
+  onWidth: (width: number | null) => void;
+}) {
+  const pane = () => split.current?.lastElementChild?.getBoundingClientRect().width ?? PANE_MIN;
+  const max = () => Math.max(PANE_MIN, Math.min(720, (split.current?.clientWidth ?? 0) * 0.6));
+  const clamp = (px: number) => Math.round(Math.min(max(), Math.max(PANE_MIN, px)));
+  const drag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    handle.setPointerCapture(event.pointerId);
+    const startX = event.clientX;
+    const startWidth = pane();
+    const move = (e: PointerEvent) => onWidth(clamp(startWidth - (e.clientX - startX)));
+    const end = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", end);
+      handle.removeEventListener("pointercancel", end);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  };
+  const key = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 64 : 16;
+    if (event.key === "ArrowLeft") onWidth(clamp(pane() + step));
+    else if (event.key === "ArrowRight") onWidth(clamp(pane() - step));
+    else if (event.key === "Home") onWidth(null);
+    else return;
+    event.preventDefault();
+  };
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Inspector width"
+      aria-valuemin={PANE_MIN}
+      aria-valuemax={720}
+      aria-valuenow={Math.round(width ?? pane())}
+      tabIndex={0}
+      title="Drag, or use the arrow keys, to resize the inspector"
+      className="group hidden w-3 cursor-col-resize touch-none place-items-center lg:grid"
+      onPointerDown={drag}
+      onKeyDown={key}
+      onDoubleClick={() => onWidth(null)}
+    >
+      <span
+        aria-hidden
+        className="h-10 w-1 rounded-full bg-line-soft transition-colors group-hover:bg-line group-focus-visible:bg-signal"
+      />
+    </div>
+  );
+}
+
 function Legend() {
   return (
     <details className="text-micro text-ink-muted">
@@ -1067,8 +1168,8 @@ function Legend() {
             aria-hidden
             className="mr-1 inline-block size-2 rounded-full bg-data-berry align-middle"
           />
-          <strong className="text-ink">A dot beside a name</strong>: it changed in the build this
-          map shows; the outline says “changed in this build”.
+          <strong className="text-ink">A dot beside a name</strong>, with Show changes on: it
+          changed in the build this map shows; the outline always says “changed in this build”.
         </li>
         <li>
           <span

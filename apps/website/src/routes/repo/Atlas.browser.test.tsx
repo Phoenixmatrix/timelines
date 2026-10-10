@@ -347,3 +347,58 @@ test("revocation clears a reader's open view", async () => {
   await expect.element(page.getByRole("heading", { name: "Nothing here", level: 1 })).toBeVisible();
   expect(page.getByText("ledger.ts").elements()).toHaveLength(0);
 });
+
+describe("the map view's inspector and controls (CORE-212)", () => {
+  const separator = () => page.getByRole("separator", { name: "Inspector width" });
+  const inspectorWidth = () =>
+    Math.round(page.getByRole("complementary", { name: "Regions" }).element().clientWidth);
+
+  test("the inspector grows with the screen, resizes from the keyboard, is remembered and resets", async () => {
+    localStorage.clear();
+    const { repo } = await setup();
+    await page.viewport(1440, 900);
+    const first = renderApp(`${repo.base}?select=${encodeURIComponent(LEDGER)}&view=map`);
+    await expect.element(heading("ledger.ts")).toBeVisible();
+    // 30% of the window, between 23rem and 36rem.
+    await expect.poll(inspectorWidth).toBe(432);
+    await focusOn(separator());
+    await userEvent.keyboard("{ArrowLeft}{ArrowLeft}");
+    await expect.poll(inspectorWidth).toBe(464);
+    await expect.element(separator()).toHaveAttribute("aria-valuenow", "464");
+    // Back after a reload, then Home returns to the default width.
+    first.unmount();
+    renderApp(`${repo.base}?select=${encodeURIComponent(LEDGER)}&view=map`);
+    await expect.poll(inspectorWidth).toBe(464);
+    await focusOn(separator());
+    await userEvent.keyboard("{Home}");
+    await expect.poll(inspectorWidth).toBe(432);
+    expect(localStorage.getItem("gitmatrix:atlas-pane")).toBeNull();
+  });
+
+  test("change dots are off until asked for, and the choice is remembered", async () => {
+    localStorage.clear();
+    const { repo } = await setup();
+    await page.viewport(1440, 900);
+    const first = renderApp(`${repo.base}?view=map`);
+    const toggle = page.getByRole("button", { name: "Show changes", exact: true });
+    await expect.element(toggle).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(toggle);
+    await expect.element(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(localStorage.getItem("gitmatrix:atlas-changes")).toBe("true");
+    first.unmount();
+    renderApp(`${repo.base}?view=map`);
+    await expect
+      .element(page.getByRole("button", { name: "Show changes", exact: true }))
+      .toHaveAttribute("aria-pressed", "true");
+  });
+
+  test("narrowing by kind appears only while looking something up", async () => {
+    const { repo } = await setup();
+    await page.viewport(1440, 900);
+    renderApp(`${repo.base}?view=map`);
+    await expect.element(lookup()).toBeVisible();
+    expect(page.getByRole("group", { name: "Kind" }).elements()).toHaveLength(0);
+    await userEvent.type(lookup(), "ledger");
+    await expect.element(page.getByRole("group", { name: "Kind" })).toBeVisible();
+  });
+});

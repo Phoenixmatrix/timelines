@@ -86,6 +86,7 @@ import {
   type WorkspaceState,
 } from "./workspace.ts";
 import { CompositeInspector, CrossLinks } from "./WorkspaceInspector.tsx";
+import { CHANGES_KEY, useRemembered } from "../repo/atlasPrefs.ts";
 
 export async function workspaceAtlasLoader({ request, params }: LoaderFunctionArgs) {
   return load<AccountPage>(`/accounts/${encodeURIComponent(params.owner ?? "")}`, request);
@@ -651,6 +652,7 @@ function WorkspaceView({
   const narrow = useMediaQuery(NARROW);
   narrowNow.current = narrow;
   const view: AtlasView = url.view ?? (narrow ? "outline" : "map");
+  const [showChanges, setShowChanges] = useRemembered(CHANGES_KEY, false);
   const routes = useMapRoutes(
     reader,
     view === "map" && selected && mapFocus === selected.id ? selected : null,
@@ -938,7 +940,22 @@ function WorkspaceView({
                 } repositories`}
               {url.snapshot && " · a linked snapshot"}
             </span>
-            <div role="group" aria-label="View" className="ml-auto flex gap-1">
+            {view === "map" && (
+              <button
+                type="button"
+                aria-pressed={showChanges}
+                title="Mark regions and files that changed in the build this map shows"
+                className="mk-btn mk-btn--ghost mk-btn--sm ml-auto aria-pressed:bg-signal-wash aria-pressed:text-ink pointer-coarse:min-h-11"
+                onClick={() => setShowChanges(!showChanges)}
+              >
+                Show changes
+              </button>
+            )}
+            <div
+              role="group"
+              aria-label="View"
+              className={`flex gap-1 ${view === "map" ? "" : "ml-auto"}`}
+            >
               {(["map", "outline"] as const).map((v) => (
                 <button
                   key={v}
@@ -977,6 +994,7 @@ function WorkspaceView({
                   loading={loading}
                   emphasis={timeline ? touched : undefined}
                   emphasisNote={touchedNote}
+                  changes={showChanges}
                   onSelect={(cell: TerritoryCell) => select(cell.entity)}
                   origin={(cell) => {
                     const name = nameOf.get(repoOf(cell.id));

@@ -226,18 +226,19 @@ export function AtlasInspector({
             ))}
           </nav>
         )}
-        <h2 ref={heading} tabIndex={-1} className="m-0 text-body font-semibold break-words">
+        <h2 ref={heading} tabIndex={-1} className="m-0 text-title break-words">
           {entity.name}
         </h2>
-        <p className="m-0 text-micro text-ink-faint">
+        <p className="m-0 text-body-sm text-ink-muted">
           {KIND[entity.kind] ?? entity.kind}
           {entity.path && <span className="font-mono"> · {entity.path}</span>}
           {changed && " · changed in this build"}
         </p>
       </div>
 
+      {/* At reading size: the summary is what the inspector is for (CORE-212). */}
       {entity.summary ? (
-        <p className="m-0 text-body-sm text-ink-muted">{entity.summary}</p>
+        <p className="m-0 max-w-[68ch] text-body text-ink">{entity.summary}</p>
       ) : summaryNote(entity.summaryState) ? (
         <p className="m-0 text-body-sm text-ink-faint">
           {summaryNote(entity.summaryState, inferred?.basis?.commit)}
@@ -247,7 +248,7 @@ export function AtlasInspector({
         <p className="m-0 text-body-sm text-ink-faint">{fileNote(data)}</p>
       )}
 
-      <p className="m-0 text-micro text-ink-faint">
+      <p className="m-0 text-micro text-ink-muted">
         {entity.structural
           ? "Structural group, not a capability."
           : entity.kind === "capability" || entity.kind === "area"

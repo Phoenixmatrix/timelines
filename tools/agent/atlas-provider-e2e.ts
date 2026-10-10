@@ -407,6 +407,17 @@ interface FixtureRepo {
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const short = (commit: string) => commit.slice(0, 7);
 
+/** The input parts of two inferences that differ, appeared or went (sorted). */
+export function changedParts(
+  before: Record<string, string> | undefined,
+  after: Record<string, string> | undefined,
+): string[] {
+  if (!before || !after) return [];
+  return [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter((key) => before[key] !== after[key])
+    .sort();
+}
+
 export async function runAtlasProviderE2E(
   ctx: HarnessContext,
   fixtures: SeedManifest,
@@ -1166,6 +1177,11 @@ export async function runAtlasProviderE2E(
           "Point the README at the public API",
         );
         const build = await built(ledger);
+        // Retained beside enabledGraph: what any changed part's prose became.
+        evidence.reuseGraph = await api(
+          `/repos/${ledger.owner}/${ledger.name}/knowledge/graph/export`,
+          tokenOf(ledger),
+        );
         const stats = build.stats as {
           atlasError?: string;
           atlasTimings?: {
@@ -1189,6 +1205,8 @@ export async function runAtlasProviderE2E(
           name: string;
           sameInputs: boolean;
           reinferred: boolean;
+          /** Input parts whose hash differs, appeared or went: what made it change. */
+          changedParts: string[];
           basis: AtlasInference["basis"];
         }[] = [];
         for (const cap of [enabled.ledgerCap, enabled.currencyCap]) {
@@ -1204,6 +1222,7 @@ export async function runAtlasProviderE2E(
             name: detail.entity.name,
             sameInputs: before.inputsHash === after.inputsHash,
             reinferred: before.inferredAt !== after.inferredAt,
+            changedParts: changedParts(before.inputParts, after.inputParts),
             basis: after.basis,
           });
         }
@@ -1222,7 +1241,9 @@ export async function runAtlasProviderE2E(
           if (c.sameInputs) assert(!c.reinferred, `${c.name} was inferred again`);
         assert(
           now.some((c) => c.sameInputs),
-          "A README edit changed every capability's inputs",
+          `A README edit changed every capability's inputs: ${now
+            .map((c) => `${c.name} (${c.changedParts.join(", ") || "parts not recorded"})`)
+            .join("; ")}`,
         );
         assert.equal(stats.atlasSpend.calls, stats.atlasDescribed.inferred);
         assert(stats.atlasDescribed.inferred <= changed, "Only changed inputs may be inferred");
