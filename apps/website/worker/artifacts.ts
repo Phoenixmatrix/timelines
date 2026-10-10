@@ -1,5 +1,6 @@
 import type { GitRef } from "../shared/api.ts";
 import { lsRefsRequest, parseLsRefs, type LsRefsEntry } from "./git/pktline.ts";
+import { retrying, UPSTREAM_TIMEOUT_MS, withTimeout } from "./retry.ts";
 
 const TOKEN_TTL_SECONDS = 60 * 60;
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
@@ -27,8 +28,15 @@ export async function upstreamToken(
   const cached = tokenCache.get(key);
   if (cached && cached.expiresAt - Date.now() > TOKEN_REFRESH_MARGIN_MS) return cached.secret;
   // A pending binding call cannot be shared with a different request's lifetime.
-  using repo = await env.ARTIFACTS.get(artifactsName);
-  const created = await repo.createToken(scope, TOKEN_TTL_SECONDS);
+  // An extra token from a retried call is harmless; it expires unused.
+  const created = await retrying(
+    async () => {
+      // Binding calls take no AbortSignal: bounded by racing a timer instead.
+      using repo = await withTimeout(env.ARTIFACTS.get(artifactsName), UPSTREAM_TIMEOUT_MS);
+      return await withTimeout(repo.createToken(scope, TOKEN_TTL_SECONDS), UPSTREAM_TIMEOUT_MS);
+    },
+    { retryable: isTransientArtifactsError, label: "Artifacts token", context: { artifactsName } },
+  );
   const token = { secret: created.plaintext, expiresAt: Date.parse(created.expiresAt) };
   tokenCache.set(key, token);
   return token.secret;
@@ -86,20 +94,49 @@ export async function lsRefs(
   remote: string,
   prefixes?: readonly string[],
 ): Promise<LsRefsEntry[]> {
-  const token = await upstreamToken(env, artifactsName, "read");
-  const response = await fetch(`${remote}/git-upload-pack`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/x-git-upload-pack-request",
-      accept: "application/x-git-upload-pack-result",
-      "git-protocol": "version=2",
+  // A read: retried through the provider's transient failures, each try bounded.
+  return retrying(
+    async () => {
+      const token = await upstreamToken(env, artifactsName, "read");
+      const response = await fetch(`${remote}/git-upload-pack`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/x-git-upload-pack-request",
+          accept: "application/x-git-upload-pack-result",
+          "git-protocol": "version=2",
+        },
+        body: lsRefsRequest(prefixes),
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new UpstreamStatusError("ls-refs", response.status);
+      }
+      return parseLsRefs(new Uint8Array(await response.arrayBuffer()));
     },
-    body: lsRefsRequest(prefixes),
-  });
-  if (!response.ok) throw new Error(`ls-refs failed with HTTP ${response.status}`);
-  return parseLsRefs(new Uint8Array(await response.arrayBuffer()));
+    {
+      retryable: isTransientArtifactsError,
+      label: "Artifacts ls-refs",
+      context: { artifactsName },
+    },
+  );
 }
+
+/** A git endpoint's HTTP failure, with the status that says whether to retry. */
+export class UpstreamStatusError extends Error {
+  readonly status: number;
+  constructor(operation: string, status: number) {
+    super(`${operation} failed with HTTP ${status}`);
+    this.status = status;
+  }
+}
+
+/**
+ * Statuses that say the provider, not the request, failed. Rate limiting (429)
+ * isn't among them: asking again at once only adds to it.
+ */
+const TRANSIENT_STATUSES = new Set([500, 502, 503, 504]);
 
 const MISSING_REMOTE_REPO = /^ArtifactsError: Repository not found: [A-Za-z0-9][A-Za-z0-9._-]*\.$/;
 
@@ -110,10 +147,14 @@ const TRANSIENT_CODES: readonly ArtifactsErrorCode[] = [
   "FORK_IN_PROGRESS",
 ];
 // Remote bindings and Durable Object RPC keep only the message: the provider's
-// internal error, a fork still in progress (CORE-315), or the dropped connection
-// of local development's remote binding (CORE-302).
+// internal error, a fork still in progress (CORE-315), the dropped connection
+// of local development's remote binding (CORE-302), or a network failure on
+// the way: a name lookup that failed once, a reset or refused connection
+// (CORE-331).
 const TRANSIENT_REMOTE =
-  /^ArtifactsError: An internal error occurred|^ArtifactsError: Repository "[^"]+" is currently being forked|Peer closed WebSocket|Network connection lost/;
+  /^ArtifactsError: An internal error occurred|^ArtifactsError: Repository "[^"]+" is currently being forked|Peer closed WebSocket|Network connection lost|DNS lookup failed|Temporary failure in name resolution|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|^fetch failed$/;
+/** Node-style network error codes, as some runtimes' fetch reports them. */
+const TRANSIENT_NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN"]);
 
 /**
  * Whether `error` is a dropped connection to the provider (local
@@ -128,8 +169,14 @@ export function isDroppedConnection(error: unknown): boolean {
 /** Whether `error` is a transient Artifacts or transport failure, worth retrying idempotent work. */
 export function isTransientArtifactsError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
+  if (error instanceof UpstreamStatusError) return TRANSIENT_STATUSES.has(error.status);
+  // A call that ran past its time limit (AbortSignal.timeout) got no answer.
+  if (error instanceof Error && error.name === "TimeoutError") return true;
   if ("code" in error && typeof error.code === "string")
-    return (TRANSIENT_CODES as readonly string[]).includes(error.code);
+    return (
+      (TRANSIENT_CODES as readonly string[]).includes(error.code) ||
+      TRANSIENT_NETWORK_CODES.has(error.code)
+    );
   return error instanceof Error && TRANSIENT_REMOTE.test(error.message);
 }
 

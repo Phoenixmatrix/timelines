@@ -11,7 +11,13 @@
 // v2 fetch without blobs, bounded in depth and in size.
 
 import type { Actor } from "../db.ts";
-import { lsRefs, upstreamToken } from "../artifacts.ts";
+import {
+  isTransientArtifactsError,
+  lsRefs,
+  upstreamToken,
+  UpstreamStatusError,
+} from "../artifacts.ts";
+import { retrying } from "../retry.ts";
 import { packCommits, type PackCommit } from "../git/pack.ts";
 import { DELIM, FLUSH, pkt } from "../git/pktline.ts";
 import { indexPushedMentions } from "../mentions/index.ts";
@@ -284,20 +290,38 @@ async function fetchNewCommits(
   want: string,
   haves: string[],
 ): Promise<NewCommits> {
-  const token = await upstreamToken(env, repo.artifacts_name, "read");
-  const response = await fetch(`${repo.artifacts_remote}/git-upload-pack`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/x-git-upload-pack-request",
-      accept: "application/x-git-upload-pack-result",
-      "git-protocol": "version=2",
+  // A read: retried through transient failures (CORE-331), each try bounded,
+  // with room for a pack up to MAX_PACK_BYTES.
+  return retrying(
+    async () => {
+      const token = await upstreamToken(env, repo.artifacts_name, "read");
+      const response = await fetch(`${repo.artifacts_remote}/git-upload-pack`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/x-git-upload-pack-request",
+          accept: "application/x-git-upload-pack-result",
+          "git-protocol": "version=2",
+        },
+        body: newCommitsRequest(want, haves),
+        signal: AbortSignal.timeout(PACK_TIMEOUT_MS),
+      });
+      if (!response.ok || !response.body) {
+        await response.body?.cancel();
+        throw new UpstreamStatusError("fetch", response.status);
+      }
+      return readNewCommits(response.body, MAX_PACK_BYTES);
     },
-    body: newCommitsRequest(want, haves),
-  });
-  if (!response.ok || !response.body) throw new Error(`fetch failed with HTTP ${response.status}`);
-  return readNewCommits(response.body, MAX_PACK_BYTES);
+    {
+      retryable: isTransientArtifactsError,
+      label: "Push log: reading new commits",
+      context: { artifactsName: repo.artifacts_name },
+    },
+  );
 }
+
+/** How long one read of new commits may take, pack included. */
+const PACK_TIMEOUT_MS = 60_000;
 
 /**
  * The commits in a v2 fetch response. `shallow` lines (in `shallow-info`) mean
