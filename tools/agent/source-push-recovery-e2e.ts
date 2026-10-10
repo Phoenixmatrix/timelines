@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { TimelineDetail } from "../../apps/website/shared/timelines.ts";
+import type { CheckpointView, TimelineDetail } from "../../apps/website/shared/timelines.ts";
 import type { HarnessContext, SeedManifest } from "./types.ts";
 import { queueFixture, type QueueFixture, type QueueGm, type RepoInventory } from "./queue-e2e.ts";
 import type { CiRunList, RepoDetail } from "../../apps/website/shared/api.ts";
@@ -91,12 +91,12 @@ export async function runSourcePushRecoveryE2E(
     assert(result.barrier?.operationId);
     return result.barrier.operationId;
   };
-  async function start(name: string): Promise<Case> {
+  async function start(name: string, policy: "auto" | "approval" = "auto"): Promise<Case> {
     const slug = `source-recovery-${tag}-${name}`;
     const cwd = join(ctx.work, slug);
     clones.push(cwd);
     await gm(["clone", f!.repo, cwd], "marco");
-    await gm(["timeline", "start", slug, "--owner", "orbit", "--policy", "auto"], "marco", cwd);
+    await gm(["timeline", "start", slug, "--owner", "orbit", "--policy", policy], "marco", cwd);
     const detail = await f!.json<TimelineDetail>(`/api/tracker/orbit/timelines/${slug}`);
     const source = detail.timeline.repos[0]!.source!;
     assert.equal(source.kind, "timeline-work");
@@ -208,6 +208,45 @@ export async function runSourcePushRecoveryE2E(
       ...fenced,
       originalCasRejected: true,
       normalSyncPublished: true,
+    });
+
+    const mergedFence = await start("merge-checkpoint", "approval");
+    await control(mergedFence, "arm", { point: "before-forward", mode: "fail" });
+    await launch(["push"], mergedFence, true)();
+    const mergedId = await hit(mergedFence);
+    const mergedRecovery = await recover(mergedFence, mergedId);
+    await marker(mergedFence, mergedRecovery, mergedId);
+    await control(mergedFence, "delete");
+    await gm(["fetch"], "marco", mergedFence.cwd);
+    await gm(
+      ["merge", mergedRecovery.fenceCommit!, "-m", "Integrate the proven source recovery fence"],
+      "marco",
+      mergedFence.cwd,
+    );
+    await publish(mergedFence, false);
+    const mergedHead = await head(mergedFence);
+    assert.equal(
+      (await f.git(["show", "-s", "--format=%P", "FETCH_HEAD"])).split(" ")[1],
+      mergedRecovery.fenceCommit,
+      "Exercise the recovery fence as a merge parent, not only linear rebased history",
+    );
+    const checkpoint = JSON.parse(
+      await gm(
+        ["timeline", "checkpoint", "-m", "Review normally merged recovery-fence ancestry"],
+        "marco",
+        mergedFence.cwd,
+      ),
+    ) as CheckpointView;
+    assert.equal(checkpoint.checkpoint.repos[0]!.source?.commit, mergedHead);
+    assert.equal(checkpoint.checkpoint.repos[0]!.logicalBase?.commit, mergedFence.before);
+    assert.deepEqual(checkpoint.checkpoint.repos[0]!.dependencies, []);
+    assert.equal(checkpoint.approved, false, "Recovery provenance must not grant approval");
+    record({
+      case: "merge-checkpoint",
+      fenceCommit: mergedRecovery.fenceCommit,
+      head: mergedHead,
+      checkpoint: checkpoint.checkpoint.id,
+      canonicalBasePreserved: true,
     });
 
     const accepted = await start("accepted-provider");
