@@ -37,31 +37,11 @@ export function scopeNotices(
         tone: "error",
         text: `The latest Knowledge build failed, so this map is from ${short(mapCommit)}, not the newest code.`,
       });
-    else if (status.state === "queued" && status.pending)
-      // Pushes wait for one batched update (CORE-286): say how many, and when.
-      notices.push({
-        id: "building",
-        tone: "info",
-        text: `This map shows ${short(mapCommit)}. ${status.pending.pushes} ${
-          status.pending.pushes === 1 ? "push is" : "pushes are"
-        } waiting for the next update${
-          status.pending.dueAt
-            ? `, at about ${new Date(status.pending.dueAt).toLocaleTimeString(undefined, {
-                hour: "2-digit",
-                minute: "2-digit",
-              })}`
-            : ""
-        }${status.head && status.head !== mapCommit ? `; the branch is at ${short(status.head)}` : ""}.`,
-      });
-    else if (status.state === "building" || status.state === "queued")
-      notices.push({
-        id: "building",
-        tone: "info",
-        text: `A newer map is ${status.state === "queued" ? "queued" : "being built"}. This one shows ${short(mapCommit)}${
-          status.head && status.head !== mapCommit ? `; the branch is at ${short(status.head)}` : ""
-        }.`,
-      });
-    else if (status.indexedCommit && mapCommit && status.indexedCommit !== mapCommit)
+    // A pending or running update is the status chip's to say (CORE-212):
+    // repeating it here said the same thing twice.
+    else if (status.state === "queued" || status.state === "building") {
+      // Nothing more to say until it lands.
+    } else if (status.indexedCommit && mapCommit && status.indexedCommit !== mapCommit)
       notices.push({
         id: "newer",
         tone: "info",

@@ -32,15 +32,9 @@ describe("Atlas states", () => {
     expect(scopeNotices(status({}), overview())).toEqual([]);
   });
 
-  test("building, failed and behind each say which commit the map shows", () => {
-    const building = scopeNotices(status({ state: "building", head: "bbbbbbbbbb" }), overview());
-    expect(building).toEqual([
-      expect.objectContaining({
-        id: "building",
-        tone: "info",
-        text: expect.stringMatching(/aaaaaaa.*bbbbbbb/),
-      }),
-    ]);
+  test("failed and behind each say which commit the map shows; a running build is the chip's to say", () => {
+    // The status chip says it's building and what the map reflects (CORE-212).
+    expect(scopeNotices(status({ state: "building", head: "bbbbbbbbbb" }), overview())).toEqual([]);
     expect(scopeNotices(status({ state: "failed" }), overview())[0]).toMatchObject({
       id: "failed",
       tone: "error",
@@ -114,7 +108,8 @@ describe("Atlas states", () => {
     expect(fileNote({ language: "typescript", membership: { capability: "cap:x" } })).toBeNull();
   });
 
-  test("pushes waiting for a batched update say how many, and that the map shows the indexed commit (CORE-286)", () => {
+  test("pushes waiting for a batched update are left to the status chip (CORE-286, CORE-212)", () => {
+    // The chip says "Reflects aaaaaaa · 3 pushes pending · update at ~…": once is enough.
     const notices = scopeNotices(
       status({
         state: "queued",
@@ -123,14 +118,6 @@ describe("Atlas states", () => {
       }),
       overview(),
     );
-    expect(notices).toEqual([
-      expect.objectContaining({
-        id: "building",
-        tone: "info",
-        text: expect.stringMatching(
-          /^This map shows aaaaaaa\. 3 pushes are waiting for the next update, at about .+; the branch is at ccccccc\.$/,
-        ),
-      }),
-    ]);
+    expect(notices).toEqual([]);
   });
 });
