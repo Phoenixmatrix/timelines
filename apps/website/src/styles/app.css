@@ -93,6 +93,13 @@ body,
   min-height: 100%;
 }
 
+/* Keep centered settings pages aligned; phone overlays still use the full viewport. */
+@media (min-width: 64rem) {
+  html:has(.settings-layout) {
+    scrollbar-gutter: stable;
+  }
+}
+
 body {
   margin: 0;
   background: var(--surface);

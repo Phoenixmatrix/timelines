@@ -44,7 +44,7 @@ export function NewRepo() {
         Start empty and push to it, or import a public repository with its history.
       </p>
 
-      <Form method="post" className="mt-8 flex flex-col gap-6">
+      <Form method="post" className="mt-8 flex max-w-3xl flex-col gap-6">
         <Card title="Name and owner">
           <div className="mk-card-body">
             <div className="grid grid-cols-[minmax(0,12rem)_auto_minmax(0,1fr)] items-end gap-2">
@@ -120,8 +120,8 @@ export function NewRepo() {
           </div>
         </Card>
 
-        <div className="flex items-center justify-end gap-3">
-          <FormError message={actionData?.error} />
+        <FormError message={actionData?.error} />
+        <div className="mk-form-actions px-5">
           <button className="mk-btn mk-btn--primary" disabled={busy}>
             {importing ? "Importing…" : busy ? "Creating…" : "Create repository"}
           </button>

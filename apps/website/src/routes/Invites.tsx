@@ -52,7 +52,7 @@ export function Invites() {
           <Form method="post" ref={formRef} className="mk-card-body">
             <TextField label="Email" name="email" type="email" autoComplete="off" required />
             <FormError message={result?.error} />
-            <div>
+            <div className="mk-form-actions">
               <button className="mk-btn mk-btn--primary" disabled={navigation.state !== "idle"}>
                 Invite
               </button>

@@ -347,7 +347,31 @@ function MirrorCard({ initial, base }: { initial: RepoMirror | null; base: strin
           )
         )}
         <FormError message={error} />
-        <div className="flex flex-wrap items-center justify-end gap-3">
+        <div className="mk-form-actions">
+          <button
+            type="button"
+            className="mk-btn mk-btn--primary"
+            disabled={!!busy || !url.trim() || (!token && !mirror?.hasToken)}
+            aria-busy={busy === "save"}
+            onClick={() => void save()}
+          >
+            <BusyLabel
+              busy={busy === "save"}
+              idle={mirror ? "Save mirror" : "Add mirror"}
+              working={mirror ? "Saving…" : "Adding…"}
+            />
+          </button>
+          {mirror && (
+            <button
+              type="button"
+              className="mk-btn"
+              disabled={!!busy || !mirror.enabled}
+              aria-busy={busy === "sync"}
+              onClick={() => void sync()}
+            >
+              <BusyLabel busy={busy === "sync"} idle="Sync now" working="Syncing…" />
+            </button>
+          )}
           {mirror && (
             <ConfirmDialog
               trigger={
@@ -362,31 +386,6 @@ function MirrorCard({ initial, base }: { initial: RepoMirror | null; base: strin
               onConfirm={() => void remove()}
             />
           )}
-          <span className="flex-1" />
-          {mirror && (
-            <button
-              type="button"
-              className="mk-btn"
-              disabled={!!busy || !mirror.enabled}
-              aria-busy={busy === "sync"}
-              onClick={() => void sync()}
-            >
-              <BusyLabel busy={busy === "sync"} idle="Sync now" working="Syncing…" />
-            </button>
-          )}
-          <button
-            type="button"
-            className="mk-btn mk-btn--primary"
-            disabled={!!busy || !url.trim() || (!token && !mirror?.hasToken)}
-            aria-busy={busy === "save"}
-            onClick={() => void save()}
-          >
-            <BusyLabel
-              busy={busy === "save"}
-              idle={mirror ? "Save mirror" : "Add mirror"}
-              working={mirror ? "Saving…" : "Adding…"}
-            />
-          </button>
         </div>
       </div>
     </Card>
@@ -411,8 +410,7 @@ export function Settings() {
   const fullName = `${repo.owner.slug}/${repo.name}`;
 
   return (
-    // Settings read as forms: one readable column, two side by side on wide screens.
-    <div className="max-w-3xl gap-6 xl:max-w-none xl:columns-2 [&>*]:mb-6 [&>*]:break-inside-avoid">
+    <div className="flex max-w-3xl flex-col gap-6">
       <Card title="General">
         <Form method="post" className="mk-card-body">
           <input type="hidden" name="intent" value="update" />
@@ -451,8 +449,8 @@ export function Settings() {
               ]}
             />
           </div>
-          <div className="flex items-center justify-end gap-3">
-            <FormError message={actionData?.error} />
+          <FormError message={actionData?.error} />
+          <div className="mk-form-actions">
             <button className="mk-btn mk-btn--primary" disabled={saving} aria-busy={saving}>
               <BusyLabel busy={saving} idle="Save changes" working="Saving…" />
             </button>
@@ -488,9 +486,8 @@ export function Settings() {
         title="Delete this repository"
         description="Its history, branches and tokens go for good."
       >
-        <div className="mt-4 flex items-center justify-between gap-3">
+        <div className="mt-4 flex flex-col items-start gap-3">
           <FormError message={deleter.data?.error} />
-          <span className="flex-1" />
           <ConfirmDialog
             trigger={<button className="mk-btn mk-btn--danger-ghost">Delete repository…</button>}
             title={`Delete ${fullName}?`}

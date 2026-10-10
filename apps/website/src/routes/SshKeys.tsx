@@ -111,8 +111,8 @@ export function SshKeys() {
                 ]}
               />
             </div>
-            <div className="flex items-center justify-end gap-3">
-              <FormError message={result && "error" in result ? result.error : null} />
+            <FormError message={result && "error" in result ? result.error : null} />
+            <div className="mk-form-actions">
               <button
                 className="mk-btn mk-btn--primary"
                 disabled={navigation.state === "submitting"}

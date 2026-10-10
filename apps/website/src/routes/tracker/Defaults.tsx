@@ -38,8 +38,8 @@ export function TrackerDefaultsForm({
   };
 
   return (
-    <section className="rounded-pane bg-pane p-4" aria-labelledby="tracker-defaults-title">
-      <h2 id="tracker-defaults-title" className="m-0 text-title">
+    <section className="mk-card" aria-labelledby="tracker-defaults-title">
+      <h2 id="tracker-defaults-title" className="mk-card-title">
         Default view and team
       </h2>
       <p className="mt-1 mb-4 text-body-sm text-ink-muted">
@@ -93,7 +93,7 @@ export function TrackerDefaultsForm({
           all teams.
         </p>
         {error && <FormError message={error} />}
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="mk-form-actions">
           <button type="submit" className="mk-btn mk-btn--primary" disabled={busy}>
             Save defaults
           </button>

@@ -1266,6 +1266,16 @@ read as `agent_decides`.
   Tracker administration includes teams, workspaces, and repository subscriptions;
   changing its account stays in Settings. **Back to issues** retains the current
   filters and layout.
+  Profile, personal, account and site forms share a left-aligned 48rem content
+  column (`SettingsPage`), the kit's 20px section padding, and wrapping,
+  left-aligned primary actions (`mk-form-actions`, 44px minimum targets).
+  Validation feedback sits above the action row rather than squeezing its
+  buttons. Repository creation and settings use the same form width; repository
+  settings stay in one column so visual and keyboard reading order agree.
+  Usage, retention and tracker administration deliberately retain their wider
+  data layouts (`SettingsPage wide` or `tracker`). Desktop settings reserve a
+  stable scrollbar gutter so short and long pages stay on the same horizontal
+  axis; phone dialogs and the assistant retain the full viewport width.
 - **Default team in one click:** the star next to each team in the facet
   column makes it your default; the filled star marks the current one, and
   clicking it clears the default. Under the query bar a note names the default

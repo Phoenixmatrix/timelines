@@ -240,7 +240,7 @@ function AiSettingsForm({
 
   return (
     <form
-      className="mt-6 flex flex-col gap-8"
+      className="mk-card mt-6 flex flex-col gap-8"
       aria-busy={busy}
       onSubmit={async (event) => {
         event.preventDefault();
@@ -511,7 +511,7 @@ function AiSettingsForm({
             : notice || (dirty ? "You have unsaved changes." : "")}
         </p>
         {saved.canManage && (
-          <div className="flex flex-wrap gap-3">
+          <div className="mk-form-actions">
             <button
               type="submit"
               className="mk-btn mk-btn--primary min-h-11"
