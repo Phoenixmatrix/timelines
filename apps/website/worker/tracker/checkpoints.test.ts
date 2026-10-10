@@ -317,7 +317,8 @@ describe("approvals pinned to a checkpoint", () => {
         commit: oid(10),
         tree: oid(11),
       };
-      if (field === "logicalBase") measured.logicalBase = foreign;
+      if (field === "logicalBase")
+        measured.logicalBase = { ...measured.logicalBase!, commit: oid(10), tree: oid(11) };
       else measured.dependencies = [{ source: foreign, base: measured.logicalBase! }];
       const renewed = t.timelines.createCheckpoint(t.bot, "search", {
         summary: "Review the new dependency proof",

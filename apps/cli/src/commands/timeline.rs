@@ -136,6 +136,10 @@ pub struct CheckpointArgs {
     /// Summary in Markdown: what it holds and why (repeat for paragraphs; '-' reads stdin, '@path' a file).
     #[arg(short, long)]
     pub message: Vec<String>,
+    /// Renew this checkpoint's logical base to current canonical main after merging main and pushing.
+    /// Does not merge Git commits or change allocation metadata; requires no timeline dependencies.
+    #[arg(long)]
+    pub sync_main: bool,
     #[command(flatten)]
     pub owner: Owner,
 }
@@ -1150,11 +1154,19 @@ fn checkpoint(ctx: &Ctx, args: &CheckpointArgs) -> Result<Shown> {
     let owner = owner(ctx, &config, args.owner.owner.clone())?;
     let slug = named_or_current(&args.slug, "checkpoint")?;
     let summary = summary(&args.message)?;
-    let body = json!({ "summary": summary });
+    let mut body = json!({ "summary": summary });
+    if args.sync_main {
+        body["syncMain"] = json!(true);
+    }
     if ctx.dry_run {
         return Ok(Shown {
             text: format!(
-                "dry run: nothing was changed\nWould record a checkpoint of {slug}'s pushed commits."
+                "dry run: nothing was changed\nWould record a checkpoint of {slug}'s pushed commits.{}",
+                if args.sync_main {
+                    "\nWould renew only this checkpoint's logical base to current canonical main, which must already be merged and pushed; no Git merge or allocation metadata change."
+                } else {
+                    ""
+                }
             ),
             value: json!({"dry_run": true, "owner": owner, "timeline": slug, "request": body}),
         });

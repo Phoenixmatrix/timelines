@@ -935,6 +935,20 @@
           "required": false
         },
         {
+          "description": "Only issues with this tag; repeat for any of several. Case-insensitive; `gm issue tags` lists the catalog. (`--label` is the old name of this flag.)",
+          "flag": false,
+          "multiple": true,
+          "name": "--tag",
+          "required": false
+        },
+        {
+          "description": "Leave out issues with this tag (repeat)",
+          "flag": false,
+          "multiple": true,
+          "name": "--exclude-tag",
+          "required": false
+        },
+        {
           "default": "50",
           "description": "",
           "flag": false,
@@ -1024,6 +1038,20 @@
           "flag": false,
           "multiple": false,
           "name": "--search",
+          "required": false
+        },
+        {
+          "description": "Only issues with this tag; repeat for any of several. Case-insensitive; `gm issue tags` lists the catalog. (`--label` is the old name of this flag.)",
+          "flag": false,
+          "multiple": true,
+          "name": "--tag",
+          "required": false
+        },
+        {
+          "description": "Leave out issues with this tag (repeat)",
+          "flag": false,
+          "multiple": true,
+          "name": "--exclude-tag",
           "required": false
         },
         {
@@ -2060,6 +2088,20 @@
           "flag": false,
           "multiple": false,
           "name": "--under",
+          "required": false
+        },
+        {
+          "description": "Only issues with this tag; repeat for any of several. Case-insensitive; `gm issue tags` lists the catalog. (`--label` is the old name of this flag.)",
+          "flag": false,
+          "multiple": true,
+          "name": "--tag",
+          "required": false
+        },
+        {
+          "description": "Leave out issues with this tag (repeat)",
+          "flag": false,
+          "multiple": true,
+          "name": "--exclude-tag",
           "required": false
         },
         {
@@ -3901,7 +3943,8 @@
       "command": "gm timeline checkpoint",
       "examples": [
         "gm timeline checkpoint -m 'Search v2 ranking is ready: …'",
-        "gm timeline checkpoint search-v2 -m @summary.md"
+        "gm timeline checkpoint search-v2 -m @summary.md",
+        "gm timeline checkpoint --sync-main -m 'Current canonical main merged and pushed; renew checkpoint base'"
       ],
       "mutates": true,
       "options": [
@@ -3912,6 +3955,13 @@
           "name": "--message",
           "required": false,
           "short": "m"
+        },
+        {
+          "description": "Renew this checkpoint's logical base to current canonical main after merging main and pushing. Does not merge Git commits or change allocation metadata; requires no timeline dependencies",
+          "flag": true,
+          "multiple": false,
+          "name": "--sync-main",
+          "required": false
         },
         {
           "description": "Tracker account (default: .gitmatrix/agents.yml's, else origin's owner, else `gm tracker use`)",

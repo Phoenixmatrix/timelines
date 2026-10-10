@@ -197,6 +197,153 @@ function fixture(count = 2) {
   };
 }
 
+describe("explicit canonical checkpoint bases", () => {
+  const actor = { id: "owner", slug: "owner", displayName: "Owner", isSiteAdmin: false };
+  function syncedSource() {
+    const f = fixture(1);
+    const repo = f.current.repos[0]!;
+    const base = { ...repo.logicalBase! };
+    const main = {
+      hash: oid(80),
+      parents: [base.commit],
+      treeHash: oid(180),
+      message: "canonical change",
+    };
+    const source = { ...repo.source!, commit: oid(82), tree: oid(182) };
+    const graph = f.graphs.get("work_0")!;
+    graph.set(main.hash, main);
+    graph.set(source.commit, {
+      hash: source.commit,
+      parents: [repo.commit, main.hash],
+      treeHash: source.tree,
+      message: "resolved main synchronization",
+    });
+    f.graphs.get(repo.id)!.set(main.hash, main);
+    f.refs.get(repo.id)!.set("refs/heads/main", main.hash);
+    f.refs.get("work_0")!.set("refs/heads/work", source.commit);
+    const timeline = { id: "timeline", repos: [repo] } as unknown as Timeline;
+    vi.mocked(lsRefs).mockImplementation(async (_env, name) =>
+      [...f.refs.get(name)!].map(([name, oid]) => ({ name, oid })),
+    );
+    return { f, repo, base, main, source, graph, timeline };
+  }
+
+  test("only explicit renewal changes B; source and allocation snapshots remain intact", async () => {
+    const { f, repo, base, main, source, timeline } = syncedSource();
+    try {
+      const [ordinary] = await measure(f.env, actor, timeline);
+      const [renewed] = await measure(f.env, actor, timeline, true);
+      expect(ordinary!.logicalBase).toEqual(base);
+      expect(renewed!.logicalBase).toEqual({
+        ...base,
+        commit: main.hash,
+        tree: main.treeHash,
+      });
+      expect(renewed!.base).toBe(main.hash);
+      expect(renewed!.source).toEqual(source);
+      expect(renewed!.dependencies).toEqual([]);
+      expect(repo.logicalBase).toEqual(base);
+      expect(
+        f.sqlite.prepare("SELECT fork_commit, fork_tree FROM timeline_work_sources").get(),
+      ).toEqual({ fork_commit: base.commit, fork_tree: base.tree });
+      const [laterOrdinary] = await measure(f.env, actor, timeline);
+      expect(laterOrdinary!.logicalBase).toEqual(base);
+      expect(ordinary!.logicalBase).toEqual(base);
+    } finally {
+      f.sqlite.close();
+    }
+  });
+
+  test("the original base itself counts as current main in work ancestry", async () => {
+    const f = fixture(1);
+    try {
+      const repo = f.current.repos[0]!;
+      const timeline = { id: "timeline", repos: [repo] } as unknown as Timeline;
+      vi.mocked(lsRefs).mockImplementation(async (_env, name) =>
+        [...f.refs.get(name)!].map(([name, oid]) => ({ name, oid })),
+      );
+      const [renewed] = await measure(f.env, actor, timeline, true);
+      expect(renewed!.logicalBase).toEqual(repo.logicalBase);
+      expect(renewed!.source).toEqual(repo.source);
+    } finally {
+      f.sqlite.close();
+    }
+  });
+
+  test.each([
+    "unmerged main with equal content",
+    "missing main ref",
+    "unavailable main snapshot",
+    "prior base outside canonical history",
+    "foreign logical base",
+    "declared dependency",
+    "inferred dependency",
+  ] as const)("renewal fails closed for %s", async (mode) => {
+    const { f, repo, base, main, source, graph, timeline } = syncedSource();
+    try {
+      const canonical = f.graphs.get(repo.id)!;
+      if (mode === "unmerged main with equal content") {
+        canonical.set(oid(83), {
+          hash: oid(83),
+          parents: [main.hash],
+          treeHash: source.tree,
+          message: "new main not imported into work",
+        });
+        f.refs.get(repo.id)!.set("refs/heads/main", oid(83));
+      } else if (mode === "missing main ref") {
+        f.refs.get(repo.id)!.delete("refs/heads/main");
+      } else if (mode === "unavailable main snapshot") {
+        canonical.delete(main.hash);
+      } else if (mode === "prior base outside canonical history") {
+        const replaced = { hash: oid(84), parents: [], treeHash: oid(184), message: "new root" };
+        canonical.set(replaced.hash, replaced);
+        graph.set(replaced.hash, replaced);
+        graph.get(source.commit)!.parents = [repo.commit, replaced.hash];
+        f.refs.get(repo.id)!.set("refs/heads/main", replaced.hash);
+      } else if (mode === "foreign logical base") {
+        repo.logicalBase = {
+          ...base,
+          kind: "timeline-work",
+          sourceId: "foreign",
+          timelineId: "parent",
+          ref: "refs/heads/work",
+        };
+      } else {
+        const foreign = { ...source, sourceId: "foreign", timelineId: "parent", commit: oid(90) };
+        f.sqlite.exec(`INSERT INTO timeline_work_sources
+          (source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,
+           allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,
+           initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at,initial_token_revoked)
+          VALUES('foreign','repo0','parent','parent','owner','foreign','https://foreign','ready',
+            'foreign-allocation','canonical','${base.commit}','${base.tree}','refs/heads/main',
+            'canonical','${base.commit}','${base.tree}','refs/heads/main','now','now',1);`);
+        if (mode === "declared dependency") {
+          repo.dependencies = [{ source: foreign, base }];
+        } else {
+          graph.set(foreign.commit, {
+            hash: foreign.commit,
+            parents: [base.commit],
+            treeHash: foreign.tree,
+            message: "foreign work",
+          });
+          graph.get(repo.commit)!.parents = [foreign.commit];
+          f.sqlite.exec(`INSERT INTO source_revision_origins(repo_id,commit_oid,source_id)
+            VALUES('repo0','${foreign.commit}','foreign')`);
+        }
+      }
+      const measured = measure(f.env, actor, timeline, true);
+      if (mode === "unavailable main snapshot")
+        await expect(measured).rejects.toThrow("blocked_dependency");
+      else await expect(measured).rejects.toMatchObject({ code: "blocked_dependency" });
+      expect(
+        f.sqlite.prepare("SELECT COUNT(*) AS count FROM source_integration_receipts").get(),
+      ).toEqual({ count: 0 });
+    } finally {
+      f.sqlite.close();
+    }
+  });
+});
+
 describe("compact landing state", () => {
   test("a failing gate blocks every repository", async () => {
     const f = fixture();
