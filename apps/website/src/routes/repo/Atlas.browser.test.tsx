@@ -375,6 +375,40 @@ describe("the map view's inspector and controls (CORE-212)", () => {
     expect(localStorage.getItem("gitmatrix:atlas-pane")).toBeNull();
   });
 
+  test("a delayed selection preserves the reader's focus and keyboard resize controls", async () => {
+    localStorage.clear();
+    const { server, repo } = await setup();
+    await page.viewport(1440, 900);
+    let entered!: () => void;
+    let release!: () => void;
+    const requested = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    server.on("GET", `${repo.api}/atlas/ancestors`, async ({ url }) => {
+      const response = await server.call<AtlasAncestors>("GET", `${url.pathname}${url.search}`);
+      entered();
+      await blocked;
+      return response;
+    });
+    renderApp(`${repo.base}?select=${encodeURIComponent(LEDGER)}&view=map`);
+    await requested;
+    try {
+      await focusOn(separator());
+      await userEvent.keyboard("{ArrowLeft}{ArrowLeft}");
+      await expect.poll(inspectorWidth).toBe(464);
+    } finally {
+      release();
+    }
+    await expect.element(heading("ledger.ts")).toBeVisible();
+    await expect.element(separator()).toHaveFocus();
+    await userEvent.keyboard("{Home}");
+    await expect.poll(inspectorWidth).toBe(432);
+    expect(localStorage.getItem("gitmatrix:atlas-pane")).toBeNull();
+  });
+
   test("change dots are off until asked for, and the choice is remembered", async () => {
     localStorage.clear();
     const { repo } = await setup();

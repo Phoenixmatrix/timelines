@@ -432,6 +432,21 @@ function Territory({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url.select, resolver]);
 
+  useLayoutEffect(() => {
+    if (!focusOnShow || focus.state === "ready") return;
+    // A restored selection may arrive after the reader has started using the
+    // page. That newer interaction owns focus, not the pending network answer.
+    const cancel = () => setFocusOnShow(null);
+    document.addEventListener("focusin", cancel, true);
+    document.addEventListener("pointerdown", cancel, true);
+    document.addEventListener("keydown", cancel, true);
+    return () => {
+      document.removeEventListener("focusin", cancel, true);
+      document.removeEventListener("pointerdown", cancel, true);
+      document.removeEventListener("keydown", cancel, true);
+    };
+  }, [focusOnShow, focus.state]);
+
   const select = (entity: AtlasEntitySummary) => {
     if (entity.id === url.select) return;
     navigate({ select: entity.id, snapshot: snapshot.id });

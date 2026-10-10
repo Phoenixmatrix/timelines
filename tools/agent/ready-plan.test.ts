@@ -11,6 +11,7 @@ import {
   type ReadyOptions,
   type ReadyPlan,
 } from "./ready-plan.ts";
+import { ciBuildPlan } from "./ci-build.ts";
 
 const exec = promisify(execFile);
 const options: ReadyOptions = { all: false, dryRun: false, base: "origin/main" };
@@ -521,5 +522,67 @@ await test("--all preserves full gates while dry-run leaves selection and filesy
     assert.equal(all.e2e, true);
     assert.deepEqual(all.changed, []);
     assert.ok(all.reasons[0].includes("--all"));
+  });
+});
+
+await test("CI build selection covers all changes since proven success, not only the latest commit", async () => {
+  await fixture(async (root, git, put) => {
+    const base = (await git(["rev-parse", "HEAD"])).trim();
+    const env = {
+      GITMATRIX_COMMIT: base,
+      GITMATRIX_VERIFIED_BASE: JSON.stringify({ commit: base, runNumber: 1, jobId: "build-1" }),
+    };
+    await put("README.md");
+    assert.equal((await ciBuildPlan(root, env)).build, false);
+    await put("apps/site/src/content/docs/guide.md");
+    assert.equal((await ciBuildPlan(root, env)).build, true);
+    await git(["add", "."]);
+    await git(["commit", "-m", "site content"]);
+    await put("README.md", "Later documentation change\n");
+    await git(["add", "."]);
+    await git(["commit", "-m", "readme"]);
+    env.GITMATRIX_COMMIT = (await git(["rev-parse", "HEAD"])).trim();
+    assert.equal((await ciBuildPlan(root, env)).build, true);
+  });
+});
+
+await test("CI build selection cannot use absent, shallow, unrelated or mismatched evidence", async () => {
+  await fixture(async (root, git, put) => {
+    const base = (await git(["rev-parse", "HEAD"])).trim();
+    const proof = (commit: string) => JSON.stringify({ commit, runNumber: 1, jobId: "build-1" });
+    for (const baseline of [undefined, "null", "not-json", proof("f".repeat(40))]) {
+      assert.equal(
+        (
+          await ciBuildPlan(root, {
+            GITMATRIX_COMMIT: base,
+            GITMATRIX_VERIFIED_BASE: baseline,
+          })
+        ).build,
+        true,
+      );
+    }
+    assert.equal(
+      (
+        await ciBuildPlan(root, {
+          GITMATRIX_COMMIT: "f".repeat(40),
+          GITMATRIX_VERIFIED_BASE: proof(base),
+        })
+      ).build,
+      true,
+    );
+    await put("README.md");
+    await git(["add", "."]);
+    await git(["commit", "-m", "other branch"]);
+    const other = (await git(["rev-parse", "HEAD"])).trim();
+    await git(["checkout", "--detach", base]);
+    assert.equal(
+      (
+        await ciBuildPlan(root, {
+          GITMATRIX_COMMIT: base,
+          GITMATRIX_VERIFIED_BASE: proof(other),
+        })
+      ).build,
+      true,
+    );
   });
 });

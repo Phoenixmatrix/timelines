@@ -2,7 +2,12 @@ import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { onPush, startRun, startWorkflow } from "./trigger.ts";
-import { candidateProofs, executionIdentity, prerequisitesSatisfied } from "./verification.ts";
+import {
+  candidateProofs,
+  executionIdentity,
+  prerequisitesSatisfied,
+  previousVerification,
+} from "./verification.ts";
 import { CiRun } from "./workflow.ts";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import type { RunParams } from "./trigger.ts";
@@ -11,7 +16,7 @@ import type { CiRunDetail } from "../../shared/api.ts";
 import { ci } from "./api.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
-import { claim } from "./jobs.ts";
+import { claim, jobPayload, loadJob } from "./jobs.ts";
 
 const fixture = vi.hoisted(() => ({
   yaml: "",
@@ -662,5 +667,59 @@ describe("landed candidate verification", () => {
     expect(executionIdentity("registry/image:latest", version)).toBeNull();
     expect(executionIdentity(image, undefined)).toBeNull();
     expect(executionIdentity(image, { id: "development" })).toBeNull();
+  });
+});
+
+describe("verified change-selection baselines", () => {
+  async function baseline() {
+    const t = await setup(gatePipeline);
+    await t.start({ verification: undefined });
+    t.sqlite.exec(`UPDATE ci_jobs SET status='running',claimed_by='sandbox',
+      execution_identity='sandbox-v1:version:image' WHERE id='production-check'`);
+    return t;
+  }
+
+  test("only executed equivalent success supplies a baseline; repository env cannot forge it", async () => {
+    const t = await baseline();
+    expect(await previousVerification(t.env.DB, "production-check")).toEqual({
+      commit,
+      runNumber: 1,
+      jobId: "gates-check",
+    });
+    t.sqlite.exec(`UPDATE ci_jobs SET spec=json_set(spec,'$.env.GITMATRIX_VERIFIED_BASE','forged')
+      WHERE name='check'`);
+    const payload = await jobPayload(t.env.DB, (await loadJob(t.env.DB, "production-check"))!, {
+      origin: "https://gm.test",
+      token: "test-token",
+    });
+    expect(JSON.parse(payload.env.GITMATRIX_VERIFIED_BASE ?? "null")).toEqual({
+      commit,
+      runNumber: 1,
+      jobId: "gates-check",
+    });
+    t.sqlite.exec("UPDATE ci_jobs SET status='skipped', verified_by='{}' WHERE id='gates-check'");
+    expect(await previousVerification(t.env.DB, "production-check")).toBeNull();
+  });
+
+  test.each([
+    "UPDATE ci_jobs SET execution_identity='new-image' WHERE id='production-check'",
+    "UPDATE ci_jobs SET execution_identity=NULL WHERE id='production-check'",
+    "UPDATE ci_jobs SET runner='local' WHERE id='production-check'",
+    "UPDATE ci_jobs SET source_id='other-source' WHERE id='production-check'",
+    "UPDATE ci_jobs SET spec=json_set(spec,'$.verification',NULL) WHERE id='production-check'",
+    "UPDATE ci_jobs SET spec=json_set(spec,'$.secrets',json('[\"SECRET\"]')) WHERE id='production-check'",
+    "UPDATE ci_jobs SET spec=json_set(spec,'$.env.changed','yes') WHERE id='gates-check'",
+    "UPDATE ci_jobs SET source_id='other-source' WHERE id='gates-check'",
+    "UPDATE ci_jobs SET status='failed',exit_code=1 WHERE id='gates-check'",
+    "UPDATE ci_jobs SET finished_at=NULL WHERE id='gates-check'",
+    "UPDATE ci_jobs SET source_completion_pending=1 WHERE id='gates-check'",
+    "UPDATE ci_runs SET status='running' WHERE id='gates'",
+    "UPDATE ci_runs SET covered_by='other' WHERE id='gates'",
+    "UPDATE ci_steps SET status='skipped' WHERE job_id='gates-check'",
+    "DELETE FROM ci_steps WHERE job_id='gates-check'",
+  ])("falls back without complete equivalent evidence: %s", async (change) => {
+    const t = await baseline();
+    t.sqlite.exec(change);
+    expect(await previousVerification(t.env.DB, "production-check")).toBeNull();
   });
 });
