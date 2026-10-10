@@ -1081,8 +1081,18 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
         } else {
             "work"
         };
-        let clone = remote::git(
-            config,
+        // A shallow clone can succeed while the exact-commit fetch fails.
+        // Keep the last failed operation's stderr, not just the clone's.
+        let mut failed_stderr = Vec::new();
+        let mut git_succeeded = |cwd: &Path, args: &[&str]| -> Result<bool> {
+            let output = remote::git(config, cwd, args)?;
+            let succeeded = output.status.success();
+            if !succeeded {
+                failed_stderr = output.stderr;
+            }
+            Ok(succeeded)
+        };
+        let cloned = git_succeeded(
             &dir,
             &[
                 "clone",
@@ -1097,24 +1107,16 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
             ],
         )?;
         let commit = s(job, "commit");
-        let checked_out = clone.status.success()
-            && (remote::git(config, &checkout, &["checkout", "--quiet", commit])?
-                .status
-                .success()
-                || (remote::git(
-                    config,
+        let checked_out = cloned
+            && (git_succeeded(&checkout, &["checkout", "--quiet", commit])?
+                || (git_succeeded(
                     &checkout,
                     &["fetch", "--quiet", "--depth", "1", "origin", commit],
-                )?
-                .status
-                .success()
-                    && remote::git(config, &checkout, &["checkout", "--quiet", commit])?
-                        .status
-                        .success()));
+                )? && git_succeeded(&checkout, &["checkout", "--quiet", commit])?));
         if !checked_out {
             reporter.log(
                 SETUP_STEP,
-                String::from_utf8_lossy(&clone.stderr).into_owned(),
+                String::from_utf8_lossy(&failed_stderr).into_owned(),
             );
             return Ok(("failed", None, Some("Checkout failed.".into())));
         }

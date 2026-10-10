@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Landing, TimelineDetail, TimelineRepo } from "../../apps/website/shared/timelines.ts";
 import type { HarnessContext, SeedManifest } from "./types.ts";
-import type { CiRunDetail, CiRunList } from "../../apps/website/shared/api.ts";
+import type { CiLogs, CiRunDetail, CiRunList } from "../../apps/website/shared/api.ts";
 import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import {
   queueFixture,
@@ -201,10 +201,16 @@ export async function runSourceLandingE2E(
               (run.landing.timeline === slug || run.landing.id === snapshot?.landing?.id)
             )
               numbers.add(run.number);
-          for (const number of numbers)
-            await capture(`${f.repo}:ci:${number}`, () =>
+          for (const number of numbers) {
+            const detail = await capture(`${f.repo}:ci:${number}`, () =>
               f.json<CiRunDetail>(`${f.api}/ci/runs/${number}`),
             );
+            for (const job of detail?.jobs ?? [])
+              if (job.status === "failed")
+                await capture(`${f.repo}:ci:${number}:${job.name}:logs`, () =>
+                  f.json<CiLogs>(`${f.api}/ci/jobs/${job.id}/logs`),
+                );
+          }
         }
         throw error;
       }
