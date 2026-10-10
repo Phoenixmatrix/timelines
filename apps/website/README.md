@@ -274,6 +274,32 @@ flight on a branch, a push's run is held; when one finishes, the newest held run
 starts and covers the older ones (`covered_by`), and `gm runs wait` follows the
 covering run.
 
+**Documentation-only builds (CORE-134).** The required production `build` job
+executes `tools/agent/ci-build.ts`, which uses the readiness planner against a
+server-supplied successful-job baseline. Ordinary allowlisted README/changelog
+changes and test-only changes need no compilation; site content Markdown,
+runtime inputs and unknown/global paths still build. Check/test gates remain
+mandatory, and the build job logs its decision and baseline rather than pretending
+that a compiler ran.
+
+The baseline must be an executed successful job from a successful run, in the
+same canonical repository, with identical job specification and immutable
+Worker/image execution identity. Reused/skipped jobs are not producers. The
+consumer verifies that this commit is an ancestor present in its checkout and
+compares the entire range, including earlier commits in a multi-commit push.
+Missing evidence/history, changed runtime or configuration, and uncertain inputs
+fall back to the full build. A Worker rollout therefore needs a fresh successful
+build before documentation-only compilation can be omitted. Deployment continues
+using each deployed Worker's own commit tag; it never uses this build baseline.
+
+Inspect `gm runs logs N --job build` for `ci.build.plan`: `build: false`
+means compilation was omitted, and `baseline.runNumber` / `baseline.jobId`
+identify the successful producer. The required job still runs its selection
+guard and must succeed; this is distinct from main's **Verified** candidate
+reuse. Do not set `GITMATRIX_VERIFIED_BASE` by hand to request a fast path.
+After a Worker rollout, a normal successful build (or an explicit
+`gm runs start --ref main`) establishes evidence for the new runtime.
+
 **Explicit merge queue (CORE-136).** `gm push --queue --issue CORE-123` submits
 independent default-branch work without immediately advancing main. It uploads a
 source staging ref, then admits a durable per-repository entry whose ID is the
@@ -2324,6 +2350,10 @@ unreadable (access revoked, made private or deleted: a 404 or 401 without an
 Atlas `code`; `atlasAccessLost`, `onAtlasAccessLost` in `src/lib/atlas.ts`),
 the tab reads its route again, so the not-found page replaces the whole view
 rather than leaving what was read before on screen.
+Restored selections move focus to the inspector when it arrives, unless a
+newer focus, pointer or keyboard interaction already took ownership while the
+selection was loading (CORE-332). In particular, a late selection must not take
+the resize handle's focus or swallow its Home-to-reset action.
 
 **Atlas authorization suite** (`worker/atlas/authorization.test.ts`,
 CORE-178). One D1-backed suite drives the real application (`worker/app.ts`:
@@ -2645,6 +2675,12 @@ of those reuse properties.
   (`push`, `manual`, `preview`, `landing` or `step`) and `GITMATRIX_TOKEN`; `GITMATRIX_TIMELINE` on a
   timeline's bookmark and in preview runs, which also get `GITMATRIX_CHECKPOINT`
   and `GITMATRIX_PREVIEW_ACTION`. A job's `env:` and secrets come after them.
+  `GITMATRIX_VERIFIED_BASE` is reserved and cannot be overridden by repository
+  environment or secrets: JSON `{commit, runNumber, jobId}` from an executed,
+  runtime-equivalent successful job, or JSON `null`. Only opted-in
+  `context-invariant-v1` sandbox jobs without secrets can receive evidence.
+  It is a candidate comparison baseline, not authorization to skip a required
+  job; consumers must prove ancestry and complete input independence.
 
 API: `/api/repos/:o/:n/ci` (runs, `?ref=<branch>` for one branch's, run detail,
 logs with `?after=`, cancel, re-run, commit statuses, secrets) and

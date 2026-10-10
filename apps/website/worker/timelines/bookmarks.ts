@@ -3,7 +3,7 @@
 // server already has: the ref commands, then an empty pack (git sends one
 // whenever a command creates or moves a ref), with a short-lived write token.
 
-import { upstreamToken } from "../artifacts.ts";
+import { isTransientArtifactsError, upstreamToken, UpstreamStatusError } from "../artifacts.ts";
 import {
   needsPack,
   parsePushReport,
@@ -12,6 +12,7 @@ import {
   ZERO_OID,
 } from "../mirror/protocol.ts";
 import { invalidateRefs } from "../objects.ts";
+import { retrying, UPSTREAM_TIMEOUT_MS } from "../retry.ts";
 
 /** "PACK", version 2, no objects, and the SHA-1 of those 12 bytes. */
 const EMPTY_PACK = new Uint8Array([
@@ -46,13 +47,25 @@ export async function writeRefs(
 ): Promise<RefWriteResult[]> {
   if (!writes.length) return [];
   const authorization = `Bearer ${await upstreamToken(env, repo.artifacts_name, "write")}`;
-  const advertised = await fetch(`${repo.artifacts_remote}/info/refs?service=git-receive-pack`, {
-    headers: { authorization },
-  });
-  if (!advertised.ok)
-    throw new Error(`Artifacts refused to list refs for a push (HTTP ${advertised.status}).`);
-  const { capabilities } = parseReceivePackAdvertisement(
-    new Uint8Array(await advertised.arrayBuffer()),
+  // The advertisement is a read, retried and bounded; the update itself is not
+  // retried here (each write applies only from `old`, and callers recover).
+  const { capabilities } = await retrying(
+    async () => {
+      const advertised = await fetch(
+        `${repo.artifacts_remote}/info/refs?service=git-receive-pack`,
+        { headers: { authorization }, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) },
+      );
+      if (!advertised.ok) {
+        await advertised.body?.cancel();
+        throw new UpstreamStatusError("receive-pack advertisement", advertised.status);
+      }
+      return parseReceivePackAdvertisement(new Uint8Array(await advertised.arrayBuffer()));
+    },
+    {
+      retryable: isTransientArtifactsError,
+      label: "Artifacts receive-pack advertisement",
+      context: { artifactsName: repo.artifacts_name },
+    },
   );
   const updates = writes.map((w) => ({
     ref: w.ref,

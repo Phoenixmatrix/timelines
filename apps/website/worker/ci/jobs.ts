@@ -8,6 +8,7 @@ import { timelineSlugOf } from "../../shared/timelines.ts";
 import { batch, db, nowIso } from "../schema.ts";
 import type { JobSpec } from "./config.ts";
 import { registrySetup, revokeJobTokens } from "./registry.ts";
+import { previousVerification } from "./verification.ts";
 
 /** What ci_jobs.spec holds: the parsed job with pipeline env merged in. */
 export type StoredJob = Omit<JobSpec, "name">;
@@ -124,6 +125,8 @@ export async function jobPayload(
       ...setup.env,
       ...spec.env,
       ...secrets,
+      // Reserved: repository env and secrets cannot manufacture verification provenance.
+      GITMATRIX_VERIFIED_BASE: JSON.stringify(await previousVerification(d1, job.id)),
     },
     files: setup.files,
     steps: spec.steps.map((s, i) => ({ position: i, name: s.name, run: s.run })),

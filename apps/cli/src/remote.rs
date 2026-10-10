@@ -552,11 +552,83 @@ impl Access {
     }
 }
 
+/// How long gm waits to reach the server (name lookup, then connecting), so a
+/// dropped network fails instead of hanging.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long gm waits for a response to start, so a stuck request ends with an
+/// error instead of a hang. Writes can take a while (forking a timeline's
+/// sources); reads less so. Streams count only until their headers arrive.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(not(test))]
+const READ_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+#[cfg(test)]
+const READ_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+/// Waits before retrying a read that failed in transit or met a gateway error:
+/// Cloudflare in front of the server is sometimes briefly unavailable. Writes
+/// are never retried here, since a lost reply doesn't mean nothing happened.
+#[cfg(not(test))]
+const READ_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(2),
+];
+#[cfg(test)]
+const READ_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(10),
+    std::time::Duration::from_millis(20),
+];
+
+/// A gateway that couldn't reach the server, or a server briefly unavailable.
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 502..=504)
+}
+
+/// A failure in transit: no answer came, so asking again is safe for a read.
+/// A timeout isn't one: the server may still be working on the request, and
+/// asking again only adds to its load.
+fn retryable_error(error: &ureq::Error) -> bool {
+    matches!(
+        error,
+        ureq::Error::Io(_) | ureq::Error::HostNotFound | ureq::Error::ConnectionFailed
+    )
+}
+
+/// GET `url`, retrying failures in transit and gateway errors after
+/// READ_RETRY_DELAYS; the last attempt's answer or error is returned.
+fn get_with_retries(
+    agent: &ureq::Agent,
+    url: &str,
+    auth: Option<&str>,
+) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    let mut delays = READ_RETRY_DELAYS.iter();
+    loop {
+        let mut req = agent
+            .get(url)
+            .config()
+            .timeout_recv_response(Some(READ_RESPONSE_TIMEOUT))
+            .build();
+        if let Some(a) = auth {
+            req = req.header("authorization", a);
+        }
+        let outcome = req.call();
+        let retry = match &outcome {
+            Ok(response) => retryable_status(response.status().as_u16()),
+            Err(error) => retryable_error(error),
+        };
+        match delays.next() {
+            Some(delay) if retry => std::thread::sleep(*delay),
+            _ => return outcome,
+        }
+    }
+}
+
 fn agent(url: &str, no_redirects: bool) -> Result<ureq::Agent> {
     let access = Access::load()?.filter(|access| origin(url).as_deref() == Some(&access.origin));
     let protected = access.is_some();
     let mut builder = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .timeout_resolve(Some(CONNECT_TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
         .middleware(cli_source);
     if let Some(access) = access {
         builder = builder.middleware(
@@ -625,22 +697,24 @@ pub fn api_with(
     let url = format!("{}/api{}", config.server(), path);
     let agent = agent(&url, false)?;
     let auth = token.map(|t| format!("Bearer {t}"));
-    let unreachable = |e: ureq::Error| {
-        GmError::new(
+    let unreachable = |e: ureq::Error| match e {
+        ureq::Error::Timeout(_) => GmError::new(
+            "server_timeout",
+            format!("{} didn't answer in time: {e}", config.server()),
+        )
+        .hint("The server is slow or stuck; try again shortly."),
+        e => GmError::new(
             "server_unreachable",
             format!("Could not reach {}: {e}", config.server()),
         )
         .hint(
             "Is the dev server running? Start it with `vp dev` in apps/website, or set GM_SERVER.",
-        )
+        ),
     };
     let mut response = match (method.to_uppercase().as_str(), body) {
-        ("GET", _) | ("DELETE", None) => {
-            let mut req = if method.eq_ignore_ascii_case("GET") {
-                agent.get(&url)
-            } else {
-                agent.delete(&url)
-            };
+        ("GET", _) => get_with_retries(&agent, &url, auth.as_deref()).map_err(unreachable)?,
+        ("DELETE", None) => {
+            let mut req = agent.delete(&url);
             if let Some(a) = &auth {
                 req = req.header("authorization", a);
             }
@@ -1288,5 +1362,123 @@ mod config_tests {
         let text = serde_json::to_string(&prod.stored("https://gitmatrix.example")).unwrap();
         assert_eq!(loaded(&text, DEFAULT_SERVER).token.as_deref(), Some("a"));
         assert_eq!(loaded(&text, "https://gitmatrix.example").token, None);
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    /// A server answering each request with the next status in `statuses`
+    /// (then 200), recording each request's method.
+    fn serve(statuses: Vec<u16>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (record, mut statuses) = (Arc::clone(&seen), statuses.into_iter());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                record
+                    .lock()
+                    .unwrap()
+                    .push(line.split(' ').next().unwrap_or("").to_string());
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                std::io::Read::read_exact(&mut reader, &mut vec![0; length]).unwrap();
+                let status = statuses.next().unwrap_or(200);
+                let body = format!(r#"{{"status":{status}}}"#);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    fn config(url: &str) -> Config {
+        Config {
+            server: Some(url.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_read_retries_gateway_errors_until_the_server_answers() {
+        let (url, seen) = serve(vec![503, 502]);
+        let value = api_with(&config(&url), "GET", "/thing", None, None).unwrap();
+        assert_eq!(value["status"], 200);
+        assert_eq!(*seen.lock().unwrap(), ["GET", "GET", "GET"]);
+    }
+
+    #[test]
+    fn a_read_gives_up_after_its_retries_with_the_last_answer() {
+        let (url, seen) = serve(vec![504, 503, 502, 200]);
+        let error = api_with(&config(&url), "GET", "/thing", None, None).unwrap_err();
+        assert!(error.message.contains("502"), "{}", error.message);
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn writes_and_ordinary_errors_are_never_retried() {
+        let (url, seen) = serve(vec![503, 500]);
+        let body = serde_json::json!({});
+        assert!(api_with(&config(&url), "POST", "/thing", Some(&body), None).is_err());
+        assert!(api_with(&config(&url), "GET", "/thing", None, None).is_err());
+        assert_eq!(*seen.lock().unwrap(), ["POST", "GET"]);
+    }
+
+    #[test]
+    fn a_dropped_connection_is_retried_then_reported() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(Mutex::new(0));
+        let count = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                *count.lock().unwrap() += 1;
+                drop(stream);
+            }
+        });
+        let error = api_with(&config(&url), "GET", "/thing", None, None).unwrap_err();
+        assert_eq!(error.code, "server_unreachable");
+        assert_eq!(*accepted.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_read_that_times_out_is_reported_not_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(Mutex::new(0));
+        let count = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                *count.lock().unwrap() += 1;
+                // Never answer: hold the connection open.
+                held.push(stream);
+            }
+        });
+        let error = api_with(&config(&url), "GET", "/thing", None, None).unwrap_err();
+        assert_eq!(error.code, "server_timeout");
+        assert_eq!(*accepted.lock().unwrap(), 1);
     }
 }

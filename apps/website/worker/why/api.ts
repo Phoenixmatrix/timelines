@@ -27,7 +27,8 @@ import {
 } from "../../shared/why.ts";
 import { fail } from "../api/http.ts";
 import { loadSourceRepo } from "../api/repos.ts";
-import { upstreamToken } from "../artifacts.ts";
+import { isTransientArtifactsError, upstreamToken, UpstreamStatusError } from "../artifacts.ts";
+import { retrying, UPSTREAM_TIMEOUT_MS } from "../retry.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor, RepoRow } from "../db.ts";
 import { DELIM, FLUSH, pkt } from "../git/pktline.ts";
@@ -119,31 +120,51 @@ async function ownerTracker(
 
 /** A commit's `change-id` header: a one-commit protocol v2 fetch, without blobs. */
 async function headerChangeId(env: Env, row: RepoRow, oid: string): Promise<string | null> {
-  const token = await upstreamToken(env, row.artifacts_name, "read");
-  const response = await fetch(`${row.artifacts_remote}/git-upload-pack`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/x-git-upload-pack-request",
-      accept: "application/x-git-upload-pack-result",
-      "git-protocol": "version=2",
-    },
-    body:
-      pkt("command=fetch\n") +
-      pkt("agent=gitmatrix\n") +
-      pkt("object-format=sha1\n") +
-      DELIM +
-      pkt("no-progress\n") +
-      pkt("ofs-delta\n") +
-      pkt("filter blob:none\n") +
-      pkt("deepen 1\n") +
-      pkt(`want ${oid}\n`) +
-      pkt("done\n") +
-      FLUSH,
-  });
-  if (!response.ok || !response.body) return null;
-  const { commits } = await readNewCommits(response.body, HEADER_PACK_BYTES);
-  return commits.find((commit) => commit.oid === oid)?.changeId ?? null;
+  // A read: retried through transient failures (CORE-331); any other refusal
+  // still just means no header.
+  try {
+    return await retrying(
+      async () => {
+        const token = await upstreamToken(env, row.artifacts_name, "read");
+        const response = await fetch(`${row.artifacts_remote}/git-upload-pack`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/x-git-upload-pack-request",
+            accept: "application/x-git-upload-pack-result",
+            "git-protocol": "version=2",
+          },
+          body:
+            pkt("command=fetch\n") +
+            pkt("agent=gitmatrix\n") +
+            pkt("object-format=sha1\n") +
+            DELIM +
+            pkt("no-progress\n") +
+            pkt("ofs-delta\n") +
+            pkt("filter blob:none\n") +
+            pkt("deepen 1\n") +
+            pkt(`want ${oid}\n`) +
+            pkt("done\n") +
+            FLUSH,
+          signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+        });
+        if (!response.ok || !response.body) {
+          await response.body?.cancel();
+          throw new UpstreamStatusError("fetch", response.status);
+        }
+        const { commits } = await readNewCommits(response.body, HEADER_PACK_BYTES);
+        return commits.find((commit) => commit.oid === oid)?.changeId ?? null;
+      },
+      {
+        retryable: isTransientArtifactsError,
+        label: "Why: reading a commit header",
+        context: { artifactsName: row.artifacts_name },
+      },
+    );
+  } catch (error) {
+    if (error instanceof UpstreamStatusError) return null;
+    throw error;
+  }
 }
 
 /** The Worker's sources: D1's push log, the repository, and the owner's tracker. */
