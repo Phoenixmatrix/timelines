@@ -1772,6 +1772,11 @@ the URL says. What each surface does with it:
 A landed or abandoned timeline stays selectable: the shell banner says how it
 ended and that its view is read-only, on the tracker and every other page.
 
+The switcher's **Timeline graph** link sits beside its title, above the changing
+list and loading/error messages, so resolving the list does not move a footer
+link during a click. It remains a native link and follows the page's account,
+including an explicitly selected account in Settings.
+
 ## Release notes
 
 Release notes are code-update history, not deployment records. The default view

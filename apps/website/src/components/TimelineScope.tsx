@@ -214,7 +214,18 @@ function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
   return (
     <>
       <div className="px-3 pt-2.5 pb-2">
-        <Popover.Title className="m-0 text-title">Timeline</Popover.Title>
+        <div className="flex items-center gap-2">
+          <Popover.Title className="m-0 text-title">Timeline</Popover.Title>
+          <Link
+            to={
+              scope.owner ? `/tracker/${encodeURIComponent(scope.owner)}/timelines` : "/timelines"
+            }
+            onClick={close}
+            className="mk-btn mk-btn--ghost mk-btn--sm ml-auto no-underline"
+          >
+            Timeline graph
+          </Link>
+        </div>
         <Popover.Description className="mt-0.5 mb-0 text-body-sm text-ink-muted">
           Scope every page to main plus one line of work
           {scope.owner ? (
@@ -280,8 +291,8 @@ function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
       ) : words.length && !shown.length ? (
         <p className="m-0 px-3 py-2 text-body-sm text-ink-faint">No timeline matches.</p>
       ) : null}
-      <div className="sticky bottom-0 mt-1 flex items-center gap-2 border-t border-line-soft bg-rail px-1.5 pt-1.5">
-        {scope.owner && ended.length > 0 && !showEnded && !words.length && (
+      {scope.owner && ended.length > 0 && !showEnded && !words.length && (
+        <div className="sticky bottom-0 mt-1 flex items-center gap-2 border-t border-line-soft bg-rail px-1.5 pt-1.5">
           <button
             type="button"
             className="mk-btn mk-btn--ghost mk-btn--sm"
@@ -289,15 +300,8 @@ function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
           >
             Show {ended.length} ended
           </button>
-        )}
-        <Link
-          to={scope.owner ? `/tracker/${encodeURIComponent(scope.owner)}/timelines` : "/timelines"}
-          onClick={close}
-          className="mk-btn mk-btn--ghost mk-btn--sm ml-auto no-underline"
-        >
-          Timeline graph
-        </Link>
-      </div>
+        </div>
+      )}
     </>
   );
 }
