@@ -4,6 +4,25 @@ import { getWorkSource } from "./sources.ts";
 import { lsRefs } from "../artifacts.ts";
 
 export type ReadParents = (oid: string) => Promise<readonly string[] | null>;
+
+/** One operation's immutable metadata, isolated by physical repository.
+ * Keep capabilities with their caller; never cache absence, errors or provenance. */
+export class RevisionMetadata {
+  private readonly repos = new Map<string, Map<string, ArtifactsCommitMetadata>>();
+
+  reader(name: string, repo: Pick<ArtifactsRepo, "readCommit">) {
+    let commits = this.repos.get(name);
+    if (!commits) this.repos.set(name, (commits = new Map()));
+    return async (oid: string): Promise<ArtifactsCommitMetadata | null> => {
+      const known = commits.get(oid);
+      if (known) return known;
+      const commit = await repo.readCommit(oid);
+      if (commit) commits.set(oid, commit);
+      return commit;
+    };
+  }
+}
+
 /** Exhaustive closure: unavailable objects are uncertainty, never negative evidence. */
 export async function revisionClosure(head: string, read: ReadParents): Promise<Set<string>> {
   const seen = new Set<string>();
@@ -54,7 +73,12 @@ export async function admittedReceipts(env: Env, source: SourceSnapshot, canonic
 }
 
 /** Checkpoint chooses B; moving main can invalidate its proof, never select another B. */
-export async function validateDependencies(env: Env, repo: LandingRepo, canonical: Set<string>) {
+export async function validateDependencies(
+  env: Env,
+  repo: LandingRepo,
+  canonical: Set<string>,
+  metadata = new RevisionMetadata(),
+) {
   if (!repo.source || !repo.logicalBase || !repo.dependencies)
     throw new Error("migration_required: renew checkpoint with owned source metadata");
   const base = repo.logicalBase;
@@ -79,9 +103,10 @@ export async function validateDependencies(env: Env, repo: LandingRepo, canonica
   if (!owner || owner.state === "purged" || owner.state === "purging")
     throw new Error("blocked_dependency: logical base source is unavailable");
   using artifacts = await env.ARTIFACTS.get(owner.artifacts_name);
+  const readCommit = metadata.reader(owner.artifacts_name, artifacts);
   const closure = await revisionClosure(
     base.commit,
-    async (oid) => (await artifacts.readCommit(oid))?.parents ?? null,
+    async (oid) => (await readCommit(oid))?.parents ?? null,
   );
   if (repo.dependencies.some((dependency) => !closure.has(dependency.source.commit)))
     throw new Error(
@@ -169,25 +194,32 @@ export async function validateMergeEdges(
 }
 
 /** Membership is written completely BEFORE receipt visibility; retries fill the same identity. */
-export async function recordIntent(env: Env, landing: Landing, repo: LandingRepo, tree: string) {
+export async function recordIntent(
+  env: Env,
+  landing: Landing,
+  repo: LandingRepo,
+  tree: string,
+  metadata = new RevisionMetadata(),
+) {
   const source = repo.source!;
   const existing = await receiptFor(env, landing.id, repo.id);
   if (existing && existing.status !== "intent") return existing;
   const owned = await getWorkSource(env, repo.id, source.sourceId);
   if (!owned || owned.state !== "ready") throw new Error("Source is not available for landing");
   using artifacts = await env.ARTIFACTS.get(owned.artifacts_name);
-  const commit = await artifacts.readCommit(source.commit);
+  const readCommit = metadata.reader(owned.artifacts_name, artifacts);
+  const commit = await readCommit(source.commit);
   if (!commit || commit.treeHash !== source.tree)
     throw new Error("Approved source tree is unavailable");
-  const metadata = new Map<string, ArtifactsCommitMetadata>();
+  const inputs: ArtifactsCommitMetadata[] = [];
   const members = await revisionClosure(source.commit, async (oid) => {
-    const value = await artifacts.readCommit(oid);
-    if (value) metadata.set(oid, value);
+    const value = await readCommit(oid);
+    if (value) inputs.push(value);
     return value?.parents ?? null;
   });
   const baseMembers = await revisionClosure(
     repo.logicalBase!.commit,
-    async (oid) => (await artifacts.readCommit(oid))?.parents ?? null,
+    async (oid) => (await readCommit(oid))?.parents ?? null,
   );
   const id = `${landing.id}:${repo.id}`;
   for (const oid of members) {
@@ -200,11 +232,7 @@ export async function recordIntent(env: Env, landing: Landing, repo: LandingRepo
   await env.DB.prepare(
     "INSERT INTO source_integration_inputs(receipt_id,repo_id,commits_json) VALUES(?,?,?) ON CONFLICT(receipt_id) DO NOTHING",
   )
-    .bind(
-      id,
-      repo.id,
-      JSON.stringify([...metadata.values()].filter((value) => !baseMembers.has(value.hash))),
-    )
+    .bind(id, repo.id, JSON.stringify(inputs.filter((value) => !baseMembers.has(value.hash))))
     .run();
   await env.DB.prepare(`INSERT INTO source_integration_receipts
     (id,landing_id,checkpoint_id,repo_id,source_id,source_commit,source_tree,logical_base_json,dependencies_json,canonical_base,canonical_commit,canonical_tree,noop,status,created_at)

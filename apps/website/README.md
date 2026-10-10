@@ -1596,6 +1596,18 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   Known foreign work still needs exact reviewed integration. This is
   service-recorded provenance, not proof of where otherwise unknown external
   Git objects were authored.
+  Checkpoint measurement and each landing progress invocation reuse successful
+  immutable commit metadata by physical repository and OID. Overlapping base,
+  dependency and merge-parent closures still traverse every ancestor, but do
+  not repeatedly fetch already-read metadata. The landing receipt reuses the
+  same source metadata; canonical ancestry reads are also shared within that
+  invocation. No cache crosses requests, caches absence or provider errors, or
+  substitutes for fresh source state, origin, acknowledgement and receipt checks.
+  Missing ancestry blocks proof; provider errors remain errors rather than
+  evidence of absence. Repository capabilities retain their existing `using`
+  ownership. `worker/timelines/landing.test.ts` covers 448 revisions with 58
+  overlapping merges, exact receipt membership, old foreign/unacknowledged
+  branches and unavailable ancestry.
 - **Abandoning** is for the accountable person or the agent that started the
   timeline. It ends writes and archives work sources rather than deleting their
   history. Settled partial landings retain successful receipts; abandoning never

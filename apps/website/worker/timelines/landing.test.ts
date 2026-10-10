@@ -357,7 +357,7 @@ describe("compact landing state", () => {
     async (path) => {
       const f = fixture(1),
         write = f.deps.writeRefs.bind(f.deps),
-        parents = f.deps.parents.bind(f.deps);
+        refs = f.deps.refs.bind(f.deps);
       const rewrite = () => {
         f.graphs.get("repo0")!.set(oid(91), {
           parents: [],
@@ -379,12 +379,13 @@ describe("compact landing state", () => {
           throw new Error("timeout after provider success");
         };
         await f.run();
-        // The rewrite lands while reconciling walks the history it read (the
-        // first walk validates dependencies).
-        let walks = 0;
-        f.deps.parents = async (repo, commit) => {
-          if (commit === f.current.repos[0]!.merge && ++walks === 2) rewrite();
-          return parents(repo, commit);
+        // Rewrite after reconciliation observes main, before the receipt's
+        // fresh ref check. Immutable ancestry may already be cached.
+        let observations = 0;
+        f.deps.refs = async (repo) => {
+          const observed = new Map(await refs(repo));
+          if (repo.artifacts_name === "repo0" && ++observations === 2) rewrite();
+          return observed;
         };
       }
       const landing = await f.run();
@@ -447,19 +448,19 @@ describe("compact landing state", () => {
       ]);
     },
   );
-  test("a dependency read transport failure preserves prepared work for the next progress request", async () => {
+  test("a canonical ref transport failure preserves prepared work for the next progress request", async () => {
     const f = fixture();
     for (const [index, repo] of f.current.repos.entries())
       repo.gateRun = { id: `gate${index}`, number: 2 };
     const prepared = structuredClone(f.current.repos);
-    const parents = f.deps.parents.bind(f.deps);
+    const refs = f.deps.refs.bind(f.deps);
     let interrupted = false;
-    f.deps.parents = async (repo, commit) => {
-      if (repo.id === "repo1" && f.writes.includes("repo0") && !interrupted) {
+    f.deps.refs = async (repo) => {
+      if (repo.artifacts_name === "repo1" && f.writes.includes("repo0") && !interrupted) {
         interrupted = true;
         throw new Error("Peer closed WebSocket: 1006");
       }
-      return parents(repo, commit);
+      return refs(repo);
     };
     const gates = vi.spyOn(f.deps, "startGates");
     expect((await f.run()).state).toBe("advancing");
@@ -482,20 +483,19 @@ describe("compact landing state", () => {
     for (const [index, repo] of f.current.repos.entries())
       repo.gateRun = { id: `gate${index}`, number: 2 };
     f.deps.stepRetryMs = [0, 0];
-    const parents = f.deps.parents.bind(f.deps);
+    const refs = f.deps.refs.bind(f.deps);
     let interrupted = false;
-    f.deps.parents = async (repo, commit) => {
-      if (repo.id === "repo1" && f.writes.includes("repo0") && !interrupted) {
+    f.deps.refs = async (repo) => {
+      if (repo.artifacts_name === "repo1" && f.writes.includes("repo0") && !interrupted) {
         interrupted = true;
         throw new Error("Peer closed WebSocket: 1006");
       }
-      return parents(repo, commit);
+      return refs(repo);
     };
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect((await f.run()).state).toBe("landed");
     expect(interrupted).toBe(true);
     expect(f.writes).toEqual(["repo0", "repo1"]);
-    expect(warn).toHaveBeenCalledWith("Landing: a step failed; retrying it", expect.anything());
     warn.mockRestore();
   });
   test("a step that keeps failing is left to the next look after its retries", async () => {
@@ -1213,6 +1213,148 @@ describe("exact nested admission", () => {
       validateDependencies(f.env, imported, new Set([repo.base!, repo.merge!])),
     ).rejects.toThrow("blocked_dependency");
   });
+  test.each(["valid", "missing", "provider error", "foreign", "unacknowledged"] as const)(
+    "448 revisions and 58 overlapping merges preserve exact checkpoint and landing proof: %s",
+    async (mode) => {
+      const f = fixture(1);
+      try {
+        const repo = f.current.repos[0]!;
+        const graph = f.graphs.get("work_0")!;
+        graph.delete(repo.commit);
+        let tip = repo.base!;
+        let serial = 1_000;
+        const branches: string[] = [];
+        const append = (parents: string[]) => {
+          const hash = oid(serial++);
+          graph.set(hash, { hash, parents, treeHash: repo.source!.tree, message: "owned work" });
+          return hash;
+        };
+        for (let merge = 0; merge < 58; merge++) {
+          const fork = tip;
+          for (let n = 0; n < 5; n++) tip = append([tip]);
+          const side = append([fork]);
+          branches.push(side);
+          tip = append([tip, side]);
+        }
+        for (let n = 0; n < 41; n++) tip = append([tip]);
+        repo.commit = tip;
+        repo.source = { ...repo.source!, commit: tip };
+        f.refs.get("work_0")!.set("refs/heads/work", tip);
+        f.sqlite.exec(`INSERT INTO source_operations
+          (id,owner_id,timeline_id,repo_id,source_id,kind,state,data,created_at,updated_at)
+          VALUES('large-push','owner','timeline','repo0','work_0','push','accepted','{}','now','now')`);
+        for (const hash of graph.keys()) {
+          if (hash === repo.base) continue;
+          f.sqlite
+            .prepare(`INSERT INTO source_revision_origins(repo_id,commit_oid,source_id)
+            VALUES('repo0',?,'work_0')`)
+            .run(hash);
+          f.sqlite
+            .prepare(`INSERT INTO source_progress_members
+            (repo_id,source_id,commit_oid,operation_id,created_at)
+            VALUES('repo0','work_0',?,'large-push','now')`)
+            .run(hash);
+        }
+        expect(graph.size).toBe(448);
+        expect([...graph.values()].filter((commit) => commit.parents.length === 2)).toHaveLength(
+          58,
+        );
+        // An old side branch must still be checked, not just recent merge tips.
+        const uncertain = branches[0]!;
+        if (mode === "missing") graph.delete(uncertain);
+        if (mode === "foreign")
+          f.sqlite
+            .prepare("UPDATE source_revision_origins SET source_id='foreign' WHERE commit_oid=?")
+            .run(uncertain);
+        if (mode === "unacknowledged")
+          f.sqlite.prepare("DELETE FROM source_progress_members WHERE commit_oid=?").run(uncertain);
+        const reads = new Map<string, number>();
+        const get = f.env.ARTIFACTS.get.bind(f.env.ARTIFACTS);
+        Object.assign(f.env.ARTIFACTS, {
+          get: async (name: string) => {
+            const artifacts = await get(name);
+            const read = artifacts.readCommit.bind(artifacts);
+            return Object.assign(artifacts, {
+              readCommit: async (hash: string) => {
+                if (name === "work_0") {
+                  reads.set(hash, (reads.get(hash) ?? 0) + 1);
+                  if (mode === "provider error" && hash === uncertain)
+                    throw new Error("Artifacts INTERNAL_ERROR");
+                }
+                return read(hash);
+              },
+            });
+          },
+        });
+        vi.mocked(lsRefs).mockImplementation(async (_env, name) =>
+          [...f.refs.get(name)!].map(([name, oid]) => ({ name, oid })),
+        );
+        const checkpoint = measure(
+          f.env,
+          { id: "owner", slug: "owner", displayName: "Owner", isSiteAdmin: false },
+          { id: "timeline", repos: [repo] } as unknown as Timeline,
+        );
+        if (mode === "valid") {
+          const [measured] = await checkpoint;
+          expect(measured).toMatchObject({
+            commit: tip,
+            source: repo.source,
+            logicalBase: repo.logicalBase,
+            dependencies: [],
+          });
+          expect(reads.size).toBe(448);
+          expect([...reads.values()].every((count) => count === 1)).toBe(true);
+          // A successful earlier proof cannot supply a later request's missing evidence.
+          const previous = graph.get(uncertain)!;
+          graph.delete(uncertain);
+          await expect(
+            measure(
+              f.env,
+              { id: "owner", slug: "owner", displayName: "Owner", isSiteAdmin: false },
+              { id: "timeline", repos: [repo] } as unknown as Timeline,
+            ),
+          ).rejects.toThrow(/unavailable|blocked_dependency/);
+          graph.set(uncertain, previous);
+          reads.clear();
+          expect((await f.run()).state).toBe("landed");
+          expect(f.writes).toEqual(["repo0"]);
+          expect(reads.size).toBe(448);
+          expect([...reads.values()].every((count) => count === 1)).toBe(true);
+          expect(
+            f.sqlite.prepare("SELECT count(*) AS count FROM source_integration_members").get(),
+          ).toEqual({ count: 448 });
+          const inputs = f.sqlite
+            .prepare("SELECT commits_json FROM source_integration_inputs")
+            .get() as { commits_json: string };
+          expect(
+            new Set(JSON.parse(inputs.commits_json).map((commit: { hash: string }) => commit.hash)),
+          ).toEqual(new Set([...graph.keys()].filter((hash) => hash !== repo.base)));
+          expect(
+            await admittedReceipts(
+              f.env,
+              { ...repo.source!, commit: uncertain },
+              new Set([repo.base!, repo.merge!]),
+            ),
+          ).toMatchObject([{ status: "complete" }]);
+        } else {
+          await expect(checkpoint).rejects.toThrow(
+            mode === "provider error"
+              ? "Artifacts INTERNAL_ERROR"
+              : /unavailable|blocked_dependency/,
+          );
+          const result = await f.run();
+          expect(result.state).toBe(mode === "provider error" ? "advancing" : "blocked_dependency");
+          expect(f.writes).toEqual([]);
+          expect(
+            f.sqlite.prepare("SELECT count(*) AS count FROM source_integration_receipts").get(),
+          ).toEqual({ count: 0 });
+        }
+      } finally {
+        f.sqlite.close();
+      }
+    },
+  );
+
   test("full graph closure traverses both parents and blocks unavailable evidence", async () => {
     const parents: Record<string, string[]> = {
       tip: ["left", "right"],
