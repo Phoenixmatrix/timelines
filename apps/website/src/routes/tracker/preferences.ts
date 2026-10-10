@@ -6,7 +6,7 @@ export const VIEW_LABEL = {
   list: "List",
   board: "Board",
   graph: "Graph",
-  chronicle: "Chronicle",
+  chronicle: "History",
 } as const;
 export type View = keyof typeof VIEW_LABEL;
 
