@@ -26,6 +26,7 @@ import {
 } from "./preferences.ts";
 import { refreshAfterTrackerMutation } from "../release-notes/queue.ts";
 import { view as checkpointView, writableRepoIds } from "../timelines/checkpoints.ts";
+import type { RepoIssueSummary } from "../../shared/api.ts";
 
 export const tracker = new Hono<AppEnv>();
 
@@ -445,11 +446,39 @@ tracker.get("/repos/:owner/:name/tracker", async (c) => {
     return c.json({ error: "Repository not found." }, 404);
   const workspaces: { trackerOwner: string; workspaceId: string; slug: string; name: string }[] =
     [];
-  for (const owner of await accessible(c.env.DB, actor)) {
+  const owners = await accessible(c.env.DB, actor);
+  for (const owner of owners) {
     const result = await trackerObject(c.env, owner.id).subscribedWorkspaces(repo.id);
     if (!result.ok) return response(c, result);
     for (const workspace of result.value)
       workspaces.push({ trackerOwner: owner.slug, ...workspace });
   }
-  return c.json({ workspaces });
+  return c.json({
+    workspaces,
+    canManage:
+      roleFor(repo, actor) === "admin" &&
+      owners.some((owner) => owner.slug === repo.owner_slug && owner.canAdmin),
+  });
+});
+
+tracker.get("/repos/:owner/:name/tracker/summary", async (c) => {
+  const actor = c.get("actor");
+  const repo = await findRepo(c.env.DB, actor, c.req.param("owner"), c.req.param("name"));
+  if (!repo || roleFor(repo, actor) === "none")
+    return c.json({ error: "Repository not found." }, 404);
+  const summary: RepoIssueSummary = { ready: null, workspaces: 0 };
+  if (!actor) return c.json(summary);
+  const timeline = timelineParam(c);
+  for (const owner of await accessible(c.env.DB, actor)) {
+    // A timeline belongs to the repository owner; other subscribed trackers retain main's view.
+    const result = await trackerObject(c.env, owner.id).repoReadySummary(
+      repo.id,
+      owner.slug === repo.owner_slug ? timeline : undefined,
+    );
+    if (!result.ok) return response(c, result);
+    if (!result.value.workspaces) continue;
+    summary.workspaces += result.value.workspaces;
+    summary.ready = (summary.ready ?? 0) + result.value.ready;
+  }
+  return c.json(summary);
 });

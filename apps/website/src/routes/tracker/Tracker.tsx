@@ -57,6 +57,7 @@ import {
 } from "../../../shared/tracker.ts";
 import { ActivityStrip } from "../../components/ActivityStrip.tsx";
 import { SettingsPage } from "../../components/SettingsPage.tsx";
+import { issuePageTitle, usePageTitle } from "../../components/PageTitle.tsx";
 import { FormError, popMotion, SelectField, Tip, useToast } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { useViewer } from "../../lib/session.ts";
@@ -278,6 +279,7 @@ function Workbench({ data }: { data: TrackerView }) {
   const scopeQuery = timelineQuery(timeline ? { tl: timeline.slug } : {});
   const selected =
     snapshot.issues.find((issue) => issue.id === route.issue || issue.key === route.issue) ?? null;
+  usePageTitle(route.issue ? issuePageTitle(selected, owner, timeline?.name) : null);
   useEffect(() => {
     if (selected?.id === editOnCreate) setEditOnCreate(null);
   }, [selected?.id, editOnCreate]);

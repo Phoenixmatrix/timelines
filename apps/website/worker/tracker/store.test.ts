@@ -1208,6 +1208,70 @@ describe("tracker SQLite authority", () => {
       { workspaceId: "other-workspace", slug: "other", name: "Other" },
     ]);
   });
+  test("repository ready summaries deduplicate workspace membership and use canonical readiness", () => {
+    const f = fixture();
+    expect(f.store.repoReadySummary("repo")).toEqual({ ready: 0, workspaces: 0 });
+    f.mutate(
+      { kind: "workspace.create", id: "second", data: { slug: "second", name: "Second" } },
+      {
+        kind: "subscription.add",
+        id: "sub-one",
+        data: { workspaceId: "workspace", repoId: "repo" },
+      },
+      { kind: "subscription.add", id: "sub-two", data: { workspaceId: "second", repoId: "repo" } },
+      {
+        kind: "issue.create",
+        id: "ready",
+        data: {
+          teamId: "team",
+          title: "Ready",
+          status: "todo",
+          workspaceIds: ["workspace", "second"],
+        },
+      },
+      {
+        kind: "issue.create",
+        id: "outside",
+        data: { teamId: "team", title: "Not associated", status: "todo" },
+      },
+      {
+        kind: "issue.create",
+        id: "human",
+        data: {
+          teamId: "team",
+          title: "Human",
+          status: "todo",
+          pickup: "human_only",
+          workspaceIds: ["workspace"],
+        },
+      },
+      {
+        kind: "issue.create",
+        id: "blocked",
+        data: { teamId: "team", title: "Blocked", status: "todo", workspaceIds: ["workspace"] },
+      },
+      {
+        kind: "link.add",
+        id: "block",
+        data: { kind: "blocks", fromId: "outside", toId: "blocked" },
+      },
+    );
+    expect(f.store.repoReadySummary("repo")).toEqual({ ready: 1, workspaces: 2 });
+    f.mutate({
+      kind: "issue.update",
+      id: "ready",
+      expectedVersion: 1,
+      data: { pickup: "not_ready" },
+    });
+    expect(f.store.repoReadySummary("repo")).toEqual({ ready: 0, workspaces: 2 });
+    expect(f.store.repoReadySummary("unrelated")).toEqual({ ready: 0, workspaces: 0 });
+  });
+  test("team navigation excludes archived teams and returns no issue content", () => {
+    const f = fixture();
+    expect(f.store.teamDirectory()).toEqual([{ id: "team", key: "ENG", name: "Engineering" }]);
+    f.mutate({ kind: "team.update", id: "team", expectedVersion: 1, data: { archived: true } });
+    expect(f.store.teamDirectory()).toEqual([]);
+  });
   test("malformed optional fields and content/cardinality limits reject without partial writes", () => {
     const f = fixture();
     f.issue("issue");

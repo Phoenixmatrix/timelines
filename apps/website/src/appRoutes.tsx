@@ -3,6 +3,7 @@
 
 import { redirect, type RouteObject } from "react-router";
 import { AppShell } from "./components/AppShell.tsx";
+import { PageTitle, PageTitleError, withPageTitles } from "./components/PageTitle.tsx";
 import { keepPageUnderPanel } from "./lib/commitPanel.ts";
 import { rootLoader } from "./lib/session.ts";
 import { scopeOf, timelineScopeMiddleware } from "./lib/timelineScope.ts";
@@ -68,8 +69,36 @@ import {
 import { RepoTracker, repoTrackerLoader } from "./routes/repo/Tracker.tsx";
 import { GoPage, goLoader } from "./refs/GoPage.tsx";
 
+function TitledShell() {
+  return (
+    <PageTitle>
+      <AppShell />
+    </PageTitle>
+  );
+}
+
+function TitledError() {
+  return (
+    <PageTitleError>
+      <ErrorPage />
+    </PageTitleError>
+  );
+}
+
+function RootError() {
+  return (
+    <PageTitle>
+      <TitledError />
+    </PageTitle>
+  );
+}
+
+function InitialPageTitle() {
+  return <PageTitle loading>{null}</PageTitle>;
+}
+
 /** The app's routes. */
-export const routes: RouteObject[] = [
+export const routes: RouteObject[] = withPageTitles([
   {
     id: "root",
     // The timeline scope (?tl=) follows every navigation that doesn't name one.
@@ -78,11 +107,13 @@ export const routes: RouteObject[] = [
     // The session only changes through forms (sign in, sign out).
     shouldRevalidate: ({ formMethod, currentUrl, nextUrl, defaultShouldRevalidate }) =>
       formMethod || currentUrl.href === nextUrl.href ? defaultShouldRevalidate : false,
-    Component: AppShell,
+    Component: TitledShell,
+    ErrorBoundary: RootError,
+    HydrateFallback: InitialPageTitle,
     // Errors render inside the shell so the rail stays put.
     children: [
       {
-        ErrorBoundary: ErrorPage,
+        ErrorBoundary: TitledError,
         children: [
           { index: true, loader: homeLoader, Component: Home },
           { path: "signin", loader: signInLoader, action: signInAction, Component: SignIn },
@@ -262,8 +293,14 @@ export const routes: RouteObject[] = [
               ] satisfies RouteObject[]
             ).map(keepPageUnderPanel),
           },
+          {
+            path: "*",
+            loader: () => {
+              throw new Response(null, { status: 404 });
+            },
+          },
         ],
       },
     ],
   },
-];
+]);

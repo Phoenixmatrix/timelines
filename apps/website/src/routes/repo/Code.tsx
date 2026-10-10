@@ -7,8 +7,21 @@ import {
 } from "@phosphor-icons/react";
 import { Suspense, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
-import { Await, Link, useLoaderData, useNavigate, type LoaderFunctionArgs } from "react-router";
-import type { CommitSummary, RepoDetail, TreeEntry, TreeResponse } from "../../../shared/api.ts";
+import {
+  Await,
+  Link,
+  useLoaderData,
+  useLocation,
+  useNavigate,
+  type LoaderFunctionArgs,
+} from "react-router";
+import type {
+  CommitSummary,
+  RepoDetail,
+  RepoIssueSummary,
+  TreeEntry,
+  TreeResponse,
+} from "../../../shared/api.ts";
 import { CopyField, link } from "../../components/ui.tsx";
 import { coAuthors } from "../../lib/commitAttribution.ts";
 import { firstLine, fullDate, timeAgo } from "../../lib/format.ts";
@@ -16,7 +29,7 @@ import { blobUrl, commitsUrl, treeUrl } from "../../lib/refs.ts";
 import { CommitLink } from "../../components/CommitLink.tsx";
 import { repoData, requestSource, routeData } from "../../lib/repoData.ts";
 import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
-import { ApiError } from "../../lib/api.ts";
+import { api, ApiError } from "../../lib/api.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { railClass } from "../../components/Rail.tsx";
 import { useViewer } from "../../lib/session.ts";
@@ -59,13 +72,17 @@ export async function codeLoader({ request, params }: LoaderFunctionArgs) {
     return { tree: await routeData(Promise.reject(tree)), about: null };
   }
   // The About rail is extra: it streams in beside the files and never holds
-  // them up. Both reads are cached, so moving between folders reuses them.
+  // them up. Knowledge and CI reads are cached; readiness is read live.
   const about = Promise.all([
     source && source !== "canonical"
       ? Promise.resolve(null)
       : repoData.graphNode(owner, name, "repo").catch(() => null),
     repoData.ciRuns(owner, name, source).catch(() => null),
-  ]).then(([knowledge, ci]) => ({ knowledge, ci }));
+    api<RepoIssueSummary>(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/tracker/summary?${new URLSearchParams({ timeline: scopeOf(new URL(request.url).search) ?? "main" })}`,
+      { signal: request.signal },
+    ).catch(() => null),
+  ]).then(([knowledge, ci, issues]) => ({ knowledge, ci, issues }));
   return { tree: tree as TreeResponse, about };
 }
 
@@ -372,6 +389,7 @@ export function Code() {
   const { tree, about } = useLoaderData<typeof codeLoader>();
   const repo = useRepo();
   const navigate = useNavigate();
+  const { search } = useLocation();
   if (!tree) return <EmptyRepo repo={repo} />;
 
   return (
@@ -415,7 +433,11 @@ export function Code() {
         )}
       </div>
       <aside aria-label="About this repository" className={`hidden xl:block ${railClass}`}>
-        <Suspense fallback={null}>
+        {/* Never reuse a resolved private count while a different repository or scope loads. */}
+        <Suspense
+          key={`${repo.id}:${repo.source?.sourceId ?? "canonical"}:${scopeOf(search) ?? "main"}`}
+          fallback={null}
+        >
           <Await resolve={about} errorElement={null}>
             {(data: Awaited<NonNullable<typeof about>>) => <About repo={repo} {...data} />}
           </Await>

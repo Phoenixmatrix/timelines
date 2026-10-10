@@ -426,19 +426,26 @@ links to the step in the timeline's story; `gm why` prints the same.
 
 A timeline's **Story** (`/tracker/:owner/timelines/:slug/story`, linked from
 the timeline page; `src/routes/tracker/Story.tsx`) lists its commits newest
-first along the first-parent line of `timeline/<slug>` (the last commits once
-abandoned, the landed head once landed) down to the fork point, merges marked.
+first along the first-parent line of the timeline's owned source ref, retained
+after landing; abandoned timelines pin the source's last commit. Historical
+canonical timelines use the contributing merge parent. The line stops at the
+fork point, with merges marked. Legacy records without a source retain their
+stored bookmark.
 Each row shows the step's summary, agent, time, test result and how complete
 its context is. Opening one shows the commit's diff beside its why,
 instructions, steering, challenges and tests, with the missing-hook note when
-a harness hook didn't record them. `j`/`k` (or ←/→) step through, Escape
-closes; filters by agent and issue and the step itself live in the URL; an
+a harness hook didn't record them. With character navigation enabled, `j` is
+Next (the next visible row) and `k` is Previous (the previous visible row),
+matching the visible buttons. Right/Down is Next and Left/Up is Previous even without the opt-in; Escape
+closes. Filters by agent and issue and the step itself live in the URL; an
 amended change offers its earlier versions. On a phone the list and the step
 take the screen in turn.
 
 It reads `history` for the line, `steps?commits=` for the context in batches
-of 100, and the diff from `GET /api/repos/:o/:n/commits/:oid/diff`: the
-commit against its first parent as hunks, bounded by `DIFF_LIMITS`
+of 100, and the diff from `GET /api/repos/:o/:n/commits/:oid/diff`. History
+pages, selected and amended diffs, and commit-panel links carry the timeline's
+source identity; a physical `work` ref is never read in the canonical namespace.
+The diff shows the commit against its first parent as hunks, bounded by `DIFF_LIMITS`
 (`shared/diff.ts`: 300 files listed, 60 patched, 256 KiB per side, 400 tree
 reads; binary and oversized files are counted without hunks). Diffs are
 addressed by commit, so they're cached as immutable.
@@ -1228,9 +1235,17 @@ read as `agent_decides`.
   no defaults are saved). **Everything** remains a valid saved default.
   Choosing **Everything**, **Show everything**, or an explicit empty `q=` URL
   still requests all issues; clearing search does not change saved preferences.
-- **Keyboard shortcuts:** enable them in **Account menu → Preferences**. This
-  opt-in applies only to the current browser: `c`/`n` captures an issue, `/`
-  filters, `j`/`k` moves between issues, and Escape closes the issue.
+- **Keyboard shortcuts:** press `?` or use **Keyboard shortcuts** in the rail for
+  accessible help. Character navigation is off by default; enable it in
+  **Account menu → Preferences** for this browser. `g i` opens the current
+  tracker (or the default tracker without context), `g p` opens Packages, and
+  `g h` opens Home. Press both keys within one second; another key, a route or
+  focus change, pointer interaction or leaving the window cancels the chord.
+  In the tracker, `c`/`n` captures an issue, `/` filters, `j`/`k` selects the
+  next/previous issue, and Escape closes it. In Story, `j`/`k` invokes
+  Next/Previous. Help and navigation avoid text entry, composition and other
+  dialogs; help traps focus and Escape restores it. Cmd/Ctrl-K search and
+  Cmd/Ctrl-J assistant shortcuts are unchanged outside help.
 - **Settings:** the gear at the bottom of the navigation rail opens a shared
   settings area, starting with **Teams and workspaces** for the current tracker,
   or your default tracker when outside a tracker. A left-hand section navigation
@@ -1296,11 +1311,12 @@ read as `agent_decides`.
   An uncertain write blocks new server mutations and retries
   its original operation ID; local editing and form dismissal remain available,
   and confirmation acknowledges the original save before sending queued edits.
-- **Keyboard:** single-key shortcuts are off by default; enable or disable them
-  through **Shortcuts** in the account actions. The preference persists locally.
+- **Keyboard:** character navigation is off by default; enable or disable it
+  through **Account menu → Preferences**. The preference persists locally.
   `c` or `n` focuses capture, `/` focuses search, `j`/`k` selects adjacent issues,
-  and `e` edits the selected issue. Shortcuts do not run while typing or interacting
-  with form controls. The enabled legend lists the available keys.
+  and Escape closes the selected issue. Shortcuts do not run while typing or
+  interacting with form controls. The enabled legend lists the available keys;
+  `?` or the rail’s **Keyboard shortcuts** button opens global help.
 
 | Route                                                             | Contract                                                                                                |
 | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |

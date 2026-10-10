@@ -274,6 +274,12 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   tagCatalog() {
     return this.reply(() => this.store.tagCatalog());
   }
+  teamDirectory() {
+    return this.reply(() => this.store.teamDirectory());
+  }
+  repoReadySummary(repoId: string, timeline?: string) {
+    return this.reply(() => this.store.repoReadySummary(repoId, timeline));
+  }
   subscribedWorkspaces(repoId: string) {
     return this.reply(() => this.store.subscribedWorkspaces(repoId));
   }

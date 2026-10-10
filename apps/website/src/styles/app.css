@@ -382,6 +382,41 @@ body {
   }
 }
 
+/* One phone row, including account/organization controls. The same dimensions
+   size the sticky rail and reserve its occlusion for native anchors and focus.
+   The timeline banner scrolls with the page on phones, so adds no offset. */
+@media (max-width: 639.98px) {
+  :root:has(.app-rail) {
+    --phone-rail-row: 48px;
+    --phone-rail-padding: 8px;
+    --phone-rail-height: calc(var(--phone-rail-row) + 2 * var(--phone-rail-padding));
+    scroll-padding-top: var(--phone-rail-height);
+  }
+  .mk-rail.app-rail {
+    --size-dock: 44px;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    gap: 4px;
+    width: 100%;
+    min-width: 0;
+    height: var(--phone-rail-height);
+    padding: var(--phone-rail-padding) 12px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+  .app-rail::-webkit-scrollbar {
+    display: none;
+  }
+  .app-rail > * {
+    flex-shrink: 0;
+  }
+  .app-rail :is(a, button) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
+
 /* The relationship lens re-centres with a view transition: cards that stay on
    screen glide to their new place on the expo ease; everything else cross-fades. */
 ::view-transition-group(*) {

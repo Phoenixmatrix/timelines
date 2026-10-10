@@ -763,6 +763,34 @@ export class TrackerStore {
         return { request, issue: { id: issue.id, key: issue.key, title: issue.title } };
       });
   }
+  /** Account navigation needs team identity only, not a private issue snapshot. */
+  teamDirectory(): { id: string; key: string; name: string }[] {
+    return this.all<Team>("team")
+      .filter((team) => !team.archived)
+      .map(({ id, key, name }) => ({ id, key, name }))
+      .sort((a, b) => a.key.localeCompare(b.key));
+  }
+
+  /** Count each ready issue once across this repository's active subscriptions. */
+  repoReadySummary(repoId: string, timeline?: string): { ready: number; workspaces: number } {
+    const workspaces = this.subscribedWorkspaces(repoId);
+    if (!workspaces.length) return { ready: 0, workspaces: 0 };
+    const scope = this.timeline(timeline);
+    return this.within(scope, () => {
+      const ids = new Set(workspaces.map((workspace) => workspace.workspaceId));
+      const issues = this.all<Issue>("issue");
+      const graph = readinessIndex(issues, this.all<Link>("link"));
+      const now = new Date(this.clock()).toISOString();
+      let ready = 0;
+      for (const issue of issues)
+        if (
+          issue.workspaceIds.some((id) => ids.has(id)) &&
+          readiness(issue, graph, now) === "ready"
+        )
+          ready++;
+      return { ready, workspaces: workspaces.length };
+    });
+  }
   subscribedWorkspaces(repoId: string): { workspaceId: string; slug: string; name: string }[] {
     id(repoId);
     return all(

@@ -181,8 +181,16 @@ export interface AccountPage extends AccountSummary {
   bio: string;
   repos: RepoSummary[];
   members: (AccountSummary & { role: "owner" | "member" })[];
+  /** null means no tracker access; [] means an accessible tracker with no active teams. */
+  teams: { id: string; key: string; name: string }[] | null;
   /** An organization the signed-in person can manage (its owners, site admins). */
   viewerCanManage: boolean;
+}
+
+/** Only membership-visible subscriptions contribute; null never means zero ready work. */
+export interface RepoIssueSummary {
+  ready: number | null;
+  workspaces: number;
 }
 
 export interface Collaborator extends AccountSummary {

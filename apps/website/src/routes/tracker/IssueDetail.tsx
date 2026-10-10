@@ -992,7 +992,7 @@ export function IssueDetail({
     <article
       ref={detailRef}
       tabIndex={-1}
-      className="min-w-0 outline-none max-sm:scroll-mt-[calc(var(--size-dock)+16px)]"
+      className="min-w-0 outline-none"
       aria-label={`${issue.key} issue detail`}
     >
       <header className="pr-10 pb-4">

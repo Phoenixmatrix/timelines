@@ -8,6 +8,8 @@ import { createDb } from "../../registry/core/db.ts";
 import { slugProblem } from "../names.ts";
 import { canManageOrg } from "../avatars/api.ts";
 import { fail, readJson, requireActor } from "./http.ts";
+import { accessible } from "../tracker/api.ts";
+import { trackerObject } from "../tracker/stub.ts";
 
 export const accounts = new Hono<AppEnv>();
 
@@ -131,11 +133,22 @@ accounts.get("/accounts/:slug", async (c) => {
         ).map((row) => ({ ...accountSummary(row), role: row.role }))
       : [];
   const actor = c.get("actor");
+  // Repository visibility, subscriptions and site administration do not grant tracker membership.
+  const trackerOwner = actor
+    ? (await accessible(c.env.DB, actor)).find((owner) => owner.id === account.id)
+    : undefined;
+  let teams: AccountPage["teams"] = null;
+  if (trackerOwner) {
+    const result = await trackerObject(c.env, account.id).teamDirectory();
+    if (!result.ok) return c.json({ error: result.error, code: result.code }, result.status);
+    teams = result.value;
+  }
   const page: AccountPage = {
     ...accountSummary(account),
     bio: account.bio,
     repos: await visibleRepos(c.env.DB, actor, account.id),
     members,
+    teams,
     // People manage organizations; agents acting for them don't.
     viewerCanManage:
       account.kind === "org" && !!actor && !actor.agent
