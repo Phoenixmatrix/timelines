@@ -2340,6 +2340,10 @@ unreadable (access revoked, made private or deleted: a 404 or 401 without an
 Atlas `code`; `atlasAccessLost`, `onAtlasAccessLost` in `src/lib/atlas.ts`),
 the tab reads its route again, so the not-found page replaces the whole view
 rather than leaving what was read before on screen.
+Restored selections move focus to the inspector when it arrives, unless a
+newer focus, pointer or keyboard interaction already took ownership while the
+selection was loading (CORE-332). In particular, a late selection must not take
+the resize handle's focus or swallow its Home-to-reset action.
 
 **Atlas authorization suite** (`worker/atlas/authorization.test.ts`,
 CORE-178). One D1-backed suite drives the real application (`worker/app.ts`:
