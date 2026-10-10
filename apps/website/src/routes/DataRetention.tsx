@@ -54,7 +54,7 @@ export function DataRetention() {
   if (!options.some((o) => o.value === data.owner))
     options.push({ value: data.owner, label: `@${data.owner}` });
   return (
-    <SettingsPage owner={data.owner}>
+    <SettingsPage owner={data.owner} wide>
       <h1 className="m-0 text-headline">Data retention</h1>
       <p className="mt-1.5 mb-0 max-w-[65ch] text-ink-muted">{INTRO}</p>
       <div className="mt-6 flex max-w-md flex-col gap-1 text-field-label">
@@ -102,7 +102,7 @@ export async function siteRetentionLoader({ request }: { request: Request }) {
 export function SiteRetention() {
   const data = useLoaderData<typeof siteRetentionLoader>();
   return (
-    <SettingsPage>
+    <SettingsPage wide>
       <h1 className="m-0 text-headline">Site data retention</h1>
       <p className="mt-1.5 mb-0 max-w-[65ch] text-ink-muted">
         Retention for data no account owns, and the defaults every account starts from. Nothing is

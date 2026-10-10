@@ -39,7 +39,7 @@ export function Preferences() {
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         Choose how the issue tracker opens and how you move through it.
       </p>
-      <div className="mt-8 flex flex-col gap-8">
+      <div className="mt-8 flex flex-col gap-6">
         {data ? (
           <div className="flex flex-col gap-4">
             <div className="flex flex-wrap items-end gap-3">
@@ -67,8 +67,8 @@ export function Preferences() {
         ) : (
           <p className="m-0 text-ink-muted">No trackers are available for this account.</p>
         )}
-        <section aria-labelledby="keyboard-shortcuts-title">
-          <h2 id="keyboard-shortcuts-title" className="m-0 text-title">
+        <section className="mk-card" aria-labelledby="keyboard-shortcuts-title">
+          <h2 id="keyboard-shortcuts-title" className="mk-card-title">
             Keyboard shortcuts
           </h2>
           <label className="mt-3 flex min-h-11 cursor-pointer items-center gap-3">

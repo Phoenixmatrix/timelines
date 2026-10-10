@@ -93,6 +93,26 @@ body,
   min-height: 100%;
 }
 
+/* App-owned form layout; the vendored kit stays unchanged. */
+@layer components {
+  .mk-form-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+  }
+  .mk-form-actions > .mk-btn {
+    min-height: var(--size-field);
+  }
+}
+
+/* Keep centered settings pages aligned; phone overlays still use the full viewport. */
+@media (min-width: 64rem) {
+  html:has(.settings-layout) {
+    scrollbar-gutter: stable;
+  }
+}
+
 body {
   margin: 0;
   background: var(--surface);

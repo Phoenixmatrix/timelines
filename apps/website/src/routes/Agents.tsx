@@ -115,8 +115,8 @@ export function Agents() {
               placeholder="Works through the CORE graph"
               autoComplete="off"
             />
-            <div className="flex items-center justify-end gap-3">
-              <FormError message={error} />
+            <FormError message={error} />
+            <div className="mk-form-actions">
               <button className="mk-btn mk-btn--primary" disabled={creating}>
                 Create agent
               </button>

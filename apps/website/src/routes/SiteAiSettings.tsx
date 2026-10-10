@@ -66,7 +66,7 @@ export function SiteAiSettings() {
           their own account in its AI settings.
         </p>
         <form
-          className="mt-6 flex flex-col gap-6"
+          className="mk-card mt-8 flex flex-col gap-6"
           aria-busy={saving}
           onSubmit={(event) => {
             event.preventDefault();
@@ -139,7 +139,7 @@ export function SiteAiSettings() {
                 : notice || (dirty ? "You have unsaved changes." : "")}
             </p>
             {saved.canManage && (
-              <div className="flex flex-wrap gap-3">
+              <div className="mk-form-actions">
                 <button
                   type="submit"
                   className="mk-btn mk-btn--primary min-h-11"

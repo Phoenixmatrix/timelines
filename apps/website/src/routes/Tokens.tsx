@@ -75,8 +75,8 @@ export function Tokens() {
                 ]}
               />
             </div>
-            <div className="flex items-center justify-end gap-3">
-              <FormError message={created && "error" in created ? created.error : null} />
+            <FormError message={created && "error" in created ? created.error : null} />
+            <div className="mk-form-actions">
               <button
                 className="mk-btn mk-btn--primary"
                 disabled={navigation.state === "submitting"}

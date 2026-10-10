@@ -99,7 +99,7 @@ export function AssistantSkills() {
                 Added /{add.data.name}.
               </p>
             )}
-            <div>
+            <div className="mk-form-actions">
               <button
                 className="mk-btn mk-btn--primary pointer-coarse:min-h-11"
                 disabled={add.state !== "idle"}
@@ -312,7 +312,7 @@ function SkillRow({ skill }: { skill: PersonalAssistantSkill }) {
           <input type="hidden" name="intent" value="save" />
           <input type="hidden" name="id" value={skill.id} />
           <SkillFields skill={skill} disabled={busy} />
-          <div className="flex flex-wrap gap-2">
+          <div className="mk-form-actions">
             <button className="mk-btn mk-btn--primary pointer-coarse:min-h-11" disabled={busy}>
               {busy ? "Saving…" : "Save skill"}
             </button>

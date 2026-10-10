@@ -202,7 +202,7 @@ export interface PictureTarget {
 /** Your profile picture, on Settings → Profile. */
 export function AvatarCard({ viewer }: { viewer: Viewer }) {
   return (
-    <Card title="Picture" className="max-w-xl">
+    <Card title="Picture">
       <PictureEditor
         target={{
           endpoint: "/account/avatar",
