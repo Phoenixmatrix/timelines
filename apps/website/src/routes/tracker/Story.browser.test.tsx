@@ -221,6 +221,13 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
     .element(step.getByRole("button", { name: /Next/ }))
     .toHaveAttribute("aria-keyshortcuts", "j ArrowRight ArrowDown");
   // Arrows and visible actions agree with the letter keys.
+  // A pointer action followed by a key before React commits must take two
+  // hops, not navigate again from the rendered (older) selection.
+  (step.getByRole("button", { name: /Previous/ }).element() as HTMLButtonElement).click();
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
+  await app.waitForUrl((url) => url.searchParams.get("step") === merge);
+  await userEvent.keyboard("{ArrowDown}{ArrowDown}");
+  await app.waitForUrl((url) => url.searchParams.get("step") === plain);
   await userEvent.click(step.getByRole("button", { name: /Previous/ }));
   await app.waitForUrl((url) => url.searchParams.get("step") === rank);
   await userEvent.keyboard("{ArrowDown}");

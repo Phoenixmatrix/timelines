@@ -1211,12 +1211,20 @@ read as `agent_decides`.
   inherited. Checkpoints, claims, blockers and completion evidence remain distinct.
 - **Creator and audit:** issue details show **Created by** and the creation time
   without opening history. Expand **Audit history** for newest-first events,
-  including comments, requests, relations and parent changes. Each entry shows
-  the actor (and an agent's accountable person), timestamp, client-reported source,
-  operation ID and field changes; **Full event details** exposes the complete
-  sanitized event. **Load older events** pages through the history. History loads
-  only while expanded, refreshes when the snapshot cursor advances, and resets
-  on issue/account changes. Activity & handoff remains the comments workspace.
+  including comments, requests, relations and parent changes. Entries default to
+  compact actor/time rows with changed-field deltas: short before/after values,
+  added/removed tags and workspace associations, and changed words for descriptions
+  and other long text. Previews show at most three fields and four text changes,
+  with bounded excerpts; large rewrites use a truncated preview instead of an
+  expensive diff. Creation events do not repeat every default field, and missing
+  earlier values are labeled rather than presented as inferred changes.
+  Expand an event (click, Enter or Space) for complete before/after values, the
+  actor's identity and accountability, client-reported source and operation ID;
+  **Full event details** exposes the complete sanitized event. Current names make
+  reference-field previews readable; full values retain the original IDs.
+  **Load older events** pages through the history. History loads only while
+  expanded, refreshes when the snapshot cursor advances, and resets on
+  issue/account changes. Activity & handoff remains the comments workspace.
   Legacy attribution/source gaps are labeled unknown; current-directory identity
   resolution is labeled separately from mutation-time snapshots.
 - **Startup defaults:** in **Account menu → Preferences → Default view and team**, choose
@@ -1243,7 +1251,9 @@ read as `agent_decides`.
   focus change, pointer interaction or leaving the window cancels the chord.
   In the tracker, `c`/`n` captures an issue, `/` filters, `j`/`k` selects the
   next/previous issue, and Escape closes it. In Story, `j`/`k` invokes
-  Next/Previous. Help and navigation avoid text entry, composition and other
+  Next/Previous. Story's buttons, row clicks, arrow/letter keys and close actions
+  share the requested selection, so rapid mixed input does not navigate from
+  the previous render. Help and navigation avoid text entry, composition and other
   dialogs; help traps focus and Escape restores it. Cmd/Ctrl-K search and
   Cmd/Ctrl-J assistant shortcuts are unchanged outside help.
 - **Settings:** the gear at the bottom of the navigation rail opens a shared

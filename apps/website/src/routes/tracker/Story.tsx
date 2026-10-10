@@ -175,7 +175,10 @@ export function Story() {
   const index = shown.findIndex((row) => row.commit.oid === selected);
   const current = index >= 0 ? shown[index]! : null;
 
-  const set = (changes: Record<string, string | null>) =>
+  const set = (changes: Record<string, string | null>): void => {
+    // Buttons, row clicks and keys share the same pending selection. React
+    // may not have rendered the URL yet when the next input arrives.
+    if ("step" in changes) position.current.heading = changes.step;
     setParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -186,19 +189,24 @@ export function Story() {
       },
       { replace: true },
     );
+  };
   const open = (row: StoryRow | undefined) => row && set({ step: row.commit.oid });
 
-  // j/k and the arrow keys step through; Escape closes the step. The handler
-  // reads the latest position, and remembers the step it asked for until the
-  // URL shows it: a render in between (a diff loading) must not send the next
-  // key from the old step.
-  const position = useRef({ shown, open, set, selected, heading: null as string | null });
+  // Keep the requested step across intermediate renders until the URL shows
+  // it. Undefined means settled; null is an explicitly requested close.
+  const position = useRef({
+    shown,
+    open,
+    set,
+    selected,
+    heading: undefined as string | null | undefined,
+  });
   position.current = {
     shown,
     open,
     set,
     selected,
-    heading: position.current.heading === selected ? null : position.current.heading,
+    heading: position.current.heading === selected ? undefined : position.current.heading,
   };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -223,22 +231,15 @@ export function Story() {
         return;
       if ((event.key === "j" || event.key === "k") && !readTrackerShortcuts()) return;
       const { shown, open, set, selected, heading } = position.current;
-      const at = heading ?? selected;
+      const at = heading === undefined ? selected : heading;
       const index = shown.findIndex((row) => row.commit.oid === at);
       // Next/Previous follow the visible newest-first list, down/up respectively.
-      const go = (row: StoryRow | undefined) => {
-        if (!row) return;
-        position.current.heading = row.commit.oid;
-        open(row);
-      };
       if (event.key === "k" || event.key === "ArrowLeft" || event.key === "ArrowUp")
-        go(shown[index < 0 ? 0 : index - 1]);
+        open(shown[index < 0 ? 0 : index - 1]);
       else if (event.key === "j" || event.key === "ArrowRight" || event.key === "ArrowDown")
-        go(shown[index < 0 ? 0 : index + 1]);
-      else if (event.key === "Escape" && at) {
-        position.current.heading = null;
-        set({ step: null });
-      } else return;
+        open(shown[index < 0 ? 0 : index + 1]);
+      else if (event.key === "Escape" && at) set({ step: null });
+      else return;
       event.preventDefault();
     };
     document.addEventListener("keydown", onKey);
