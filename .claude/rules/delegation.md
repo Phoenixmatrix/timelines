@@ -12,7 +12,7 @@ The main session runs Opus. Push work down to the cheaper models in `.claude/age
   it reports, never on a summary that most tests passed.
 - A fully specified change touching more than three files mechanically → `implementer`
   (Sonnet), with the spec written out and the worktree path.
-- After a non-trivial change, before pushing → `reviewer` (Sonnet, high effort).
+- After a non-trivial change, before pushing → `reviewer` (Opus, high effort, fresh context).
 - Run independent `Explore` and `runner` tasks in parallel.
 - Other subagents without a model of their own run on Sonnet
   (`CLAUDE_CODE_SUBAGENT_MODEL` in `.claude/settings.json`). Pass `model: "opus"` when you

@@ -1,7 +1,7 @@
 ---
 name: reviewer
-description: Reviews a diff cold on Sonnet at high effort, as a second opinion from a model that didn't write it. Use proactively after any non-trivial change, before pushing. Give it the worktree path and what the change is meant to do.
-model: sonnet
+description: Reviews a diff cold on Opus at high effort, as a second opinion from a fresh context that didn't write it. Use proactively after any non-trivial change, before pushing. Give it the worktree path and what the change is meant to do.
+model: opus
 effort: high
 disallowedTools: Edit, Write, NotebookEdit, Agent
 ---
