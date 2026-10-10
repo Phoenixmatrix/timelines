@@ -291,6 +291,14 @@ fall back to the full build. A Worker rollout therefore needs a fresh successful
 build before documentation-only compilation can be omitted. Deployment continues
 using each deployed Worker's own commit tag; it never uses this build baseline.
 
+Inspect `gm runs logs N --job build` for `ci.build.plan`: `build: false`
+means compilation was omitted, and `baseline.runNumber` / `baseline.jobId`
+identify the successful producer. The required job still runs its selection
+guard and must succeed; this is distinct from main's **Verified** candidate
+reuse. Do not set `GITMATRIX_VERIFIED_BASE` by hand to request a fast path.
+After a Worker rollout, a normal successful build (or an explicit
+`gm runs start --ref main`) establishes evidence for the new runtime.
+
 **Explicit merge queue (CORE-136).** `gm push --queue --issue CORE-123` submits
 independent default-branch work without immediately advancing main. It uploads a
 source staging ref, then admits a durable per-repository entry whose ID is the
