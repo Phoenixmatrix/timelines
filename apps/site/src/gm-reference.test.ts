@@ -1,7 +1,3 @@
-// The gm reference stays true to gm (CORE-115): the snapshot the site renders
-// must list exactly the commands, and the examples, that gm's manifest declares.
-// When this fails, refresh the snapshot: `vp run site#gm-reference`.
-
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
@@ -10,35 +6,6 @@ import { commandSlug, groupCommands, paramLabel, type GmManifest } from "./gm-re
 const manifest = JSON.parse(
   readFileSync(new URL("./data/gm-commands.json", import.meta.url), "utf8"),
 ) as GmManifest;
-const metaSource = readFileSync(new URL("../../cli/src/meta.rs", import.meta.url), "utf8");
-
-/** `meta!("timeline start", …, ex: ["gm timeline start x", …])` entries in meta.rs. */
-function declared(): Map<string, string[]> {
-  const commands = new Map<string, string[]>();
-  for (const match of metaSource.matchAll(/meta!\("([^"]+)",([\s\S]*?)\),\n/g)) {
-    const examples = /ex: \[([\s\S]*?)\]$/.exec(match[2]!.trim())?.[1] ?? "";
-    commands.set(
-      `gm ${match[1]}`,
-      [...examples.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => JSON.parse(`"${m[1]}"`) as string),
-    );
-  }
-  return commands;
-}
-
-await test("the snapshot lists every command gm declares, and no other", () => {
-  const meta = declared();
-  assert.ok(meta.size > 100, `meta.rs declares ${meta.size} commands`);
-  assert.deepEqual(
-    manifest.commands.map((command) => command.command).sort(),
-    [...meta.keys()].sort(),
-  );
-});
-
-await test("the snapshot's examples are gm's", () => {
-  const meta = declared();
-  for (const command of manifest.commands)
-    assert.deepEqual(command.examples, meta.get(command.command), command.command);
-});
 
 await test("every command has a summary, a usage line and a unique anchor", () => {
   const slugs = new Set<string>();

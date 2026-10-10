@@ -1455,6 +1455,9 @@ address holds `from`, `to`, `at` (the playhead), `rs`/`re` (a selected range),
 range half a window wider on each side, at most 10 pages, and never the
 change feed. Phones get the List layout, the accessible equivalent of the
 canvas. Design: root `DESIGN.md`, "Chronicle (time axis)".
+The List scrubber preserves in-flight keyboard positions until the address
+changes; snapshot refreshes alone do not reset them. Committed positions
+remain navigable with Back and Forward.
 
 **Development history:** `POST /api/dev/chronicle {account, team, issues?, days?, seed?, link?}`
 (agent secret) makes `issues` issues of a new team worked by the account's
@@ -1658,6 +1661,20 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   honor cancellation before a provider operation starts. Once CAS has begun, an
   uncertain result stays fenced until its exact outcome is reconciled; a concurrent
   main advance cannot manufacture a successful receipt.
+
+  For canonical-rooted work with no dependencies, a native merge alone does not
+  renew **B**. After merging current main, resolving conflicts and pushing, use
+  `gm timeline checkpoint --sync-main -m '…'` (`syncMain: true` on the checkpoint
+  POST). Every repository must contain the exact current main commit in its
+  published work history, and its allocation-time canonical base must remain
+  in main's ancestry. Otherwise renewal is blocked; equal trees are not proof.
+  The new immutable checkpoint pins that canonical commit and tree as B.
+  Changing B requires a fresh checkpoint and approval even at the same work OID.
+  Allocation metadata, old checkpoints and integration receipts are unchanged.
+  Request the flag on each checkpoint that should use synchronized main;
+  omitted/false keeps ordinary measurement, without inheriting the renewed B.
+  Foreign/nested bases and dependencies keep their existing admission flow and
+  cannot use this option.
 
   **Nested eligibility** uses exact ancestry, not matching change IDs. A child
   forked at parent P0 waits for a completed parent integration covering P0

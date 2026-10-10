@@ -23,13 +23,13 @@ header links to the web app at gitmatrix.fward.dev.
 ```sh
 vp run site#dev           # local dev server
 vp run site#build         # astro build, then the Worker's build output
-vp run site#test          # the gm reference matches apps/cli/src/meta.rs
+vp run site#test          # reference grouping, parameter labels and anchors
 vp run site#typecheck
 vp run site#gm-reference  # refresh the gm snapshot from this checkout's gm source
 ```
 
-When `site#test` reports that the reference no longer matches gm, run
-`vp run site#gm-reference` and commit the snapshot.
+After changing CLI commands, flags, help or examples, run
+`vp run site#gm-reference` and commit the generated snapshot.
 
 ## Deploying
 

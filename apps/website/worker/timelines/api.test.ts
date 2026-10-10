@@ -744,7 +744,9 @@ describe("checkpoints", () => {
                ('run0', 'app', 'canonical', 3, '${oid(1)}', 'main', 'push', 'succeeded');
     `);
     // Cat can read the repository but not write to it.
-    expect((await t.call("cat", "POST", "/search/checkpoints", {})).status).toBe(403);
+    expect((await t.call("cat", "POST", "/search/checkpoints", { syncMain: true })).status).toBe(
+      403,
+    );
     const created = await t.call("bot", "POST", "/search/checkpoints", { summary: "Ranking v2" });
     expect(created.status).toBe(201);
     const made = created.body as CheckpointView;
@@ -786,6 +788,16 @@ describe("checkpoints", () => {
     const one = await t.call("cat", "GET", "/search/checkpoints/1");
     expect(one.body.checkpoint).toEqual(made.checkpoint);
     expect((await t.call("cat", "GET", "/search/checkpoints/2")).status).toBe(404);
+  });
+
+  test("canonical renewal rejects a coerced boolean without creating a checkpoint", async () => {
+    const t = await setup();
+    await t.call("bot", "POST", "", { slug: "search", repos: ["orbit/app"] });
+    const rejected = await t.call("bot", "POST", "/search/checkpoints", { syncMain: "true" });
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.code).toBe("invalid_input");
+    const listed = (await t.call("bot", "GET", "/search/checkpoints")).body as CheckpointList;
+    expect(listed.checkpoints).toEqual([]);
   });
 });
 

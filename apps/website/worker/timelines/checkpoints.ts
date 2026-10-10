@@ -43,6 +43,7 @@ export async function measure(
   env: Env,
   actor: Actor,
   timeline: Timeline,
+  syncMain = false,
 ): Promise<CheckpointRepo[]> {
   const ids = timeline.repos.map((repo) => repo.id);
   const rows = ids.length
@@ -85,8 +86,10 @@ export async function measure(
           : new Set<string>();
       const visited = new Set<string>();
       const pending = [commit];
+      let containsMain = false;
       while (pending.length) {
         const oid = pending.pop()!;
+        if (syncMain && oid === base) containsMain = true;
         if (visited.has(oid) || baseMembers.has(oid)) continue;
         visited.add(oid);
         const value = await readCommit(oid);
@@ -138,7 +141,34 @@ export async function measure(
       // Select only from snapshots actually imported into this source, never
       // from a parent's newer landing tip. Persist this choice in the checkpoint.
       let logicalBase = repo.logicalBase;
-      if (base && dependencies.some((dependency) => !baseMembers.has(dependency.source.commit))) {
+      if (syncMain) {
+        if (logicalBase.kind !== "canonical" || dependencies.length)
+          fail(
+            "blocked_dependency",
+            "Explicit main synchronization needs a canonical-rooted source without dependencies.",
+            409,
+          );
+        if (!base || !readCanonical || !canonical.has(logicalBase.commit) || !containsMain)
+          fail(
+            "blocked_dependency",
+            "Merge and push current main before explicitly renewing the checkpoint base.",
+            409,
+          );
+        const main = await readCanonical(base);
+        if (!main) fail("invalid_source", "The canonical snapshot is unavailable.", 409);
+        logicalBase = {
+          sourceId: "canonical",
+          repoId: row.id,
+          kind: "canonical",
+          timelineId: null,
+          ref: `refs/heads/${row.default_branch}`,
+          commit: base,
+          tree: main.treeHash,
+        };
+      } else if (
+        base &&
+        dependencies.some((dependency) => !baseMembers.has(dependency.source.commit))
+      ) {
         const snapshots = [logicalBase, ...dependencies.map((dependency) => dependency.source)];
         const foreign = snapshots.filter(
           (source) =>

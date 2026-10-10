@@ -421,12 +421,14 @@ timelines.get("/:slug/checkpoints/:ref", async (c) => {
 timelines.post("/:slug/checkpoints", async (c) => {
   const access = await authorize(c, false);
   const actor = c.get("actor")!;
-  const data = await input(c, ["summary"]);
+  const data = await input(c, ["summary", "syncMain"]);
+  if (data.syncMain !== undefined && typeof data.syncMain !== "boolean")
+    fail("invalid_input", "syncMain must be a boolean.");
   const tracker = trackerObject(c.env, access.owner.id);
   const timeline = unwrap(await tracker.timeline(c.req.param("slug"), 0, 1)).timeline;
   if (timeline.status === "landed" || timeline.status === "abandoned")
     fail("timeline_ended", `${timeline.slug} is ${timeline.status}.`, 409);
-  const repos = await measure(c.env, actor, timeline);
+  const repos = await measure(c.env, actor, timeline, data.syncMain === true);
   const state = unwrap(
     await tracker.createCheckpoint(access, timeline.slug, { summary: data.summary, repos }),
   );

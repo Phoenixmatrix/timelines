@@ -2016,7 +2016,7 @@ export async function runE2E(
     (await json<RepoDetail>(api, ownerToken)).branches.find((b) => b.shortName === name)?.oid;
   type LandingRecord = Landing;
   /** Wait for a landing to stop working; its runs' logs go into the evidence on a stop. */
-  async function settledLanding(slug: string): Promise<LandingRecord> {
+  async function settledLanding(slug: string, checkpointId?: string): Promise<LandingRecord> {
     const landing = await poll(
       async () =>
         (
@@ -2026,7 +2026,9 @@ export async function runE2E(
           )
         ).landing,
       (value) =>
-        !!value && ["landed", "conflict", "failed", "blocked_dependency"].includes(value.state),
+        !!value &&
+        (!checkpointId || value.checkpointId === checkpointId) &&
+        ["landed", "conflict", "failed", "blocked_dependency"].includes(value.state),
       `timeline ${slug} to land or stop`,
       300_000,
     );
@@ -2516,6 +2518,8 @@ export async function runE2E(
     const file = `landing-e2e/${slug}.txt`;
     const clone = await landingTimeline(slug);
     const mainBefore = await branchTip("main");
+    assert(mainBefore, "main must exist before the source is synced");
+    const originalSource = await timelineSource(slug);
     // Main changes the same file after the fork.
     const mainClone = join(work, `main-${slug}`);
     await gm(["clone", fullName, mainClone], "marco");
@@ -2528,10 +2532,38 @@ export async function runE2E(
       (tip) => !!tip && tip !== mainBefore,
       "main after the clashing push",
     );
+    assert(mainTip);
     await mkdir(join(clone, "landing-e2e"), { recursive: true });
     await writeFile(join(clone, file), "the timeline's version\n");
+    await mkdir(join(clone, ".gitmatrix"), { recursive: true });
+    await writeFile(
+      join(clone, ".gitmatrix", "ci.yml"),
+      JSON.stringify({
+        on: { push: { branches: ["never-agent-auto"] }, preview: {} },
+        jobs: {
+          gate: {
+            if: 'trigger == "landing"',
+            steps: [
+              {
+                run: `test "$(cat ${file})" = "resolved main and timeline" && test "$(git log -1 --format=%P | wc -w)" = 1 && echo LANDING_GATE_OK`,
+              },
+            ],
+          },
+          preview: {
+            if: 'trigger == "preview" && action == "create"',
+            steps: [
+              {
+                run: `test -f ${file} && test "$(git rev-parse HEAD)" = "$GITMATRIX_COMMIT" && case "$GITMATRIX_SOURCE_ID" in work_*) echo SOURCE_PREVIEW_OK;; *) exit 1;; esac`,
+              },
+            ],
+          },
+        },
+      }),
+    );
     try {
-      await pushAndCheckpoint(clone, slug, `Clashing E2E ${slug}`);
+      const unsynced = await pushAndCheckpoint(clone, slug, `Clashing E2E ${slug}`);
+      assert.equal(unsynced.repos[0]?.logicalBase?.commit, mainBefore);
+      assert.equal(unsynced.repos[0]?.source?.sourceId, originalSource.sourceId);
       const landing = await settledLanding(slug);
       assert.equal(landing.state, "conflict", `Expected a conflict, got: ${landing.reason}`);
       assert.equal(landing.repos[0]?.gateRun, null, "A conflicting merge is never tested");
@@ -2547,6 +2579,102 @@ export async function runE2E(
       ) as { landing?: { state: string; reason: string } };
       assert.equal(shown.landing?.state, "conflict", "gm timeline show reports the landing");
       record({ timeline: slug, main: mainTip, conflict: landing.reason });
+
+      // Resolve the ordinary local merge in the same owned source, then publish it.
+      // gm records a conflicted merge below @; squash folds the resolution into it.
+      const synced = JSON.parse(await gm(["timeline", "merge", "main"], "jun", clone)) as {
+        conflicts: { paths: string[] }[];
+      };
+      assert(synced.conflicts.some((conflict) => conflict.paths.includes(file)));
+      const resolved = "resolved main and timeline\n";
+      await writeFile(join(clone, file), resolved);
+      const resolvedBlob = await nativeGit(["hash-object", file], clone);
+      await gm(["squash"], "jun", clone);
+      const status = JSON.parse(await gm(["status"], "jun", clone)) as { conflicts: unknown[] };
+      assert.deepEqual(status.conflicts, [], "The native merge is fully resolved before push");
+      await gm(["push"], "jun", clone);
+      const published = await poll(
+        () => sourceTip(slug),
+        (tip) => !!tip && tip !== unsynced.repos[0]?.commit,
+        "the resolved merge in the original owned source",
+      );
+      assert(published);
+      assert.deepEqual(await timelineSource(slug), originalSource);
+      assert.equal(await branchTip("main"), mainTip, "Sync does not itself land the work");
+      await nativeGit(["merge-base", "--is-ancestor", mainTip, published], clone);
+      const resolvedTree = await nativeGit(["rev-parse", `${published}^{tree}`], clone);
+      assert.equal(await nativeGit(["rev-parse", `${published}:${file}`], clone), resolvedBlob);
+
+      const renewed = JSON.parse(
+        await gm(
+          [
+            "timeline",
+            "checkpoint",
+            "--sync-main",
+            "-m",
+            `Resolved main sync ${slug}`,
+            "--owner",
+            fixtures.tracker.owner,
+          ],
+          "jun",
+          clone,
+        ),
+      ) as { checkpoint: Checkpoint };
+      const checkpoint = renewed.checkpoint;
+      assert.notEqual(checkpoint.id, unsynced.id, "Sync creates a fresh review checkpoint");
+      assert.equal(checkpoint.number, unsynced.number + 1);
+      const reviewed = checkpoint.repos[0];
+      assert(reviewed?.logicalBase);
+      assert.equal(reviewed.commit, published);
+      assert.equal(reviewed.source?.sourceId, originalSource.sourceId);
+      assert.equal(reviewed.source?.tree, resolvedTree);
+      assert.equal(reviewed.logicalBase.kind, "canonical");
+      assert.equal(reviewed.logicalBase.ref, "refs/heads/main");
+      assert.equal(reviewed.logicalBase.commit, mainTip);
+      assert.equal(
+        reviewed.logicalBase.tree,
+        await nativeGit(["rev-parse", `${mainTip}^{tree}`], clone),
+      );
+      assert.deepEqual(reviewed.dependencies, []);
+
+      const completed = await settledLanding(slug, checkpoint.id);
+      assert.equal(completed.checkpointId, checkpoint.id);
+      assert.equal(completed.state, "landed", `Synced landing stopped: ${completed.reason}`);
+      const landed = completed.repos[0];
+      assert(landed?.merge && landed.mergeRun?.number && landed.gateRun?.number);
+      assert.equal((await runDetail(landed.mergeRun.number)).status, "succeeded");
+      const gates = await runDetail(landed.gateRun.number);
+      assert.equal(gates.status, "succeeded");
+      assert.equal(gates.trigger, "landing");
+      assert.equal(gates.ref, `gitmatrix/landing/${slug}`);
+      assert.equal(await branchTip("main"), landed.merge);
+      await nativeGit(["fetch", "origin", "main"], clone);
+      assert.equal(await nativeGit(["show", "-s", "--format=%P", landed.merge], clone), mainTip);
+      assert.equal(
+        await nativeGit(["rev-parse", `${landed.merge}^{tree}`], clone),
+        resolvedTree,
+        "Compact landing preserves the complete resolved source tree",
+      );
+      assert.equal(await nativeGit(["rev-parse", `${landed.merge}:${file}`], clone), resolvedBlob);
+      assert.equal(await nativeGit(["show", `${landed.merge}:${file}`], clone), resolved.trim());
+      assert.deepEqual(await timelineSource(slug), originalSource);
+      assert.equal(await sourceTip(slug), published, "Landing retains the original source tip");
+      const receipt = await json<{
+        status: string;
+        integration: {
+          source: SourceSnapshot;
+          canonical: SourceSnapshot;
+          logicalBase: SourceSnapshot;
+        } | null;
+        members: string[];
+      }>(`${api}/sources/${originalSource.sourceId}/lineage?commit=${published}`, ownerToken);
+      assert.equal(receipt.status, "integrated");
+      assert.deepEqual(receipt.integration?.source, reviewed.source);
+      assert.deepEqual(receipt.integration?.logicalBase, reviewed.logicalBase);
+      assert.equal(receipt.integration?.canonical.commit, landed.merge);
+      assert.equal(receipt.integration?.canonical.tree, resolvedTree);
+      assert.deepEqual(receipt.members, [published]);
+      record({ timeline: slug, unsynced, checkpoint, resolvedTree, receipt, gates: gates.number });
     } finally {
       await request(`${timelinesApi}/${slug}/abandon`, fixtures.tokens.jun, "POST").catch(() => {});
     }

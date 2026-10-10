@@ -87,7 +87,6 @@ export function Chronicle({
   const address = useMemo(() => readAddress(params, now), [params, now]);
   // During a gesture the view runs ahead of the address, which catches up at its end.
   const [live, setLive] = useState<{ from: number; to: number; at: number } | null>(null);
-  useEffect(() => setLive(null), [params]);
   const view = { from: live?.from ?? address.from, to: live?.to ?? address.to };
   const at = live?.at ?? address.at;
   const range = address.range;
@@ -101,7 +100,13 @@ export function Chronicle({
   // The params last written: navigation settles asynchronously, and a quick
   // second key press must build on the first.
   const latest = useRef(params);
+  const acknowledged = useRef(params.toString());
   useEffect(() => {
+    // Snapshot updates can recreate params without acknowledging a navigation.
+    const key = params.toString();
+    if (acknowledged.current === key) return;
+    acknowledged.current = key;
+    setLive(null);
     latest.current = params;
   }, [params]);
   const commit = (next: Partial<ChronicleAddress>, push = true) => {
@@ -126,10 +131,9 @@ export function Chronicle({
     [],
   );
   const onPlayhead = (t: number, done: boolean) => {
-    if (done) {
-      setLive(null);
-      commit({ ...view, at: t }, true);
-    } else setLive({ ...view, at: t });
+    // Keep the gesture visible until navigation acknowledges it, including keyup.
+    setLive({ ...view, at: t });
+    if (done) commit({ ...view, at: t }, true);
   };
 
   const issues = data?.issues ?? [];

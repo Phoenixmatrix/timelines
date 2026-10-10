@@ -246,7 +246,13 @@ another timeline.
   checkpoint. `gm timeline land` queues it by hand or says why it can't land
   yet. Main only moves to a merge that passed the gates. If the merge with main
   conflicts, landing stops and asks for a sync: merge main in when asked
-  (`gm timeline merge main`), push, and make a new checkpoint.
+  (`gm timeline merge main`), resolve conflicts, and push. For canonical-rooted
+  work without dependencies, use `gm timeline checkpoint --sync-main -m '…'`
+  to pin the exact current main already present in the published work as this
+  checkpoint's logical base. The allocation base and old records do not change;
+  request the flag on each checkpoint that should use synchronized main. A new
+  base needs a fresh approval even at the same work commit. Foreign/nested work
+  keeps the ordinary checkpoint/dependency-admission flow, not `--sync-main`.
 - `gm timeline use main` goes back to main. `gm timeline abandon` ends a
   timeline you started, when a person asks or the attempt is dead.
 
