@@ -37,9 +37,10 @@ Hourly cleanup and 24-hour expiry bound resource accumulation; see the root READ
 for costs and failure recovery.
 
 The website Vite configuration prebundles the Lezer dependencies used by the
-late-loaded source highlighter. Keep that `optimizeDeps.include` list aligned
-with the runtime imports in `shared/semantic/`: discovering another parser on
-first source navigation can reload the dev page and interrupt browser E2E.
+late-loaded source highlighter and `diff` used by audit history. Keep
+`optimizeDeps.include` aligned with imports in `shared/semantic/` and late-loaded
+UI modules: discovering dependencies during navigation can reload dev pages or
+running test frames, invalidating React state.
 
 There is no local Artifacts, Workers AI, Vectorize or AI Search emulator.
 These bindings (the AI ones only when opted in) use real services; D1, Durable Objects and Workflows run locally
