@@ -339,8 +339,18 @@ export interface AtlasInference {
   /** The naming algorithm/prompt version. */
   version: number;
   model: string;
-  /** Hash of exactly what the model was given; identical inputs are never re-inferred. */
+  /**
+   * Hash of what the model was given, with each component as the members it
+   * shares rather than its model-written wording; identical inputs are never
+   * re-inferred.
+   */
   inputsHash: string;
+  /**
+   * A short hash of each part of those inputs (`file:<path>`, `component:<id>`,
+   * `concept:<id>`, `areas`, `grouping`, and `order` for how they are listed),
+   * so a re-inference can say what changed.
+   */
+  inputParts?: Record<string, string>;
   /** The source version the prose was written from (the original one, when stale). */
   basis: { repoId: string; sourceId?: string; commit: string; buildId: string };
   inferredAt: string;

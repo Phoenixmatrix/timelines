@@ -365,6 +365,61 @@ describe("capability names and summaries", () => {
     expect(provenanceOf(second.capabilities[0]!).inferred!.basis.buildId).toBe("b1");
   });
 
+  test("a component reworded by the model reuses the prose: only what it shares changes it", async () => {
+    const { sqlite, DB } = setup();
+    const ai = fakeAi();
+    const first = await build(DB, ai, "b1");
+    // A push rewrote Ops' synthesis (any of its files changing does): new wording, same members.
+    node(sqlite, "component:ops", "component", "Shipping", null, "Ships the shop blue-green.", {
+      dir: "ops",
+    });
+    const second = await build(DB, ai, "b2");
+    expect(second.described).toMatchObject({ current: 2, cached: 2, inferred: 0 });
+    expect(ai.calls).toHaveLength(2);
+    expect(second.capabilities).toEqual(first.capabilities);
+    // The members a component shares are part of the inputs.
+    edge(sqlite, "component:ops", "file:src/billing/charge.ts", "contains");
+    const third = await build(DB, ai, "b3");
+    expect(third.described).toMatchObject({ cached: 1, inferred: 1 });
+    const changed = third.capabilities.find(
+      (c) => provenanceOf(c).inferred?.basis.buildId === "b3",
+    )!;
+    const was = provenanceOf(first.capabilities.find((c) => c.id === changed.id)!).inferred!;
+    const parts = provenanceOf(changed).inferred!.inputParts!;
+    expect(Object.keys(parts).filter((key) => parts[key] !== was.inputParts![key])).toEqual([
+      "component:component:ops",
+      "order",
+    ]);
+  });
+
+  test("prose cached by its components' wording is adopted under the new key, not bought again", async () => {
+    const { sqlite, DB } = setup();
+    const ai = fakeAi();
+    const first = await build(DB, ai, "b1");
+    // Restore the storage before components were keyed by their members:
+    // the cache key was the hash of exactly what the model was shown.
+    for (const call of ai.calls) {
+      const key = await sha256(
+        `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:r1:canonical:${call.user}`,
+      );
+      const name = `Capability of ${(JSON.parse(call.user) as { files: { path: string }[] }).files[0]!.path}`;
+      sqlite
+        .prepare(`UPDATE kg_synthesis SET key = ? WHERE json_extract(data, '$.name') = ?`)
+        .run(key, name);
+    }
+    const second = await build(DB, ai, "b2");
+    expect(second.described).toMatchObject({ current: 2, cached: 2, inferred: 0 });
+    expect(ai.calls).toHaveLength(2);
+    expect(second.capabilities).toEqual(first.capabilities);
+    // Adopted under the new key: the next build finds it there.
+    node(sqlite, "component:ops", "component", "Shipping", null, "Ships the shop blue-green.", {
+      dir: "ops",
+    });
+    const third = await build(DB, ai, "b3");
+    expect(third.described).toMatchObject({ cached: 2, inferred: 0 });
+    expect(ai.calls).toHaveLength(2);
+  });
+
   test("a wording-only change in model output never moves members or ids", async () => {
     const { sqlite, DB } = setup();
     const first = await build(DB, fakeAi(), "b1");
@@ -514,6 +569,12 @@ describe("capability names and summaries", () => {
       model: selected,
       basis: { buildId: "b3" },
     });
+    // Provenance says which input part changed.
+    const was = provenanceOf(first.capabilities.find((c) => c.id === changed.id)!).inferred!;
+    const parts = provenanceOf(changed).inferred!.inputParts!;
+    expect(Object.keys(parts).filter((key) => parts[key] !== was.inputParts![key])).toEqual([
+      "file:ops/deploy.ts",
+    ]);
     const unchanged = third.capabilities.find((c) => c.id !== changed.id)!;
     expect(provenanceOf(unchanged)).toEqual(
       provenanceOf(first.capabilities.find((c) => c.id === unchanged.id)!),
@@ -540,14 +601,14 @@ describe("capability names and summaries", () => {
       // exact input hash, both in the cache key and immutable inference record.
       for (const call of ai.calls) {
         const identity = `atlas-capability:${DESCRIBE_VERSION}:${ANALYZER}:`;
-        const key = await sha256(`${identity}r1:canonical:${call.user}`);
         const legacyKey = await sha256(`${identity}${original}:r1:${call.user}`);
+        const name = `Capability of ${(JSON.parse(call.user) as { files: { path: string }[] }).files[0]!.path}`;
         sqlite
           .prepare(
             `UPDATE kg_synthesis SET key = ?,
-           data = json_set(data, '$.inference.inputsHash', ?) WHERE key = ?`,
+           data = json_set(data, '$.inference.inputsHash', ?) WHERE json_extract(data, '$.name') = ?`,
           )
-          .run(legacyKey, legacyKey, key);
+          .run(legacyKey, legacyKey, name);
       }
       const stored = sqlite.prepare("SELECT * FROM kg_synthesis ORDER BY key").all();
       const cached = sqlite.prepare("SELECT data FROM kg_synthesis").all() as { data: string }[];
