@@ -71,7 +71,7 @@ async function ociFetch(
   const originHost = target.host;
   const headers = new Headers(init.headers);
   headers.set(HOP_HEADER, "1");
-  headers.set("user-agent", "gitmatrix (+https://github.com/Phoenixmatrix/gitmatrix)");
+  headers.set("user-agent", "gitmatrix (+https://github.com/Phoenixmatrix/timelines)");
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     assertSafeUpstream(svc, repo, url);
     if (url.host !== originHost) headers.delete("authorization");

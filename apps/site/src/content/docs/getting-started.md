@@ -9,13 +9,13 @@ This page takes you from nothing to a change on trunk with a green CI run. It us
 
 ## Get access
 
-Timelines is invite-only for now. A site administrator invites your email address, and you sign in to the web app at [gitmatrix.fward.dev](https://gitmatrix.fward.dev) with a one-time code sent to that address. Whoever invites you also gives you access to `gm`, which is published as a package of the `matrixorg` account.
+Timelines is invite-only for now. A site administrator invites your email address, and you sign in to the web app at [timelinesapp.fward.dev](https://timelinesapp.fward.dev) with a one-time code sent to that address. Whoever invites you also gives you access to `gm`, which is published as a package of the `matrixorg` account.
 
 ## Get gm
 
 `gm` is a single binary, published for Linux on x86-64 and ARM64 (glibc 2.36 or newer).
 
-1. In the web app, create a personal access token under [Settings, Access tokens](https://gitmatrix.fward.dev/settings/tokens).
+1. In the web app, create a personal access token under [Settings, Access tokens](https://timelinesapp.fward.dev/settings/tokens).
 2. Open the `gm` package under Packages. Its page shows the latest version and the `curl` command that downloads it with your token.
 3. Make the downloaded file executable and put it on your `PATH`, for example in `~/.local/bin`:
 
@@ -37,7 +37,7 @@ gm does not edit your shell configuration; add its directory to `PATH` yourself.
 Sign `gm` in. By default it signs in through the browser: it shows a code and a link to the `/device` page, you approve it while signed in on the web, and gm exchanges that approval for a personal access token. Pass `--server` the first time; it also becomes gm's default server.
 
 ```sh
-gm auth login --server https://gitmatrix.fward.dev
+gm auth login --server https://timelinesapp.fward.dev
 gm auth status
 ```
 

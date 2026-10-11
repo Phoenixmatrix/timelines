@@ -9,15 +9,26 @@
   dispatched retain their existing success, failure and timeout accounting.
   Gateway reconciliation remains strict.
 
-### CORE-324: Timelines presentation without an identity cutover
+### CORE-324: Timelines branding and address migration
 
 - Public application, site, documentation, CLI and assistant presentation use
-  Timelines while retaining the pounce logo. Technical keys, API headers,
-  installation identifiers, repository slugs and hostnames remain unchanged.
+  Timelines while retaining the pounce logo. The application moves to
+  `timelinesapp.fward.dev`, with `matrixorg/timelines` and its corresponding
+  GitHub mirror as the public repository names. Internal resource names,
+  technical keys, API headers and installation identifiers remain unchanged.
 - New system-authored commits use the Timelines display name; existing Git
   history is not rewritten. The assistant-profile migration updates only the
   original built-in description, preserving customized profiles, agent identities,
   revocation and credentials.
+- Repository administrators can rename a canonical repository in place without
+  moving its physical Git storage or changing IDs, source identities, grants or
+  history. Parent-timeline forks resolve renamed repositories by stable ID.
+- Live timeline, checkpoint, landing and approval views, subscription navigation
+  and Atlas workspace choices resolve current repository names by stable ID.
+  Frozen tracker records and replica cursors remain unchanged.
+- GitHub backup renames run through the mirror administrator API, fenced by the
+  expected remote repository ID and mirror lease. One-operation administration
+  credentials do not replace the stored push credential.
 
 ### CORE-150: bounded release-highlights proof cleanup and scheduling
 

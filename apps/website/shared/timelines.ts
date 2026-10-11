@@ -27,7 +27,7 @@ export type TimelineStatus =
   | "landed"
   | "abandoned";
 
-/** A repository a timeline touches. Owner and name are as of creation; the id is the authority. */
+/** Stable repository identity. Stored labels are historical; live API views resolve names by ID. */
 export interface TimelineRepo {
   id: string;
   owner: string;

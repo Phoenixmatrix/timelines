@@ -27,6 +27,7 @@ import {
 } from "./preferences.ts";
 import { refreshAfterTrackerMutation } from "../release-notes/queue.ts";
 import { view as checkpointView, writableRepoIds } from "../timelines/checkpoints.ts";
+import { currentRepositoryNames } from "../timelines/names.ts";
 import type { RepoIssueSummary } from "../../shared/api.ts";
 
 export const tracker = new Hono<AppEnv>();
@@ -170,8 +171,16 @@ tracker.get("/requests", async (c) => {
     if (pinned.length) {
       const states = await stub.checkpointStates(pinned);
       if (!states.ok) return response(c, states);
-      for (const { state, timeline } of states.value)
-        checkpoints.set(state.checkpoint.id, await checkpointView(c.env, state, timeline));
+      const current = await currentRepositoryNames(
+        c.env.DB,
+        owner.id,
+        states.value.map(({ state }) => state.checkpoint),
+      );
+      for (const [index, { state, timeline }] of states.value.entries())
+        checkpoints.set(
+          state.checkpoint.id,
+          await checkpointView(c.env, { ...state, checkpoint: current[index]! }, timeline),
+        );
     }
     for (const item of result.value) {
       const checkpoint = item.request.checkpoint && checkpoints.get(item.request.checkpoint.id);

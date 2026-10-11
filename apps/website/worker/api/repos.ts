@@ -1,4 +1,5 @@
 import { Hono, type Context } from "hono";
+import { sql } from "kysely";
 import type {
   BlobResponse,
   Collaborator,
@@ -10,6 +11,7 @@ import type {
   RepoRole,
   TreeEntry,
   TreeResponse,
+  UpdateRepoRequest,
   Visibility,
 } from "../../shared/api.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
@@ -753,18 +755,54 @@ repos.patch("/:owner/:name", async (c) => {
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
   const { row } = loaded;
-  const body = await readJson<{ description: string; visibility: Visibility }>(c);
+  const body = await readJson<UpdateRepoRequest>(c);
+  const name =
+    body.name === undefined ? row.name : typeof body.name === "string" ? body.name.trim() : "";
+  if (!REPO_NAME.test(name) || name.toLowerCase().endsWith(".git")) {
+    return fail(
+      c,
+      400,
+      "Use letters, numbers, dots, dashes and underscores, without a .git ending.",
+    );
+  }
   const description = body.description?.trim() ?? row.description;
   const visibility =
     body.visibility === "public" || body.visibility === "private"
       ? body.visibility
       : row.visibility;
-  await db(c.env.DB)
+  // One conditional statement arbitrates names (including tombstones) without
+  // touching storage, source identities or any ID-keyed dependent records.
+  const result = await db(c.env.DB)
     .updateTable("repos")
-    .set({ description, visibility })
+    .set({ name, description, visibility })
     .where("id", "=", row.id)
-    .execute();
-  const updated = await findRepo(c.env.DB, c.get("actor"), row.owner_slug, row.name);
+    .where("name", "=", row.name)
+    .where("deleted_at", "is", null)
+    .where(sql<boolean>`NOT EXISTS (
+      SELECT 1 FROM repos AS occupied
+      WHERE occupied.owner_id = ${row.owner_id}
+        AND occupied.name = ${name} AND occupied.id != ${row.id}
+    )`)
+    .executeTakeFirst();
+  if (!result.numUpdatedRows) {
+    const current = await db(c.env.DB)
+      .selectFrom("repos")
+      .select(["name", "deleted_at"])
+      .where("id", "=", row.id)
+      .executeTakeFirst();
+    if (!current || current.deleted_at) return fail(c, 404, "Repository not found.");
+    const existing = await findRepo(c.env.DB, null, row.owner_slug, name, { deleting: true });
+    return fail(
+      c,
+      409,
+      existing && existing.id !== row.id
+        ? existing.deleted_at
+          ? `${row.owner_slug}/${name} is being deleted. Its name is free again once that finishes.`
+          : `${row.owner_slug}/${name} already exists.`
+        : "The repository changed during this request. Reload it and try again.",
+    );
+  }
+  const updated = await findRepo(c.env.DB, c.get("actor"), row.owner_slug, name);
   return c.json(updated && repoSummary(updated, c.get("actor")));
 });
 

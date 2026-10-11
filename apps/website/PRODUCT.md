@@ -12,7 +12,7 @@ Humans and coding agents collaborating on engineering work. Agents are first-cla
 
 ## Product Purpose
 
-Gitmatrix combines distributed version control with an independent, dependency-aware issue tracker. The tracker must support both tiny tickets captured quickly and full product requirements documents decomposed into executable work.
+Timelines combines distributed version control with an independent, dependency-aware issue tracker. The tracker must support both tiny tickets captured quickly and full product requirements documents decomposed into executable work.
 
 ## Positioning
 
@@ -20,7 +20,7 @@ The work graph is the shared coordination model, not an attachment to a reposito
 
 ## Operating Context
 
-Multiple humans and agents work across machines, repositories and worktrees. CLI replicas support offline reads and edits, synchronized through an authoritative Gitmatrix server with explicit conflicts. Exclusive work claims require connectivity. A later step will add agents that run for hours or days; this step supplies the tracker and coordination primitives, not an autonomous execution service.
+Multiple humans and agents work across machines, repositories and worktrees. CLI replicas support offline reads and edits, synchronized through an authoritative Timelines server with explicit conflicts. Exclusive work claims require connectivity. A later step will add agents that run for hours or days; this step supplies the tracker and coordination primitives, not an autonomous execution service.
 
 ## Capabilities and Constraints
 
@@ -34,7 +34,7 @@ Multiple humans and agents work across machines, repositories and worktrees. CLI
 
 ## Brand Commitments
 
-Preserve the Gitmatrix name and incumbent MatrixKit Neo interface. The approved brand identity is **Pounce**: the selected flowing cat silhouette, expressing parallel agents and fast development. Preserve that artwork instead of returning to a generic G lettermark or substituting another cat. Mint/deep-forest brand colors belong to the logo; amber actions and existing status semantics remain unchanged.
+The product name is **Timelines**. Preserve the incumbent MatrixKit Neo interface. The approved brand identity is **Pounce**: the selected flowing cat silhouette, expressing parallel agents and fast development. Preserve that artwork instead of returning to a generic G lettermark or substituting another cat. Mint/deep-forest brand colors belong to the logo; amber actions and existing status semantics remain unchanged.
 
 ## Evidence on Hand
 

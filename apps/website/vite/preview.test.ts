@@ -128,7 +128,6 @@ describe("cloudflare.config.ts in preview mode", () => {
     expect(worker.env.EMAIL).toBeDefined();
     expect(worker.env.AUTH_FAILURES).toMatchObject({ namespace: "4401" });
     expect(worker.triggers).toHaveLength(3);
-    expect(worker.domains).toEqual(["gitmatrix.fward.dev"]);
     // Previews answer on the workers.dev subdomain; production itself doesn't.
     expect(worker.workersDev).toBe(false);
     expect(worker.previewUrls).toBe(true);

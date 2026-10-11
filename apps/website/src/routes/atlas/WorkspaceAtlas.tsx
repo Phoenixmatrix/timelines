@@ -302,15 +302,16 @@ function TrackerSeed({
       signal: controller.signal,
     })
       .then((snapshot) => {
-        const readable = new Set(repos.map((r) => r.name));
+        const readable = new Map(repos.map((repo) => [repo.id, repo.name]));
         const workspaces = snapshot.workspaces
           .filter((w) => !w.archived)
           .map((w) => ({
             id: w.id,
             name: w.name,
             repos: snapshot.subscriptions
-              .filter((s) => s.workspaceId === w.id && s.owner === owner && readable.has(s.name))
-              .map((s) => s.name)
+              .filter((subscription) => subscription.workspaceId === w.id)
+              .map((subscription) => readable.get(subscription.repoId))
+              .filter((name): name is string => name !== undefined)
               .filter((name, i, all) => all.indexOf(name) === i)
               .slice(0, ATLAS_WORKSPACE_MAX_REPOS),
           }))

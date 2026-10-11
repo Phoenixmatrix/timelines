@@ -1,5 +1,5 @@
 ---
-name: Gitmatrix — MatrixKit Neo
+name: Timelines — MatrixKit Neo
 description: Warm charcoal work surfaces, readable engineering context and one amber action signal.
 colors:
   stage: "oklch(0.145 0.005 70)"
@@ -78,13 +78,13 @@ components:
     padding: "0 14px"
 ---
 
-# Design System: Gitmatrix
+# Design System: Timelines
 
 ## Overview
 
 **Creative North Star: "MatrixKit Neo"**
 
-Preserve the incumbent Gitmatrix identity: warm charcoal panes, Figtree text, Geist Mono identifiers and restrained amber actions. The product is a working environment for humans and agents, not a marketing dashboard. Hierarchy comes from readable content, tonal surfaces and explicit state.
+Preserve the incumbent MatrixKit Neo visual identity for Timelines: warm charcoal panes, Figtree text, Geist Mono identifiers and restrained amber actions. The product is a working environment for humans and agents, not a marketing dashboard. Hierarchy comes from readable content, tonal surfaces and explicit state.
 
 **Key Characteristics:**
 

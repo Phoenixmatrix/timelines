@@ -395,7 +395,6 @@ export function TrackerAdmin({
   const [reposError, setReposError] = useState("");
   const [reposAttempt, setReposAttempt] = useState(0);
   useEffect(() => {
-    if (!snapshot.canAdmin) return;
     const controller = new AbortController();
     setReposError("");
     api<{ repos: RepoSummary[] }>("/repos", { signal: controller.signal }).then(
@@ -407,7 +406,7 @@ export function TrackerAdmin({
       },
     );
     return () => controller.abort();
-  }, [snapshot.canAdmin, reposAttempt]);
+  }, [snapshot.owner.id, reposAttempt]);
   const [workspaceId, setWorkspaceId] = useState("");
   const [repoId, setRepoId] = useState("");
   const [createTeamOpen, setCreateTeamOpen] = useState(!snapshot.teams.length);
@@ -417,6 +416,7 @@ export function TrackerAdmin({
   const [removalErrors, setRemovalErrors] = useState<Record<string, string>>({});
   const [removalSaved, setRemovalSaved] = useState("");
   const administeredRepos = (repos ?? []).filter((repo) => repo.viewerRole === "admin");
+  const repositoriesById = new Map((repos ?? []).map((repo) => [repo.id, repo]));
   const subscriptionGroups = new Map<string, Snapshot["subscriptions"]>();
   for (const subscription of snapshot.subscriptions) {
     const group = subscriptionGroups.get(subscription.repoId);
@@ -518,14 +518,21 @@ export function TrackerAdmin({
         {snapshot.subscriptions.length ? (
           <div className="mt-4 space-y-4">
             {[...subscriptionGroups].map(([id, subscriptions]) => {
-              const repository = subscriptions[0]!;
-              const repoName = `${repository.owner}/${repository.name}`;
+              const repository = repositoriesById.get(id);
+              const historical = subscriptions[0]!;
+              const repoName = repository
+                ? `${repository.owner.slug}/${repository.name}`
+                : `${historical.owner}/${historical.name}`;
               return (
                 <section key={id} aria-label={`${repoName} subscriptions`}>
                   <h3 className="m-0 text-body-sm font-semibold break-words">
-                    <Link className={link} to={`/${repoName}/tracker`}>
-                      {repoName}
-                    </Link>
+                    {repository ? (
+                      <Link className={link} to={`/${repoName}/tracker`}>
+                        {repoName}
+                      </Link>
+                    ) : (
+                      repoName
+                    )}
                   </h3>
                   <ul className="m-0 mt-1 list-none p-0">
                     {subscriptions.map((subscription) => {
@@ -587,7 +594,7 @@ export function TrackerAdmin({
             {removalSaved}
           </p>
         )}
-        {snapshot.canAdmin && reposError && (
+        {reposError && (
           <div className="mt-4">
             <FormError message={reposError} />
             <button
@@ -598,7 +605,7 @@ export function TrackerAdmin({
             </button>
           </div>
         )}
-        {snapshot.canAdmin && repos === null && !reposError && (
+        {repos === null && !reposError && (
           <p role="status" className="mk-hint mt-4 mb-0">
             Loading repository choices…
           </p>
