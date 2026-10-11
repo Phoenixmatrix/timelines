@@ -775,6 +775,69 @@ await test("retired namespace orphans release quota without losing cleanup or be
   }
 });
 
+await test("released orphan journals stay retired while released live journals cannot be reused", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-released-orphan-"));
+  try {
+    const directory = join(home, ".local/state/gitmatrix-agent/environments");
+    const bin = join(home, "bin");
+    const old = owned(join(home, "retired"));
+    old.status = "orphaned";
+    old.resources = { artifacts: "orphaned", vectors: "deleted", search: "deleted" };
+    old.quota = { authority: "https://quota.example", state: "released" };
+    await Promise.all([directory, bin, old.dir].map((path) => mkdir(path, { recursive: true })));
+    const journal = join(directory, `${old.id}.json`);
+    await writeFile(journal, JSON.stringify(old));
+    await writeFile(join(old.dir, "environment.json"), JSON.stringify(old));
+    await quotaFixture(home, 1);
+    await writeFile(
+      join(bin, "cf"),
+      `#!${process.execPath}\nconst args=process.argv.slice(2); if(args[0]==='auth'){console.log(JSON.stringify({authenticated:true,tokenValid:true,accounts:[{id:'${"a".repeat(32)}'}]}));process.exit(0)} if(args[0]==='artifacts'&&args[2]==='delete'&&args.includes('${old.id}')){console.error('Namespace is not empty');process.exit(1)} console.log(args.includes('list')?'[]':'{}');\n`,
+      { mode: 0o700 },
+    );
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const run = (root: string) =>
+      command(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(root)});`,
+        ],
+        {
+          env: {
+            ...unitTestEnvironment(process.env),
+            HOME: home,
+            PATH: `${bin}:${process.env.PATH}`,
+          },
+        },
+      );
+    const root = join(home, "new-worktree");
+    await mkdir(root);
+    await run(root);
+    const created = JSON.parse(
+      await readFile(join(root, ".gitmatrix-agent/environment.json"), "utf8"),
+    ) as Environment;
+    assert.notEqual(created.id, old.id);
+    assert.equal(created.quota?.state, "reserved");
+    assert.deepEqual(
+      Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))),
+      [created.id],
+      "only the new environment consumes the one available slot",
+    );
+    const retired = JSON.parse(await readFile(journal, "utf8")) as Environment;
+    assert.equal(retired.status, "orphaned");
+    assert.equal(retired.quota?.state, "released");
+    // An inconsistent live journal still fails closed rather than borrowing that exception.
+    old.status = "ready";
+    old.resources.artifacts = "created";
+    await writeFile(journal, JSON.stringify(old));
+    await writeFile(join(old.dir, "environment.json"), JSON.stringify(old));
+    await assert.rejects(run(old.root), /released environment reservation cannot be reused/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 for (const login of ["valid", "logged out"] as const)
   await test(`cleanup ${login === "valid" ? "retries" : "doesn't retry"} a 401 when the login is ${login} (CORE-316)`, async () => {
     const home = await mkdtemp(join(tmpdir(), "gitmatrix-auth-"));

@@ -1408,12 +1408,19 @@ own schema. Generate the new binding with `cf workers types`.
 These primitives support durable agent handoffs. An autonomous hours/days-long
 execution loop is not included.
 
-### Chronicle: history by time and linked work
+### History: issues over time and linked work
 
-The Chronicle (CORE-42) is the tracker on a time axis. Two read-only routes
+History (CORE-42, named in CORE-278) is the tracker on a time axis. Two read-only routes
 serve it; the shapes and the pure readers (`stateAt`, `summarize`) are in
 `shared/chronicle.ts`, the replay in `worker/tracker/chronicle.ts` and the
 linked work in `worker/tracker/work.ts`.
+
+The view switcher and account's default-layout picker both call this **History**:
+it shows what happened, not a new kind of work or a planning schedule. The stable
+`chronicle` view ID, saved preferences, URLs, API routes and implementation names
+are unchanged, so existing links still open the same view. **Timelines** remains
+the name of separate lines of work; the inner layout toggle is tracked separately
+in CORE-280.
 
 | Route                                                                          | Contract                                                                                                                                                                                                                                                      |
 | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1474,10 +1481,11 @@ range half a window wider on each side, at most 10 pages, and never the
 change feed. The layout toggle is **Chart / List**: Chart names the visual
 time-axis layout without conflicting with the separate Timelines feature.
 Phones get the List layout, the accessible equivalent of the canvas.
-Design: root `DESIGN.md`, "Chronicle (time axis)".
+Design: root `DESIGN.md`, "History (time axis)".
 The List scrubber preserves in-flight keyboard positions until the address
-changes; snapshot refreshes alone do not reset them. Committed positions
-remain navigable with Back and Forward.
+changes; snapshot refreshes alone do not reset them. Address acknowledgement
+runs before paint so a delayed passive effect cannot clear the next keyboard
+gesture. Committed positions remain navigable with Back and Forward.
 
 **Development history:** `POST /api/dev/chronicle {account, team, issues?, days?, seed?, link?}`
 (agent secret) makes `issues` issues of a new team worked by the account's

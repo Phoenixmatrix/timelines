@@ -682,7 +682,7 @@ The usage and retention browser journeys close each persona/viewport context aft
 its assertions and trace finish, before opening the next. Keep that lifetime bounded:
 finished pages still consume renderer memory if left open until scenario teardown.
 
-The Chronicle journey compares the range summary with the same API issue population
+The History journey compares the range summary with the same API issue population
 the browser loads. Ruler drags update the address before the inspector's close link
 necessarily rerenders: wait for that link's final range destination, then verify
 closing preserves it before comparing counts. The selected range must include the

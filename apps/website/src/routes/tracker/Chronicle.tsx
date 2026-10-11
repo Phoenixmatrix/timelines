@@ -29,7 +29,7 @@ import {
   MagnifyingGlassPlusIcon,
   XIcon,
 } from "@phosphor-icons/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import type { ChronicleIssue, WorkSpan } from "../../../shared/chronicle.ts";
 import { Tip } from "../../components/ui.tsx";
@@ -101,8 +101,9 @@ export function Chronicle({
   // second key press must build on the first.
   const latest = useRef(params);
   const acknowledged = useRef(params.toString());
-  useEffect(() => {
+  useLayoutEffect(() => {
     // Snapshot updates can recreate params without acknowledging a navigation.
+    // Acknowledge before paint; a passive effect can erase the next key's gesture.
     const key = params.toString();
     if (acknowledged.current === key) return;
     acknowledged.current = key;
