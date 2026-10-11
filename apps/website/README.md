@@ -1989,6 +1989,12 @@ are the CLI equivalents; `gm release notes day:2026-10-02` selects a UTC day.
 Entries about issues from trackers the viewer can't read are omitted, and an introduction is
 shown only to viewers who can read every tracker that shaped it.
 
+The responsive reading layout (CORE-273) centers a bounded 84rem composition
+inside the unchanged repository header and tabs. Desktop navigation and the
+About rail frame a capped reading column; phones use a native release selector
+with daily/tag groups instead of a long navigation list. Long identifiers wrap,
+and selecting a release preserves the timeline filter and browser history.
+
 Both release views expose the same searchable timeline picker as the tracker.
 Its selection lives in `?tl=<slug>` and survives links, query submissions,
 Back/Forward and reload; selecting main explicitly clears the timeline scope.
@@ -2117,6 +2123,11 @@ A team's notes use `team:KEY`. Other filters are `repo:` (name or owner/name),
 Facets count the matching entries. It requires membership in the tracker
 account, and also applies repository visibility and per-entry tracker access.
 `gm release feed [QUERY] [--team KEY] [--owner OWNER]` is the CLI equivalent.
+
+The tracker feed uses a centered 72rem composition with bounded note text.
+From 1024px, facets occupy a separate right-hand rail; below that, the same
+controls sit in a keyboard-accessible **Narrow it down** disclosure before the
+feed. Search stays visible, and empty results use the same reading column.
 
 The issue tracker's header exposes **Release notes** as a full-size, bordered
 button with the same scroll icon as the navigation rail and a 44px minimum touch

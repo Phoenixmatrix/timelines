@@ -1,4 +1,4 @@
-import { MagnifyingGlassIcon, RocketLaunchIcon } from "@phosphor-icons/react";
+import { FunnelSimpleIcon, MagnifyingGlassIcon, RocketLaunchIcon } from "@phosphor-icons/react";
 import { useCallback, useEffect, useState } from "react";
 import {
   Form,
@@ -100,24 +100,28 @@ function Facets({
   const tokens = (q.match(/(-?[A-Za-z]+:)?"[^"]*"|\S+/g) ?? []).map(canonical);
   if (facets.length < min && !tokens.some((t) => t.startsWith(`${queryKey}:`))) return null;
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <span className="mr-1 text-micro text-ink-faint">{title}</span>
-      {facets.slice(0, 12).map((facet) => {
-        const value = /\s/.test(facet.value) ? `"${facet.value}"` : facet.value;
-        const pressed = tokens.includes(canonical(`${queryKey}:${value}`));
-        return (
-          <button
-            key={facet.value}
-            type="button"
-            className="mk-chip"
-            aria-pressed={pressed}
-            onClick={() => onQuery(toggle(q, queryKey, facet.value))}
-          >
-            {label(facet)}
-            <span className="font-mono text-micro tabular-nums opacity-70">{facet.count}</span>
-          </button>
-        );
-      })}
+    <div className="flex min-w-0 flex-col gap-2">
+      <span className="text-micro font-semibold text-ink-faint">{title}</span>
+      <div className="flex min-w-0 flex-wrap gap-1.5">
+        {facets.slice(0, 12).map((facet) => {
+          const value = /\s/.test(facet.value) ? `"${facet.value}"` : facet.value;
+          const pressed = tokens.includes(canonical(`${queryKey}:${value}`));
+          return (
+            <button
+              key={facet.value}
+              type="button"
+              className="mk-chip h-auto min-h-11 max-w-full py-1.5 text-left lg:min-h-7"
+              aria-pressed={pressed}
+              onClick={() => onQuery(toggle(q, queryKey, facet.value))}
+            >
+              <span className="min-w-0 [overflow-wrap:anywhere]">{label(facet)}</span>
+              <span className="shrink-0 font-mono text-micro tabular-nums opacity-70">
+                {facet.count}
+              </span>
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -135,21 +139,21 @@ function Entry({
   const { tracker } = useRefContext();
   const context = { tracker, owner: entry.repo.owner, repo: entry.repo.name };
   return (
-    <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
+    <li className="flex min-w-0 flex-col gap-2 border-t border-line-soft py-4 first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
         <span className="mk-chip mk-chip--tag">{CATEGORY_LABELS[entry.category]}</span>
-        <span className="text-body font-semibold text-ink">
+        <span className="min-w-0 max-w-[72ch] text-body font-semibold text-ink [overflow-wrap:anywhere]">
           <LinkedText text={entry.title} context={context} />
         </span>
       </div>
       {entry.summary && (
-        <p className="m-0 text-body-sm text-ink-muted">
+        <p className="m-0 max-w-[72ch] text-body-sm leading-relaxed text-ink-muted [overflow-wrap:anywhere]">
           <LinkedText text={entry.summary} context={context} />
         </p>
       )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-micro text-ink-faint">
         {entry.repos.map((repo) => (
-          <span key={`${repo.owner}/${repo.name}`}>
+          <span key={`${repo.owner}/${repo.name}`} className="min-w-0 [overflow-wrap:anywhere]">
             <Link
               className="text-ink-muted"
               to={repoPath(
@@ -171,7 +175,7 @@ function Entry({
         ))}
         <button
           type="button"
-          className="mk-btn mk-btn--ghost mk-btn--sm text-micro text-ink-faint"
+          className="mk-btn mk-btn--ghost mk-btn--sm min-h-11 max-w-full whitespace-normal text-left text-micro text-ink-faint lg:min-h-7"
           title={new Date(entry.lastCommitAt).toUTCString()}
           aria-label={`${expanded ? "Hide" : "Show"} release note details for ${entry.title}; last commit ${timeAgo(entry.lastCommitAt)}`}
           aria-expanded={expanded}
@@ -236,79 +240,16 @@ export function TrackerReleases() {
     weeks.set(week, [...(weeks.get(week) ?? []), entry]);
   }
 
-  return (
-    <div className="flex min-h-dvh flex-col gap-4 px-4 py-3">
-      <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <h1 className="m-0 text-title-lg">Release notes</h1>
-        <SelectField
-          ariaLabel="Tracker owner"
-          value={owner}
-          className="w-44"
-          options={trackers.map((tracker) => ({ value: tracker.slug, label: tracker.displayName }))}
-          onChange={(value) => navigate(`/tracker/${encodeURIComponent(value)}/releases`)}
-        />
-        <TimelineSwitcher variant="filter" />
-        <Link to={`/tracker/${encodeURIComponent(owner)}/highlights`} className="mk-btn mk-btn--sm">
-          View highlights
-        </Link>
-        <button
-          type="button"
-          className="mk-btn mk-btn--ghost mk-btn--sm ml-auto"
-          disabled={revalidator.state !== "idle"}
-          onClick={() => void revalidator.revalidate()}
-        >
-          Refresh notes
-        </button>
-      </header>
-      <p className="m-0 max-w-[52rem] text-body-sm text-ink-muted">
-        Daily updates group default-branch first-parent commits by UTC Git commit date. Tagged
-        releases are optional snapshots, not deployment records.
-      </p>
-      <Form method="get" className="relative flex max-w-[52rem] items-center" role="search">
-        {new URLSearchParams(location.search).has("tl") && (
-          <input type="hidden" name="tl" value={scope ?? "main"} />
-        )}
-        <MagnifyingGlassIcon
-          className="pointer-events-none absolute left-3 size-4 text-ink-faint"
-          aria-hidden
-        />
-        <input
-          name="q"
-          className="mk-input mk-input--code h-10 min-w-0 flex-1 pl-9 sm:text-body-sm"
-          aria-label="Filter release notes"
-          aria-invalid={feed.query.unknown.length ? "true" : undefined}
-          aria-describedby="release-query-help"
-          placeholder="team:core repo:engine type:fix since:30d search words"
-          spellCheck={false}
-          autoCapitalize="off"
-          autoComplete="off"
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-        />
-      </Form>
-      <p id="release-query-help" className="m-0 -mt-2 text-micro text-ink-faint">
-        {feed.query.unknown.length ? `Not understood: ${feed.query.unknown.join(" ")}. ` : ""}
-        Daily updates are shown by default. Use kind:tag for tagged releases or
-        release:day:YYYY-MM-DD for a UTC day. Filter by team, repo, ws, type, tag (issue tags),
-        release, kind, timeline, since and until; prefix with - to exclude. These are code updates,
-        not deployments.
-      </p>
-      {feed.entries.length > 0 && (
-        <div className="max-w-[52rem]">
-          <ReleaseNotesComposer
-            target={{ kind: "tracker", owner, q, timeline: scope }}
-            label={feed.owner.displayName}
-          />
-        </div>
-      )}
-      <div className="flex max-w-[52rem] flex-col gap-2">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="mr-1 text-micro text-ink-faint">History</span>
+  const narrow = (
+    <div className="flex min-w-0 flex-col gap-5">
+      <div className="flex min-w-0 flex-col gap-2">
+        <span className="text-micro font-semibold text-ink-faint">History</span>
+        <div className="flex flex-wrap gap-1.5">
           {(["daily", "tag"] as const).map((kind) => (
             <button
               key={kind}
               type="button"
-              className="mk-chip"
+              className="mk-chip min-h-11 lg:min-h-7"
               aria-pressed={
                 feed.query.filters.some(
                   (filter) => filter.key === "kind" && !filter.negated && filter.value === kind,
@@ -330,98 +271,196 @@ export function TrackerReleases() {
             </button>
           ))}
         </div>
-        <Facets
-          title="Teams"
-          facets={feed.facets.teams}
-          q={q}
-          queryKey="team"
-          onQuery={onQuery}
-          min={1}
-        />
-        <Facets
-          title="Type"
-          facets={feed.facets.categories}
-          q={q}
-          queryKey="type"
-          onQuery={onQuery}
-          label={(facet) => CATEGORY_LABELS[facet.value as ReleaseCategory] ?? facet.label}
-        />
-        <Facets title="Repos" facets={feed.facets.repos} q={q} queryKey="repo" onQuery={onQuery} />
-        <Facets
-          title="Workspaces"
-          facets={feed.facets.workspaces}
-          q={q}
-          queryKey="ws"
-          onQuery={onQuery}
-        />
-        <Facets
-          title="Tags"
-          facets={feed.facets.tags ?? feed.facets.labels}
-          q={q}
-          queryKey="tag"
-          onQuery={onQuery}
-        />
       </div>
-      {feed.entries.length === 0 ? (
-        <div className="mk-empty flex max-w-[44rem] flex-col items-center gap-3 py-12">
-          <RocketLaunchIcon size={28} className="text-ink-faint" aria-hidden />
-          <div>
-            {scope
-              ? "No landed notes you can see match this timeline and these filters. Choose another timeline or main, or adjust your search."
-              : q
-                ? "No code updates match this filter."
-                : `No daily notes are available for ${feed.owner.displayName}'s repositories or teams yet.`}
-          </div>
-          <p className="m-0 text-body-sm text-ink-faint">
-            Refresh to check for newly processed notes.
+      <Facets
+        title="Teams"
+        facets={feed.facets.teams}
+        q={q}
+        queryKey="team"
+        onQuery={onQuery}
+        min={1}
+      />
+      <Facets
+        title="Type"
+        facets={feed.facets.categories}
+        q={q}
+        queryKey="type"
+        onQuery={onQuery}
+        label={(facet) => CATEGORY_LABELS[facet.value as ReleaseCategory] ?? facet.label}
+      />
+      <Facets title="Repos" facets={feed.facets.repos} q={q} queryKey="repo" onQuery={onQuery} />
+      <Facets
+        title="Workspaces"
+        facets={feed.facets.workspaces}
+        q={q}
+        queryKey="ws"
+        onQuery={onQuery}
+      />
+      <Facets
+        title="Tags"
+        facets={feed.facets.tags ?? feed.facets.labels}
+        q={q}
+        queryKey="tag"
+        onQuery={onQuery}
+      />
+    </div>
+  );
+
+  return (
+    <div className="mx-auto flex min-h-dvh w-full max-w-6xl min-w-0 flex-col gap-5 px-4 py-5 sm:px-8 sm:py-7">
+      <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <h1 className="m-0 text-title-lg">Release notes</h1>
+        <SelectField
+          ariaLabel="Tracker owner"
+          value={owner}
+          className="w-44 max-w-full"
+          options={trackers.map((tracker) => ({ value: tracker.slug, label: tracker.displayName }))}
+          onChange={(value) => navigate(`/tracker/${encodeURIComponent(value)}/releases`)}
+        />
+        <TimelineSwitcher variant="filter" />
+        <Link
+          to={`/tracker/${encodeURIComponent(owner)}/highlights`}
+          className="mk-btn mk-btn--sm min-h-11 sm:min-h-8"
+        >
+          View highlights
+        </Link>
+        <button
+          type="button"
+          className="mk-btn mk-btn--ghost mk-btn--sm min-h-11 sm:ml-auto sm:min-h-8"
+          disabled={revalidator.state !== "idle"}
+          onClick={() => void revalidator.revalidate()}
+        >
+          Refresh notes
+        </button>
+      </header>
+      <p className="m-0 max-w-[72ch] text-body-sm leading-relaxed text-ink-muted">
+        Daily updates group default-branch first-parent commits by UTC Git commit date. Tagged
+        releases are optional snapshots, not deployment records.
+      </p>
+      <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(0,1fr)_16rem] lg:gap-10">
+        <div className="flex min-w-0 flex-col gap-4">
+          <Form method="get" className="relative flex min-w-0 items-center" role="search">
+            {new URLSearchParams(location.search).has("tl") && (
+              <input type="hidden" name="tl" value={scope ?? "main"} />
+            )}
+            <MagnifyingGlassIcon
+              className="pointer-events-none absolute left-3 size-4 text-ink-faint"
+              aria-hidden
+            />
+            <input
+              name="q"
+              className="mk-input mk-input--code h-11 min-w-0 flex-1 pl-9 sm:text-body-sm"
+              aria-label="Filter release notes"
+              aria-invalid={feed.query.unknown.length ? "true" : undefined}
+              aria-describedby="release-query-help"
+              placeholder="team:core repo:engine type:fix since:30d search words"
+              spellCheck={false}
+              autoCapitalize="off"
+              autoComplete="off"
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+            />
+          </Form>
+          <p
+            id="release-query-help"
+            className="m-0 -mt-2 max-w-[72ch] text-micro leading-relaxed text-ink-faint [overflow-wrap:anywhere]"
+          >
+            {feed.query.unknown.length ? `Not understood: ${feed.query.unknown.join(" ")}. ` : ""}
+            Daily updates are shown by default. Use kind:tag for tagged releases or
+            release:day:YYYY-MM-DD for a UTC day. Filter by team, repo, ws, type, tag (issue tags),
+            release, kind, timeline, since and until; prefix with - to exclude. These are code
+            updates, not deployments.
           </p>
-        </div>
-      ) : (
-        <div className="flex max-w-[52rem] flex-col gap-8 pb-8">
-          {[...weeks].map(([week, entries]) => (
-            <section key={week}>
-              <h2 className="mt-0 mb-3 text-title">
-                Week of{" "}
-                {new Date(week).toLocaleDateString("en", {
-                  month: "short",
-                  day: "numeric",
-                  year: "numeric",
-                  timeZone: "UTC",
-                })}{" "}
-                UTC
-              </h2>
-              <ul className="m-0 list-none p-0">
-                {entries.map((entry) => (
-                  <Entry
-                    key={entry.id}
-                    entry={entry}
-                    expanded={selectedEntry?.id === entry.id}
-                    onSelect={(id, trigger) =>
-                      setSelected(
-                        selectedEntry?.id === id
-                          ? null
-                          : {
-                              id,
-                              trigger,
-                              pathname: location.pathname,
-                              search: location.search,
-                              owner,
-                              q,
-                            },
-                      )
-                    }
-                  />
-                ))}
-              </ul>
-            </section>
-          ))}
-          {feed.truncated && (
-            <p className="m-0 text-body-sm text-ink-faint">
-              Showing the newest {feed.entries.length}. Narrow the filter to see older work.
-            </p>
+          {feed.entries.length > 0 && (
+            <div className="max-w-[52rem]">
+              <ReleaseNotesComposer
+                target={{ kind: "tracker", owner, q, timeline: scope }}
+                label={feed.owner.displayName}
+              />
+            </div>
+          )}
+          <details className="rounded-pane bg-pane px-3.5 py-1 open:pb-3.5 lg:hidden">
+            <summary className="flex min-h-11 cursor-pointer list-none flex-wrap items-center gap-x-2 gap-y-1 font-semibold [&::-webkit-details-marker]:hidden">
+              <FunnelSimpleIcon weight="bold" aria-hidden />
+              Narrow it down
+              <span className="text-body-sm font-normal text-ink-faint">
+                history, teams, type, repos, workspaces, tags
+              </span>
+            </summary>
+            <div className="pt-4">{narrow}</div>
+          </details>
+          {feed.entries.length === 0 ? (
+            <div className="mk-empty flex min-w-0 flex-col items-center gap-3 py-12 [overflow-wrap:anywhere]">
+              <RocketLaunchIcon size={28} className="text-ink-faint" aria-hidden />
+              <div>
+                {scope
+                  ? "No landed notes you can see match this timeline and these filters. Choose another timeline or main, or adjust your search."
+                  : q
+                    ? "No code updates match this filter."
+                    : `No daily notes are available for ${feed.owner.displayName}'s repositories or teams yet.`}
+              </div>
+              <p className="m-0 text-body-sm text-ink-faint">
+                Refresh to check for newly processed notes.
+              </p>
+            </div>
+          ) : (
+            <div className="flex min-w-0 flex-col gap-8 pb-8">
+              {[...weeks].map(([week, entries]) => (
+                <section key={week}>
+                  <h2 className="mt-0 mb-3 text-title">
+                    Week of{" "}
+                    {new Date(week).toLocaleDateString("en", {
+                      month: "short",
+                      day: "numeric",
+                      year: "numeric",
+                      timeZone: "UTC",
+                    })}{" "}
+                    UTC
+                  </h2>
+                  <ul className="m-0 list-none p-0">
+                    {entries.map((entry) => (
+                      <Entry
+                        key={entry.id}
+                        entry={entry}
+                        expanded={selectedEntry?.id === entry.id}
+                        onSelect={(id, trigger) =>
+                          setSelected(
+                            selectedEntry?.id === id
+                              ? null
+                              : {
+                                  id,
+                                  trigger,
+                                  pathname: location.pathname,
+                                  search: location.search,
+                                  owner,
+                                  q,
+                                },
+                          )
+                        }
+                      />
+                    ))}
+                  </ul>
+                </section>
+              ))}
+              {feed.truncated && (
+                <p className="m-0 text-body-sm text-ink-faint">
+                  Showing the newest {feed.entries.length}. Narrow the filter to see older work.
+                </p>
+              )}
+            </div>
           )}
         </div>
-      )}
+        <aside
+          className="hidden min-w-0 flex-col gap-5 border-l border-line-soft pl-6 lg:flex lg:self-start"
+          aria-label="Narrow it down"
+        >
+          <div className="flex items-center gap-2">
+            <FunnelSimpleIcon weight="bold" aria-hidden className="text-ink-faint" />
+            <h2 className="m-0 text-title">Narrow it down</h2>
+          </div>
+          {narrow}
+        </aside>
+      </div>
       <ReleaseNoteDetails selection={selection} onClose={closeDetails} />
     </div>
   );
