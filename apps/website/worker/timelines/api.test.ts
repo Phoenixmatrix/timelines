@@ -322,6 +322,64 @@ describe("recent timeline presence", () => {
 });
 
 describe("forking", () => {
+  test("inherits stable repository identity after rename even when the old name is reused", async () => {
+    const t = await setup();
+    expect((await t.call("ben", "POST", "", { slug: "search", repos: ["orbit/app"] })).status).toBe(
+      201,
+    );
+    const sourceId = t.work().sourceId;
+    expect((await t.raw("ann", "PATCH", "/repos/orbit/app", { name: "renamed" })).status).toBe(200);
+    t.sqlite.exec(`INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
+      VALUES('replacement','orbit','app','private','r-replacement','https://replacement')`);
+    const child = await t.call("ben", "POST", "", { slug: "child", parent: "search" });
+    expect(child.status).toBe(201);
+    expect(child.body.timeline.repos).toMatchObject([{ id: "app", name: "renamed" }]);
+    expect(
+      t.sqlite
+        .prepare(
+          "SELECT repo_id,fork_source_id FROM timeline_work_sources WHERE timeline_slug='child'",
+        )
+        .get(),
+    ).toEqual({ repo_id: "app", fork_source_id: sourceId });
+    expect(t.work("child").refs.get("refs/heads/work")).toBe(oid(1));
+    expect(t.app.refs.get("refs/heads/main")).toBe(oid(1));
+  });
+
+  test("projects renamed repositories in live timeline and checkpoint views without rewriting history", async () => {
+    const t = await setup();
+    const created = await t.call("ben", "POST", "", { slug: "search", repos: ["orbit/app"] });
+    expect(created.status).toBe(201);
+    t.work().commits.add(oid(9));
+    t.work().refs.set("refs/heads/work", oid(9));
+    const made = await t.call("ben", "POST", "/search/checkpoints", { summary: "Before rename" });
+    expect(made.status).toBe(201);
+    const frozen = made.body as CheckpointView;
+    expect((await t.raw("ann", "PATCH", "/repos/orbit/app", { name: "renamed" })).status).toBe(200);
+    t.sqlite.exec(`INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote)
+      VALUES('replacement','orbit','app','private','r-replacement','https://replacement')`);
+
+    const liveRepos = [{ ...created.body.timeline.repos[0], name: "renamed" }];
+    expect((await t.call("cat", "GET", "/search")).body.timeline.repos).toEqual(liveRepos);
+    expect((await t.call("cat", "GET", "")).body.timelines[0].repos).toEqual(liveRepos);
+    const liveCheckpoint = {
+      ...frozen.checkpoint,
+      repos: [{ ...frozen.checkpoint.repos[0], name: "renamed" }],
+    };
+    expect((await t.call("cat", "GET", "/search/checkpoints/1")).body.checkpoint).toEqual(
+      liveCheckpoint,
+    );
+    expect(
+      (await t.call("cat", "GET", "/search/checkpoints")).body.checkpoints[0].checkpoint,
+    ).toEqual(liveCheckpoint);
+    const storedTimeline = await t.trackers.get("orbit")!.timeline("search", 0, 1);
+    const storedCheckpoint = await t.trackers.get("orbit")!.checkpoint("search", "1");
+    expect(storedTimeline).toMatchObject({
+      ok: true,
+      value: { timeline: { repos: created.body.timeline.repos } },
+    });
+    expect(storedCheckpoint).toMatchObject({ ok: true, value: { checkpoint: frozen.checkpoint } });
+  });
+
   test("allocates isolated owned sources at main's tip without modifying canonical refs", async () => {
     const t = await setup();
     const created = await t.call("ben", "POST", "", {
@@ -900,6 +958,7 @@ describe("approving a checkpoint", () => {
     t.work().refs.set("refs/heads/work", oid(9));
     const made = (await t.call("bot", "POST", "/search/checkpoints", { summary: "Ready" }))
       .body as CheckpointView;
+    expect((await t.raw("ann", "PATCH", "/repos/orbit/app", { name: "renamed" })).status).toBe(200);
     const mutate = (who: "ann" | "ben" | "cat" | "bot", mutation: unknown) =>
       t.raw(who, "POST", "/tracker/orbit/mutate", {
         operationId: crypto.randomUUID(),
@@ -937,7 +996,10 @@ describe("approving a checkpoint", () => {
     expect(inbox.requests[0]).toMatchObject({
       request: { id: "req", checkpoint: { id: made.checkpoint.id, timeline: "search", number: 1 } },
       checkpoint: {
-        checkpoint: { summary: "Ready", repos: [{ commit: oid(9), base: oid(1) }] },
+        checkpoint: {
+          summary: "Ready",
+          repos: [{ id: "app", owner: "orbit", name: "renamed", commit: oid(9), base: oid(1) }],
+        },
         current: true,
         approval: { state: "pending" },
       },
@@ -952,6 +1014,9 @@ describe("approving a checkpoint", () => {
     expect(after).toMatchObject({ approved: true, approval: { state: "approved", by: "ben" } });
     // Approved while it's the head: the approval timeline enters the landing queue (CORE-77).
     expect((await t.call("ben", "GET", "/search")).body.timeline.status).toBe("landing");
+    expect((await t.call("ben", "GET", "/search/landing")).body.landing.repos).toMatchObject([
+      { id: "app", owner: "orbit", name: "renamed", commit: oid(9) },
+    ]);
   });
 });
 

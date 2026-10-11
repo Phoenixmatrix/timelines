@@ -14,7 +14,7 @@ const remote = { dev: { remote: true } };
 type Runner = "local" | "sandbox";
 
 /** Where the deployed Worker lives; GITMATRIX_PUBLIC_URL can override it. */
-const PRODUCTION_HOST = "gitmatrix.fward.dev";
+const PRODUCTION_HOST = "timelinesapp.fward.dev";
 
 /**
  * Remote resources dev also talks to (Artifacts, Vectorize, AI Search) get
@@ -107,7 +107,12 @@ export default defineConfig(({ mode, isPreview }) => {
       // sets the subdomain to exactly that (enabled false, previews_enabled true).
       ...(dev || preview
         ? {}
-        : { domains: [PRODUCTION_HOST], workersDev: false, previewUrls: true }),
+        : {
+            // Temporary cutover overlap: in-flight CI still reports to the old origin.
+            domains: [PRODUCTION_HOST, "gitmatrix.fward.dev"],
+            workersDev: false,
+            previewUrls: true,
+          }),
       observability: { enabled: true },
       // Multi-GB hashing/indexing; up to 20,000 historical frames with base/cache I/O.
       limits: { cpuMs: 300_000, subrequests: 200_000 },
@@ -344,7 +349,7 @@ export default defineConfig(({ mode, isPreview }) => {
           simple: { limit: 5, period: 60 },
         }),
         // Where package clients and CI sandboxes reach gitmatrix. Generated
-        // indexes (Helm, APT, RPM…) embed it; deployed, https://gitmatrix.fward.dev.
+        // indexes (Helm, APT, RPM…) embed it; deployed, https://timelinesapp.fward.dev.
         ...(publicUrl ? { PUBLIC_URL: bindings.text(publicUrl) } : {}),
       },
       // No consumers or cron in a preview: Worker Previews don't run them, and

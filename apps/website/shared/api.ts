@@ -256,6 +256,13 @@ export interface CreateRepoRequest {
   importUrl?: string;
 }
 
+/** Repository administrators may change the URL name without replacing its identity. */
+export interface UpdateRepoRequest {
+  name?: string;
+  description?: string;
+  visibility?: Visibility;
+}
+
 export interface ApiError {
   error: string;
 }

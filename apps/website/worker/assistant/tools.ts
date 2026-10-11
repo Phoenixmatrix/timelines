@@ -26,7 +26,7 @@ import type { Group } from "./plan.ts";
 const REPO = z
   .string()
   .regex(/^[\w.-]+\/[\w.-]+$/)
-  .describe("owner/name, e.g. matrixorg/gitmatrix");
+  .describe("owner/name, e.g. matrixorg/timelines");
 const SOURCE = z
   .string()
   .optional()
@@ -839,7 +839,7 @@ export function buildTools(context: ToolContext) {
   const navigate = {
     navigate: tool({
       description:
-        "Open a page of Timelines in the person's browser, beside this chat. Use when they ask to see or go somewhere, or when showing beats describing (a file at the lines you mean, the issue you created). Paths are app paths like /matrixorg/gitmatrix/blob/main/README.md#L10-L20 or /tracker/matrixorg/issues/CORE-25.",
+        "Open a page of Timelines in the person's browser, beside this chat. Use when they ask to see or go somewhere, or when showing beats describing (a file at the lines you mean, the issue you created). Paths are app paths like /matrixorg/timelines/blob/main/README.md#L10-L20 or /tracker/matrixorg/issues/CORE-25.",
       inputSchema: z.object({
         path: z
           .string()

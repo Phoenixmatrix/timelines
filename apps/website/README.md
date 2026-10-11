@@ -10,7 +10,8 @@ The public product name is **Timelines**. The app lockup reuses the approved
 Pounce cat with an outlined Figtree Timelines wordmark at the approved weight and spacing; the
 four-colour timeline-scope icon remains a separate navigation symbol.
 Internal `GitmatrixLogo`, `gm`, `.gitmatrix`, protocol identifiers, resource
-names, sender addresses and configured origins are unchanged by the rebrand.
+names and sender addresses remain unchanged. The production application uses
+`timelinesapp.fward.dev` and its canonical repository is `matrixorg/timelines`.
 Sign-in email display names and copy use Timelines.
 
 ```
@@ -227,7 +228,7 @@ rate-limit binding; past the limit the key is locked out for 15 minutes.
   session for a personal access token (`POST /api/tokens/device`).
 
 Deploying needs the `BETTER_AUTH_SECRET` and `REGISTRY_KEK` secrets. The Worker
-serves https://gitmatrix.fward.dev (override with `GITMATRIX_PUBLIC_URL` at deploy
+serves https://timelinesapp.fward.dev (override with `GITMATRIX_PUBLIC_URL` at deploy
 time), with production-only D1, Artifacts, Vectorize and AI Search resources so it
 never shares data with `vp dev`. mail.fward.dev is enabled for Email Sending.
 
@@ -666,6 +667,45 @@ never substitute the canonical server. `/api/dev/tokens`, `/api/dev/seed` and
 | `/api/identity/*`                                                                         | Better Auth: email codes, device login (`/device/*`)                           |
 | `POST /api/tokens/device` (Bearer: device session)                                        | Trade a one-time device session for a gm token                                 |
 | `GET\|POST /api/invites`, `DELETE /api/invites/:email`                                    | Invitations (site admins)                                                      |
+
+### Renaming a repository in place
+
+Repository administrators can `PATCH /api/repos/:owner/:name` with
+`{name?, description?, visibility?}`. For example:
+
+```sh
+gm api PATCH /repos/matrixorg/gitmatrix --data '{"name":"timelines"}'
+```
+
+The response is the updated repository summary. `name` uses the creation rules:
+trimmed, 1–100 letters/numbers/dots/dashes/underscores, no leading dot and no
+`.git` ending (case-insensitive). Invalid names return 400; a name already held
+by another repository, including one awaiting deletion, returns 409. The entire
+patch is rejected on collision, including description/visibility changes.
+Deleted repositories return 404; readers/writers cannot rename (403, or 404
+when they cannot read the repository). Omit `name` to retain the current name.
+
+This changes the URL, not the repository ID or physical Artifacts name/remote.
+Refs, Git history, owned timeline sources, permissions, registry provenance and
+grants, CI records/secrets, mirrors and tracker/workspace ID references remain
+attached to the same repository. No redirect or alias is created: old URLs stop
+resolving, and the old name is available for a different repository. Ref/object
+caches retain their physical storage keys. Historical tracker/checkpoint labels,
+generated prose and recorded external links are not rewritten; inherited
+timeline forks resolve the parent repositories by ID, not those old labels.
+Live timeline, checkpoint, landing and approval-inbox responses resolve current
+repository names by stable ID. Subscription links and Atlas workspace choices
+also join current repository metadata by ID; stored subscriptions, checkpoints,
+events and replica cursors are unchanged.
+
+Before a production rename, exercise this on a disposable repository containing
+a commit and an owned timeline source: record its ID and refs, rename it, read
+the same commit/source through the new URL, and check the old URL is 404.
+Also attempt an occupied name and a nonadmin rename, verifying both repositories
+remain unchanged. Quiesce jobs/clients that already captured the old URL, then
+update local remotes, CI configuration and external links. The PATCH does not
+rename a GitHub repository, change a mirror destination URL, change package
+names, or migrate authentication between application hosts.
 
 ## Global search
 
@@ -3179,7 +3219,7 @@ expiry ─▶ preview run (teardown) ─▶ preview-teardown job ─▶ … prev
 `Gitmatrix previews` self-hosted Access application protects
 `*-gitmatrix.fward.workers.dev`. This includes named timeline previews,
 deployment URLs, and production-version preview URLs, but not
-`gitmatrix.fward.dev`. The application and its policies are permanent:
+`timelinesapp.fward.dev`. The application and its policies are permanent:
 **preview teardown must never delete them.** A Preview can disappear from
 Cloudflare's management API while its old route still serves (CORE-216);
 the hostname policy continues to require authentication even then.
@@ -3252,7 +3292,7 @@ not bearer capabilities.
   `previewUrls: true` and `workersDev: false`, and each production deploy
   sets the subdomain to `enabled: false`, `previews_enabled: true` (before
   previews: both false). Production itself still answers only on
-  gitmatrix.fward.dev. Each production version is also reachable at its own
+  timelinesapp.fward.dev. Each production version is also reachable at its own
   version preview URL, `<version>-gitmatrix.<subdomain>.workers.dev`, with
   production's bindings, **behind the same persistent Access application**.
   Sign-in there does not share production cookies, since Better Auth trusts
@@ -3268,19 +3308,19 @@ account's, shared with production. So when cf builds a Preview
 tools/preview made from `GITMATRIX_PREVIEW_*` (`vite/preview.ts`; a missing
 one fails the build rather than falling back to production's) and:
 
-| Production                                       | In a preview                                               |
-| ------------------------------------------------ | ---------------------------------------------------------- |
-| `DB`, `REGISTRY_DB`                              | The timeline's own D1s                                     |
-| `REGISTRY_BLOBS` (`gitmatrix-registry-blobs`)    | The timeline's own bucket                                  |
-| `ARTIFACTS` (`gitmatrix`)                        | The timeline's own namespace                               |
-| `CI_RUN`, `KNOWLEDGE_BUILD` and their Workflows  | Left out: Workflow names are the account's                 |
-| `JOBS`, `REGISTRY_JOBS`, queue consumers, cron   | Left out: no mirror syncs, release notes or package sweeps |
-| `EMAIL`                                          | Left out: persona sign-in instead                          |
-| `AI`, `VECTORS`, `SEARCH`                        | Left out: no knowledge builds, wiki or assistant           |
-| Secrets Store (auth secret, registry key)        | Text bindings from a secret generated for each create      |
-| `gitmatrix.fward.dev`, `PUBLIC_URL`, `OWNER_ORG` | Left out: a preview answers at its own URL                 |
-| CI Sandbox container                             | Left out: previews run no CI                               |
-| `AUTH_FAILURES` namespace 4401                   | 4402                                                       |
+| Production                                          | In a preview                                               |
+| --------------------------------------------------- | ---------------------------------------------------------- |
+| `DB`, `REGISTRY_DB`                                 | The timeline's own D1s                                     |
+| `REGISTRY_BLOBS` (`gitmatrix-registry-blobs`)       | The timeline's own bucket                                  |
+| `ARTIFACTS` (`gitmatrix`)                           | The timeline's own namespace                               |
+| `CI_RUN`, `KNOWLEDGE_BUILD` and their Workflows     | Left out: Workflow names are the account's                 |
+| `JOBS`, `REGISTRY_JOBS`, queue consumers, cron      | Left out: no mirror syncs, release notes or package sweeps |
+| `EMAIL`                                             | Left out: persona sign-in instead                          |
+| `AI`, `VECTORS`, `SEARCH`                           | Left out: no knowledge builds, wiki or assistant           |
+| Secrets Store (auth secret, registry key)           | Text bindings from a secret generated for each create      |
+| `timelinesapp.fward.dev`, `PUBLIC_URL`, `OWNER_ORG` | Left out: a preview answers at its own URL                 |
+| CI Sandbox container                                | Left out: previews run no CI                               |
+| `AUTH_FAILURES` namespace 4401                      | 4402                                                       |
 
 Behind that, the build binds `PREVIEW_MODE=true`, and `worker/preview.ts`
 guards each effect that would leave the preview, in case a binding ever
@@ -3365,7 +3405,7 @@ commit:4f2a run:42 by:jun tag:latest`, with `-` to exclude);
 - **npm login** works both ways: an access token as the password, or
   `--auth-type=web`, which approves the login at `/cli-auth/npm/:id`.
 
-Deployed, package indexes embed https://gitmatrix.fward.dev (or
+Deployed, package indexes embed https://timelinesapp.fward.dev (or
 `GITMATRIX_PUBLIC_URL`), and the `REGISTRY_KEK` secret seals keys. Development uses a fixed public key. `pnpm run
 db:migrate` applies both databases' migrations. Account slugs must not take
 the registry's path prefixes (`v2`, `npm`, `pypi`, `maven`, `cargo`, `go`,
@@ -3596,6 +3636,19 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
 - **No git binary.** Workers can't run git, so `worker/mirror/` speaks the
   protocol: the pack streams from Artifacts to the target without buffering.
 - The token (push access on the target) is sealed with `REGISTRY_KEK`.
+
+Repository administrators can rename an existing GitHub backup with
+`POST /api/repos/:o/:n/mirror/rename`, supplying `{name, expectedRepositoryId}`.
+The numeric GitHub repository ID is required to prevent a stale/reused name
+from targeting another repository. Only `https://github.com` targets are
+accepted, and the existing mirror lease excludes simultaneous syncs.
+An optional `token` grants administration access for that operation only;
+it is neither persisted nor substituted for the sealed push credential.
+The response retains the remote ID and updates the mirror's clone URL without
+changing Git refs, sync history or source identity. Previews and non-admins
+cannot invoke it. After an uncertain response, inspect the remote before
+retrying; if GitHub renamed it but local configuration changed concurrently,
+confirm its ID and use the existing mirror update endpoint to repair the URL.
 
 ## Data retention
 

@@ -72,6 +72,7 @@ import {
 import type { SourceSnapshot } from "../../shared/code-source.ts";
 import type { TimelineRepo } from "../../shared/timelines.ts";
 import { migrateLegacyTimeline } from "./migration.ts";
+import { currentRepositoryNames } from "./names.ts";
 
 /** Repositories one timeline may touch. */
 const MAX_REPOS = 20;
@@ -130,12 +131,13 @@ timelines.get("/", async (c) => {
       status === undefined ? undefined : timelineStatus(status),
     ),
   );
-  if (stalled !== "true") return c.json<TimelineList>({ timelines: list });
+  const current = await currentRepositoryNames(c.env.DB, access.owner.id, list);
+  if (stalled !== "true") return c.json<TimelineList>({ timelines: current });
   // Stalling is expected of experimental timelines: isStalled leaves them out.
   const { idleDays } = await previewSettings(c.env.DB, access.owner.id);
   const now = Date.now();
   return c.json<TimelineList>({
-    timelines: list.filter((timeline) => isStalled(timeline, now, idleDays)),
+    timelines: current.filter((timeline) => isStalled(timeline, now, idleDays)),
     idleDays,
   });
 });
@@ -155,11 +157,25 @@ timelines.post("/", async (c) => {
     data.parent === undefined || data.parent === "main" ? null : timelineSlug(data.parent);
   const tracker = trackerObject(c.env, access.owner.id);
   const parent = parentSlug ? unwrap(await tracker.timeline(parentSlug, 0, 1)).timeline : null;
+  // Parent snapshots retain their original labels; resolve current URLs by the
+  // stable IDs so a rename (or reuse of the old name) cannot change fork identity.
+  const inherited =
+    data.repos === undefined && parent?.repos.length
+      ? await selectRepos(c.env.DB, actor.id)
+          .where(
+            "r.id",
+            "in",
+            parent.repos.map((repo) => repo.id),
+          )
+          .execute()
+      : [];
+  if (data.repos === undefined && parent && inherited.length !== parent.repos.length)
+    fail("not_found", "A parent repository no longer exists.", 404);
 
   // The repositories, by default the parent's: each the account's own, and writable.
   const requested =
     data.repos === undefined
-      ? (parent?.repos.map((repo) => ({ repo: `${repo.owner}/${repo.name}` })) ?? [])
+      ? inherited.map((repo) => ({ repo: `${repo.owner_slug}/${repo.name}` }))
       : Array.isArray(data.repos)
         ? data.repos.map((entry) => (typeof entry === "string" ? { repo: entry } : entry))
         : fail("invalid_input", "repos must be a list of owner/name.");
@@ -175,7 +191,10 @@ timelines.post("/", async (c) => {
     const [owner, name, extra] = text(fullName, "repo").split("/");
     if (!owner || !name || extra !== undefined)
       fail("invalid_input", "A repository is owner/name.");
-    const row = await findRepo(c.env.DB, actor, owner, name);
+    const row =
+      data.repos === undefined
+        ? inherited.find((repo) => repo.owner_slug === owner && repo.name === name)
+        : await findRepo(c.env.DB, actor, owner, name);
     const role = row ? roleFor(row, actor) : "none";
     if (!row || !atLeast(role, "read")) fail("not_found", `No repository ${owner}/${name}.`, 404);
     if (!atLeast(role, "write"))
@@ -235,7 +254,8 @@ timelines.post("/", async (c) => {
     }),
   );
   noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  return c.json<TimelineChange>({ timeline, bookmarks: created }, 201);
+  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [timeline]);
+  return c.json<TimelineChange>({ timeline: current!, bookmarks: created }, 201);
 });
 
 timelines.get("/:slug", async (c) => {
@@ -252,7 +272,8 @@ timelines.get("/:slug", async (c) => {
     ),
   );
   noteAgentPresence(c, presenceTarget(access.owner.id, detail.timeline.id));
-  return c.json<TimelineDetail>(detail);
+  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [detail.timeline]);
+  return c.json<TimelineDetail>({ ...detail, timeline: current! });
 });
 
 timelines.get("/:slug/presence", async (c) => {
@@ -275,7 +296,8 @@ timelines.patch("/:slug", async (c) => {
     ),
   );
   noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  return c.json<Timeline>(timeline);
+  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [timeline]);
+  return c.json<Timeline>(current!);
 });
 
 timelines.post("/:slug/migrate", async (c) => {
@@ -288,7 +310,8 @@ timelines.post("/:slug/migrate", async (c) => {
     fail("forbidden", "Migration needs write access to every repository.", 403);
   const result = await migrateLegacyTimeline(c.env, access.owner.id, detail.timeline.id);
   noteAgentPresence(c, presenceTarget(access.owner.id, detail.timeline.id));
-  return c.json(result);
+  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [result]);
+  return c.json(current!);
 });
 
 timelines.post("/:slug/migration/resolve", async (c) => {
@@ -332,7 +355,8 @@ timelines.post("/:slug/migration/resolve", async (c) => {
     ),
   );
   noteAgentPresence(c, presenceTarget(access.owner.id, detail.timeline.id));
-  return c.json(result);
+  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [result]);
+  return c.json(current!);
 });
 
 timelines.post("/:slug/abandon", async (c) => {
@@ -383,7 +407,8 @@ timelines.post("/:slug/abandon", async (c) => {
     bookmarks.push({ repoId: entry.id, ref: entry.source.ref, ok: true });
   }
   noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  return c.json<TimelineChange>({ timeline: result.timeline, bookmarks });
+  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [result.timeline]);
+  return c.json<TimelineChange>({ timeline: current!, bookmarks });
 });
 
 timelines.get("/:slug/checkpoints", async (c) => {
@@ -399,7 +424,17 @@ timelines.get("/:slug/checkpoints", async (c) => {
     unwrap(states).map((state) => view(c.env, state, timeline)),
   );
   noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  return c.json<CheckpointList>({ checkpoints });
+  const current = await currentRepositoryNames(
+    c.env.DB,
+    access.owner.id,
+    checkpoints.map((checkpoint) => checkpoint.checkpoint),
+  );
+  return c.json<CheckpointList>({
+    checkpoints: checkpoints.map((checkpoint, index) => ({
+      ...checkpoint,
+      checkpoint: current[index]!,
+    })),
+  });
 });
 
 timelines.get("/:slug/checkpoints/:ref", async (c) => {
@@ -415,7 +450,10 @@ timelines.get("/:slug/checkpoints/:ref", async (c) => {
   const timeline = unwrap(detail).timeline;
   const checkpoint = await view(c.env, unwrap(state), timeline);
   noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  return c.json<CheckpointView>(checkpoint);
+  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [
+    checkpoint.checkpoint,
+  ]);
+  return c.json<CheckpointView>({ ...checkpoint, checkpoint: current! });
 });
 
 timelines.post("/:slug/checkpoints", async (c) => {
@@ -464,7 +502,10 @@ timelines.post("/:slug/checkpoints", async (c) => {
     );
   const checkpoint = await view(c.env, state, timeline);
   noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  return c.json<CheckpointView>(checkpoint, 201);
+  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [
+    checkpoint.checkpoint,
+  ]);
+  return c.json<CheckpointView>({ ...checkpoint, checkpoint: current! }, 201);
 });
 
 timelines.post("/:slug/checkpoints/:ref/revive", async (c) => {
@@ -487,8 +528,11 @@ timelines.post("/:slug/checkpoints/:ref/revive", async (c) => {
   );
   const checkpoint = await view(c.env, state, timeline);
   noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
+  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [
+    checkpoint.checkpoint,
+  ]);
   return c.json<PreviewRevival>(
-    { checkpoint, runs },
+    { checkpoint: { ...checkpoint, checkpoint: current! }, runs },
     runs.some((run) => "number" in run) ? 201 : 200,
   );
 });
@@ -511,7 +555,8 @@ timelines.post("/:slug/land", async (c) => {
     "request",
   );
   noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  return c.json<LandResult>(result, result.queued ? 202 : 200);
+  const [current] = await currentRepositoryNames(c.env.DB, access.owner.id, [result.landing]);
+  return c.json<LandResult>({ ...result, landing: current! }, result.queued ? 202 : 200);
 });
 
 timelines.get("/:slug/landing", async (c) => {
@@ -520,5 +565,10 @@ timelines.get("/:slug/landing", async (c) => {
   const timeline = unwrap(await tracker.timeline(c.req.param("slug"), 0, 1)).timeline;
   const landing = unwrap(await tracker.landing(timeline.slug));
   noteAgentPresence(c, presenceTarget(access.owner.id, timeline.id));
-  return c.json<{ landing: Landing | null }>({ landing });
+  const [current] = await currentRepositoryNames(
+    c.env.DB,
+    access.owner.id,
+    landing ? [landing] : [],
+  );
+  return c.json<{ landing: Landing | null }>({ landing: current ?? null });
 });

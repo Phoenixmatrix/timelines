@@ -552,7 +552,7 @@ server holds:
 
 ```bash
 gm ask "Why did run 44 fail?"                          # inside a checkout: about its repository
-gm ask -R matrixorg/gitmatrix "Where is readiness computed?"
+gm ask -R matrixorg/timelines "Where is readiness computed?"
 gm ask --chat CHAT_ID "And who changed it last?"       # follow up
 gm ask --write "File a P1 bug in CORE for the flaky clone test"
 gm assistant list | show CHAT_ID | delete CHAT_ID
@@ -1409,7 +1409,7 @@ a running `gm` binary. Symlinks and nonregular destinations are refused.
 `--dry-run` checks remote metadata without creating files or directories.
 Add the bin directory to `PATH` yourself; no shell configuration is edited.
 
-The `matrixorg/gitmatrix` pipeline on gitmatrix.fward.dev publishes Linux x86-64 and ARM64 release
+The `matrixorg/timelines` pipeline on timelinesapp.fward.dev publishes Linux x86-64 and ARM64 release
 binaries as `gm/<apps/cli tree id>/<os>-<arch>/gm`: the git tree id of the CLI's
 source (`git rev-parse HEAD:apps/cli`, `Cargo.lock` included). The same source
 always has the same version, so unrelated pushes and reruns reuse the existing

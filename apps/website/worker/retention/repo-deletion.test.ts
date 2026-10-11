@@ -344,6 +344,32 @@ async function setup() {
 
 type World = Awaited<ReturnType<typeof setup>>;
 
+test("renaming preserves registry grants/provenance and never invokes deletion providers", async () => {
+  const t = await setup();
+  const grants = t.registry.prepare("SELECT * FROM package_sources").all();
+  const publishes = t.registry.prepare("SELECT * FROM publishes").all();
+  const physical = [...t.artifacts.repos];
+  const vectors = [...t.vectors.vectors];
+  const search = [...t.search.items];
+  const providers = [t.purges.instances.size, t.builds.instances.size, t.ciRuns.instances.size];
+  const response = await t.call("/orbit/doomed", {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "retained" }),
+  });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ id: "r_doomed", name: "retained" });
+  expect(t.registry.prepare("SELECT * FROM package_sources").all()).toEqual(grants);
+  expect(t.registry.prepare("SELECT * FROM publishes").all()).toEqual(publishes);
+  expect([...t.artifacts.repos]).toEqual(physical);
+  expect([...t.vectors.vectors]).toEqual(vectors);
+  expect([...t.search.items]).toEqual(search);
+  expect([t.purges.instances.size, t.builds.instances.size, t.ciRuns.instances.size]).toEqual(
+    providers,
+  );
+  expect(t.sqlite.prepare("SELECT * FROM repo_deletions").all()).toEqual([]);
+});
+
 /**
  * A Workflow step that just runs; `crash` makes the n-th `do` step die before
  * or after its work. `names` lists every step and sleep, `done` the steps.

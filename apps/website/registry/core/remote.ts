@@ -115,7 +115,7 @@ export async function upstreamFetch(
   let url = typeof target === "string" ? upstreamUrl(repo, target) : target;
   const headers = new Headers(init.headers);
   headers.set(HOP_HEADER, "1");
-  headers.set("user-agent", "gitmatrix (+https://github.com/Phoenixmatrix/gitmatrix)");
+  headers.set("user-agent", "gitmatrix (+https://github.com/Phoenixmatrix/timelines)");
   const auth = init.anonymous ? null : await credentialHeader(services, repo);
   const upstreamHost = new URL(upstreamBase(repo)).host;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {

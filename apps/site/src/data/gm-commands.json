@@ -6576,7 +6576,7 @@
       "command": "gm ask",
       "examples": [
         "gm ask \"Why did run 44 fail?\"",
-        "gm ask -R matrixorg/gitmatrix \"Where is the tracker's readiness computed?\"",
+        "gm ask -R matrixorg/timelines \"Where is the tracker's readiness computed?\"",
         "gm ask --chat CHAT_ID \"And who changed it last?\"",
         "gm ask --write \"File a bug for the flaky clone test in CORE\""
       ],

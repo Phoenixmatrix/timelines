@@ -4,7 +4,7 @@ The public marketing and documentation site for Timelines, served at
 [timelines.fward.dev](https://timelines.fward.dev) (CORE-115). It is built with
 [Astro](https://astro.build) as static pages and served by a Worker of its own,
 `gitmatrix-site`, that has no code: only its assets. Nobody signs in here; the
-header links to the web app at gitmatrix.fward.dev.
+header links to the web app at timelinesapp.fward.dev.
 
 ## Layout
 
