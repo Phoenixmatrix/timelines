@@ -111,8 +111,9 @@ pattern, handler)`, a URLPattern pathname), then, with `{ world: true }`, to
   `vite/browser-commands.ts`). Requests act as the world's persona (marco by
   default; `server.as()` switches, and `server.call(..., as)` acts as someone
   else once). An explicit `null` persona means signed out; omitting the per-request
-  persona uses the world's current one. `server.requests` records every request,
-  for "it read only this" assertions.
+  persona uses the world's current one. `server.requests` records completed,
+  unaborted requests for "it read only this" assertions; count handler entries
+  separately when checking in-flight or cancelled requests.
 - A world's repositories (`server.repo()`) have refs (`server.push()`) and
   accept ref-only pushes, but no git objects: file listings and history are
   canned (`cannedFiles()` in `git.ts`). No model, index or CI runner exists
@@ -135,6 +136,12 @@ and `expect.poll(() => el.getAttribute(...)).toMatch(...)` for patterns.
 Pass a timeout to `expect.element(locator, { timeout })`, not the matcher.
 Locator text with an apostrophe is safer as a RegExp. Restore what a test
 changes in the page (viewport, theme, emulated media) in a `finally`.
+
+Polling tests should fake only their interval clocks, leaving runner timeouts
+and browser actions on real time. Hold a response behind a promise to exercise
+the busy state and its elapsed-time bound; release it in `onTestFinished` too.
+Assert pause, no overlapping checks and manual recovery—not one request per
+timer tick, since busy revalidation deliberately skips ticks.
 
 ## Recent agent presence
 
@@ -1989,6 +1996,12 @@ are the CLI equivalents; `gm release notes day:2026-10-02` selects a UTC day.
 Entries about issues from trackers the viewer can't read are omitted, and an introduction is
 shown only to viewers who can read every tracker that shaped it.
 
+The responsive reading layout (CORE-273) centers a bounded 84rem composition
+inside the unchanged repository header and tabs. Desktop navigation and the
+About rail frame a capped reading column; phones use a native release selector
+with daily/tag groups instead of a long navigation list. Long identifiers wrap,
+and selecting a release preserves the timeline filter and browser history.
+
 Both release views expose the same searchable timeline picker as the tracker.
 Its selection lives in `?tl=<slug>` and survives links, query submissions,
 Back/Forward and reload; selecting main explicitly clears the timeline scope.
@@ -2117,6 +2130,11 @@ A team's notes use `team:KEY`. Other filters are `repo:` (name or owner/name),
 Facets count the matching entries. It requires membership in the tracker
 account, and also applies repository visibility and per-entry tracker access.
 `gm release feed [QUERY] [--team KEY] [--owner OWNER]` is the CLI equivalent.
+
+The tracker feed uses a centered 72rem composition with bounded note text.
+From 1024px, facets occupy a separate right-hand rail; below that, the same
+controls sit in a keyboard-accessible **Narrow it down** disclosure before the
+feed. Search stays visible, and empty results use the same reading column.
 
 The issue tracker's header exposes **Release notes** as a full-size, bordered
 button with the same scroll icon as the navigation rail and a 44px minimum touch

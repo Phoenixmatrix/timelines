@@ -3,6 +3,7 @@ import {
   Link,
   useLoaderData,
   useLocation,
+  useNavigate,
   useRevalidator,
   type LoaderFunctionArgs,
 } from "react-router";
@@ -73,7 +74,7 @@ function Entry({
   onSelect: (trigger: HTMLButtonElement) => void;
 }) {
   return (
-    <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
+    <li className="flex min-w-0 flex-col gap-1 border-t border-line-soft py-4 first:border-t-0 first:pt-0">
       <div className="text-body font-semibold text-ink">
         <LinkedText text={entry.title} />
       </div>
@@ -85,7 +86,7 @@ function Entry({
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-micro text-ink-faint">
         <button
           type="button"
-          className="cursor-pointer bg-transparent p-0 text-left text-ink-faint underline decoration-dotted underline-offset-4 hover:text-ink"
+          className="min-h-11 cursor-pointer bg-transparent py-2 text-left text-ink-faint underline decoration-dotted underline-offset-4 hover:text-ink"
           title="Show commits and linked issue"
           aria-label={`Show release note details for ${entry.title}; last commit ${timeAgo(entry.lastCommitAt)}`}
           aria-expanded={expanded}
@@ -111,41 +112,75 @@ function Sidebar({
   selected: string;
 }) {
   const location = useLocation();
+  const navigate = useNavigate();
   const search = new URLSearchParams(location.search);
   search.delete("source");
   return (
-    <nav aria-label="Releases">
-      {(["daily", "tag"] as const).map((kind) => (
-        <section key={kind} className="mb-5">
-          <h2 className="mx-2.5 mt-0 mb-2 text-body-sm font-semibold">
-            {kind === "daily" ? "Daily updates" : "Tagged releases"}
-          </h2>
-          <ul className="m-0 flex list-none flex-col gap-0.5 p-0">
-            {index.releases
-              .filter((release) => release.kind === kind)
-              .map((release) => (
-                <li key={release.name}>
-                  <Link
-                    to={`${repoPath(owner, name, "releases", encodeURIComponent(release.name))}?${search}`}
-                    aria-current={selected === release.name ? "page" : undefined}
-                    className="flex items-baseline gap-2 rounded-plate px-2.5 py-1.5 text-body-sm text-ink-muted no-underline hover:bg-pane hover:text-ink aria-[current=page]:bg-raised aria-[current=page]:font-semibold aria-[current=page]:text-ink"
-                  >
-                    <span className="min-w-0 flex-1 truncate">{releaseLabel(release.name)}</span>
-                    <span className="font-mono text-micro text-ink-faint tabular-nums">
-                      {release.entries}
-                    </span>
-                  </Link>
-                </li>
-              ))}
-          </ul>
-          {!index.releases.some((release) => release.kind === kind) && (
-            <p className="mx-2.5 my-0 text-micro text-ink-faint">
-              {kind === "daily" ? "No daily updates yet." : "No tag snapshots."}
-            </p>
+    <>
+      <label className="flex min-w-0 flex-col gap-2 text-body-sm font-semibold md:hidden">
+        Release
+        <select
+          className="mk-input mk-select min-h-11 w-full min-w-0 max-w-full font-normal"
+          value={selected}
+          onChange={(event) =>
+            void navigate(
+              `${repoPath(owner, name, "releases", encodeURIComponent(event.target.value))}?${search}`,
+            )
+          }
+        >
+          {!index.releases.some((release) => release.name === selected) && (
+            <option value={selected} disabled>
+              {selected ? releaseLabel(selected) : "Choose an update or tag"}
+            </option>
           )}
-        </section>
-      ))}
-    </nav>
+          {(["daily", "tag"] as const).map((kind) => (
+            <optgroup key={kind} label={kind === "daily" ? "Daily updates" : "Tagged releases"}>
+              {index.releases
+                .filter((release) => release.kind === kind)
+                .map((release) => (
+                  <option key={release.name} value={release.name}>
+                    {releaseLabel(release.name)} ({release.entries})
+                  </option>
+                ))}
+            </optgroup>
+          ))}
+        </select>
+      </label>
+      <nav aria-label="Releases" className="hidden md:block">
+        {(["daily", "tag"] as const).map((kind) => (
+          <section key={kind} className="mb-5">
+            <h2 className="mx-2.5 mt-0 mb-2 text-body-sm font-semibold">
+              {kind === "daily" ? "Daily updates" : "Tagged releases"}
+            </h2>
+            <ul className="m-0 flex list-none flex-col gap-0.5 p-0">
+              {index.releases
+                .filter((release) => release.kind === kind)
+                .map((release) => (
+                  <li key={release.name}>
+                    <Link
+                      to={`${repoPath(owner, name, "releases", encodeURIComponent(release.name))}?${search}`}
+                      aria-current={selected === release.name ? "page" : undefined}
+                      className="flex min-h-11 items-baseline gap-2 rounded-plate px-2.5 py-2.5 text-body-sm text-ink-muted no-underline hover:bg-pane hover:text-ink aria-[current=page]:bg-raised aria-[current=page]:font-semibold aria-[current=page]:text-ink"
+                    >
+                      <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+                        {releaseLabel(release.name)}
+                      </span>
+                      <span className="shrink-0 font-mono text-micro text-ink-faint tabular-nums">
+                        {release.entries}
+                      </span>
+                    </Link>
+                  </li>
+                ))}
+            </ul>
+            {!index.releases.some((release) => release.kind === kind) && (
+              <p className="mx-2.5 my-0 text-micro text-ink-faint">
+                {kind === "daily" ? "No daily updates yet." : "No tag snapshots."}
+              </p>
+            )}
+          </section>
+        ))}
+      </nav>
+    </>
   );
 }
 
@@ -205,7 +240,7 @@ export function Releases() {
 
   if (index.releases.length === 0 && !release) {
     return (
-      <div className="mk-empty flex max-w-[44rem] flex-col items-center gap-3 py-12">
+      <div className="mk-empty mx-auto flex w-full max-w-[44rem] flex-col items-center gap-4 py-12 [overflow-wrap:anywhere] sm:py-16">
         <TimelineSwitcher variant="filter" />
         <RocketLaunchIcon size={28} className="text-ink-faint" aria-hidden />
         {canReadHighlights && (
@@ -251,20 +286,20 @@ export function Releases() {
   ];
 
   return (
-    <div className="grid gap-x-8 gap-y-8 md:grid-cols-[13rem_minmax(0,1fr)] xl:grid-cols-[13rem_minmax(0,46rem)_minmax(15rem,19rem)] xl:gap-x-12">
-      <aside className="max-h-64 overflow-y-auto md:row-span-2 md:sticky md:top-[calc(var(--scope-banner)+1.5rem)] md:max-h-[calc(100dvh-3rem-var(--scope-banner))] md:self-start">
+    <div className="mx-auto grid w-full max-w-[84rem] grid-cols-[minmax(0,1fr)] gap-x-8 gap-y-8 md:grid-cols-[12rem_minmax(0,1fr)] xl:grid-cols-[12rem_minmax(0,1fr)_16rem] xl:gap-x-10">
+      <aside className="min-w-0 md:row-span-2 md:sticky md:top-[calc(var(--scope-banner)+1.5rem)] md:max-h-[calc(100dvh-3rem-var(--scope-banner))] md:self-start md:overflow-y-auto">
         {canReadHighlights && (
           <Link
             to={`/tracker/${encodeURIComponent(owner)}/highlights`}
-            className="mk-btn mk-btn--sm mb-4"
+            className="mk-btn mk-btn--sm mb-4 min-h-11"
           >
             View organization highlights
           </Link>
         )}
         <Sidebar index={index} owner={owner} name={repo.name} selected={name} />
       </aside>
-      <article className="min-w-0 md:col-start-2">
-        <div className="mb-4">
+      <article className="w-full min-w-0 max-w-[72ch] justify-self-center [overflow-wrap:anywhere] md:col-start-2">
+        <div className="mb-6">
           <TimelineSwitcher variant="filter" />
         </div>
         {/* Writing is billed to the owner's account: only its members are offered it. */}
@@ -290,7 +325,7 @@ export function Releases() {
           </div>
         ) : (
           <>
-            <header className="mb-6 flex flex-col gap-1">
+            <header className="mb-8 flex flex-col gap-2">
               <h2 className="m-0 text-headline">
                 {release.release.kind === "daily" ? "Daily update" : "Tag"}{" "}
                 {releaseLabel(release.release.name)}
@@ -321,7 +356,7 @@ export function Releases() {
             {groups.map((group) =>
               group.category === "internal" ? (
                 <details key={group.category} className="mb-8">
-                  <summary className="mb-3 cursor-pointer text-title text-ink-muted">
+                  <summary className="mb-3 min-h-11 cursor-pointer py-2 text-title text-ink-muted">
                     {HEADINGS.internal}{" "}
                     <span className="font-mono text-micro tabular-nums">
                       {group.entries.length}
@@ -360,7 +395,7 @@ export function Releases() {
       {release && (
         <aside
           aria-label="About these notes"
-          className={`md:col-start-2 xl:col-start-3 xl:row-start-1 ${railClass}`}
+          className={`w-full max-w-[72ch] justify-self-center [overflow-wrap:anywhere] md:col-start-2 xl:col-start-3 xl:row-start-1 ${railClass}`}
         >
           {release.release.kind === "tag" && (
             <RailSection title="Range">
