@@ -25,6 +25,8 @@ const SETTING = {
   "release-notes": "release-notes",
   // Highlights (CORE-359) keep their own label and follow the release notes setting.
   "release-highlights": "release-notes",
+  // Custom release notes written on demand (CORE-151) follow it too.
+  "release-notes-compose": "release-notes",
   "merge-queue": "merge-queue",
 } as const satisfies Record<string, AiLogComponent>;
 
@@ -39,6 +41,8 @@ export function componentOf(feature: string): GatewayComponent {
       return "release-notes";
     case "release_highlights":
       return "release-highlights";
+    case "release_notes_compose":
+      return "release-notes-compose";
     case "merge_queue":
       return "merge-queue";
     case "avatars":

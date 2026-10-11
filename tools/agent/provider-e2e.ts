@@ -120,7 +120,7 @@ export const COPPER_FINCH_STAGES = [
   {
     id: "release-notes",
     covers:
-      "Daily notes and their rollover, a named tag, a tracker issue's entry and team feed; original completion evidence retrieved through Knowledge and a real assistant turn with tracker permissions",
+      "Daily notes and their rollover, a named tag, a tracker issue's entry and team feed; custom release notes written on demand (one metered call); original completion evidence retrieved through Knowledge and a real assistant turn with tracker permissions",
     requires: ["knowledge-edit"],
     paths: [
       HARNESS,
@@ -134,6 +134,8 @@ export const COPPER_FINCH_STAGES = [
       `${SRC}/routes/repo/Releases.tsx`,
       `${SRC}/routes/tracker/Releases.tsx`,
       `${SRC}/components/ReleaseNoteDetails.tsx`,
+      `${SRC}/components/ReleaseNotesComposer.tsx`,
+      `${SRC}/lib/releaseExport.ts`,
     ],
   },
   {
@@ -2465,6 +2467,72 @@ export async function runProviderE2E(
           ),
           "The team's release feed must include the shipped issue",
         );
+        // CORE-151: custom release notes written on demand from that release, one
+        // metered call billed to the repository's owner and labelled in the gateway.
+        enter("release-compose");
+        const composeStarted = new Date().toISOString();
+        const composeCalls = async () =>
+          (await appUsage())
+            .filter((row) => row.feature === "release_notes_compose" && row.slug === owner)
+            .reduce((sum, row) => sum + row.calls + row.failed, 0);
+        const composeBefore = await composeCalls();
+        const composed = await api(`${base}/release-notes/compose`, "POST", {
+          prompt:
+            "A short announcement for customers, in plain language, with no issue keys, links or internal jargon.",
+          release: "@day:2026-01-03",
+        });
+        evidence.releaseCompose = composed;
+        assert.equal(typeof composed.model, "string");
+        assert(
+          composed.entries >= 1,
+          "The compose call must have written from the release's notes",
+        );
+        assert.equal(composed.truncated, false);
+        assert(
+          typeof composed.markdown === "string" && composed.markdown.trim().length > 40,
+          "Custom release notes must not be empty",
+        );
+        assert.match(
+          composed.markdown,
+          /verif|check|match/i,
+          "Custom notes must describe verifying parcels against checksums",
+        );
+        assert.match(
+          composed.markdown,
+          /batch|all|every|multiple|several|many/i,
+          "Custom notes must describe checking several parcels at once",
+        );
+        assert.doesNotMatch(
+          composed.markdown,
+          /\b[A-Z][A-Z0-9]+-\d+\b/,
+          "No issue keys were asked for",
+        );
+        assert.doesNotMatch(composed.markdown, /https?:\/\//i, "No links were asked for");
+        assert.equal(
+          (await composeCalls()) - composeBefore,
+          1,
+          "One request must be one metered call",
+        );
+        const composeAccount = (await appUsage()).find(
+          (row) => row.feature === "release_notes_compose" && row.slug === owner,
+        )?.account_id;
+        assert(composeAccount, "The compose call must be billed to the repository's owner");
+        const composeOwned = await ownedEnvironment();
+        await waitFor("release-compose-gateway-evidence", 120_000, async () => {
+          const logs = await collectGatewayLogs((page) =>
+            gatewayLogs(composeOwned, composeStarted, "release-notes-compose", undefined, page),
+          );
+          evidence.releaseComposeGateway = logs;
+          assert(logs.length <= 1, "Custom release notes must make one provider call");
+          return logs.some(
+            (log) =>
+              log.success &&
+              !log.cached &&
+              log.provider === "workers-ai" &&
+              log.feature === "release_notes_compose" &&
+              log.account === composeAccount,
+          );
+        });
         passed("release-notes");
       }
       if (want("release-highlights")) {
@@ -3876,10 +3944,11 @@ export async function runProviderE2E(
           // (CORE-290's componentOf; highlights since CORE-359).
           const logs = (
             await Promise.all(
-              ["knowledge", "release-notes", "release-highlights"].map((component) =>
-                collectGatewayLogs((page) =>
-                  gatewayLogs(owned, String(evidence.startedAt), component, undefined, page),
-                ),
+              ["knowledge", "release-notes", "release-highlights", "release-notes-compose"].map(
+                (component) =>
+                  collectGatewayLogs((page) =>
+                    gatewayLogs(owned, String(evidence.startedAt), component, undefined, page),
+                  ),
               ),
             )
           ).flat();

@@ -13,6 +13,7 @@ import type {
   AssistantSkillSummary,
 } from "../../shared/assistant-skills.ts";
 import { personalSkills, SKILL_NAME } from "./personal-skills.ts";
+import { WRITING_GUIDANCE } from "../release-notes/writing.ts";
 
 interface Builtin {
   name: string;
@@ -145,6 +146,22 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 - api_get /repos/:o/:n/knowledge/graph/node?id=... reads a node and its neighbours (ids look like file:path, sym:path#name, component:name).
 - Prefer the wiki overview for "what is this repository / how does X work at a high level"; read code for exact behaviour.
 - Link: [the wiki](/<owner>/<repo>/wiki), [the map](/<owner>/<repo>/knowledge?node=<id>).`,
+  },
+  {
+    name: "release-notes-writer",
+    group: "knowledge",
+    description:
+      "Writing custom, client-ready release notes (an announcement, changelog or customer email) from a repository's or organization's release notes.",
+    body: `# Writing release notes
+
+Fetch the notes first, with api_get, then write from them:
+- One release of a repository: GET /repos/:o/:n/release-notes lists releases (daily updates are named @day:YYYY-MM-DD, tags by tag name); GET /repos/:o/:n/release-notes/release?name=<name> returns its entries (add &timeline=<slug> to keep one timeline's landed work).
+- Many releases of an organization: GET /tracker/:owner/release-notes?q=<filter> (for example since:7d, release:v1.2, repo:app, type:feature, team:CORE).
+These return only what the person may read, so write from nothing else. If they return no entries, say so rather than inventing notes.
+
+${WRITING_GUIDANCE}
+
+Answer with the Markdown itself (a short lead-in is fine) so the person can copy it. The release-notes pages also have a "Write custom release notes" control that writes, previews and exports (Markdown, Word, PDF) the same thing without this chat; mention it when the person wants a file.`,
   },
   {
     name: "navigation",

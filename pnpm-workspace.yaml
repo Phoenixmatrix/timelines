@@ -36,6 +36,7 @@ catalog:
   "@vitejs/plugin-react": ^6.1.1
   cf: 1.0.0-beta.7
   diff: ^9.0.0
+  docx: ^9.9.0
   better-auth: ^1.7.7
   fflate: ^0.8.3
   fzstd: ^0.1.1

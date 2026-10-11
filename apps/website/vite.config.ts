@@ -146,6 +146,7 @@ export default defineConfig({
       "@lezer/xml",
       "@lezer/yaml",
       "diff",
+      "docx",
       "yaml",
     ],
   },

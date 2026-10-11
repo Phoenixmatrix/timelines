@@ -49,6 +49,20 @@ describe("configured inference failures", () => {
   });
 });
 
+describe("rate limit retries", () => {
+  test("chatText forwards rateLimitRetries: 0, so a rate-limited call is not retried", async () => {
+    let attempts = 0;
+    const env = environment(async () => {
+      attempts++;
+      throw new Error("3021: Too many requests");
+    });
+    await expect(
+      chatText(env, "reason", "system", "user", { rateLimitRetries: 0 }),
+    ).rejects.toThrow(/Too many requests/);
+    expect(attempts).toBe(1);
+  });
+});
+
 describe("JSON repair accounting", () => {
   test("both failed parsing and repair tokens remain attributed to the configured model", async () => {
     let attempts = 0;

@@ -327,7 +327,12 @@ export async function chatText(
   tier: "fast" | "reason",
   system: string,
   user: string,
-  options: { maxTokens?: number; think?: boolean; model?: string } = {},
+  options: {
+    maxTokens?: number;
+    think?: boolean;
+    model?: string;
+    rateLimitRetries?: number;
+  } = {},
 ): Promise<{ text: string; usage: Usage }> {
   return chat(
     env,
@@ -341,6 +346,7 @@ export async function chatText(
       maxTokens: options.maxTokens ?? 4000,
       think: options.think ?? false,
       model: options.model,
+      rateLimitRetries: options.rateLimitRetries,
     },
   );
 }

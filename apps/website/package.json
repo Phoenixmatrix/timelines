@@ -42,6 +42,7 @@
     "ai": "catalog:",
     "better-auth": "catalog:",
     "diff": "catalog:",
+    "docx": "catalog:",
     "hono": "catalog:",
     "jose": "catalog:",
     "kysely": "catalog:",

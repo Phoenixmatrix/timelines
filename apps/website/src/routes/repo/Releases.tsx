@@ -14,6 +14,7 @@ import {
   type ReleaseNotesRelease,
 } from "../../../shared/release-notes.ts";
 import { CommitLink } from "../../components/CommitLink.tsx";
+import { ReleaseNotesComposer } from "../../components/ReleaseNotesComposer.tsx";
 import { RailSection, railClass } from "../../components/Rail.tsx";
 import { TimelineSwitcher } from "../../components/TimelineScope.tsx";
 import {
@@ -266,6 +267,20 @@ export function Releases() {
         <div className="mb-4">
           <TimelineSwitcher variant="filter" />
         </div>
+        {/* Writing is billed to the owner's account: only its members are offered it. */}
+        {release && canReadHighlights && (
+          <ReleaseNotesComposer
+            target={{
+              kind: "repo",
+              owner,
+              name: repo.name,
+              release: release.release.name,
+              timeline: scope,
+            }}
+            label={releaseLabel(release.release.name)}
+            aiOff={index.status.state === "disabled"}
+          />
+        )}
         {!release ? (
           <div className="mk-empty max-w-[44rem]">
             {name

@@ -17,6 +17,7 @@ import { ensureReleaseNotes } from "./queue.ts";
 import { compactReleaseInputs } from "./compact.ts";
 import { findAccountBySlug } from "../db.ts";
 import { readReleaseHighlights } from "./highlights.ts";
+import { composeRepoNotes, composeTrackerNotes } from "./compose.ts";
 
 export const releaseNotes = new Hono<AppEnv>();
 
@@ -240,3 +241,7 @@ trackerReleaseNotes.get("/highlights", async (c) => {
     throw error;
   }
 });
+
+// Custom release notes written on demand (CORE-151).
+releaseNotes.route("/", composeRepoNotes);
+trackerReleaseNotes.route("/", composeTrackerNotes);

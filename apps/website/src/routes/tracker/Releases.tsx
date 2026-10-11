@@ -23,6 +23,7 @@ import {
   ReleaseNoteDetails,
   type ReleaseNoteDetailsSelection,
 } from "../../components/ReleaseNoteDetails.tsx";
+import { ReleaseNotesComposer } from "../../components/ReleaseNotesComposer.tsx";
 import { SelectField } from "../../components/ui.tsx";
 import { TimelineSwitcher } from "../../components/TimelineScope.tsx";
 import { api, load } from "../../lib/api.ts";
@@ -292,6 +293,14 @@ export function TrackerReleases() {
         release, kind, timeline, since and until; prefix with - to exclude. These are code updates,
         not deployments.
       </p>
+      {feed.entries.length > 0 && (
+        <div className="max-w-[52rem]">
+          <ReleaseNotesComposer
+            target={{ kind: "tracker", owner, q, timeline: scope }}
+            label={feed.owner.displayName}
+          />
+        </div>
+      )}
       <div className="flex max-w-[52rem] flex-col gap-2">
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="mr-1 text-micro text-ink-faint">History</span>

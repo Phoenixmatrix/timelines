@@ -2044,6 +2044,56 @@ cadence, unchanged detailed notes, exact backlinks, generated desktop/mobile
 surfaces, the `/highlights` and rail navigation to the default organization, and
 the repository page's link.
 
+**Custom release notes** (CORE-151) are written on demand, in the words a person
+asks for (a customer announcement, a changelog, an email), from release notes
+the viewer may already read. Nothing is stored.
+
+| Route                                                | Body                                                                                  |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `POST /api/repos/:owner/:name/release-notes/compose` | `{ prompt, release?, timeline? }`: one release (the newest daily update when omitted) |
+| `POST /api/tracker/:owner/release-notes/compose`     | `{ prompt, q?, timeline? }`: the feed `q` selects, as the page shows it               |
+
+Both answer `{ markdown, model, entries, truncated }` with
+`cache-control: private, no-store`. They need a signed-in person or an agent
+acting for one (401 otherwise); the prompt is 1 to 2,000 characters and `q` at
+most 500 (400); an unknown release is 404. Only members of the billed account
+may write: the repository route answers 403 ("Only members of <account> can
+write custom release notes.") to anyone else who can read the repository (a
+private one still 404s), and site admins count as members; the organization
+route keeps the feed's membership check (403). Each person writes at most 50 a
+day per account (`ai_usage` calls plus failed attempts for the feature, UTC
+day): the 51st is 429. Entries come from the same readers as the read APIs, so
+tracker-private entries a viewer cannot read are absent. Paid work needs
+`env.AI` (503) and the billed account's AI release notes switched on (409, "AI
+release-note writing is off for <account>"); the billed account is the
+repository's owner or the organization. With no entries the answer is 422 and
+no model is called. A model that fails or rate-limits is a 502 ("The model
+didn't answer. Try again in a minute."), never retried. Entries are serialized
+compactly (at most 200 and 60,000 characters; one entry larger than that has its
+summary cut to fit; `truncated` says anything was left out) and sent apart from
+the request, which sets audience, tone and format; the shared writing rules
+(`worker/release-notes/writing.ts`) keep the output client-ready, forbid
+inventing facts or availability dates, and allow no images and links only when
+asked.
+
+One request is one model call on the account's Task model (rate-limit retries
+off), at most 2,000 output tokens. It meters as `release_notes_compose` for the person (and the
+agent) who asked (AI Gateway label `release-notes-compose`, following the
+release-notes body-logging setting). The assistant's built-in `release-notes-writer`
+skill teaches the same rules and how to fetch the notes, so the sidebar can do it too.
+
+On both release-notes pages, for members of the account, **Write custom release
+notes** (`ReleaseNotesComposer.tsx`) opens, collapsed by default, a request box with
+starting prompts and a line naming what it writes from (the selected release, or
+the current filter). The result renders as plain Markdown (no images, no autolinked issue keys or
+commit refs) and exports as: **Copy**
+(Markdown, plus `text/html` where the browser allows), **Download Markdown**,
+**Print / Save as PDF** (the print dialog on a clean, notes-only page) and
+**Download Word**, a real `.docx` built in the browser by `docx`, imported only
+on click (`lib/releaseExport.ts`). The `release-notes` real-provider stage makes
+one compose call and checks its content, its single metered call and its
+`release-notes-compose` Gateway log.
+
 | Route                                                       | Contract                                   |
 | ----------------------------------------------------------- | ------------------------------------------ |
 | `GET /api/repos/:owner/:name/release-notes`                 | `ReleaseNotesIndex`: status and releases   |
