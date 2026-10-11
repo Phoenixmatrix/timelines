@@ -97,6 +97,36 @@ function lineOf(report: UsageReport, construct: string, item: string): UsageLine
 }
 
 describe("costs", () => {
+  test("a model's tokens counted in its total and split into input and output are priced once", async () => {
+    const asOf = "2026-10-20";
+    // As ai_usage records chat models: the total counts the input and output tokens too.
+    const report = buildReport({
+      scope: "account",
+      account: { slug: "orbit", displayName: "Orbit" },
+      rows: collections(asOf, 30, (day) => [
+        ...STORAGE(day),
+        activity(addDays(day, -1), "workers_ai", FLASH, "input_tokens", 2e6 / 30),
+        activity(addDays(day, -1), "workers_ai", FLASH, "output_tokens", 1e6 / 30),
+        activity(addDays(day, -1), "workers_ai", FLASH, "total_tokens", 3e6 / 30),
+      ]),
+      asOf,
+      timeline: await timeline(),
+      version: 1,
+    });
+    const flash = lineOf(report, "workers_ai", FLASH);
+    // 2M input × $0.15/M + 1M output × $0.50/M, and nothing more for the total.
+    expect(flash.monthlyUsd).toBeCloseTo(0.8, 10);
+    expect(flash.costs.map((c) => c.figure)).toEqual(["input_tokens", "output_tokens"]);
+    expect(flash.note ?? "").not.toContain("priced as input");
+    // The figure still shows every token.
+    expect(flash.figures.find((f) => f.metric === "total_tokens")?.quantity).toBeCloseTo(3e6, 0);
+    // So does the trend: each priced day (the model's price applies from its
+    // catalog date) is a thirtieth of the month, not more.
+    const priced = report.trend.map((d) => d.byConstruct.workers_ai ?? 0).filter((v) => v > 0);
+    expect(priced.length).toBeGreaterThan(0);
+    for (const usd of priced) expect(usd).toBeCloseTo(0.8 / 30, 10);
+  });
+
   test("equal usage × catalog prices, in the prices' units", async () => {
     const asOf = "2026-10-20";
     const report = buildReport({

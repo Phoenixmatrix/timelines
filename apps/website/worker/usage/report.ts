@@ -218,6 +218,23 @@ function cost(
   };
 }
 
+/**
+ * The figure as priced. A model's total_tokens counts every token, including
+ * the input and output tokens priced on their own; only the rest (calls that
+ * reported nothing but a total) is priced as total.
+ */
+function pricedFigure(
+  construct: UsageConstruct,
+  figure: UsageFigure,
+  figures: readonly UsageFigure[],
+): UsageFigure {
+  if (construct !== "workers_ai" || figure.metric !== "total_tokens") return figure;
+  const split = figures
+    .filter((f) => f.metric === "input_tokens" || f.metric === "output_tokens")
+    .reduce((sum, f) => sum + f.quantity, 0);
+  return split > 0 ? { ...figure, quantity: Math.max(0, figure.quantity - split) } : figure;
+}
+
 function line(
   pricing: Pricing,
   scope: "account" | "site",
@@ -226,9 +243,13 @@ function line(
   kind: "storage" | "activity",
   figures: UsageFigure[],
 ): UsageLine {
-  const costs = figures.flatMap((f) => cost(pricing, construct, item, kind, f) ?? []);
+  const priced = figures.map((f) => pricedFigure(construct, f, figures));
+  // A figure adjusted down to nothing (tokens all already split) costs nothing.
+  const costs = priced.flatMap((f, i) =>
+    f !== figures[i] && f.quantity === 0 ? [] : (cost(pricing, construct, item, kind, f) ?? []),
+  );
   const notes: string[] = [];
-  for (const f of figures) {
+  for (const f of priced) {
     const rule = RULES[construct]?.[f.metric];
     if (rule?.approximation && costs.some((c) => c.figure === f.metric))
       notes.push(`${f.metric.replace(/_/g, " ")}: ${rule.approximation}.`);
@@ -425,14 +446,21 @@ export function buildReport(input: ReportInput): UsageReport {
   for (let day = addDays(input.asOf, 1 - WINDOW_DAYS); day <= input.asOf; day = addDays(day, 1)) {
     const dayPricing: Pricing = { ...p, asOf: day, activityScale: 1, activityEstimated: null };
     const byConstruct: Partial<Record<UsageConstruct, number>> = {};
-    for (const row of input.rows) {
-      if (row.day !== day) continue;
-      const c = cost(dayPricing, row.construct, row.item, row.kind, {
-        metric: row.metric,
-        quantity: row.quantity,
-        estimated: row.estimated,
-        method: row.method,
-      });
+    const today = input.rows.filter((row) => row.day === day);
+    const asFigure = (row: SnapshotRow): UsageFigure => ({
+      metric: row.metric,
+      quantity: row.quantity,
+      estimated: row.estimated,
+      method: row.method,
+    });
+    for (const row of today) {
+      // Priced as the lines are: a model's total less what input and output priced.
+      const siblings = today
+        .filter((r) => r.construct === row.construct && r.item === row.item && r.kind === row.kind)
+        .map(asFigure);
+      const figure = pricedFigure(row.construct, asFigure(row), siblings);
+      if (figure.quantity === 0 && row.quantity > 0) continue;
+      const c = cost(dayPricing, row.construct, row.item, row.kind, figure);
       if (!c || c.startsOn) continue;
       const usd = row.kind === "storage" ? c.monthlyUsd / WINDOW_DAYS : c.monthlyUsd;
       byConstruct[row.construct] = (byConstruct[row.construct] ?? 0) + usd;
