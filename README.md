@@ -906,8 +906,10 @@ vp run agent maintenance status
   reason. Once the app is stopped and all other cleanup succeeds, an acknowledged
   quota release frees both local and installation capacity. Its namespace may
   still incur storage charges; the ownership journal remains and every cleanup
-  retries deletion. Setup never readopts retired orphans. A failed quota release
-  remains journaled and continues holding installation capacity until acknowledged.
+  retries deletion. Setup never readopts retired orphans, even after a provider
+  retry fails. A persisted quota-release acknowledgement remains authoritative
+  if cleanup was interrupted before writing its terminal status. A failed quota
+  release remains journaled and continues holding installation capacity until acknowledged.
   AI environments created before Gateway ownership was introduced must be destroyed
   and recreated with `setup --ai`; their legacy journals remain valid for cleanup.
 - Foreground apps stop at expiry. Process-group shutdown is PID-start-time fenced;
