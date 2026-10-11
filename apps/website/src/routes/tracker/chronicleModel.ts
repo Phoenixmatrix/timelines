@@ -351,6 +351,17 @@ export function rowAt(tops: number[], rows: Row[], y: number): number {
   return rows.length ? lo : -1;
 }
 
+/** Checkpoints are read through the row's summary, not tiny canvas hit targets. */
+export function isCheckpoint(marker: ChronicleMarker): boolean {
+  return marker.kind === "checkpoint" || marker.kind === "timeline-checkpoint";
+}
+
+export function checkpointInWindow(marker: ChronicleMarker, from: number, to: number): boolean {
+  if (!isCheckpoint(marker)) return false;
+  const at = Date.parse(marker.at);
+  return at >= from && at <= to;
+}
+
 /** What sits under a point in an issue's lane: a marker (within 6px) wins over a span. */
 export function hitInRow(
   issue: ChronicleIssue,
@@ -361,6 +372,7 @@ export function hitInRow(
   let best: ChronicleMarker | null = null;
   let distance = 7;
   for (const marker of issue.markers) {
+    if (isCheckpoint(marker)) continue;
     const d = Math.abs(t(Date.parse(marker.at)) - x);
     if (d < distance) {
       best = marker;

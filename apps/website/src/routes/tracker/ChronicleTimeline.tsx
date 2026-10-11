@@ -12,6 +12,7 @@
 // +/- zoom, ↑/↓ pick a row, Enter opens it, [ and ] select its spans,
 // , and . jump to its previous and next event.
 
+import { FlagIcon } from "@phosphor-icons/react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import {
@@ -23,12 +24,15 @@ import {
   type WorkSpan,
 } from "../../../shared/chronicle.ts";
 import type { IssueStatus } from "../../../shared/tracker.ts";
+import { Tip } from "../../components/ui.tsx";
 import type { Loaded } from "./chronicleData.ts";
 import {
+  checkpointInWindow,
   duration,
   eventTimes,
   GROUP_HEIGHT,
   hitInRow,
+  isCheckpoint,
   moment,
   ROW_HEIGHT,
   rowAt,
@@ -145,6 +149,19 @@ export function ChronicleTimeline({
   const issueRows = useMemo(
     () => rows.flatMap((row, i) => (row.kind === "issue" ? [i] : [])),
     [rows],
+  );
+  const checkpointCounts = useMemo(
+    () =>
+      new Map(
+        data.issues.map((issue) => [
+          issue.id,
+          issue.markers.reduce(
+            (count, marker) => count + Number(checkpointInWindow(marker, view.from, view.to)),
+            0,
+          ),
+        ]),
+      ),
+    [data.issues, view.from, view.to],
   );
   const theme = useThemeVersion();
   const found = cursorId ? rows.findIndex((r) => r.id === cursorId) : -1;
@@ -520,37 +537,56 @@ export function ChronicleTimeline({
             const issue = row.issue;
             const state = stateAsOf(issue, at, now);
             const selected = selection.issue === issue.id;
+            const checkpoints = checkpointCounts.get(issue.id) ?? 0;
             return (
-              <Link
+              <div
                 key={row.id}
-                to={issueHref(issue.id)}
-                preventScrollReset
-                data-chronicle-row={issue.key}
-                data-state={state ?? "none"}
-                aria-current={selected ? "true" : undefined}
-                aria-label={`${issue.key} ${issue.title}: ${state ? STATE_LABEL[state] : "not created yet"} as of ${moment(at)}; ${issue.spans.length} work span${issue.spans.length === 1 ? "" : "s"}`}
-                className={`absolute left-0 flex items-center gap-2 border-b border-line-soft px-3 no-underline hover:bg-raised ${selected ? "bg-signal-wash text-ink" : "text-ink-muted"}`}
+                className={`absolute left-0 flex items-center border-b border-line-soft ${selected ? "bg-signal-wash" : ""}`}
                 style={{ top: tops[i], height: ROW_HEIGHT, width: labelWidth }}
-                // The whole row shows the full title, as the lanes do.
-                onPointerMove={(event) => {
-                  if (!lanes.current) return;
-                  const p = local(event, lanes.current);
-                  setHover({ x: p.x, y: p.y, issue });
-                }}
-                onPointerLeave={() => setHover(null)}
               >
-                <span className="flex w-3 shrink-0 justify-center">
-                  {state ? (
-                    <StateDot state={state} />
-                  ) : (
-                    <span className="size-2 rounded-full border border-line" aria-hidden />
-                  )}
-                </span>
-                <span className="w-[4.5rem] shrink-0 truncate font-mono text-mono text-ink-muted">
-                  {issue.key}
-                </span>
-                <span className="min-w-0 flex-1 truncate text-body-sm text-ink">{issue.title}</span>
-              </Link>
+                <Link
+                  to={issueHref(issue.id)}
+                  preventScrollReset
+                  data-chronicle-row={issue.key}
+                  data-state={state ?? "none"}
+                  aria-current={selected ? "true" : undefined}
+                  aria-label={`${issue.key} ${issue.title}: ${state ? STATE_LABEL[state] : "not created yet"} as of ${moment(at)}; ${issue.spans.length} work span${issue.spans.length === 1 ? "" : "s"}`}
+                  className={`flex h-full min-w-0 flex-1 items-center gap-2 px-3 no-underline hover:bg-raised ${selected ? "text-ink" : "text-ink-muted"}`}
+                  onPointerMove={(event) => {
+                    if (!lanes.current) return;
+                    const p = local(event, lanes.current);
+                    setHover({ x: p.x, y: p.y, issue });
+                  }}
+                  onPointerLeave={() => setHover(null)}
+                >
+                  <span className="flex w-3 shrink-0 justify-center">
+                    {state ? (
+                      <StateDot state={state} />
+                    ) : (
+                      <span className="size-2 rounded-full border border-line" aria-hidden />
+                    )}
+                  </span>
+                  <span className="w-[4.5rem] shrink-0 truncate font-mono text-mono text-ink-muted">
+                    {issue.key}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-body-sm text-ink">
+                    {issue.title}
+                  </span>
+                </Link>
+                {checkpoints > 0 && (
+                  <Tip label={`${checkpoints} checkpoint${checkpoints === 1 ? "" : "s"} in range`}>
+                    <Link
+                      to={`${issueHref(issue.id)}#chronicle-checkpoints`}
+                      preventScrollReset
+                      aria-label={`Read ${checkpoints} checkpoint${checkpoints === 1 ? "" : "s"} for ${issue.key}`}
+                      className="flex h-full min-w-11 shrink-0 items-center justify-center gap-1 rounded-plate px-1 text-micro text-ink-muted no-underline hover:bg-raised hover:text-ink"
+                    >
+                      <FlagIcon size={14} weight="fill" aria-hidden />
+                      <span className="tabular-nums">{checkpoints}</span>
+                    </Link>
+                  </Tip>
+                )}
+              </div>
             );
           })}
           <div
@@ -858,7 +894,7 @@ function drawSpans(
   }
 }
 
-/** A small filled flag: a claim, or a checkpoint (status by shape). */
+/** A small filled flag identifies the holder of a work span. */
 function flag(ctx: CanvasRenderingContext2D, px: number, py: number, size: number) {
   ctx.fillRect(px, py, 1.5, size);
   ctx.beginPath();
@@ -879,24 +915,11 @@ function drawMarkers(
 ) {
   const y = top + ROW_HEIGHT - 6;
   for (const marker of issue.markers) {
+    if (isCheckpoint(marker)) continue;
     const t = Date.parse(marker.at);
     if (t < view.from || t > view.to) continue;
     const px = x(t);
     switch (marker.kind) {
-      case "checkpoint":
-        ctx.fillStyle = c.ink;
-        flag(ctx, px - 1, y - 9, 8);
-        break;
-      case "timeline-checkpoint":
-        ctx.strokeStyle = c.muted;
-        ctx.lineWidth = 1;
-        ctx.strokeRect(px - 0.5, y - 9, 0.5, 8);
-        ctx.beginPath();
-        ctx.moveTo(px, y - 9);
-        ctx.lineTo(px + 6, y - 7);
-        ctx.lineTo(px, y - 5);
-        ctx.stroke();
-        break;
       case "evidence":
       case "landed":
       case "timeline-landing":

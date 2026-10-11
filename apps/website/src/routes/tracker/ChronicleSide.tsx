@@ -5,8 +5,8 @@
 // range, and its linked work, each item opening its existing page.
 
 import { XIcon } from "@phosphor-icons/react";
-import { useMemo } from "react";
-import { Link } from "react-router";
+import { useEffect, useMemo, useRef } from "react";
+import { Link, useLocation } from "react-router";
 import {
   actorText,
   MARKER_LABEL,
@@ -14,6 +14,7 @@ import {
   summarize,
   workedMs,
   type ChronicleIssue,
+  type ChronicleMarker,
   type WorkSpan,
 } from "../../../shared/chronicle.ts";
 import type { AuditActor, IssueStatus } from "../../../shared/tracker.ts";
@@ -22,7 +23,9 @@ import { Actor } from "./Actor.tsx";
 import { LinkedWorkPanel } from "./LinkedWork.tsx";
 import type { Loaded } from "./chronicleData.ts";
 import {
+  checkpointInWindow,
   duration,
+  isCheckpoint,
   moment,
   stamp,
   stateAsOf,
@@ -205,6 +208,8 @@ export function Inspector({
   closeHref,
   spanHref,
   openIssueHref,
+  checkpointHref,
+  window: view,
 }: {
   owner: string;
   issue: ChronicleIssue;
@@ -215,8 +220,25 @@ export function Inspector({
   closeHref: string;
   spanHref: (span: WorkSpan) => string;
   openIssueHref: string;
+  checkpointHref: (marker: ChronicleMarker) => string;
+  window: { from: number; to: number };
 }) {
   const state = stateAsOf(issue, at, now);
+  const location = useLocation();
+  const checkpointSection = useRef<HTMLElement>(null);
+  const checkpoints = useMemo(
+    () => issue.markers.filter((marker) => checkpointInWindow(marker, view.from, view.to)),
+    [issue.markers, view.from, view.to],
+  );
+  const otherMarkers = useMemo(
+    () => issue.markers.filter((marker) => !isCheckpoint(marker)),
+    [issue.markers],
+  );
+  useEffect(() => {
+    if (location.hash !== "#chronicle-checkpoints") return;
+    checkpointSection.current?.focus({ preventScroll: true });
+    checkpointSection.current?.scrollIntoView({ block: "nearest" });
+  }, [issue.id, location.hash]);
   return (
     <section
       aria-labelledby="chronicle-inspector"
@@ -292,6 +314,52 @@ export function Inspector({
           <p className="m-0 px-2 text-body-sm text-ink-faint">Nobody held a claim in this range.</p>
         )}
       </div>
+      {checkpoints.length > 0 && (
+        <section
+          id="chronicle-checkpoints"
+          ref={checkpointSection}
+          tabIndex={-1}
+          aria-labelledby="chronicle-checkpoints-title"
+          className="rounded-plate focus-visible:outline-2 focus-visible:outline-signal-line"
+        >
+          <h3 id="chronicle-checkpoints-title" className="m-0 mb-1 text-label text-ink-muted">
+            Checkpoints <span className="text-ink-faint tabular-nums">{checkpoints.length}</span>
+          </h3>
+          <ol className="m-0 flex list-none flex-col divide-y divide-line-soft p-0">
+            {checkpoints.map((marker) => (
+              <li key={marker.id} className="py-2" data-chronicle-marker={marker.kind}>
+                <div className="flex flex-wrap items-center justify-between gap-x-2">
+                  <time
+                    dateTime={marker.at}
+                    className="font-mono text-micro text-ink-faint tabular-nums"
+                  >
+                    {stamp(time(marker.at))}
+                  </time>
+                  <Link
+                    to={checkpointHref(marker)}
+                    preventScrollReset
+                    aria-label={`Go to ${MARKER_LABEL[marker.kind].toLowerCase()} at ${moment(time(marker.at))}`}
+                    className="gm-link flex min-h-8 items-center text-body-sm max-sm:min-h-11"
+                  >
+                    Go to time
+                  </Link>
+                </div>
+                {marker.kind === "timeline-checkpoint" && (
+                  <p className="m-0 text-micro text-ink-muted">Timeline checkpoint</p>
+                )}
+                <p className="m-0 whitespace-pre-wrap text-body-sm text-ink [overflow-wrap:anywhere]">
+                  {marker.text || "No summary recorded."}
+                </p>
+                {marker.actorId && (
+                  <p className="m-0 mt-1 text-micro text-ink-muted">
+                    {actorText(data.actors, marker.actorId)}
+                  </p>
+                )}
+              </li>
+            ))}
+          </ol>
+        </section>
+      )}
       <div>
         <h3 className="m-0 mb-1 text-label text-ink-muted">Changes in range</h3>
         <ol className="m-0 flex list-none flex-col gap-1 p-0 text-body-sm">
@@ -316,11 +384,11 @@ export function Inspector({
           ))}
         </ol>
       </div>
-      {issue.markers.length > 0 && (
+      {otherMarkers.length > 0 && (
         <div>
           <h3 className="m-0 mb-1 text-label text-ink-muted">What happened</h3>
           <ol className="m-0 flex list-none flex-col gap-1.5 p-0 text-body-sm">
-            {issue.markers.map((m) => (
+            {otherMarkers.map((m) => (
               <li key={m.id} className="flex gap-2 px-2" data-chronicle-marker={m.kind}>
                 <span className="w-28 shrink-0 font-mono text-micro text-ink-faint tabular-nums">
                   {stamp(time(m.at))}
