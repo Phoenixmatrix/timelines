@@ -85,6 +85,8 @@ const bookkeeping: Record<string, true> = {
   createdAt: true,
   updatedAt: true,
   createdBy: true,
+  // Follows the status change it comes with, and names who that event already does (CORE-220).
+  completion: true,
 };
 function valueText(value: unknown, key?: string): string {
   if (key === "requires") return value ? requirementsText(value as IssueRequirements) : "Any agent";

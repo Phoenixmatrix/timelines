@@ -36,6 +36,7 @@ const labels: Record<string, string> = {
   "release-notes": "Release notes",
   packages: "Packages",
   "needs-you": "Needs you",
+  "agent-work": "Agent work",
   "-/go/*": "Open reference",
   "settings/agents": "Agents",
   "settings/tokens": "Access tokens",

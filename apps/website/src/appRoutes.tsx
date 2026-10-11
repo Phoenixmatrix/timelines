@@ -27,6 +27,7 @@ import { Feeds, feedsAction, feedsLoader } from "./routes/packages/Feeds.tsx";
 import { NpmLogin, npmLoginAction, npmLoginLoader } from "./routes/packages/NpmLogin.tsx";
 import { AllPackages, allPackagesLoader } from "./routes/packages/AllPackages.tsx";
 import { NeedsYou, needsYouLoader } from "./routes/NeedsYou.tsx";
+import { AgentWork, agentWorkLoader, agentWorkShouldRevalidate } from "./routes/AgentWork.tsx";
 import { OwnerPackages, ownerPackagesLoader } from "./routes/packages/OwnerPackages.tsx";
 import { PackageConsole, packageConsoleLoader } from "./routes/packages/PackageConsole.tsx";
 import { Wiki, wikiLoader } from "./routes/repo/Wiki.tsx";
@@ -127,6 +128,12 @@ export const routes: RouteObject[] = withPageTitles([
           { path: "highlights", loader: highlightsIndexLoader, Component: TrackerIndex },
           { path: "packages", loader: allPackagesLoader, Component: AllPackages },
           { path: "needs-you", loader: needsYouLoader, Component: NeedsYou },
+          {
+            path: "agent-work",
+            loader: agentWorkLoader,
+            shouldRevalidate: agentWorkShouldRevalidate,
+            Component: AgentWork,
+          },
           // Whatever a ref names (CORE-22): redirects, or a chooser when it's ambiguous.
           { path: "-/go/*", loader: goLoader, Component: GoPage },
           {

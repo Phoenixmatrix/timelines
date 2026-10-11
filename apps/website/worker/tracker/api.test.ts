@@ -4,6 +4,7 @@ import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import type { Access } from "./store.ts";
+import type { CompletedWorkList } from "../../shared/tracker.ts";
 import { defaultOwner, preferencesFor, savePreferences } from "./preferences.ts";
 import { tracker } from "./api.ts";
 
@@ -24,7 +25,11 @@ function setup(actor: Actor | null = ann) {
     ok: true,
     value: [{ name: "ux", issues: 2, open: 1 }],
   }));
-  const getByName = vi.fn(() => ({ snapshot, tagCatalog }));
+  const completedWork = vi.fn(async (_filter: unknown) => ({
+    ok: true,
+    value: { items: [] as unknown[], truncated: false },
+  }));
+  const getByName = vi.fn((_owner: string) => ({ snapshot, tagCatalog, completedWork }));
   const env = { DB: d1(sqlite), TRACKER: { getByName } } as unknown as Env;
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
@@ -37,6 +42,7 @@ function setup(actor: Actor | null = ann) {
     call: (path: string, init: RequestInit = {}) => app.request(`/api${path}`, init, env),
     snapshot,
     getByName,
+    completedWork,
   };
 }
 
@@ -201,5 +207,111 @@ describe("tracker preferences", () => {
     expect(write.status).toBe(403);
     expect((await agent.call("/tracker/orbit/preferences", { method: "DELETE" })).status).toBe(403);
     expect((await agent.call("/tracker/orbit/preferences")).status).toBe(200);
+  });
+});
+
+describe("agent work (CORE-220)", () => {
+  const credit = (actorId: string, at: string) => ({
+    actorId,
+    accountableId: "ann",
+    agent: "laptop",
+    at,
+  });
+  const item = (key: string, actorId: string, at: string) => ({
+    issue: { id: key.toLowerCase(), key, title: key, type: "task", status: "done" },
+    completion: credit(actorId, at),
+    timeline: null,
+    evidence: null,
+  });
+  const world = setup;
+  async function seedAgents(database: D1Database) {
+    await database
+      .prepare(
+        `INSERT INTO agents (id, name, accountable_id, revoked_at) VALUES
+          ('agt-bot', 'bot', 'ann', NULL), ('agt-old', 'old', 'ann', '2026-01-01T00:00:00Z'),
+          ('agt-ben', 'helper', 'ben', NULL)`,
+      )
+      .run();
+  }
+
+  test("by default: every readable tracker, anything ann's agents finished, newest first", async () => {
+    const t = world();
+    await seedAgents(t.database);
+    t.getByName.mockImplementation(
+      (owner: string) =>
+        ({
+          snapshot: t.snapshot,
+          completedWork: vi.fn(async () => ({
+            ok: true,
+            value: {
+              items:
+                owner === "ann"
+                  ? [item("ANN-1", "agt-bot", "2026-10-01T00:00:00Z")]
+                  : [item("ORB-1", "agt-old", "2026-10-02T00:00:00Z")],
+              truncated: owner === "orbit",
+            },
+          })),
+        }) as never,
+    );
+    const result = await t.call("/agent-work?since=30d");
+    expect(result.status).toBe(200);
+    const body = (await result.json()) as CompletedWorkList;
+    expect(body).toMatchObject({
+      agents: [
+        { id: "agt-bot", name: "bot", revoked: false },
+        { id: "agt-old", name: "old", revoked: true },
+      ],
+      trackers: [{ slug: "ann" }, { slug: "orbit" }],
+      truncated: true,
+      items: [
+        { tracker: { slug: "orbit" }, issue: { key: "ORB-1" } },
+        { tracker: { slug: "ann" }, issue: { key: "ANN-1" } },
+      ],
+    });
+    // Ben's agent is not ann's; the private org is not readable.
+    expect(JSON.stringify(body)).not.toContain("helper");
+    expect(
+      t.getByName.mock.calls.map(([owner]) => owner).sort((a, b) => a.localeCompare(b)),
+    ).toEqual(["ann", "orbit"]);
+    expect(Date.now() - Date.parse(body.since)).toBeGreaterThan(29 * 86_400_000);
+  });
+
+  test("asks each tracker for ann's agents, or just the one named", async () => {
+    const t = world();
+    await seedAgents(t.database);
+    await t.call("/agent-work");
+    expect(t.completedWork).toHaveBeenCalledWith(
+      expect.objectContaining({ accountableId: "ann", actorIds: null }),
+    );
+    const since = (t.completedWork.mock.calls[0]![0] as { since: string }).since;
+    expect(Math.round((Date.now() - Date.parse(since)) / 86_400_000)).toBe(14);
+    t.completedWork.mockClear();
+    const one = await t.call("/agent-work?agent=bot&tracker=orbit");
+    expect(one.status).toBe(200);
+    expect(t.completedWork).toHaveBeenCalledTimes(1);
+    expect(t.completedWork).toHaveBeenCalledWith(
+      expect.objectContaining({ accountableId: "ann", actorIds: ["agt-bot"] }),
+    );
+    expect(t.getByName).toHaveBeenLastCalledWith("orbit");
+    // Someone else's agent, a tracker ann isn't in, or a bad window.
+    expect((await t.call("/agent-work?agent=helper")).status).toBe(404);
+    expect((await t.call("/agent-work?tracker=private")).status).toBe(404);
+    expect((await t.call("/agent-work?since=soon")).status).toBe(400);
+  });
+
+  test("an agent signed in sees only its own work", async () => {
+    const t = world({ ...ann, agent: { id: "agt-bot", name: "bot" } });
+    await seedAgents(t.database);
+    const result = await t.call("/agent-work");
+    expect(await result.json()).toMatchObject({ agents: [{ id: "agt-bot" }] });
+    expect(t.completedWork).toHaveBeenCalledWith(
+      expect.objectContaining({ accountableId: "ann", actorIds: ["agt-bot"] }),
+    );
+    expect((await t.call("/agent-work?agent=old")).status).toBe(404);
+  });
+
+  test("needs a signed-in person", async () => {
+    const t = world(null);
+    expect((await t.call("/agent-work")).status).toBe(401);
   });
 });

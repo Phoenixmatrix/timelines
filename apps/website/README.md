@@ -1146,6 +1146,31 @@ name but different accountable people remain distinct. `assignee:me` selects
 the signed-in identity and `assignee:none` selects unassigned issues; other
 active filters still apply.
 
+Who finished an issue (CORE-220) is recorded on it as `completion
+{actorId, accountableId, agent, at}`: the tracker stamps it when the issue
+becomes done or done in a timeline, crediting the claim's holder (else whoever
+set the status), and clears it on reopen. Like the status it follows, it is
+per timeline view: finishing in a timeline credits main at once (main shows the
+issue done in that timeline), while work main already had done keeps main's
+credit until the timeline that finished it again lands; landing brings the
+timeline's credit.
+`accountableId` and `agent` (the claim's session name) are set only when an
+agent finished it. `done-by:me` selects what you finished, `done-by:mine` what
+the agents you answer for finished, and `done-by:<agent or person>` one
+finisher's work; `done:14d` (or a date) selects work finished since then. Both
+match only done or done-in-a-timeline issues with a recorded completion. The
+**My agents' work** view is `done-by:mine done:14d`. Issues finished earlier
+are credited from their surviving history when the tracker starts (newest
+first, at most 100 issues and about 5,000 events read per start); those whose
+history was pruned stay uncredited
+(`completion: null`).
+
+**Agent work** (`/agent-work`, linked from Settings > Agents) lists what your
+agents finished across every tracker you're in, from `GET
+/api/agent-work?since=14d[&agent=<name or id>][&tracker=<owner>]` (an agent
+signed in sees only its own work). Filter by agent, tracker, window (7, 14 or
+30 days) and type; opening a row loads that issue's linked work.
+
 Use **Close issue** when work will not be completed. Choose Duplicate, Not planned,
 No longer needed, Cannot reproduce, or Other, then **Confirm close**. This saves
 the issue as `canceled`, not `done`; the selected reason stays visible after reload.

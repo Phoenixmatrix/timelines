@@ -31,6 +31,28 @@ export interface OpenRequests {
   /** Names for the ids the requests mention: a person, or "builder for Ann Lee". */
   names: Record<string, string>;
 }
+/** One finished issue on the agent work page (CORE-220, `GET /api/agent-work`). */
+export interface CompletedWork {
+  tracker: { slug: string; displayName: string };
+  issue: Pick<Issue, "id" | "key" | "title" | "type" | "status">;
+  completion: IssueCompletion;
+  /** The unlanded timeline it was finished in; null once landed, or finished on main. */
+  timeline: DoneIn | null;
+  /** The first line of its latest completion evidence, if it has any. */
+  evidence: string | null;
+}
+export interface CompletedWorkList {
+  /** The start of the window (ISO): work finished since then. */
+  since: string;
+  /** Your agents, revoked ones too (or, signed in as an agent, itself): whom rows name. */
+  agents: { id: string; name: string; revoked: boolean }[];
+  /** The trackers searched. */
+  trackers: { slug: string; displayName: string }[];
+  /** Newest first. */
+  items: CompletedWork[];
+  /** A tracker had more than the page shows: narrow the window or filter. */
+  truncated: boolean;
+}
 /** An agent in the tracker, with its accountable human inline. */
 export interface TrackerAgent {
   id: string;
@@ -223,6 +245,61 @@ export interface Issue extends TrackerEntity {
   doneIn?: DoneIn | null;
   /** Latest trusted queue failure; global across timeline views and never client-writable. */
   queueFailure?: QueueFailure | null;
+  /**
+   * Who finished it (CORE-220): set by the tracker when it becomes done (or
+   * done in a timeline), cleared when it's reopened. Per view, like the status
+   * it follows: finishing in a timeline credits main at once when main becomes
+   * done in that timeline; work main already had done keeps main's credit
+   * until the timeline that finished it again lands, and landing brings the
+   * timeline's credit. A view replays only the fields its timeline changed,
+   * so it can show main's credit on an issue the view itself hasn't finished:
+   * read it together with the status (done or done in a timeline), as the
+   * queries do. Absent on issues finished before it (and not recovered from
+   * history); null when reopened, or done with nothing on record. Never
+   * client-writable.
+   */
+  completion?: IssueCompletion | null;
+}
+
+/** Who finished an issue, and when (CORE-220). */
+export interface IssueCompletion {
+  /** The claim holder when there was one, else whoever made it done. */
+  actorId: string;
+  /** The person answerable when an agent finished it; null for a person. */
+  accountableId: string | null;
+  /** An agent's working session (its claim's `--agent` name); null for a person or without a claim. */
+  agent: string | null;
+  at: string;
+}
+
+/** Done, or done in a timeline that hasn't landed: finished, as far as credit goes. */
+export function isFinished(status: IssueStatus | undefined | null): boolean {
+  return status === "done" || status === "done_in_timeline";
+}
+
+/**
+ * The credit for finishing an issue (CORE-220): its claim's holder when it had
+ * a claim, else the actor. An agent is one of `agents`, or a holder answerable
+ * to someone else; only an agent's credit names an accountable person, so
+ * "my agents' work" never includes what a person finished.
+ */
+export function completionBy(
+  claim: Pick<IssueClaim, "actorId" | "accountableId" | "agent"> | null,
+  actor: { id: string; accountableId: string | null },
+  agents: readonly Pick<TrackerAgent, "id" | "accountable">[],
+  at: string,
+): IssueCompletion {
+  const holder = claim ? { id: claim.actorId, accountableId: claim.accountableId ?? null } : actor;
+  const known = agents.find((a) => a.id === holder.id);
+  const accountableId =
+    known?.accountable.id ??
+    (holder.accountableId && holder.accountableId !== holder.id ? holder.accountableId : null);
+  return {
+    actorId: holder.id,
+    accountableId,
+    agent: claim && accountableId ? claim.agent.trim() || null : null,
+    at,
+  };
 }
 
 /**
@@ -242,6 +319,8 @@ export const TIMELINE_SCOPED_ISSUE_FIELDS = [
   "parentId",
   "workspaceIds",
   "labels",
+  // Who finished it follows the status (CORE-220).
+  "completion",
 ] as const satisfies readonly (keyof Issue)[];
 /** Entity types whose existence and contents are per view; the rest are shared by every view. */
 export const TIMELINE_SCOPED_TYPES = ["issue", "link", "comment"] as const;
