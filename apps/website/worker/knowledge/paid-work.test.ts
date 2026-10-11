@@ -234,6 +234,38 @@ describe("call deadlines", () => {
 });
 
 describe("a stopped build stops paying", () => {
+  test.each(["repos", "site_ai_log_bodies"])(
+    "stopping during %s preparation neither dispatches nor meters a model attempt",
+    async (table) => {
+      const { sqlite, env, calls } = setup(async (call) => {
+        call.options.signal?.throwIfAborted();
+        return ANSWER;
+      });
+      let stopped = false;
+      try {
+        const outcome = aiWork({ feature: "knowledge", repo: "repo" }, () =>
+          paidWork({}, async (guard) => {
+            const prepare = env.DB.prepare.bind(env.DB);
+            env.DB.prepare = (query) => {
+              if (!stopped && query.includes(`"${table}"`)) {
+                stopped = true;
+                guard.stop("stopped", "Stopped during request preparation");
+              }
+              return prepare(query);
+            };
+            return decide(env, {}, QUESTION);
+          }),
+        );
+        await expect(outcome).rejects.toBeInstanceOf(PaidWorkStopped);
+        expect(stopped).toBe(true);
+        expect(calls).toHaveLength(0);
+        expect(usage(sqlite)).toEqual([]);
+      } finally {
+        sqlite.close();
+      }
+    },
+  );
+
   test("once the watchdog marks a build failed, its calls are refused and those in flight aborted", async () => {
     let hang = true;
     let sent!: () => void;

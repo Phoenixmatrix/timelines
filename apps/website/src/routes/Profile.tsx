@@ -42,7 +42,7 @@ export function Profile() {
     <SettingsPage>
       <h1 className="m-0 text-headline">Profile</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
-        Manage your picture, display name and username. These identify you across Gitmatrix. See{" "}
+        Manage your picture, display name and username. These identify you across Timelines. See{" "}
         <Link to={`/${viewer.slug}`} className={link}>
           your repositories
         </Link>{" "}

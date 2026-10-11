@@ -304,6 +304,8 @@ export interface Comment {
   body: string;
   kind: "comment" | "checkpoint" | "evidence";
   actorId: string;
+  /** Original author captured by the server; absent on legacy comments. */
+  actor?: AuditActor;
   createdAt: string;
 }
 export interface Link {
@@ -722,18 +724,31 @@ export interface Attribution {
   /** What to call it: an agent's name, a person's display name, or a session's name. */
   name: string;
   /** An agent identity, a person, or a person's own named working session (`--agent`). */
-  kind: "agent" | "person" | "session";
+  kind: "agent" | "person" | "session" | "unknown";
   /** The human accountable: the agent's person, or the person themself. */
   person: TrackerIdentity | null;
 }
 export function attribution(
   snapshot: Pick<Snapshot, "members" | "agents">,
   id: string,
+  actor?: AuditActor | null,
 ): Attribution {
+  // A recorded identity outranks today's directory, including after deletion.
+  if (actor && actor.kind !== "unknown") {
+    const person =
+      actor.kind === "person"
+        ? (snapshot.members.find((member) => member.id === actor.id) ?? null)
+        : actor.accountable;
+    return { name: actor.name ?? actor.id, kind: actor.kind, person };
+  }
   const agent = snapshot.agents.find((a) => a.id === id);
   if (agent) return { name: agent.name, kind: "agent", person: agent.accountable };
   const person = snapshot.members.find((m) => m.id === id) ?? null;
-  return { name: person?.displayName ?? id, kind: "person", person };
+  return {
+    name: actor?.name ?? person?.displayName ?? id,
+    kind: person ? "person" : "unknown",
+    person,
+  };
 }
 /** A claim's holder: its agent, or the person with their session name when they gave one. */
 export function claimAttribution(

@@ -254,8 +254,10 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
       await container.destroy();
       if (done) await report(this.env, jobId, { done });
       else {
-        // Preserve Workflow retries, but never leave a stopped attempt claiming
-        // to run. Cancellation may have won while destruction was in flight.
+        // Preserve Workflow retries, but clear active-attempt evidence only after
+        // confirmed shutdown. This makes a stopped queued retry cancellable while
+        // retaining its logs and step history until another attempt starts.
+        // Cancellation may have won while destruction was in flight.
         await revokeJobTokens(d1, jobId);
         await d1
           .prepare(`UPDATE ci_jobs SET
@@ -263,7 +265,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
             AND r.status IN ('queued','running')) THEN 'queued' ELSE 'cancelled' END,
           finished_at=CASE WHEN EXISTS (SELECT 1 FROM ci_runs r WHERE r.id=ci_jobs.run_id
             AND r.status IN ('queued','running')) THEN NULL ELSE ? END,
-          claimed_by=NULL,source_completion_pending=0
+          claimed_by=NULL,started_at=NULL,source_completion_pending=0
           WHERE id=? AND status='running'`)
           .bind(nowIso(), jobId)
           .run();

@@ -42,6 +42,7 @@ const FILES: &[(&str, &str)] = &[
     asset!("hooks/hooks.json"),
     asset!("hooks/register.tsx"),
     asset!("hooks/gm.ts"),
+    asset!("hooks/identity.ts"),
     asset!("types/index.d.ts"),
 ];
 
@@ -103,10 +104,31 @@ fn status(f: &Planned) -> &'static str {
     }
 }
 
+fn read_optional(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn install(dir: &Path, key: Option<&str>, check: bool, dry_run: bool) -> Result<Shown> {
     let folder = dir.join("skills").join(NAME);
+    if folder.exists() {
+        let manifest = read_optional(&folder.join(".claude-plugin/plugin.json"))?;
+        let ours = manifest
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|value| value["name"] == NAME);
+        if !ours {
+            return Err(GmError::new(
+                "not_ours",
+                "The mod destination belongs to another plugin; leaving it.",
+            )
+            .exit(exit::CONFLICT));
+        }
+    }
     let keybindings = dir.join("keybindings.json");
-    let current = std::fs::read_to_string(&keybindings).ok();
+    let current = read_optional(&keybindings)?;
     let bound = bind(current.as_deref(), key)?;
     let mut files: Vec<Planned> = FILES
         .iter()
@@ -168,7 +190,7 @@ fn install(dir: &Path, key: Option<&str>, check: bool, dry_run: bool) -> Result<
         text.push_str(&format!("  {:<9} {}\n", status(f), f.path.display()));
     }
     text.push_str(
-        "Next: start a Claude Code session; the card shows the gitmatrix issue it works on.",
+        "Next: start a Claude Code session; the card shows this checkout's agent, accountable owner and claimed issue.",
     );
     Ok(Shown::new(value, text))
 }
@@ -189,12 +211,12 @@ fn remove(dir: &Path, dry_run: bool) -> Result<Shown> {
     if folder.exists() && !ours {
         return Err(GmError::new(
             "not_ours",
-            format!("{} isn't the gitmatrix mod; leaving it.", folder.display()),
+            format!("{} isn't the Timelines mod; leaving it.", folder.display()),
         )
         .exit(exit::CONFLICT));
     }
     let keybindings = dir.join("keybindings.json");
-    let current = std::fs::read_to_string(&keybindings).ok();
+    let current = read_optional(&keybindings)?;
     let unbound = match current.as_deref() {
         Some(text) => unbind(text)?,
         None => None,
@@ -498,5 +520,36 @@ mod tests {
         std::fs::write(folder.join("SKILL.md"), "someone else's").unwrap();
         assert_eq!(remove(dir.path(), false).err().unwrap().code, "not_ours");
         assert!(folder.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn install_preserves_foreign_mods_and_malformed_keybindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("skills").join(NAME);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("SKILL.md"), "personal mod").unwrap();
+        assert_eq!(
+            install(dir.path(), None, false, false).err().unwrap().code,
+            "not_ours"
+        );
+        assert_eq!(
+            std::fs::read_to_string(folder.join("SKILL.md")).unwrap(),
+            "personal mod"
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("keybindings.json"), "{broken").unwrap();
+        assert_eq!(
+            install(other.path(), None, false, false)
+                .err()
+                .unwrap()
+                .code,
+            "invalid_keybindings"
+        );
+        assert!(!other.path().join("skills").exists());
+        assert_eq!(
+            std::fs::read_to_string(other.path().join("keybindings.json")).unwrap(),
+            "{broken"
+        );
     }
 }

@@ -107,7 +107,7 @@ The request appears on the person's **Needs you** page; they can also answer wit
 gm timeline land      # queue the head checkpoint, or say why it can't land yet
 ```
 
-`auto` timelines queue themselves when checkpoint CI is green; `approval` timelines need the approval first. Landing is compact: Gitmatrix applies the approved tree change onto current main, runs the repository's gates on that exact candidate, and advances main to a single new commit. Work-in-progress commits stay in the timeline's own repository. For a timeline that spans several repositories, every repository is prepared and gated before any main advances.
+`auto` timelines queue themselves when checkpoint CI is green; `approval` timelines need the approval first. Landing is compact: Timelines applies the approved tree change onto current main, runs the repository's gates on that exact candidate, and advances main to a single new commit. Work-in-progress commits stay in the timeline's own repository. For a timeline that spans several repositories, every repository is prepared and gated before any main advances.
 
 Conflicts and failed gates stop landing. Sync, push, and make a new checkpoint (and get a new approval) when the work changes. If main moves during landing, the candidate is prepared and gated again.
 
@@ -117,7 +117,7 @@ Issues completed in a timeline are done there, and shown as done in the timeline
 
 ## Previews
 
-Gitmatrix does not host previews; your CI deploys them. A repository opts in with `on: preview` in `.gitmatrix/ci.yml`. Each checkpoint then starts a preview run (`trigger == "preview" && action == "create"`) at the checkpoint's commit, and a job records where it deployed with `gm deploy record --url "$URL"`. When previews expire, Gitmatrix starts a `teardown` run. By default a preview expires 2 days after its timeline lands or is abandoned, or after 7 days without a push.
+Timelines does not host previews; your CI deploys them. A repository opts in with `on: preview` in `.gitmatrix/ci.yml`. Each checkpoint then starts a preview run (`trigger == "preview" && action == "create"`) at the checkpoint's commit, and a job records where it deployed with `gm deploy record --url "$URL"`. When previews expire, Timelines starts a `teardown` run. By default a preview expires 2 days after its timeline lands or is abandoned, or after 7 days without a push.
 
 ```sh
 gm timeline revive search-v2 -c 3   # rebuild an expired checkpoint's preview

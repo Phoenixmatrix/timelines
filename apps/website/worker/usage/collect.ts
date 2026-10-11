@@ -334,7 +334,7 @@ const artifacts: Step = {
           quantity: Number(row?.bytes ?? 0),
           estimated: true,
           method:
-            "pack bytes pushed through Gitmatrix since 2026-10-04 (Artifacts reports no repository sizes): an upper bound for that history, nothing for earlier pushes",
+            "pack bytes pushed through Timelines since 2026-10-04 (Artifacts reports no repository sizes): an upper bound for that history, nothing for earlier pushes",
         },
       ],
       next: null,

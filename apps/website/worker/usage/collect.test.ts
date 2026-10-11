@@ -242,6 +242,67 @@ describe("collectUsage", () => {
     expect(await collectUsage(env, NOW)).toMatchObject({ steps: 0, done: true });
   });
 
+  test("highlight storage belongs to the scope owner, or the viewer for global projections", async () => {
+    const projections = [
+      { scope: "repo", scopeId: "repo_1", owner: "acc_o", body: "Repository highlights: é" },
+      { scope: "tracker", scopeId: "acc_o", owner: "acc_o", body: "Organization highlights" },
+      { scope: "site", scopeId: "acc_p", owner: "acc_p", body: "Global highlights" },
+    ];
+    const updatedAt = NOW.toISOString();
+    const insert = main.prepare(`
+      INSERT INTO release_highlights
+        (scope, scope_id, viewer_id, owner_account_id, source_hash, body, status, updated_at)
+      VALUES (?, ?, 'acc_p', ?, 'hash', ?, 'ready', ?)
+    `);
+    for (const projection of projections) {
+      insert.run(
+        projection.scope,
+        projection.scopeId,
+        projection.owner,
+        projection.body,
+        updatedAt,
+      );
+    }
+    // All rows fit in the sample. Count the fixture's UTF-8 payload independently
+    // of the collector's SQL, including the manifest and two integer defaults.
+    const payloadBytes = (projection: (typeof projections)[number]) =>
+      new TextEncoder().encode(
+        projection.scope +
+          projection.scopeId +
+          "acc_p" +
+          projection.owner +
+          "hash[]" +
+          projection.body +
+          "ready" +
+          updatedAt +
+          "00",
+      ).byteLength;
+
+    await collectAll();
+    const owner = figures("acc_o");
+    const viewer = figures("acc_p");
+    expect(owner[`${TODAY} d1/release-notes/rows`]).toMatchObject({
+      quantity: 2,
+      estimated: 0,
+      kind: "storage",
+    });
+    expect(owner[`${TODAY} d1/release-notes/bytes`]).toMatchObject({
+      quantity: payloadBytes(projections[0]!) + payloadBytes(projections[1]!),
+      estimated: 1,
+    });
+    expect(viewer[`${TODAY} d1/release-notes/rows`]).toMatchObject({
+      quantity: 1,
+      estimated: 0,
+      kind: "storage",
+    });
+    expect(viewer[`${TODAY} d1/release-notes/bytes`]).toMatchObject({
+      quantity: payloadBytes(projections[2]!),
+      estimated: 1,
+    });
+    expect(figures(SITE)[`${TODAY} d1/release-notes/rows`]).toBeUndefined();
+    expect(figures(SITE)[`${TODAY} d1/release-notes/bytes`]).toBeUndefined();
+  });
+
   test("bounded and resumable: tiny budgets reach the same figures", async () => {
     await collectAll();
     const whole = { o: figures("acc_o"), p: figures("acc_p"), site: figures(SITE) };

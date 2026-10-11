@@ -71,7 +71,7 @@ export function questions(): Record<string, ClefQuestion> {
       `needs_${group}`,
       {
         type: "noul",
-        instructions: `To handle the message well, will the assistant need this area of Gitmatrix? ${description}.`,
+        instructions: `To handle the message well, will the assistant need this area of Timelines? ${description}.`,
       } satisfies ClefQuestion,
     ]),
   );

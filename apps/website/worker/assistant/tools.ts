@@ -580,7 +580,7 @@ export function buildTools(context: ToolContext) {
   const general = {
     api_get: tool({
       description:
-        "Last resort for reads the other tools don't cover: GET a Gitmatrix JSON API path exactly as listed in the gitmatrix-api skill (e.g. /repos/o/n/collaborators). Never guess paths; issues, CI, code and packages have their own tools.",
+        "Last resort for reads the other tools don't cover: GET a Timelines JSON API path exactly as listed in the gitmatrix-api skill (e.g. /repos/o/n/collaborators). Never guess paths; issues, CI, code and packages have their own tools.",
       inputSchema: z.object({
         path: z.string().min(1).describe("Path under /api, with any query string"),
       }),
@@ -821,7 +821,7 @@ export function buildTools(context: ToolContext) {
     }),
     api_write: tool({
       description:
-        "Any other change through the Gitmatrix JSON API (see the gitmatrix-api skill): POST, PUT, PATCH or DELETE. Give a one-line summary of the effect; the person sees the exact request before it runs.",
+        "Any other change through the Timelines JSON API (see the gitmatrix-api skill): POST, PUT, PATCH or DELETE. Give a one-line summary of the effect; the person sees the exact request before it runs.",
       inputSchema: z.object({
         summary: z.string().min(3).max(200),
         method: z.enum(["POST", "PUT", "PATCH", "DELETE"]),
@@ -839,7 +839,7 @@ export function buildTools(context: ToolContext) {
   const navigate = {
     navigate: tool({
       description:
-        "Open a page of Gitmatrix in the person's browser, beside this chat. Use when they ask to see or go somewhere, or when showing beats describing (a file at the lines you mean, the issue you created). Paths are app paths like /matrixorg/gitmatrix/blob/main/README.md#L10-L20 or /tracker/matrixorg/issues/CORE-25.",
+        "Open a page of Timelines in the person's browser, beside this chat. Use when they ask to see or go somewhere, or when showing beats describing (a file at the lines you mean, the issue you created). Paths are app paths like /matrixorg/gitmatrix/blob/main/README.md#L10-L20 or /tracker/matrixorg/issues/CORE-25.",
       inputSchema: z.object({
         path: z
           .string()

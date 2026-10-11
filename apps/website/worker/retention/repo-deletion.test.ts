@@ -416,6 +416,72 @@ const NOTHING_LEFT = {
 // ---- tests ------------------------------------------------------------------
 
 describe("repository deletion", () => {
+  test("drains an unstarted queued gate on a failed run without replacing its failure", async () => {
+    const w = await setup();
+    w.sqlite.exec(`
+      UPDATE ci_runs SET status='failed',config_error='WorkflowError(instance.already_exists)',
+        finished_at='2026-10-11T04:04:56Z' WHERE id='r_doomed-run1';
+      UPDATE ci_jobs SET status='queued' WHERE id='r_doomed-job1';
+      UPDATE ci_steps SET status='pending' WHERE job_id='r_doomed-job1';
+    `);
+    await requestDeletion(w.env, cleanRow, "ann");
+    const delegate = steps(w).step;
+    const step: PurgeStep = {
+      ...delegate,
+      async do(name, config, work) {
+        const result = await delegate.do(name, config, work);
+        if (name === "stop:ci-acknowledged") {
+          expect(
+            w.sqlite
+              .prepare(
+                "SELECT status,config_error,finished_at FROM ci_runs WHERE id='r_doomed-run1'",
+              )
+              .get(),
+          ).toEqual({
+            status: "failed",
+            config_error: "WorkflowError(instance.already_exists)",
+            finished_at: "2026-10-11T04:04:56Z",
+          });
+          expect(
+            w.sqlite
+              .prepare(
+                "SELECT status,source_completion_pending FROM ci_jobs WHERE id='r_doomed-job1'",
+              )
+              .get(),
+          ).toEqual({ status: "cancelled", source_completion_pending: 0 });
+        }
+        return result;
+      },
+    };
+    expect(await purge(w, step)).toBe("done");
+    expect(w.artifacts.repos.has("art-r_doomed")).toBe(false);
+  });
+
+  test.each(["running", "claim", "started", "source"] as const)(
+    "a failed parent does not acknowledge a gate with %s evidence",
+    async (evidence) => {
+      const w = await setup();
+      w.sqlite.exec(`
+        UPDATE ci_runs SET status='failed',config_error='Original failure' WHERE id='r_doomed-run1';
+        UPDATE ci_jobs SET status='queued' WHERE id='r_doomed-job1';
+        UPDATE ci_steps SET status='running' WHERE job_id='r_doomed-job1';
+      `);
+      const change = {
+        running: "status='running'",
+        claim: "claimed_by='runner'",
+        started: "started_at='2026-10-11T04:04:56Z'",
+        source: "source_completion_pending=1",
+      }[evidence];
+      w.sqlite.exec(`UPDATE ci_jobs SET ${change} WHERE id='r_doomed-job1'`);
+      await requestDeletion(w.env, cleanRow, "ann");
+      await expect(purge(w)).rejects.toThrow(/CI consumer acknowledgment/);
+      expect(w.artifacts.repos.has("art-r_doomed")).toBe(true);
+      expect(
+        w.sqlite.prepare("SELECT status FROM ci_steps WHERE job_id='r_doomed-job1'").get(),
+      ).toEqual({ status: "running" });
+    },
+  );
+
   test.each([false, true])(
     "waits for CI acknowledgment after tombstone (historical ambiguity: %s)",
     async (historical) => {

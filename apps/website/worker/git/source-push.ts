@@ -266,7 +266,7 @@ export async function recoverSourcePush(
     const id = crypto.randomUUID();
     const createdAt = nowIso();
     const identity = {
-      name: "Gitmatrix source recovery",
+      name: "Timelines source recovery",
       email: "source-recovery@gitmatrix.com",
       time: Math.floor(Date.parse(createdAt) / 1000),
     };

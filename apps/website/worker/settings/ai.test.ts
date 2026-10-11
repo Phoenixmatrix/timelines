@@ -14,6 +14,7 @@ import { tokenCredential, type AppEnv } from "../auth.ts";
 import { previewSettings, previewSettingsApi } from "../deployments/settings.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import {
+  accountAiSnapshot,
   aiSettings,
   aiSettingsApi,
   knowledgeSchedule,
@@ -158,6 +159,43 @@ describe("account AI settings", () => {
     await expect(repoAiSnapshot(t.env.DB, "missing")).rejects.toThrow(/no such repository/);
   });
 
+  test.each(["clef-flash", "clef-omni"])(
+    "%s round-trips as classification and resolves into new snapshots only",
+    async (classification) => {
+      const t = await setup();
+      const original = await repoAiSnapshot(t.env.DB, "repo");
+      expect(original.models.classification).toBe("@cf/cloudflare/clef");
+      const saved = await t.call(t.tokens.owner, "PATCH", { models: { classification } });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({
+        models: { ...DEFAULT_AI_CONFIGURATION.models, classification },
+      });
+      const read = (await (await t.call(t.tokens.member)).json()) as AiSettingsView;
+      expect(read.models.classification).toBe(classification);
+      expect(
+        read.catalog.classification.find((option) => option.id === classification)?.model,
+      ).toBe(`@cf/cloudflare/${classification}`);
+      expect((await repoAiSnapshot(t.env.DB, "repo")).models.classification).toBe(
+        `@cf/cloudflare/${classification}`,
+      );
+      expect((await repoAiSnapshot(t.env.DB, "sibling")).models.classification).toBe(
+        `@cf/cloudflare/${classification}`,
+      );
+      expect(await repoAiSnapshot(t.env.DB, "personal")).toEqual(original);
+      expect(original.models.classification).toBe("@cf/cloudflare/clef");
+      for (const role of ["fast", "task"]) {
+        const rejected = await t.call(t.tokens.owner, "PATCH", {
+          models: { [role]: classification },
+        });
+        expect(rejected.status).toBe(400);
+      }
+      expect((await aiSettings(t.env.DB, "org")).models).toEqual({
+        ...DEFAULT_AI_CONFIGURATION.models,
+        classification,
+      });
+    },
+  );
+
   test.each(
     [
       null,
@@ -281,6 +319,115 @@ describe("account AI settings", () => {
       features: { atlas: false, wiki: false },
       updatedBy: "admin",
     });
+  });
+
+  test("release highlights cadence defaults daily and persists bounded account-owned partial updates", async () => {
+    const t = await setup();
+    const initial = await aiSettings(t.env.DB, "org");
+    expect(initial.releaseHighlights).toEqual({ intervalHours: 24 });
+    expect(await (await t.call(t.tokens.member)).json()).toMatchObject({
+      releaseHighlights: { intervalHours: 24 },
+    });
+    for (const token of [t.tokens.member, t.tokens.agent]) {
+      expect(
+        (await t.call(token, "PATCH", { releaseHighlights: { intervalHours: 1 } })).status,
+      ).toBe(403);
+    }
+    for (const intervalHours of [1, 168]) {
+      const saved = await t.call(t.tokens.owner, "PATCH", { releaseHighlights: { intervalHours } });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({
+        releaseHighlights: { intervalHours },
+        features: initial.features,
+        models: initial.models,
+        knowledgeUpdates: initial.knowledgeUpdates,
+        updatedBy: "ann",
+        updatedAt: expect.any(String),
+      });
+      expect(await (await t.call(t.tokens.member)).json()).toMatchObject({
+        releaseHighlights: { intervalHours },
+      });
+    }
+    const before = await aiSettings(t.env.DB, "org");
+    expect((await t.call(t.tokens.owner, "PATCH", { releaseHighlights: {} })).status).toBe(200);
+    expect(await aiSettings(t.env.DB, "org")).toEqual(before);
+    const responses = await Promise.all([
+      t.call(t.tokens.owner, "PATCH", { releaseHighlights: { intervalHours: 12 } }),
+      t.call(t.tokens.owner, "PATCH", { features: { releaseNotes: false } }),
+      t.call(t.tokens.owner, "PATCH", { knowledgeUpdates: { quietMinutes: 7 } }),
+    ]);
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200]);
+    expect(await aiSettings(t.env.DB, "org")).toMatchObject({
+      releaseHighlights: { intervalHours: 12 },
+      features: { releaseNotes: false },
+      knowledgeUpdates: { quietMinutes: 7 },
+    });
+    expect((await aiSettings(t.env.DB, "owner")).releaseHighlights).toEqual({ intervalHours: 24 });
+    expect(await accountAiSnapshot(t.env.DB, "org")).toEqual(
+      await repoAiSnapshot(t.env.DB, "repo"),
+    );
+    expect(await accountAiSnapshot(t.env.DB, "owner")).toEqual(
+      await repoAiSnapshot(t.env.DB, "personal"),
+    );
+    const snapshot = await accountAiSnapshot(t.env.DB, "org");
+    await t.call(t.tokens.owner, "PATCH", { features: { releaseNotes: true } });
+    expect(snapshot.features.releaseNotes).toBe(false);
+    expect((await accountAiSnapshot(t.env.DB, "org")).features.releaseNotes).toBe(true);
+    await expect(accountAiSnapshot(t.env.DB, "missing")).rejects.toThrow(/no such account/);
+  });
+
+  test.each(
+    [
+      null,
+      [],
+      false,
+      24,
+      { intervalHours: 0 },
+      { intervalHours: -1 },
+      { intervalHours: 169 },
+      { intervalHours: 1.5 },
+      { intervalHours: "24" },
+      { intervalHours: null },
+      { intervalHours: true },
+      { hours: 24 },
+      { constructor: 24 },
+    ].map((releaseHighlights) => ({ releaseHighlights })),
+  )("rejects malformed highlights cadence %# without writing", async ({ releaseHighlights }) => {
+    const t = await setup();
+    const response = await t.call(t.tokens.owner, "PATCH", { releaseHighlights });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toHaveProperty("error");
+    expect(t.sqlite.prepare("SELECT count(*) AS count FROM account_settings").get()).toMatchObject({
+      count: 0,
+    });
+  });
+
+  test("stored account cadence and viewer-scoped highlight keys obey migration constraints", async () => {
+    const t = await setup();
+    t.sqlite.exec("INSERT INTO account_settings (account_id) VALUES ('org')");
+    expect((await aiSettings(t.env.DB, "org")).releaseHighlights).toEqual({ intervalHours: 24 });
+    for (const hours of [0, 169]) {
+      expect(() =>
+        t.sqlite
+          .prepare(
+            "UPDATE account_settings SET release_highlights_interval_hours = ? WHERE account_id = 'org'",
+          )
+          .run(hours),
+      ).toThrow();
+    }
+    const insert = t.sqlite.prepare(
+      "INSERT INTO release_highlights (scope, scope_id, viewer_id, owner_account_id, source_hash, body, updated_at) VALUES ('repo', 'repo', ?, 'org', 'hash', '', '2026-10-11T00:00:00.000Z')",
+    );
+    insert.run("owner");
+    insert.run("member");
+    expect(() => insert.run("owner")).toThrow();
+    expect(
+      t.sqlite
+        .prepare(
+          "SELECT source_manifest, status, due_at, lease_until FROM release_highlights WHERE viewer_id = 'owner'",
+        )
+        .get(),
+    ).toMatchObject({ source_manifest: "[]", status: "idle", due_at: 0, lease_until: 0 });
   });
 
   test("knowledge update windows (CORE-286): defaults, owners' choices, validation and the development override", async () => {

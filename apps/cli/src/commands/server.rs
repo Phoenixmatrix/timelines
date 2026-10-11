@@ -1,4 +1,4 @@
-//! Commands for the Gitmatrix server itself: sign-in, repositories, raw API.
+//! Commands for the Timelines server itself: sign-in, repositories, raw API.
 
 use super::Ctx;
 use crate::cli::{AuthCommand, MirrorCommand, RepoCommand};

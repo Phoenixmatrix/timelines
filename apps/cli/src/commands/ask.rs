@@ -1,4 +1,4 @@
-//! `gm ask`: ask the Gitmatrix assistant from a terminal (CORE-26), the way a
+//! `gm ask`: ask the Timelines assistant from a terminal (CORE-26), the way a
 //! DeepWiki MCP answers questions about a codebase, but over everything the
 //! server knows: code and its knowledge graph, issues, CI and packages.
 //!

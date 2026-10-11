@@ -4,6 +4,11 @@
 // repository-relative path globs whose changes it verifies:
 // COPPER_FINCH_STAGES in provider-e2e.ts and ATLAS_STAGES in
 // atlas-provider-e2e.ts. A change matching SHARED_PATHS runs every stage.
+// The independent classification stage admits the account's selected model and
+// spends at most one decision per new Clef variant; it requires no knowledge build.
+// release-highlights builds only on real release-notes fixtures: three initial
+// scopes, an authorized outsider's site view, one scheduled repo refresh and
+// one invalidation repair (six-call ceiling).
 //
 // The rules that keep targeting honest:
 //
@@ -13,9 +18,9 @@
 //   a stage whose code changed.
 // - A selected stage brings the stages it `requires` (a fresh environment
 //   has none of their state), and runs every one with its real assertions.
-// - `--resume` skips only a stage that passed in this worktree's previous run
-//   from the same merge base, with the same content in every changed file
-//   that maps to it (its fingerprint). Prerequisites still run.
+// - `--resume` reuses a stage's most recent successful attempt across skipped
+//   runs, only while the merge base and every mapped changed file stay the same.
+//   A later failed or incomplete attempt invalidates it. Prerequisites still run.
 // - After a failure, a full run is refused for COOLDOWN_MS, and so is a rerun
 //   with nothing changed since the failure, unless `--force`.
 
@@ -130,7 +135,7 @@ export function selectStages(options: {
   const skipped: Record<string, string> = {};
   for (const id of Object.keys(reasons))
     if (options.reusable?.has(id)) {
-      skipped[id] = "passed in the previous run with the same inputs (--resume)";
+      skipped[id] = "passed in an earlier run with unchanged inputs (--resume)";
       delete reasons[id];
     }
   // Prerequisites run whether or not they passed before: the environment is new.
@@ -288,21 +293,23 @@ export async function appendHistory(root: string, record: RunRecord): Promise<vo
   await privateJson(historyPath(root), [...history, record].slice(-20));
 }
 
-/** Stages the previous run passed whose inputs (base and fingerprint) are unchanged. */
+/** Reuse the latest attempt, carrying evidence only through unchanged skipped runs. */
 export function reusableStages(
-  previous: RunRecord | undefined,
+  history: readonly RunRecord[],
   base: string | null,
   current: Record<string, string>,
 ): Set<string> {
-  if (!previous || previous.base !== base) return new Set();
-  return new Set(
-    Object.entries(previous.outcomes)
-      .filter(
-        ([id, outcome]) =>
-          outcome === "passed" && current[id] && previous.fingerprints[id] === current[id],
-      )
-      .map(([id]) => id),
-  );
+  const reusable = new Set<string>();
+  for (const id of STAGE_IDS) {
+    if (!current[id]) continue;
+    for (let index = history.length - 1; index >= 0; index--) {
+      const run = history[index]!;
+      if (run.base !== base || run.fingerprints[id] !== current[id]) break;
+      if (run.outcomes[id] === "passed") reusable.add(id);
+      if (run.outcomes[id] || run.stages.includes(id)) break;
+    }
+  }
+  return reusable;
 }
 
 /**

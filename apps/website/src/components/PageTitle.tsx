@@ -210,7 +210,7 @@ export function PageTitle({
         ? override.title
         : routeTitle(matches, location.search);
   useLayoutEffect(() => {
-    document.title = join(title, "Gitmatrix");
+    document.title = join(title, "Timelines");
   }, [title]);
   return <TitleContext.Provider value={publish}>{children}</TitleContext.Provider>;
 }

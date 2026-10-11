@@ -88,7 +88,7 @@ A job receives only the secrets it lists under `secrets:`. Values are masked in 
 
 ## Steps and step runs
 
-The word "steps" means two things in Gitmatrix. A job's `steps:` are its shell commands. A **step** of a [timeline](/docs/concepts/timelines/#steps) is a meaningful commit pushed with its context. Each push to a timeline can get a light **step run**, the way pull-request checks are lighter than main's.
+The word "steps" means two things in Timelines. A job's `steps:` are its shell commands. A **step** of a [timeline](/docs/concepts/timelines/#steps) is a meaningful commit pushed with its context. Each push to a timeline can get a light **step run**, the way pull-request checks are lighter than main's.
 
 A repository opts in with `on: step`, and a job joins step runs by listing `step` in its own `on:`:
 
@@ -121,7 +121,7 @@ The pipeline also gates work that lands through the merge queue or a timeline. T
 
 ## Deployments and previews
 
-Gitmatrix deploys nothing itself. A job that deploys records where it went, and the run page and commit list show it:
+Timelines deploys nothing itself. A job that deploys records where it went, and the run page and commit list show it:
 
 ```sh
 gm deploy record --url "$URL"

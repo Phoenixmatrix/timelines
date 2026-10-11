@@ -50,6 +50,40 @@ function setup() {
 }
 
 describe("timeline views of the tracker", () => {
+  test("landing a comment preserves its original agent rather than attributing it to the lander", () => {
+    const t = setup();
+    t.mutate(undefined, { kind: "issue.create", id: "a", data: { teamId: "team", title: "A" } });
+    t.fork("search");
+    const agent = {
+      id: "agt-builder",
+      name: "builder",
+      accountable: t.access.members[0]!,
+      capabilities: null,
+      capabilitiesUpdatedAt: null,
+      revokedAt: null,
+    };
+    t.store.mutate(
+      { ...t.access, actorId: agent.id, agents: [agent] },
+      {
+        operationId: "agent-comment",
+        timeline: "search",
+        mutations: [{ kind: "comment.add", id: "note", data: { issueId: "a", body: "Built it" } }],
+      },
+    );
+    const original = t.view("search").comments[0]!;
+    expect(original.actor).toEqual({
+      id: agent.id,
+      name: agent.name,
+      kind: "agent",
+      accountable: agent.accountable,
+    });
+    const landed = t.store.landTimeline(t.access, "search");
+    const event = landed.find((item) => item.entityType === "comment")!;
+    expect(event.actor).toMatchObject({ id: "ann", kind: "person" });
+    expect(event.entity).toEqual(original);
+    expect(t.view().comments).toEqual([original]);
+  });
+
   test("pickup stays global across old timeline views and cannot be loosened by an agent", () => {
     const t = setup();
     t.mutate(undefined, {

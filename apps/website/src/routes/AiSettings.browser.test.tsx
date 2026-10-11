@@ -111,4 +111,94 @@ test("a member sees the body-logging setting read-only", async () => {
   await expect
     .element(page.getByRole("button", { name: "Save AI settings" }))
     .not.toBeInTheDocument();
+  await expect
+    .element(page.getByRole("spinbutton", { name: "Highlights refresh interval" }))
+    .toBeDisabled();
+});
+
+test("an owner saves highlights cadence, reloads it, and retains it while release notes are off", async () => {
+  const server = await TestServer.start({ world: true, persona: "marco" });
+  const app = renderApp("/settings/ai?owner=orbit");
+  const cadence = page.getByRole("spinbutton", { name: "Highlights refresh interval" });
+  const save = page.getByRole("button", { name: "Save AI settings" });
+  await expect.element(cadence).toHaveValue(24);
+  await expect.element(save).toBeDisabled();
+  await userEvent.fill(cadence, "48");
+  await expect.element(save).toBeEnabled();
+  await userEvent.click(save);
+  await expect.element(page.getByText(/AI settings saved for @orbit/)).toBeVisible();
+  await expect.element(save).toBeDisabled();
+  const saved = await server.call<AiSettingsView>("GET", "/api/accounts/orbit/settings/ai");
+  expect(saved.releaseHighlights.intervalHours).toBe(48);
+  // A fresh route load must use persisted settings rather than the local draft.
+  app.unmount();
+  renderApp("/settings/ai?owner=orbit");
+  await expect.element(cadence).toHaveValue(48);
+  await userEvent.fill(cadence, "72");
+  await userEvent.click(page.getByRole("button", { name: "Discard changes" }));
+  await expect.element(cadence).toHaveValue(48);
+  await expect.element(save).toBeDisabled();
+  const releaseNotes = page.getByRole("checkbox", { name: "Release notes", exact: true });
+  await expect.element(releaseNotes).toBeChecked();
+  await userEvent.click(releaseNotes);
+  await userEvent.click(save);
+  await expect
+    .poll(async () => {
+      const view = await server.call<AiSettingsView>("GET", "/api/accounts/orbit/settings/ai");
+      return { enabled: view.features.releaseNotes, hours: view.releaseHighlights.intervalHours };
+    })
+    .toEqual({ enabled: false, hours: 48 });
+  await expect.element(cadence).toBeEnabled();
+});
+
+test("invalid highlights intervals block saving other edits and can be discarded", async () => {
+  const server = await TestServer.start({ world: true, persona: "marco" });
+  renderApp("/settings/ai?owner=orbit");
+  const cadence = page.getByRole("spinbutton", { name: "Highlights refresh interval" });
+  const save = page.getByRole("button", { name: "Save AI settings" });
+  await expect.element(cadence).toHaveValue(24);
+  // Even another valid change cannot submit an invalid cadence.
+  await userEvent.click(page.getByRole("checkbox", { name: "Release notes", exact: true }));
+  for (const value of ["0", "169", "-1", "1.5", ""]) {
+    await userEvent.fill(cadence, value);
+    await expect.element(cadence).toHaveAttribute("aria-invalid", "true");
+    await expect.element(save).toBeDisabled();
+    const unchanged = await server.call<AiSettingsView>("GET", "/api/accounts/orbit/settings/ai");
+    expect(unchanged.releaseHighlights.intervalHours).toBe(24);
+    expect(unchanged.features.releaseNotes).toBe(true);
+  }
+  await userEvent.click(page.getByRole("button", { name: "Discard changes" }));
+  await expect.element(cadence).toHaveValue(24);
+  await expect.element(cadence).not.toHaveAttribute("aria-invalid", "true");
+  await expect.element(save).toBeDisabled();
+  // Both inclusive bounds are accepted and persisted by the real API.
+  for (const value of [1, 168]) {
+    await userEvent.fill(cadence, String(value));
+    await expect.element(save).toBeEnabled();
+    await userEvent.click(save);
+    await expect
+      .poll(
+        async () =>
+          (await server.call<AiSettingsView>("GET", "/api/accounts/orbit/settings/ai"))
+            .releaseHighlights.intervalHours,
+      )
+      .toBe(value);
+    await expect.element(save).toBeDisabled();
+  }
+});
+
+test("a site administrator can change another account's highlights cadence", async () => {
+  const server = await TestServer.start({ world: true, persona: "priya" });
+  renderApp("/settings/ai?owner=orbit");
+  const cadence = page.getByRole("spinbutton", { name: "Highlights refresh interval" });
+  await expect.element(cadence).toBeEnabled();
+  await userEvent.fill(cadence, "12");
+  await userEvent.click(page.getByRole("button", { name: "Save AI settings" }));
+  await expect
+    .poll(
+      async () =>
+        (await server.call<AiSettingsView>("GET", "/api/accounts/orbit/settings/ai"))
+          .releaseHighlights.intervalHours,
+    )
+    .toBe(12);
 });

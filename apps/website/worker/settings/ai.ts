@@ -6,7 +6,9 @@ import {
   AI_MODEL_CATALOG,
   DEFAULT_AI_CONFIGURATION,
   DEFAULT_KNOWLEDGE_SCHEDULE,
+  DEFAULT_RELEASE_HIGHLIGHTS_SCHEDULE,
   MAX_KNOWLEDGE_WAIT_MINUTES,
+  MAX_RELEASE_HIGHLIGHTS_INTERVAL_HOURS,
   parseProviderModelId,
   type AiLogBodiesPatch,
   type AiLogBodiesView,
@@ -43,6 +45,7 @@ export async function aiSettings(d1: D1Database, accountId: string): Promise<AiS
       "s.ai_updated_at",
       "s.knowledge_quiet_minutes",
       "s.knowledge_max_wait_minutes",
+      "s.release_highlights_interval_hours",
       "a.slug",
     ])
     .where("s.account_id", "=", accountId)
@@ -52,6 +55,7 @@ export async function aiSettings(d1: D1Database, accountId: string): Promise<AiS
       features: { ...DEFAULT_AI_CONFIGURATION.features },
       models: { ...DEFAULT_AI_CONFIGURATION.models },
       knowledgeUpdates: { ...DEFAULT_KNOWLEDGE_SCHEDULE },
+      releaseHighlights: { ...DEFAULT_RELEASE_HIGHLIGHTS_SCHEDULE },
       updatedAt: null,
       updatedBy: null,
     };
@@ -71,6 +75,7 @@ export async function aiSettings(d1: D1Database, accountId: string): Promise<AiS
       quietMinutes: row.knowledge_quiet_minutes,
       maxWaitMinutes: row.knowledge_max_wait_minutes,
     },
+    releaseHighlights: { intervalHours: row.release_highlights_interval_hours },
     updatedAt: row.ai_updated_at,
     updatedBy: row.slug,
   };
@@ -84,7 +89,18 @@ export async function repoAiSnapshot(d1: D1Database, repoId: string): Promise<Ai
     .where("id", "=", repoId)
     .executeTakeFirst();
   if (!repo) throw new Error("Cannot resolve AI settings: no such repository.");
-  const settings = await aiSettings(d1, repo.owner_id);
+  return accountAiSnapshot(d1, repo.owner_id);
+}
+
+/** Resolve account-owned work without inventing a repository for site/tracker scopes. */
+export async function accountAiSnapshot(d1: D1Database, accountId: string): Promise<AiSnapshot> {
+  const account = await db(d1)
+    .selectFrom("accounts")
+    .select("id")
+    .where("id", "=", accountId)
+    .executeTakeFirst();
+  if (!account) throw new Error("Cannot resolve AI settings: no such account.");
+  const settings = await aiSettings(d1, accountId);
   const prices: NonNullable<AiSnapshot["prices"]> = {};
   const builtIn = (role: AiRole, id: string) => {
     const option = AI_MODEL_CATALOG[role].find((entry) => entry.id === id);
@@ -95,7 +111,7 @@ export async function repoAiSnapshot(d1: D1Database, repoId: string): Promise<Ai
     const id = settings.models[role];
     const custom = parseProviderModelId(id);
     if (!custom) return builtIn(role, id);
-    const resolved = await resolveProviderModel(d1, repo.owner_id, custom.provider, custom.model);
+    const resolved = await resolveProviderModel(d1, accountId, custom.provider, custom.model);
     // Removing a model in use is refused (worker/ai-providers/api.ts); should one
     // still go missing, new work uses the default rather than failing every read.
     if (!resolved) {
@@ -275,7 +291,13 @@ function object(value: unknown): value is Record<string, unknown> {
 function validate(body: unknown, catalog: AiModelCatalog): AiSettingsPatch | string {
   if (!object(body)) return "AI settings must be a JSON object.";
   for (const key of Object.keys(body))
-    if (key !== "features" && key !== "models" && key !== "knowledgeUpdates" && key !== "logBodies")
+    if (
+      key !== "features" &&
+      key !== "models" &&
+      key !== "knowledgeUpdates" &&
+      key !== "releaseHighlights" &&
+      key !== "logBodies"
+    )
       return `Unknown field: ${key}.`;
   if (body.features !== undefined) {
     if (!object(body.features)) return "features must be an object of boolean toggles.";
@@ -307,6 +329,21 @@ function validate(body: unknown, catalog: AiModelCatalog): AiSettingsPatch | str
         value > MAX_KNOWLEDGE_WAIT_MINUTES
       )
         return `knowledgeUpdates.${key} must be a whole number of minutes from 0 to ${MAX_KNOWLEDGE_WAIT_MINUTES}.`;
+    }
+  }
+  if (body.releaseHighlights !== undefined) {
+    if (!object(body.releaseHighlights))
+      return "releaseHighlights must be an object of intervals in hours.";
+    for (const [key, value] of Object.entries(body.releaseHighlights)) {
+      if (!Object.hasOwn(DEFAULT_RELEASE_HIGHLIGHTS_SCHEDULE, key))
+        return `Unknown field: releaseHighlights.${key}.`;
+      if (
+        typeof value !== "number" ||
+        !Number.isInteger(value) ||
+        value < 1 ||
+        value > MAX_RELEASE_HIGHLIGHTS_INTERVAL_HOURS
+      )
+        return `releaseHighlights.${key} must be a whole number of hours from 1 to ${MAX_RELEASE_HIGHLIGHTS_INTERVAL_HOURS}.`;
     }
   }
   if (body.logBodies !== undefined) {
@@ -367,6 +404,8 @@ aiSettingsApi.patch("/", async (c) => {
     values.knowledge_quiet_minutes = patch.knowledgeUpdates.quietMinutes;
   if (patch.knowledgeUpdates?.maxWaitMinutes !== undefined)
     values.knowledge_max_wait_minutes = patch.knowledgeUpdates.maxWaitMinutes;
+  if (patch.releaseHighlights?.intervalHours !== undefined)
+    values.release_highlights_interval_hours = patch.releaseHighlights.intervalHours;
   if (Object.keys(values).length) {
     values.ai_updated_by = actor.id;
     values.ai_updated_at = nowIso();

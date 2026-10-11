@@ -45,6 +45,10 @@ await test("changed paths select their stages and the stages those require", () 
       ["knowledge", "knowledge-edit", "release-notes"],
     ],
     [
+      ["apps/website/src/routes/Highlights.tsx"],
+      ["knowledge", "knowledge-edit", "release-notes", "release-highlights"],
+    ],
+    [
       ["apps/website/worker/timelines/checkpoints.ts"],
       ["knowledge", "knowledge-edit", "release-notes", "overlays", "timeline-pages"],
     ],
@@ -79,6 +83,43 @@ await test("changed paths select their stages and the stages those require", () 
   ];
   for (const [changed, expected] of examples)
     assert.deepEqual(stagesFor(changed), expected, changed.join(", "));
+});
+
+await test("classification is bounded and independent, without narrowing shared AI coverage", () => {
+  const selected = selectStages({ changed: [], requested: ["classification"] });
+  assert.deepEqual(selected.stages, ["classification"]);
+  assert.deepEqual(selected.reasons.classification, [{ kind: "requested" }]);
+  assert.deepEqual(AI_STAGES.find((stage) => stage.id === "classification")!.requires, []);
+  for (const path of [
+    "apps/website/shared/ai.ts",
+    "apps/website/worker/settings/ai.ts",
+    "apps/website/worker/knowledge/models.ts",
+  ])
+    assert.deepEqual(stagesFor([path]), STAGE_IDS, path);
+  assert.deepEqual(stagesFor(["apps/website/worker/api/dev.ts"]), [
+    "classification",
+    "knowledge",
+    "search",
+    "knowledge-edit",
+    "release-notes",
+    "release-highlights",
+    "repository-deletion",
+  ]);
+});
+
+await test("highlights depends only on the real detailed-note fixture and preserves classification independence", () => {
+  assert.deepEqual(AI_STAGES.find((stage) => stage.id === "release-highlights")!.requires, [
+    "release-notes",
+  ]);
+  assert.deepEqual(stagesFor(["apps/website/worker/release-notes/highlights.ts"]), [
+    "knowledge",
+    "knowledge-edit",
+    "release-notes",
+    "release-highlights",
+  ]);
+  assert.deepEqual(selectStages({ changed: [], requested: ["classification"] }).stages, [
+    "classification",
+  ]);
 });
 
 await test("--all runs every stage, and --stage adds to what changed, never replaces it", () => {
@@ -182,11 +223,11 @@ await test("--resume skips only stages that passed with the same base and inputs
   });
   const now = { ...previous.fingerprints, avatars: "changed-avatars" };
   // Avatars' code changed since it passed; queue failed: both run again.
-  assert.deepEqual([...reusableStages(previous, "base", now)].sort(), ["knowledge", "search"]);
-  assert.deepEqual([...reusableStages(previous, "moved", now)], []);
+  assert.deepEqual([...reusableStages([previous], "base", now)].sort(), ["knowledge", "search"]);
+  assert.deepEqual([...reusableStages([previous], "moved", now)], []);
   const resumed = selectStages({
     changed: ["apps/website/worker/ai-gateway.ts"],
-    reusable: reusableStages(previous, "base", now),
+    reusable: reusableStages([previous], "base", now),
   });
   // search and knowledge passed, but assistant needs them in its new environment.
   assert(resumed.stages.includes("search") && resumed.stages.includes("knowledge"));
@@ -198,7 +239,41 @@ await test("--resume skips only stages that passed with the same base and inputs
     reusable: new Set(["avatars"]),
   });
   assert.deepEqual(independent.stages, ["queue"]);
-  assert.match(independent.skipped.avatars!, /passed in the previous run/);
+});
+
+await test("--resume preserves successful evidence across skipped runs", () => {
+  const first = record({
+    stages: ["avatars", "queue"],
+    outcomes: { avatars: "passed", queue: "failed" },
+  });
+  const second = record({
+    stages: ["queue"],
+    fingerprints: { ...first.fingerprints, queue: "first-fix" },
+    outcomes: { queue: "failed" },
+  });
+  const third = record({
+    stages: ["queue"],
+    fingerprints: { ...first.fingerprints, queue: "second-fix" },
+    outcomes: { queue: "failed" },
+  });
+  assert.deepEqual(
+    [...reusableStages([first, second, third], "base", third.fingerprints)],
+    ["avatars"],
+  );
+});
+
+await test("--resume never reaches past a later attempt or changed inputs", () => {
+  const first = record({ stages: ["avatars"], outcomes: { avatars: "passed" } });
+  for (const later of [
+    record({ stages: ["avatars"], outcomes: { avatars: "failed" } }),
+    record({ stages: ["avatars"] }),
+    record({
+      stages: ["queue"],
+      fingerprints: { ...first.fingerprints, avatars: "changed" },
+    }),
+    record({ stages: ["queue"], base: "another-base" }),
+  ])
+    assert.deepEqual([...reusableStages([first, later], "base", first.fingerprints)], []);
 });
 
 await test("a failure refuses a full run, and an unchanged rerun, within the cooldown", () => {

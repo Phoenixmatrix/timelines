@@ -192,6 +192,8 @@ export const TABLE_GROUPS: TableGroup[] = [
       release_note_entries: REPO,
       release_note_mentions: REPO,
       release_note_state: REPO,
+      // Projections are viewer-specific, but their persisted scope owner pays.
+      release_highlights: "owner_account_id = ?1",
     },
   },
   {

@@ -120,7 +120,7 @@ async function setup(config = yaml) {
       },
       get: async (id: string) => {
         if (!workflows.has(id)) throw new Error("No Workflow");
-        return { id };
+        return { id, status: async () => ({ status: "running" }) };
       },
     },
   } as unknown as Env;
@@ -237,6 +237,25 @@ const gatePipeline = `jobs:
     if: branch == "main"
     steps: ['true']
 `;
+
+test("a Workflow cannot queue another job after its run fails during startup", async () => {
+  const t = await setup("jobs:\n  gate:\n    steps: [echo gate]\n");
+  await t.start({ verification: undefined });
+  const w = workflow(t);
+  w.before(async (name) => {
+    if (name === "start:gate")
+      t.sqlite.exec(`UPDATE ci_runs SET status='failed',config_error='Startup failure'
+        WHERE id='production'`);
+  });
+  await w.run();
+  expect(w.executed).toEqual([]);
+  expect(
+    t.sqlite.prepare("SELECT status,config_error FROM ci_runs WHERE id='production'").get(),
+  ).toEqual({ status: "failed", config_error: "Startup failure" });
+  expect(t.sqlite.prepare("SELECT status FROM ci_jobs WHERE run_id='production'").get()).toEqual({
+    status: "pending",
+  });
+});
 
 describe("landed candidate verification", () => {
   test.each(["advancing", "landed"])(

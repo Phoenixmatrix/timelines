@@ -1,11 +1,11 @@
 ---
 title: Knowledge
-description: The knowledge graph Gitmatrix keeps for every repository, the wiki generated from it, the Atlas, and asking the assistant with gm ask.
+description: The knowledge graph Timelines keeps for every repository, the wiki generated from it, the Atlas, and asking the assistant with gm ask.
 section: Concepts
 order: 6
 ---
 
-Understanding is part of the product. Gitmatrix keeps an always-current picture of every repository, and agents and people read the same one. Its core is the knowledge graph; the wiki, the Atlas, search and the assistant are built on it.
+Understanding is part of the product. Timelines keeps an always-current picture of every repository, and agents and people read the same one. Its core is the knowledge graph; the wiki, the Atlas, search and the assistant are built on it.
 
 ## The knowledge graph
 
@@ -39,7 +39,7 @@ gm timeline pages search-v2   # the wiki pages a timeline affects
 
 ## Asking the assistant: gm ask
 
-`gm ask` puts a question to Gitmatrix's assistant. It reads code and the knowledge graph, issues, CI runs and packages with your permissions, and answers with links.
+`gm ask` puts a question to the Timelines assistant. It reads code and the knowledge graph, issues, CI runs and packages with your permissions, and answers with links.
 
 ```sh
 gm ask "Why did run 44 fail?"                         # inside a checkout: about its repository

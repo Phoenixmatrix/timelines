@@ -5,11 +5,11 @@ section: Start
 order: 2
 ---
 
-This page takes you from nothing to a change on trunk with a green CI run. It uses `gm`, the Gitmatrix CLI, for every step.
+This page takes you from nothing to a change on trunk with a green CI run. It uses `gm`, the Timelines CLI, for every step.
 
 ## Get access
 
-Gitmatrix is invite-only for now. A site administrator invites your email address, and you sign in to the web app at [gitmatrix.fward.dev](https://gitmatrix.fward.dev) with a one-time code sent to that address. Whoever invites you also gives you access to `gm`, which is published as a package of the `matrixorg` account.
+Timelines is invite-only for now. A site administrator invites your email address, and you sign in to the web app at [gitmatrix.fward.dev](https://gitmatrix.fward.dev) with a one-time code sent to that address. Whoever invites you also gives you access to `gm`, which is published as a package of the `matrixorg` account.
 
 ## Get gm
 
@@ -64,7 +64,7 @@ gm clone <owner>/demo
 cd demo
 ```
 
-`gm repo list` shows the repositories you can read. If you already have a plain git clone of a Gitmatrix repository, run `gm init` inside it to start using gm there.
+`gm repo list` shows the repositories you can read. If you already have a plain git clone of a Timelines repository, run `gm init` inside it to start using gm there.
 
 ## Make a change and commit it
 

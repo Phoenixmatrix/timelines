@@ -1,3 +1,6 @@
+// Claude loads this manifest contract on its own: keep it free of imports.
+export type GmAgentIdentity = { id: string; name: string; accountable: string | null };
+
 export type GmWork = {
   key: string;
   title: string;
@@ -13,6 +16,7 @@ export type GmWork = {
 };
 
 export type GmSnapshot = {
+  identity: GmAgentIdentity | null;
   work: GmWork | null;
   error: string | null;
   fetchedAt: number;

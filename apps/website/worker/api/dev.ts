@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
-import type { AppEnv } from "../auth.ts";
+import { tokenCredential, type AppEnv } from "../auth.ts";
 import type { TokenScope } from "../../shared/api.ts";
 import { newArtifactsName } from "../artifacts.ts";
 import {
@@ -15,6 +15,8 @@ import {
 } from "../atlas/fixture.ts";
 import { decide, type ClefQuestion } from "../knowledge/models.ts";
 import { timelineKnowledgeSource } from "../knowledge/sources.ts";
+import { repoAiSnapshot } from "../settings/ai.ts";
+import { aiWork } from "../usage/ai.ts";
 import { findAccountBySlug } from "../db.ts";
 import { accessFor } from "../tracker/access.ts";
 import { trackerObject } from "../tracker/stub.ts";
@@ -31,7 +33,7 @@ import { repoInventory } from "../retention/repo-inventory.ts";
 import { plantOrphans, resetOrphanSweep, sweepRepoOrphans } from "../retention/repo-orphans.ts";
 import type { DurableClass } from "../durable/classes.ts";
 import { batch, db } from "../schema.ts";
-import { fail, readJson } from "./http.ts";
+import { fail, readJson, requirePerson } from "./http.ts";
 import { issueToken } from "./tokens.ts";
 import { sourceFixtures } from "./dev-source-fixtures.ts";
 import { sourceRetentionFixture } from "./dev-source-retention.ts";
@@ -39,6 +41,7 @@ import { sourceAuthFixture } from "./dev-source-auth.ts";
 import { landingFixtures } from "./dev-landing-fixtures.ts";
 import { knowledgeFixtures } from "./dev-knowledge-fixtures.ts";
 import { sourcePushFixtures } from "./dev-source-push-fixtures.ts";
+import { sweepReleaseHighlights } from "../release-notes/highlights.ts";
 
 // DEVELOPMENT ONLY: empty, named repositories exercising the persona permissions.
 // The harness populates their bounded, pinned contents through the real CLI.
@@ -113,6 +116,7 @@ dev.use("*", async (c, next) => {
       "/landing-fixtures",
       "/source-push-fixtures",
       "/knowledge-fixtures",
+      "/release-highlights-fixtures",
       "/chronicle",
     ].some((path) => c.req.path.endsWith(path))
   ) {
@@ -133,6 +137,87 @@ dev.post("/source-auth", sourceAuthFixture);
 dev.post("/landing-fixtures", landingFixtures);
 dev.post("/source-push-fixtures", sourcePushFixtures);
 dev.post("/knowledge-fixtures", knowledgeFixtures);
+
+// Owned provider proof only: no canonical-dev or production clock override.
+dev.post("/release-highlights-fixtures", async (c) => {
+  if (!Reflect.get(c.env, "AGENT_ID")) return fail(c, 404, "Not found.");
+  const actor = await findAccountBySlug(c.env.DB, "marco");
+  const input = await readJson<{ repo: string; action: string }>(c);
+  if (typeof input.repo !== "string" || typeof input.action !== "string")
+    return fail(c, 400, "A fixture repository and action are required.");
+  const k = db(c.env.DB);
+  const repo = await k
+    .selectFrom("repos")
+    .selectAll()
+    .where("id", "=", input.repo)
+    .executeTakeFirst();
+  if (
+    !actor ||
+    !repo ||
+    !/^provider-[a-f0-9]{10}$/.test(repo.name) ||
+    repo.owner_id !== "acc_orbit"
+  )
+    return fail(c, 403, "Only the owned Copper Finch fixture is allowed.");
+  const rows = k
+    .selectFrom("release_highlights")
+    .selectAll()
+    .where("viewer_id", "=", actor.id)
+    .where((eb) =>
+      eb.or([
+        eb.and([eb("scope", "=", "repo"), eb("scope_id", "=", repo.id)]),
+        eb.and([eb("scope", "=", "tracker"), eb("scope_id", "=", repo.owner_id)]),
+        eb.and([eb("scope", "=", "site"), eb("scope_id", "=", actor.id)]),
+      ]),
+    );
+  const entry = await k
+    .selectFrom("release_note_entries")
+    .selectAll()
+    .where("repo_id", "=", repo.id)
+    .where("release", "=", "@day:2026-01-03")
+    .where("issue_key", "=", "CF-1")
+    .executeTakeFirstOrThrow();
+  const addedId = `highlights-proof-${repo.id}`;
+  if (input.action === "append") {
+    await k
+      .insertInto("release_note_entries")
+      .values({
+        ...entry,
+        id: addedId,
+        subject: addedId,
+        title: "Batch parcel verification",
+      })
+      .execute();
+  } else if (input.action === "remove-appended") {
+    await k
+      .deleteFrom("release_note_entries")
+      .where("id", "=", addedId)
+      .where("repo_id", "=", repo.id)
+      .execute();
+  } else if (input.action === "due") {
+    for (const row of await rows.where("scope", "=", "repo").execute())
+      await k
+        .updateTable("release_highlights")
+        .set({ due_at: Date.now() - 1 })
+        .where("scope", "=", row.scope)
+        .where("scope_id", "=", row.scope_id)
+        .where("viewer_id", "=", actor.id)
+        .execute();
+    await sweepReleaseHighlights(c.env, { scope: "repo", scopeId: repo.id, viewerId: actor.id });
+  } else if (input.action !== "inspect") {
+    return fail(c, 400, "Unknown fixture action.");
+  }
+  return c.json({
+    rows: await rows.execute(),
+    usage: await k
+      .selectFrom("ai_usage")
+      .selectAll()
+      .where("feature", "=", "release_notes")
+      .where("account_id", "in", [actor.id, repo.owner_id, "acc_sam"])
+      .orderBy("account_id")
+      .orderBy("model")
+      .execute(),
+  });
+});
 
 // The Durable Object purge contract in the real runtime (CORE-197): every
 // class, a fresh instance each, registered, given storage, purged.
@@ -448,15 +533,37 @@ dev.get("/environment", async (c) => {
 
 // Mint a token for any persona with no sign-in, so scripts can bootstrap:
 //   curl -X POST localhost:5180/api/dev/tokens -d '{"persona":"jun"}'
-// A clef playground: ask typed questions about any state, to tune the
-// questions the knowledge pipeline asks.
+// A clef playground: supplying an owned personal repository exercises its
+// admitted account policy, with one metered attempt and no model override.
 dev.post("/clef", async (c) => {
-  const { state, questions } = await readJson<{
+  const { repo, state, questions } = await readJson<{
+    repo: string;
     state: unknown;
     questions: Record<string, ClefQuestion>;
   }>(c);
   if (!state || !questions) return fail(c, 400, "Send {state, questions}.");
-  return c.json(await decide(c.env, state, questions));
+  if (repo === undefined) return c.json(await decide(c.env, state, questions));
+  const credential = await tokenCredential(c);
+  if (credential.kind !== "token") return fail(c, 401, "Invalid access token.");
+  if (credential.scope === "read") return fail(c, 403, "This token is read-only.");
+  c.set("actor", credential.actor);
+  const actor = requirePerson(c);
+  if (actor instanceof Response) return actor;
+  const owned = await db(c.env.DB)
+    .selectFrom("repos")
+    .select("id")
+    .where("id", "=", repo)
+    .where("owner_id", "=", actor.id)
+    .executeTakeFirst();
+  if (!owned) return fail(c, 404, "No owned personal repository.");
+  const policy = await repoAiSnapshot(c.env.DB, owned.id);
+  const answers = await aiWork({ feature: "knowledge", repo: owned.id }, () =>
+    decide(c.env, state, questions, {
+      model: policy.models.classification,
+      rateLimitRetries: 0,
+    }),
+  );
+  return c.json(answers);
 });
 
 dev.post("/tokens", async (c) => {

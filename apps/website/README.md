@@ -1,10 +1,17 @@
-# Gitmatrix
+# Timelines
 
 A git host on Cloudflare: one Worker serves the React app, a JSON API, and git's
 smart HTTP protocol. Repository contents live in
 [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/); accounts,
 permissions and tokens live in D1. Account-owned issue trackers live in SQLite
 Durable Objects, independent of repository history.
+
+The public product name is **Timelines**. The app lockup reuses the approved
+Pounce cat with an outlined Figtree Timelines wordmark at the approved weight and spacing; the
+four-colour timeline-scope icon remains a separate navigation symbol.
+Internal `GitmatrixLogo`, `gm`, `.gitmatrix`, protocol identifiers, resource
+names, sender addresses and configured origins are unchanged by the rebrand.
+Sign-in email display names and copy use Timelines.
 
 ```
 git client ──Basic user:token──▶ Worker /:owner/:repo.git/*  ──Bearer art_…──▶ Artifacts git remote
@@ -265,6 +272,22 @@ CI Durable Objects and Workflows of runs in flight: their jobs start over in a
 fresh sandbox (an attempt in progress is joined, a leftover container replaced,
 a start that doesn't take is retried), with three retries per job.
 
+**CI startup and deletion (CORE-345).** A repeated Workflow start joins the exact
+existing instance only after its status can be read; a duplicate landing start
+must not turn its running producer into a failed CI run. A real startup failure
+keeps its original configuration error and settles only jobs that never started.
+Cancellation and repository purge use the same boundary: pending/queued jobs
+without a runner claim, start time or outstanding source acknowledgment can be
+cancelled, while live consumers must still report completion. Purge also drains
+such unstarted children of historical terminal runs, without rewriting the
+parent's failure or treating Workflow termination as consumer acknowledgment.
+A Sandbox infrastructure retry clears its active-attempt start and claim only
+after container destruction is acknowledged and its job tokens are revoked.
+The stopped queued retry can therefore be cancelled during Workflow backoff;
+its prior logs, step state and failure evidence remain until a new attempt starts.
+An unresolved or failed destruction retains the live-consumer boundary and keeps
+source purge blocked.
+
 **Fewer runs (CORE-23, `worker/ci/coalesce.ts`).** Starting a commit that already
 has a run in flight on its branch returns that run. A job can declare `paths:`
 (files or directories): on a push, it's skipped as unchanged when those paths
@@ -380,7 +403,7 @@ investigated by the deterministic queue ID, never silently retried as a direct
 push. Ordinary
 `gm push` and native Git pushes intentionally remain available for recovery:
 they are **not universally protected by this queue**. A broken queue must not
-prevent fixing Gitmatrix itself. Timeline-bound work instead uses its existing
+prevent fixing Timelines itself. Timeline-bound work instead uses its existing
 checkpoint/land queue: `--queue` is rejected there, and pinned human approvals
 are never automatically weakened or replaced.
 
@@ -408,9 +431,9 @@ overwriting, and capped at 256 KiB per step.
 | `DELETE /api/repos/:o/:n/steps/:changeId/:commitOid`                  | Delete or redact (admins): the text goes, a tombstone stays                               |
 
 Anyone who can read the repository reads its steps. A step is **verified** once
-a push has shown Gitmatrix its commit, at upload (from `change_refs`) or on a
+a push has shown Timelines its commit, at upload (from `change_refs`) or on a
 later push (`worker/ref-log/record.ts`); until then it's "local, unverified".
-Context is the agent's account, shown as such next to what Gitmatrix verifies.
+Context is the agent's account, shown as such next to what Timelines verifies.
 
 ### The live feed
 
@@ -692,7 +715,7 @@ they are. Each second step (Go to, Find, code and wiki) shows above the input;
   `/tracker` opens, else your own; the hint names it), but never a reference
   (a hash, an issue key, `#12`, `pkg@1.0`). Fallbacks come last and
   are never selected by default, so Enter on a search opens a result. **Ask
-  Gitmatrix “…”** (CORE-96) submits the text to the assistant in a new
+  Timelines “…”** (CORE-96) submits the text to the assistant in a new
   conversation and opens it; it's the only palette action that reaches a model,
   and only when chosen: typing, highlighting or closing sends nothing.
 
@@ -816,7 +839,7 @@ fenced) is never touched, and nothing inside another address is a ref.
 ] }
 ```
 
-- **Issue keys** link only to an issue in a Gitmatrix tracker the viewer
+- **Issue keys** link only to an issue in a Timelines tracker the viewer
   belongs to. The page's tracker (`context.tracker`) is asked first, then the
   trackers subscribed to the page's repository (and its owner's), then the
   viewer's others (at most 25). The first tier with a match decides; two
@@ -1043,6 +1066,16 @@ The workbench keeps the list, board or blocker graph beside the selected issue;
 phones navigate from the list into detail. Expand a ticket into a Markdown PRD,
 acceptance criteria, parent/child plan, dependencies and durable comments, agent
 checkpoints or evidence.
+
+**Agent attribution (CORE-215).** Issue comments, checkpoints, evidence and Story
+steps lead with the agent's own name; the shared identity label exposes its
+accountable human in the tooltip and screen-reader text. Human authors retain
+their own identity and profile link; an agent's name never links to its owner's
+profile. New comments capture the authenticated author's identity on the server,
+so later renames, deletion or timeline landing do not replace the original author.
+Legacy comments without that snapshot resolve only by their exact actor ID in
+the current directory; unresolved identities remain unknown, and an accountable
+human's ID alone never implies an agent.
 
 The search bar's **Clear search** (×) button clears both typed text and applied
 query filters immediately, shows all issues, and returns focus to the input.
@@ -1608,6 +1641,11 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   the ten most recently active timelines; landed timelines fold into one node
   on main, and the rest are listed by status, workspace, agent or person. The
   layout is in `src/routes/tracker/timelineGraph.ts`.
+  Main and timeline summary rows are full-width native selection links with
+  aligned labels, visible Select/Selected cues and keyboard focus (CORE-229).
+  Their 48px rows share the drawing's geometry for touch targets. Event links,
+  commit navigation and Show lane/Fold remain independent controls; selection
+  keeps other URL parameters and browser Back/Forward restores the scope.
 - **Experimental** (CORE-86) marks a timeline that isn't expected to land. It
   restricts nothing: any writer sets or clears it (the graph's inspector,
   `PATCH`, `gm timeline flag <slug> --experimental|--no-experimental`), its
@@ -1907,6 +1945,38 @@ are the CLI equivalents; `gm release notes day:2026-10-02` selects a UTC day.
 Entries about issues from trackers the viewer can't read are omitted, and an introduction is
 shown only to viewers who can read every tracker that shaped it.
 
+**Highlights** are separate, person-specific summaries of authorized daily entries:
+`GET /api/repos/:owner/:repo/release-notes/highlights`,
+`GET /api/tracker/:owner/release-notes/highlights`, and
+`GET /api/release-notes/highlights`. These responses are private/no-store.
+Anonymous repository readers retain detailed notes but highlights are disabled;
+tracker/site highlights require a person sign-in. Exact daily-note backlinks
+are server-generated, never model-generated. Detailed notes are not modified.
+The signed-in `/highlights` page is an app-owned, reserved route, not an account
+slug. Its timeline navigation resolves the person's default tracker.
+
+Opening a surface creates its viewer projection. The existing hourly cron checks
+at most 25 due projections; the account's cadence defaults to 24 hours and can be
+set to 1–168 hours (repository/tracker owner, or the viewer for site highlights).
+New entries alone wait for that cadence. Every read and model invocation checks
+authorization and the summarized entries' digests; changed, deleted, or revoked
+sources suppress old prose immediately. A bounded source manifest tracks source
+repositories/accounts for deletion cleanup. D1 leases coalesce concurrent requests;
+failed attempts persist an error and wait for the next cadence, without a tight
+paid retry loop. The release-notes feature switch and missing AI bindings prevent
+new highlights calls. Calls use the existing account-attributed release-notes
+metering and configured task model, with stored model/time provenance.
+Persisted highlights are included in release-notes storage usage, charged to
+`owner_account_id`: the repository/tracker scope owner, or the viewer for global
+projections. A different viewer does not take on the scope owner's storage charge.
+
+The `release-highlights` real-provider stage includes an outsider's authorized
+global notes while excluding private sources. Its six-call ceiling covers the
+three initial scopes, that outsider view, a scheduled repository refresh and
+repair after cited-source removal. It checks configurable cadence, unchanged
+detailed notes, exact backlinks, generated desktop/mobile surfaces and the global
+page's default-tracker navigation.
+
 | Route                                                       | Contract                                   |
 | ----------------------------------------------------------- | ------------------------------------------ |
 | `GET /api/repos/:owner/:name/release-notes`                 | `ReleaseNotesIndex`: status and releases   |
@@ -1975,12 +2045,19 @@ input/output tokens, not a total bill estimate:
 | Role                     | Option ID            | Provider model                  | Released   | Input / output |
 | ------------------------ | -------------------- | ------------------------------- | ---------- | -------------- |
 | Classification (default) | `clef`               | `@cf/cloudflare/clef`           | 2026-10-01 | $0.24 / $0     |
+| Classification           | `clef-flash`         | `@cf/cloudflare/clef-flash`     | 2026-10-01 | $0.038 / $0    |
+| Classification           | `clef-omni`          | `@cf/cloudflare/clef-omni`      | 2026-10-09 | $0.15 / $0     |
 | Fast / Task (default)    | `glm-5.3-flash`      | `@cf/zai-org/glm-5.3-flash`     | 2026-08-26 | $0.15 / $0.50  |
 | Fast / Task              | `gemma-4-26b-a4b-it` | `@cf/google/gemma-4-26b-a4b-it` | 2026-04-04 | $0.10 / $0.30  |
 
 Classification handles structured decisions; Fast handles file analysis and
 release entries; Task handles synthesis, wiki prose, Atlas descriptions and
 release introductions. Embedding models and dimensions remain fixed.
+
+Clef remains the default. [Clef Flash](https://developers.cloudflare.com/workers-ai/models/clef-flash/)
+and [Clef Omni](https://developers.cloudflare.com/workers-ai/models/clef-omni/)
+are classification-only alternatives; their published prices were checked on
+2026-10-11. The request's model selector follows the selected provider model.
 
 `GET/PATCH /api/accounts/:slug/settings/ai` returns features, selected option IDs,
 the catalog, save provenance and `canManage`. PATCH accepts partial nested
@@ -2679,7 +2756,17 @@ no account grouping budget is drawn.
 
 The model catalog lives in `shared/ai.ts`; provider adapters live in
 `worker/knowledge/models.ts`. `POST /api/dev/clef` with
-`{state, questions}` is a playground for tuning `clef` questions. Resources (dev): Vectorize index
+`{state, questions}` is a playground for tuning `clef` questions. Adding `repo`
+(a personal repository ID) requires its owner's writable personal token and
+uses the repository's admitted classification policy, with metering and no
+automatic retry. The independent `test-ai` stage `classification` uses this
+path for one real decision each on Clef Flash and Clef Omni: distinguishing an
+ongoing outage from a healthy status and a hypothetical question. It checks
+persisted selector acceptance and uncached, account-attributed Gateway records.
+Classifier Gateway records can omit token counts, so application metering must
+also show exactly one added successful call and positive input tokens.
+The proof restores the original selection in `finally`; Clef remains the default.
+It requires no Knowledge build. Resources (dev): Vectorize index
 `gitmatrix-knowledge`, AI Search namespace `gitmatrix` / instance `knowledge`.
 
 ## CI/CD
@@ -3992,6 +4079,17 @@ with the price catalog (CORE-208, `cloudflare_prices`). The report
   on the Cloudflare account, so nothing is subtracted (gross list price). A
   price whose billing hasn't started (Artifacts before 2026-10-14, AI Search
   before 2026-11-01) is shown with its start date and left out of totals.
+- **Classifier price versions (CORE-329):** migration
+  `20261011052218_classifier_prices.sql` adds Clef Flash at **$0.038/M input
+  tokens** and Clef Omni at **$0.150/M input tokens**, effective **2026-10-11
+  UTC**, the observation day (not an inferred provider change date). Both
+  have free output. The [Workers AI pricing page](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+  was last updated 2026-10-09; its fetched snapshot is
+  `worker/usage/fixtures/workers_ai_2026-10-11.txt`. Flash's original
+  **$0.090/M** version and the original `workers_ai.txt` remain intact for
+  historical billing. Other products retain their original provenance.
+  `seedPrice` selects the latest seeded version for budgets; reports select
+  the version on the usage day. The default classifier remains Clef.
 - **CI sandboxes** are priced at Cloudflare's Containers rates (catalog
   product `containers`: `vcpu` per vCPU-second, `memory` per GiB-second,
   `disk` per GB-second, from

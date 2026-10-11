@@ -1,10 +1,9 @@
 // The price catalog's seed (CORE-208): Cloudflare's published Workers Paid
-// prices, read from the pricing pages on 2026-10-04 (UTC) by exactly the
-// parsers a refresh uses (pages.ts); the saved pages are in fixtures/ and
-// catalog.test.ts checks that parsing them still yields these. The migration
-// that creates the catalog inserts the same rows (also checked), and Atlas
-// budgets take their model prices from here (knowledge/budget.ts), so there is
-// one source of truth.
+// prices, initially read on 2026-10-04 (UTC). Saved source pages live in
+// fixtures/; additive migrations and catalog.test.ts preserve each version.
+// CORE-329 adds only the Clef Flash/Omni prices read on 2026-10-11, not a
+// refetch of other products. Atlas budgets use the latest seeded version
+// (knowledge/budget.ts); dated usage uses the catalog's price timeline.
 //
 // Containers (CI sandboxes) joined the catalog later the same day (CORE-210),
 // as a second seed change.
@@ -19,6 +18,10 @@ import { pricingPage } from "./pages.ts";
 export const SEED_DATE = "2026-10-04";
 /** When the pages were fetched. */
 export const SEED_FETCHED_AT = "2026-10-04T02:24:00.000Z";
+
+/** Workers AI page fetched for CORE-329; other product provenance is unchanged. */
+export const CLASSIFIER_PRICE_DATE = "2026-10-11";
+export const CLASSIFIER_PRICE_FETCHED_AT = "2026-10-11T05:22:18.000Z";
 
 type Row = [
   metric: string,
@@ -141,11 +144,21 @@ export const SEED_PRICES: readonly PublishedPrice[] = [
     ["memory", "GiB-second", 1, 0.0000025, 90000, "month", "2026-10-04"],
     ["disk", "GB-second", 1, 0.00000007, 720000, "month", "2026-10-04"],
   ]),
+  // CORE-329: additive versions; the 2026-10-04 Flash price remains historical.
+  // Source: fixtures/workers_ai_2026-10-11.txt, last updated 2026-10-09.
+  // Both classifiers bill input only; their output is free.
+  ...page("workers_ai", "2026-10-09", [
+    ["@cf/cloudflare/clef-flash:input", "token", 1000000, 0.038, null, null, CLASSIFIER_PRICE_DATE],
+    ["@cf/cloudflare/clef-omni:input", "token", 1000000, 0.15, null, null, CLASSIFIER_PRICE_DATE],
+  ]),
 ];
 
-/** A seeded price; throws for one the seed doesn't have (a programming error). */
+/** The latest seeded version; dated billing must use priceOn with its usage day. */
 export function seedPrice(product: PriceProduct, metric: string): PublishedPrice {
-  const price = SEED_PRICES.find((p) => p.product === product && p.metric === metric);
+  let price: PublishedPrice | undefined;
+  for (const candidate of SEED_PRICES)
+    if (candidate.product === product && candidate.metric === metric)
+      if (!price || candidate.effectiveFrom > price.effectiveFrom) price = candidate;
   if (!price) throw new Error(`No seeded price for ${product} ${metric}`);
   return price;
 }

@@ -242,7 +242,7 @@ export async function callProvider(
     // OpenRouter's attribution headers: which app made the call.
     const site = Reflect.get(env, "PUBLIC_URL");
     if (typeof site === "string" && site) headers["http-referer"] = site;
-    headers["x-title"] = "Gitmatrix";
+    headers["x-title"] = "Timelines";
   }
   const response = await fetch(url, {
     method: "POST",

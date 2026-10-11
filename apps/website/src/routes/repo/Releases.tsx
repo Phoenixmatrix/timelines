@@ -199,6 +199,12 @@ export function Releases() {
     return (
       <div className="mk-empty flex max-w-[44rem] flex-col items-center gap-3 py-12">
         <RocketLaunchIcon size={28} className="text-ink-faint" aria-hidden />
+        <Link
+          to={repoPath(owner, repo.name, "releases", "highlights")}
+          className="mk-btn mk-btn--sm"
+        >
+          View highlights
+        </Link>
         <div>
           No daily updates are available yet. Daily notes group default-branch commits by UTC Git
           commit date, not deployment date.
@@ -234,6 +240,12 @@ export function Releases() {
   return (
     <div className="grid gap-x-8 gap-y-8 md:grid-cols-[13rem_minmax(0,1fr)] xl:grid-cols-[13rem_minmax(0,46rem)_minmax(15rem,19rem)] xl:gap-x-12">
       <aside className="max-h-64 overflow-y-auto md:row-span-2 md:sticky md:top-[calc(var(--scope-banner)+1.5rem)] md:max-h-[calc(100dvh-3rem-var(--scope-banner))] md:self-start">
+        <Link
+          to={repoPath(owner, repo.name, "releases", "highlights")}
+          className="mk-btn mk-btn--sm mb-4"
+        >
+          View highlights
+        </Link>
         <Sidebar index={index} owner={owner} name={repo.name} selected={name} />
       </aside>
       <article className="min-w-0 md:col-start-2">

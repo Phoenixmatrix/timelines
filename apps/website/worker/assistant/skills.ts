@@ -26,8 +26,8 @@ export const BUILTIN: Builtin[] = [
   {
     name: "gitmatrix-api",
     description:
-      "Every Gitmatrix JSON API route, for api_get and api_write: repositories, collaborators, mirrors, knowledge, CI, secrets, packages and registries, tracker mutations, people.",
-    body: `# Gitmatrix JSON API
+      "Every Timelines JSON API route, for api_get and api_write: repositories, collaborators, mirrors, knowledge, CI, secrets, packages and registries, tracker mutations, people.",
+    body: `# Timelines JSON API
 
 Paths are under /api; pass them to api_get (GET) or api_write (everything else) without the /api prefix. Responses are JSON; errors are {"error": "..."} with an HTTP status. You act as the person's assistant agent, with their permissions: a 403 means they can't do it either, so say so.
 
@@ -76,7 +76,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
     name: "tracker",
     group: "tracker",
     description:
-      "How the Gitmatrix tracker works and how to plan with it: teams, statuses, priorities, PRDs and sub-issues, blockers, claims, requests to people.",
+      "How the Timelines tracker works and how to plan with it: teams, statuses, priorities, PRDs and sub-issues, blockers, claims, requests to people.",
     body: `# The tracker
 
 - Trackers belong to an account or organization (the owner), independent of repositories. Issues belong to a team (key like CORE) and get keys CORE-1, CORE-2…
@@ -124,7 +124,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
     name: "packages",
     group: "packages",
     description:
-      "Packages in the Gitmatrix registry: formats, feeds, versions, tags, yanking and deprecating.",
+      "Packages in the Timelines registry: formats, feeds, versions, tags, yanking and deprecating.",
     body: `# Packages
 
 - Formats include npm, pypi, oci (containers), cargo, go, maven, nuget, rubygems, apt, rpm, brew, generic and releases. Each account or organization publishes into its own feeds.
@@ -150,7 +150,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
     name: "navigation",
     group: "navigation",
     description:
-      "Gitmatrix's pages and their paths: for links in answers and for opening pages with navigate.",
+      "Timelines' pages and their paths: for links in answers and for opening pages with navigate.",
     body: `# Pages
 
 - Home / ; Issue tracker /tracker and /tracker/<owner> ; an issue /tracker/<owner>/issues/<KEY> ; Needs you /needs-you ; Packages /packages
@@ -177,10 +177,10 @@ Use navigate when the person asks to go somewhere or see something, or to show w
   {
     name: "gm-cli",
     description:
-      "How people and agents do things with gm, the Gitmatrix CLI: clone, commit, push, CI, issues, packages, agents.",
+      "How people and agents do things with gm, the Timelines CLI: clone, commit, push, CI, issues, packages, agents.",
     body: `# gm
 
-gm is jj-style version control plus the Gitmatrix client. Every edit lives in a change; operations can be undone (gm undo).
+gm is jj-style version control plus the Timelines client. Every edit lives in a change; operations can be undone (gm undo).
 - gm clone owner/repo · gm status · gm commit -m "…" · gm push (gm push --sync when trunk moved) · gm sync · gm log
 - gm runs list / wait / logs --follow · gm secret set NAME
 - gm issue create "Title" --team CORE [--owner <tracker>] · gm issue next · claim · checkpoint · complete [--evidence TEXT] · gm request list/answer. Provide actual completion evidence when available; it is recommended, not required. gm issue show returns completionEvidence with original attribution.

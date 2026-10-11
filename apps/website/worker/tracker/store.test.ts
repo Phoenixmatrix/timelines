@@ -66,6 +66,68 @@ function fixture() {
   };
 }
 
+describe("comment author snapshots", () => {
+  test("comments, checkpoints and evidence retain the authenticated agent after directory removal", () => {
+    const f = fixture();
+    f.issue("work");
+    const result = f.store.mutate(
+      { ...f.access, actorId: "agt-bot" },
+      {
+        operationId: "agent-notes",
+        mutations: (["comment", "checkpoint", "evidence"] as const).map((kind) => ({
+          kind: "comment.add",
+          id: kind,
+          data: { issueId: "work", kind, body: kind },
+        })),
+      },
+    );
+    const actor = {
+      id: "agt-bot",
+      kind: "agent",
+      name: "bot",
+      accountable: { id: "alice", slug: "alice", displayName: "Alice" },
+    };
+    expect(result.events.map((event) => event.entity)).toEqual(
+      ["comment", "checkpoint", "evidence"].map((kind) =>
+        expect.objectContaining({
+          id: kind,
+          actorId: "agt-bot",
+          actor,
+        }),
+      ),
+    );
+    const comments = f.reopen().snapshot({ ...f.access, agents: [] }).comments;
+    expect(comments).toHaveLength(3);
+    for (const comment of comments) expect(comment.actor).toEqual(actor);
+  });
+
+  test("human comments stay human and clients cannot supply actor metadata", () => {
+    const f = fixture();
+    f.issue("work");
+    f.mutate({ kind: "comment.add", id: "human", data: { issueId: "work", body: "Hello" } });
+    expect(f.store.snapshot(f.access).comments[0]).toMatchObject({
+      actorId: "alice",
+      actor: { id: "alice", kind: "person", name: "Alice", accountable: null },
+    });
+    const spoof = {
+      kind: "comment.add" as const,
+      id: "spoof",
+      data: {
+        issueId: "work",
+        body: "Fake",
+        actor: {
+          id: "agt-bot",
+          kind: "agent",
+          name: "bot",
+          accountable: null,
+        },
+      },
+    };
+    expect(() => f.mutate(spoof)).toThrow();
+    expect(f.store.snapshot(f.access).comments).toHaveLength(1);
+  });
+});
+
 describe("Knowledge completion evidence", () => {
   test("an exact issue key cannot be evicted by newer prefix matches before the result limit", () => {
     const f = fixture();

@@ -1,5 +1,5 @@
 ---
-name: Gitmatrix
+name: Timelines
 description: A git host for agent-driven development, drawn in MatrixKit Neo; warm charcoal panes and one amber signal.
 colors:
   surface: "oklch(0.235 0.007 70)"
@@ -206,15 +206,15 @@ components:
     textColor: "{colors.ink}"
 ---
 
-# Design System: Gitmatrix
+# Design System: Timelines
 
 ## Overview
 
 **Creative North Star: "The Night Shift Console"**
 
-Gitmatrix is read by people checking on work their agents did while they weren't looking: what landed, what CI said, what a commit published, what the knowledge graph now believes. The system is a dark, warm, quiet console for that review. Charcoal panes with a faint warm cast (hue 70) sit on a slightly lighter page; text is warm off-white in three strengths; one amber signal marks what is selected, current or the next thing to press. Outside status/data colors and the Pounce brand mark, surfaces stay neutral, so a person scanning a long table sees the amber and nothing competing with it.
+Timelines is read by people checking on work their agents did while they weren't looking: what landed, what CI said, what a commit published, what the knowledge graph now believes. The system is a dark, warm, quiet console for that review. Charcoal panes with a faint warm cast (hue 70) sit on a slightly lighter page; text is warm off-white in three strengths; one amber signal marks what is selected, current or the next thing to press. Outside status/data colors and the Pounce brand mark, surfaces stay neutral, so a person scanning a long table sees the amber and nothing competing with it.
 
-Density is that of a working tool, not a marketing page. Lists are single panes with hairline-divided rows; numbers line up in tabular figures; versions, hashes, commands and counts are set in Geist Mono and words in Figtree. The densest surface (the package console: query bar, saved views, publish-rate strip, virtualized version table, facet column) and the sparsest (the sign-in ledger) are built from the same handful of pieces. MatrixKit Neo is the incumbent system, vendored from Claude Design as is; Gitmatrix composes it with Tailwind utilities and adds almost no CSS of its own.
+Density is that of a working tool, not a marketing page. Lists are single panes with hairline-divided rows; numbers line up in tabular figures; versions, hashes, commands and counts are set in Geist Mono and words in Figtree. The densest surface (the package console: query bar, saved views, publish-rate strip, virtualized version table, facet column) and the sparsest (the sign-in ledger) are built from the same handful of pieces. MatrixKit Neo is the incumbent system, vendored from Claude Design as is; Timelines composes it with Tailwind utilities and adds almost no CSS of its own.
 
 Dark is the home theme (`data-theme="dark"` on `<html>`); a light theme redefines every token under `data-theme="light"` and is chosen from the account menu. Both themes share the same roles, so code names roles, never values.
 
@@ -230,7 +230,7 @@ Dark is the home theme (`data-theme="dark"` on `<html>`); a light theme redefine
 
 ## Brand identity
 
-**Pounce** is the user-approved Gitmatrix identity: a flowing cat silhouette whose paths separate and rejoin, suggesting nimble, parallel agent work. Preserve the selected artwork, not the former G lettermark. The logo alone uses the `brand` role: mint `#91f5be` in dark and deep forest `#10251c` in light. Its outlined Figtree wordmark uses `ink`; the interface's amber action signal does not change.
+**Pounce** is the user-approved Timelines identity: a flowing cat silhouette whose paths separate and rejoin, suggesting nimble, parallel agent work. Preserve the selected artwork, not the former G lettermark. The logo alone uses the `brand` role: mint `#91f5be` in dark and deep forest `#10251c` in light. Its outlined Figtree wordmark reads "Timelines" and uses `ink`; the interface's amber action signal does not change.
 
 Use `GitmatrixLogo` for the full lockup on Home and authentication pages and the mark alone in the rail. The master SVG, matching favicon family, generation provenance and cache-version convention are documented in [the website brand specification](apps/website/DESIGN.md#brand-identity).
 
@@ -330,7 +330,7 @@ Settings forms share a 48rem maximum content column, the kit's 20px card padding
 
 ## Elevation & Depth
 
-Gitmatrix is flat. Depth is carried by the tonal stack: sunken wells below the page, panes a step darker than the page surface and set off by tone alone, raised and pressed for interactive fills. Panes have no borders and no shadows. Shadows exist only on surfaces that float above content and can be dismissed or scrolled past, and they are always paired with a 1px `line-soft` ring so the edge holds in both themes. Inputs use the same idea at rest: a 1px `line-soft` ring drawn with box-shadow rather than a border, stepping to `line` on hover and a 2px `signal-line` ring on focus.
+Timelines is flat. Depth is carried by the tonal stack: sunken wells below the page, panes a step darker than the page surface and set off by tone alone, raised and pressed for interactive fills. Panes have no borders and no shadows. Shadows exist only on surfaces that float above content and can be dismissed or scrolled past, and they are always paired with a 1px `line-soft` ring so the edge holds in both themes. Inputs use the same idea at rest: a 1px `line-soft` ring drawn with box-shadow rather than a border, stepping to `line` on hover and a 2px `signal-line` ring on focus.
 
 ### Shadow Vocabulary
 
@@ -423,7 +423,7 @@ The issue tracker's list is the query console's sibling at a larger scale: a mon
 
 ### Sign-in ledger
 
-Signing in and approving `gm auth login` (`/signin`, `/device`) are their own pages: the app shell steps aside, leaving the darkest stage tone edge to edge, the Gitmatrix mark and wordmark top left, the host in mono top right, and one 30rem column. The flow is a **ledger** of three steps joined by a thread (`Step` in `AuthFrame.tsx`): the active step has an amber ring with an amber dot and opens to its content; a finished step settles into one row (a green check, its value, its time in tabular mono, a quiet Change) and greens the thread below it; a waiting step is a hollow ring in faint ink with its title alone. Email, then Code, then Signed in, which settles as "as <name>" for a moment before the redirect; a visitor who is already signed in sees all three settled with Continue, Sign out and Use another account. The code is six cells over one real input (`CodeCells`), so paste and the mail client's one-time-code autofill work and the sixth digit submits; the cell to type next takes the signal ring, a wrong code clears them with red rings and one error line. `/device` is the same ledger from gm's side: the code from your terminal (marked as a one-time code so password managers leave it alone), Approve or Deny, gm is signed in. In development, personas sit below a hairline as a compact list, never as the page.
+Signing in and approving `gm auth login` (`/signin`, `/device`) are their own pages: the app shell steps aside, leaving the darkest stage tone edge to edge, the Timelines mark and wordmark top left, the host in mono top right, and one 30rem column. The flow is a **ledger** of three steps joined by a thread (`Step` in `AuthFrame.tsx`): the active step has an amber ring with an amber dot and opens to its content; a finished step settles into one row (a green check, its value, its time in tabular mono, a quiet Change) and greens the thread below it; a waiting step is a hollow ring in faint ink with its title alone. Email, then Code, then Signed in, which settles as "as <name>" for a moment before the redirect; a visitor who is already signed in sees all three settled with Continue, Sign out and Use another account. The code is six cells over one real input (`CodeCells`), so paste and the mail client's one-time-code autofill work and the sixth digit submits; the cell to type next takes the signal ring, a wrong code clears them with red rings and one error line. `/device` is the same ledger from gm's side: the code from your terminal (marked as a one-time code so password managers leave it alone), Approve or Deny, gm is signed in. In development, personas sit below a hairline as a compact list, never as the page.
 
 ### Board and the backlog digest
 

@@ -10,6 +10,8 @@
 // environment's: no model, index or queue; Artifacts remotes hold refs and
 // accept ref-only pushes (worker/testing/remote.ts) but no objects; the
 // Knowledge coordinator is always idle; CI runs are recorded, never run.
+// Step feeds retain real records, but return finite SSE backlog snapshots:
+// the Vitest command transport serializes responses and cannot hold streams open.
 // Anything that needs more (file contents, CI runners, real sessions) belongs
 // in a canned response or in E2E.
 
@@ -36,6 +38,7 @@ import { search } from "../search/api.ts";
 import { aiProvidersApi } from "../ai-providers/api.ts";
 import { aiSettingsApi, siteAiSettingsApi } from "../settings/ai.ts";
 import { steps } from "../steps/api.ts";
+import { StepFeed, sseEvent } from "../steps/feed.ts";
 import { timelines } from "../timelines/api.ts";
 import { timelineGraph } from "../timelines/graph.ts";
 import { resolveSource } from "../timelines/sources.ts";
@@ -46,6 +49,7 @@ import { Tracker } from "../tracker/object.ts";
 import { fakeProviders, isProviderUrl } from "./ai-providers.ts";
 import { d1, migratedDatabase } from "./d1.ts";
 import { durableStorage } from "./durable.ts";
+import { fakeDurableState } from "./durable-state.ts";
 import { fakeRemotes } from "./remote.ts";
 
 /** Who a world's requests act as: a seeded persona, or nobody (signed out). */
@@ -106,11 +110,31 @@ function absent(name: string) {
   );
 }
 
+/** Real feed persistence and retention, with a finite command-transport response. */
+class BrowserStepFeed extends StepFeed {
+  override async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const raw = request.headers.get("last-event-id") ?? url.searchParams.get("after");
+    const after = raw && /^\d+$/.test(raw) ? Number(raw) : 0;
+    const backlog = await this.since(after);
+    return new Response(
+      `retry: 5000\n: ${backlog.length} record(s)\n\n${backlog.map(sseEvent).join("")}`,
+      {
+        headers: {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-store",
+        },
+      },
+    );
+  }
+}
+
 function createWorld(persona: Persona): string {
   const sqlite = migratedDatabase();
   for (const sql of sqlFiles(new URL("../../seed/", import.meta.url).href)) sqlite.exec(sql);
   const git = fakeRemotes();
   const trackers = new Map<string, Tracker>();
+  const feeds = new Map<string, BrowserStepFeed>();
   const env: Env = {
     DB: d1(sqlite),
     REGISTRY_DB: d1(registryDatabase()),
@@ -135,6 +159,13 @@ function createWorld(persona: Persona): string {
           trackers.set(id, new Tracker(ctx, env));
         }
         return trackers.get(id);
+      },
+    },
+    STEP_FEED: {
+      getByName: (name: string) => {
+        if (!feeds.has(name))
+          feeds.set(name, new BrowserStepFeed(fakeDurableState({ name }).ctx, env));
+        return feeds.get(name)!;
       },
     },
     // Landing and previews start CI runs: here they start nothing.

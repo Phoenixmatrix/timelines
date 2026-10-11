@@ -1,4 +1,4 @@
-//! Commands that talk to the Gitmatrix git endpoint: clone, fetch, sync, push.
+//! Commands that talk to the Timelines git endpoint: clone, fetch, sync, push.
 
 mod progress;
 
@@ -121,7 +121,7 @@ pub fn clone(ctx: &Ctx, args: &cli::CloneArgs) -> Result<Cloned> {
     if !output.status.success() {
         return Err(remote::git_failure("Clone", &output));
     }
-    progress.stage("initializing", "Initializing the Gitmatrix workspace...");
+    progress.stage("initializing", "Initializing the Timelines workspace...");
     let ws = Workspace::init(&target)?;
     let cloned = Cloned {
         repository: repository.to_string(),

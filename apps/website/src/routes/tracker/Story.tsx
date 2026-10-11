@@ -1,7 +1,7 @@
 // A timeline's story (CORE-234): its steps in order, each commit with the
 // context its agent attached (CORE-226), and the commit's diff beside it.
 
-import { CaretLeftIcon, CaretRightIcon, GitMergeIcon, RobotIcon } from "@phosphor-icons/react";
+import { CaretLeftIcon, CaretRightIcon, GitMergeIcon } from "@phosphor-icons/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Link,
@@ -17,7 +17,7 @@ import type { CommitDiff, DiffFile } from "../../../shared/diff.ts";
 import type { Step, StepPage, StepVersions } from "../../../shared/steps.ts";
 import type { TimelineDetail, TimelineRepo } from "../../../shared/timelines.ts";
 import { SelectField, link } from "../../components/ui.tsx";
-import { PersonLink } from "../../components/PersonLink.tsx";
+import { Actor } from "./Actor.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { commitPanelUrl } from "../../lib/commitPanel.ts";
 import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
@@ -399,10 +399,17 @@ function StepRow({ row, active, onOpen }: { row: StoryRow; active: boolean; onOp
           </span>
         </span>
         <span className="mt-0.5 flex flex-wrap items-center gap-x-2 text-micro text-ink-faint">
-          <span className="inline-flex items-center gap-1">
-            {row.step?.author.kind === "agent" && <RobotIcon aria-hidden />}
-            {agentOf(row)}
-          </span>
+          {row.step ? (
+            <Actor
+              who={{
+                name: row.step.author.name,
+                kind: row.step.author.kind,
+                person: row.step.author.accountable,
+              }}
+            />
+          ) : (
+            agentOf(row)
+          )}
           <time dateTime={at} title={fullDate(at)} className="tabular-nums">
             {timeAgo(at)}
           </time>
@@ -481,21 +488,14 @@ function StepDetail({
       <p className="mt-1 mb-3 flex flex-wrap gap-x-3 text-body-sm text-ink-muted">
         <span>
           {step ? (
-            step.author.kind === "agent" ? (
-              <>
-                {step.author.name}
-                {step.author.accountable && (
-                  <>
-                    {" for "}
-                    <PersonLink slug={step.author.accountable.slug}>
-                      {step.author.accountable.displayName}
-                    </PersonLink>
-                  </>
-                )}
-              </>
-            ) : (
-              <PersonLink slug={step.author.accountable?.slug}>{step.author.name}</PersonLink>
-            )
+            <Actor
+              who={{
+                name: step.author.name,
+                kind: step.author.kind,
+                person: step.author.accountable,
+              }}
+              link
+            />
           ) : (
             row.commit.authorName
           )}

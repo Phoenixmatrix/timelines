@@ -246,6 +246,9 @@ export function TrackerReleases() {
           options={trackers.map((tracker) => ({ value: tracker.slug, label: tracker.displayName }))}
           onChange={(value) => navigate(`/tracker/${encodeURIComponent(value)}/releases`)}
         />
+        <Link to={`/tracker/${encodeURIComponent(owner)}/highlights`} className="mk-btn mk-btn--sm">
+          View highlights
+        </Link>
         <button
           type="button"
           className="mk-btn mk-btn--ghost mk-btn--sm ml-auto"

@@ -370,7 +370,7 @@ export function priceLines(
 
 export function buildReport(input: ReportInput): UsageReport {
   const notes = [
-    "Figures are attributed estimates from Gitmatrix's own records, not Cloudflare's bill.",
+    "Figures are attributed estimates from Timelines' own records, not Cloudflare's bill.",
     "Costs are gross list prices: included allowances apply once to the whole Cloudflare account, so they aren't subtracted here.",
   ];
   const sources = PRICING_PAGES.map((page) => {

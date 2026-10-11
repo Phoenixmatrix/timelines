@@ -3289,6 +3289,10 @@ export async function runE2E(
           /developers\.cloudflare\.com\/d1\//,
         );
         await noSideways(page, label);
+        await page.screenshot({
+          path: join(ctx.artifacts, `usage-costs-${width}.png`),
+          fullPage: true,
+        });
         // CSV export: one row per figure.
         const [download] = await Promise.all([
           page.waitForEvent("download"),

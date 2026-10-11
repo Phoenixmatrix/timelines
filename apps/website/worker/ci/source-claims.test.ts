@@ -78,6 +78,52 @@ function fixture(sqlite = migratedDatabase()) {
 }
 
 describe("CI source claim lifetime", () => {
+  test("cancellation settles only unstarted or confirmed-stopped children and leaves live evidence intact", async () => {
+    const t = fixture();
+    const env = { DB: d1(t.sqlite) } as unknown as Env;
+    try {
+      t.run("cancel", "running");
+      for (const id of ["unstarted", "stopped", "claimed", "started", "ack", "running"]) {
+        t.job(id, "cancel", id === "running" ? "running" : "queued");
+        t.sqlite
+          .prepare("INSERT INTO ci_steps(job_id,position,name,status) VALUES (?,0,'step',?)")
+          .run(id, id === "unstarted" ? "pending" : "running");
+      }
+      t.sqlite.exec(`
+        UPDATE ci_jobs SET claimed_by='runner' WHERE id='claimed';
+        UPDATE ci_jobs SET started_at='2026-10-11T04:04:56Z' WHERE id='started';
+        UPDATE ci_jobs SET source_completion_pending=1 WHERE id='ack';
+        UPDATE ci_jobs SET error='earlier failure',exit_code=137 WHERE id='stopped';
+      `);
+      await cancelRun(env, "cancel");
+      expect(t.sqlite.prepare("SELECT id,status FROM ci_jobs ORDER BY id").all()).toEqual([
+        { id: "ack", status: "queued" },
+        { id: "claimed", status: "queued" },
+        { id: "running", status: "running" },
+        { id: "started", status: "queued" },
+        { id: "stopped", status: "cancelled" },
+        { id: "unstarted", status: "cancelled" },
+      ]);
+      expect(t.sqlite.prepare("SELECT job_id,status FROM ci_steps ORDER BY job_id").all()).toEqual([
+        { job_id: "ack", status: "running" },
+        { job_id: "claimed", status: "running" },
+        { job_id: "running", status: "running" },
+        { job_id: "started", status: "running" },
+        { job_id: "stopped", status: "running" },
+        { job_id: "unstarted", status: "cancelled" },
+      ]);
+      expect(t.roots()).toEqual(["cancel"]);
+      expect(
+        t.sqlite.prepare("SELECT error,exit_code FROM ci_jobs WHERE id='stopped'").get(),
+      ).toEqual({ error: "earlier failure", exit_code: 137 });
+      for (const id of ["claimed", "started", "ack", "running"])
+        await report(env, id, { done: { status: "cancelled" } });
+      expect(t.roots()).toEqual([]);
+    } finally {
+      t.sqlite.close();
+    }
+  });
+
   test.each(["stopped", "stop-failed"])(
     "Sandbox source claim waits for confirmed container shutdown: %s",
     async (shutdown) => {

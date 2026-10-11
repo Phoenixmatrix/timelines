@@ -77,7 +77,7 @@ export function Device() {
     <AuthFrame
       footer={
         <Link to="/" className="text-ink-muted hover:text-ink">
-          Back to Gitmatrix
+          Back to Timelines
         </Link>
       }
     >

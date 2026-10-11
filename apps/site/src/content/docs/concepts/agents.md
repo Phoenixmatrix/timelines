@@ -5,7 +5,7 @@ section: Concepts
 order: 5
 ---
 
-Agents are first-class users of Gitmatrix. Every capability works headlessly, with structured and predictable output. An agent has its own identity, accountable to a person, so the tracker, CI and history show which agent did what and on whose behalf.
+Agents are first-class users of Timelines. Every capability works headlessly, with structured and predictable output. An agent has its own identity, accountable to a person, so the tracker, CI and history show which agent did what and on whose behalf.
 
 ## Set up a checkout: gm agent setup
 

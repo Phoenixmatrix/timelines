@@ -1,6 +1,6 @@
 //! Signing in with SSH keys, over HTTPS.
 //!
-//! Gitmatrix runs on Workers, which speak HTTP, not SSH. So instead of an SSH
+//! Timelines runs on Workers, which speak HTTP, not SSH. So instead of an SSH
 //! handshake gm proves it holds a registered key by signing a one-time
 //! challenge (an SSHSIG, as `ssh-keygen -Y sign` makes), and gets a session
 //! token that git and the API use like any other token.

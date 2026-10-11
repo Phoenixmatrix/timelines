@@ -1,4 +1,4 @@
-/** The approved Pounce cat and outlined wordmark share one scalable master. */
+/** The approved Pounce cat and Timelines wordmark share one scalable master. */
 export function GitmatrixLogo({
   markOnly = false,
   className = "",
@@ -12,12 +12,12 @@ export function GitmatrixLogo({
       width={markOnly ? 315 : 1494}
       height={315}
       role="img"
-      aria-label="Gitmatrix"
+      aria-label="Timelines"
       focusable="false"
       className={`block shrink-0 ${className}`}
     >
-      <use href="/brand/gitmatrix.svg?v=pounce#mark" className="text-brand" />
-      {!markOnly && <use href="/brand/gitmatrix.svg?v=pounce#wordmark" className="text-ink" />}
+      <use href="/brand/gitmatrix.svg?v=timelines#mark" className="text-brand" />
+      {!markOnly && <use href="/brand/gitmatrix.svg?v=timelines#wordmark" className="text-ink" />}
     </svg>
   );
 }

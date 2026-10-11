@@ -1,6 +1,6 @@
 # gm
 
-The Gitmatrix CLI, written in Rust. It is built for agents first: JSON output,
+The Timelines CLI, written in Rust. It is built for agents first: JSON output,
 discoverable commands, structured errors. It uses a change-based workflow like
 [jj](https://jj-vcs.github.io/jj/): commit early, commit often, no staging area,
 no pull requests.
@@ -196,7 +196,7 @@ commit without one says "no context recorded". On the web, a selected line's
 
 ## Deployments
 
-Gitmatrix deploys nothing; whatever deploys tells it where code went. Inside a CI
+Timelines deploys nothing; whatever deploys tells it where code went. Inside a CI
 job, `gm deploy record` acts as the job (`GITMATRIX_TOKEN`): the server fills in
 the repository, source, run, job and commit. The environment is `production`
 for canonical default-branch work, `timeline/<slug>` for a timeline's owned
@@ -545,7 +545,7 @@ not start work without a received token.
 
 ### Asking the assistant: `gm ask`
 
-`gm ask` puts a question to Gitmatrix's assistant, which reads code and the
+`gm ask` puts a question to the Timelines assistant, which reads code and the
 knowledge graph, issues, CI runs and packages with your permissions, the way a
 DeepWiki MCP answers questions about a codebase, but across everything the
 server holds:
@@ -610,10 +610,11 @@ gm agent setup --check                           # exit 4 if instructions or ski
 ### The Claude Code work card: `gm agent mod`
 
 `gm agent mod` installs a Claude Code mod that shows, in a small card above the
-prompt, the gitmatrix issue the session works on: key and title, status,
-priority, the lease's time left, the checkout's timeline and the latest
-checkpoint. `ctrl+x g` (or `/gm-work`) toggles it; it stays within 46 columns
-and 5 rows, so it fits a pane of a four-way split, and never covers the prompt.
+prompt, the current checkout's actual agent name and accountable owner (when
+available), even without a claimed issue. Below it are the issue key and title,
+status, priority, lease, timeline and checkpoint. The card is initially shown;
+`ctrl+x g` (or `/gm-work`) toggles it and remembers that choice. It stays within
+the prompt's available rows and 46 columns.
 
 ```bash
 gm agent mod                     # install or update; once per machine
@@ -636,6 +637,41 @@ gm agent mod --remove            # uninstall it and its chord
   shown and after each gm command the session runs (`vp run agent gm` aside).
 - **Source.** `assets/claude-code-mod` is the mod as a plugin folder; gm embeds
   it. Its README says how to develop it.
+- **Identity and safety.** Each refresh resolves `gm agent show -o json` in
+  the session's current checkout, not the human login or a cached agent name.
+  No checkout, missing gm, failed authentication or malformed/revoked identity
+  clears the identity; subprocess errors and credential fields are never displayed.
+  Accountable owner falls back to its ID when no display name is available.
+- **Supported Claude interface.** This uses Claude's early-access function-hook
+  mod API, not a status-line replacement. Function hooks must be enabled in your
+  Claude build; see the [upstream mod contract](https://github.com/anthropics/claude-code/blob/main/mods/README.md).
+
+### Oh My Pi agent identity extension
+
+`gm agent setup --harness pi` installs the native OMP extension under
+`.omp/extensions/gitmatrix-agent/` in this checkout, alongside the existing
+step-capture extension. Other extensions and OMP settings are not changed.
+Restart OMP (or reload its extensions) to load it. Its `gitmatrix-agent` status
+entry shows the agent and accountable owner without replacing the footer.
+It refreshes on session start/switch, after each turn, every minute, and on
+`/gm-agent`. Outside a checkout or without a valid agent identity the entry is
+cleared silently. `gm agent setup --harness pi --check` checks installed assets.
+
+Interactive smoke check (with a built, current `gm` on PATH):
+
+1. In a configured checkout, run `gm agent show -o json` and note only its agent
+   name and accountable owner; do not paste raw credentials into the harness.
+2. Run `gm agent mod`, then start `claude`. The card must show that agent even
+   without claims. Toggle `/gm-work` twice. In a function-hooks-enabled build,
+   `claude --plugin-dir apps/cli/assets/claude-code-mod` also loads from source.
+3. Run `gm agent setup --harness pi`, then `omp` in the same checkout. Confirm
+   the status entry matches the agent; `/gm-agent` refreshes it.
+4. Switch to another configured checkout/session with a different agent.
+   Refresh (`/gm-work` off/on or `/gm-agent`); the old name must disappear.
+   Start either harness outside a Git checkout and confirm no agent is claimed.
+5. Rerun installation and confirm personal keybindings, mods, OMP extensions
+   and settings remain intact. Claude removal is `gm agent mod --remove`;
+   remove only `.omp/extensions/gitmatrix-agent/` to uninstall the OMP identity UI.
 
 ### Autonomous human interventions
 

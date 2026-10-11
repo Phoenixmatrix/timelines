@@ -166,11 +166,11 @@ export async function sendCode(env: Env, email: string, otp: string) {
   if (Reflect.get(env, "DEV_MODE") === "true")
     console.log(`[auth] sign-in code for ${email}: ${otp}`);
   await env.EMAIL.send({
-    from: { email: env.EMAIL_FROM, name: "Gitmatrix" },
+    from: { email: env.EMAIL_FROM, name: "Timelines" },
     to: email,
-    subject: `Your Gitmatrix sign-in code: ${otp}`,
-    text: `Your Gitmatrix sign-in code is ${otp}.\n\nIt expires in 10 minutes. If you didn't ask for it, you can ignore this email.`,
-    html: `<p>Your Gitmatrix sign-in code is</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;font-family:monospace">${otp}</p><p>It expires in 10 minutes. If you didn't ask for it, you can ignore this email.</p>`,
+    subject: `Your Timelines sign-in code: ${otp}`,
+    text: `Your Timelines sign-in code is ${otp}.\n\nIt expires in 10 minutes. If you didn't ask for it, you can ignore this email.`,
+    html: `<p>Your Timelines sign-in code is</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;font-family:monospace">${otp}</p><p>It expires in 10 minutes. If you didn't ask for it, you can ignore this email.</p>`,
   });
 }
 

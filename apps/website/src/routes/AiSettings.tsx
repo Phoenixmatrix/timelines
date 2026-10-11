@@ -12,6 +12,7 @@ import type { AccountSummary } from "../../shared/api.ts";
 import {
   AI_PROVIDERS,
   MAX_KNOWLEDGE_WAIT_MINUTES,
+  MAX_RELEASE_HIGHLIGHTS_INTERVAL_HOURS,
   type AiFeatures,
   type AiLogBodiesPatch,
   type AiLogComponent,
@@ -194,6 +195,9 @@ function AiSettingsForm({
     maxWaitMinutes: String(v.knowledgeUpdates.maxWaitMinutes),
   });
   const [schedule, setSchedule] = useState(scheduleText(initial));
+  const [highlightHours, setHighlightHours] = useState(
+    String(initial.releaseHighlights.intervalHours),
+  );
   // Gateway body logging overrides (CORE-290): null follows the site default.
   const overrides = (v: AiSettingsView) =>
     Object.fromEntries(
@@ -227,12 +231,26 @@ function AiSettingsForm({
     if (value !== null && value !== saved.knowledgeUpdates[key])
       (patch.knowledgeUpdates ??= {})[key] = value;
   }
+  const intervalHours = Number(highlightHours);
+  const invalidHighlights =
+    !/^\d+$/.test(highlightHours.trim()) ||
+    !Number.isInteger(intervalHours) ||
+    intervalHours < 1 ||
+    intervalHours > MAX_RELEASE_HIGHLIGHTS_INTERVAL_HOURS;
+  if (!invalidHighlights && intervalHours !== saved.releaseHighlights.intervalHours)
+    patch.releaseHighlights = { intervalHours };
   for (const entry of saved.logBodies.components) {
     const choice = logBodies[entry.component];
     if (choice !== (entry.account ?? null))
       (patch.logBodies ??= {} as AiLogBodiesPatch)[entry.component] = choice;
   }
-  const dirty = !!(patch.features || patch.models || patch.knowledgeUpdates || patch.logBodies);
+  const dirty = !!(
+    patch.features ||
+    patch.models ||
+    patch.knowledgeUpdates ||
+    patch.releaseHighlights ||
+    patch.logBodies
+  );
   const changed = () => {
     setNotice("");
     setError("");
@@ -244,7 +262,8 @@ function AiSettingsForm({
       aria-busy={busy}
       onSubmit={async (event) => {
         event.preventDefault();
-        if (busy || !saved.canManage || !dirty || invalidSchedule.length) return;
+        if (busy || !saved.canManage || !dirty || invalidSchedule.length || invalidHighlights)
+          return;
         setSaving(true);
         changed();
         try {
@@ -257,6 +276,7 @@ function AiSettingsForm({
           setFeatures(persisted.features);
           setModels(persisted.models);
           setSchedule(scheduleText(persisted));
+          setHighlightHours(String(persisted.releaseHighlights.intervalHours));
           setLogBodies(overrides(persisted));
           setNotice(`AI settings saved for @${owner}. New jobs will use these settings.`);
         } catch (cause) {
@@ -308,6 +328,46 @@ function AiSettingsForm({
               >
                 {description}
               </p>
+              {key === "releaseNotes" && (
+                <div className="mt-3 ml-7 flex min-w-0 flex-col gap-1">
+                  <label htmlFor="release-highlights-hours" className="text-field-label">
+                    Highlights refresh interval
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      id="release-highlights-hours"
+                      type="number"
+                      inputMode="numeric"
+                      min={1}
+                      max={MAX_RELEASE_HIGHLIGHTS_INTERVAL_HOURS}
+                      step={1}
+                      required
+                      value={highlightHours}
+                      aria-invalid={invalidHighlights || undefined}
+                      aria-describedby="release-highlights-hint release-highlights-help"
+                      onChange={(event) => {
+                        setHighlightHours(event.target.value);
+                        changed();
+                      }}
+                      className="mk-input w-28 tabular-nums"
+                    />
+                    <span className="text-body-sm text-ink-muted">hours</span>
+                  </div>
+                  <span id="release-highlights-hint" className="text-body-sm text-ink-muted">
+                    {invalidHighlights
+                      ? `Enter a whole number from 1 to ${MAX_RELEASE_HIGHLIGHTS_INTERVAL_HOURS} hours.`
+                      : `Default: 24 hours (daily). Choose 1–${MAX_RELEASE_HIGHLIGHTS_INTERVAL_HOURS} hours (up to 7 days).`}
+                  </span>
+                  <p
+                    id="release-highlights-help"
+                    className="mt-1 mb-0 max-w-[65ch] text-body-sm text-ink-muted"
+                  >
+                    Refreshes highlights that a viewer has previously opened. Highlights follow the
+                    Release notes toggle; turning it off stops new highlights work and keeps this
+                    interval. Saving a new interval does not start AI work immediately.
+                  </p>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -526,18 +586,19 @@ function AiSettingsForm({
             <button
               type="submit"
               className="mk-btn mk-btn--primary min-h-11"
-              disabled={busy || !dirty || invalidSchedule.length > 0}
+              disabled={busy || !dirty || invalidSchedule.length > 0 || invalidHighlights}
             >
               {saving ? "Saving…" : "Save AI settings"}
             </button>
             <button
               type="button"
               className="mk-btn mk-btn--ghost min-h-11"
-              disabled={busy || (!dirty && !invalidSchedule.length)}
+              disabled={busy || (!dirty && !invalidSchedule.length && !invalidHighlights)}
               onClick={() => {
                 setFeatures(saved.features);
                 setModels(saved.models);
                 setSchedule(scheduleText(saved));
+                setHighlightHours(String(saved.releaseHighlights.intervalHours));
                 setLogBodies(overrides(saved));
                 changed();
               }}

@@ -1,4 +1,4 @@
-//! Talking to the Gitmatrix server: stored credentials, the JSON API, and
+//! Talking to the Timelines server: stored credentials, the JSON API, and
 //! git's network commands with the token attached.
 
 use crate::output::{GmError, Result, exit};
@@ -1148,7 +1148,7 @@ pub fn git_failure(action: &str, output: &std::process::Output) -> GmError {
         || stderr.contains("Couldn't connect")
     {
         return GmError::new("server_unreachable", format!("{action} failed: {detail}"))
-            .hint("Is the Gitmatrix dev server running (`vp dev` in apps/website)?");
+            .hint("Is the Timelines dev server running (`vp dev` in apps/website)?");
     }
     GmError::new("git_failed", format!("{action} failed: {detail}"))
 }

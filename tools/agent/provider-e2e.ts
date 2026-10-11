@@ -14,9 +14,10 @@ import type {
 } from "../../apps/website/shared/assistant-skills.ts";
 import type { CodeSource, SourceSnapshot } from "../../apps/website/shared/code-source.ts";
 import type { Landing } from "../../apps/website/shared/timelines.ts";
-import type { Comment, MutationResult } from "../../apps/website/shared/tracker.ts";
+import type { Comment, MutationResult, TrackerList } from "../../apps/website/shared/tracker.ts";
 import type {
   ReleaseFeed,
+  ReleaseHighlights,
   ReleaseNoteEntry,
   ReleaseNotesIndex,
   ReleaseNotesRelease,
@@ -42,6 +43,13 @@ const HARNESS = "tools/agent/provider-e2e.ts";
  * it builds on (commits pushed, a build indexed), which run first.
  */
 export const COPPER_FINCH_STAGES = [
+  {
+    id: "classification",
+    covers:
+      "Account-selected Clef Flash and Omni each identify an outage among harmless reports in one real, metered decision; settings are restored",
+    requires: [],
+    paths: [HARNESS, `${WORKER}/api/dev.ts`],
+  },
   {
     id: "knowledge",
     covers:
@@ -125,6 +133,26 @@ export const COPPER_FINCH_STAGES = [
       `${SRC}/routes/repo/Releases.tsx`,
       `${SRC}/routes/tracker/Releases.tsx`,
       `${SRC}/components/ReleaseNoteDetails.tsx`,
+    ],
+  },
+  {
+    id: "release-highlights",
+    covers:
+      "Repo/tracker/site summaries and an authorized outsider view, daily backlinks, account/model/Gateway evidence, desktop/mobile and global navigation, cadence and source invalidation (six-summary ceiling)",
+    requires: ["release-notes"],
+    paths: [
+      HARNESS,
+      `${WORKER}/release-notes/highlights.ts`,
+      `${WORKER}/release-notes/highlights.test.ts`,
+      `${WORKER}/api/dev.ts`,
+      `${WORKER}/names.ts`,
+      `${SHARED}/release-notes.ts`,
+      `${SRC}/routes/Highlights.tsx`,
+      `${SRC}/routes/Highlights.browser.test.tsx`,
+      `${SRC}/routes/repo/Releases.tsx`,
+      `${SRC}/routes/tracker/Releases.tsx`,
+      `${SRC}/appRoutes.tsx`,
+      `${SRC}/lib/timelineScope.ts`,
     ],
   },
   {
@@ -728,6 +756,124 @@ export async function runProviderE2E(
           task: "gemma-4-26b-a4b-it",
         },
       });
+    }
+    const appUsage = async () => {
+      const response = await fetch(
+        `${ctx.origin}/api/dev/ai-usage?since=${String(evidence.startedAt).slice(0, 10)}`,
+        {
+          headers: { authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET ?? ""}` },
+          signal: AbortSignal.timeout(60_000),
+        },
+      );
+      assert.equal(response.status, 200, "Reading the app's AI usage failed");
+      return ((await response.json()) as { usage: UsageRow[] }).usage;
+    };
+    if (mode === "ai" && want("classification")) {
+      begin("classification");
+      enter("classification-selected-policy");
+      const owned = await ownedEnvironment();
+      const path = `/accounts/${persona}/settings/ai`;
+      const original = (await api(path)) as AiSettingsView;
+      assert.equal(original.models.classification, "clef", "Clef remains the fixture default");
+      const fixture = await api(`/repos/${persona}/hello-world`);
+      assert.equal(typeof fixture.id, "string");
+      const accountId = `acc_${persona}`;
+      const decisions: Record<string, unknown>[] = [];
+      const report = { account: persona, repo: fixture.id, decisions, restored: false };
+      evidence.classification = report;
+      try {
+        for (const selector of ["clef-flash", "clef-omni"] as const) {
+          const selectedPolicy = (await api(path, "PATCH", {
+            models: { classification: selector },
+          })) as AiSettingsView;
+          assert.equal(selectedPolicy.models.classification, selector);
+          const persisted = (await api(path)) as AiSettingsView;
+          assert.equal(persisted.models.classification, selector);
+          const model = `@cf/cloudflare/${selector}`;
+          const matchesUsage = (row: UsageRow) =>
+            row.account_id === accountId && row.feature === "knowledge" && row.model === model;
+          const beforeUsage = (await appUsage()).find(matchesUsage);
+          const startedAt = new Date().toISOString();
+          // One choice per model, no retry: select an actual outage, not a
+          // harmless status or a question mentioning outage terminology.
+          const answers = await api("/dev/clef", "POST", {
+            repo: fixture.id,
+            state: {
+              alpha: "All production requests succeed. The status page is green.",
+              bravo:
+                "Production is down now. Every request fails with HTTP 503. All users are blocked.",
+              charlie:
+                "Where can I find instructions for responding to a hypothetical outage? Everything works now.",
+            },
+            questions: {
+              incident: {
+                type: "choice",
+                instructions:
+                  "Which report describes an actual ongoing production outage requiring immediate response?",
+                criteria: {
+                  alpha: "The report named alpha.",
+                  bravo: "The report named bravo.",
+                  charlie: "The report named charlie.",
+                },
+              },
+            },
+          });
+          const answer = answers.incident;
+          assert.equal(answer?.type, "choice");
+          assert.equal(
+            answer.choice,
+            "bravo",
+            `${selector} must distinguish outage from harmless reports`,
+          );
+          const probabilities: Record<string, number> = {};
+          for (const key of ["alpha", "bravo", "charlie"]) {
+            const probability = answer.probabilities?.[key];
+            assert(Number.isFinite(probability) && probability >= 0 && probability <= 1);
+            probabilities[key] = probability;
+          }
+          assert(probabilities.bravo! > probabilities.alpha!);
+          assert(probabilities.bravo! > probabilities.charlie!);
+          const decision = {
+            selector,
+            model,
+            choice: "bravo",
+            probabilities,
+            gateway: [] as GatewayLogSummary[],
+            usage: { before: beforeUsage, after: undefined as UsageRow | undefined },
+          };
+          decisions.push(decision);
+          await waitFor(`classification-${selector}-gateway`, 120_000, async () => {
+            const { logs } = await gatewayLogs(owned, startedAt, "knowledge", decision.model);
+            decision.gateway = logs.filter((log) => log.account === accountId);
+            assert(decision.gateway.length <= 1, "Each selected classifier gets at most one call");
+            if (!decision.gateway.length) return false;
+            const log = decision.gateway[0]!;
+            assert.equal(log.model, decision.model);
+            assert.equal(log.provider, "workers-ai");
+            assert.equal(log.feature, "knowledge");
+            assert.equal(log.success, true);
+            assert.equal(log.cached, false);
+            return true;
+          });
+          // Gateway can omit decision-model token counts; use actual response metering.
+          decision.usage.after = (await appUsage()).find(matchesUsage);
+          assert(decision.usage.after, `${selector} must record account model usage`);
+          assert.equal(decision.usage.after.calls - (beforeUsage?.calls ?? 0), 1);
+          assert(
+            decision.usage.after.input > (beforeUsage?.input ?? 0),
+            "The decision must have real provider input usage",
+          );
+        }
+      } finally {
+        const restored = (await api(path, "PATCH", {
+          models: { classification: original.models.classification },
+        })) as AiSettingsView;
+        assert.equal(restored.models.classification, original.models.classification);
+        const persisted = (await api(path)) as AiSettingsView;
+        assert.equal(persisted.models.classification, original.models.classification);
+        report.restored = true;
+      }
+      passed("classification");
     }
     await api(
       "/repos",
@@ -2308,6 +2454,383 @@ export async function runProviderE2E(
         );
         passed("release-notes");
       }
+      if (want("release-highlights")) {
+        begin("release-highlights");
+        // Atlas also owns Marco/Sam fixtures; finish it before this account-wide
+        // usage window. Its failure is reported independently below.
+        await atlas;
+        enter("release-highlights");
+        const highlightsStartedAt = new Date().toISOString();
+        const repo = await api(base);
+        const personalPath = `/accounts/${persona}/settings/ai`;
+        const personal: AiSettingsView = await api(personalPath);
+        const orgPolicy: AiSettingsView = await api(settingsPath);
+        const outsiderApi = async (path: string, method = "GET", body?: unknown) => {
+          const response = await fetch(`${ctx.origin}/api${path}`, {
+            method,
+            headers: {
+              authorization: `Bearer ${fixtures.tokens.sam}`,
+              "content-type": "application/json",
+            },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            signal: AbortSignal.timeout(60_000),
+          });
+          assert.equal(response.status, 200);
+          return response.json();
+        };
+        const outsiderPolicy: AiSettingsView = await outsiderApi("/accounts/sam/settings/ai");
+        const detailed = await notesFor("day:2026-01-03");
+        const tagged = await notesFor("provider-v1");
+        const report: Record<string, unknown> = { maximumSummaries: 6, expectedSummaries: 6 };
+        evidence.highlights = report;
+        type StoredHighlight = {
+          scope: ReleaseHighlights["scope"];
+          scope_id: string;
+          viewer_id: string;
+          owner_account_id: string;
+          generated_at: string;
+          due_at: number;
+          model: string;
+          source_manifest: string;
+        };
+        type FixtureState = {
+          rows: StoredHighlight[];
+          usage: { account_id: string; model: string; calls: number; failed_calls: number }[];
+        };
+        const fixture = async (action: string): Promise<FixtureState> => {
+          assert(ctx.env.GITMATRIX_AGENT_SECRET);
+          const response = await fetch(`${ctx.origin}/api/dev/release-highlights-fixtures`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ repo: repo.id, action }),
+            signal: AbortSignal.timeout(60_000),
+          });
+          assert.equal(response.status, 200, `Highlights fixture ${action}`);
+          return response.json();
+        };
+        const paths = [
+          `${base}/release-notes/highlights`,
+          `/tracker/${owner}/release-notes/highlights`,
+          "/release-notes/highlights",
+        ];
+        const summaries: ReleaseHighlights[] = [];
+        const observedHighlights: ReleaseHighlights[] = [];
+        report.generations = observedHighlights;
+        const ready = async (path: string, previous?: string | null) => {
+          let result!: ReleaseHighlights;
+          await waitFor("highlights-ready", 180_000, async () => {
+            result = await api(path);
+            assert.notEqual(result.status.state, "failed", "Real highlights generation failed");
+            return result.status.state === "ready" && result.status.generatedAt !== previous;
+          });
+          observedHighlights.push(result);
+          assert(
+            result.notes.some(
+              (note) =>
+                note.repo.owner === owner &&
+                note.repo.name === name &&
+                note.release === "@day:2026-01-03",
+            ),
+          );
+          assert(result.body && result.body.length <= 1500);
+          assert.match(result.body, /parcel|checksum/i);
+          assert.match(result.body, /verif|check|match/i);
+          assert.match(result.body, /batch|all|every|multiple|several|many/i);
+          assert.doesNotMatch(result.body, /CF-1|https?:\/\/|\]\(/);
+          assert(result.model);
+          return result;
+        };
+        const before = await fixture("inspect");
+        report.before = before;
+        let appended = false;
+        const proofErrors: unknown[] = [];
+        try {
+          // Preserve each account's selected Task model; prove its actual provenance.
+          await api(personalPath, "PATCH", {
+            features: { releaseNotes: true },
+            releaseHighlights: { intervalHours: 24 },
+          });
+          await outsiderApi("/accounts/sam/settings/ai", "PATCH", {
+            features: { releaseNotes: true },
+          });
+          report.policies = { organization: orgPolicy, personal, outsider: outsiderPolicy };
+          report.semanticRequirements = [
+            "parcel/checksum verification",
+            "batch/all/every/multiple parcels",
+            "no issue keys or invented URLs",
+          ];
+          assert.equal(
+            orgPolicy.releaseHighlights.intervalHours,
+            24,
+            "Default organization cadence is daily",
+          );
+          assert.equal(
+            personal.releaseHighlights.intervalHours,
+            24,
+            "Default personal cadence is daily",
+          );
+          assert.equal(
+            before.rows.length,
+            0,
+            "Fresh proof owns exactly its new viewer projections",
+          );
+          for (const path of paths) summaries.push(await ready(path));
+          const initial = await fixture("inspect");
+          report.initial = { summaries, storage: initial };
+          report.statements = summaries.map((summary) => ({
+            scope: summary.scope,
+            // Exact generated prose, not a substituted expected answer.
+            text: summary.body,
+            model: summary.model,
+            generatedAt: summary.status.generatedAt,
+            dailyBacklinks: summary.notes,
+          }));
+          assert.equal(initial.rows.length, 3);
+          for (const row of initial.rows) {
+            assert.equal(row.viewer_id, "acc_marco");
+            assert.equal(row.owner_account_id, row.scope === "site" ? "acc_marco" : "acc_orbit");
+            assert(Math.abs(row.due_at - Date.parse(row.generated_at) - 24 * 3600_000) < 180_000);
+            const summary = summaries.find((value) => value.scope === row.scope)!;
+            assert.equal(row.model, summary.model);
+            const manifest = JSON.parse(row.source_manifest) as {
+              repoId: string;
+              release: string;
+              repo: { owner: string; name: string };
+            }[];
+            assert(manifest.some((source) => source.repoId === repo.id));
+            assert.deepEqual(summary.notes, [
+              ...new Map(
+                manifest.map((source) => [
+                  JSON.stringify([source.repoId, source.release]),
+                  { repo: source.repo, release: source.release },
+                ]),
+              ).values(),
+            ]);
+          }
+          // Privacy is tested with generation enabled, never hidden behind an AI-off state.
+          const outsider: Record<string, unknown>[] = [];
+          for (const path of paths) {
+            const response = await fetch(`${ctx.origin}/api${path}`, {
+              headers: { authorization: `Bearer ${fixtures.tokens.sam}` },
+              signal: AbortSignal.timeout(60_000),
+            });
+            const body = await response.json();
+            outsider.push({ path, status: response.status, body });
+            if (path !== "/release-notes/highlights") assert([403, 404].includes(response.status));
+            else {
+              assert.equal(response.status, 200);
+              assert.notEqual(body.status.state, "disabled");
+              assert.doesNotMatch(
+                JSON.stringify(body),
+                new RegExp(`${name}|CF-1|batch parcel`, "i"),
+              );
+            }
+          }
+          report.outsider = outsider;
+          let outsiderSummary!: ReleaseHighlights;
+          await waitFor("highlights-outsider-ready", 180_000, async () => {
+            outsiderSummary = await outsiderApi("/release-notes/highlights");
+            report.outsiderSummary = outsiderSummary;
+            assert.notEqual(outsiderSummary.status.state, "failed");
+            assert.doesNotMatch(
+              JSON.stringify(outsiderSummary),
+              new RegExp(`${name}|CF-1|copper[\\s-]*finch`, "i"),
+            );
+            return outsiderSummary.status.state === "ready";
+          });
+          assert(
+            outsiderSummary.notes.some((note) => note.repo.owner === "sam"),
+            "Sam must retain their own authorized notes without the private fixture",
+          );
+          const beforeAppend = await fixture("inspect");
+          await fixture("append");
+          appended = true;
+          for (let repeat = 0; repeat < 2; repeat++)
+            for (const [index, path] of paths.entries())
+              assert.deepEqual(await api(path), summaries[index]);
+          const unchanged = await fixture("inspect");
+          assert.deepEqual(
+            unchanged,
+            beforeAppend,
+            "New entries and repeated reads before due must not generate or charge",
+          );
+          report.beforeDue = unchanged;
+          await api(settingsPath, "PATCH", { releaseHighlights: { intervalHours: 48 } });
+          assert.equal((await api(settingsPath)).releaseHighlights.intervalHours, 48);
+          await fixture("due"); // Actual sweep; only the owned repository row is aged.
+          const refreshed = await ready(paths[0], summaries[0].status.generatedAt);
+          const scheduled = await fixture("inspect");
+          const scheduledRow = scheduled.rows.find((row) => row.scope === "repo")!;
+          assert(
+            Math.abs(scheduledRow.due_at - Date.parse(scheduledRow.generated_at) - 48 * 3600_000) <
+              180_000,
+          );
+          report.scheduled = { summary: refreshed, storage: scheduled };
+          // Removing a now-cited source must suppress stale prose, even before due.
+          await fixture("remove-appended");
+          appended = false;
+          const invalidated: ReleaseHighlights = await api(paths[0]);
+          assert.equal(invalidated.body, null);
+          assert.deepEqual(invalidated.notes, []);
+          assert.notEqual(invalidated.status.state, "ready");
+          const restored = await ready(paths[0], refreshed.status.generatedAt);
+          report.invalidation = { invalidated, restored };
+          assert.deepEqual(await notesFor("day:2026-01-03"), detailed);
+          assert.deepEqual(await notesFor("provider-v1"), tagged);
+          const browser = await chromium.launch({ headless: true });
+          try {
+            const trackerList: TrackerList = await api("/tracker");
+            const defaultTracker =
+              trackerList.trackers.find((tracker) => tracker.id === trackerList.defaultOwnerId) ??
+              trackerList.trackers[0];
+            assert(defaultTracker, "The fixture must have an accessible default tracker");
+            const context = await browser.newContext({ baseURL: ctx.origin });
+            const page = await context.newPage();
+            await page.goto("/signin");
+            await page
+              .getByRole("button", { name: new RegExp(`Continue as ${persona}`, "i") })
+              .click();
+            await page.waitForURL((url) => url.pathname !== "/signin");
+            const screenshots: string[] = [];
+            for (const viewport of [
+              { width: 1440, height: 1000 },
+              { width: 390, height: 844 },
+            ]) {
+              await page.setViewportSize(viewport);
+              for (const [index, route] of [
+                `/${owner}/${name}/releases/highlights`,
+                `/tracker/${owner}/highlights`,
+                "/highlights",
+              ].entries()) {
+                await page.goto(route);
+                const summary = index === 0 ? restored : summaries[index];
+                await playwrightExpect(
+                  page.getByRole("article", { name: "Release highlights" }).locator("p").first(),
+                ).toHaveText(summary.body!, { timeout: 60_000 });
+                const backlink = page.locator(
+                  `a[href="/${owner}/${name}/releases/%40day%3A2026-01-03"]`,
+                );
+                await playwrightExpect(backlink).toBeVisible();
+                const screenshot = `highlights-${summary.scope}-${viewport.width}.png`;
+                await page.screenshot({ path: join(ctx.artifacts, screenshot), fullPage: true });
+                screenshots.push(screenshot);
+                if (summary.scope === "site" && viewport.width === 1440) {
+                  await page.getByRole("button", { name: /^Timeline: main/ }).click();
+                  const graph = page
+                    .getByRole("dialog", { name: "Timeline", exact: true })
+                    .getByRole("link", { name: "Timeline graph", exact: true });
+                  const graphPath = `/tracker/${encodeURIComponent(defaultTracker.slug)}/timelines`;
+                  await playwrightExpect(graph).toHaveAttribute("href", graphPath);
+                  const navigationScreenshot = "highlights-site-navigation.png";
+                  await page.screenshot({
+                    path: join(ctx.artifacts, navigationScreenshot),
+                    fullPage: true,
+                  });
+                  await graph.click();
+                  await page.waitForURL((url) => url.pathname === graphPath);
+                  await playwrightExpect(
+                    page.getByRole("heading", { name: "Timelines", exact: true }),
+                  ).toBeVisible();
+                  report.globalNavigation = {
+                    defaultOwner: defaultTracker.slug,
+                    url: page.url(),
+                    screenshot: navigationScreenshot,
+                  };
+                }
+              }
+            }
+            report.screenshots = screenshots;
+          } finally {
+            await browser.close();
+          }
+          const after = await fixture("inspect");
+          report.after = after;
+          let calls = 0;
+          for (const account of ["acc_orbit", "acc_marco", "acc_sam"]) {
+            const prior = before.usage
+              .filter((row) => row.account_id === account)
+              .reduce((sum, row) => sum + row.calls + row.failed_calls, 0);
+            const current = after.usage
+              .filter((row) => row.account_id === account)
+              .reduce((sum, row) => sum + row.calls + row.failed_calls, 0);
+            assert.equal(
+              current - prior,
+              account === "acc_orbit" ? 4 : 1,
+              "Each real summary is charged to its controlling account",
+            );
+            calls += current - prior;
+          }
+          assert(calls <= 6, "Highlights exceeded the hard six-summary budget");
+          report.calls = calls;
+          const owned = await ownedEnvironment();
+          await waitFor("highlights-gateway-evidence", 120_000, async () => {
+            const logs = await collectGatewayLogs((page) =>
+              gatewayLogs(owned, highlightsStartedAt, "release-notes", undefined, page),
+            );
+            report.gateway = logs;
+            assert(logs.length <= 6, "Every provider attempt counts against the six-call ceiling");
+            const successful = logs.filter(
+              (log) =>
+                log.success &&
+                !log.cached &&
+                log.provider === "workers-ai" &&
+                log.feature === "release_notes",
+            );
+            for (const row of after.rows) {
+              const count = successful.filter(
+                (log) => log.account === row.owner_account_id && log.model === row.model,
+              ).length;
+              if (count < (row.scope === "site" ? 1 : 4)) return false;
+            }
+            return (
+              successful.length === 6 &&
+              successful.some(
+                (log) => log.account === "acc_sam" && log.model === outsiderSummary.model,
+              )
+            );
+          });
+          passed("release-highlights");
+        } catch (error) {
+          proofErrors.push(error);
+          throw error;
+        } finally {
+          // Independent restores must all run, even if appended-entry cleanup fails.
+          const cleanups = await Promise.allSettled([
+            appended ? fixture("remove-appended") : Promise.resolve(),
+            api(settingsPath, "PATCH", { releaseHighlights: orgPolicy.releaseHighlights }),
+            api(personalPath, "PATCH", {
+              features: { releaseNotes: personal.features.releaseNotes },
+              releaseHighlights: personal.releaseHighlights,
+            }),
+            outsiderApi("/accounts/sam/settings/ai", "PATCH", {
+              features: { releaseNotes: outsiderPolicy.features.releaseNotes },
+            }),
+          ]);
+          const cleanupNames = [
+            "appended entry",
+            "organization policy",
+            "personal policy",
+            "outsider policy",
+          ];
+          const cleanupErrors = cleanups.flatMap((result, index) =>
+            result.status === "rejected"
+              ? [
+                  new Error(`Release highlights cleanup failed: ${cleanupNames[index]}`, {
+                    cause: result.reason,
+                  }),
+                ]
+              : [],
+          );
+          if (cleanupErrors.length)
+            throw new AggregateError(
+              [...proofErrors, ...cleanupErrors],
+              "Release highlights proof cleanup failed",
+            );
+        }
+      }
       if (want("overlays") || want("timeline-pages")) {
         begin(want("overlays") ? "overlays" : "timeline-pages");
         enter("knowledge-timeline-overlay");
@@ -3219,17 +3742,6 @@ export async function runProviderE2E(
         const owned = await ownedEnvironment();
         const usageEvidence: Record<string, unknown> = {};
         evidence.usageReconciliation = usageEvidence;
-        const appUsage = async () => {
-          const response = await fetch(
-            `${ctx.origin}/api/dev/ai-usage?since=${String(evidence.startedAt).slice(0, 10)}`,
-            {
-              headers: { authorization: `Bearer ${ctx.env.GITMATRIX_AGENT_SECRET ?? ""}` },
-              signal: AbortSignal.timeout(60_000),
-            },
-          );
-          assert.equal(response.status, 200, "Reading the app's AI usage failed");
-          return ((await response.json()) as { usage: UsageRow[] }).usage;
-        };
         const ownerAccount = (await appUsage()).find((row) => row.slug === owner)?.account_id;
         assert(ownerAccount, `The fixture owner ${owner} recorded no AI usage`);
         usageEvidence.account = ownerAccount;

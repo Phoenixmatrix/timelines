@@ -21,7 +21,7 @@ web
 
 ## Product Purpose
 
-Gitmatrix is a git host built for agent-driven development, running entirely
+Timelines is a git host built for agent-driven development, running entirely
 on Cloudflare. Agents land work continuously on trunk while CI checks it, and
 the host keeps an always-current understanding of every repository (a
 knowledge graph, and a wiki generated from it) that agents and people both
@@ -74,7 +74,7 @@ trust what happened quickly.
 
 ## Brand Commitments
 
-- The name **Gitmatrix**; the CLI binary is `gm`.
+- The name **Timelines**; the CLI binary is `gm`.
 - The web app uses the **MatrixKit Neo** design system from Claude Design
   (tokens in `apps/website/src/styles/tokens.css`, components in
   `matrixkit.css`, vendored as is).

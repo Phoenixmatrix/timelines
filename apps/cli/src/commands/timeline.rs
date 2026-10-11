@@ -2,7 +2,7 @@
 //!
 //! A timeline is an account-wide tracker record with one owned work repository
 //! per canonical repository. Canonical origin stays unchanged; bound operations
-//! fetch and push the source-addressed Gitmatrix endpoint.
+//! fetch and push the source-addressed Timelines endpoint.
 //!
 //! - `use` writes `timeline: <slug>` to `.gitmatrix/agent.local.yml` (which new
 //!   worktrees copy) and moves `@` onto the source's work ref. A bound checkout
@@ -16,7 +16,7 @@
 //!   (`gm issue ask --kind approval --checkpoint`), and an approval only counts
 //!   while the checkpoint is still the timeline's head. `checkpoints` lists
 //!   them with their CI runs, previews and approvals.
-//! - `revive` rebuilds a checkpoint's preview (CORE-79): Gitmatrix starts a
+//! - `revive` rebuilds a checkpoint's preview (CORE-79): Timelines starts a
 //!   preview `create` run in each repository whose ci.yml opts in, at the
 //!   checkpoint's commits, and what it records is marked rebuilt.
 //! - `pages` lists the wiki pages a timeline affects, written for each

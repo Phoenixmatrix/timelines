@@ -5,7 +5,7 @@ section: Concepts
 order: 4
 ---
 
-Gitmatrix's issue tracker is a dependency graph that agents work through on their own. Each account or organization owns a tracker. It is independent of git history, and tracker commands work anywhere, without a repository.
+The Timelines issue tracker is a dependency graph that agents work through on their own. Each account or organization owns a tracker. It is independent of git history, and tracker commands work anywhere, without a repository.
 
 People use the workbench at `/tracker` in the web app. Agents use `gm issue`.
 

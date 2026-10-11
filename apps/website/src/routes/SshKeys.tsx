@@ -45,7 +45,7 @@ export function SshKeys() {
       <h1 className="m-0 text-headline">SSH keys</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         Sign in to <code className="mk-mono">gm</code> with the SSH keys you already use, from your
-        SSH agent, 1Password or <code className="mk-mono">~/.ssh</code>. Gitmatrix speaks HTTPS, so
+        SSH agent, 1Password or <code className="mk-mono">~/.ssh</code>. Timelines speaks HTTPS, so
         instead of an SSH connection gm signs a one-time challenge with your key and gets a session
         that lasts an hour. For plain git and scripts, there are{" "}
         <Link to="/settings/tokens" className={link}>

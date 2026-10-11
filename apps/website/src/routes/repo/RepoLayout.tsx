@@ -118,7 +118,7 @@ function ClonePopover({ repo }: { repo: RepoDetail }) {
                       : "You can clone but not push."}
                 </>
               ) : repo.source?.kind === "timeline-work" ? (
-                "Work sources require an authorized Gitmatrix account."
+                "Work sources require an authorized Timelines account."
               ) : repo.visibility === "public" ? (
                 "Public repositories clone without signing in. Pushing needs an account with write access."
               ) : null}

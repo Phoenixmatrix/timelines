@@ -85,6 +85,67 @@ beforeEach(() => {
   files.ciYml = OPTED_IN;
 });
 
+describe("Workflow startup terminalization", () => {
+  test("a duplicate landing start joins the existing Workflow without failing its queued gate", async () => {
+    const t = setup();
+    files.ciYml = "jobs:\n  gate:\n    steps: [echo gate]\n";
+    const failure = new Error("WorkflowError(instance.already_exists)");
+    t.env.CI_RUN = {
+      async create({ id }: { id: string }) {
+        t.sqlite.prepare("UPDATE ci_jobs SET status='queued' WHERE run_id=?").run(id);
+        throw failure;
+      },
+      async get() {
+        return { status: async () => ({ status: "running" }) };
+      },
+    } as unknown as Env["CI_RUN"];
+    try {
+      const result = await t.start({
+        trigger: "landing",
+        preview: undefined,
+        runId: "landing-run",
+      });
+      expect(result).toEqual({ runId: "landing-run", number: 1 });
+      expect(t.sqlite.prepare("SELECT status,config_error FROM ci_runs").get()).toEqual({
+        status: "queued",
+        config_error: null,
+      });
+      expect(t.jobs("landing-run")[0]?.status).toBe("queued");
+    } finally {
+      t.sqlite.close();
+    }
+  });
+
+  test("a failed start preserves its error and settles only unstarted jobs", async () => {
+    const t = setup();
+    files.ciYml = "jobs:\n  gate:\n    steps: [echo gate]\n";
+    const failure = new Error("Workflow unavailable");
+    t.env.CI_RUN = {
+      create: async () => {
+        throw failure;
+      },
+      get: async () => {
+        throw new Error("No instance");
+      },
+    } as unknown as Env["CI_RUN"];
+    try {
+      await expect(
+        t.start({ trigger: "landing", preview: undefined, runId: "failed-start" }),
+      ).rejects.toBe(failure);
+      expect(t.sqlite.prepare("SELECT status,config_error FROM ci_runs").get()).toEqual({
+        status: "failed",
+        config_error: `The run could not be started: ${String(failure)}`,
+      });
+      expect(t.jobs("failed-start")[0]?.status).toBe("cancelled");
+      expect(t.sqlite.prepare("SELECT status FROM ci_steps").get()).toEqual({
+        status: "cancelled",
+      });
+    } finally {
+      t.sqlite.close();
+    }
+  });
+});
+
 describe("preview runs", () => {
   test("deletion fences new CI and workflow recovery but permits purge teardown", async () => {
     const t = setup();

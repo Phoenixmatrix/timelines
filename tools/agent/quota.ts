@@ -98,6 +98,59 @@ export async function readEnvironmentLimits(): Promise<{ maximum: number; author
 }
 
 const execute = promisify(execFile);
+
+function quotaResponseError(status: number, message: unknown): QuotaResponseError {
+  if (status === 409) {
+    const capacity =
+      typeof message === "string"
+        ? /^Installation environment limit reached \((0|[1-9][0-9]{0,9})\/(0|[1-9][0-9]{0,9})\)\. Destroy unused environments on their owning machines, or ask a site administrator to change gm settings environments set --site --max\. Expired reservations still require cleanup\.$/.exec(
+            message,
+          )
+        : null;
+    if (capacity && Number(capacity[1]) <= 2147483647 && Number(capacity[2]) <= 2147483647)
+      return new QuotaResponseError(
+        `Installation environment limit reached (${Number(capacity[1])}/${Number(capacity[2])}). Destroy unused environments on their owning machines, or ask a site administrator to change gm settings environments set --site --max. Expired reservations still require cleanup.`,
+      );
+    if (message === "Environment reservation belongs to a different owner or configuration.")
+      return new QuotaResponseError(
+        "Environment reservation belongs to a different owner or configuration. Inspect the owning environment's journal and resolve the reservation conflict before retrying.",
+      );
+    return new QuotaResponseError(
+      "Quota request conflicted (409); no recognized capacity diagnostic.",
+    );
+  }
+  if (status === 401 || status === 403)
+    return new QuotaResponseError(
+      `Quota authorization failed (${status}). Sign in to the pinned authority with an identity permitted to manage this reservation.`,
+    );
+  return new QuotaResponseError(`Quota request failed (${status}).`);
+}
+
+function subprocessQuotaError(error: unknown): never {
+  // gm -o json emits { error: { code, message, ... } } on stderr.
+  // Parse only that envelope; arbitrary text, hints and stdout are never diagnostics.
+  if (error && typeof error === "object" && "stderr" in error && typeof error.stderr === "string") {
+    let diagnostic;
+    try {
+      diagnostic = JSON.parse(error.stderr);
+    } catch {
+      throw error;
+    }
+    const detail = diagnostic?.error;
+    if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+      const status =
+        detail.code === "conflict"
+          ? 409
+          : detail.code === "unauthenticated"
+            ? 401
+            : detail.code === "forbidden"
+              ? 403
+              : undefined;
+      if (status !== undefined) throw quotaResponseError(status, detail.message);
+    }
+  }
+  throw error;
+}
 async function quotaRequest(
   record: QuotaOwner,
   method: "POST" | "DELETE",
@@ -126,7 +179,15 @@ async function quotaRequest(
         redirect: "error",
         signal: AbortSignal.timeout(120_000),
       });
-      if (!response.ok) throw new QuotaResponseError(`Quota request failed (${response.status}).`);
+      if (!response.ok) {
+        const diagnostic: unknown = await response.json().catch(() => null);
+        throw quotaResponseError(
+          response.status,
+          diagnostic && typeof diagnostic === "object" && "error" in diagnostic
+            ? diagnostic.error
+            : undefined,
+        );
+      }
       try {
         acknowledgement = await response.json();
       } catch {
@@ -155,7 +216,7 @@ async function quotaRequest(
           timeout: 120_000,
           maxBuffer: 16 * 1024 * 1024,
         },
-      );
+      ).catch(subprocessQuotaError);
       try {
         acknowledgement = JSON.parse(stdout);
       } catch {
@@ -180,9 +241,9 @@ async function quotaRequest(
     const detail =
       error instanceof QuotaResponseError
         ? error.message
-        : "Quota transport or credentials unavailable.";
+        : "Quota transport or credentials unavailable. Check the quota API and sign in to the pinned authority with gm before retrying cleanup/setup.";
     throw new Error(
-      `Environment quota authority ${authority} refused ${method}. No admission fallback is allowed. Deploy the environment quota API, sign in to that authority with gm, and retry cleanup/setup. ${detail}`,
+      `Environment quota authority ${authority} refused ${method}. No admission fallback is allowed. ${detail}`,
     );
   }
 }

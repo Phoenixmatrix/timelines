@@ -7,6 +7,11 @@ import { sweepDurableInstances } from "./durable/sweep.ts";
 import { collectUsage } from "./usage/collect.ts";
 import { runMirrorJob, type MirrorJob } from "./mirror/queue.ts";
 import { runReleaseNotesJob, type ReleaseNotesJob } from "./release-notes/queue.ts";
+import {
+  runReleaseHighlightsJob,
+  sweepReleaseHighlights,
+  type ReleaseHighlightsJob,
+} from "./release-notes/highlights.ts";
 import { retentionCron, runRetentionJob, type RetentionJob } from "./retention/runs.ts";
 import { resumeDeletions } from "./retention/repo-deletion.ts";
 import { sweepRepoOrphans, sweepsOrphans } from "./retention/repo-orphans.ts";
@@ -31,10 +36,12 @@ export default {
     if (isPreview(env)) return batch.retryAll();
     if (batch.queue === "gitmatrix-jobs") {
       for (const message of batch.messages as readonly Message<
-        MirrorJob | ReleaseNotesJob | RetentionJob
+        MirrorJob | ReleaseNotesJob | ReleaseHighlightsJob | RetentionJob
       >[]) {
         if (message.body.type === "retention")
           await runRetentionJob(env, message as Message<RetentionJob>);
+        else if (message.body.type === "release-highlights")
+          await runReleaseHighlightsJob(env, message as Message<ReleaseHighlightsJob>);
         else if (message.body.type === "release-notes")
           await runReleaseNotesJob(env, message as Message<ReleaseNotesJob>, (work) =>
             ctx.waitUntil(work),
@@ -62,6 +69,11 @@ export default {
   async scheduled(_controller, env, ctx) {
     if (isPreview(env)) return;
     ctx.waitUntil(scheduleSweeps(env));
+    ctx.waitUntil(
+      sweepReleaseHighlights(env).catch((error) =>
+        console.error("Release highlights: hourly sweep failed", error),
+      ),
+    );
     ctx.waitUntil(
       sweepPreviews(env, { waitUntil: (work) => ctx.waitUntil(work) }).catch((error) =>
         console.error("Previews: the sweep failed", error),
@@ -126,7 +138,10 @@ export default {
       ).catch((error) => console.error("Mentions: the backfill failed", error)),
     );
   },
-} satisfies ExportedHandler<Env, Job | MirrorJob | ReleaseNotesJob | RetentionJob>;
+} satisfies ExportedHandler<
+  Env,
+  Job | MirrorJob | ReleaseNotesJob | ReleaseHighlightsJob | RetentionJob
+>;
 export { KnowledgeBuild } from "./knowledge/build.ts";
 export { KnowledgeCoordinator } from "./knowledge/coordinator.ts";
 export { StepFeed } from "./steps/feed.ts";

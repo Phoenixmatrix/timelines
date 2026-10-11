@@ -141,6 +141,15 @@ test("settings graph navigation keeps its account and position while the list lo
   const graph = page.getByRole("link", { name: "Timeline graph", exact: true });
   await expect.element(graph).toHaveAttribute("href", "/tracker/orbit/timelines");
   await expect.element(page.getByText("Loading timelines…")).toBeVisible();
+  // Measure the data transition, not the popover's separate entrance motion.
+  const popup = page.getByRole("dialog", { name: "Timeline", exact: true });
+  await expect.element(popup).not.toHaveAttribute("data-starting-style");
+  await Promise.all(
+    popup
+      .element()
+      .getAnimations()
+      .map((animation) => animation.finished),
+  );
   await graph.click({ trial: true });
   const before = graph.element().getBoundingClientRect();
   release();

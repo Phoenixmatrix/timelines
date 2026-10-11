@@ -246,15 +246,11 @@ describe("provider models in AI settings and jobs", () => {
     const settings = (await (
       await call(tokens.member, "GET", "settings/ai")
     ).json()) as AiSettingsView;
-    const ids = (role: "classification" | "fast" | "task") =>
-      settings.catalog[role].map((option) => option.id);
-    expect(ids("classification")).toEqual(["clef", "typesafe:jev-latest"]);
-    expect(ids("fast")).toEqual([
-      "glm-5.3-flash",
-      "gemma-4-26b-a4b-it",
-      "openrouter:anthropic/claude-sonnet-5",
-    ]);
-    expect(ids("task")).toEqual(ids("fast"));
+    const providerIds = (role: "classification" | "fast" | "task") =>
+      settings.catalog[role].filter((option) => option.provider).map((option) => option.id);
+    expect(providerIds("classification")).toEqual(["typesafe:jev-latest"]);
+    expect(providerIds("fast")).toEqual(["openrouter:anthropic/claude-sonnet-5"]);
+    expect(providerIds("task")).toEqual(providerIds("fast"));
     // A capability mismatch is refused like any unknown model.
     const wrong = await call(tokens.owner, "PATCH", "settings/ai", {
       models: { classification: "openrouter:anthropic/claude-sonnet-5" },

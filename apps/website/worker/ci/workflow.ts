@@ -355,7 +355,7 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
       const run = (
         await kdb.selectFrom("ci_runs").select("status").where("id", "=", runId).executeTakeFirst()
       )?.status;
-      if (run === "cancelled") return "cancelled" as const;
+      if (run !== "queued" && run !== "running") return "cancelled" as const;
       if (blocked) {
         await batch(d1, [
           kdb
@@ -379,6 +379,11 @@ export class CiRun extends WorkflowEntrypoint<Env, RunParams> {
         .set({ status: "queued" })
         .where("id", "=", job.id)
         .where("status", "=", "pending")
+        .where(
+          "run_id",
+          "in",
+          kdb.selectFrom("ci_runs").select("id").where("status", "in", ["queued", "running"]),
+        )
         .execute();
       return "queued" as const;
     });

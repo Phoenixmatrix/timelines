@@ -3,7 +3,7 @@
 export type AiRole = "classification" | "fast" | "task";
 /** A model an account added from one of its own providers (CORE-294): `<provider>:<model>`. */
 export type ProviderModelId = `${AiProviderKind}:${string}`;
-export type ClassificationModel = "clef" | ProviderModelId;
+export type ClassificationModel = "clef" | "clef-flash" | "clef-omni" | ProviderModelId;
 export type GenerationModel = "glm-5.3-flash" | "gemma-4-26b-a4b-it" | ProviderModelId;
 
 export interface AiFeatures {
@@ -77,6 +77,25 @@ export const AI_MODEL_CATALOG: Readonly<Record<AiRole, readonly AiModelOption[]>
       outputUsdPerMillion: 0,
       url: "https://developers.cloudflare.com/workers-ai/models/clef/",
     },
+    // Clef family prices checked 2026-10-11; output tokens are not charged.
+    {
+      id: "clef-flash",
+      name: "Clef Flash",
+      model: "@cf/cloudflare/clef-flash",
+      releasedAt: "2026-10-01",
+      inputUsdPerMillion: 0.038,
+      outputUsdPerMillion: 0,
+      url: "https://developers.cloudflare.com/workers-ai/models/clef-flash/",
+    },
+    {
+      id: "clef-omni",
+      name: "Clef Omni",
+      model: "@cf/cloudflare/clef-omni",
+      releasedAt: "2026-10-09",
+      inputUsdPerMillion: 0.15,
+      outputUsdPerMillion: 0,
+      url: "https://developers.cloudflare.com/workers-ai/models/clef-omni/",
+    },
   ],
   fast: [GLM_FLASH, GEMMA],
   task: [GLM_FLASH, GEMMA],
@@ -109,6 +128,17 @@ export const DEFAULT_KNOWLEDGE_SCHEDULE: KnowledgeUpdateSchedule = {
 
 /** The longest either wait may be: one day. */
 export const MAX_KNOWLEDGE_WAIT_MINUTES = 1440;
+
+/** Refresh highlights for opened surfaces; the scope's account controls cadence. */
+export interface ReleaseHighlightsSchedule {
+  intervalHours: number;
+}
+
+export const DEFAULT_RELEASE_HIGHLIGHTS_SCHEDULE: ReleaseHighlightsSchedule = {
+  intervalHours: 24,
+};
+
+export const MAX_RELEASE_HIGHLIGHTS_INTERVAL_HOURS = 168;
 
 /**
  * What AI Gateway logs keep (CORE-290): every model call's metadata (model,
@@ -197,6 +227,7 @@ export interface SiteAiSettingsPatch {
 
 export interface AiSettings extends AiConfiguration {
   knowledgeUpdates: KnowledgeUpdateSchedule;
+  releaseHighlights: ReleaseHighlightsSchedule;
   updatedAt: string | null;
   updatedBy: string | null;
 }
@@ -216,6 +247,7 @@ export interface AiSettingsPatch {
   features?: Partial<AiFeatures>;
   models?: Partial<AiModelSelection>;
   knowledgeUpdates?: Partial<KnowledgeUpdateSchedule>;
+  releaseHighlights?: Partial<ReleaseHighlightsSchedule>;
   logBodies?: AiLogBodiesPatch;
 }
 

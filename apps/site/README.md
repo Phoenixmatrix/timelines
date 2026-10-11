@@ -1,6 +1,6 @@
 # Public site
 
-The public marketing and documentation site for Gitmatrix, served at
+The public marketing and documentation site for Timelines, served at
 [timelines.fward.dev](https://timelines.fward.dev) (CORE-115). It is built with
 [Astro](https://astro.build) as static pages and served by a Worker of its own,
 `gitmatrix-site`, that has no code: only its assets. Nobody signs in here; the
@@ -17,6 +17,11 @@ header links to the web app at gitmatrix.fward.dev.
 - `src/styles/tokens.css`: a copy of the web app's MatrixKit Neo tokens, and
   `public/brand/`, `public/favicon*`: copies of its brand assets. Keep them in
   step with `apps/website`.
+
+The header pairs the exact Pounce cat with the Timelines name in the site's
+existing Figtree typography. Preserve the cat paths, palette and historical
+asset provenance; internal `gitmatrix` names and operational app URLs are
+not product-name prose.
 
 ## Commands
 

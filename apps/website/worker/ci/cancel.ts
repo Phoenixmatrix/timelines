@@ -4,10 +4,20 @@
 
 import { batch, db, nowIso } from "../schema.ts";
 
-/** Cancel undispatched work; running children acknowledge cancellation in report(). */
+/** Cancel undispatched or confirmed-stopped work; live children acknowledge in report(). */
 export async function cancelRun(env: Env, runId: string): Promise<void> {
   const kdb = db(env.DB);
   const now = nowIso();
+  // Ambiguous queued retries retain active-attempt evidence. Only a confirmed
+  // Sandbox shutdown clears it; Workflow termination alone never acknowledges it.
+  const unstarted = kdb
+    .selectFrom("ci_jobs")
+    .select("id")
+    .where("run_id", "=", runId)
+    .where("status", "in", ["pending", "queued"])
+    .where("claimed_by", "is", null)
+    .where("started_at", "is", null)
+    .where("source_completion_pending", "=", 0);
   await batch(env.DB, [
     kdb
       .updateTable("ci_runs")
@@ -15,15 +25,14 @@ export async function cancelRun(env: Env, runId: string): Promise<void> {
       .where("id", "=", runId)
       .where("status", "in", ["queued", "running"]),
     kdb
-      .updateTable("ci_jobs")
-      .set({ status: "cancelled", finished_at: now })
-      .where("run_id", "=", runId)
-      .where("status", "in", ["pending", "queued"]),
-    kdb
       .updateTable("ci_steps")
       .set({ status: "cancelled", finished_at: now })
-      .where("job_id", "in", kdb.selectFrom("ci_jobs").select("id").where("run_id", "=", runId))
-      .where("status", "in", ["pending", "running"]),
+      .where("job_id", "in", unstarted)
+      .where("status", "=", "pending"),
+    kdb
+      .updateTable("ci_jobs")
+      .set({ status: "cancelled", finished_at: now })
+      .where("id", "in", unstarted),
   ]);
   const workflow = Reflect.get(env, "CI_RUN") as Workflow | undefined;
   const instance = await workflow?.get(runId).catch(() => null);

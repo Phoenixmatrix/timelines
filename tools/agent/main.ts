@@ -360,7 +360,7 @@ async function selectAiStages(options: TestAiOptions): Promise<Selection | null>
     changed,
     requested: options.stages,
     all: options.all,
-    reusable: options.resume ? reusableStages(history.at(-1), base, prints) : undefined,
+    reusable: options.resume ? reusableStages(history, base, prints) : undefined,
     base,
     fingerprints: prints,
   });
@@ -385,7 +385,7 @@ async function selectAiStages(options: TestAiOptions): Promise<Selection | null>
       JSON.stringify({
         event: "test-ai.nothing-to-run",
         reason: options.resume
-          ? "Every selected stage passed in the previous run with the same inputs."
+          ? "Every selected stage has unchanged successful evidence."
           : "No changed path maps to an AI stage; nothing is provisioned or spent.",
         next: "Name stages with --stage <id> or use --all when a change needs them anyway.",
       }),

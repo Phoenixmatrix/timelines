@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 import type { Timeline, TimelineEvent, TimelineStatus } from "../../../shared/timelines.ts";
 import { STATUS_LABEL, type Lane, type Row, type TimelineGraph } from "./timelineGraph.ts";
 
-export const ROW_HEIGHT = 36;
+export const ROW_HEIGHT = 48;
 const LANE_WIDTH = 16;
 const PAD = 12;
 
@@ -125,7 +125,7 @@ export function LaneDrawing({
   );
   return (
     <svg
-      className="pointer-events-none absolute top-0 left-0"
+      className="pointer-events-none absolute top-0 left-0 z-10"
       width={width}
       height={height}
       viewBox={`0 0 ${width} ${height}`}

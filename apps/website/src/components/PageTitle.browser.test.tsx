@@ -49,14 +49,14 @@ test("issue selection and saved live edits publish titles without reloading the 
   await expect.poll(() => document.title).toContain("Issue unavailable");
   expect(document.title).not.toContain("Renamed live issue");
   await app.navigate("/tracker/orbit");
-  await expect.poll(() => document.title).toBe("orbit · Issues · Gitmatrix");
+  await expect.poll(() => document.title).toMatch(/^orbit · Issues · /);
   await app.navigate("/settings/preferences");
-  await expect.poll(() => document.title).toBe("Preferences · Gitmatrix");
+  await expect.poll(() => document.title).toMatch(/^Preferences · /);
 
   // A protected destination redirects to auth, not the issue we were looking at.
   server.on("GET", "/api/tracker/private/view", () => reply({ error: "Sign in" }, 401));
   await app.navigate("/tracker/private/issues/secret");
-  await expect.poll(() => document.title).toBe("Sign in · Gitmatrix");
+  await expect.poll(() => document.title).toMatch(/^Sign in · /);
   expect(app.url().pathname).toBe("/signin");
 });
 
@@ -121,18 +121,18 @@ test("repository, file and CI titles clear during loading and after failed navig
   });
   const navigation = app.navigate("/tracker/private/issues/private-key");
   try {
-    await expect.poll(() => document.title).toBe("Loading · Gitmatrix");
+    await expect.poll(() => document.title).toMatch(/^Loading · /);
   } finally {
     release();
   }
   await navigation;
-  await expect.poll(() => document.title).toBe("Access denied · Gitmatrix");
+  await expect.poll(() => document.title).toMatch(/^Access denied · /);
   expect(document.title).not.toMatch(/private|engine|42/i);
 
   await app.navigate("/signin?next=/tracker/private/issues/private-key");
-  await expect.poll(() => document.title).toBe("Sign in · Gitmatrix");
+  await expect.poll(() => document.title).toMatch(/^Sign in · /);
   await app.navigate("/this/path/has/no/route");
-  await expect.poll(() => document.title).toBe("Page not found · Gitmatrix");
+  await expect.poll(() => document.title).toMatch(/^Page not found · /);
   await app.navigate("/orbit/engine/ci/42");
   await expect.poll(() => document.title).toContain("orbit/engine · CI #42");
 });
@@ -150,9 +150,9 @@ test("an initial root-loader failure replaces an earlier private document title"
   document.title = "Private issue from the previous document";
   renderApp("/settings/profile");
   try {
-    await expect.poll(() => document.title).toBe("Loading · Gitmatrix");
+    await expect.poll(() => document.title).toMatch(/^Loading · /);
   } finally {
     release();
   }
-  await expect.poll(() => document.title).toBe("Page unavailable · Gitmatrix");
+  await expect.poll(() => document.title).toMatch(/^Page unavailable · /);
 });

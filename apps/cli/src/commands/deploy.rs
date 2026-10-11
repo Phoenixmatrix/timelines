@@ -1,4 +1,4 @@
-//! Deployment records: Gitmatrix deploys nothing, so jobs and outside systems
+//! Deployment records: Timelines deploys nothing, so jobs and outside systems
 //! tell it where code went (`gm deploy record`), and it shows them next to CI
 //! runs, commits and timelines. Inside a CI job gm records as the job (its
 //! GITMATRIX_TOKEN): the server fills in the repository's run, commit and
