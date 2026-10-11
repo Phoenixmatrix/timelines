@@ -820,24 +820,24 @@ changed, unless `--force`: inspect the evidence and fix the cause instead of loo
 `completion.json` and `ai-e2e.json` (`selection`, `stages`, `cost`) record which
 stages ran, why, their outcomes and the Gateway-logged spend.
 
-| Stage                                                | Verifies                                                                                           |
-| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `classification`                                     | Selected Clef Flash/Omni decisions, uncached attribution and one metered call per model            |
-| `knowledge`                                          | AI settings admission, the build, graph and generated wiki overview                                |
-| `search`                                             | Vectorize entity and AI Search passage visibility, isolation, palette search                       |
-| `assistant`                                          | A real turn from the index, approval-gated writes, retry, status between steps                     |
-| `avatars`                                            | Real avatar generation within its ten-call budget                                                  |
-| `knowledge-edit`                                     | An edit's incremental rebuild, concept naming, successor build settings                            |
-| `release-notes`                                      | Daily notes, rollover, a tag, a tracker issue's entry, the team feed                               |
-| `release-highlights`                                 | Grounded repo/tracker/site prose, authorized-source isolation, cadence, invalidation and real UI   |
-| `overlays`                                           | A timeline bookmark's knowledge overlay, main untouched                                            |
-| `timeline-pages`                                     | A checkpoint's wiki pages, main untouched                                                          |
-| `repository-deletion`                                | Purging the fixture's vectors, search items and Artifacts; the orphan sweep                        |
-| `queue`                                              | The merge queue's real conflict repair                                                             |
-| `atlas-describe`                                     | The ledger's capabilities named and summarized with provenance; Knowledge tab                      |
-| `atlas-workspace`                                    | A dependency resolved across repositories in the workspace Atlas                                   |
-| `atlas-reuse`                                        | Same-tree commit: cached prose and inference provenance, advanced source basis, no new Atlas calls |
-| `atlas-disabled`, `atlas-refused`, `atlas-exhausted` | The three degraded Atlas providers                                                                 |
+| Stage                                                | Verifies                                                                                            |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `classification`                                     | Selected Clef Flash/Omni decisions, uncached attribution and one metered call per model             |
+| `knowledge`                                          | AI settings admission, the build, graph and generated wiki overview                                 |
+| `search`                                             | Vectorize entity and AI Search passage visibility, isolation, palette search                        |
+| `assistant`                                          | A real turn from the index, approval-gated writes, retry, status between steps                      |
+| `avatars`                                            | Real avatar generation within its ten-call budget                                                   |
+| `knowledge-edit`                                     | An edit's incremental rebuild, concept naming, successor build settings                             |
+| `release-notes`                                      | Daily notes, rollover, a tag, a tracker issue's entry, the team feed                                |
+| `release-highlights`                                 | Grounded organization prose over seven days, authorized-source isolation, cadence, invalidation, UI |
+| `overlays`                                           | A timeline bookmark's knowledge overlay, main untouched                                             |
+| `timeline-pages`                                     | A checkpoint's wiki pages, main untouched                                                           |
+| `repository-deletion`                                | Purging the fixture's vectors, search items and Artifacts; the orphan sweep                         |
+| `queue`                                              | The merge queue's real conflict repair                                                              |
+| `atlas-describe`                                     | The ledger's capabilities named and summarized with provenance; Knowledge tab                       |
+| `atlas-workspace`                                    | A dependency resolved across repositories in the workspace Atlas                                    |
+| `atlas-reuse`                                        | Same-tree commit: cached prose and inference provenance, advanced source basis, no new Atlas calls  |
+| `atlas-disabled`, `atlas-refused`, `atlas-exhausted` | The three degraded Atlas providers                                                                  |
 
 Every run provisions its own paid resources. Together, the stages verify the exact
 pushed commit, named graph relationships, generated wiki provenance/content, and

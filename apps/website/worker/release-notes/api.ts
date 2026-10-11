@@ -161,37 +161,6 @@ releaseNotes.get("/range", async (c) => {
     await objects.close();
   }
 });
-releaseNotes.get("/highlights", async (c) => {
-  c.header("cache-control", "private, no-store");
-  const loaded = await loadRepo(c);
-  if (loaded instanceof Response) return loaded;
-  const actor = c.get("actor");
-  if (!actor || actor.agent)
-    return c.json({
-      scope: "repo",
-      repo: { owner: loaded.row.owner_slug, name: loaded.row.name },
-      status: { state: "disabled", generatedAt: null },
-      body: null,
-      model: null,
-      notes: [],
-      updatedAt: null,
-    });
-  try {
-    return c.json(
-      await readReleaseHighlights(c.env, actor, {
-        type: "release-highlights",
-        scope: "repo",
-        scopeId: loaded.row.id,
-        viewerId: actor.id,
-        ownerAccountId: loaded.row.owner_id,
-      }),
-    );
-  } catch (error) {
-    if (error instanceof FeedError) return c.json({ error: error.message }, error.status);
-    throw error;
-  }
-});
-
 /** The releases this repository has notes for, and whether generation is running. */
 releaseNotes.get("/", async (c) => {
   const loaded = await loadRepo(c);
@@ -264,28 +233,6 @@ trackerReleaseNotes.get("/highlights", async (c) => {
         scopeId: owner.id,
         viewerId: actor.id,
         ownerAccountId: owner.id,
-      }),
-    );
-  } catch (error) {
-    if (error instanceof FeedError) return c.json({ error: error.message }, error.status);
-    throw error;
-  }
-});
-
-export const siteReleaseNotes = new Hono<AppEnv>();
-siteReleaseNotes.get("/highlights", async (c) => {
-  c.header("cache-control", "private, no-store");
-  const actor = c.get("actor");
-  if (!actor || actor.agent)
-    return c.json({ error: "Sign in as a person to read highlights." }, 401);
-  try {
-    return c.json(
-      await readReleaseHighlights(c.env, actor, {
-        type: "release-highlights",
-        scope: "site",
-        scopeId: actor.id,
-        viewerId: actor.id,
-        ownerAccountId: actor.id,
       }),
     );
   } catch (error) {

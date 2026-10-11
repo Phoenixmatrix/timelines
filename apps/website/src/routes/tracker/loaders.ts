@@ -36,13 +36,17 @@ export function trackerIndexLoader({ request }: LoaderFunctionArgs) {
   return intoDefaultTracker(request, "");
 }
 
-/** `/timelines` and `/release-notes`, the rail's places: your default tracker's. */
+/** `/timelines`, `/release-notes` and `/highlights`, the rail's places: your default tracker's. */
 export function timelinesIndexLoader({ request }: LoaderFunctionArgs) {
   return intoDefaultTracker(request, "/timelines");
 }
 
 export function releaseNotesIndexLoader({ request }: LoaderFunctionArgs) {
   return intoDefaultTracker(request, "/releases");
+}
+
+export function highlightsIndexLoader({ request }: LoaderFunctionArgs) {
+  return intoDefaultTracker(request, "/highlights");
 }
 
 /** `?tl=<slug>` selects a timeline's view; main's is the default. */

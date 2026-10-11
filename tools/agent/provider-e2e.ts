@@ -139,7 +139,7 @@ export const COPPER_FINCH_STAGES = [
   {
     id: "release-highlights",
     covers:
-      "Repo/tracker/site summaries and an authorized outsider view, daily backlinks, account/model/Gateway evidence, desktop/mobile and global navigation, cadence and source invalidation (six-summary ceiling)",
+      "Organization summaries over the last seven days, retired repo/site endpoints, a refused non-member, daily backlinks, account/model/Gateway evidence, desktop/mobile and rail navigation, cadence and source invalidation (three-summary ceiling)",
     requires: ["release-notes"],
     paths: [
       HARNESS,
@@ -152,6 +152,8 @@ export const COPPER_FINCH_STAGES = [
       `${SRC}/routes/Highlights.browser.test.tsx`,
       `${SRC}/routes/repo/Releases.tsx`,
       `${SRC}/routes/tracker/Releases.tsx`,
+      `${SRC}/routes/tracker/loaders.ts`,
+      `${SRC}/components/AppShell.tsx`,
       `${SRC}/appRoutes.tsx`,
       `${SRC}/lib/timelineScope.ts`,
     ],
@@ -2472,26 +2474,33 @@ export async function runProviderE2E(
         await atlas;
         enter("release-highlights");
         const repo = await api(base);
-        const personalPath = `/accounts/${persona}/settings/ai`;
-        const personal: AiSettingsView = await api(personalPath);
         const orgPolicy: AiSettingsView = await api(settingsPath);
-        const outsiderApi = async (path: string, method = "GET", body?: unknown) => {
+        // Highlights are organization-level, windowed to seven days: the fixture's real
+        // daily note is long past, so the proof copies it to today ("recent") and to ten
+        // days ago ("stale", which must never feed the summary).
+        // Both come from the fixture's own clock once its copies exist.
+        let recentRelease = "";
+        let cutoffRelease = "";
+        let recentLink = "";
+        const raw = async (path: string, token: string) => {
           const response = await fetch(`${ctx.origin}/api${path}`, {
-            method,
-            headers: {
-              authorization: `Bearer ${fixtures.tokens.sam}`,
-              "content-type": "application/json",
-            },
-            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            headers: { authorization: `Bearer ${token}` },
             signal: AbortSignal.timeout(60_000),
           });
-          assert.equal(response.status, 200);
-          return response.json();
+          const text = await response.text();
+          let body: Record<string, unknown> = {};
+          try {
+            body = JSON.parse(text);
+          } catch {
+            // A plain-text 404 carries no body worth keeping.
+          }
+          return { status: response.status, body };
         };
-        const outsiderPolicy: AiSettingsView = await outsiderApi("/accounts/sam/settings/ai");
         const detailed = await notesFor("day:2026-01-03");
         const tagged = await notesFor("provider-v1");
-        const report: Record<string, unknown> = { maximumSummaries: 6, expectedSummaries: 6 };
+        // One new viewer projection: the first summary, the scheduled refresh and the
+        // invalidation repair are each one paid call, all billed to the organization.
+        const report: Record<string, unknown> = { maximumSummaries: 3, expectedSummaries: 3 };
         evidence.highlights = report;
         type StoredHighlight = {
           scope: ReleaseHighlights["scope"];
@@ -2504,6 +2513,7 @@ export async function runProviderE2E(
           source_manifest: string;
         };
         type FixtureState = {
+          day?: string;
           rows: StoredHighlight[];
           usage: { account_id: string; model: string; calls: number; failed_calls: number }[];
         };
@@ -2521,15 +2531,10 @@ export async function runProviderE2E(
           assert.equal(response.status, 200, `Highlights fixture ${action}`);
           return response.json();
         };
-        const paths = [
-          `${base}/release-notes/highlights`,
-          `/tracker/${owner}/release-notes/highlights`,
-          "/release-notes/highlights",
-        ];
-        const summaries: ReleaseHighlights[] = [];
+        const path = `/tracker/${owner}/release-notes/highlights`;
         const observedHighlights: ReleaseHighlights[] = [];
         report.generations = observedHighlights;
-        const ready = async (path: string, previous?: string | null) => {
+        const ready = async (previous?: string | null) => {
           let result!: ReleaseHighlights;
           await waitFor("highlights-ready", 180_000, async () => {
             result = await api(path);
@@ -2537,19 +2542,26 @@ export async function runProviderE2E(
             return result.status.state === "ready" && result.status.generatedAt !== previous;
           });
           observedHighlights.push(result);
+          assert.equal(result.scope, "tracker");
+          assert.equal(result.owner.slug, owner);
           assert(
             result.notes.some(
               (note) =>
                 note.repo.owner === owner &&
                 note.repo.name === name &&
-                note.release === "@day:2026-01-03",
+                note.release === recentRelease,
             ),
+          );
+          assert(
+            result.notes.every((note) => note.release >= cutoffRelease),
+            "Only daily notes from the last seven days may back a summary",
           );
           assert(result.body && result.body.length <= 1500);
           assert.match(result.body, /parcel|checksum/i);
           assert.match(result.body, /verif|check|match/i);
           assert.match(result.body, /batch|all|every|multiple|several|many/i);
           assert.doesNotMatch(result.body, /CF-1|https?:\/\/|\]\(/);
+          assert.doesNotMatch(result.body, /hologram|calibration/i);
           assert(result.model);
           return result;
         };
@@ -2559,111 +2571,93 @@ export async function runProviderE2E(
         // those can finish detailed-note generation before this proof begins.
         const highlightsStartedAt = new Date().toISOString();
         let appended = false;
+        let windowed = false;
         const proofErrors: unknown[] = [];
         try {
-          // Preserve each account's selected Task model; prove its actual provenance.
-          await api(personalPath, "PATCH", {
-            features: { releaseNotes: true },
-            releaseHighlights: { intervalHours: 24 },
-          });
-          await outsiderApi("/accounts/sam/settings/ai", "PATCH", {
-            features: { releaseNotes: true },
-          });
-          report.policies = { organization: orgPolicy, personal, outsider: outsiderPolicy };
+          report.policies = { organization: orgPolicy };
           report.semanticRequirements = [
             "parcel/checksum verification",
             "batch/all/every/multiple parcels",
             "no issue keys or invented URLs",
+            "no entry older than seven days",
           ];
           assert.equal(
             orgPolicy.releaseHighlights.intervalHours,
             24,
             "Default organization cadence is daily",
           );
-          assert.equal(
-            personal.releaseHighlights.intervalHours,
-            24,
-            "Default personal cadence is daily",
-          );
-          assert.equal(
-            before.rows.length,
-            0,
-            "Fresh proof owns exactly its new viewer projections",
-          );
-          for (const path of paths) summaries.push(await ready(path));
-          const initial = await fixture("inspect");
-          report.initial = { summaries, storage: initial };
-          report.statements = summaries.map((summary) => ({
-            scope: summary.scope,
-            // Exact generated prose, not a substituted expected answer.
-            text: summary.body,
-            model: summary.model,
-            generatedAt: summary.status.generatedAt,
-            dailyBacklinks: summary.notes,
-          }));
-          assert.equal(initial.rows.length, 3);
-          for (const row of initial.rows) {
-            assert.equal(row.viewer_id, "acc_marco");
-            assert.equal(row.owner_account_id, row.scope === "site" ? "acc_marco" : "acc_orbit");
-            assert(Math.abs(row.due_at - Date.parse(row.generated_at) - 24 * 3600_000) < 180_000);
-            const summary = summaries.find((value) => value.scope === row.scope)!;
-            assert.equal(row.model, summary.model);
-            const manifest = JSON.parse(row.source_manifest) as {
-              repoId: string;
-              release: string;
-              repo: { owner: string; name: string };
-            }[];
-            assert(manifest.some((source) => source.repoId === repo.id));
-            assert.deepEqual(summary.notes, [
-              ...new Map(
-                manifest.map((source) => [
-                  JSON.stringify([source.repoId, source.release]),
-                  { repo: source.repo, release: source.release },
-                ]),
-              ).values(),
-            ]);
-          }
-          // Privacy is tested with generation enabled, never hidden behind an AI-off state.
-          const outsider: Record<string, unknown>[] = [];
-          for (const path of paths) {
-            const response = await fetch(`${ctx.origin}/api${path}`, {
-              headers: { authorization: `Bearer ${fixtures.tokens.sam}` },
-              signal: AbortSignal.timeout(60_000),
-            });
-            const body = await response.json();
-            outsider.push({ path, status: response.status, body });
-            if (path !== "/release-notes/highlights") assert([403, 404].includes(response.status));
-            else {
-              assert.equal(response.status, 200);
-              assert.notEqual(body.status.state, "disabled");
-              assert.doesNotMatch(
-                JSON.stringify(body),
-                new RegExp(`${name}|CF-1|batch parcel`, "i"),
-              );
-            }
-          }
-          report.outsider = outsider;
-          let outsiderSummary!: ReleaseHighlights;
-          await waitFor("highlights-outsider-ready", 180_000, async () => {
-            outsiderSummary = await outsiderApi("/release-notes/highlights");
-            report.outsiderSummary = outsiderSummary;
-            assert.notEqual(outsiderSummary.status.state, "failed");
-            assert.doesNotMatch(
-              JSON.stringify(outsiderSummary),
-              new RegExp(`${name}|CF-1|copper[\\s-]*finch`, "i"),
+          assert.equal(before.rows.length, 0, "Fresh proof owns exactly its new viewer projection");
+          windowed = true;
+          const recentDay = (await fixture("recent")).day;
+          assert(recentDay, "The fixture must report the day it used");
+          recentRelease = `@day:${recentDay}`;
+          cutoffRelease = `@day:${new Date(Date.parse(recentDay) - 7 * 86_400_000).toISOString().slice(0, 10)}`;
+          recentLink = `/${owner}/${name}/releases/${encodeURIComponent(recentRelease)}`;
+          await fixture("stale");
+          // The repository and site summaries no longer exist.
+          for (const retired of [`${base}/release-notes/highlights`, "/release-notes/highlights"])
+            assert.equal(
+              (await raw(retired, fixtures.tokens[persona])).status,
+              404,
+              `${retired} no longer exists`,
             );
-            return outsiderSummary.status.state === "ready";
-          });
+          const summary = await ready();
+          const initial = await fixture("inspect");
+          report.initial = { summary, storage: initial };
+          report.statements = [
+            {
+              scope: summary.scope,
+              // Exact generated prose, not a substituted expected answer.
+              text: summary.body,
+              model: summary.model,
+              generatedAt: summary.status.generatedAt,
+              dailyBacklinks: summary.notes,
+            },
+          ];
+          assert.equal(initial.rows.length, 1);
+          const [row] = initial.rows;
+          assert.equal(row.scope, "tracker");
+          assert.equal(row.scope_id, "acc_orbit");
+          assert.equal(row.viewer_id, "acc_marco");
+          assert.equal(row.owner_account_id, "acc_orbit");
+          assert(Math.abs(row.due_at - Date.parse(row.generated_at) - 24 * 3600_000) < 180_000);
+          assert.equal(row.model, summary.model);
+          const manifest = JSON.parse(row.source_manifest) as {
+            repoId: string;
+            release: string;
+            repo: { owner: string; name: string };
+          }[];
           assert(
-            outsiderSummary.notes.some((note) => note.repo.owner === "sam"),
-            "Sam must retain their own authorized notes without the private fixture",
+            manifest.some(
+              (source) => source.repoId === repo.id && source.release === recentRelease,
+            ),
           );
+          assert(
+            manifest.every((source) => source.release >= cutoffRelease),
+            "The stale and original daily notes are outside the seven-day window",
+          );
+          assert.deepEqual(summary.notes, [
+            ...new Map(
+              manifest.map((source) => [
+                JSON.stringify([source.repoId, source.release]),
+                { repo: source.repo, release: source.release },
+              ]),
+            ).values(),
+          ]);
+          // Privacy is tested with generation enabled, never hidden behind an AI-off state:
+          // a non-member gets the tracker's refusal and no prose.
+          const outsider = await raw(path, fixtures.tokens.sam);
+          report.outsider = outsider;
+          assert([403, 404].includes(outsider.status));
+          assert.doesNotMatch(
+            JSON.stringify(outsider.body),
+            new RegExp(`${name}|CF-1|batch parcel|copper[\\s-]*finch`, "i"),
+          );
+          assert.equal(outsider.body.body, undefined);
           const beforeAppend = await fixture("inspect");
           await fixture("append");
           appended = true;
-          for (let repeat = 0; repeat < 2; repeat++)
-            for (const [index, path] of paths.entries())
-              assert.deepEqual(await api(path), summaries[index]);
+          for (let repeat = 0; repeat < 2; repeat++) assert.deepEqual(await api(path), summary);
           const unchanged = await fixture("inspect");
           assert.deepEqual(
             unchanged,
@@ -2673,10 +2667,10 @@ export async function runProviderE2E(
           report.beforeDue = unchanged;
           await api(settingsPath, "PATCH", { releaseHighlights: { intervalHours: 48 } });
           assert.equal((await api(settingsPath)).releaseHighlights.intervalHours, 48);
-          await fixture("due"); // Actual sweep; only the owned repository row is aged.
-          const refreshed = await ready(paths[0], summaries[0].status.generatedAt);
+          await fixture("due"); // Actual sweep; only the owned organization row is aged.
+          const refreshed = await ready(summary.status.generatedAt);
           const scheduled = await fixture("inspect");
-          const scheduledRow = scheduled.rows.find((row) => row.scope === "repo")!;
+          const scheduledRow = scheduled.rows.find((value) => value.scope === "tracker")!;
           assert(
             Math.abs(scheduledRow.due_at - Date.parse(scheduledRow.generated_at) - 48 * 3600_000) <
               180_000,
@@ -2685,11 +2679,11 @@ export async function runProviderE2E(
           // Removing a now-cited source must suppress stale prose, even before due.
           await fixture("remove-appended");
           appended = false;
-          const invalidated: ReleaseHighlights = await api(paths[0]);
+          const invalidated: ReleaseHighlights = await api(path);
           assert.equal(invalidated.body, null);
           assert.deepEqual(invalidated.notes, []);
           assert.notEqual(invalidated.status.state, "ready");
-          const restored = await ready(paths[0], refreshed.status.generatedAt);
+          const restored = await ready(refreshed.status.generatedAt);
           report.invalidation = { invalidated, restored };
           assert.deepEqual(await notesFor("day:2026-01-03"), detailed);
           assert.deepEqual(await notesFor("provider-v1"), tagged);
@@ -2702,42 +2696,62 @@ export async function runProviderE2E(
             assert(defaultTracker, "The fixture must have an accessible default tracker");
             const context = await browser.newContext({ baseURL: ctx.origin });
             const page = await context.newPage();
+            if (defaultTracker.slug !== owner)
+              // Landing on another default organization must not spend on its summary.
+              await page.route(
+                `**/api/tracker/${defaultTracker.slug}/release-notes/highlights`,
+                (route) =>
+                  route.fulfill({
+                    json: {
+                      scope: "tracker",
+                      owner: { slug: defaultTracker.slug, displayName: defaultTracker.displayName },
+                      status: { state: "disabled", generatedAt: null },
+                      body: null,
+                      model: null,
+                      notes: [],
+                      updatedAt: null,
+                    },
+                  }),
+              );
             await page.goto("/signin");
             await page
               .getByRole("button", { name: new RegExp(`Continue as ${persona}`, "i") })
               .click();
             await page.waitForURL((url) => url.pathname !== "/signin");
+            const organizationPath = `/tracker/${encodeURIComponent(owner)}/highlights`;
+            const defaultPath = `/tracker/${encodeURIComponent(defaultTracker.slug)}/highlights`;
             const screenshots: string[] = [];
+            const article = page.getByRole("article", { name: "Release highlights" });
             for (const viewport of [
               { width: 1440, height: 1000 },
               { width: 390, height: 844 },
             ]) {
               await page.setViewportSize(viewport);
-              for (const [index, route] of [
-                `/${owner}/${name}/releases/highlights`,
-                `/tracker/${owner}/highlights`,
-                "/highlights",
-              ].entries()) {
+              for (const route of [organizationPath, "/highlights"]) {
                 await page.goto(route);
-                const summary = index === 0 ? restored : summaries[index];
-                await playwrightExpect(
-                  page.getByRole("article", { name: "Release highlights" }).locator("p").first(),
-                ).toHaveText(summary.body!, { timeout: 60_000 });
-                const backlink = page.locator(
-                  `a[href="/${owner}/${name}/releases/%40day%3A2026-01-03"]`,
+                await page.waitForURL(
+                  (url) => url.pathname === (route === "/highlights" ? defaultPath : route),
                 );
-                await playwrightExpect(backlink).toBeVisible();
-                const screenshot = `highlights-${summary.scope}-${viewport.width}.png`;
-                await page.screenshot({ path: join(ctx.artifacts, screenshot), fullPage: true });
-                screenshots.push(screenshot);
-                if (summary.scope === "site" && viewport.width === 1440) {
+                const screenshot = `highlights-${route === "/highlights" ? "default" : "organization"}-${viewport.width}.png`;
+                if (route === "/highlights" && defaultTracker.slug !== owner) {
+                  await page.screenshot({ path: join(ctx.artifacts, screenshot), fullPage: true });
+                  screenshots.push(screenshot);
+                } else {
+                  await playwrightExpect(article.locator("p").first()).toHaveText(restored.body!, {
+                    timeout: 60_000,
+                  });
+                  await playwrightExpect(page.locator(`a[href="${recentLink}"]`)).toBeVisible();
+                  await page.screenshot({ path: join(ctx.artifacts, screenshot), fullPage: true });
+                  screenshots.push(screenshot);
+                }
+                if (route === "/highlights" && viewport.width === 1440) {
                   await page.getByRole("button", { name: /^Timeline: main/ }).click();
                   const graph = page
                     .getByRole("dialog", { name: "Timeline", exact: true })
                     .getByRole("link", { name: "Timeline graph", exact: true });
                   const graphPath = `/tracker/${encodeURIComponent(defaultTracker.slug)}/timelines`;
                   await playwrightExpect(graph).toHaveAttribute("href", graphPath);
-                  const navigationScreenshot = "highlights-site-navigation.png";
+                  const navigationScreenshot = "highlights-organization-navigation.png";
                   await page.screenshot({
                     path: join(ctx.artifacts, navigationScreenshot),
                     fullPage: true,
@@ -2755,12 +2769,47 @@ export async function runProviderE2E(
                 }
               }
             }
+            // The rail: from Home it lands on the default organization; inside an
+            // organization it stays there.
+            const rail = page
+              .getByRole("navigation", { name: "Places" })
+              .getByRole("link", { name: "Highlights", exact: true });
+            await page.goto("/");
+            await playwrightExpect(rail).toHaveAttribute("href", "/highlights");
+            await rail.click();
+            await page.waitForURL((url) => url.pathname === defaultPath);
+            await page.goto(`/tracker/${encodeURIComponent(owner)}/releases`);
+            await playwrightExpect(rail).toHaveAttribute("href", organizationPath);
+            await rail.click();
+            await page.waitForURL((url) => url.pathname === organizationPath);
+            await playwrightExpect(article.locator("p").first()).toHaveText(restored.body!, {
+              timeout: 60_000,
+            });
+            // The repository's release page links to its organization's highlights, and
+            // its old highlights page is gone.
+            await page.goto(`/${owner}/${name}/releases`);
+            const organizationLink = page
+              .getByRole("link", { name: "View organization highlights", exact: true })
+              .first();
+            await playwrightExpect(organizationLink).toHaveAttribute("href", organizationPath);
+            await organizationLink.click();
+            await page.waitForURL((url) => url.pathname === organizationPath);
+            await playwrightExpect(article.locator("p").first()).toHaveText(restored.body!, {
+              timeout: 60_000,
+            });
+            await page.goto(`/${owner}/${name}/releases/highlights`);
+            await playwrightExpect(
+              page.getByRole("link", { name: "View organization highlights", exact: true }).first(),
+            ).toBeVisible();
+            await playwrightExpect(article).toHaveCount(0);
             report.screenshots = screenshots;
           } finally {
             await browser.close();
           }
           const after = await fixture("inspect");
           report.after = after;
+          // Exactly three paid summaries, all the organization's: first, scheduled
+          // refresh, invalidation repair. Nothing is billed to the viewer or the outsider.
           let calls = 0;
           for (const account of ["acc_orbit", "acc_marco", "acc_sam"]) {
             const prior = before.usage
@@ -2771,39 +2820,37 @@ export async function runProviderE2E(
               .reduce((sum, row) => sum + row.calls + row.failed_calls, 0);
             assert.equal(
               current - prior,
-              account === "acc_orbit" ? 4 : 1,
-              "Each real summary is charged to its controlling account",
+              account === "acc_orbit" ? 3 : 0,
+              "Each real summary is charged to the organization",
             );
             calls += current - prior;
           }
-          assert(calls <= 6, "Highlights exceeded the hard six-summary budget");
+          assert(calls <= 3, "Highlights exceeded the hard three-summary budget");
           report.calls = calls;
           const owned = await ownedEnvironment();
           await waitFor("highlights-gateway-evidence", 120_000, async () => {
             const logs = await collectGatewayLogs((page) =>
-              gatewayLogs(owned, highlightsStartedAt, "release-notes", undefined, page),
+              gatewayLogs(owned, highlightsStartedAt, "release-highlights", undefined, page),
             );
             report.gateway = logs;
-            assert(logs.length <= 6, "Every provider attempt counts against the six-call ceiling");
+            assert(
+              logs.length <= 3,
+              "Every provider attempt counts against the three-call ceiling",
+            );
             const successful = logs.filter(
               (log) =>
                 log.success &&
                 !log.cached &&
                 log.provider === "workers-ai" &&
-                log.feature === "release_notes",
+                log.feature === "release_highlights",
             );
             for (const row of after.rows) {
               const count = successful.filter(
                 (log) => log.account === row.owner_account_id && log.model === row.model,
               ).length;
-              if (count < (row.scope === "site" ? 1 : 4)) return false;
+              if (count < 3) return false;
             }
-            return (
-              successful.length === 6 &&
-              successful.some(
-                (log) => log.account === "acc_sam" && log.model === outsiderSummary.model,
-              )
-            );
+            return successful.length === 3;
           });
           passed("release-highlights");
         } catch (error) {
@@ -2813,21 +2860,10 @@ export async function runProviderE2E(
           // Independent restores must all run, even if appended-entry cleanup fails.
           const cleanups = await Promise.allSettled([
             appended ? fixture("remove-appended") : Promise.resolve(),
+            windowed ? fixture("remove-windowed") : Promise.resolve(),
             api(settingsPath, "PATCH", { releaseHighlights: orgPolicy.releaseHighlights }),
-            api(personalPath, "PATCH", {
-              features: { releaseNotes: personal.features.releaseNotes },
-              releaseHighlights: personal.releaseHighlights,
-            }),
-            outsiderApi("/accounts/sam/settings/ai", "PATCH", {
-              features: { releaseNotes: outsiderPolicy.features.releaseNotes },
-            }),
           ]);
-          const cleanupNames = [
-            "appended entry",
-            "organization policy",
-            "personal policy",
-            "outsider policy",
-          ];
+          const cleanupNames = ["appended entry", "windowed copies", "organization policy"];
           const cleanupErrors = cleanups.flatMap((result, index) =>
             result.status === "rejected"
               ? [
@@ -2837,11 +2873,26 @@ export async function runProviderE2E(
                 ]
               : [],
           );
-          if (cleanupErrors.length)
+          if (cleanupErrors.length) {
+            // Name every failure: the AggregateError's own message is all the run prints.
+            const errors = [...proofErrors, ...cleanupErrors];
+            const described = errors.map((error) => {
+              const cause: unknown = error instanceof Error ? error.cause : undefined;
+              const why =
+                cause instanceof Error
+                  ? cause.message
+                  : typeof cause === "string"
+                    ? cause
+                    : cause === undefined
+                      ? ""
+                      : JSON.stringify(cause);
+              return `${error instanceof Error ? error.message : JSON.stringify(error)}${why ? ` (cause: ${why})` : ""}`;
+            });
             throw new AggregateError(
-              [...proofErrors, ...cleanupErrors],
-              "Release highlights proof cleanup failed",
+              errors,
+              `Release highlights proof cleanup failed: ${described.join("; ")}`,
             );
+          }
         }
       }
       if (want("overlays") || want("timeline-pages")) {
@@ -3821,10 +3872,11 @@ export async function runProviderE2E(
         usageEvidence.account = ownerAccount;
         let rows: ReturnType<typeof reconcileUsage>["rows"] = [];
         await waitFor("usage-reconciliation", 180_000, async () => {
-          // Release notes log under their own component (CORE-290's componentOf).
+          // Release notes and their highlights log under their own components
+          // (CORE-290's componentOf; highlights since CORE-359).
           const logs = (
             await Promise.all(
-              ["knowledge", "release-notes"].map((component) =>
+              ["knowledge", "release-notes", "release-highlights"].map((component) =>
                 collectGatewayLogs((page) =>
                   gatewayLogs(owned, String(evidence.startedAt), component, undefined, page),
                 ),

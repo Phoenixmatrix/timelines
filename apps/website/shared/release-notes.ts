@@ -138,7 +138,7 @@ export interface ReleaseNoteEntry {
 
 export type ReleaseNotesState = "disabled" | "idle" | "generating" | "ready" | "failed";
 
-export type ReleaseHighlightsScope = "site" | "tracker" | "repo";
+export type ReleaseHighlightsScope = "tracker";
 export type ReleaseHighlightsState = "disabled" | "idle" | "generating" | "ready" | "failed";
 
 /** An authorized backlink to the exact detailed daily note, never a model-written URL. */
@@ -147,11 +147,10 @@ export interface ReleaseHighlightsLink {
   release: string;
 }
 
-/** GET highlights for a repository, tracker organization, or signed-in viewer. */
+/** GET highlights for a tracker organization. */
 export interface ReleaseHighlights {
   scope: ReleaseHighlightsScope;
-  owner?: { slug: string; displayName: string };
-  repo?: { owner: string; name: string };
+  owner: { slug: string; displayName: string };
   status: { state: ReleaseHighlightsState; generatedAt: string | null };
   body: string | null;
   model: string | null;

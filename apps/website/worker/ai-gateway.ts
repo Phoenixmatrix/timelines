@@ -23,6 +23,8 @@ const SETTING = {
   "assistant-status": "assistant-titles",
   avatars: "avatars",
   "release-notes": "release-notes",
+  // Highlights (CORE-359) keep their own label and follow the release notes setting.
+  "release-highlights": "release-notes",
   "merge-queue": "merge-queue",
 } as const satisfies Record<string, AiLogComponent>;
 
@@ -35,6 +37,8 @@ export function componentOf(feature: string): GatewayComponent {
       return "assistant";
     case "release_notes":
       return "release-notes";
+    case "release_highlights":
+      return "release-highlights";
     case "merge_queue":
       return "merge-queue";
     case "avatars":

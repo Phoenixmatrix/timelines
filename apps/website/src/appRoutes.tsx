@@ -63,6 +63,7 @@ import { Tokens, tokensAction, tokensLoader } from "./routes/Tokens.tsx";
 import { Tracker, TrackerIndex } from "./routes/tracker/Tracker.tsx";
 import {
   releaseNotesIndexLoader,
+  highlightsIndexLoader,
   timelinesIndexLoader,
   trackerIndexLoader,
   trackerLoader,
@@ -123,7 +124,7 @@ export const routes: RouteObject[] = withPageTitles([
           { path: "tracker", loader: trackerIndexLoader, Component: TrackerIndex },
           { path: "timelines", loader: timelinesIndexLoader, Component: TrackerIndex },
           { path: "release-notes", loader: releaseNotesIndexLoader, Component: TrackerIndex },
-          { path: "highlights", loader: highlightsLoader, Component: Highlights },
+          { path: "highlights", loader: highlightsIndexLoader, Component: TrackerIndex },
           { path: "packages", loader: allPackagesLoader, Component: AllPackages },
           { path: "needs-you", loader: needsYouLoader, Component: NeedsYou },
           // Whatever a ref names (CORE-22): redirects, or a chooser when it's ambiguous.
@@ -270,7 +271,6 @@ export const routes: RouteObject[] = withPageTitles([
                 { path: "changes", Component: SemanticChanges },
                 { path: "wiki/*", loader: wikiLoader, Component: Wiki },
                 { path: "releases/*", loader: releasesLoader, Component: Releases },
-                { path: "releases/highlights", loader: highlightsLoader, Component: Highlights },
                 // Knowledge is the Semantic Code Atlas (CORE-174): bounded regions, never the whole graph.
                 {
                   path: "knowledge",

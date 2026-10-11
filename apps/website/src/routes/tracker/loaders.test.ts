@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { RouterContextProvider, type LoaderFunctionArgs } from "react-router";
 import {
+  highlightsIndexLoader,
   releaseNotesIndexLoader,
   timelinesIndexLoader,
   trackerIndexLoader,
@@ -79,10 +80,11 @@ describe("tracker navigation", () => {
     const result = await trackerIndexLoader(args("/tracker")).catch((e) => e);
     expect(result.headers.get("location")).toBe("/tracker/ann");
   });
-  test("the rail's Timelines and Release notes open your default tracker's pages", async () => {
+  test("the rail's Timelines, Release notes and Highlights open your default tracker's pages", async () => {
     for (const [loader, path, location] of [
       [timelinesIndexLoader, "/timelines", "/tracker/ann/timelines"],
       [releaseNotesIndexLoader, "/release-notes?q=fix", "/tracker/ann/releases?q=fix"],
+      [highlightsIndexLoader, "/highlights", "/tracker/ann/highlights"],
     ] as const) {
       reply({ viewerId: "ann", trackers: owners, defaultOwnerId: "ann" });
       vi.stubGlobal("localStorage", { getItem: () => null });

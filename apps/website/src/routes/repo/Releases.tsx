@@ -24,6 +24,7 @@ import { LinkedText } from "../../refs/RefLink.tsx";
 import { api, ApiError, load } from "../../lib/api.ts";
 import { shortOid, timeAgo } from "../../lib/format.ts";
 import { repoPath } from "../../lib/refs.ts";
+import { useViewer } from "../../lib/session.ts";
 import { scopeOf } from "../../lib/timelineScope.ts";
 import { useRepo } from "./RepoLayout.tsx";
 import { useEffect, useState } from "react";
@@ -165,6 +166,11 @@ export function Releases() {
   const { index, release, name } = useLoaderData<typeof releasesLoader>();
   const repo = useRepo();
   const owner = repo.owner.slug;
+  // Highlights need the organization's tracker, which only its members (or the owner) can read.
+  const viewer = useViewer();
+  const canReadHighlights = Boolean(
+    viewer?.canCreateIn.some((account) => account.id === repo.owner.id),
+  );
   const location = useLocation();
   const scope = scopeOf(location.search);
   const [selected, setSelected] = useState<{
@@ -201,12 +207,14 @@ export function Releases() {
       <div className="mk-empty flex max-w-[44rem] flex-col items-center gap-3 py-12">
         <TimelineSwitcher variant="filter" />
         <RocketLaunchIcon size={28} className="text-ink-faint" aria-hidden />
-        <Link
-          to={repoPath(owner, repo.name, "releases", "highlights")}
-          className="mk-btn mk-btn--sm"
-        >
-          View highlights
-        </Link>
+        {canReadHighlights && (
+          <Link
+            to={`/tracker/${encodeURIComponent(owner)}/highlights`}
+            className="mk-btn mk-btn--sm"
+          >
+            View organization highlights
+          </Link>
+        )}
         <div>
           {scope
             ? "No landed notes you can see match this timeline. Choose another timeline or main to see all notes."
@@ -244,12 +252,14 @@ export function Releases() {
   return (
     <div className="grid gap-x-8 gap-y-8 md:grid-cols-[13rem_minmax(0,1fr)] xl:grid-cols-[13rem_minmax(0,46rem)_minmax(15rem,19rem)] xl:gap-x-12">
       <aside className="max-h-64 overflow-y-auto md:row-span-2 md:sticky md:top-[calc(var(--scope-banner)+1.5rem)] md:max-h-[calc(100dvh-3rem-var(--scope-banner))] md:self-start">
-        <Link
-          to={repoPath(owner, repo.name, "releases", "highlights")}
-          className="mk-btn mk-btn--sm mb-4"
-        >
-          View highlights
-        </Link>
+        {canReadHighlights && (
+          <Link
+            to={`/tracker/${encodeURIComponent(owner)}/highlights`}
+            className="mk-btn mk-btn--sm mb-4"
+          >
+            View organization highlights
+          </Link>
+        )}
         <Sidebar index={index} owner={owner} name={repo.name} selected={name} />
       </aside>
       <article className="min-w-0 md:col-start-2">

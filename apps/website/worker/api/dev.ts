@@ -163,21 +163,65 @@ dev.post("/release-highlights-fixtures", async (c) => {
     .selectAll()
     .where("viewer_id", "=", actor.id)
     .where((eb) =>
-      eb.or([
-        eb.and([eb("scope", "=", "repo"), eb("scope_id", "=", repo.id)]),
-        eb.and([eb("scope", "=", "tracker"), eb("scope_id", "=", repo.owner_id)]),
-        eb.and([eb("scope", "=", "site"), eb("scope_id", "=", actor.id)]),
-      ]),
+      eb.or([eb.and([eb("scope", "=", "tracker"), eb("scope_id", "=", repo.owner_id)])]),
     );
-  const entry = await k
-    .selectFrom("release_note_entries")
-    .selectAll()
-    .where("repo_id", "=", repo.id)
-    .where("release", "=", "@day:2026-01-03")
-    .where("issue_key", "=", "CF-1")
-    .executeTakeFirstOrThrow();
+  // The fixture's real daily note is dated long ago, outside the 7-day window.
+  // "recent" and "stale" copy it to today and to ten days ago, so the proof can
+  // see the window select (only) the recent copy.
+  const dayOf = (daysAgo: number) =>
+    new Date(Date.now() - daysAgo * 86_400_000).toISOString().slice(0, 10);
+  const copies = { recent: dayOf(0), stale: dayOf(10) };
+  const original = "@day:2026-01-03";
+  // The UTC date a "recent"/"stale" copy used, so the proof never recomputes it.
+  let copied: string | undefined;
+  const copyDay = async (kind: keyof typeof copies) => {
+    const day = copies[kind];
+    copied = day;
+    const release = `@day:${day}`;
+    const source = await k
+      .selectFrom("release_notes")
+      .selectAll()
+      .where("repo_id", "=", repo.id)
+      .where("release", "=", original)
+      .executeTakeFirstOrThrow();
+    await k
+      .insertInto("release_notes")
+      .values({ ...source, release, released_at: day, updated_at: `${day}T00:00:00.000Z` })
+      .onConflict((oc) => oc.doNothing())
+      .execute();
+    const entries = await k
+      .selectFrom("release_note_entries")
+      .selectAll()
+      .where("repo_id", "=", repo.id)
+      .where("release", "=", original)
+      .execute();
+    for (const [index, entry] of entries.entries())
+      await k
+        .insertInto("release_note_entries")
+        .values({
+          ...entry,
+          id: `highlights-${kind}-${index}-${repo.id}`,
+          release,
+          shipped_at: `${day}T00:00:00.000Z`,
+          updated_at: `${day}T00:00:00.000Z`,
+          ...(kind === "stale" ? { title: "Hologram calibration archive" } : {}),
+        })
+        .onConflict((oc) => oc.doNothing())
+        .execute();
+  };
   const addedId = `highlights-proof-${repo.id}`;
-  if (input.action === "append") {
+  if (input.action === "recent" || input.action === "stale") {
+    await copyDay(input.action);
+  } else if (input.action === "append") {
+    const entry = await k
+      .selectFrom("release_note_entries")
+      .selectAll()
+      .where("repo_id", "=", repo.id)
+      // Short patterns: D1 rejects long LIKE patterns ("pattern too complex"), and
+      // repo_id already scopes these to the fixture's repository.
+      .where("id", "like", "highlights-recent-%")
+      .where("issue_key", "=", "CF-1")
+      .executeTakeFirstOrThrow();
     await k
       .insertInto("release_note_entries")
       .values({
@@ -193,8 +237,29 @@ dev.post("/release-highlights-fixtures", async (c) => {
       .where("id", "=", addedId)
       .where("repo_id", "=", repo.id)
       .execute();
+  } else if (input.action === "remove-windowed") {
+    // Entries cascade with their daily release; found by id so midnight cannot orphan them.
+    const releases = await k
+      .selectFrom("release_note_entries")
+      .select("release")
+      .distinct()
+      .where("repo_id", "=", repo.id)
+      .where((eb) =>
+        eb.or([eb("id", "like", "highlights-recent-%"), eb("id", "like", "highlights-stale-%")]),
+      )
+      .execute();
+    if (releases.length)
+      await k
+        .deleteFrom("release_notes")
+        .where("repo_id", "=", repo.id)
+        .where(
+          "release",
+          "in",
+          releases.map((row) => row.release),
+        )
+        .execute();
   } else if (input.action === "due") {
-    for (const row of await rows.where("scope", "=", "repo").execute())
+    for (const row of await rows.execute())
       await k
         .updateTable("release_highlights")
         .set({ due_at: Date.now() - 1 })
@@ -202,16 +267,22 @@ dev.post("/release-highlights-fixtures", async (c) => {
         .where("scope_id", "=", row.scope_id)
         .where("viewer_id", "=", actor.id)
         .execute();
-    await sweepReleaseHighlights(c.env, { scope: "repo", scopeId: repo.id, viewerId: actor.id });
+    await sweepReleaseHighlights(c.env, {
+      scope: "tracker",
+      scopeId: repo.owner_id,
+      viewerId: actor.id,
+    });
   } else if (input.action !== "inspect") {
     return fail(c, 400, "Unknown fixture action.");
   }
   return c.json({
+    day: copied,
     rows: await rows.execute(),
     usage: await k
       .selectFrom("ai_usage")
       .selectAll()
-      .where("feature", "=", "release_notes")
+      // Highlights meter as their own feature (CORE-359), apart from release-note writing.
+      .where("feature", "=", "release_highlights")
       .where("account_id", "in", [actor.id, repo.owner_id, "acc_sam"])
       .orderBy("account_id")
       .orderBy("model")

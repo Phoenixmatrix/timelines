@@ -6,9 +6,9 @@
 // atlas-provider-e2e.ts. A change matching SHARED_PATHS runs every stage.
 // The independent classification stage admits the account's selected model and
 // spends at most one decision per new Clef variant; it requires no knowledge build.
-// release-highlights builds only on real release-notes fixtures: three initial
-// scopes, an authorized outsider's site view, one scheduled repo refresh and
-// one invalidation repair (six-call ceiling).
+// release-highlights builds only on real release-notes fixtures: one
+// organization summary over the last seven days, a refused non-member, one
+// scheduled refresh and one invalidation repair (three-call ceiling).
 //
 // The rules that keep targeting honest:
 //

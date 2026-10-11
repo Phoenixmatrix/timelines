@@ -233,10 +233,7 @@ export function AppShell() {
   const trackerPage = tracker?.params["*"]?.split("/")[0];
   const onTimelines = trackerPage === "timelines" || location.pathname === "/timelines";
   const onReleaseNotes = trackerPage === "releases" || location.pathname === "/release-notes";
-  const onHighlights =
-    trackerPage === "highlights" ||
-    location.pathname === "/highlights" ||
-    /^\/[^/]+\/[^/]+\/releases\/highlights$/.test(location.pathname);
+  const onHighlights = trackerPage === "highlights" || location.pathname === "/highlights";
   const owner =
     tracker?.params.owner ??
     (location.pathname === "/settings/preferences"
@@ -319,7 +316,11 @@ export function AppShell() {
               </Place>
             )}
             {viewer && (
-              <Place to="/highlights" label="Highlights" active={onHighlights}>
+              <Place
+                to={owner ? `/tracker/${encodeURIComponent(owner)}/highlights` : "/highlights"}
+                label="Highlights"
+                active={onHighlights}
+              >
                 {(active) => (
                   <NewspaperIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
                 )}

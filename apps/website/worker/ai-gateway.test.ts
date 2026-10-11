@@ -33,6 +33,7 @@ const COMPONENTS: [GatewayComponent, AiLogComponent][] = [
   ["assistant-status", "assistant-titles"],
   ["avatars", "avatars"],
   ["release-notes", "release-notes"],
+  ["release-highlights", "release-notes"],
   ["merge-queue", "merge-queue"],
 ];
 
@@ -162,6 +163,7 @@ describe("AI Gateway body logging", () => {
         "unattributed",
         "assistant",
         "release_notes",
+        "release_highlights",
         "merge_queue",
         "avatars",
       ].map(componentOf),
@@ -173,6 +175,7 @@ describe("AI Gateway body logging", () => {
       "knowledge",
       "assistant",
       "release-notes",
+      "release-highlights",
       "merge-queue",
       "avatars",
     ]);

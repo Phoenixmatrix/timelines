@@ -16,11 +16,7 @@ import { repoPath } from "../lib/refs.ts";
 
 /** Viewer-specific prose must never be reused from a browser or intermediary cache. */
 export async function highlightsLoader({ request, params }: LoaderFunctionArgs) {
-  const path = params.repo
-    ? `/repos/${encodeURIComponent(params.owner!)}/${encodeURIComponent(params.repo)}/release-notes/highlights`
-    : params.owner
-      ? `/tracker/${encodeURIComponent(params.owner)}/release-notes/highlights`
-      : "/release-notes/highlights";
+  const path = `/tracker/${encodeURIComponent(params.owner!)}/release-notes/highlights`;
   const headers = { "Cache-Control": "private, no-store" };
   try {
     const highlights = await api<ReleaseHighlights>(path, {
@@ -60,19 +56,10 @@ export function Highlights() {
     return () => clearInterval(timer);
   }, [pending, pathname]);
 
-  const repo = highlights.repo;
   const owner = highlights.owner;
-  const scopeName = repo
-    ? `${repo.owner}/${repo.name}`
-    : owner
-      ? owner.displayName
-      : "Your repositories";
+  const scopeName = owner.displayName;
   usePageTitle(`Highlights · ${scopeName}`);
-  const detailsPath = repo
-    ? repoPath(repo.owner, repo.name, "releases")
-    : owner
-      ? `/tracker/${encodeURIComponent(owner.slug)}/releases`
-      : "/release-notes";
+  const detailsPath = `/tracker/${encodeURIComponent(owner.slug)}/releases`;
   const ready = highlights.status.state === "ready" && Boolean(highlights.body?.trim());
   const stateMessage =
     highlights.status.state === "disabled"
@@ -91,15 +78,7 @@ export function Highlights() {
         aria-label="Highlights breadcrumbs"
         className="mb-5 flex flex-wrap items-center gap-x-2 gap-y-1 text-body-sm text-ink-muted"
       >
-        {repo ? (
-          <Link to={repoPath(repo.owner, repo.name)} className="break-all">
-            {scopeName}
-          </Link>
-        ) : owner ? (
-          <Link to={`/tracker/${encodeURIComponent(owner.slug)}`}>{scopeName}</Link>
-        ) : (
-          <Link to="/">Home</Link>
-        )}
+        <Link to={`/tracker/${encodeURIComponent(owner.slug)}`}>{scopeName}</Link>
         <span aria-hidden>/</span>
         <Link to={detailsPath}>Release notes</Link>
         <span aria-hidden>/</span>
@@ -109,9 +88,8 @@ export function Highlights() {
         <h1 className="m-0 text-headline">Highlights</h1>
         <p className="mt-2 mb-0 break-words text-title text-ink">{scopeName}</p>
         <p className="mt-2 mb-0 text-body-sm text-ink-muted">
-          A short overview of daily code updates
-          {highlights.scope === "site" ? " across repositories you can access" : " in this scope"},
-          not deployments. Highlights refresh on the configured schedule after this page is first
+          A short overview of the past week's daily code updates in this organization, not
+          deployments. Highlights refresh on the configured schedule after this page is first
           opened.
         </p>
       </header>
@@ -184,5 +162,5 @@ export function Highlights() {
       )}
     </div>
   );
-  return repo ? content : <Page>{content}</Page>;
+  return <Page>{content}</Page>;
 }

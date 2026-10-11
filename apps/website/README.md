@@ -2005,37 +2005,44 @@ feed this constraint intersects with every `q` filter, including positive or
 negated `timeline:` terms, before result limits and facet counts. It does not
 generate notes for unlanded work or grant additional access.
 
-**Highlights** are separate, person-specific summaries of authorized daily entries:
-`GET /api/repos/:owner/:repo/release-notes/highlights`,
-`GET /api/tracker/:owner/release-notes/highlights`, and
-`GET /api/release-notes/highlights`. These responses are private/no-store.
-Anonymous repository readers retain detailed notes but highlights are disabled;
-tracker/site highlights require a person sign-in. Exact daily-note backlinks
-are server-generated, never model-generated. Detailed notes are not modified.
-The signed-in `/highlights` page is an app-owned, reserved route, not an account
-slug. Its timeline navigation resolves the person's default tracker.
+**Highlights** are separate, person-specific summaries of an organization's
+authorized daily entries from today and the previous seven UTC days:
+`GET /api/tracker/:owner/release-notes/highlights`. The response is
+private/no-store and requires a person sign-in. There are no repository or site
+levels: those endpoints answer 404 and stale queued jobs for them are skipped.
+Exact daily-note backlinks are server-generated, never model-generated.
+Detailed notes are not modified. The signed-in `/highlights` page is an
+app-owned, reserved route, not an account slug: it redirects to the person's
+default organization's highlights, as the rail does when no organization is open.
+A repository's release page links to its organization's highlights.
 
-Opening a surface creates its viewer projection. The existing hourly cron checks
+Opening the page creates the viewer projection. The existing hourly cron checks
 at most 25 due projections; the account's cadence defaults to 24 hours and can be
-set to 1–168 hours (repository/tracker owner, or the viewer for site highlights).
+set to 1–168 hours (the organization's setting).
 New entries alone wait for that cadence. Every read and model invocation checks
 authorization and the summarized entries' digests; changed, deleted, or revoked
-sources suppress old prose immediately. A bounded source manifest tracks source
+sources suppress old prose immediately. The window only chooses sources for a new
+summary: entries ageing out of it never blank an existing summary or reset its due
+time, and wait for the next scheduled refresh, which regenerates from the current window. A bounded source manifest tracks source
 repositories/accounts for deletion cleanup. D1 leases coalesce concurrent requests;
 failed attempts persist an error and wait for the next cadence, without a tight
 paid retry loop. The release-notes feature switch and missing AI bindings prevent
-new highlights calls. Calls use the existing account-attributed release-notes
-metering and configured task model, with stored model/time provenance.
+new highlights calls. Calls meter as their own feature, `release_highlights`
+(AI Gateway label `release-highlights`, following the release-notes body-logging
+setting), billed to the organization and attributed to the reader who asked,
+with the configured task model and stored model/time provenance.
 Persisted highlights are included in release-notes storage usage, charged to
-`owner_account_id`: the repository/tracker scope owner, or the viewer for global
-projections. A different viewer does not take on the scope owner's storage charge.
+`owner_account_id`: the organization. A different viewer does not take on the
+organization's storage charge.
 
-The `release-highlights` real-provider stage includes an outsider's authorized
-global notes while excluding private sources. Its six-call ceiling covers the
-three initial scopes, that outsider view, a scheduled repository refresh and
-repair after cited-source removal. It checks configurable cadence, unchanged
-detailed notes, exact backlinks, generated desktop/mobile surfaces and the global
-page's default-tracker navigation.
+The `release-highlights` real-provider stage proves the seven-day window with a
+recent and a stale copy of the fixture's daily note, and that a non-member is
+refused without prose. Its three-call ceiling covers the first summary, a
+scheduled refresh and repair after cited-source removal, all billed to the
+organization. It checks the retired repository and site endpoints, configurable
+cadence, unchanged detailed notes, exact backlinks, generated desktop/mobile
+surfaces, the `/highlights` and rail navigation to the default organization, and
+the repository page's link.
 
 | Route                                                       | Contract                                   |
 | ----------------------------------------------------------- | ------------------------------------------ |
