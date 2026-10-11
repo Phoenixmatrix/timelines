@@ -13,9 +13,12 @@
 // GITMATRIX_PREVIEW_ACTION (worker/ci/jobs.ts), and report what they deployed
 // with `gm deploy record`, which fills in the checkpoint from the run.
 //
-// A run checks out from the timeline's bookmark while it exists. Once the
-// timeline has landed or been abandoned, its bookmark is gone: the run then
-// names the default branch, and the runners fetch the commit itself by id.
+// A checkpoint's run names the branch it was measured from: its source's ref
+// (`work` in the timeline's own repository since CORE-255, which outlives
+// landing and abandonment) or, for a canonical repository, the timeline's
+// bookmark. Revivals and teardowns look the branch up (previewBranch): `work`
+// for a timeline source; for a canonical repository the bookmark while it
+// exists, otherwise the default branch, and the runners fetch the commit by id.
 
 import type { Checkpoint, Timeline } from "../../shared/timelines.ts";
 import { timelineBookmark } from "../../shared/timelines.ts";

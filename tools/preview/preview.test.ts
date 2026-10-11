@@ -36,7 +36,10 @@ function fakeCloudflare(state: {
   buckets?: Record<string, string[]>;
   namespaces?: Record<string, string[]>;
   previews?: string[];
+  /** Namespaces that count a repository no list shows (CORE-302): delete refuses. */
+  stuck?: string[];
 }) {
+  const stuck = new Set(state.stuck ?? []);
   const databases = state.databases ?? [];
   const buckets = state.buckets ?? {};
   const namespaces = state.namespaces ?? {};
@@ -97,10 +100,13 @@ function fakeCloudflare(state: {
       }
       if (command === "artifacts namespaces delete") {
         if (!namespaces[args[3]!]) throw new Error("HTTP 404: namespace not found");
+        if (stuck.has(args[3]!)) throw new Error("[10202] Namespace is not empty (409)");
         delete namespaces[args[3]!];
         return "";
       }
       if (command === "artifacts namespaces create") {
+        if (namespaces[flag(args, "--namespace")])
+          throw new Error("HTTP 409: namespace already exists");
         namespaces[flag(args, "--namespace")] = [];
         return "{}";
       }
@@ -527,4 +533,139 @@ await test("preview credentials never escape into reported child output", () => 
     redact(`${accessEnv.GITMATRIX_ACCESS_TOKEN} test-client.access test-secret ${sessionSecret}`),
     "[hidden] [hidden] [hidden] [hidden]",
   );
+});
+
+/** A stuck namespace in a fake that otherwise holds one timeline's old preview. */
+function stuckAccount(repos: string[] = []) {
+  const name = "gitmatrix-preview-faster-search";
+  return fakeCloudflare({
+    databases: [
+      { uuid: "old-db", name },
+      { uuid: "old-registry", name: "gitmatrix-preview-registry-faster-search" },
+    ],
+    buckets: { [name]: ["a"] },
+    namespaces: { [name]: repos },
+    previews: ["timeline-faster-search"],
+    stuck: [name],
+  });
+}
+
+function captureStderr() {
+  const lines: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    lines.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  return {
+    lines,
+    restore() {
+      process.stderr.write = original as typeof process.stderr.write;
+    },
+  };
+}
+
+const deps = (cloudflare: Cloudflare) => ({
+  cloudflare,
+  seed: async () => {},
+  record: async () => {},
+  wait: async () => {},
+  secret: "s".repeat(64),
+});
+const job = { slug: "faster-search", account: "acct", env: accessEnv as NodeJS.ProcessEnv };
+
+await test("teardown deletes a stuck namespace's repositories, then orphans the namespace", async () => {
+  const fake = stuckAccount(["old-repo"]);
+  const stderr = captureStderr();
+  try {
+    await teardown(fake.cloudflare, "acct", "faster-search");
+  } finally {
+    stderr.restore();
+  }
+  const event = JSON.parse(stderr.lines.join("").trim().split("\n")[0]!);
+  assert.equal(event.event, "preview.namespace.orphaned");
+  assert.equal(event.namespace, "gitmatrix-preview-faster-search");
+  assert.deepEqual(fake.databases, []);
+  assert.deepEqual(fake.buckets, {});
+  assert.equal(fake.previews.size, 0);
+  // Left behind, but with nothing listable in it.
+  assert.deepEqual(fake.namespaces, { "gitmatrix-preview-faster-search": [] });
+});
+
+await test("create reuses a stuck namespace, and a revival clears the last create's repositories", async () => {
+  const fake = stuckAccount(["old-repo"]);
+  let seeded = 0;
+  const seeding = {
+    ...deps(fake.cloudflare),
+    // Seeding creates repositories in the preview's namespace, as the fixtures do.
+    seed: async (_origin: string, resources: { artifacts: string }) => {
+      fake.namespaces[resources.artifacts]!.push(`r-${++seeded}`);
+    },
+  };
+  const stderr = captureStderr();
+  try {
+    await create(seeding, job);
+    assert.deepEqual(fake.namespaces, { "gitmatrix-preview-faster-search": ["r-1"] });
+    await create(seeding, job);
+  } finally {
+    stderr.restore();
+  }
+  assert.deepEqual(fake.namespaces, { "gitmatrix-preview-faster-search": ["r-2"] });
+  assert.ok(!fake.calls.some((call) => call.startsWith("artifacts namespaces create")));
+  assert.equal(fake.previews.size, 1);
+  assert.equal(fake.databases.length, 2);
+});
+
+await test("create refuses a leftover namespace that lists repositories again", async () => {
+  const fake = stuckAccount();
+  const base = fake.cloudflare.cf.bind(fake.cloudflare);
+  let refused = false;
+  let lists = 0;
+  fake.cloudflare.cf = async (args, env) => {
+    const command = args.slice(0, 3).join(" ");
+    if (command === "artifacts namespaces delete")
+      return base(args, env).catch((error: unknown) => {
+        refused = true;
+        throw error;
+      });
+    // Empty for teardown's own check, then a repository appears before provisioning.
+    if (refused && command === "artifacts namespaces repos" && args[3] === "list")
+      return JSON.stringify(++lists > 1 ? [{ name: "late" }] : []);
+    return base(args, env);
+  };
+  const stderr = captureStderr();
+  try {
+    await assert.rejects(create(deps(fake.cloudflare), job), /still lists repositories/);
+  } finally {
+    stderr.restore();
+  }
+});
+
+await test("a namespace Cloudflare won't delete fails teardown when a fresh list shows a repository", async () => {
+  const fake = fakeCloudflare({ namespaces: { "gitmatrix-preview-faster-search": [] } });
+  const base = fake.cloudflare.cf.bind(fake.cloudflare);
+  let lists = 0;
+  fake.cloudflare.cf = async (args, env) => {
+    const command = args.slice(0, 3).join(" ");
+    if (command === "artifacts namespaces delete") throw new Error("namespace is not empty");
+    // Empty while repositories are deleted; a repository appears by the final check.
+    if (command === "artifacts namespaces repos" && args[3] === "list")
+      return JSON.stringify(++lists > 1 ? [{ name: "r" }] : []);
+    return base(args, env);
+  };
+  await assert.rejects(
+    teardown(fake.cloudflare, "acct", "faster-search"),
+    /namespace is not empty/,
+  );
+});
+
+await test("create still fails when the namespace create fails for another reason", async () => {
+  const fake = fakeCloudflare({});
+  const base = fake.cloudflare.cf.bind(fake.cloudflare);
+  fake.cloudflare.cf = async (args, env) => {
+    if (args.slice(0, 3).join(" ") === "artifacts namespaces create")
+      throw new Error("HTTP 403: forbidden");
+    return base(args, env);
+  };
+  await assert.rejects(create(deps(fake.cloudflare), job), /forbidden/);
 });
