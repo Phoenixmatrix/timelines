@@ -1515,10 +1515,12 @@ change feed. The layout toggle is **Chart / List**: Chart names the visual
 time-axis layout without conflicting with the separate Timelines feature.
 Phones get the List layout, the accessible equivalent of the canvas.
 Design: root `DESIGN.md`, "History (time axis)".
-The List scrubber preserves in-flight keyboard positions until the address
-changes; snapshot refreshes alone do not reset them. Address acknowledgement
-runs before paint so a delayed passive effect cannot clear the next keyboard
-gesture. Committed positions remain navigable with Back and Forward.
+The List scrubber preserves newer keyboard positions when an earlier address
+write finishes. Each committed gesture carries an instance/revision receipt in
+router history state: only the latest receipt can acknowledge its matching
+position, even when a gesture returns to the same address. Snapshot refreshes
+alone do not reset the scrubber. Acknowledgement runs before paint; external
+navigation and Back/Forward restore the position from that history entry.
 
 **Development history:** `POST /api/dev/chronicle {account, team, issues?, days?, seed?, link?}`
 (agent secret) makes `issues` issues of a new team worked by the account's
