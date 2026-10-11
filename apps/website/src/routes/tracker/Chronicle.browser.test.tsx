@@ -1,5 +1,5 @@
-import { expect, test } from "vite-plus/test";
-import { page } from "vite-plus/test/browser";
+import { expect, test, vi } from "vite-plus/test";
+import { page, userEvent } from "vite-plus/test/browser";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
 import { mutate } from "../../testing/timelines.ts";
@@ -76,3 +76,86 @@ test("list playhead preserves successive keyboard increments and browser history
   await app.forward();
   await expect.element(scrubber).toHaveValue(String(at + 2 * step));
 });
+
+test.each([
+  { committed: false, direction: "ArrowRight", offset: 2 },
+  { committed: true, direction: "ArrowRight", offset: 2 },
+  { committed: true, direction: "ArrowLeft", offset: 0 },
+])(
+  "an older URL acknowledgement preserves $direction (committed: $committed)",
+  async ({ committed, direction, offset }) => {
+    const server = await TestServer.start({ world: true });
+    await mutate(server, [
+      {
+        kind: "team.create",
+        id: "chronicle-ack-team",
+        data: { key: "ACK", name: "Acknowledgements", memberIds: ["acc_marco"] },
+      },
+    ]);
+    const from = Date.parse("2026-01-01T00:00:00.000Z");
+    const at = from + 9 * 3_600_000;
+    const params = new URLSearchParams({
+      view: "chronicle",
+      layout: "list",
+      from: new Date(from).toISOString(),
+      to: new Date(from + 24 * 3_600_000).toISOString(),
+      at: new Date(at).toISOString(),
+    });
+    const app = renderApp(`/tracker/orbit?${params}`);
+    const scrubber = page.getByRole("slider", { name: "Playhead" });
+    await expect.element(scrubber).toBeVisible();
+    const input = scrubber.element() as HTMLInputElement;
+    const step = Number(input.step);
+    const nextAt = at + offset * step;
+    await focusOn(scrubber);
+    const navigate = app.router.navigate.bind(app.router);
+    const pending: Array<() => Promise<void>> = [];
+    const navigation = vi.spyOn(app.router, "navigate").mockImplementation((to, options) => {
+      if (typeof to === "number") return navigate(to);
+      return new Promise<void>((resolve, reject) => {
+        pending.push(() => navigate(to, options).then(resolve, reject));
+      });
+    });
+    let held = false;
+    try {
+      await press("ArrowRight");
+      await expect.poll(() => pending.length).toBe(1);
+      if (committed) await press(direction);
+      else {
+        await userEvent.keyboard(`{${direction}>}`);
+        held = true;
+      }
+      await expect.element(scrubber).toHaveValue(String(nextAt));
+      await pending.shift()!();
+      await app.waitForUrl(
+        (url) => url.searchParams.get("at") === new Date(at + step).toISOString(),
+      );
+      // Router state leads React's commit; wait for the rendered URL before
+      // checking that its acknowledgement did not erase the newer gesture.
+      await expect
+        .element(page.getByRole("link", { name: "Settings", exact: true }))
+        .toHaveAttribute(
+          "href",
+          expect.stringContaining(`at=${encodeURIComponent(new Date(at + step).toISOString())}`),
+        );
+      await expect.element(scrubber).toHaveValue(String(nextAt));
+      if (held) {
+        await userEvent.keyboard(`{/${direction}}`);
+        held = false;
+      }
+      await expect.poll(() => pending.length).toBe(1);
+      await pending.shift()!();
+      await app.waitForUrl((url) => url.searchParams.get("at") === new Date(nextAt).toISOString());
+      navigation.mockRestore();
+      expect(document.activeElement).toBe(input);
+      await app.back();
+      await expect.element(scrubber).toHaveValue(String(at + step));
+      await app.forward();
+      await expect.element(scrubber).toHaveValue(String(nextAt));
+    } finally {
+      navigation.mockRestore();
+      if (held) await userEvent.keyboard(`{/${direction}}`);
+      for (const acknowledge of pending) await acknowledge();
+    }
+  },
+);

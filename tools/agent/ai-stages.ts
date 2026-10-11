@@ -49,6 +49,8 @@ export interface StageDefinition {
 export const SHARED_PATHS = [
   "tools/agent/ai-stages.ts",
   "tools/agent/main.ts",
+  "tools/agent/model-failure-evidence.ts",
+  "tools/agent/model-failure-evidence.test.ts",
   "tools/agent/environment.ts",
   "tools/agent/seed.ts",
   "tools/agent/types.ts",
@@ -62,6 +64,8 @@ export const SHARED_PATHS = [
   "apps/website/worker/app.ts",
   "apps/website/worker/ai-gateway.ts",
   "apps/website/worker/knowledge/models.ts",
+  "apps/website/worker/knowledge/model-failure.ts",
+  "apps/website/worker/knowledge/model-failure.test.ts",
   "apps/website/worker/ai-providers/**",
   "apps/website/worker/settings/**",
   "apps/website/worker/usage/ai.ts",

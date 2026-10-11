@@ -75,6 +75,10 @@ await test("changed paths select their stages and the stages those require", () 
     [["tools/agent/atlas-provider-e2e.ts"], ATLAS],
     // Shared infrastructure runs everything.
     [["apps/website/worker/ai-gateway.ts"], STAGE_IDS],
+    [["tools/agent/model-failure-evidence.ts"], STAGE_IDS],
+    [["tools/agent/model-failure-evidence.test.ts"], STAGE_IDS],
+    [["apps/website/worker/knowledge/model-failure.ts"], STAGE_IDS],
+    [["apps/website/worker/knowledge/model-failure.test.ts"], STAGE_IDS],
     [["apps/website/cloudflare.config.ts"], STAGE_IDS],
     [["pnpm-lock.yaml"], STAGE_IDS],
     // Nothing AI changed: nothing is provisioned or spent.

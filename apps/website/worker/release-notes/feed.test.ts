@@ -159,6 +159,57 @@ describe("release feed", () => {
     ]);
   });
 
+  test("timeline scope is independent of q and precedes facets and result truncation", () => {
+    const landed = row({
+      subject: "commit:landed",
+      landing_oid: "landed",
+      timeline_branch: "timeline/search",
+    });
+    const tagged = { ...landed, id: "tagged", release: "v1" };
+    const other = row({
+      subject: "commit:other",
+      landing_oid: "other",
+      timeline_branch: "timeline/other",
+      shipped_at: "2026-10-01T00:00:00.000Z",
+    });
+    const unlanded = { ...landed, id: "unlanded", landing_oid: null };
+    const secret = {
+      ...landed,
+      id: "secret",
+      kind: "issue" as const,
+      tracker_owner_id: "secret",
+    };
+    const privateRepo = { ...landed, id: "private", repo_id: "private" };
+    const selected = (timeline?: string, q = "") =>
+      buildFeed([other, unlanded, secret, privateRepo, landed, tagged], {
+        trackers: new Map([["orbit", "orbit"]]),
+        visibleRepoIds: new Set(["engine"]),
+        workspaces: new Map(),
+        query: parseReleaseQuery(q),
+        timeline,
+        now: 0,
+        limit: 1,
+      });
+    const scoped = selected("search");
+    expect(scoped.entries.map((entry) => entry.id)).toEqual([landed.id]);
+    expect(scoped.truncated).toBe(false);
+    expect(scoped.facets.timelines).toEqual([
+      { value: "search", label: "timeline/search", count: 1 },
+    ]);
+    expect(scoped.facets.categories).toEqual([{ value: "feature", label: "feature", count: 1 }]);
+    expect(scoped.query).toEqual(parseReleaseQuery(""));
+    expect(selected("search", "timeline:search").entries.map((e) => e.id)).toEqual([landed.id]);
+    expect(selected("search", "timeline:other").entries).toEqual([]);
+    expect(selected("search", "-timeline:search").entries).toEqual([]);
+    expect(selected("search", "kind:tag").entries.map((e) => e.id)).toEqual(["tagged"]);
+    expect(selected("search", "release:v1").entries.map((e) => e.id)).toEqual(["tagged"]);
+    expect(selected("missing").entries).toEqual([]);
+    expect(selected("SEARCH").entries).toEqual([]);
+    expect(selected("main")).toEqual(selected());
+    expect(selected("")).toEqual(selected());
+    expect(selected("main", "timeline:search")).toEqual(selected(undefined, "timeline:search"));
+  });
+
   test("lists each daily update newest first, within the viewer's access, with facets", () => {
     const all = feed("");
     expect(all.entries.map((e) => [e.title, e.repos[0]!.name, e.release])).toEqual([
@@ -298,6 +349,42 @@ describe("release feed", () => {
     ]);
     expect((await releaseFeed(env, actor, "orbit", "release:v1")).entries.map((e) => e.id)).toEqual(
       ["tag"],
+    );
+    sqlite.exec(`
+      INSERT INTO release_note_entries
+        (id, repo_id, release, subject, kind, category, title, summary, inputs_hash, shipped_at,
+         updated_at, timeline_branch)
+      VALUES ('unlanded', 'owned', '@day:2026-09-20', 'commit:unlanded', 'commit', 'feature',
+        'Not landed', 'Not landed', 'h', '2026-10-01', '2026-10-01', 'timeline/search');
+      UPDATE release_note_entries SET timeline_branch = 'timeline/search', landing_oid = 'landed'
+        WHERE id IN ('day', 'tag');
+      WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5000)
+      INSERT INTO release_note_entries
+        (id, repo_id, release, subject, kind, category, title, summary, inputs_hash, shipped_at,
+         updated_at, timeline_branch, landing_oid)
+      SELECT 'other-' || n, 'owned', '@day:2026-09-20', 'commit:other-' || n, 'commit',
+        'feature', 'Other timeline', 'Other change', 'h', '2026-10-01', '2026-10-01',
+        'timeline/other', 'other-landing' FROM seq;
+    `);
+    const scoped = await releaseFeed(env, actor, "orbit", "", "search");
+    expect(scoped.entries.map((entry) => entry.id)).toEqual(["day"]);
+    expect(scoped.truncated).toBe(false);
+    expect(scoped.facets.timelines).toEqual([
+      { value: "search", label: "timeline/search", count: 1 },
+    ]);
+    expect(
+      (await releaseFeed(env, actor, "orbit", "kind:tag", "search")).entries.map((e) => e.id),
+    ).toEqual(["tag"]);
+    expect((await releaseFeed(env, actor, "orbit", "timeline:other", "search")).entries).toEqual(
+      [],
+    );
+    expect((await releaseFeed(env, actor, "orbit", "-timeline:search", "search")).entries).toEqual(
+      [],
+    );
+    expect((await releaseFeed(env, actor, "orbit", "", "missing")).entries).toEqual([]);
+    expect((await releaseFeed(env, actor, "orbit", "", "SEARCH")).entries).toEqual([]);
+    expect(await releaseFeed(env, actor, "orbit", "kind:tag", "main")).toEqual(
+      await releaseFeed(env, actor, "orbit", "kind:tag"),
     );
   });
 });

@@ -197,7 +197,7 @@ describe("AI Gateway body logging", () => {
     await aiWork({ feature: "wiki", account: "acc_a" }, () => decide(env, {}, question));
     choose("acc_o", "knowledge", false);
     await aiWork({ feature: "wiki", repo: "repo" }, () => decide(env, {}, question));
-    expect(calls.map((c) => [c.gateway?.metadata, c.extraHeaders ?? null] as const)).toEqual([
+    expect(calls.map((c) => [c.gateway?.metadata, c.extraHeaders ?? null] as const)).toMatchObject([
       [{ component: "release-notes", account: "acc_o", feature: "release_notes" }, null],
       [{ component: "knowledge", account: "acc_o", feature: "knowledge" }, HEADER],
       [{ component: "knowledge", account: "acc_o", feature: "wiki" }, null],

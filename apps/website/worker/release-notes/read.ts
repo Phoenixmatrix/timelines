@@ -1,6 +1,6 @@
 // Reading stored release notes for one viewer. Repository access is checked by
-// the caller; here, entries about issues from trackers the viewer can't read
-// are left out, and so is any introduction those issues shaped.
+// the caller; unreadable trackers and their introductions are left out. Timeline
+// scope keeps only landed entries, never a cross-timeline introduction.
 
 import type {
   ReleaseNoteChange,
@@ -10,7 +10,7 @@ import type {
   ReleaseNotesState,
   ReleaseSummary,
 } from "../../shared/release-notes.ts";
-import { releaseKind } from "../../shared/release-notes.ts";
+import { landedTimelineSlug, releaseKind } from "../../shared/release-notes.ts";
 import type { Actor } from "../db.ts";
 import { db, type Database } from "../schema.ts";
 import { accessible } from "../tracker/api.ts";
@@ -86,8 +86,10 @@ export async function releaseIndex(
   repoId: string,
   trackers: ViewerTrackers,
   aiEnabled: boolean,
+  timeline?: string,
 ): Promise<ReleaseNotesIndex> {
   const d = db(d1);
+  const scope = timeline && timeline !== "main" ? timeline : null;
   const [state, releases, entries] = await Promise.all([
     d
       .selectFrom("release_note_state")
@@ -104,13 +106,16 @@ export async function releaseIndex(
       .execute(),
     d
       .selectFrom("release_note_entries")
-      .select(["release", "kind", "tracker_owner_id"])
+      .select(["release", "kind", "tracker_owner_id", "landing_oid", "timeline_branch"])
       .where("repo_id", "=", repoId)
       .execute(),
   ]);
   const counts = new Map<string, number>();
   for (const entry of entries)
-    if (entry.kind !== "issue" || trackers.has(entry.tracker_owner_id ?? ""))
+    if (
+      (entry.kind !== "issue" || trackers.has(entry.tracker_owner_id ?? "")) &&
+      (!scope || (entry.landing_oid && entry.timeline_branch === `timeline/${scope}`))
+    )
       counts.set(entry.release, (counts.get(entry.release) ?? 0) + 1);
   let stateName: ReleaseNotesState = "idle";
   const available =
@@ -126,6 +131,7 @@ export async function releaseIndex(
       generatedAt: state?.format_version === 1 ? state.generated_at : null,
     },
     releases: (state?.format_version === 1 ? releases : [])
+      .filter((row) => !scope || counts.has(row.release))
       .sort(byRecency)
       .map((row): ReleaseSummary => ({
         name: row.release,
@@ -144,8 +150,10 @@ export async function releaseNotesFor(
   repoId: string,
   name: string,
   trackers: ViewerTrackers,
+  timeline?: string,
 ): Promise<ReleaseNotesRelease | null> {
   const d = db(d1);
+  const scope = timeline && timeline !== "main" ? timeline : null;
   const state = await d
     .selectFrom("release_note_state")
     .select("format_version")
@@ -170,6 +178,7 @@ export async function releaseNotesFor(
     .execute();
   const entries = rows
     .flatMap((entry) => toEntry(entry, trackers) ?? [])
+    .filter((entry) => !scope || landedTimelineSlug(entry.timeline) === scope)
     .sort(
       (a, b) =>
         CATEGORY_ORDER[a.category] - CATEGORY_ORDER[b.category] ||
@@ -177,7 +186,7 @@ export async function releaseNotesFor(
         a.title.localeCompare(b.title),
     );
   const shapedBy = JSON.parse(row.intro_trackers) as string[];
-  const intro = shapedBy.every((id) => trackers.has(id)) ? row.intro : null;
+  const intro = !scope && shapedBy.every((id) => trackers.has(id)) ? row.intro : null;
   return {
     release: {
       name: row.release,

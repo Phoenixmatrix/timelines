@@ -6,7 +6,7 @@
 // work": mode errors).
 
 import { Popover } from "@base-ui/react/popover";
-import { CheckIcon, GitForkIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
+import { CaretDownIcon, CheckIcon, GitForkIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Link, useLocation, useRouteLoaderData } from "react-router";
 import type { RepoDetail } from "../../shared/api.ts";
@@ -156,7 +156,15 @@ const ENDED = new Set(["landed", "abandoned"]);
 
 // ---- switcher ----------------------------------------------------------------
 
-function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
+function SwitcherPanel({
+  scope,
+  close,
+  filter,
+}: {
+  scope: Scope;
+  close: () => void;
+  filter: boolean;
+}) {
   const location = useLocation();
   const [search, setSearch] = useState("");
   const [showEnded, setShowEnded] = useState(false);
@@ -227,7 +235,9 @@ function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
           </Link>
         </div>
         <Popover.Description className="mt-0.5 mb-0 text-body-sm text-ink-muted">
-          Scope every page to main plus one line of work
+          {filter
+            ? "Filter release notes to landed work from one timeline; main shows all notes"
+            : "Scope every page to main plus one line of work"}
           {scope.owner ? (
             <>
               {" "}
@@ -257,7 +267,11 @@ function SwitcherPanel({ scope, close }: { scope: Scope; close: () => void }) {
       )}
       <ul className="m-0 list-none p-0" aria-label="Timelines">
         {!words.length &&
-          row(null, <span className="mk-mono text-body-sm">main</span>, <Meta>default</Meta>)}
+          row(
+            null,
+            <span className="mk-mono text-body-sm">main</span>,
+            <Meta>{filter ? "all notes" : "default"}</Meta>,
+          )}
         {shown.map((t) =>
           row(
             t.slug,
@@ -310,12 +324,12 @@ function Meta({ children }: { children: React.ReactNode }) {
   return <span className="shrink-0 text-micro text-ink-faint tabular-nums">{children}</span>;
 }
 
-/** The switcher: a place in the rail, or the banner's Switch button. */
+/** The shared picker in the rail, scope banner, or an inline filter. */
 export function TimelineSwitcher({
   variant,
   active = false,
 }: {
-  variant: "rail" | "banner";
+  variant: "rail" | "banner" | "filter";
   active?: boolean;
 }) {
   const [open, setOpen] = useState(false);
@@ -342,6 +356,15 @@ export function TimelineSwitcher({
           />
         )}
       </Popover.Trigger>
+    ) : variant === "filter" ? (
+      <Popover.Trigger
+        className="mk-btn mk-btn--secondary min-w-0 max-w-full max-sm:min-h-11"
+        aria-label={`Filter release notes by timeline: ${name ?? "main (all notes)"}`}
+      >
+        <GitForkIcon className="size-4 shrink-0" aria-hidden />
+        <span className="truncate">Timeline: {name ?? "main (all notes)"}</span>
+        <CaretDownIcon className="size-4 shrink-0" aria-hidden />
+      </Popover.Trigger>
     ) : (
       <Popover.Trigger className="mk-btn mk-btn--ghost mk-btn--sm shrink-0">Switch</Popover.Trigger>
     );
@@ -362,7 +385,11 @@ export function TimelineSwitcher({
           className="z-50"
         >
           <Popover.Popup className={`mk-popup ${popMotion} w-[min(22rem,calc(100vw-2rem))]`}>
-            <SwitcherPanel scope={scope} close={() => setOpen(false)} />
+            <SwitcherPanel
+              scope={scope}
+              close={() => setOpen(false)}
+              filter={variant === "filter"}
+            />
           </Popover.Popup>
         </Popover.Positioner>
       </Popover.Portal>

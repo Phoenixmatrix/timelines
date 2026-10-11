@@ -29,8 +29,8 @@ import {
   MagnifyingGlassPlusIcon,
   XIcon,
 } from "@phosphor-icons/react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate, useNavigationType } from "react-router";
 import type { ChronicleIssue, WorkSpan } from "../../../shared/chronicle.ts";
 import { Tip } from "../../components/ui.tsx";
 import { useChronicle } from "./chronicleData.ts";
@@ -76,12 +76,15 @@ export function Chronicle({
   base: string;
   query: string;
   params: URLSearchParams;
-  setParams: (next: URLSearchParams, options: { replace: boolean }) => void;
+  setParams: (next: URLSearchParams, options: { replace: boolean; state?: unknown }) => void;
   /** The route's issue (id or key). */
   selectedIssue: string | null;
   serverNow: number;
 }) {
   const navigate = useNavigate();
+  const location = useLocation();
+  const navigationType = useNavigationType();
+  const navigationId = useId();
   const phone = usePhone();
   const now = serverNow;
   const address = useMemo(() => readAddress(params, now), [params, now]);
@@ -100,21 +103,44 @@ export function Chronicle({
   // The params last written: navigation settles asynchronously, and a quick
   // second key press must build on the first.
   const latest = useRef(params);
-  const acknowledged = useRef(params.toString());
+  const revision = useRef(0);
+  const acknowledged = useRef({ location: location.key, search: params.toString() });
   useLayoutEffect(() => {
-    // Snapshot updates can recreate params without acknowledging a navigation.
-    // Acknowledge before paint; a passive effect can erase the next key's gesture.
-    const key = params.toString();
-    if (acknowledged.current === key) return;
-    acknowledged.current = key;
-    setLive(null);
+    const search = params.toString();
+    if (acknowledged.current.location === location.key && acknowledged.current.search === search)
+      return;
+    acknowledged.current = { location: location.key, search };
+    const receipt = location.state?.chronicleNavigation as
+      | { id?: unknown; revision?: unknown }
+      | undefined;
+    const own =
+      navigationType !== "POP" &&
+      receipt?.id === navigationId &&
+      typeof receipt.revision === "number" &&
+      receipt.revision > 0 &&
+      receipt.revision <= revision.current;
+    // A previous navigation can commit after the next key's gesture starts.
+    if (own && receipt.revision !== revision.current) return;
     latest.current = params;
-  }, [params]);
+    if (own)
+      setLive((current) =>
+        current?.from === address.from && current.to === address.to && current.at === address.at
+          ? null
+          : current,
+      );
+    else {
+      revision.current++;
+      setLive(null);
+    }
+  }, [params, address, location.key, location.state, navigationType, navigationId]);
   const commit = (next: Partial<ChronicleAddress>, push = true) => {
     const base = latest.current;
     const written = writeAddress(base, { ...readAddress(base, now), ...next });
     latest.current = written;
-    setParams(written, { replace: !push });
+    setParams(written, {
+      replace: !push,
+      state: { chronicleNavigation: { id: navigationId, revision: ++revision.current } },
+    });
   };
   // Wheel bursts settle into one history entry.
   const settle = useRef<ReturnType<typeof setTimeout> | null>(null);

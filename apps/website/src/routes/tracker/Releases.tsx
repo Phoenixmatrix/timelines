@@ -10,7 +10,6 @@ import {
   type LoaderFunctionArgs,
 } from "react-router";
 import {
-  landedTimelineSlug,
   releaseKind,
   releaseLabel,
   type ReleaseCategory,
@@ -25,6 +24,7 @@ import {
   type ReleaseNoteDetailsSelection,
 } from "../../components/ReleaseNoteDetails.tsx";
 import { SelectField } from "../../components/ui.tsx";
+import { TimelineSwitcher } from "../../components/TimelineScope.tsx";
 import { api, load } from "../../lib/api.ts";
 import { timeAgo } from "../../lib/format.ts";
 import { repoPath } from "../../lib/refs.ts";
@@ -33,10 +33,14 @@ import { useRefContext } from "../../refs/context.ts";
 import { LinkedText } from "../../refs/RefLink.tsx";
 
 export async function trackerReleasesLoader({ request, params }: LoaderFunctionArgs) {
-  const q = new URL(request.url).searchParams.get("q") ?? "";
+  const search = new URL(request.url).searchParams;
+  const q = search.get("q") ?? "";
+  const query = new URLSearchParams({ q });
+  const scope = scopeOf(search);
+  if (scope) query.set("timeline", scope);
   const [feed, trackers] = await Promise.all([
     load<ReleaseFeed>(
-      `/tracker/${encodeURIComponent(params.owner!)}/release-notes?q=${encodeURIComponent(q)}`,
+      `/tracker/${encodeURIComponent(params.owner!)}/release-notes?${query}`,
       request,
     ),
     api<{ trackers: TrackerOwner[] }>("/tracker", { signal: request.signal }),
@@ -119,12 +123,10 @@ function Facets({
 
 function Entry({
   entry,
-  scope,
   expanded,
   onSelect,
 }: {
   entry: ReleaseFeedEntry;
-  scope: string | null;
   expanded: boolean;
   onSelect: (id: string, trigger: HTMLButtonElement) => void;
 }) {
@@ -135,9 +137,6 @@ function Entry({
     <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
         <span className="mk-chip mk-chip--tag">{CATEGORY_LABELS[entry.category]}</span>
-        {scope && landedTimelineSlug(entry.timeline) === scope && (
-          <span className="mk-chip mk-chip--tag">This timeline</span>
-        )}
         <span className="text-body font-semibold text-ink">
           <LinkedText text={entry.title} context={context} />
         </span>
@@ -192,7 +191,6 @@ export function TrackerReleases() {
   const [draft, setDraft] = useState(q);
   useEffect(() => setDraft(q), [q]);
   const owner = feed.owner.slug;
-  // In a timeline's scope (?tl=) what it landed is marked; the Timelines facet narrows to it.
   const location = useLocation();
   const scope = scopeOf(location.search);
   const [selected, setSelected] = useState<{
@@ -224,10 +222,12 @@ export function TrackerReleases() {
   useEffect(() => {
     if (selected && !selectedEntry) setSelected(null);
   }, [selected, selectedEntry]);
-  const onQuery = (next: string) =>
-    navigate(
-      `/tracker/${encodeURIComponent(owner)}/releases${next ? `?q=${encodeURIComponent(next)}` : ""}`,
-    );
+  const onQuery = (next: string) => {
+    const search = new URLSearchParams(location.search);
+    if (next) search.set("q", next);
+    else search.delete("q");
+    void navigate({ pathname: location.pathname, search: search.toString() });
+  };
 
   const weeks = new Map<string, ReleaseFeedEntry[]>();
   for (const entry of feed.entries) {
@@ -246,6 +246,7 @@ export function TrackerReleases() {
           options={trackers.map((tracker) => ({ value: tracker.slug, label: tracker.displayName }))}
           onChange={(value) => navigate(`/tracker/${encodeURIComponent(value)}/releases`)}
         />
+        <TimelineSwitcher variant="filter" />
         <Link to={`/tracker/${encodeURIComponent(owner)}/highlights`} className="mk-btn mk-btn--sm">
           View highlights
         </Link>
@@ -263,6 +264,9 @@ export function TrackerReleases() {
         releases are optional snapshots, not deployment records.
       </p>
       <Form method="get" className="relative flex max-w-[52rem] items-center" role="search">
+        {new URLSearchParams(location.search).has("tl") && (
+          <input type="hidden" name="tl" value={scope ?? "main"} />
+        )}
         <MagnifyingGlassIcon
           className="pointer-events-none absolute left-3 size-4 text-ink-faint"
           aria-hidden
@@ -348,22 +352,16 @@ export function TrackerReleases() {
           queryKey="tag"
           onQuery={onQuery}
         />
-        <Facets
-          title="Timelines"
-          facets={feed.facets.timelines ?? []}
-          q={q}
-          queryKey="timeline"
-          onQuery={onQuery}
-          min={scope ? 1 : 2}
-        />
       </div>
       {feed.entries.length === 0 ? (
         <div className="mk-empty flex max-w-[44rem] flex-col items-center gap-3 py-12">
           <RocketLaunchIcon size={28} className="text-ink-faint" aria-hidden />
           <div>
-            {q
-              ? "No code updates match this filter."
-              : `No daily notes are available for ${feed.owner.displayName}'s repositories or teams yet.`}
+            {scope
+              ? "No landed notes you can see match this timeline and these filters. Choose another timeline or main, or adjust your search."
+              : q
+                ? "No code updates match this filter."
+                : `No daily notes are available for ${feed.owner.displayName}'s repositories or teams yet.`}
           </div>
           <p className="m-0 text-body-sm text-ink-faint">
             Refresh to check for newly processed notes.
@@ -388,7 +386,6 @@ export function TrackerReleases() {
                   <Entry
                     key={entry.id}
                     entry={entry}
-                    scope={scope}
                     expanded={selectedEntry?.id === entry.id}
                     onSelect={(id, trigger) =>
                       setSelected(

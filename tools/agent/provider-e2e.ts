@@ -28,6 +28,7 @@ import { runAtlasProviderE2E } from "./atlas-provider-e2e.ts";
 import { command, validateEnvironment, type Environment } from "./environment.ts";
 import { runQueueAiE2E } from "./queue-ai-e2e.ts";
 import { collectGatewayLogs, reconcileUsage, type UsageRow } from "./usage-reconciliation.ts";
+import { collectModelFailureEvidence, modelFailureAttempt } from "./model-failure-evidence.ts";
 import type { Outcome, Selection, StageDefinition } from "./ai-stages.ts";
 
 const WORKER = "apps/website/worker";
@@ -164,7 +165,7 @@ export const COPPER_FINCH_STAGES = [
   {
     id: "timeline-pages",
     covers:
-      "A checkpoint's wiki pages for a tracked timeline, leaving main untouched; its compact landing's release notes",
+      "A checkpoint's wiki pages for a tracked timeline, leaving main untouched; its compact landing's release notes and timeline-filtered repository/tracker views",
     // Compact landing purges and regenerates release notes, which only that stage turns on.
     requires: ["knowledge-edit", "release-notes"],
     paths: [
@@ -173,6 +174,14 @@ export const COPPER_FINCH_STAGES = [
       `${WORKER}/timelines/**`,
       `${SRC}/components/TimelinePages.tsx`,
       `${SRC}/routes/tracker/Checkpoint.tsx`,
+      `${WORKER}/release-notes/api.ts`,
+      `${WORKER}/release-notes/read*.ts`,
+      `${WORKER}/release-notes/feed*.ts`,
+      `${SRC}/routes/repo/Releases.tsx`,
+      `${SRC}/routes/repo/RepoLayout.tsx`,
+      `${SRC}/routes/tracker/Releases.tsx`,
+      `${SRC}/components/TimelineScope.tsx`,
+      `${SRC}/lib/timelineScope.ts`,
     ],
   },
   {
@@ -232,7 +241,7 @@ interface GatewayLog {
   provider: string;
   success: boolean;
   cached: boolean;
-  metadata?: { component?: string; account?: string; feature?: string };
+  metadata?: { component?: string; account?: string; feature?: string; attempt?: string };
   request: string;
   response: string;
   response_content_type: string;
@@ -255,6 +264,7 @@ interface GatewayLogSummary {
   cost?: number;
   account?: string;
   feature?: string;
+  attempt?: string;
 }
 
 // List metadata only: never persist request/response bodies or raw cf output.
@@ -335,6 +345,7 @@ async function gatewayLogs(
         cost: log.cost,
         account: log.metadata?.account,
         feature: log.metadata?.feature,
+        attempt: modelFailureAttempt(log.metadata?.attempt),
       },
     ];
   });
@@ -2460,7 +2471,6 @@ export async function runProviderE2E(
         // usage window. Its failure is reported independently below.
         await atlas;
         enter("release-highlights");
-        const highlightsStartedAt = new Date().toISOString();
         const repo = await api(base);
         const personalPath = `/accounts/${persona}/settings/ai`;
         const personal: AiSettingsView = await api(personalPath);
@@ -2545,6 +2555,9 @@ export async function runProviderE2E(
         };
         const before = await fixture("inspect");
         report.before = before;
+        // Match the app-usage baseline, not the earlier prerequisite reads:
+        // those can finish detailed-note generation before this proof begins.
+        const highlightsStartedAt = new Date().toISOString();
         let appended = false;
         const proofErrors: unknown[] = [];
         try {
@@ -3455,6 +3468,58 @@ export async function runProviderE2E(
             assert.equal(compactEntry.provenance?.[0]?.source.sourceId, pagesWork.source.sourceId);
             assert.equal(compactEntry.provenance?.[0]?.source.commit, pagesHead);
             assert.match(`${compactEntry.title} ${compactEntry.summary}`, /receipt/i);
+            const timelineQuery = `timeline=${encodeURIComponent(pagesSlug)}`;
+            const scopedIndex: ReleaseNotesIndex = await api(
+              `${base}/release-notes?${timelineQuery}`,
+            );
+            const scopedNotes: ReleaseNotesRelease = await api(
+              `${base}/release-notes/release?name=provider-compact&${timelineQuery}`,
+            );
+            assert.deepEqual(
+              scopedNotes.entries.map((entry) => entry.id),
+              [compactEntry.id],
+            );
+            assert.equal(scopedNotes.release.intro, null);
+            assert.equal(scopedNotes.release.introModel, null);
+            assert.equal(
+              scopedIndex.releases.find((release) => release.name === "provider-compact")?.entries,
+              1,
+            );
+            for (const release of scopedIndex.releases) {
+              const scoped: ReleaseNotesRelease = await api(
+                `${base}/release-notes/release?name=${encodeURIComponent(release.name)}&${timelineQuery}`,
+              );
+              assert.equal(release.entries, scoped.entries.length);
+              assert(
+                scoped.entries.every((entry) => entry.timeline?.branch === `timeline/${pagesSlug}`),
+              );
+            }
+            const scopedFeed: ReleaseFeed = await api(
+              `/tracker/${owner}/release-notes?${timelineQuery}&q=${encodeURIComponent("release:provider-compact")}`,
+            );
+            assert.deepEqual(
+              scopedFeed.entries.map((entry) => entry.id),
+              [compactEntry.id],
+            );
+            const conflictingFeed: ReleaseFeed = await api(
+              `/tracker/${owner}/release-notes?${timelineQuery}&q=${encodeURIComponent(`-timeline:${pagesSlug}`)}`,
+            );
+            assert.deepEqual(conflictingFeed.entries, []);
+            const unknownIndex: ReleaseNotesIndex = await api(
+              `${base}/release-notes?timeline=no-such-release-timeline`,
+            );
+            assert.deepEqual(unknownIndex.releases, []);
+            const mainNotes: ReleaseNotesRelease = await api(
+              `${base}/release-notes/release?name=provider-compact&timeline=main`,
+            );
+            assert.deepEqual(mainNotes, compactNotes);
+            evidence.releaseTimelineFilter = {
+              scopedIndex,
+              scopedNotes,
+              scopedFeed,
+              conflictingFeed,
+              unknownIndex,
+            };
             for (const oid of [pagesFirst, pagesHead]) {
               await api(`${base}/commits?source=${pagesWork.source.sourceId}&ref=${oid}`);
               await api(`${base}/commits?ref=${oid}`, "GET", undefined, 404);
@@ -3503,6 +3568,15 @@ export async function runProviderE2E(
             assert.deepEqual(regenerated.provenance, compactEntry.provenance);
             assert.deepEqual(regenerated.timeline, compactEntry.timeline);
             assert.match(`${regenerated.title} ${regenerated.summary}`, /receipt/i);
+            const retainedScoped: ReleaseNotesRelease = await api(
+              `${base}/release-notes/release?name=provider-compact&${timelineQuery}`,
+            );
+            assert.deepEqual(
+              retainedScoped.entries.map((entry) => entry.id),
+              [regenerated.id],
+            );
+            assert.equal(retainedScoped.release.intro, null);
+            evidence.releaseTimelineFilterAfterSourceExpiry = retainedScoped;
             evidence.compactRelease = {
               landing: compactLanding,
               compactOid,
@@ -4023,6 +4097,7 @@ export async function runProviderE2E(
       } catch (error) {
         evidence.cost = { error: error instanceof Error ? error.message : String(error) };
       }
+      evidence.modelFailures = await collectModelFailureEvidence(ctx.artifacts);
     }
     evidence.finishedAt = new Date().toISOString();
     let serialized = JSON.stringify(evidence, null, 2);

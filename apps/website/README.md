@@ -1515,10 +1515,12 @@ change feed. The layout toggle is **Chart / List**: Chart names the visual
 time-axis layout without conflicting with the separate Timelines feature.
 Phones get the List layout, the accessible equivalent of the canvas.
 Design: root `DESIGN.md`, "History (time axis)".
-The List scrubber preserves in-flight keyboard positions until the address
-changes; snapshot refreshes alone do not reset them. Address acknowledgement
-runs before paint so a delayed passive effect cannot clear the next keyboard
-gesture. Committed positions remain navigable with Back and Forward.
+The List scrubber preserves newer keyboard positions when an earlier address
+write finishes. Each committed gesture carries an instance/revision receipt in
+router history state: only the latest receipt can acknowledge its matching
+position, even when a gesture returns to the same address. Snapshot refreshes
+alone do not reset the scrubber. Acknowledgement runs before paint; external
+navigation and Back/Forward restore the position from that history entry.
 
 **Development history:** `POST /api/dev/chronicle {account, team, issues?, days?, seed?, link?}`
 (agent secret) makes `issues` issues of a new team worked by the account's
@@ -1857,11 +1859,13 @@ the URL says. What each surface does with it:
   `?timeline=` is rewritten to `?tl=`.
 - **Wiki**: the timeline's own version of a page where it wrote one (`&set=`
   picks a checkpoint's), noted as such, with a link to main's.
-- **Release notes** cover landed work: entries the timeline landed are marked,
-  and `timeline:<slug>` (a Timelines facet) narrows to them.
+- **Release notes** cover canonical landed work. The shared timeline picker is
+  also available inline on repository and tracker release views (CORE-283).
+  A selected timeline filters to what it landed; main shows all canonical notes.
 
 A landed or abandoned timeline stays selectable: the shell banner says how it
-ended and that its view is read-only, on the tracker and every other page.
+ended and that its work view is read-only. Release notes instead describe the
+landed-note filter, which remains readable after work-source retention expires.
 
 The switcher's **Timeline graph** link sits beside its title, above the changing
 list and loading/error messages, so resolving the list does not move a footer
@@ -1945,6 +1949,22 @@ are the CLI equivalents; `gm release notes day:2026-10-02` selects a UTC day.
 Entries about issues from trackers the viewer can't read are omitted, and an introduction is
 shown only to viewers who can read every tracker that shaped it.
 
+Both release views expose the same searchable timeline picker as the tracker.
+Its selection lives in `?tl=<slug>` and survives links, query submissions,
+Back/Forward and reload; selecting main explicitly clears the timeline scope.
+Repository layouts and note requests stay canonical even when a stale URL names
+an expired work source. A scoped index counts only matching entries the viewer
+may read and omits empty releases. An explicitly selected day/tag can still show
+an empty result with the picker available. Scoped views omit the whole-release
+introduction and its model attribution, since that prose may describe other work.
+
+The index, detail and tracker feed APIs accept an independent `timeline=<slug>`
+constraint. Empty or `main` means all canonical notes; an unknown or nonmatching
+slug returns no matching entries, never an unfiltered fallback. In a tracker
+feed this constraint intersects with every `q` filter, including positive or
+negated `timeline:` terms, before result limits and facet counts. It does not
+generate notes for unlanded work or grant additional access.
+
 **Highlights** are separate, person-specific summaries of authorized daily entries:
 `GET /api/repos/:owner/:repo/release-notes/highlights`,
 `GET /api/tracker/:owner/release-notes/highlights`, and
@@ -2012,8 +2032,12 @@ account-wide feed.
 Real-provider coverage in `vp run agent test-ai` checks daily generation without
 tags, a second commit on a different UTC committer date despite unchanged
 authorship, retained earlier-day provenance, a named tag containing both changes,
-and daily/tag tracker feeds without duplicate default entries. This is separate
-from the non-AI readiness gate.
+and daily/tag tracker feeds without duplicate default entries. The timeline-pages
+stage additionally checks filtered repository counts/detail and tracker feeds
+against real compact-landing notes, conflicting query constraints, main reset,
+and retained filtering after work-source expiry and note regeneration. These are
+gate requirements, not claims of an observed run; inspect retained outcomes.
+This is separate from the non-AI readiness gate.
 
 For the generator's local regressions, run
 `vp test worker/release-notes/generate.test.ts` from `apps/website`, followed by
@@ -2358,6 +2382,20 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   `sum(neurons)`: that dataset is adaptively sampled and its aggregates are
   already weighted by `sampleInterval`. Multiplying by it again squares the
   weight, which overstated spend about 7× in CORE-284.
+- **Failed-attempt evidence** (CORE-347): the model invocation boundary emits
+  a single `ai.model.failed` JSON warning before retries can discard the failure.
+  It records a unique attempt ID (also attached to Workers AI Gateway metadata),
+  account/feature/model attribution, whether dispatch occurred, and finite
+  failure categories and numeric codes. Local deadlines and stopped/expired
+  work are distinguished from provider rejection; unknown failures stay unknown.
+  Raw error messages, stacks, causes, prompts and responses are not included.
+  Accounting, retries and the original exception are unchanged. `test-ai`
+  retains the allowlisted records as `ai-e2e.json.modelFailures` on success
+  and failure before owned-resource cleanup. Collection is bounded to the
+  final 8 MiB of the server log, 4 KiB per line and 256 events; missing reads,
+  invalid records and omissions are explicit, not evidence of zero failures.
+  A missing Gateway record still fails strict reconciliation and does not,
+  by itself, establish a provider outage.
 - **Timeline overlays** (`worker/knowledge/overlay.ts`, CORE-83): a push to an
   owned work source recomputes that timeline's graph diff against main's indexed
   graph using its explicit logical-base/source snapshot. `timeline/<slug>` is

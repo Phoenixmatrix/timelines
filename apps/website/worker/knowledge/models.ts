@@ -10,7 +10,8 @@ import { aiGatewayOptions, componentOf } from "../ai-gateway.ts";
 import { callProvider } from "../ai-providers/providers.ts";
 import { parseProviderModelRef, providerKey } from "../ai-providers/store.ts";
 import { attribution, recordAiCall, tokensOf } from "../usage/ai.ts";
-import { paidWorkGuard } from "./paid-work.ts";
+import { modelFailureDiagnostic } from "./model-failure.ts";
+import { paidWorkGuard, PaidWorkStopped } from "./paid-work.ts";
 
 export const MODELS = {
   fast: "@cf/zai-org/glm-5.3-flash",
@@ -126,10 +127,12 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
   const controller = new AbortController();
   const stopped = () => controller.abort(guard!.signal.reason);
   guard?.signal.addEventListener("abort", stopped, { once: true });
-  const timer = setTimeout(
-    () => controller.abort(new Error(`${metered} timed out after ${Math.round(ms / 1000)}s`)),
-    ms,
-  );
+  const attempt = crypto.randomUUID();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error(`${metered} timed out after ${Math.round(ms / 1000)}s`));
+  }, ms);
   const aborted = new Promise<never>((_, reject) => {
     controller.signal.addEventListener("abort", () => reject(controller.signal.reason), {
       once: true,
@@ -152,6 +155,7 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
         })
       : aiGatewayOptions(env, componentOf(work.feature), work).then((gateway) => {
           controller.signal.throwIfAborted();
+          gateway.gateway.metadata.attempt = attempt;
           dispatched = true;
           return (env.AI as unknown as LooseAi).run(model, inputs, {
             ...gateway,
@@ -164,6 +168,32 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
     await recordAiCall(env, metered, tokensOf(result));
     return result;
   } catch (error) {
+    const failure = controller.signal.aborted ? controller.signal.reason : error;
+    try {
+      console.warn(
+        JSON.stringify(
+          modelFailureDiagnostic(
+            {
+              attempt,
+              provider: provider?.kind ?? "workers-ai",
+              model: metered,
+              ...work,
+              dispatched,
+            },
+            failure,
+            failure instanceof PaidWorkStopped
+              ? failure.kind === "expired"
+                ? "work_expired"
+                : "work_stopped"
+              : timedOut
+                ? "deadline"
+                : undefined,
+          ),
+        ),
+      );
+    } catch {
+      // Diagnostics must never change failure propagation or usage accounting.
+    }
     if (dispatched) await recordAiCall(env, metered, {}, { failed: true });
     throw controller.signal.aborted ? controller.signal.reason : error;
   } finally {
