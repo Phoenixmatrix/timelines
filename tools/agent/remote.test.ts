@@ -668,3 +668,137 @@ await describe("edge route request recovery", async () => {
     });
   }
 });
+
+await it("collected child ownership never regresses and remote maintenance reconciles reservations (CORE-368)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "remote-quota-forward-"));
+  try {
+    const parent = environment();
+    const child = (n: number) => `gma-mga0000${n}-${String(n).repeat(12)}`;
+    await writeFile(join(directory, "machine-id"), "fixture-machine\n");
+    // Fixture quota authority: lists the rows in rows.json, records DELETEs.
+    await writeFile(
+      join(directory, "gm"),
+      `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (process.env.GM_SERVER !== 'https://quota.example') process.exit(3);
+const path = ${JSON.stringify(join(directory, "rows.json"))};
+const rows = JSON.parse(fs.readFileSync(path, 'utf8'));
+if (args.join(' ') === '-o json api GET /environments') {
+  console.log(JSON.stringify({ maximum: 4, used: rows.length, reservations: rows }));
+} else if (args.slice(0, 4).join(' ') === '-o json api DELETE') {
+  const id = args[4].split('/').at(-1);
+  fs.writeFileSync(path, JSON.stringify(rows.filter((row) => row.id !== id)));
+  console.log(JSON.stringify({ id, released: true, removed: rows.some((row) => row.id === id) }));
+} else process.exit(4);
+`,
+      { mode: 0o700 },
+    );
+    await promisify(execFile)(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `
+        import assert from "node:assert/strict";
+        import { mkdir, readFile, writeFile } from "node:fs/promises";
+        import { join } from "node:path";
+        import { remoteMain } from ${JSON.stringify(new URL("./remote.ts", import.meta.url).href)};
+        import { persistRemote, remoteRegistry } from ${JSON.stringify(new URL("./remote-environment.ts", import.meta.url).href)};
+        import { hostId } from ${JSON.stringify(new URL("./quota.ts", import.meta.url).href)};
+        const authority = "https://quota.example";
+        const state = join(process.env.HOME, ".local/state/gitmatrix-agent");
+        await mkdir(state, { recursive: true });
+        await writeFile(join(state, "limits.json"), JSON.stringify({ maximum: 4, authority }));
+        const fixtureHost = await hostId();
+        assert.ok(fixtureHost);
+        const record = ${JSON.stringify(parent)};
+        record.root = process.env.HOME;
+        record.created = Date.now();
+        record.expires = record.created + 60_000;
+        record.quota = { authority, state: "reserved" };
+        const owned = (id, state) => ({ id, account: record.account, expires: record.expires,
+          quota: { authority, state }, resources: { artifacts: state === "released" ? "deleted" : "created" } });
+        record.resources = [owned(${JSON.stringify(child(1))}, "released"),
+          owned(${JSON.stringify(child(2))}, "reserved"), owned(${JSON.stringify(child(3))}, "pending")];
+        await persistRemote(record);
+        // A lagging ownership record: every child reports the opposite of progress.
+        const reported = { ${JSON.stringify(child(1))}: "reserved", ${JSON.stringify(child(2))}: "pending",
+          ${JSON.stringify(child(3))}: "reserved" };
+        globalThis.fetch = async (input) => {
+          const route = new URL(input).pathname.replace("/__remote", "");
+          if (route.endsWith("/logs")) return Response.json({ text: "", nextOffset: 0, done: true, exitCode: 0 });
+          assert.equal(route, "/ownership");
+          return Response.json({ environments: Object.entries(reported).map(([id, state]) => ({
+            ...owned(id, state), resources: { artifacts: "created" } })) });
+        };
+        await remoteMain(record.root, ["logs", "fixture"]);
+        const journal = JSON.parse(await readFile(join(remoteRegistry, "environments", record.id + ".json"), "utf8"));
+        assert.deepEqual(journal.resources.map((owned) => owned.quota.state), ["released", "reserved", "reserved"]);
+        const longAgo = Date.now() - 3 * 86_400_000;
+        const rowsPath = ${JSON.stringify(join(directory, "rows.json"))};
+        const initialRows = JSON.stringify([
+          // Live rows long past their expiry are still never released.
+          { id: record.id, host: fixtureHost, expires: longAgo },
+          { id: ${JSON.stringify(child(1))}, host: null },
+          { id: ${JSON.stringify(child(2))}, host: fixtureHost, expires: longAgo },
+          { id: ${JSON.stringify(child(4))}, host: fixtureHost },
+          { id: ${JSON.stringify(child(5))}, host: null, expires: Date.now() - 3_600_000 },
+          { id: ${JSON.stringify(child(6))}, host: null, expires: longAgo },
+        ]);
+        // The hourly remote sweep releases released-locally and own-orphan rows only.
+        await writeFile(rowsPath, initialRows);
+        await remoteMain(record.root, ["cleanup", "--expired"]);
+        assert.deepEqual(JSON.parse(await readFile(rowsPath, "utf8")).map((row) => row.id),
+          [record.id, ${JSON.stringify(child(2))}, ${JSON.stringify(child(5))}, ${JSON.stringify(child(6))}]);
+        await writeFile(rowsPath, initialRows);
+        const maintenance = async (...flags) => {
+          const output = [];
+          const log = console.log;
+          console.log = (line) => output.push(line);
+          try {
+            await remoteMain(record.root, ["maintenance", "reservations", ...flags]);
+          } finally {
+            console.log = log;
+          }
+          return JSON.parse(output.join("\\n"));
+        };
+        const report = await maintenance("--release");
+        assert.deepEqual(Object.fromEntries(report.reservations.map((row) => [row.id, row.class])), {
+          [record.id]: "live",
+          ${JSON.stringify(child(1))}: "released-locally",
+          ${JSON.stringify(child(2))}: "live",
+          ${JSON.stringify(child(4))}: "own-orphan",
+          ${JSON.stringify(child(5))}: "foreign",
+          ${JSON.stringify(child(6))}: "expired-foreign",
+        });
+        assert.equal(report.expired, false);
+        assert.deepEqual(report.released, [
+          { id: ${JSON.stringify(child(1))}, removed: true },
+          { id: ${JSON.stringify(child(4))}, removed: true },
+        ]);
+        const remaining = JSON.parse(await readFile(${JSON.stringify(join(directory, "rows.json"))}, "utf8"));
+        assert.deepEqual(remaining.map((row) => row.id), [record.id, ${JSON.stringify(child(2))}, ${JSON.stringify(child(5))}, ${JSON.stringify(child(6))}]);
+        const expired = await maintenance("--release", "--expired");
+        assert.equal(expired.expired, true);
+        assert.deepEqual(expired.released, [{ id: ${JSON.stringify(child(6))}, removed: true }]);
+        const after = JSON.parse(await readFile(${JSON.stringify(join(directory, "rows.json"))}, "utf8"));
+        assert.deepEqual(after.map((row) => row.id), [record.id, ${JSON.stringify(child(2))}, ${JSON.stringify(child(5))}]);
+        await assert.rejects(remoteMain(record.root, ["maintenance", "reservations", "--expired"]), /--release \\[--expired\\]/);
+        await assert.rejects(remoteMain(record.root, ["maintenance", "reservations", "--all"]), /Use maintenance reservations/);
+        `,
+      ],
+      {
+        env: {
+          ...unitTestEnvironment(process.env),
+          HOME: directory,
+          PATH: `${directory}:${process.env.PATH}`,
+          GITMATRIX_AGENT_MACHINE_ID_FILE: join(directory, "machine-id"),
+        },
+        timeout: 15_000,
+      },
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

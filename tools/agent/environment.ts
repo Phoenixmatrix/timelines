@@ -8,12 +8,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { HarnessContext } from "./types.ts";
 import { withFileLock } from "./heavy.ts";
 import {
+  advanceQuota,
   parseEnvironmentLimits,
   readEnvironmentLimits,
   reserveQuota,
   releaseQuota,
 } from "./quota.ts";
 import type { QuotaReservation } from "./quota.ts";
+import { prunable, sweepReservations } from "./reservations.ts";
 
 const TTL = 24 * 60 * 60 * 1000;
 const ID = /^gma-[a-z0-9]{8,10}-[a-f0-9]{12}$/;
@@ -295,6 +297,9 @@ async function persist(env: Environment): Promise<void> {
     for (const resource of ["artifacts", "vectors", "search", "gateway"] as const)
       if (previous.resources[resource] === "deleted") env.resources[resource] = "deleted";
   }
+  // A stale in-memory copy never moves the journal's reservation backwards (CORE-368).
+  const quota = advanceQuota(previous?.quota, env.quota);
+  if (quota) env.quota = quota;
   // Central journal survives worktree removal and is committed before local state.
   await privateJson(join(registry, "environments", `${env.id}.json`), env);
   if (process.env.GITMATRIX_REMOTE_HOSTED === "1") {
@@ -656,11 +661,27 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
 }
 
 export async function cleanupExpired(): Promise<void> {
+  // Best effort, and before taking the registry lock: its network calls must not
+  // stall every setup on this machine. Pruning after it stays safe because ids
+  // are random and a released reservation is never re-reserved, so a row the
+  // listing did not show cannot reappear.
+  const listing = await sweepReservations();
+  if (!listing)
+    console.error(
+      JSON.stringify({
+        event: "cleanup.prune_skipped",
+        message:
+          "Reservations could not be listed; deleted journals are kept until a sweep can confirm their reservations are gone.",
+      }),
+    );
   await registryLock(async () => {
     const failures: string[] = [];
     for (const env of await inventory()) {
       if (env.status === "deleted" && Date.now() - env.expires > 7 * TTL) {
-        await rm(join(registry, "environments", `${env.id}.json`));
+        // A journal whose row may still be reserved stays: it is the only
+        // record that can release that row.
+        if (prunable(env.quota, env.id, listing))
+          await rm(join(registry, "environments", `${env.id}.json`));
         continue;
       }
       // An orphaned namespace is retried on every sweep, expired or not.
@@ -913,8 +934,14 @@ export async function context(env: Environment): Promise<HarnessContext> {
       env.expires <= Date.now()
     )
       throw new Error("Environment is expired or being destroyed; run destroy then setup.");
-    // Re-read under the same lock as cleanup, never resurrect a released slot.
-    if (current?.quota) env.quota = current.quota;
+    // Re-read under the same lock as cleanup, never resurrect a released slot,
+    // whether the release is in the journal or only in memory (CORE-368).
+    const quota = advanceQuota(current?.quota, env.quota);
+    if (quota) env.quota = quota;
+    if (quota?.state === "released")
+      throw new Error(
+        "This environment's installation reservation was already released; run destroy then setup.",
+      );
     await reserveQuota(env, "local", persist);
   });
   await safeLocalDirectory(env);

@@ -41,7 +41,7 @@ export async function installMaintenance(): Promise<void> {
     if ((await realpath(executable)).startsWith(`${checkout}/`))
       throw new Error("Scheduled cleanup requires Node, cf and gm installed outside the worktree.");
   }
-  for (const name of ["quota.ts", "heavy.ts", "environment.ts"]) {
+  for (const name of ["quota.ts", "reservations.ts", "heavy.ts", "environment.ts"]) {
     const temporary = join(registry, `${name}.${process.pid}.tmp`);
     await copyFile(join(source, name), temporary);
     await rename(temporary, join(registry, name));
@@ -118,6 +118,7 @@ export async function installRemoteMaintenance(root: string): Promise<void> {
     "maintenance.ts",
     "environment.ts",
     "quota.ts",
+    "reservations.ts",
     "heavy.ts",
     "types.ts",
     "../remote/cloudflare.config.ts",

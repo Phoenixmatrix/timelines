@@ -5,6 +5,8 @@ import { fail, requireActor, requirePerson } from "./http.ts";
 const MAXIMUM = 2147483647;
 const TTL = 24 * 60 * 60 * 1000;
 const ID = /^(?:gma-[a-z0-9]{8,10}-[a-f0-9]{12}|gmr-[a-f0-9]{24})$/;
+/** An opaque per-machine id the client persists; lets its owner reconcile journal-less rows. */
+const HOST = /^[A-Za-z0-9._-]{1,64}$/;
 
 export const environments = new Hono<AppEnv>();
 export const environmentSettings = new Hono<AppEnv>();
@@ -58,7 +60,7 @@ environments.get("/", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
   const reservations = await c.env.DB.prepare(
-    "SELECT id, cloud_account AS account, backend, expires, created_at AS createdAt FROM environment_reservations WHERE owner_id = ? ORDER BY created_at",
+    "SELECT id, cloud_account AS account, backend, expires, host, created_at AS createdAt FROM environment_reservations WHERE owner_id = ? ORDER BY created_at",
   )
     .bind(actor.id)
     .all();
@@ -77,7 +79,9 @@ environments.post("/reservations", async (c) => {
     !body ||
     typeof body !== "object" ||
     Array.isArray(body) ||
-    Object.keys(body).some((key) => !["id", "account", "backend", "expires"].includes(key)) ||
+    Object.keys(body).some(
+      (key) => !["id", "account", "backend", "expires", "host"].includes(key),
+    ) ||
     !("id" in body) ||
     typeof body.id !== "string" ||
     !ID.test(body.id) ||
@@ -92,22 +96,24 @@ environments.post("/reservations", async (c) => {
     typeof body.expires !== "number" ||
     !Number.isSafeInteger(body.expires) ||
     body.expires > Date.now() + TTL ||
-    body.expires <= 0
+    body.expires <= 0 ||
+    ("host" in body && (typeof body.host !== "string" || !HOST.test(body.host)))
   )
     return fail(
       c,
       400,
-      "Provide an owned environment id, Cloudflare account, local/remote backend and expiry (maximum 24 hours).",
+      "Provide an owned environment id, Cloudflare account, local/remote backend and expiry (maximum 24 hours), and optionally a host id (1-64 of A-Z a-z 0-9 . _ -).",
     );
+  const host = "host" in body ? (body.host as string) : null;
   // One SQLite write statement is the admission decision. Never count then insert
   // in separate requests: concurrent hosts must compete for the very same slots.
   await c.env.DB.prepare(`
-    INSERT INTO environment_reservations (id, owner_id, cloud_account, backend, expires)
-    SELECT ?, ?, ?, ?, ? FROM environment_limits
+    INSERT INTO environment_reservations (id, owner_id, cloud_account, backend, expires, host)
+    SELECT ?, ?, ?, ?, ?, ? FROM environment_limits
     WHERE id = 1 AND (SELECT count(*) FROM environment_reservations) < maximum
     ON CONFLICT(id) DO NOTHING
   `)
-    .bind(body.id, actor.id, body.account, body.backend, body.expires)
+    .bind(body.id, actor.id, body.account, body.backend, body.expires, host)
     .run();
   const reservation = await c.env.DB.prepare(
     "SELECT owner_id, cloud_account, backend, expires FROM environment_reservations WHERE id = ?",
@@ -122,6 +128,14 @@ environments.post("/reservations", async (c) => {
       reservation.expires !== body.expires
     )
       return fail(c, 409, "Environment reservation belongs to a different owner or configuration.");
+    // The host is provenance, not identity: a re-POST without one (an older
+    // client) still matches. A legacy row only ever gains a host, never changes it.
+    if (host)
+      await c.env.DB.prepare(
+        "UPDATE environment_reservations SET host = ? WHERE id = ? AND owner_id = ? AND host IS NULL",
+      )
+        .bind(host, body.id, actor.id)
+        .run();
     return c.json({ reserved: true, id: body.id });
   }
   const current = await limits(c.env.DB);
@@ -150,8 +164,12 @@ environments.delete("/reservations/:id", async (c) => {
     );
   // Called only after the owning lifecycle has removed its active resources.
   // No clock-based deletion: an unreachable host must not free live cloud capacity.
-  await c.env.DB.prepare("DELETE FROM environment_reservations WHERE id = ? AND owner_id = ?")
+  const deleted = await c.env.DB.prepare(
+    "DELETE FROM environment_reservations WHERE id = ? AND owner_id = ?",
+  )
     .bind(id, actor.id)
     .run();
-  return c.json({ released: true, id });
+  // Idempotent, but truthful: `removed` says whether this call freed a row, so a
+  // client can tell an acknowledged release from one that matched nothing.
+  return c.json({ released: true, id, removed: (deleted.meta.changes ?? 0) > 0 });
 });

@@ -454,3 +454,30 @@ for (const failure of ["http", "transport"] as const) {
     `);
   });
 }
+
+await test("hosted reservations carry no host and verify a release that removed nothing (CORE-368)", async () => {
+  await isolated(`
+    const fixture = await quotaFixture();
+    const persist = async (value) => { fixture.published.set(value.id, JSON.parse(JSON.stringify(value))); };
+    const record = { id: 'gmr-' + 'b'.repeat(24), root: env.root, account: env.account, expires: env.expires };
+    await reserveQuota(record, 'remote', persist);
+    assert.equal(Object.hasOwn(fixture.reservations.get(record.id), 'host'), false,
+      'a hosted child must not claim a host before its parent journal knows it');
+    await assert.rejects(readFile(join(registry, 'host.json')), { code: 'ENOENT' });
+    let listed = true;
+    const transport = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      if (options.method === 'DELETE') return Response.json({ id: record.id, released: true, removed: false });
+      if (options.method === 'GET') {
+        assert.equal(url, 'https://quota.example/api/environments');
+        return Response.json({ maximum: 4, used: 1, reservations: listed ? [{ id: record.id, host: null }] : [] });
+      }
+      return transport(url, options);
+    };
+    await assert.rejects(releaseQuota(record, persist), /still lists it/);
+    assert.equal(record.quota.state, 'reserved');
+    listed = false;
+    await releaseQuota(record, persist);
+    assert.equal(record.quota.state, 'released');
+  `);
+});

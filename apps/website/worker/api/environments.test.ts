@@ -146,7 +146,7 @@ describe("installation environment quota", () => {
     ).toBe(403);
     expect(
       await (await call(tokens.owner, "DELETE", `/environments/reservations/${remote.id}`)).json(),
-    ).toEqual({ id: remote.id, released: true });
+    ).toEqual({ id: remote.id, released: true, removed: true });
     expect(
       (await call(tokens.owner, "POST", "/environments/reservations", reservation(10))).status,
     ).toBe(200);
@@ -206,5 +206,80 @@ describe("installation environment quota", () => {
     expect(
       sqlite.prepare("SELECT count(*) AS n FROM environment_reservations").get(),
     ).toMatchObject({ n: 1 });
+  });
+
+  test("release says whether it removed a row; repeating it is acknowledged but not removed", async () => {
+    const { tokens, call } = await setup();
+    const body = reservation(1);
+    await call(tokens.owner, "POST", "/environments/reservations", body);
+    const release = () => call(tokens.owner, "DELETE", `/environments/reservations/${body.id}`);
+    expect(await (await release()).json()).toEqual({ id: body.id, released: true, removed: true });
+    expect(await (await release()).json()).toEqual({ id: body.id, released: true, removed: false });
+    // A row never reserved is equally absent, not an error.
+    const unknown = reservation(2).id;
+    expect(
+      await (await call(tokens.owner, "DELETE", `/environments/reservations/${unknown}`)).json(),
+    ).toEqual({ id: unknown, released: true, removed: false });
+  });
+
+  test("an optional host is recorded and listed but never part of reservation identity", async () => {
+    const { tokens, call, sqlite } = await setup();
+    const host = (id: string) =>
+      (
+        sqlite.prepare("SELECT host FROM environment_reservations WHERE id = ?").get(id) as {
+          host: string | null;
+        }
+      ).host;
+    const hosted = { ...reservation(1), host: "0123456789abcdef0123456789abcdef" };
+    expect((await call(tokens.owner, "POST", "/environments/reservations", hosted)).status).toBe(
+      200,
+    );
+    expect(host(hosted.id)).toBe(hosted.host);
+    // Legacy clients re-POST without a host; a different host is not a conflict and
+    // never rewrites the recorded provenance.
+    const { host: _omitted, ...legacy } = hosted;
+    expect((await call(tokens.owner, "POST", "/environments/reservations", legacy)).status).toBe(
+      200,
+    );
+    expect(
+      (
+        await call(tokens.owner, "POST", "/environments/reservations", {
+          ...hosted,
+          host: "other-machine",
+        })
+      ).status,
+    ).toBe(200);
+    expect(host(hosted.id)).toBe(hosted.host);
+    // A legacy row without a host gains one from its owner's next reservation.
+    const old = reservation(2);
+    await call(tokens.owner, "POST", "/environments/reservations", old);
+    expect(host(old.id)).toBeNull();
+    await call(tokens.owner, "POST", "/environments/reservations", { ...old, host: "machine.b" });
+    expect(host(old.id)).toBe("machine.b");
+    for (const invalid of ["", "x".repeat(65), "has space", "slash/no", 7, null])
+      expect(
+        (
+          await call(tokens.owner, "POST", "/environments/reservations", {
+            ...reservation(3),
+            host: invalid,
+          })
+        ).status,
+      ).toBe(400);
+    const listed = (await (await call(tokens.owner, "GET", "/environments")).json()) as {
+      reservations: { id: string; host: string | null; createdAt: string }[];
+    };
+    expect(listed.reservations.map(({ id, host }) => ({ id, host }))).toEqual([
+      { id: hosted.id, host: hosted.host },
+      { id: old.id, host: "machine.b" },
+    ]);
+    expect(listed.reservations.every(({ createdAt }) => typeof createdAt === "string")).toBe(true);
+    // Other owners never see these rows.
+    expect(
+      (
+        (await (await call(tokens.other, "GET", "/environments")).json()) as {
+          reservations: unknown[];
+        }
+      ).reservations,
+    ).toEqual([]);
   });
 });

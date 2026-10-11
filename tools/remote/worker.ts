@@ -1,7 +1,8 @@
 import { timingSafeEqual } from "node:crypto";
 import { DurableObject } from "cloudflare:workers";
 import { bootstrapSource, runtimeSource } from "./runtime.mjs";
-import { REMOTE_ROOT } from "../agent/remote-protocol.ts";
+// remote-build.ts packages this one protocol import; keep it the only one.
+import { REMOTE_ROOT, mergeOwnershipQuota } from "../agent/remote-protocol.ts";
 
 const COOKIE = "__Host-gmr-preview";
 const PREFIX = "/__remote";
@@ -432,6 +433,12 @@ export class RemoteWorkspace extends DurableObject<Env> {
                 return error("Invalid quota authority", 400);
               quota = { authority: value.authority, state: value.state };
             }
+            // Reservations only move forward and never change authority (CORE-368).
+            const stored = await this.ctx.storage.get<{
+              quota?: Parameters<typeof mergeOwnershipQuota>[0];
+            }>("ownership:" + environment.id);
+            const merged = mergeOwnershipQuota(stored?.quota, quota);
+            quota = merged.quota;
             await this.ctx.storage.put("ownership:" + environment.id, {
               id: environment.id,
               account: environment.account,
@@ -442,6 +449,10 @@ export class RemoteWorkspace extends DurableObject<Env> {
               ai: environment.ai,
               ...(quota ? { quota } : {}),
             });
+            // Resource states are still recorded, since cleanup depends on them,
+            // but a different authority is refused loudly, never adopted.
+            if (merged.conflict)
+              return error("Quota authority differs from the recorded reservation", 409);
             return json({ ok: true });
           }
           return error("Method not allowed", 405);

@@ -26,7 +26,8 @@ import { syncSources, retrieveArtifact } from "./remote-sync.ts";
 import type { RemoteRequest } from "./remote-protocol.ts";
 import { writeRemoteBuild } from "./remote-build.ts";
 import { installRemoteMaintenance } from "./maintenance.ts";
-import { readEnvironmentLimits } from "./quota.ts";
+import { advanceQuota, readEnvironmentLimits } from "./quota.ts";
+import { parseReservationArgs, reconcileReservations, sweepReservations } from "./reservations.ts";
 
 const secrets = new Set<string>();
 const help = `Cloudflare execution (local agents/source; remote tooling, no local app build)
@@ -36,6 +37,7 @@ const help = `Cloudflare execution (local agents/source; remote tooling, no loca
   exec -- <argv> | inspect [db|registry] [SQL] | debug [local-port]
   artifacts <remote-path> <destination-outside-worktree>
   stop | reset [--ai] | destroy | cleanup --expired
+  maintenance reservations [--release [--expired]]
 check uses normal readiness selection; missing remote base history selects full coverage.
 Requires Node 24+, git, flock and authenticated cf CLI only. No local install/build.
 Mode: --execution > GITMATRIX_AGENT_EXECUTION > .gitmatrix/development.json > local;
@@ -379,10 +381,11 @@ async function collectOwnership(record: RemoteEnvironment, request: RemoteReques
     if (previous?.quota) {
       if (clean.quota && clean.quota.authority !== previous.quota.authority)
         throw new Error("Remote child quota authority changed; refusing ownership replacement.");
-      if (!clean.quota || previous.quota.state === "released") {
-        clean.quota = { ...previous.quota };
-        clean.expires = previous.expires;
-      }
+      // Forward-only: a lagging ownership record never undoes a reservation
+      // or release this host already recorded (CORE-368).
+      const quota = advanceQuota(previous.quota, clean.quota)!;
+      if (!clean.quota || quota.state !== clean.quota.state) clean.expires = previous.expires;
+      clean.quota = quota;
     }
     if (index < 0) record.resources.push(clean);
     else record.resources[index] = clean;
@@ -876,7 +879,16 @@ export async function remoteMain(root: string, args: string[]): Promise<void> {
             failures.push(`${record.id}: ${safeMessage(error)}`);
           }
         }
+      // Best effort: release rows whose journals are released or gone (CORE-368).
+      await sweepReservations();
       if (failures.length) throw new Error(failures.join("\n"));
+      return;
+    }
+    if (operation === "maintenance") {
+      if (rest[0] !== "reservations")
+        throw new Error("Use maintenance reservations [--release [--expired]].");
+      const { release, expired } = parseReservationArgs(rest.slice(1));
+      console.log(JSON.stringify(await reconcileReservations(release, { expired }), null, 2));
       return;
     }
     if (operation === "destroy" || operation === "reset") {
