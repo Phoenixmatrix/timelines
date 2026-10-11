@@ -1529,7 +1529,7 @@ in CORE-280.
   message names the issue's key, kept apart from that evidence: the issue
   page and the inspector label them "Mentioned in". After each push the push
   log's commit read (`worker/ref-log/record.ts`) feeds `worker/mentions`,
-  which resolves each key (`issueKeys()`) to a Gitmatrix tracker issue: first
+  which resolves each key (`issueKeys()`) to a Timelines tracker issue: first
   trackers whose workspaces subscribe to the repository, then the owner's,
   then (for a person's repository) their organizations'. Within a tier the
   owner's tracker breaks a tie; otherwise the key is recorded `ambiguous` and
@@ -2966,7 +2966,7 @@ of those reuse properties.
   another's artifacts, and keeping them in one stage avoids a scheduler barrier.
   Real AI verification is an explicit agent command.
   Checkpoints of a timeline get a preview of the app
-  ([Gitmatrix's own previews](#gitmatrixs-own-previews)). Each push to a
+  ([Timelines' own previews](#timelines-own-previews)). Each push to a
   timeline also gets a [step run](#step-runs) of just `step-check` (`vp check`:
   format, lint, types) and `step-unit` (the website's unit tests related to the
   step's changes, `vp test run --project unit --changed`), about 25 s locally;
@@ -3079,7 +3079,7 @@ always wait ten minutes.
 
 ### Deployments and previews
 
-Gitmatrix deploys nothing (`TIMELINES-RESEARCH.md`, "Previews: primitives, not
+Timelines deploys nothing (`TIMELINES-RESEARCH.md`, "Previews: primitives, not
 hosting"): a job that deploys records where it went, and the run page and the
 commit list show it. An environment is a name per repository: `production`,
 `timeline/<slug>` for a timeline's previews, `branch/<name>` for any other
@@ -3099,7 +3099,7 @@ the wire types (`worker/deployments/`).
 | `POST /api/tracker/:o/timelines/:slug/checkpoints/:ref/revive` | Rebuild a checkpoint's preview: `{checkpoint, runs: [{repoId, number, runId} \| {repoId, skipped}]}`; write access to every repository |
 
 - **Who records.** Anyone with write access, with a personal or agent token
-  (systems outside Gitmatrix too), or a CI job with its own credential
+  (systems outside Timelines too), or a CI job with its own credential
   (`GITMATRIX_TOKEN`, `gmj_…`), which the API accepts only on these routes and
   only for the job's repository while it runs. A job's record takes its run,
   job, commit and accountable person from the run, and its environment from
@@ -3121,7 +3121,7 @@ the wire types (`worker/deployments/`).
 Projects implement previews in their own CI (CORE-79; `TIMELINES-RESEARCH.md`,
 "Previews: primitives, not hosting"). A repository opts in with `on: preview`
 (also `on: [push, preview]` or `preview:` under `on:`; pushes start runs either
-way, as before). Gitmatrix then starts **preview runs**: `trigger` is
+way, as before). Timelines then starts **preview runs**: `trigger` is
 `"preview"`, and `action` is `"create"` or `"teardown"` (empty in every other
 run). Jobs choose an action with `if:` like any other condition, and a preview
 run runs only the jobs whose `if:` holds: a job without `if:` (tests, deploys)
@@ -3153,10 +3153,10 @@ jobs:
       - run: ./scripts/preview-teardown.sh "timeline-$GITMATRIX_TIMELINE"
 ```
 
-| Gitmatrix starts | When                                                                                                   | Run                                                               |
+| Timelines starts | When                                                                                                   | Run                                                               |
 | ---------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
 | `create`         | A checkpoint is made (`gm timeline checkpoint`), in each of its repositories                           | At that repository's checkpoint commit in its recorded source     |
-| `teardown`       | The hourly sweep finds a timeline's previews in a repository all due (expiry below)                    | At the newest preview's commit, with its checkpoint, by Gitmatrix |
+| `teardown`       | The hourly sweep finds a timeline's previews in a repository all due (expiry below)                    | At the newest preview's commit, with its checkpoint, by Timelines |
 | `create` again   | Someone revives a checkpoint's preview: the button on the checkpoint, `gm timeline revive`, or the API | At the checkpoint's commit; what it records is marked rebuilt     |
 
 Each preview run's jobs get `GITMATRIX_TRIGGER=preview`,
@@ -3201,7 +3201,7 @@ the toolchain or seed changed. A revived preview's clock starts at the
 revival: it lasts `endedDays` after it for an ended timeline, `idleDays`
 otherwise.
 
-#### Gitmatrix's own previews
+#### Timelines' own previews
 
 This repository implements the contract for itself (CORE-80;
 `TIMELINES-RESEARCH.md`, "Gitmatrix's own previews: the reference
@@ -3209,8 +3209,8 @@ implementation"), as a worked example any project could copy. It uses only
 what every project has: `on: preview`, the job variables and credential, a
 repository secret, `cf`, and `gm deploy record`.
 
-**Asking for a preview.** A Gitmatrix timeline asks by making a checkpoint
-(`gm timeline checkpoint`). Gitmatrix then starts a `create` run, and the
+**Asking for a preview.** A Timelines timeline asks by making a checkpoint
+(`gm timeline checkpoint`). Timelines then starts a `create` run, and the
 `preview` job in `.gitmatrix/ci.yml` builds a preview of that checkpoint. There
 is nothing else to switch on: checkpoints are what reviewers approve, so a
 timeline that never makes one never pays for a preview. Revival works the same way.
@@ -3279,7 +3279,7 @@ expiry. Never remove the Access application to work around an expired token.
 
 Send the two values as `CF-Access-Client-Id` and `CF-Access-Client-Secret`
 headers. They authenticate to Access; `Authorization` remains available for
-Gitmatrix's own token. Example for an agent running Node from this checkout:
+Timelines' own token. Example for an agent running Node from this checkout:
 
 ```sh
 node --env-file=.env --input-type=module -e '
@@ -3307,7 +3307,7 @@ on the production server receive neither Access credential variable.
 `PREVIEW_ACCESS_AUD` before serving any API, Git, WebSocket or static request.
 `worker/preview-gate.ts` validates RS256 signatures against the team's public
 keys, issuer, audience and expiry, failing closed on missing configuration,
-invalid assertions or unavailable keys. Plain Gitmatrix tokens, the former
+invalid assertions or unavailable keys. Plain Timelines tokens, the former
 preview-key header/cookie/query parameter, and forged identity headers do
 not bypass it. Access-authenticated humans and service tokens can then use
 the preview's seeded persona sign-in. Recorded URLs are ordinary links,
@@ -3522,7 +3522,7 @@ before revisiting this design.
 
 ## Assistant
 
-Ask Gitmatrix (CORE-25/26) is an assistant that reads and changes everything a
+Ask Timelines (CORE-25/26) is an assistant that reads and changes everything a
 person can: code and its knowledge graph, issues, CI, packages, repository
 settings. It chats in a column docked beside the page (rail button or ⌘J /
 Ctrl+J), opens pages there for you, and answers `gm ask` in a terminal.
@@ -3568,6 +3568,10 @@ short viewport, independently of the conversation.
   `rerun_ci`, `cancel_ci`, `api_write`). On the web every write waits for an
   approval card whose wording comes from the request itself
   (`shared/assistant.ts` `describeWrite`), never the model's summary.
+  Approval or refusal belongs to the specific tool call. The assistant is
+  instructed to use its recorded result, not interpret item names as approval
+  state. A new explicit request needs its own card; a declined call is not
+  retried without another explicit request.
   `navigate` runs in the browser (the page beside the chat moves).
 - **Code Mode.** When clef says a turn aggregates (count, compare, join across
   many issues or runs), the model gets `codemode`: it writes one script over the
@@ -3646,7 +3650,7 @@ retries remain enabled.
 
 A repository can mirror its default branch and tags on to another git host
 after every push: Settings → Mirror, `gm repo mirror set <url> --token-stdin`,
-or `PUT /api/repos/:o/:n/mirror`. Gitmatrix's own repository mirrors `main` to
+or `PUT /api/repos/:o/:n/mirror`. Timelines' own repository mirrors `main` to
 GitHub this way, as a backup.
 
 ```
@@ -3658,7 +3662,7 @@ syncMirror: target refs (receive-pack advertisement) vs Artifacts' (ls-refs)
 
 - **Default branch and tags only.** The default branch (the one HEAD names,
   falling back to `repos.default_branch`) and every tag are pushed. Other
-  branches, timelines and experiments among them, stay on Gitmatrix; pushing
+  branches, timelines and experiments among them, stay on Timelines; pushing
   one doesn't reach the target. Branches already on the target are left as
   they are.
 - **One way, and safe by default.** Mirrored refs are force-pushed, so rewinds
@@ -3692,7 +3696,7 @@ confirm its ID and use the existing mirror update endpoint to repair the URL.
 
 ## Data retention
 
-Everything Gitmatrix keeps costs storage, so data past its useful life can be
+Everything Timelines keeps costs storage, so data past its useful life can be
 cleaned up by **retention categories** (PRD CORE-195). Every new category is
 **disabled until an administrator enables it**: a fresh or upgraded deployment
 deletes nothing it didn't delete before. There are two exceptions. Auth hygiene

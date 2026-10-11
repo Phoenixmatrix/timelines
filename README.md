@@ -569,7 +569,7 @@ Use a fresh browser context per environment/persona even with isolated origins.
 
 The repository pins one `standard-4` container per Worker (4 vCPU, 12 GiB RAM,
 20 GB disk). Provisioning uses the [shared installation quota](#environment-limits-and-quota-authority),
-not a separate four-container counter. These are Gitmatrix policy limits, not
+not a separate four-container counter. These are Timelines policy limits, not
 Cloudflare account-wide quotas. The environment has an absolute maximum lifetime
 of 24 hours, with no silent renewal. A Durable Object alarm enforces compute
 expiry even if the host agent disconnects. The hosted runtime installs no systemd
@@ -1015,7 +1015,7 @@ Use `vp env doctor` when runtime/package-manager setup is suspect.
 
 ## Distributed issue tracker
 
-Gitmatrix's tracker is account-owned and independent of Git history: teams own
+The Timelines tracker is account-owned and independent of Git history: teams own
 issues, workspaces organize them, and repository subscriptions do not grant access.
 Use `/tracker` for the human workbench or `gm tracker use OWNER` and `gm issue ready`
 for agent work. See the [tracker architecture and API](apps/website/README.md#distributed-issue-tracker)

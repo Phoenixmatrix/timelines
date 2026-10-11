@@ -897,7 +897,7 @@ gm timeline use main                            # back to main
   checkouts still bound to it retain the ended-source guard.
 - **`revive [<slug>] [--checkpoint <number|id>]`** rebuilds a checkpoint's
   preview (default: the newest checkpoint), for example to look into last
-  week's work after its preview expired: Gitmatrix starts a preview `create`
+  week's work after its preview expired: Timelines starts a preview `create`
   run in each repository whose ci.yml opts in (`on: preview`), at the
   checkpoint's commits, including retained landed/abandoned sources. Expired
   sources fail explicitly rather than checking out canonical. The record it
@@ -1401,7 +1401,7 @@ destination is the artifact's basename. `install` defaults to
 (for example `linux-x86_64/gm` or `macos-aarch64/gm`). `--file` selects a different
 artifact path. These are direct executable files, not archives or installer scripts.
 
-Both commands use the normal Gitmatrix credentials, resolve `latest` once, and
+Both commands use the normal Timelines credentials, resolve `latest` once, and
 verify SHA-256 while streaming to a temporary file beside the destination.
 Installation sets mode `0755`. Only a verified complete download is atomically
 published; `--force` is required to replace an existing regular file, including
@@ -1471,7 +1471,7 @@ their values. `gm` does not load `.env` files automatically.
 
 The CLI sends the two standard `CF-Access-Client-Id` and
 `CF-Access-Client-Secret` headers only to that origin, alongside—not instead
-of—the Gitmatrix `Authorization` token. This covers JSON, device/SSH sign-in,
+of—the Timelines `Authorization` token. This covers JSON, device/SSH sign-in,
 streamed responses, uploads, downloads, and Git clone/fetch/push. Access
 credentials are never saved in `gm.json`, remote URLs, or Git configuration.
 Git receives them through ephemeral `GIT_CONFIG_*` environment entries; Git
