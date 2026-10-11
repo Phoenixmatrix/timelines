@@ -3,7 +3,7 @@
 // that timeline's work: the tracker shows the timeline's view, the code
 // browser opens its bookmark, CI lists runs on it, the package console filters
 // to versions built from it, knowledge overlays its graph diff and release
-// notes mark what it landed. No `tl` is main, the default; `tl=main` names
+// notes filter to what it landed. No `tl` is main, the default; `tl=main` names
 // main explicitly, which is how a link leaves a timeline.
 //
 // The scope is carried, not remembered: every link's href carries the current
@@ -148,6 +148,7 @@ export function scopeOwner(pathname: string, search = ""): string | null {
 
 /** The repository a code page is about, and the ref named in its path. */
 const CODE = /^\/([^/]+)\/([^/]+)\/(tree|blob|commits)\/(.+)$/;
+const RELEASES = /^\/(?:tracker\/[^/]+|[^/]+\/[^/]+)\/releases(?:\/|$)/;
 
 /**
  * The current page scoped to another timeline (null: main). A code page whose
@@ -187,7 +188,12 @@ export function switchScope(
   }
   const params = new URLSearchParams(location.search);
   params.delete("source");
-  if (slug && repo?.targetSource && repo.targetSource.sourceId !== "canonical") {
+  if (
+    slug &&
+    !RELEASES.test(pathname) &&
+    repo?.targetSource &&
+    repo.targetSource.sourceId !== "canonical"
+  ) {
     params.set("source", repo.targetSource.sourceId);
   }
   return withScope(join(pathname, params, location.hash ?? ""), slug);
@@ -214,14 +220,14 @@ export function scopeHint(
   repoHasBookmark?: boolean,
   status?: string,
 ): string {
+  if (RELEASES.test(pathname))
+    return "Only landed release notes from this timeline. Main shows all notes, including landed timelines.";
   if (status === "landed" || status === "abandoned") return endedHint(status, pathname);
   const bookmark = scopeBookmark(slug);
   const parts = pathname.split("/").slice(1);
   if (parts[0] === "tracker") {
     if (parts[2] === "timelines")
       return "Drawn with the timelines it came from and everything that depends on it.";
-    if (parts[2] === "releases")
-      return "Release notes cover landed work; what this timeline landed is marked.";
     return "Main's issues with this timeline's changes; what you change here stays in it until it lands.";
   }
   if (parts[1] === "-" && parts[2] === "packages" && parts.length > 3)
@@ -230,8 +236,6 @@ export function scopeHint(
     const section = parts[2] ?? "";
     if (section === "knowledge")
       return "Main's graph, with what this timeline adds, changes and removes.";
-    if (section === "releases")
-      return "Release notes cover landed work; what this timeline landed is marked.";
     if (repoHasBookmark === false && ["", "tree", "commits", "ci"].includes(section))
       return `This repository isn't part of the timeline; showing main.`;
     if (section === "ci") return "Runs in this timeline's work source.";

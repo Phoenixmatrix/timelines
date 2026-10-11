@@ -1857,11 +1857,13 @@ the URL says. What each surface does with it:
   `?timeline=` is rewritten to `?tl=`.
 - **Wiki**: the timeline's own version of a page where it wrote one (`&set=`
   picks a checkpoint's), noted as such, with a link to main's.
-- **Release notes** cover landed work: entries the timeline landed are marked,
-  and `timeline:<slug>` (a Timelines facet) narrows to them.
+- **Release notes** cover canonical landed work. The shared timeline picker is
+  also available inline on repository and tracker release views (CORE-283).
+  A selected timeline filters to what it landed; main shows all canonical notes.
 
 A landed or abandoned timeline stays selectable: the shell banner says how it
-ended and that its view is read-only, on the tracker and every other page.
+ended and that its work view is read-only. Release notes instead describe the
+landed-note filter, which remains readable after work-source retention expires.
 
 The switcher's **Timeline graph** link sits beside its title, above the changing
 list and loading/error messages, so resolving the list does not move a footer
@@ -1945,6 +1947,22 @@ are the CLI equivalents; `gm release notes day:2026-10-02` selects a UTC day.
 Entries about issues from trackers the viewer can't read are omitted, and an introduction is
 shown only to viewers who can read every tracker that shaped it.
 
+Both release views expose the same searchable timeline picker as the tracker.
+Its selection lives in `?tl=<slug>` and survives links, query submissions,
+Back/Forward and reload; selecting main explicitly clears the timeline scope.
+Repository layouts and note requests stay canonical even when a stale URL names
+an expired work source. A scoped index counts only matching entries the viewer
+may read and omits empty releases. An explicitly selected day/tag can still show
+an empty result with the picker available. Scoped views omit the whole-release
+introduction and its model attribution, since that prose may describe other work.
+
+The index, detail and tracker feed APIs accept an independent `timeline=<slug>`
+constraint. Empty or `main` means all canonical notes; an unknown or nonmatching
+slug returns no matching entries, never an unfiltered fallback. In a tracker
+feed this constraint intersects with every `q` filter, including positive or
+negated `timeline:` terms, before result limits and facet counts. It does not
+generate notes for unlanded work or grant additional access.
+
 **Highlights** are separate, person-specific summaries of authorized daily entries:
 `GET /api/repos/:owner/:repo/release-notes/highlights`,
 `GET /api/tracker/:owner/release-notes/highlights`, and
@@ -2012,8 +2030,12 @@ account-wide feed.
 Real-provider coverage in `vp run agent test-ai` checks daily generation without
 tags, a second commit on a different UTC committer date despite unchanged
 authorship, retained earlier-day provenance, a named tag containing both changes,
-and daily/tag tracker feeds without duplicate default entries. This is separate
-from the non-AI readiness gate.
+and daily/tag tracker feeds without duplicate default entries. The timeline-pages
+stage additionally checks filtered repository counts/detail and tracker feeds
+against real compact-landing notes, conflicting query constraints, main reset,
+and retained filtering after work-source expiry and note regeneration. These are
+gate requirements, not claims of an observed run; inspect retained outcomes.
+This is separate from the non-AI readiness gate.
 
 For the generator's local regressions, run
 `vp test worker/release-notes/generate.test.ts` from `apps/website`, followed by

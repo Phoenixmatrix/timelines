@@ -135,6 +135,33 @@ describe("the timeline scope", () => {
     );
   });
 
+  test("release scope preserves selection and query without attaching a work source", () => {
+    const repo = {
+      defaultBranch: "main",
+      branches: ["main"],
+      targetSource: {
+        sourceId: "work_child",
+        repoId: "repo",
+        kind: "timeline-work" as const,
+        timelineId: "child",
+        ref: "refs/heads/work",
+      },
+    };
+    const location = {
+      pathname: "/orbit/engine/releases/v1.0",
+      search: "?q=type%3Afix&tl=parent&source=work_parent",
+    };
+    expect(switchScope(location, "child", repo)).toBe(
+      "/orbit/engine/releases/v1.0?q=type%3Afix&tl=child",
+    );
+    expect(switchScope(location, null, repo)).toBe(
+      "/orbit/engine/releases/v1.0?q=type%3Afix&tl=main",
+    );
+    expect(
+      switchScope({ pathname: "/tracker/orbit/releases", search: "?q=-timeline%3Achild" }, "child"),
+    ).toBe("/tracker/orbit/releases?q=-timeline%3Achild&tl=child");
+  });
+
   test("a repository opens on the bookmark only when the timeline touches it", () => {
     const repo = { branches: [{ shortName: "main" }, { shortName: "timeline/search" }] };
     expect(bookmarkIn(repo, "search")).toBe("timeline/search");

@@ -122,6 +122,55 @@ describe("reading release notes", () => {
     expect((await releaseNotesFor(db, "repo", "v1", new Map()))!.release.intro).toBe("v1 intro");
     expect(await releaseNotesFor(db, "repo", "v9", new Map())).toBeNull();
   });
+
+  test("timeline scope filters visible daily and tagged entries and suppresses broad introductions", async () => {
+    const { db, sqlite } = setup();
+    sqlite.exec(`
+      UPDATE release_note_entries SET timeline_branch = 'timeline/search', landing_oid = 'landed'
+        WHERE id IN ('open-fix', 'private', 'later-feature');
+      UPDATE release_note_entries SET release = '@day:2026-09-30' WHERE id = 'later-feature';
+      UPDATE release_note_entries SET timeline_branch = 'timeline/search' WHERE id = 'open-feature';
+      UPDATE release_note_entries SET timeline_id = 'search', timeline_branch = 'timeline/other',
+        landing_oid = 'other-landing' WHERE id = 'chore';
+      UPDATE release_notes SET intro = 'All changes.', intro_model = 'intro-model', intro_trackers = '[]';
+    `);
+    const trackers = new Map([["acc", "org"]]);
+    const scoped = await releaseIndex(db, "repo", trackers, true, "search");
+    expect(scoped.releases.map((release) => [release.name, release.entries])).toEqual([
+      ["@day:2026-09-30", 1],
+      ["v2", 1],
+    ]);
+    expect(
+      (await releaseIndex(db, "repo", new Map(), true, "search")).releases.map((r) => r.name),
+    ).toEqual(["@day:2026-09-30"]);
+    for (const [name, ids] of [
+      ["@day:2026-09-30", ["later-feature"]],
+      ["v2", ["open-fix"]],
+      ["v1", []],
+    ] as const) {
+      const notes = (await releaseNotesFor(db, "repo", name, trackers, "search"))!;
+      expect(notes.entries.map((entry) => entry.id)).toEqual(ids);
+      expect(notes.release).toMatchObject({ entries: ids.length, intro: null, introModel: null });
+    }
+    const insider = new Map([...trackers, ["secret", "secret-co"]]);
+    expect(
+      (await releaseNotesFor(db, "repo", "v2", insider, "search"))!.entries.map((e) => e.id),
+    ).toEqual(["private", "open-fix"]);
+    for (const scope of ["missing", "SEARCH", "timeline/search"]) {
+      expect((await releaseIndex(db, "repo", trackers, true, scope)).releases).toEqual([]);
+      const notes = (await releaseNotesFor(db, "repo", "v2", trackers, scope))!;
+      expect(notes.entries).toEqual([]);
+      expect(notes.release).toMatchObject({ entries: 0, intro: null, introModel: null });
+    }
+    for (const scope of ["", "main"]) {
+      expect(await releaseIndex(db, "repo", trackers, true, scope)).toEqual(
+        await releaseIndex(db, "repo", trackers, true),
+      );
+      expect(await releaseNotesFor(db, "repo", "v2", trackers, scope)).toEqual(
+        await releaseNotesFor(db, "repo", "v2", trackers),
+      );
+    }
+  });
   test("old format rows and their tracker-shaped introductions stay hidden until cutover", async () => {
     const { db, sqlite } = setup();
     sqlite.exec("UPDATE release_note_state SET format_version = 0");

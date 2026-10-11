@@ -7,7 +7,6 @@ import {
   type LoaderFunctionArgs,
 } from "react-router";
 import {
-  landedTimelineSlug,
   releaseLabel,
   type ReleaseCategory,
   type ReleaseNoteEntry,
@@ -16,6 +15,7 @@ import {
 } from "../../../shared/release-notes.ts";
 import { CommitLink } from "../../components/CommitLink.tsx";
 import { RailSection, railClass } from "../../components/Rail.tsx";
+import { TimelineSwitcher } from "../../components/TimelineScope.tsx";
 import {
   RELEASE_NOTE_DETAILS_ID,
   ReleaseNoteDetails,
@@ -30,7 +30,10 @@ import { useEffect, useState } from "react";
 
 export async function releasesLoader({ request, params }: LoaderFunctionArgs) {
   const base = `/repos/${params.owner}/${params.repo}/release-notes`;
-  const index = await load<ReleaseNotesIndex>(base, request);
+  const scope = scopeOf(new URL(request.url).searchParams);
+  const query = new URLSearchParams();
+  if (scope) query.set("timeline", scope);
+  const index = await load<ReleaseNotesIndex>(`${base}?${query}`, request);
   // Without an explicit selection, open the newest daily update with visible notes.
   const name =
     params["*"] ||
@@ -39,8 +42,9 @@ export async function releasesLoader({ request, params }: LoaderFunctionArgs) {
     index.releases.find((release) => release.entries > 0)?.name ||
     index.releases[0]?.name ||
     "";
+  query.set("name", name);
   const release = name
-    ? await api<ReleaseNotesRelease>(`${base}/release?name=${encodeURIComponent(name)}`, {
+    ? await api<ReleaseNotesRelease>(`${base}/release?${query}`, {
         signal: request.signal,
       }).catch((error: unknown) => {
         if (error instanceof ApiError && error.status === 404) return null;
@@ -61,13 +65,10 @@ function Entry({
   entry,
   expanded,
   onSelect,
-  scope,
 }: {
   entry: ReleaseNoteEntry;
   expanded: boolean;
   onSelect: (trigger: HTMLButtonElement) => void;
-  /** The app's timeline scope (?tl=): what that timeline landed is marked. */
-  scope: string | null;
 }) {
   return (
     <li className="flex flex-col gap-1 border-t border-line-soft py-3 first:border-t-0 first:pt-0">
@@ -80,9 +81,6 @@ function Entry({
         </p>
       )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-micro text-ink-faint">
-        {scope && landedTimelineSlug(entry.timeline) === scope && (
-          <span className="mk-chip mk-chip--tag">This timeline</span>
-        )}
         <button
           type="button"
           className="cursor-pointer bg-transparent p-0 text-left text-ink-faint underline decoration-dotted underline-offset-4 hover:text-ink"
@@ -110,6 +108,9 @@ function Sidebar({
   name: string;
   selected: string;
 }) {
+  const location = useLocation();
+  const search = new URLSearchParams(location.search);
+  search.delete("source");
   return (
     <nav aria-label="Releases">
       {(["daily", "tag"] as const).map((kind) => (
@@ -123,7 +124,7 @@ function Sidebar({
               .map((release) => (
                 <li key={release.name}>
                   <Link
-                    to={repoPath(owner, name, "releases", encodeURIComponent(release.name))}
+                    to={`${repoPath(owner, name, "releases", encodeURIComponent(release.name))}?${search}`}
                     aria-current={selected === release.name ? "page" : undefined}
                     className="flex items-baseline gap-2 rounded-plate px-2.5 py-1.5 text-body-sm text-ink-muted no-underline hover:bg-pane hover:text-ink aria-[current=page]:bg-raised aria-[current=page]:font-semibold aria-[current=page]:text-ink"
                   >
@@ -195,9 +196,10 @@ export function Releases() {
     return () => clearInterval(timer);
   }, [index.status.state, revalidator]);
 
-  if (index.releases.length === 0) {
+  if (index.releases.length === 0 && !release) {
     return (
       <div className="mk-empty flex max-w-[44rem] flex-col items-center gap-3 py-12">
+        <TimelineSwitcher variant="filter" />
         <RocketLaunchIcon size={28} className="text-ink-faint" aria-hidden />
         <Link
           to={repoPath(owner, repo.name, "releases", "highlights")}
@@ -206,8 +208,9 @@ export function Releases() {
           View highlights
         </Link>
         <div>
-          No daily updates are available yet. Daily notes group default-branch commits by UTC Git
-          commit date, not deployment date.
+          {scope
+            ? "No landed notes you can see match this timeline. Choose another timeline or main to see all notes."
+            : "No daily updates are available yet. Daily notes group default-branch commits by UTC Git commit date, not deployment date."}
           <br />
           <span className="text-body-sm text-ink-faint">
             {index.status.state === "disabled" ||
@@ -231,9 +234,10 @@ export function Releases() {
     .filter((group) => group.entries.length);
   const models = [
     ...new Set(
-      [release?.release.introModel, ...(release?.entries.map((e) => e.model) ?? [])].flatMap(
-        (model) => (model ? [model.replace("@cf/", "")] : []),
-      ),
+      [
+        !scope && release?.release.introModel,
+        ...(release?.entries.map((e) => e.model) ?? []),
+      ].flatMap((model) => (model ? [model.replace("@cf/", "")] : [])),
     ),
   ];
 
@@ -249,6 +253,9 @@ export function Releases() {
         <Sidebar index={index} owner={owner} name={repo.name} selected={name} />
       </aside>
       <article className="min-w-0 md:col-start-2">
+        <div className="mb-4">
+          <TimelineSwitcher variant="filter" />
+        </div>
         {!release ? (
           <div className="mk-empty max-w-[44rem]">
             {name
@@ -273,14 +280,16 @@ export function Releases() {
                 {release.release.truncated && " · showing the newest 1,000 commits"}
               </p>
             </header>
-            {release.release.intro && (
+            {!scope && release.release.intro && (
               <p className="mt-0 mb-8 text-body text-ink">{release.release.intro}</p>
             )}
             {groups.length === 0 && (
               <div className="mk-empty">
-                {release.release.kind === "daily"
-                  ? "No notes you can see for this UTC day."
-                  : "No notes you can see for this tag."}{" "}
+                {scope
+                  ? "No landed notes you can see from this timeline in this release. Choose another timeline or main to see all notes."
+                  : release.release.kind === "daily"
+                    ? "No notes you can see for this UTC day."
+                    : "No notes you can see for this tag."}{" "}
                 <StatusLine status={index.status} />
               </div>
             )}
@@ -300,7 +309,6 @@ export function Releases() {
                         entry={entry}
                         expanded={selectedEntry?.id === entry.id}
                         onSelect={(trigger) => selectEntry(entry.id, trigger)}
-                        scope={scope}
                       />
                     ))}
                   </ul>
@@ -315,7 +323,6 @@ export function Releases() {
                         entry={entry}
                         expanded={selectedEntry?.id === entry.id}
                         onSelect={(trigger) => selectEntry(entry.id, trigger)}
-                        scope={scope}
                       />
                     ))}
                   </ul>

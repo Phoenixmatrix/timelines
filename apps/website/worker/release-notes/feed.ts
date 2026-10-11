@@ -29,6 +29,8 @@ export interface FeedContext {
   /** Workspace id → slug, for the account's tracker. */
   workspaces: Map<string, string>;
   query: ParsedReleaseQuery;
+  /** Independent landed-timeline scope, ANDed with the explicit query. */
+  timeline?: string;
   now: number;
   limit: number;
 }
@@ -38,6 +40,7 @@ const SCAN_LIMIT = 5000;
 
 /** Filter, merge and count rows already scoped to one tracker account. */
 export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFeed, "owner"> {
+  const scope = context.timeline && context.timeline !== "main" ? context.timeline : null;
   const query: ParsedReleaseQuery = {
     ...context.query,
     filters: oldTagSpelling(rows, context.query.filters),
@@ -61,6 +64,7 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
     if (!context.visibleRepoIds.has(row.repo_id)) continue;
     const entry = toEntry(row, context.trackers);
     if (!entry) continue;
+    if (scope && landedTimelineSlug(entry.timeline) !== scope) continue;
     if (!includeTags && entry.releaseKind !== "daily") continue;
     const repo = `${row.repo_owner}/${row.repo_name}`.toLowerCase();
     const slugs = entry.workspaceIds.flatMap((id) => context.workspaces.get(id) ?? []);
@@ -184,6 +188,7 @@ export async function releaseFeed(
   actor: Actor | null,
   ownerSlug: string,
   q: string,
+  timeline?: string,
 ): Promise<ReleaseFeed> {
   if (!actor) throw new FeedError(401, "Sign in to read release notes.");
   const owner = await findAccountBySlug(env.DB, ownerSlug);
@@ -193,6 +198,7 @@ export async function releaseFeed(
     throw new FeedError(403, "Release notes for a tracker require account membership.");
 
   const query = parseReleaseQuery(q);
+  const scope = timeline && timeline !== "main" ? timeline : null;
   const d = db(env.DB);
   const repos = await visibleRepos(env.DB, actor);
   const visibleRepoIds = new Set(repos.map((repo) => repo.id));
@@ -232,6 +238,12 @@ export async function releaseFeed(
     .where((eb) =>
       eb.or([eb("e.tracker_owner_id", "=", owner.id), eb("r.owner_id", "=", owner.id)]),
     );
+  // Scope before the scan cap so unrelated landings cannot crowd out this timeline.
+  if (scope)
+    select = select
+      .where("e.timeline_branch", "=", `timeline/${scope}`)
+      .where("e.landing_oid", "is not", null)
+      .where("e.landing_oid", "!=", "");
   // A positive `tag:` may be the old spelling of a tagged release (oldTagSpelling).
   if (
     !query.filters.some(
@@ -258,6 +270,7 @@ export async function releaseFeed(
     visibleRepoIds,
     workspaces: new Map(workspaces.ok ? workspaces.value.map((w) => [w.id, w.slug]) : []),
     query,
+    timeline,
     now: Date.now(),
     limit: FEED_LIMIT,
   });

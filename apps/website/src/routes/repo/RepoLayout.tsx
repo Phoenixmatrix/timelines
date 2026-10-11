@@ -25,7 +25,14 @@ import { CommitPanel } from "./CommitPanel.tsx";
 export async function repoLoader({ params, request }: LoaderFunctionArgs) {
   const owner = params.owner ?? "";
   const name = params.repo ?? "";
-  return routeData(repoData.detail(owner, name, await requestSource(owner, name, request), true));
+  const pathname = new URL(request.url).pathname;
+  const releases = repoPath(owner, name, "releases");
+  // Landed notes outlive their work source; the layout must not read that source either.
+  const source =
+    pathname === releases || pathname.startsWith(`${releases}/`)
+      ? null
+      : await requestSource(owner, name, request);
+  return routeData(repoData.detail(owner, name, source, true));
 }
 
 /**

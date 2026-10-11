@@ -199,7 +199,15 @@ releaseNotes.get("/", async (c) => {
   c.header("cache-control", "private, no-store");
   await ensureReleaseNotes(c.env, loaded.row.id);
   const trackers = await viewerTrackers(c.env.DB, c.get("actor"));
-  return c.json(await releaseIndex(c.env.DB, loaded.row.id, trackers, Boolean(c.env.AI)));
+  return c.json(
+    await releaseIndex(
+      c.env.DB,
+      loaded.row.id,
+      trackers,
+      Boolean(c.env.AI),
+      c.req.query("timeline"),
+    ),
+  );
 });
 
 /** One release's introduction and entries, as the viewer may see them. */
@@ -210,18 +218,30 @@ releaseNotes.get("/release", async (c) => {
   await ensureReleaseNotes(c.env, loaded.row.id);
   const name = releaseName(c.req.query("name") ?? "");
   const trackers = await viewerTrackers(c.env.DB, c.get("actor"));
-  const body = await releaseNotesFor(c.env.DB, loaded.row.id, name, trackers);
+  const body = await releaseNotesFor(
+    c.env.DB,
+    loaded.row.id,
+    name,
+    trackers,
+    c.req.query("timeline"),
+  );
   if (!body) return c.json({ error: "No release notes for that release." }, 404);
   return c.json(body);
 });
 
-/** A tracker account's release feed: `?q=` takes the feed query language. */
+/** A tracker account's release feed: `?q=` is ANDed with `?timeline=` scope. */
 export const trackerReleaseNotes = new Hono<AppEnv>();
 trackerReleaseNotes.get("/", async (c) => {
   c.header("cache-control", "private, no-store");
   try {
     return c.json(
-      await releaseFeed(c.env, c.get("actor"), c.req.param("owner") ?? "", c.req.query("q") ?? ""),
+      await releaseFeed(
+        c.env,
+        c.get("actor"),
+        c.req.param("owner") ?? "",
+        c.req.query("q") ?? "",
+        c.req.query("timeline"),
+      ),
     );
   } catch (error) {
     if (error instanceof FeedError) return c.json({ error: error.message }, error.status);
