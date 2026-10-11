@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### AI cancellation before dispatch
+
+- Cancellation during account attribution or Gateway-policy preparation prevents
+  model dispatch and does not create a phantom failed-attempt entry. Requests already
+  dispatched retain their existing success, failure and timeout accounting.
+  Gateway reconciliation remains strict.
+
+### CORE-324: Timelines presentation without an identity cutover
+
+- Public application, site, documentation, CLI and assistant presentation use
+  Timelines while retaining the pounce logo. Technical keys, API headers,
+  installation identifiers, repository slugs and hostnames remain unchanged.
+- New system-authored commits use the Timelines display name; existing Git
+  history is not rewritten. The assistant-profile migration updates only the
+  original built-in description, preserving customized profiles, agent identities,
+  revocation and credentials.
+
+### CORE-150: bounded release-highlights proof cleanup and scheduling
+
+- The owned provider fixture uses the normal highlights sweep with an exact
+  scope, repository and viewer selector; unrelated due projections are excluded
+  from admission. Scheduled cron sweeps remain unfiltered.
+- Provider proof cleanup attempts appended-entry removal and all three policy
+  restores independently, preserving the original proof error alongside any
+  cleanup failures.
+- Generated highlights prioritize concrete end-user capabilities and fixes over
+  routine documentation and housekeeping, with detailed daily notes preserved
+  as the authoritative sources.
+
 ### CORE-255: owned timeline work and compact canonical landing
 
 - Each timeline owns a separate work Git repository per canonical repository.

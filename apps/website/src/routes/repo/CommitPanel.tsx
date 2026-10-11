@@ -782,7 +782,7 @@ function Deployments({
       <Body loaded={deployments} what="deployments">
         {() =>
           rows.length === 0 ? (
-            <Note>Not deployed anywhere Gitmatrix knows of.</Note>
+            <Note>Not deployed anywhere Timelines knows of.</Note>
           ) : (
             <ul className="m-0 flex list-none flex-col gap-1.5 p-0 text-body-sm">
               {rows.map((deployment) => {

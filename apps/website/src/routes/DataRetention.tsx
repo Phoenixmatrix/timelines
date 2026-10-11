@@ -41,7 +41,7 @@ export async function retentionLoader({ request }: { request: Request }) {
 }
 
 const INTRO =
-  "Choose what Gitmatrix deletes and when. Nothing is deleted until you turn a category on or run a cleanup yourself, and each category says what it never deletes.";
+  "Choose what Timelines deletes and when. Nothing is deleted until you turn a category on or run a cleanup yourself, and each category says what it never deletes.";
 
 export function DataRetention() {
   const data = useLoaderData<typeof retentionLoader>();

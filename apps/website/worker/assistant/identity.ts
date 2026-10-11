@@ -36,7 +36,7 @@ export async function assistantAgent(d1: D1Database, userId: string): Promise<st
       id,
       name: ASSISTANT_NAME,
       accountable_id: userId,
-      description: "Gitmatrix's built-in assistant, acting for you from chat and gm ask.",
+      description: "Timelines' built-in assistant, acting for you from chat and gm ask.",
       revoked_at: null,
     })
     .onConflict((oc) => oc.doNothing())

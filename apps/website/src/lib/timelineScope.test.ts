@@ -82,7 +82,7 @@ describe("the timeline scope", () => {
       expect(scopeOwner(`/settings/${page}`, "?owner=orbit")).toBe("orbit");
     expect(scopeOwner("/settings/preferences", "?owner=orbit&tracker=marco")).toBe("orbit");
     expect(scopeOwner("/settings/ai", "?tracker=orbit")).toBeNull();
-    for (const page of ["/", "/needs-you", "/packages", "/settings/tokens", "/new"])
+    for (const page of ["/", "/highlights", "/needs-you", "/packages", "/settings/tokens", "/new"])
       expect(scopeOwner(page)).toBeNull();
   });
 

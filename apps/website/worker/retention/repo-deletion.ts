@@ -534,23 +534,43 @@ async function stopKnowledge(
 }
 
 /** Cancel the repository's CI runs, except preview teardowns (the next phase waits for those). */
-async function stopCi(env: Env, repoId: string, limits: Limits) {
-  const runs = await db(env.DB)
+async function stopCi(env: Env, repoId: string, limits: Limits, allowTeardown = true) {
+  let query = db(env.DB)
     .selectFrom("ci_runs")
     .select("id")
     .where("repo_id", "=", repoId)
-    .where("status", "in", ["queued", "running"])
     .where((eb) =>
+      eb.or([
+        eb("status", "in", ["queued", "running"]),
+        // Historical terminal runs can retain work that no runner ever claimed.
+        // Select only drainable children so live consumers cannot spin this loop.
+        eb.exists(
+          eb
+            .selectFrom("ci_jobs as j")
+            .select("j.id")
+            .whereRef("j.run_id", "=", "ci_runs.id")
+            .where("j.status", "in", ["pending", "queued"])
+            .where("j.claimed_by", "is", null)
+            .where("j.started_at", "is", null)
+            .where("j.source_completion_pending", "=", 0),
+        ),
+      ]),
+    );
+  if (allowTeardown)
+    query = query.where((eb) =>
       eb.or([eb("preview_action", "is", null), eb("preview_action", "!=", "teardown")]),
-    )
-    .limit(limits.runsPerStep)
-    .execute();
+    );
+  const runs = await query.limit(limits.runsPerStep).execute();
   for (const run of runs) await cancelRun(env, run.id);
   return { cancelled: runs.length, more: runs.length === limits.runsPerStep };
 }
 
 /** A stopped Workflow or elapsed grace period is not runner acknowledgment. */
 async function assertCiDrained(env: Env, repoId: string, allowTeardown: boolean) {
+  // This step may be replayed after older stop:ci steps were already journalled.
+  // Reconcile a bounded batch here as well; the unchanged assertion stays closed
+  // until every remaining child is settled or has genuinely acknowledged.
+  await stopCi(env, repoId, PURGE_LIMITS, allowTeardown);
   let query = db(env.DB)
     .selectFrom("ci_runs as r")
     .select("r.id")
@@ -1163,6 +1183,10 @@ export const CHILD_ROWS: [table: string, where: string][] = [
   ["change_refs", "repo_id = ?1"],
   ["commit_issue_mentions", "repo_id = ?1"],
   ["ref_updates", "repo_id = ?1"],
+  [
+    "release_highlights",
+    "(scope = 'repo' AND scope_id = ?1) OR EXISTS (SELECT 1 FROM json_each(release_highlights.source_manifest) AS source WHERE json_extract(source.value, '$.repoId') = ?1)",
+  ],
   ["release_note_entries", "repo_id = ?1"],
 ];
 

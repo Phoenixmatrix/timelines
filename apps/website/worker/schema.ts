@@ -8,6 +8,7 @@ import type {
 } from "../shared/ai.ts";
 import type { AgentPresenceTarget } from "../shared/agent-presence.ts";
 import type { QueueStatus } from "../shared/merge-queue.ts";
+import type { ReleaseHighlightsScope, ReleaseHighlightsState } from "../shared/release-notes.ts";
 
 /**
  * Gitmatrix's database (the DB binding) for Kysely. The SQL migrations in
@@ -741,6 +742,25 @@ export interface Database {
     tracker_owner_id: string;
     repo_id: string;
   };
+  release_highlights: {
+    scope: ReleaseHighlightsScope;
+    scope_id: string;
+    viewer_id: string;
+    owner_account_id: string;
+    source_hash: string;
+    /** Bounded source identifiers/digests; revalidate these even before due_at. */
+    source_manifest: Generated<string>;
+    body: string;
+    model: string | null;
+    status: Generated<Exclude<ReleaseHighlightsState, "disabled">>;
+    error: string | null;
+    generated_at: string | null;
+    updated_at: string;
+    due_at: Generated<number>;
+    lease_id: string | null;
+    lease_until: Generated<number>;
+    ai_snapshot: string | null;
+  };
   release_notes: {
     repo_id: string;
     release: string;
@@ -1064,6 +1084,7 @@ export interface Database {
     ai_updated_at: Generated<string | null>;
     knowledge_quiet_minutes: Generated<number>;
     knowledge_max_wait_minutes: Generated<number>;
+    release_highlights_interval_hours: Generated<number>;
   };
   /** An account's own AI provider and its sealed API key (CORE-294); one per kind. */
   ai_providers: {

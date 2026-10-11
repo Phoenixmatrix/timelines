@@ -1427,7 +1427,7 @@ export function IssueDetail({
             Latest checkpoint
           </h3>
           <p className="mk-hint mt-0.5 mb-2 flex flex-wrap items-center gap-x-1">
-            <Actor who={attribution(snapshot, latestCheckpoint.actorId)} />
+            <Actor who={attribution(snapshot, latestCheckpoint.actorId, latestCheckpoint.actor)} />
             {" · "}
             <time
               className="tabular-nums"
@@ -1744,7 +1744,7 @@ export function IssueDetail({
                   <span className="size-1.5 rounded-full bg-online" aria-hidden />
                   Evidence
                 </span>
-                <Actor who={attribution(snapshot, comment.actorId)} link />
+                <Actor who={attribution(snapshot, comment.actorId, comment.actor)} link />
                 <time
                   dateTime={comment.createdAt}
                   title={new Date(comment.createdAt).toLocaleString()}
@@ -1793,7 +1793,7 @@ export function IssueDetail({
             >
               <header className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-micro text-ink-muted">
                 <Actor
-                  who={attribution(snapshot, comment.actorId)}
+                  who={attribution(snapshot, comment.actorId, comment.actor)}
                   link
                   className="[&>span:last-child]:font-semibold [&>span:last-child]:text-ink"
                 />

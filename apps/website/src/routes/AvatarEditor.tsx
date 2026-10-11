@@ -429,7 +429,7 @@ export function PictureEditor({ target }: { target: PictureTarget }) {
               <p className="m-0 text-body-sm text-ink-muted">
                 {options?.status === "failed"
                   ? `The last attempt didn't produce any ${plural}, so you can try again.`
-                  : `Gitmatrix can make four abstract ${plural} to choose from. There's one set, once: no prompts and no redos.`}
+                  : `Timelines can make four abstract ${plural} to choose from. There's one set, once: no prompts and no redos.`}
               </p>
               <div>
                 <button type="button" className="mk-btn" onClick={() => setConfirming(true)}>

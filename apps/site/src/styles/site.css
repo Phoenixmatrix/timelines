@@ -84,8 +84,16 @@ pre {
   padding-block: 18px;
 }
 .lockup {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  font-size: 1.25rem;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
   color: var(--ink);
+  text-decoration: none;
 }
 .lockup svg {
   display: block;

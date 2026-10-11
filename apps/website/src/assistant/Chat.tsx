@@ -479,7 +479,7 @@ function Welcome({ page, onPick }: { page: PageContext; onPick: (prompt: string)
   return (
     <div className="flex flex-col gap-4 pt-2">
       <div>
-        <h2 className="m-0 text-title">Ask Gitmatrix</h2>
+        <h2 className="m-0 text-title">Ask Timelines</h2>
         <p className="mt-1 mb-0 max-w-[40ch] text-body-sm text-ink-muted">
           I read code, issues, CI runs and packages, open pages for you, and make changes once you
           approve each one.

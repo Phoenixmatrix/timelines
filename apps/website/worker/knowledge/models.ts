@@ -119,8 +119,10 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
   const metered = provider?.usageName ?? model;
   const guard = paidWorkGuard();
   await guard?.check();
-  const ms = Math.min(timeout, guard?.remaining() ?? Infinity);
   const work = await attribution(env);
+  // Attribution can yield while the owning work is stopped.
+  guard?.signal.throwIfAborted();
+  const ms = Math.min(timeout, guard?.remaining() ?? Infinity);
   const controller = new AbortController();
   const stopped = () => controller.abort(guard!.signal.reason);
   guard?.signal.addEventListener("abort", stopped, { once: true });
@@ -133,31 +135,36 @@ async function once(env: Env, model: string, inputs: unknown, timeout: number): 
       once: true,
     });
   });
+  let dispatched = false;
   try {
     const call = provider
-      ? providerKey(env, provider).then((key) =>
-          callProvider(
+      ? providerKey(env, provider).then((key) => {
+          controller.signal.throwIfAborted();
+          dispatched = true;
+          return callProvider(
             env,
             provider.kind,
             key,
             provider.model,
             inputs as Record<string, unknown>,
             controller.signal,
-          ),
-        )
-      : aiGatewayOptions(env, componentOf(work.feature), work).then((gateway) =>
-          (env.AI as unknown as LooseAi).run(model, inputs, {
+          );
+        })
+      : aiGatewayOptions(env, componentOf(work.feature), work).then((gateway) => {
+          controller.signal.throwIfAborted();
+          dispatched = true;
+          return (env.AI as unknown as LooseAi).run(model, inputs, {
             ...gateway,
             signal: controller.signal,
-          }),
-        );
+          });
+        });
     // The race: a binding that ignores the signal still can't hold the caller.
     const result = await Promise.race([call, aborted]);
     // Metering (CORE-207): the call's tokens, for the account whose work this is.
     await recordAiCall(env, metered, tokensOf(result));
     return result;
   } catch (error) {
-    await recordAiCall(env, metered, {}, { failed: true });
+    if (dispatched) await recordAiCall(env, metered, {}, { failed: true });
     throw controller.signal.aborted ? controller.signal.reason : error;
   } finally {
     clearTimeout(timer);
@@ -336,7 +343,7 @@ export async function decide(
   const result = (await ai(env, options.flash ? "route" : "classify", options.rateLimitRetries).run(
     model,
     {
-      model: options.flash ? "clef-flash" : "clef",
+      model: model.slice(model.lastIndexOf("/") + 1),
       state,
       questions,
     },

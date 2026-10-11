@@ -85,7 +85,7 @@ async function isolated(body: string): Promise<void> {
       import { developmentEnvironment } from ${JSON.stringify(new URL("../../apps/website/vite/environment.ts", import.meta.url).href)};
       import { readEnvironmentLimits, reserveQuota, releaseQuota } from ${JSON.stringify(new URL("./quota.ts", import.meta.url).href)};
       // Explicit transport fixture only; API invariants use migrated SQLite tests.
-      async function quotaFixture() {
+      async function quotaFixture(maximum = Infinity) {
         const credentials = { env: {
           CLOUDFLARE_ACCOUNT_ID: 'a'.repeat(32),
           CLOUDFLARE_API_TOKEN: 'fixture-cloudflare-capability',
@@ -107,6 +107,8 @@ async function isolated(body: string): Promise<void> {
           if (options.method === 'POST') {
             const value = JSON.parse(options.body);
             assert.equal(published.get(value.id)?.quota?.state, 'pending');
+            if (!reservations.has(value.id) && reservations.size >= maximum)
+              return Response.json({ error: 'Installation environment limit reached (' + reservations.size + '/' + maximum + '). Destroy unused environments on their owning machines, or ask a site administrator to change gm settings environments set --site --max. Expired reservations still require cleanup.' }, { status: 409 });
             reservations.set(value.id, value);
             return Response.json({ reserved: true, id: value.id });
           }
@@ -127,6 +129,51 @@ async function isolated(body: string): Promise<void> {
     await rm(home, { recursive: true, force: true });
   }
 }
+
+await test("hosted quota admission reports safe capacity without exposing HTTP diagnostics", async () => {
+  await isolated(`
+    const { reservations, published } = await quotaFixture(0);
+    const persist = async record => { published.set(record.id, structuredClone(record)); };
+    await assert.rejects(reserveQuota(env, 'remote', persist), error => {
+      assert.match(error.message, /Installation environment limit reached \\(0\\/0\\)/);
+      assert.match(error.message, /owning machines/);
+      assert.match(error.message, /site administrator/);
+      assert.match(error.message, /Expired reservations still require cleanup/);
+      assert.doesNotMatch(error.message, /transport or credentials|Deploy/);
+      return true;
+    });
+    assert.equal(env.quota.state, 'pending');
+    assert.equal(reservations.size, 0);
+    const capacity = 'Installation environment limit reached (4/4). Destroy unused environments on their owning machines, or ask a site administrator to change gm settings environments set --site --max. Expired reservations still require cleanup.';
+    for (const [status, body, expected] of [
+      [409, { error: 'Environment reservation belongs to a different owner or configuration.' }, /different owner or configuration/],
+      [409, { error: capacity + ' fixture-quota-capability' }, /no recognized capacity diagnostic/],
+      [409, { error: capacity.replace('(4/4)', '(4/2147483648)') }, /no recognized capacity diagnostic/],
+      [409, { error: capacity.replace('(4/4)', '(4/1.5)') }, /no recognized capacity diagnostic/],
+      [409, { error: { message: capacity } }, /no recognized capacity diagnostic/],
+      [409, ['fixture-quota-capability'], /no recognized capacity diagnostic/],
+      [401, { error: capacity }, /authorization failed \\(401\\)/],
+      [403, { error: 'fixture-quota-capability' }, /authorization failed \\(403\\)/],
+      [500, { error: capacity }, /Quota request failed \\(500\\)/],
+    ]) {
+      globalThis.fetch = async () => Response.json(body, { status });
+      await assert.rejects(reserveQuota(env, 'remote', persist), error => {
+        assert.match(error.message, expected);
+        assert.doesNotMatch(error.message, /fixture-quota-capability|Installation environment limit reached/);
+        return true;
+      });
+      assert.equal(env.quota.state, 'pending');
+    }
+    globalThis.fetch = async () => new Response('fixture-quota-capability', { status: 409 });
+    await assert.rejects(reserveQuota(env, 'remote', persist), /no recognized capacity diagnostic/);
+    globalThis.fetch = async () => { throw new Error('fixture-quota-capability'); };
+    await assert.rejects(reserveQuota(env, 'remote', persist), error => {
+      assert.match(error.message, /transport or credentials/);
+      assert.doesNotMatch(error.message, /fixture-quota-capability/);
+      return true;
+    });
+  `);
+});
 
 await test("hosted main accepts only its exact HTTPS preview origin on port 5270", () => {
   const result = developmentEnvironment(runtime());

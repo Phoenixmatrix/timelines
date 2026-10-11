@@ -120,6 +120,7 @@ const PLACES = new Set([
   "api",
   "cli-auth",
   "device",
+  "highlights",
   "needs-you",
   "new",
   "packages",

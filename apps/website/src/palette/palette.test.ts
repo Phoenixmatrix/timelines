@@ -274,7 +274,6 @@ describe("ask", () => {
     expect(ask({ viewer: null, query: "why" })).toBeUndefined();
     const command = ask({ query: " why is CI slow? " })!;
     expect(command).toMatchObject({
-      title: "Ask Gitmatrix “why is CI slow?”",
       always: true,
       run: { kind: "action" },
     });

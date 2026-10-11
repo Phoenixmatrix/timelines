@@ -32,7 +32,7 @@ export async function usageLoader({ request }: { request: Request }) {
 }
 
 const INTRO =
-  "What Gitmatrix stores and runs, priced at Cloudflare's published list prices. Figures come from a daily collection; estimated ones are marked.";
+  "What Timelines stores and runs, priced at Cloudflare's published list prices. Figures come from a daily collection; estimated ones are marked.";
 
 export function UsageCosts() {
   const data = useLoaderData<typeof usageLoader>();

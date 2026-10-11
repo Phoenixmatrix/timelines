@@ -45,7 +45,7 @@ pub struct EnvironmentSetArgs {
     /// Maximum live environments; 0 pauses new allocations. Default: 4.
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=2147483647))]
     max: Option<u32>,
-    /// Explicit shared Gitmatrix quota authority URL (--local only). Every host
+    /// Explicit shared Timelines quota authority URL (--local only). Every host
     /// managing the same installation must use the same authority.
     #[arg(long, requires = "local", conflicts_with = "site", value_parser = environment_authority)]
     authority: Option<String>,
@@ -227,7 +227,7 @@ pub struct AiSetArgs {
     /// Automatic release-note generation.
     #[arg(long, value_parser = ["on", "off"])]
     release_notes: Option<String>,
-    /// Classification model: clef, or typesafe:<model> added in Settings → AI providers;
+    /// Classification model: clef, clef-flash, clef-omni, or typesafe:<model> added in Settings → AI providers;
     /// see show for published pricing and release dates.
     #[arg(long, value_parser = classification_model)]
     classification: Option<String>,
@@ -321,7 +321,7 @@ fn model_choice(
 }
 
 fn classification_model(value: &str) -> std::result::Result<String, String> {
-    model_choice(value, &["clef"], "typesafe")
+    model_choice(value, &["clef", "clef-flash", "clef-omni"], "typesafe")
 }
 
 fn generation_model(value: &str) -> std::result::Result<String, String> {
@@ -631,6 +631,17 @@ mod tests {
             args.patch(),
             json!({"features": {"releaseNotes": true}, "logBodies": {"merge-queue": false}})
         );
+    }
+
+    #[test]
+    fn clef_models_are_accepted_only_for_classification() {
+        for model in ["clef", "clef-flash", "clef-omni"] {
+            let args = parse_set(&["--classification", model]);
+            assert_eq!(args.patch(), json!({"models": {"classification": model}}));
+            for role in ["--fast", "--task"] {
+                assert!(Cli::try_parse_from(["gm", "settings", "ai", "set", role, model]).is_err());
+            }
+        }
     }
 
     #[test]

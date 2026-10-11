@@ -33,6 +33,7 @@ import {
   type VerificationProof,
 } from "./verification.ts";
 import { durableStub } from "../durable/registry.ts";
+import { cancelRun } from "./cancel.ts";
 
 export interface CiRepo {
   id: string;
@@ -541,10 +542,11 @@ export async function startRun(
       try {
         await startWorkflow(env, runId);
       } catch (cause) {
-        // Concurrent queue recovery may have created this exact Workflow already.
-        const recovered =
-          (options.queueId || options.verification) &&
-          (await env.CI_RUN.get(runId).catch(() => null));
+        // Landing replay, like queue/source recovery, can race an earlier start.
+        // A handle alone is not evidence that the exact instance exists.
+        const recovered = await env.CI_RUN.get(runId)
+          .then((workflow) => workflow.status())
+          .catch(() => null);
         if (!recovered) {
           // Without its Workflow nothing would ever move the run on: fail it now.
           await kdb
@@ -555,7 +557,9 @@ export async function startRun(
               finished_at: nowIso(),
             })
             .where("id", "=", runId)
+            .where("status", "in", ["queued", "running"])
             .execute();
+          await cancelRun(env, runId);
           throw cause;
         }
       }

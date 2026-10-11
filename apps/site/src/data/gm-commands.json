@@ -3432,7 +3432,7 @@
           "short": "q"
         }
       ],
-      "summary": "Clone a Gitmatrix repository and set it up for gm",
+      "summary": "Clone a Timelines repository and set it up for gm",
       "usage": "gm clone [OPTIONS] <REPOSITORY> [DIRECTORY]"
     },
     {
@@ -3444,7 +3444,7 @@
       "git": "git fetch",
       "mutates": true,
       "options": [],
-      "summary": "Download new commits from Gitmatrix without changing your changes",
+      "summary": "Download new commits from Timelines without changing your changes",
       "usage": "gm fetch"
     },
     {
@@ -3512,7 +3512,7 @@
           "required": false
         }
       ],
-      "summary": "Land changes on trunk (or a bookmark) on Gitmatrix. There are no pull requests",
+      "summary": "Land changes on trunk (or a bookmark) on Timelines. There are no pull requests",
       "usage": "gm push [OPTIONS]"
     },
     {
@@ -4717,7 +4717,7 @@
           "required": false
         },
         {
-          "description": "Classification model: clef, or typesafe:<model> added in Settings → AI providers; see show for published pricing and release dates",
+          "description": "Classification model: clef, clef-flash, clef-omni, or typesafe:<model> added in Settings → AI providers; see show for published pricing and release dates",
           "flag": false,
           "multiple": false,
           "name": "--classification",
@@ -4821,7 +4821,7 @@
           "required": false
         },
         {
-          "description": "Explicit shared Gitmatrix quota authority URL (--local only). Every host managing the same installation must use the same authority",
+          "description": "Explicit shared Timelines quota authority URL (--local only). Every host managing the same installation must use the same authority",
           "flag": false,
           "multiple": false,
           "name": "--authority",
@@ -6206,7 +6206,7 @@
           "required": false
         }
       ],
-      "summary": "Install the Claude Code mod: a card above the prompt with the gitmatrix issue the session works on, toggled by ctrl+x g or /gm-work. Rerun to update",
+      "summary": "Install the Claude Code mod: a card above the prompt with the Timelines issue the session works on, toggled by ctrl+x g or /gm-work. Rerun to update",
       "usage": "gm agent mod [OPTIONS]"
     },
     {
@@ -6605,7 +6605,7 @@
           "required": false
         }
       ],
-      "summary": "Ask the Gitmatrix assistant about code, issues, CI and packages (read-only unless --write)",
+      "summary": "Ask the Timelines assistant about code, issues, CI and packages (read-only unless --write)",
       "usage": "gm ask [OPTIONS] <QUESTION>..."
     },
     {
@@ -7340,7 +7340,7 @@
           "short": "d"
         }
       ],
-      "summary": "Call the Gitmatrix JSON API directly",
+      "summary": "Call the Timelines JSON API directly",
       "usage": "gm api [OPTIONS] <METHOD> <PATH>"
     },
     {

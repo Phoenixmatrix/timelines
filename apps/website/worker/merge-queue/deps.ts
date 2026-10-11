@@ -82,7 +82,7 @@ export function queueDeps(env: Env, waitUntil: Waiter): QueueDeps {
           mainBranch: s.entry.branch,
           message: `Merge queued ${s.entry.id}`,
           title: `Queue ${s.entry.id.slice(0, 12)}`,
-          author: { name: "Gitmatrix merge queue", email: "queue@gitmatrix.dev" },
+          author: { name: "Timelines merge queue", email: "queue@gitmatrix.dev" },
           actor: { id: s.actor.id, agentId: s.actor.agent?.id ?? null },
         }),
       ),

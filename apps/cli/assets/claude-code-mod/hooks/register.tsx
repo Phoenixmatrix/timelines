@@ -5,15 +5,8 @@ import { atom, read, update } from "claude-code";
 import type { EngineInterface, Register } from "claude-code";
 
 import type { GmSnapshot } from "../types";
-import {
-  currentTimeline,
-  gmCalls,
-  gmErrorMessage,
-  metaLine,
-  myClaims,
-  nextFocus,
-  toWork,
-} from "./gm";
+import { resolveIdentity } from "./identity";
+import { currentTimeline, gmCalls, metaLine, myClaims, nextFocus, toWork } from "./gm";
 
 type Engine = EngineInterface;
 
@@ -29,30 +22,45 @@ const STORE_SHOWN = "isShown";
 const REFRESH_MS = 60_000;
 const CARD_COLUMNS = 46;
 
-const isShown = atom({ plugin: "gitmatrix-work", key: "isShown" } as const, false);
+const isShown = atom({ plugin: "gitmatrix-work", key: "isShown" } as const, true);
 const snapshot = atom({ plugin: "gitmatrix-work", key: "snapshot" } as const, null);
 const focusKey = atom({ plugin: "gitmatrix-work", key: "focusKey" } as const, null);
 
 // Module state: a hot reload starts these over, which is fine.
-let agentId: string | null = null;
+let checkout: string | null = null;
 let isLoading = false;
 let isStale = false;
 
 async function gm($: Engine, args: string[]): Promise<unknown> {
   const ran = await $.process.run(["gm", ...args, "-o", "json"], { timeoutMs: 20_000 });
   if (ran.exitCode !== 0) {
-    throw new Error(gmErrorMessage(ran.stderr) ?? `gm ${args.join(" ")} exited ${ran.exitCode}`);
+    throw new Error("Timelines work unavailable");
   }
   return JSON.parse(ran.stdout);
 }
 
 async function load($: Engine): Promise<GmSnapshot> {
   const now = await $.clock.now();
+  const cwd = await $.session.cwd();
+  if (checkout !== cwd) {
+    checkout = cwd;
+    await update($, focusKey, () => null);
+    await update($, snapshot, () => null);
+  }
+  const identity = await resolveIdentity(
+    (argv, cwd) => $.process.run(argv, { cwd, timeoutMs: 20_000 }),
+    cwd,
+  );
+  if (!identity) {
+    await update($, focusKey, () => null);
+    return { identity: null, work: null, error: null, fetchedAt: now };
+  }
+  const agentId = identity.id;
+  const previous = await read($, snapshot);
+  if (previous?.identity && previous.identity.id !== agentId) {
+    await update($, focusKey, () => null);
+  }
   try {
-    if (agentId === null) {
-      const shown = (await gm($, ["agent", "show"])) as { agent?: { id?: string } };
-      agentId = shown.agent?.id ?? null;
-    }
     const focus = await read($, focusKey);
     const listing = gm($, [
       "issue",
@@ -67,18 +75,16 @@ async function load($: Engine): Promise<GmSnapshot> {
     const focused = focus === null ? null : gm($, ["issue", "show", focus]);
     const claims = myClaims(await listing, agentId, now);
     const key = focus ?? claims[0]?.key ?? null;
-    if (key === null) return { work: null, error: null, fetchedAt: now };
+    if (key === null) return { identity, work: null, error: null, fetchedAt: now };
     const shown = await (focused ?? gm($, ["issue", "show", key]));
     const work = toWork(shown, {
       agentId,
       timeline: currentTimeline(await timelines),
       otherClaims: claims.filter((claim) => claim.key !== key).length,
     });
-    return { work, error: null, fetchedAt: now };
-  } catch (error) {
-    const before = await read($, snapshot);
-    const message = error instanceof Error ? error.message : String(error);
-    return { work: before?.work ?? null, error: message, fetchedAt: now };
+    return { identity, work, error: null, fetchedAt: now };
+  } catch {
+    return { identity, work: null, error: "Timelines work unavailable", fetchedAt: now };
   }
 }
 
@@ -92,8 +98,10 @@ async function refresh($: Engine): Promise<void> {
   try {
     do {
       isStale = false;
+      const cwd = await $.session.cwd();
       const next = await load($);
-      await update($, snapshot, () => next);
+      if (cwd !== (await $.session.cwd())) isStale = true;
+      if (!isStale) await update($, snapshot, () => next);
     } while (isStale);
   } finally {
     isLoading = false;
@@ -112,9 +120,13 @@ export const register: Register = (on) => {
   on("session.start", async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
-      description: "Toggle the gitmatrix work card",
+      description: "Toggle the Timelines work card",
     });
-    if ((await $.store.get(STORE_SHOWN)) === true) await update($, isShown, () => true);
+    checkout = null;
+    await update($, snapshot, () => null);
+    await update($, focusKey, () => null);
+    await update($, isShown, () => true);
+    if ((await $.store.get(STORE_SHOWN)) === false) await update($, isShown, () => false);
     $.clock.after(0, () => void refresh($));
     $.clock.every(REFRESH_MS, () => {
       void read($, isShown).then((shown) => (shown ? refresh($) : undefined));
@@ -124,7 +136,7 @@ export const register: Register = (on) => {
 
   on("command.run", { command: COMMAND }, async ($) => {
     const shown = await toggle($);
-    return { text: shown ? "gitmatrix work card shown." : "gitmatrix work card hidden." };
+    return { text: shown ? "Timelines work card shown." : "Timelines work card hidden." };
   });
 
   // Follows the session's own gm commands: what it claims, checkpoints,
@@ -157,22 +169,42 @@ export const register: Register = (on) => {
     const width = Math.min(CARD_COLUMNS, e.props.bodyColumns);
     const isFramed = e.props.maxRows >= 5 && width >= 20;
     const lines: JSX.Element[] = [];
+    if (snap?.identity) {
+      lines.push(
+        <Text bold wrap="truncate-end">
+          Agent: {snap.identity.name}
+        </Text>,
+      );
+      if (snap.identity.accountable) {
+        lines.push(
+          <Text dimColor wrap="truncate-end">
+            Accountable: {snap.identity.accountable}
+          </Text>,
+        );
+      }
+    }
 
     if (snap === null) {
       lines.push(
         <Text dimColor wrap="truncate-end">
-          gitmatrix: loading…
+          Timelines: loading…
         </Text>,
       );
     } else if (snap.work === null) {
       lines.push(
         <Text dimColor wrap="truncate-end">
-          {snap.error ? "gitmatrix: unavailable" : "No gitmatrix issue claimed"}
+          {!snap.identity
+            ? "No Timelines agent identity"
+            : snap.error
+              ? "Timelines: unavailable"
+              : "No Timelines issue claimed"}
         </Text>,
       );
       lines.push(
         <Text dimColor wrap="truncate-end">
-          {snap.error ?? "gm issue next picks one"}
+          {!snap.identity
+            ? "gm agent setup configures this checkout"
+            : (snap.error ?? "gm issue next picks one")}
         </Text>,
       );
     } else {

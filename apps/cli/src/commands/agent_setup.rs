@@ -296,12 +296,40 @@ pub fn setup(ctx: &Ctx, o: &Options) -> Result<Shown> {
             ".codex/hooks.json",
             super::hooks::with_codex_hook,
         )),
-        Some("pi") => files.push(plan(
-            &root,
-            ".omp/extensions/gitmatrix-steps.ts",
-            super::hooks::OMP_EXTENSION.to_string(),
-            false,
-        )),
+        Some("pi") => {
+            files.push(plan(
+                &root,
+                ".omp/extensions/gitmatrix-steps.ts",
+                super::hooks::OMP_EXTENSION.to_string(),
+                false,
+            ));
+            for (path, content) in [
+                (
+                    "index.ts",
+                    include_str!("../../assets/claude-code-mod/hooks/omp.ts").to_string(),
+                ),
+                // OMP's entry and helper are peers, unlike Claude's hooks/ folder.
+                (
+                    "identity.ts",
+                    include_str!("../../assets/claude-code-mod/hooks/identity.ts").replacen(
+                        "from \"../types\"",
+                        "from \"./types\"",
+                        1,
+                    ),
+                ),
+                (
+                    "types/index.d.ts",
+                    include_str!("../../assets/claude-code-mod/types/index.d.ts").to_string(),
+                ),
+            ] {
+                files.push(plan(
+                    &root,
+                    &format!(".omp/extensions/gitmatrix-agent/{path}"),
+                    content,
+                    false,
+                ));
+            }
+        }
         _ => {}
     }
     let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
@@ -688,6 +716,17 @@ mod tests {
     fn setup_installs_each_harness_step_hook() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".gitmatrix")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".omp/extensions")).unwrap();
+        std::fs::write(
+            dir.path().join(".omp/extensions/personal.ts"),
+            "personal extension",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".omp/settings.json"),
+            "{\"theme\":\"custom\"}",
+        )
+        .unwrap();
         let ctx = Ctx {
             format: crate::output::Format::Json,
             dry_run: false,
@@ -715,6 +754,24 @@ mod tests {
             read(".omp/extensions/gitmatrix-steps.ts"),
             super::super::hooks::OMP_EXTENSION
         );
+        let identity_extension = read(".omp/extensions/gitmatrix-agent/index.ts");
+        let identity_resolver = read(".omp/extensions/gitmatrix-agent/identity.ts");
+        let identity_contract = read(".omp/extensions/gitmatrix-agent/types/index.d.ts");
+        run("pi");
+        assert_eq!(
+            read(".omp/extensions/gitmatrix-agent/index.ts"),
+            identity_extension
+        );
+        assert_eq!(
+            read(".omp/extensions/gitmatrix-agent/identity.ts"),
+            identity_resolver
+        );
+        assert_eq!(
+            read(".omp/extensions/gitmatrix-agent/types/index.d.ts"),
+            identity_contract
+        );
+        assert_eq!(read(".omp/extensions/personal.ts"), "personal extension");
+        assert_eq!(read(".omp/settings.json"), "{\"theme\":\"custom\"}");
         // Again: nothing doubles.
         run("codex");
         let codex: serde_json::Value = serde_json::from_str(&read(".codex/hooks.json")).unwrap();

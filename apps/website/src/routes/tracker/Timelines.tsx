@@ -158,7 +158,7 @@ export function TrackerTimelines() {
   const name = (timeline: Timeline | null, strong = false): ReactNode => (
     <Link
       to={select(timeline)}
-      className={`no-underline hover:underline ${strong ? "font-semibold text-ink" : "text-ink"} ${timeline ? "" : "font-mono"}`}
+      className={`relative z-10 pointer-events-auto underline decoration-line underline-offset-2 hover:decoration-signal ${strong ? "font-semibold text-ink" : "text-ink"} ${timeline ? "" : "font-mono"}`}
       title={timeline ? `${timeline.name} (${timeline.slug})` : "main"}
       onClick={(event) => event.stopPropagation()}
     >
@@ -178,7 +178,10 @@ export function TrackerTimelines() {
     ? graph.rows.findIndex(
         (r) =>
           r.timeline?.id === selected.id &&
-          (r.kind === "head" || r.kind === "abandon" || r.kind === "landing"),
+          (r.kind === "head" ||
+            r.kind === "abandon" ||
+            r.kind === "landing" ||
+            r.kind === "landed"),
       )
     : 0;
 
@@ -188,7 +191,7 @@ export function TrackerTimelines() {
     const commit =
       merge && repo ? (
         <Link
-          className="mk-mono text-micro text-ink-faint no-underline hover:underline max-sm:hidden"
+          className="relative z-10 pointer-events-auto mk-mono text-micro text-ink-faint underline underline-offset-2 max-sm:hidden"
           to={
             repo.source && repo.source.sourceId !== "canonical"
               ? commitsUrl(repo.owner, repo.name, merge.commit, "", repo.source.sourceId)
@@ -319,6 +322,9 @@ export function TrackerTimelines() {
               className="min-w-0 overflow-x-auto rounded-pane bg-pane"
               aria-label="Timeline graph"
             >
+              <p className="m-0 border-b border-line-soft px-3 py-2 text-body-sm text-ink-muted">
+                Select a row to view a timeline and use it across the app.
+              </p>
               <ol
                 className="relative m-0 list-none p-0"
                 style={{ minWidth: width + 240 }}
@@ -328,24 +334,47 @@ export function TrackerTimelines() {
                 {graph.rows.map((row, r) => {
                   const t = row.timeline;
                   const isSelected = r === selectedRow && (selected ? true : row.kind === "main");
+                  const selectable =
+                    row.kind === "main" ||
+                    row.kind === "head" ||
+                    row.kind === "abandon" ||
+                    row.kind === "landing" ||
+                    row.kind === "landed";
                   return (
                     <li
                       key={row.key}
                       data-kind={row.kind}
-                      className={`flex items-center gap-2 border-t border-line-soft pr-3 text-body-sm first:border-t-0 ${isSelected ? "bg-signal-wash" : "hover:bg-raised"}`}
+                      className={`relative flex items-center gap-2 border-t border-line-soft pr-3 text-body-sm first:border-t-0 ${isSelected ? "bg-signal-wash" : "hover:bg-raised"}`}
                       style={{ height: ROW_HEIGHT, paddingLeft: width + 4 }}
                       onMouseEnter={() => setHovered(t?.id ?? null)}
                     >
-                      <span className="min-w-0 flex-1 truncate">
+                      {selectable && (
+                        <Link
+                          to={select(t)}
+                          aria-label={`Select ${t?.name ?? "main"}`}
+                          aria-current={isSelected ? "true" : undefined}
+                          className="absolute inset-0 z-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-signal"
+                          title={t ? `${t.name} (${t.slug})` : "main"}
+                        />
+                      )}
+                      <span
+                        className={`min-w-0 flex-1 truncate ${selectable ? "pointer-events-none" : ""}`}
+                      >
                         {row.kind === "main" ? (
                           <>
-                            {name(null, true)}
+                            <span className="font-mono font-semibold text-ink">main</span>
                             <span className="text-ink-faint"> where every timeline lands</span>
                           </>
                         ) : (
                           <RowText
                             row={row}
-                            name={(timeline) => name(timeline, row.kind === "head")}
+                            name={(timeline) =>
+                              selectable && timeline?.id === t?.id ? (
+                                <span className="font-semibold text-ink">{timeline?.name}</span>
+                              ) : (
+                                name(timeline, row.kind === "head")
+                              )
+                            }
                             commit={rowMeta(row)}
                           />
                         )}
@@ -353,10 +382,17 @@ export function TrackerTimelines() {
                           <span className="mk-chip mk-chip--tag ml-2">Experimental</span>
                         )}
                       </span>
+                      {selectable && (
+                        <span
+                          className={`pointer-events-none shrink-0 text-micro ${isSelected ? "font-semibold text-signal" : "text-ink-muted"}`}
+                        >
+                          {isSelected ? "Selected" : "Select"}
+                        </span>
+                      )}
                       {t && row.kind === "landed" && (
                         <button
                           type="button"
-                          className="mk-btn mk-btn--ghost mk-btn--sm shrink-0"
+                          className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
                           aria-label={`Draw ${t.name}'s lane`}
                           onClick={() => toggleExpanded(t.id)}
                         >
@@ -366,7 +402,7 @@ export function TrackerTimelines() {
                       {t && row.kind === "landing" && expanded.has(t.id) && (
                         <button
                           type="button"
-                          className="mk-btn mk-btn--ghost mk-btn--sm shrink-0"
+                          className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
                           aria-label={`Fold ${t.name} onto main`}
                           onClick={() => toggleExpanded(t.id)}
                         >
@@ -375,7 +411,7 @@ export function TrackerTimelines() {
                       )}
                       {row.at && (
                         <time
-                          className="shrink-0 text-micro text-ink-faint tabular-nums max-sm:hidden"
+                          className="pointer-events-none shrink-0 text-micro text-ink-faint tabular-nums max-sm:hidden"
                           dateTime={row.at}
                           title={fullDate(row.at)}
                         >
@@ -453,7 +489,7 @@ export function TrackerTimelines() {
                             <li key={t.id}>
                               <Link
                                 to={select(t)}
-                                className="flex items-center gap-2 px-4 py-1.5 text-body-sm text-ink no-underline hover:bg-raised"
+                                className="flex min-h-11 items-center gap-2 px-4 py-1.5 text-body-sm text-ink no-underline hover:bg-raised"
                               >
                                 <StatusDot status={t.status} />
                                 <span className="min-w-0 flex-1 truncate">{t.name}</span>

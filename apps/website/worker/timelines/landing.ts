@@ -818,7 +818,7 @@ async function startMerge(ctx: Context, landing: Landing, repoId: string, tip: s
     mainBranch: r.default_branch,
     title: `Land ${landing.slug} (checkpoint #${landing.checkpointNumber}): compact into ${r.default_branch}`,
     message: `Land timeline ${landing.slug} (checkpoint #${landing.checkpointNumber})\n\nSource: ${repo.source.sourceId}\nCheckpoint: ${landing.checkpointId}${keys.length ? `\nIssues: ${keys.join(" ")}` : ""}`,
-    author: { name: "Gitmatrix", email: "landing@gitmatrix.invalid" },
+    author: { name: "Timelines", email: "landing@gitmatrix.invalid" },
     actor: { id: landing.requestedBy.accountableId, agentId: landing.requestedBy.agentId },
   });
 }

@@ -14,6 +14,7 @@ import {
   PlusIcon,
   RobotIcon,
   ScrollIcon,
+  NewspaperIcon,
   SignInIcon,
   SignOutIcon,
   SlidersHorizontalIcon,
@@ -232,6 +233,10 @@ export function AppShell() {
   const trackerPage = tracker?.params["*"]?.split("/")[0];
   const onTimelines = trackerPage === "timelines" || location.pathname === "/timelines";
   const onReleaseNotes = trackerPage === "releases" || location.pathname === "/release-notes";
+  const onHighlights =
+    trackerPage === "highlights" ||
+    location.pathname === "/highlights" ||
+    /^\/[^/]+\/[^/]+\/releases\/highlights$/.test(location.pathname);
   const owner =
     tracker?.params.owner ??
     (location.pathname === "/settings/preferences"
@@ -290,7 +295,11 @@ export function AppShell() {
               <Place
                 to={owner ? `/tracker/${encodeURIComponent(owner)}` : "/tracker"}
                 label="Issue tracker"
-                active={managingTracker || onTimelines || onReleaseNotes ? false : undefined}
+                active={
+                  managingTracker || onTimelines || onReleaseNotes || onHighlights
+                    ? false
+                    : undefined
+                }
               >
                 {(active) => (
                   <ListChecksIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
@@ -306,6 +315,13 @@ export function AppShell() {
               >
                 {(active) => (
                   <ScrollIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+                )}
+              </Place>
+            )}
+            {viewer && (
+              <Place to="/highlights" label="Highlights" active={onHighlights}>
+                {(active) => (
+                  <NewspaperIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
                 )}
               </Place>
             )}

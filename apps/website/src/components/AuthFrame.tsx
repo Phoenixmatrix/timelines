@@ -34,7 +34,7 @@ export function AuthFrame({ children, footer }: { children: ReactNode; footer?: 
   return (
     <div className="flex min-h-dvh flex-col bg-stage">
       <header className="flex items-center justify-between gap-4 px-5 py-4 sm:px-8 sm:py-5">
-        <Link to="/" aria-label="Gitmatrix" className="shrink-0 rounded-control">
+        <Link to="/" aria-label="Timelines" className="shrink-0 rounded-control">
           <GitmatrixLogo className="h-8 w-auto" />
         </Link>
         <span className="truncate font-mono text-micro text-ink-faint">{host}</span>

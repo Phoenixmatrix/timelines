@@ -1,8 +1,8 @@
-# Gitmatrix
+# Timelines
 
 A Git host, package registry, CI service and distributed issue tracker on Cloudflare.
 The React app and Worker live in `apps/website`; the Rust `gm` CLI lives in
-`apps/cli`. Gitmatrix hosts its own source. GitHub is a one-way backup, not the
+`apps/cli`. Timelines hosts its own source. GitHub is a one-way backup, not the
 publication target.
 
 ## Timeline work and canonical history
@@ -20,7 +20,7 @@ See the [current timeline contract](apps/website/README.md#timelines) and
 
 ## Downloading and installing packages
 
-Authenticate `gm` with your Gitmatrix server before accessing private packages.
+Authenticate `gm` with your Timelines server before accessing private packages.
 Download any generic artifact to a local file, or install a direct Unix executable:
 
 ```sh
@@ -51,7 +51,7 @@ configuration. `--dry-run` resolves the version and checks remote checksum metad
 without creating local files or directories. For feature-worktree validation,
 always choose an external disposable `--bin-dir`, never a shared/global install.
 
-Gitmatrix publishes Linux x86-64 and ARM64 release binaries from `main`:
+Timelines publishes Linux x86-64 and ARM64 release binaries from `main`:
 `gm pkg install gm --owner matrixorg`, then use `--force` for updates. Versions
 use the `apps/cli` source tree id; unrelated pushes reuse existing artifacts.
 On 64-bit Raspberry Pi OS (Bookworm or newer), the installer selects
@@ -238,7 +238,7 @@ E2E environment consumes an installation slot: a normal Cloudflare setup uses
 The local cap protects host capacity; raising it cannot override the installation
 cap. Admission reserves capacity atomically before provider provisioning.
 
-Before setup, explicitly choose the **same shared Gitmatrix authority on every
+Before setup, explicitly choose the **same shared Timelines authority on every
 host managing the installation**, and authenticate `gm` to it:
 
 ```bash
@@ -272,6 +272,15 @@ authentication, or an unacknowledged request **fails closed**: there is no offli
 404 or local-count fallback. Deploy the quota API/schema on the chosen authority,
 restore the owning identity's access, and retry cleanup/setup; do not switch to
 another authority or remove journals to bypass a full or unreachable quota.
+
+A full installation reports `Installation environment limit reached (used/maximum)`
+in both local `gm` and hosted HTTP admission. Destroy unused environments on their
+owning machines, or ask a site administrator to adjust
+`gm settings environments set --site --max`. Expired reservations still require
+cleanup; waiting for their TTL is not enough. Reservation owner/configuration
+conflicts and authorization failures are reported separately from capacity.
+Only recognized structured diagnostics supply bounded usage numbers; arbitrary
+subprocess output and HTTP error bodies are never echoed.
 
 On rollout, local setup adopts non-retired legacy application journals from this
 user's local inventory before admitting another environment. Adoption itself needs
@@ -802,22 +811,25 @@ stages those build on. The mapping lives beside each stage, in
 Gateway and model layer, AI settings, dependency versions) runs every stage. A
 change that maps to no stage provisions nothing. `--dry-run` prints the
 selection and why; `--stage <id>` and `--all` add stages, never remove one whose
-code changed. `--resume` after a failure skips stages that passed in this
-worktree's previous run from the same merge base with the same changed content
-(their prerequisites still run in the new environment). Within 30 minutes of a
-failure it refuses a full run, and any rerun with nothing changed, unless
-`--force`: inspect the evidence and fix the cause instead of looping.
+code changed. `--resume` after a failure reuses a stage's latest attempt only
+if it passed, including across runs that skipped it. The merge base and mapped
+changed content must stay unchanged throughout; a later failed or incomplete
+attempt invalidates that evidence. Prerequisites still run in the new environment.
+Within 30 minutes of a failure it refuses a full run, and any rerun with nothing
+changed, unless `--force`: inspect the evidence and fix the cause instead of looping.
 `completion.json` and `ai-e2e.json` (`selection`, `stages`, `cost`) record which
 stages ran, why, their outcomes and the Gateway-logged spend.
 
 | Stage                                                | Verifies                                                                                           |
 | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `classification`                                     | Selected Clef Flash/Omni decisions, uncached attribution and one metered call per model            |
 | `knowledge`                                          | AI settings admission, the build, graph and generated wiki overview                                |
 | `search`                                             | Vectorize entity and AI Search passage visibility, isolation, palette search                       |
 | `assistant`                                          | A real turn from the index, approval-gated writes, retry, status between steps                     |
 | `avatars`                                            | Real avatar generation within its ten-call budget                                                  |
 | `knowledge-edit`                                     | An edit's incremental rebuild, concept naming, successor build settings                            |
 | `release-notes`                                      | Daily notes, rollover, a tag, a tracker issue's entry, the team feed                               |
+| `release-highlights`                                 | Grounded repo/tracker/site prose, authorized-source isolation, cadence, invalidation and real UI   |
 | `overlays`                                           | A timeline bookmark's knowledge overlay, main untouched                                            |
 | `timeline-pages`                                     | A checkpoint's wiki pages, main untouched                                                          |
 | `repository-deletion`                                | Purging the fixture's vectors, search items and Artifacts; the orphan sweep                        |

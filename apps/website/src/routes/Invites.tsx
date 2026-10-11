@@ -43,7 +43,7 @@ export function Invites() {
     <SettingsPage>
       <h1 className="m-0 text-headline">Invitations</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
-        Gitmatrix is invite only. Someone you invite signs in with an emailed code, and their
+        Timelines is invite only. Someone you invite signs in with an emailed code, and their
         account is created then. Add them to an organization or repository afterwards.
       </p>
 

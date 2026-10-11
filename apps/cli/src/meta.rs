@@ -535,7 +535,7 @@ pub fn schema(words: &[String]) -> Result<Schema> {
 
 // ---- guide ----------------------------------------------------------------
 
-pub const GUIDE: &str = r#"# gm: working with Gitmatrix
+pub const GUIDE: &str = r#"# gm: working with Timelines
 
 gm is change-based (like jj), not commit-and-stage based (like git).
 
@@ -638,7 +638,7 @@ Use one when the issue or a person asks; otherwise work on main.
     gm timeline flag <slug> --experimental   # not expected to land; --no-experimental clears it
 `use` writes `timeline: <slug>` to .gitmatrix/agent.local.yml (worktrees copy
 it). While bound, the source's work ref is this checkout's trunk: push, sync
-and immutability follow it through a source-scoped Gitmatrix URL. Canonical origin
+and immutability follow it through a source-scoped Timelines URL. Canonical origin
 stays unchanged, and pushing to main is refused. `gm issue` uses its tracker view.
 `GM_TIMELINE=<slug>` overrides the binding for one command.
 Only a timeline's accountable person or the agent that started it may abandon it.
@@ -809,7 +809,7 @@ person can explicitly assign an agent despite a mismatch, but neither bypasses p
 This is eligibility, not authorization: capabilities are self-reported.
 
 ## Asking the assistant
-`gm ask "<question>"` asks Gitmatrix's assistant, which reads code (and the
+`gm ask "<question>"` asks the Timelines assistant, which reads code (and the
 knowledge graph), issues, CI runs and packages with your permissions and answers
 with links. Inside a checkout it knows the repository; `-R owner/name` otherwise.
 It's read-only unless `--write`; follow up with `--chat <id>`. Conversations are
@@ -826,12 +826,12 @@ Under load a push may share a run with later pushes (it's "covered" by the newer
 run); `gm runs wait` follows the covering run, so its verdict includes your commit.
 Starting a commit that's already running returns that run; jobs with `paths:` skip
 themselves when those paths are unchanged since they last passed.
-Gitmatrix deploys nothing; a job that deploys records where it went with
+Timelines deploys nothing; a job that deploys records where it went with
 `gm deploy record --url "$URL"` (environment, commit and run come from the job;
 a `timeline/<slug>` branch makes it that timeline's preview, another branch
 deploys to `branch/<name>`; `--environment` overrides). Outside CI pass
 `--commit`. `gm deploy list --run N|--timeline SLUG`, `gm deploy update ID --status expired`.
-Previews: a repository opts in with `on: preview` in ci.yml; Gitmatrix starts a
+Previews: a repository opts in with `on: preview` in ci.yml; Timelines starts a
 preview run per checkpoint (`if: trigger == "preview" && action == "create"`),
 a `teardown` run when it expires, and a `create` again on `gm timeline revive`.
 

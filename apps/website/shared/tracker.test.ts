@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vite-plus/test";
 import {
+  attribution,
   attributionText,
   claimAttribution,
   claimHolder,
@@ -30,6 +31,39 @@ const claim = (actorId: string, agent: string): IssueClaim => ({
 });
 
 describe("who's accountable", () => {
+  test("recorded agents keep their name and accountable person after rename or deletion", () => {
+    const actor = { id: "agt", kind: "agent" as const, name: "original", accountable: ann };
+    const expected = { name: "original", kind: "agent", person: ann };
+    expect(attribution(people, "agt", actor)).toEqual(expected);
+    expect(attribution({ members: [], agents: [] }, "agt", actor)).toEqual(expected);
+  });
+
+  test("a human author is not their agent and legacy unknowns are not inferred from accountability", () => {
+    expect(attribution(people, "ann")).toEqual({ name: "Ann Lee", kind: "person", person: ann });
+    expect(
+      attribution(people, "ann", {
+        id: "ann",
+        kind: "person",
+        name: "Ann before rename",
+        accountable: null,
+      }),
+    ).toEqual({ name: "Ann before rename", kind: "person", person: ann });
+    expect(
+      attribution(people, "deleted", {
+        id: "deleted",
+        kind: "unknown",
+        name: null,
+        accountable: ann,
+      }),
+    ).toEqual({ name: "deleted", kind: "unknown", person: null });
+    expect(attribution(people, "agt")).toEqual({ name: "builder", kind: "agent", person: ann });
+    expect(attribution(people, "deleted")).toEqual({
+      name: "deleted",
+      kind: "unknown",
+      person: null,
+    });
+  });
+
   test("an agent names its person; a person's session keeps them first", () => {
     expect(claimAttribution(people, claim("agt", "session-7"))).toEqual({
       name: "builder",

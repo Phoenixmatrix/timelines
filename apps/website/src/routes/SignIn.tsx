@@ -222,7 +222,7 @@ function SignedInLedger({ viewer }: { viewer: Viewer }) {
       </Ledger>
       <div className="mt-6 flex flex-wrap items-center gap-2">
         <Link to={safeNext(params.get("next"))} className="mk-btn mk-btn--primary no-underline">
-          Continue to Gitmatrix
+          Continue to Timelines
         </Link>
         <Form method="post" action="/signin?intent=signout">
           <button className="mk-btn mk-btn--ghost">Sign out</button>
@@ -326,7 +326,7 @@ export function SignIn() {
     >
       <h1 className="m-0 text-headline">Sign in</h1>
       <p className="mt-2 mb-0 max-w-[48ch] text-ink-muted">
-        Gitmatrix is invite only. We'll email you a one-time code; there's no password to remember.
+        Timelines is invite only. We'll email you a one-time code; there's no password to remember.
       </p>
       {viewer && !params.has("switch") && !actionData ? (
         <SignedInLedger viewer={viewer} />

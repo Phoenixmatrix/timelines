@@ -32,6 +32,7 @@ export const WORKERS_AI_MODELS: Readonly<Record<string, readonly ModelMetric[]>>
   "@cf/google/gemma-4-26b-a4b-it": ["input", "output"],
   "@cf/cloudflare/clef": ["input"],
   "@cf/cloudflare/clef-flash": ["input"],
+  "@cf/cloudflare/clef-omni": ["input"],
   "@cf/qwen/qwen3-embedding-0.6b": ["input"],
   "@cf/ibm-granite/granite-4.0-h-micro": ["input", "output"],
   "@cf/black-forest-labs/flux-1-schnell": ["tile", "step"],

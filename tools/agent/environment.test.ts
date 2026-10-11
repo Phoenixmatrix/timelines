@@ -83,11 +83,15 @@ const path = ${JSON.stringify(join(home, "quota.json"))};
 const rows = fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf8')) : {};
 if (process.env.GM_SERVER !== 'https://quota.example') throw new Error('wrong quota authority');
 if (process.env.GM_TOKEN || process.env.GITMATRIX_TOKEN) throw new Error('product credential reached quota transport');
+const failurePath = ${JSON.stringify(join(home, "quota-error.json"))};
+if (fs.existsSync(failurePath)) {
+  process.stderr.write(fs.readFileSync(failurePath, 'utf8')); process.exit(1);
+}
 let acknowledgement;
 if (args[3] === 'POST') {
   const body = JSON.parse(args[args.indexOf('--data') + 1]);
   if (!rows[body.id] && Object.keys(rows).length >= ${maximum}) {
-    console.error('Installation environment limit reached'); process.exit(1);
+    console.error(JSON.stringify({ error: { code: 'conflict', message: 'Installation environment limit reached (' + Object.keys(rows).length + '/${maximum}). Destroy unused environments on their owning machines, or ask a site administrator to change gm settings environments set --site --max. Expired reservations still require cleanup.' } })); process.exit(1);
   }
   rows[body.id] = body;
   acknowledgement = { reserved: true, id: body.id };
@@ -105,6 +109,73 @@ process.stdout.write(Object.hasOwn(overrides, args[3])
     { mode: 0o700 },
   );
 }
+
+await test("gm quota admission reports safe capacity, conflict and authorization diagnostics", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-quota-diagnostic-"));
+  try {
+    await quotaFixture(home, 1);
+    const output = await command(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `
+        import assert from 'node:assert/strict';
+        import { writeFile } from 'node:fs/promises';
+        import { reserveQuota } from ${JSON.stringify(new URL("./quota.ts", import.meta.url).href)};
+        const first = ${JSON.stringify(owned(home))};
+        const persist = async () => {};
+        await reserveQuota(first, 'local', persist);
+        const rejected = { ...first, id: 'gma-mga00000-111111abcdef', quota: undefined };
+        await assert.rejects(reserveQuota(rejected, 'local', persist), error => {
+          assert.match(error.message, /Installation environment limit reached \\(1\\/1\\)/);
+          assert.match(error.message, /owning machines/);
+          assert.match(error.message, /site administrator/);
+          assert.match(error.message, /Expired reservations still require cleanup/);
+          assert.doesNotMatch(error.message, /transport or credentials|Deploy/);
+          return true;
+        });
+        assert.equal(rejected.quota.state, 'pending');
+        const capacity = 'Installation environment limit reached (1/1). Destroy unused environments on their owning machines, or ask a site administrator to change gm settings environments set --site --max. Expired reservations still require cleanup.';
+        for (const [diagnostic, expected] of [
+          [JSON.stringify({ error: { code: 'conflict', message: 'Environment reservation belongs to a different owner or configuration.' } }), /different owner or configuration/],
+          [JSON.stringify({ error: { code: 'conflict', message: capacity + ' secret-payload' } }), /no recognized capacity diagnostic/],
+          [JSON.stringify({ error: { code: 'conflict', message: capacity.replace('(1/1)', '(2147483648/1)') } }), /no recognized capacity diagnostic/],
+          [JSON.stringify({ error: { code: 'conflict', message: capacity.replace('(1/1)', '(-1/1)') } }), /no recognized capacity diagnostic/],
+          [JSON.stringify({ error: { code: 'unauthenticated', message: 'secret-payload' } }), /authorization failed \\(401\\)/],
+          [JSON.stringify({ error: { code: 'forbidden', message: capacity } }), /authorization failed \\(403\\)/],
+          [JSON.stringify({ error: { code: 'unknown', message: capacity, hint: 'secret-payload' } }), /transport or credentials/],
+          ['secret-payload ' + capacity, /transport or credentials/],
+          [JSON.stringify({ error: ['secret-payload'] }), /transport or credentials/],
+        ]) {
+          await writeFile(${JSON.stringify(join(home, "quota-error.json"))}, diagnostic);
+          await assert.rejects(reserveQuota(rejected, 'local', persist), error => {
+            assert.match(error.message, expected);
+            assert.doesNotMatch(error.message, /secret-payload|Installation environment limit reached/);
+            return true;
+          });
+          assert.equal(rejected.quota.state, 'pending');
+        }
+        console.log('quota diagnostics checked');
+        `,
+      ],
+      {
+        env: {
+          ...unitTestEnvironment(process.env),
+          HOME: home,
+          PATH: `${join(home, "bin")}:${process.env.PATH}`,
+        },
+      },
+    );
+    assert.match(output, /quota diagnostics checked/);
+    assert.equal(
+      Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))).length,
+      1,
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 await test("machine limits require whole bounded values and an explicit credential-free authority", () => {
   assert.deepEqual(parseEnvironmentLimits({ maximum: 4 }), { maximum: 4, authority: undefined });

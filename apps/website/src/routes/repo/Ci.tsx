@@ -805,7 +805,7 @@ export function CiRun() {
                       <RunBy run={run} />
                     </>
                   ) : (
-                    " by Gitmatrix"
+                    " by Timelines"
                   )}{" "}
                 </>
               ) : run.landing ? (
@@ -828,7 +828,7 @@ export function CiRun() {
                       <RunBy run={run} />
                     </>
                   ) : (
-                    " by Gitmatrix"
+                    " by Timelines"
                   )}{" "}
                 </>
               ) : (

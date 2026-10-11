@@ -1023,7 +1023,7 @@ fn execute(
             stopping = Some(Instant::now());
         }
         if ended.is_none() && Instant::now() > deadline {
-            reporter.log(step, "\n[gitmatrix] Timed out; stopping.\n".into());
+            reporter.log(step, "\n[Timelines] Timed out; stopping.\n".into());
             ended = Some(Ended::TimedOut);
             kill("-TERM", child.id());
             stopping = Some(Instant::now());
@@ -1058,7 +1058,7 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
     let artifacts = root.join("artifacts").join(&scope).join(&attempt);
     private_runner_dir(&artifacts)?;
     let artifacts = std::fs::canonicalize(artifacts)?;
-    let evidence = format!("[gitmatrix] Retained evidence: {}\n", artifacts.display());
+    let evidence = format!("[Timelines] Retained evidence: {}\n", artifacts.display());
     reporter.log(SETUP_STEP, evidence.clone());
     if echo {
         eprint!("{evidence}");
@@ -1150,14 +1150,14 @@ fn run_job(config: &Config, job: &Value, root: &Path, echo: bool) -> Result<&'st
         {
             reporter.log(
                 SETUP_STEP,
-                "[gitmatrix] Explicit CARGO_TARGET_DIR; managed compiler cache bypassed.\n".into(),
+                "[Timelines] Explicit CARGO_TARGET_DIR; managed compiler cache bypassed.\n".into(),
             );
             None
         } else {
             let cache = CompilerCache::acquire(&root.join("cache"), &scope)?;
             reporter.log(
                 SETUP_STEP,
-                format!("[gitmatrix] Compiler cache: {}\n", cache.target.display()),
+                format!("[Timelines] Compiler cache: {}\n", cache.target.display()),
             );
             env.insert(
                 "CARGO_TARGET_DIR".into(),

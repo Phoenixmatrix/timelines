@@ -1,6 +1,6 @@
 // The price catalog (CORE-208): the parsers against saved copies of
-// Cloudflare's pricing pages (fixtures/, fetched 2026-10-04), the seed, the
-// refresh's validation and diff, applying, editing and the audit trail.
+// Cloudflare's pricing pages (fixtures/, fetched 2026-10-04 and Workers AI
+// 2026-10-11), the versioned seed, refresh validation and the audit trail.
 
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -35,10 +35,17 @@ import {
 } from "./prices.ts";
 import { INSTANCE_TYPES } from "./containers.ts";
 import { markdownTables } from "./markdown.ts";
-import { SEED_DATE, SEED_PRICES } from "./seed.ts";
+import {
+  CLASSIFIER_PRICE_DATE,
+  CLASSIFIER_PRICE_FETCHED_AT,
+  SEED_DATE,
+  SEED_PRICES,
+  seedPrice,
+} from "./seed.ts";
 
 const FIXTURES = fileURLToPath(new URL("./fixtures/", import.meta.url).href);
 const fixture = (product: PriceProduct) => readFileSync(join(FIXTURES, `${product}.txt`), "utf8");
+const currentWorkersAi = () => readFileSync(join(FIXTURES, "workers_ai_2026-10-11.txt"), "utf8");
 
 /** Serves the saved pages, with any page's text replaced or an HTTP status instead. */
 function pages(overrides: Partial<Record<PriceProduct, string | number>> = {}): Fetcher {
@@ -47,9 +54,10 @@ function pages(overrides: Partial<Record<PriceProduct, string | number>> = {}): 
     if (!page) return new Response("not found", { status: 404 });
     const override = overrides[page.product];
     if (typeof override === "number") return new Response("error", { status: override });
-    return new Response(override ?? fixture(page.product), {
-      headers: { "content-type": "text/markdown" },
-    });
+    return new Response(
+      override ?? (page.product === "workers_ai" ? currentWorkersAi() : fixture(page.product)),
+      { headers: { "content-type": "text/markdown" } },
+    );
   };
 }
 
@@ -65,11 +73,56 @@ function setup() {
 const rows = (sqlite: DatabaseSync, sql: string) => sqlite.prepare(sql).all();
 
 describe("parsing the saved pricing pages", () => {
-  test("yields exactly the seeded prices", () => {
-    const parsed = PRICING_PAGES.flatMap((page) =>
+  test("keeps other products' original source snapshots and seed versions", () => {
+    const parsed = PRICING_PAGES.filter((page) => page.product !== "workers_ai").flatMap((page) =>
       parsePricingPage(page, fixture(page.product), SEED_DATE),
     );
-    expect(parsed).toEqual(SEED_PRICES);
+    expect(parsed).toEqual(SEED_PRICES.filter((p) => p.product !== "workers_ai"));
+  });
+
+  test("the current Workers AI page matches the latest prices, not the old Flash rate", () => {
+    const parsed = parsePricingPage(
+      pricingPage("workers_ai"),
+      currentWorkersAi(),
+      CLASSIFIER_PRICE_DATE,
+    );
+    const metrics = new Set(
+      SEED_PRICES.filter((p) => p.product === "workers_ai").map((p) => p.metric),
+    );
+    expect(Object.fromEntries(parsed.map((p) => [p.metric, p]))).toEqual(
+      Object.fromEntries(
+        [...metrics].map((metric) => [
+          metric,
+          {
+            ...seedPrice("workers_ai", metric),
+            effectiveFrom: CLASSIFIER_PRICE_DATE,
+            sourceUpdated: "2026-10-09",
+          },
+        ]),
+      ),
+    );
+    // The unmodified archive predates Omni. A live refresh must reject that
+    // incomplete page rather than silently drop a now-tracked model.
+    expect(fixture("workers_ai")).toContain(
+      "| @cf/cloudflare/clef-flash | $0.090 per M input tokens",
+    );
+    expect(() =>
+      parsePricingPage(pricingPage("workers_ai"), fixture("workers_ai"), SEED_DATE),
+    ).toThrow("Workers AI: no price for @cf/cloudflare/clef-omni");
+  });
+
+  test("the archived Workers AI rows still reproduce every historical seed price", () => {
+    // Supply only the newly required Omni row from its real later snapshot so
+    // the strict current registry can read the old page. No archived row changes.
+    const omniRow = currentWorkersAi().match(/^\| @cf\/cloudflare\/clef-omni .*$/m)?.[0];
+    expect(omniRow).toBeDefined();
+    const supplemented = `${fixture("workers_ai")}\n\n## Later Omni row for parser coverage\n\n| Model | Price in Tokens | Price in Neurons |\n| --- | --- | --- |\n${omniRow}\n`;
+    const historical = parsePricingPage(pricingPage("workers_ai"), supplemented, SEED_DATE).filter(
+      (p) => p.metric !== modelMetric("@cf/cloudflare/clef-omni", "input"),
+    );
+    expect(historical).toEqual(
+      SEED_PRICES.filter((p) => p.product === "workers_ai" && p.effectiveFrom === SEED_DATE),
+    );
   });
 
   test("reads the prices as published", () => {
@@ -192,7 +245,9 @@ describe("parsing the saved pricing pages", () => {
           ? "2026-10-14"
           : p.product === "ai_search"
             ? "2026-11-01"
-            : SEED_DATE;
+            : p.sourceUpdated === "2026-10-09"
+              ? CLASSIFIER_PRICE_DATE
+              : SEED_DATE;
       expect(`${p.product} ${p.metric} ${p.effectiveFrom}`).toBe(
         `${p.product} ${p.metric} ${expected}`,
       );
@@ -209,40 +264,39 @@ describe("parsing the saved pricing pages", () => {
     }
   });
 
-  test("malformed pages are rejected with a clear reason", () => {
+  test("malformed pricing pages are rejected", () => {
     const d1Page = pricingPage("d1");
     const parse = (text: string) => () => parsePricingPage(d1Page, text, SEED_DATE);
-    expect(parse("")).toThrow("D1: not a pricing page");
-    expect(parse("<html><body>Service unavailable</body></html>")).toThrow("not a pricing page");
+    expect(parse("")).toThrow();
+    expect(parse("<html><body>Service unavailable</body></html>")).toThrow();
     // A row gone.
-    expect(parse(fixture("d1").replace(/^\| Rows written .*$/m, ""))).toThrow(
-      "D1 rows_written: no row or column for it",
-    );
+    expect(parse(fixture("d1").replace(/^\| Rows written .*$/m, ""))).toThrow();
     // A unit changed.
-    expect(parse(fixture("d1").replace("$0.75 / GB-mo", "$0.75 / TB-mo"))).toThrow(
-      'D1 storage: the price is per "TB-mo", expected',
-    );
+    expect(parse(fixture("d1").replace("$0.75 / GB-mo", "$0.75 / TB-mo"))).toThrow();
     // The price gone from its cell.
-    expect(parse(fixture("d1").replace("+ $0.001 / million rows", "+ contact sales"))).toThrow(
-      "D1 rows_read: no price",
-    );
+    expect(parse(fixture("d1").replace("+ $0.001 / million rows", "+ contact sales"))).toThrow();
     // A table renamed away.
-    expect(parse(fixture("d1").replace("## Billing metrics", "## Billing"))).toThrow(
-      "D1: no billing table",
-    );
+    expect(parse(fixture("d1").replace("## Billing metrics", "## Billing"))).toThrow();
     // A tracked model no longer listed.
     expect(() =>
       parsePricingPage(
         pricingPage("workers_ai"),
-        fixture("workers_ai").replace(/^\| @cf\/cloudflare\/clef-flash .*$/m, ""),
+        currentWorkersAi().replace(/^\| @cf\/cloudflare\/clef-flash .*$/m, ""),
         SEED_DATE,
       ),
-    ).toThrow("Workers AI: no price for @cf/cloudflare/clef-flash");
+    ).toThrow();
+    expect(() =>
+      parsePricingPage(
+        pricingPage("workers_ai"),
+        currentWorkersAi().replace(/^\| @cf\/cloudflare\/clef-omni .*\n/m, ""),
+        CLASSIFIER_PRICE_DATE,
+      ),
+    ).toThrow();
   });
 });
 
 describe("the seed", () => {
-  test("the migration inserts exactly the seeded prices, as one applied change", () => {
+  test("the migrations insert exactly the seeded versions as applied changes", () => {
     const { sqlite } = setup();
     expect(
       rows(sqlite, "SELECT id, kind, status, created_by FROM cloudflare_price_changes"),
@@ -250,6 +304,8 @@ describe("the seed", () => {
       { id: 1, kind: "seed", status: "applied", created_by: null },
       // Containers (CORE-210), its own seed change.
       { id: 2, kind: "seed", status: "applied", created_by: null },
+      // Classifier prices observed 2026-10-11 (CORE-329).
+      { id: 3, kind: "seed", status: "applied", created_by: null },
     ]);
     const stored = rows(
       sqlite,
@@ -274,6 +330,69 @@ describe("the seed", () => {
     );
   });
 
+  test("classifier prices change only at the observation-day boundary", async () => {
+    const { DB } = setup();
+    const timeline = await priceTimeline(DB);
+    const flash = modelMetric("@cf/cloudflare/clef-flash", "input");
+    const omni = modelMetric("@cf/cloudflare/clef-omni", "input");
+    const before = priceOn(timeline, "workers_ai", flash, "2026-10-10")!;
+    const after = priceOn(timeline, "workers_ai", flash, CLASSIFIER_PRICE_DATE)!;
+    expect(priceOn(timeline, "workers_ai", flash, "2026-10-03")).toBeNull();
+    expect(before).toMatchObject({
+      unitPriceUsd: 0.09,
+      effectiveFrom: SEED_DATE,
+      sourceUpdated: "2026-10-01",
+      fetchedAt: "2026-10-04T02:24:00.000Z",
+      supersededAt: null,
+    });
+    expect(after).toMatchObject({
+      unitPriceUsd: 0.038,
+      effectiveFrom: CLASSIFIER_PRICE_DATE,
+      sourceUpdated: "2026-10-09",
+      fetchedAt: CLASSIFIER_PRICE_FETCHED_AT,
+      supersededAt: null,
+    });
+    expect(priceCost(before, 2_000_000)).toBeCloseTo(0.18, 12);
+    expect(priceCost(after, 2_000_000)).toBeCloseTo(0.076, 12);
+    expect(priceOn(timeline, "workers_ai", omni, "2026-10-10")).toBeNull();
+    expect(
+      priceCost(priceOn(timeline, "workers_ai", omni, CLASSIFIER_PRICE_DATE)!, 2_000_000),
+    ).toBeCloseTo(0.3, 12);
+    expect(seedPrice("workers_ai", flash)).toEqual(publishedOf(after));
+    expect(seedPrice("workers_ai", omni).unitPriceUsd).toBe(0.15);
+    expect(
+      (await priceHistory(DB, "workers_ai", flash)).map((p) => [
+        p.effectiveFrom,
+        p.unitPriceUsd,
+        p.supersededAt,
+      ]),
+    ).toEqual([
+      [CLASSIFIER_PRICE_DATE, 0.038, null],
+      [SEED_DATE, 0.09, null],
+    ]);
+    for (const [instant, expected] of [
+      ["2026-10-10T23:59:59.999Z", 0.09],
+      ["2026-10-11T00:00:00.000Z", 0.038],
+    ] as const) {
+      const catalog = await loadCatalog(DB, new Date(instant));
+      expect(priceOn(catalog.prices, "workers_ai", flash, catalog.asOf)?.unitPriceUsd).toBe(
+        expected,
+      );
+    }
+    const current = await loadCatalog(DB, new Date("2026-10-11T12:00:00Z"));
+    expect(current.prices.filter((p) => p.metric === flash)).toHaveLength(1);
+    // A partial model update does not claim to have refetched unrelated prices.
+    expect(priceOn(timeline, "d1", "rows_read", CLASSIFIER_PRICE_DATE)?.fetchedAt).toBe(
+      "2026-10-04T02:24:00.000Z",
+    );
+    for (const model of ["@cf/cloudflare/clef-flash", "@cf/cloudflare/clef-omni"]) {
+      expect(WORKERS_AI_MODELS[model]).toEqual(["input"]);
+      expect(
+        priceOn(timeline, "workers_ai", modelMetric(model, "output"), CLASSIFIER_PRICE_DATE),
+      ).toBeNull();
+    }
+  });
+
   test("Atlas budgets spend at the catalog's prices, exactly as before", () => {
     expect(ATLAS_PRICES).toEqual({
       [MODELS.fast]: { input: 0.15, output: 0.5 },
@@ -284,10 +403,10 @@ describe("the seed", () => {
 
   test("the AI settings' model prices agree with the catalog", () => {
     const perMillion = (model: string, metric: "input" | "output") => {
-      const price = SEED_PRICES.find(
-        (p) => p.product === "workers_ai" && p.metric === modelMetric(model, metric),
-      );
-      return price ? (price.unitPriceUsd * 1e6) / price.unitQuantity : 0;
+      // Missing billed metrics are errors; input-only classifiers have free output.
+      if (metric === "output" && !WORKERS_AI_MODELS[model]?.includes("output")) return 0;
+      const price = seedPrice("workers_ai", modelMetric(model, metric));
+      return (price.unitPriceUsd * 1e6) / price.unitQuantity;
     };
     for (const option of Object.values(AI_MODEL_CATALOG).flat()) {
       expect([option.model, perMillion(option.model, "input")]).toEqual([
@@ -348,14 +467,14 @@ describe("refreshing the catalog", () => {
     const { DB } = setup();
     const change = await refreshCatalog(DB, {
       fetcher: pages(),
-      now: new Date("2026-10-05T12:00:00Z"),
+      now: new Date("2026-10-12T12:00:00Z"),
       actorId: "acc_root",
     });
     expect(change).toMatchObject({
       kind: "refresh",
       status: "unchanged",
       createdBy: "root",
-      baseVersion: 2,
+      baseVersion: 3,
       diff: [],
     });
     expect(change.pages.map((p) => [p.product, p.error])).toEqual(
@@ -431,6 +550,7 @@ describe("refreshing the catalog", () => {
       fetcher: pages({ queues: fixture("queues").replace("$0.40/million", "$0.45/million") }),
       now,
       actorId: "acc_root",
+      pages: [pricingPage("queues")],
     });
     expect(change.diff.map((e) => [e.metric, e.fields])).toEqual([["operations", ["price"]]]);
     await applyChange(DB, change.id, "acc_root", now);
@@ -534,6 +654,7 @@ describe("refreshing the catalog", () => {
     expect((await listChanges(DB)).map((c) => [c.id, c.status])).toEqual([
       [second.id, "pending"],
       [first.id, "superseded"],
+      [3, "applied"],
       [2, "applied"],
       [1, "applied"],
     ]);

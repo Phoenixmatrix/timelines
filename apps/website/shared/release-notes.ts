@@ -138,6 +138,27 @@ export interface ReleaseNoteEntry {
 
 export type ReleaseNotesState = "disabled" | "idle" | "generating" | "ready" | "failed";
 
+export type ReleaseHighlightsScope = "site" | "tracker" | "repo";
+export type ReleaseHighlightsState = "disabled" | "idle" | "generating" | "ready" | "failed";
+
+/** An authorized backlink to the exact detailed daily note, never a model-written URL. */
+export interface ReleaseHighlightsLink {
+  repo: { owner: string; name: string };
+  release: string;
+}
+
+/** GET highlights for a repository, tracker organization, or signed-in viewer. */
+export interface ReleaseHighlights {
+  scope: ReleaseHighlightsScope;
+  owner?: { slug: string; displayName: string };
+  repo?: { owner: string; name: string };
+  status: { state: ReleaseHighlightsState; generatedAt: string | null };
+  body: string | null;
+  model: string | null;
+  notes: ReleaseHighlightsLink[];
+  updatedAt: string | null;
+}
+
 export interface ReleaseSummary {
   /** A Git tag name, or `@day:YYYY-MM-DD` for a UTC commit-date digest. */
   name: string;

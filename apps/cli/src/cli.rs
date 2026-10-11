@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[command(
     name = "gm",
     version,
-    about = "gm: the Gitmatrix CLI. Change-based version control for agents and people.",
+    about = "gm: the Timelines CLI. Change-based version control for agents and people.",
     long_about = None,
     disable_help_subcommand = true,
 )]
@@ -98,14 +98,14 @@ pub enum Command {
     Worktree(WorktreeCommand),
     /// Start using gm in the current git repository
     Init,
-    /// Clone a Gitmatrix repository and set it up for gm
+    /// Clone a Timelines repository and set it up for gm
     Clone(CloneArgs),
-    /// Download new commits from Gitmatrix without changing your changes
+    /// Download new commits from Timelines without changing your changes
     Fetch,
     /// Fetch, then rebase your changes onto the new trunk
     #[command(visible_alias = "pull")]
     Sync,
-    /// Land changes on trunk (or a bookmark) on Gitmatrix. There are no pull requests.
+    /// Land changes on trunk (or a bookmark) on Timelines. There are no pull requests.
     Push(PushArgs),
     /// Submit, inspect and monitor asynchronous main merge admissions
     #[command(subcommand)]
@@ -128,7 +128,7 @@ pub enum Command {
         /// The harness: claude-code, codex or pi (Oh My Pi).
         harness: String,
     },
-    /// Sign in to a Gitmatrix server
+    /// Sign in to a Timelines server
     #[command(subcommand)]
     Auth(AuthCommand),
     /// Account-wide settings for a person or organization
@@ -137,7 +137,7 @@ pub enum Command {
     /// Data retention: policies per category, clean up now (with --dry-run previews) and run history
     #[command(subcommand)]
     Retention(crate::commands::retention::RetentionCommand),
-    /// Manage repositories on the Gitmatrix server
+    /// Manage repositories on the Timelines server
     #[command(subcommand)]
     Repo(RepoCommand),
     /// Syntax-level changes from the server's repository history
@@ -160,7 +160,7 @@ pub enum Command {
     /// Agents: identities that work on their own, accountable to you
     #[command(subcommand)]
     Agent(AgentCommand),
-    /// Ask the Gitmatrix assistant about code, issues, CI and packages (read-only unless --write)
+    /// Ask the Timelines assistant about code, issues, CI and packages (read-only unless --write)
     Ask(AskArgs),
     /// Your conversations with the assistant, from the web and gm ask
     #[command(subcommand)]
@@ -168,7 +168,7 @@ pub enum Command {
     /// Packages: npm, Docker, PyPI, Cargo… versions, provenance and housekeeping
     #[command(subcommand, visible_alias = "packages")]
     Pkg(PkgCommand),
-    /// Call the Gitmatrix JSON API directly
+    /// Call the Timelines JSON API directly
     Api(ApiArgs),
     /// Discover commands: search, workflow guide, full manifest
     #[command(subcommand)]
@@ -892,7 +892,7 @@ pub enum AgentCommand {
         #[arg(long = "deny-skill")]
         deny_skills: Vec<String>,
     },
-    /// Install the Claude Code mod: a card above the prompt with the gitmatrix issue the session works on, toggled by ctrl+x g or /gm-work. Rerun to update.
+    /// Install the Claude Code mod: a card above the prompt with the Timelines issue the session works on, toggled by ctrl+x g or /gm-work. Rerun to update.
     Mod {
         /// The chord that toggles the card (default: the one already bound, else ctrl+x g)
         #[arg(long, value_name = "CHORD", conflicts_with = "remove")]

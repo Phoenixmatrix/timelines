@@ -6,8 +6,9 @@ import type { Attribution } from "../../../shared/tracker.ts";
 import { Monogram } from "../../components/Monogram.tsx";
 
 function described(who: Attribution): string {
+  if (who.kind === "unknown") return `${who.name} · Unknown identity`;
   if (who.kind === "agent") {
-    return `${who.name} · Agent${who.person ? ` · Accountable: ${who.person.displayName}` : ""}`;
+    return `${who.name} · Agent · Accountable: ${who.person?.displayName ?? "Unknown"}`;
   }
   if (!who.person || who.kind === "person") return who.name;
   return `${who.person.displayName} · Session ${who.name}`;
@@ -38,7 +39,9 @@ export function Actor({
   const primary = who.kind === "session" ? person : who.name;
   const secondary = who.kind === "session" ? who.name : null;
   const profile =
-    link && who.kind !== "agent" && who.person ? `/${encodeURIComponent(who.person.slug)}` : null;
+    link && (who.kind === "person" || who.kind === "session") && who.person
+      ? `/${encodeURIComponent(who.person.slug)}`
+      : null;
   const body = (
     <>
       <Monogram name={person} size="xs" src={who.person?.avatarUrl} />

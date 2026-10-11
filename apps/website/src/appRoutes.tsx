@@ -10,6 +10,7 @@ import { scopeOf, timelineScopeMiddleware } from "./lib/timelineScope.ts";
 import { Account, accountLoader } from "./routes/Account.tsx";
 import { ErrorPage } from "./routes/ErrorPage.tsx";
 import { Home, homeLoader } from "./routes/Home.tsx";
+import { Highlights, highlightsLoader } from "./routes/Highlights.tsx";
 import { NewRepo, newRepoAction, newRepoLoader } from "./routes/NewRepo.tsx";
 import { Blob, blobLoader } from "./routes/repo/Blob.tsx";
 import { ciAction, ciLoader, CiRun, CiRuns, ciRunLoader } from "./routes/repo/Ci.tsx";
@@ -122,6 +123,7 @@ export const routes: RouteObject[] = withPageTitles([
           { path: "tracker", loader: trackerIndexLoader, Component: TrackerIndex },
           { path: "timelines", loader: timelinesIndexLoader, Component: TrackerIndex },
           { path: "release-notes", loader: releaseNotesIndexLoader, Component: TrackerIndex },
+          { path: "highlights", loader: highlightsLoader, Component: Highlights },
           { path: "packages", loader: allPackagesLoader, Component: AllPackages },
           { path: "needs-you", loader: needsYouLoader, Component: NeedsYou },
           // Whatever a ref names (CORE-22): redirects, or a chooser when it's ambiguous.
@@ -130,6 +132,11 @@ export const routes: RouteObject[] = withPageTitles([
             path: "tracker/:owner/releases",
             loader: trackerReleasesLoader,
             Component: TrackerReleases,
+          },
+          {
+            path: "tracker/:owner/highlights",
+            loader: highlightsLoader,
+            Component: Highlights,
           },
           {
             path: "tracker/:owner/timelines",
@@ -263,6 +270,7 @@ export const routes: RouteObject[] = withPageTitles([
                 { path: "changes", Component: SemanticChanges },
                 { path: "wiki/*", loader: wikiLoader, Component: Wiki },
                 { path: "releases/*", loader: releasesLoader, Component: Releases },
+                { path: "releases/highlights", loader: highlightsLoader, Component: Highlights },
                 // Knowledge is the Semantic Code Atlas (CORE-174): bounded regions, never the whole graph.
                 {
                   path: "knowledge",

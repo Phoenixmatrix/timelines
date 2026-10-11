@@ -193,7 +193,7 @@ const actions: CommandSource = ({ viewer, query }) => {
           {
             id: "ask",
             group: "actions" as const,
-            title: `Ask Gitmatrix “${prompt}”`,
+            title: `Ask Timelines “${prompt}”`,
             hint: "Sends it in a new conversation",
             always: true,
             run: {

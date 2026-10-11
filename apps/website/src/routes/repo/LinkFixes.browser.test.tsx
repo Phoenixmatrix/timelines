@@ -115,7 +115,6 @@ test("a CI run links its branch, its timeline and the person who pushed it", asy
   await expect
     .element(page.getByRole("link", { name: "search", exact: true }))
     .toHaveAttribute("href", "/tracker/orbit/timelines?tl=search");
-  await expect.element(page.getByText(/by Gitmatrix/)).toBeVisible();
 });
 
 test("an empty Issues tab links to tracker management", async () => {

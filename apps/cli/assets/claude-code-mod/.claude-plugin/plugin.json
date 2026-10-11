@@ -1,7 +1,7 @@
 {
   "name": "gitmatrix-work",
   "version": "0.1.0",
-  "description": "A card above the prompt with the gitmatrix issue this session works on; installed by `gm agent mod`",
-  "author": { "name": "Gitmatrix" },
+  "description": "A card above the prompt with the Timelines issue this session works on; installed by `gm agent mod`",
+  "author": { "name": "Timelines" },
   "types": "./types/index.d.ts"
 }

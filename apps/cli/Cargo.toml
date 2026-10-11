@@ -1,6 +1,6 @@
 [package]
 name = "gitmatrix-cli"
-description = "gm: the Gitmatrix CLI, built for agents and a change-based workflow"
+description = "gm: the Timelines CLI, built for agents and a change-based workflow"
 version = "0.1.0"
 edition = "2024"
 

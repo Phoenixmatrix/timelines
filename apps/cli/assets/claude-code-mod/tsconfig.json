@@ -1,4 +1,5 @@
 {
   "extends": "./.claude-plugin/types/tsconfig.json",
-  "include": ["hooks", "types"]
+  "include": [".claude-plugin/types", "hooks", "types"],
+  "exclude": ["hooks/omp.ts"]
 }
