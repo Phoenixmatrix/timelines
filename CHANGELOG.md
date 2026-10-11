@@ -31,6 +31,12 @@
   credentials do not replace the stored push credential. Provider redirects
   are rejected using Workers-supported manual redirect handling, without
   forwarding credentials.
+- The production cutover preserves existing CLI credentials, local tracker
+  replicas and issue leases while moving their server namespaces and Git
+  remotes. Browser sessions require sign-in at the new hostname.
+- Assistant write instructions ground approval state in the specific call's
+  recorded result, not item names or inferred history. New explicit requests
+  need their own approval cards; declined calls are not retried automatically.
 
 ### CORE-150: bounded release-highlights proof cleanup and scheduling
 

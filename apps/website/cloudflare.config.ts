@@ -108,8 +108,7 @@ export default defineConfig(({ mode, isPreview }) => {
       ...(dev || preview
         ? {}
         : {
-            // Temporary cutover overlap: in-flight CI still reports to the old origin.
-            domains: [PRODUCTION_HOST, "gitmatrix.fward.dev"],
+            domains: [PRODUCTION_HOST],
             workersDev: false,
             previewUrls: true,
           }),
