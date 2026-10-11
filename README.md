@@ -273,7 +273,7 @@ authentication, or an unacknowledged request **fails closed**: there is no offli
 restore the owning identity's access, and retry cleanup/setup; do not switch to
 another authority or remove journals to bypass a full or unreachable quota.
 
-On rollout, local setup adopts non-deleted legacy application journals from this
+On rollout, local setup adopts non-retired legacy application journals from this
 user's local inventory before admitting another environment. Adoption itself needs
 capacity and access to the authority. Legacy Cloudflare environments or hosted
 children **without quota metadata must instead be destroyed on their owning host
@@ -283,10 +283,13 @@ installation usage as complete: no machine can discover another offline
 machine's legacy inventory.
 
 Failed provisioning, interrupted cleanup and expired reservations conservatively
-retain installation capacity until owned resources are actually removed and the
-authority acknowledges release. An offline host or elapsed TTL alone never frees
-a reservation. See [cleanup and cost bounds](#cleanup-and-cost-bounds), including
-the distinction between local orphan retirement and installation capacity.
+retain installation capacity until cleanup succeeds and the authority acknowledges
+release. A stopped application whose only remaining resource is an Artifacts
+namespace that refuses deletion while listing no repositories is retired as
+**orphaned**: it releases its development slot but retains its ownership journal
+and cleanup retries. Other cleanup failures still hold capacity. An offline host
+or elapsed TTL alone never frees a reservation. See
+[cleanup and cost bounds](#cleanup-and-cost-bounds).
 
 ### Local create, run and inspect
 
@@ -900,9 +903,11 @@ vp run agent maintenance status
   retried; unrelated resources are never discovered and deleted by prefix alone.
   An Artifacts namespace Cloudflare refuses to delete ("Namespace is not empty")
   while listing no repositories is **orphaned**: `status` reports it with the
-  reason, it no longer counts toward the **local** cap, and every cleanup retries
-  it; its journal and **installation reservation remain** until the namespace is
-  actually deleted. A failed quota release also remains journaled for retry.
+  reason. Once the app is stopped and all other cleanup succeeds, an acknowledged
+  quota release frees both local and installation capacity. Its namespace may
+  still incur storage charges; the ownership journal remains and every cleanup
+  retries deletion. Setup never readopts retired orphans. A failed quota release
+  remains journaled and continues holding installation capacity until acknowledged.
   AI environments created before Gateway ownership was introduced must be destroyed
   and recreated with `setup --ai`; their legacy journals remain valid for cleanup.
 - Foreground apps stop at expiry. Process-group shutdown is PID-start-time fenced;
