@@ -1471,8 +1471,10 @@ summary or, for a selected issue or span, the inspector with linked work. The
 address holds `from`, `to`, `at` (the playhead), `rs`/`re` (a selected range),
 `span`, `group=team` and `layout=list`. It reads pages of `/chronicle` for a
 range half a window wider on each side, at most 10 pages, and never the
-change feed. Phones get the List layout, the accessible equivalent of the
-canvas. Design: root `DESIGN.md`, "Chronicle (time axis)".
+change feed. The layout toggle is **Chart / List**: Chart names the visual
+time-axis layout without conflicting with the separate Timelines feature.
+Phones get the List layout, the accessible equivalent of the canvas.
+Design: root `DESIGN.md`, "Chronicle (time axis)".
 The List scrubber preserves in-flight keyboard positions until the address
 changes; snapshot refreshes alone do not reset them. Committed positions
 remain navigable with Back and Forward.

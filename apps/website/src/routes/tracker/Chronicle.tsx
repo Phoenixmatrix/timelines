@@ -259,7 +259,7 @@ export function Chronicle({
         <div className="mk-segmented max-md:hidden" role="radiogroup" aria-label="Show as">
           {(
             [
-              [false, "Timeline"],
+              [false, "Chart"],
               [true, "List"],
             ] as const
           ).map(([value, label]) => (

@@ -600,7 +600,7 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
               id: env.id,
               namespace: env.id,
               message:
-                "Cloudflare refuses to delete this Artifacts namespace although it lists no repositories; it no longer counts toward the environment limit and cleanup retries it.",
+                "Cloudflare refuses to delete this Artifacts namespace although it lists no repositories; its ownership journal is retained for cleanup retries.",
             }),
           );
           continue;
@@ -642,9 +642,9 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
     }
   }
   await rm(join(registry, "workspaces", env.id), { recursive: true, force: true });
-  // Empty namespace orphans stay counted globally until actual deletion. A
-  // transient release failure also retains a retryable deleting journal.
-  if (env.resources.artifacts !== "orphaned") await releaseQuota(env, persist);
+  // Retire compute capacity only after all other cleanup has succeeded. An
+  // unlistable Artifacts orphan remains journaled and retried, not called deleted.
+  await releaseQuota(env, persist);
   env.status = env.resources.artifacts === "orphaned" ? "orphaned" : "deleted";
   await persist(env);
   console.log(JSON.stringify({ event: `environment.${env.status}`, id: env.id }));
@@ -729,7 +729,7 @@ export async function createEnvironment(
     // Adopt legacy journals before admitting anything new. Other hosts must do
     // the same during rollout; a local journal cannot discover offline hosts.
     for (const current of existing)
-      if (current.status !== "deleted") await reserveQuota(current, "local", persist);
+      if (!retired(current)) await reserveQuota(current, "local", persist);
     if (!ephemeral) {
       const current = existing.find(
         (e) => e.root === root && e.dir === join(root, ".gitmatrix-agent") && !retired(e),

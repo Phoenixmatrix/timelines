@@ -686,7 +686,7 @@ await test("legacy AI journals require recreation for use but remain valid for c
   }
 });
 
-await test("empty namespace orphans free local slots but retain global reservations until deleted", async () => {
+await test("retired namespace orphans release quota without losing cleanup or being readopted", async () => {
   const home = await mkdtemp(join(tmpdir(), "gitmatrix-orphan-"));
   try {
     const directory = join(home, ".local/state/gitmatrix-agent/environments");
@@ -704,6 +704,7 @@ await test("empty namespace orphans free local slots but retain global reservati
     await quotaFixture(home);
     // Every slot taken by an expired environment whose namespace won't go.
     const journals: string[] = [];
+    const reservations: Record<string, unknown> = {};
     for (let i = 0; i < 4; i++) {
       const env = owned(join(home, `worktree-${i}`));
       env.id = `gma-mga0000${i}-${String(i).repeat(12)}`;
@@ -711,11 +712,19 @@ await test("empty namespace orphans free local slots but retain global reservati
       env.created -= 172_800_000;
       env.expires -= 172_800_000;
       env.resources = { artifacts: "created", vectors: "deleted", search: "deleted" };
+      env.quota = { authority: "https://quota.example", state: "reserved" };
+      reservations[env.id] = {
+        id: env.id,
+        account: env.account,
+        backend: "local",
+        expires: env.expires,
+      };
       await mkdir(env.dir, { recursive: true });
       await writeFile(join(env.dir, "environment.json"), JSON.stringify(env));
       journals.push(join(directory, `${env.id}.json`));
       await writeFile(journals[i]!, JSON.stringify(env));
     }
+    await writeFile(join(home, "quota.json"), JSON.stringify(reservations));
     const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
     const run = (code: string) =>
       command(process.execPath, ["--input-type=module", "-e", code], {
@@ -732,16 +741,23 @@ await test("empty namespace orphans free local slots but retain global reservati
       assert.equal(env.resources.artifacts, "orphaned");
       assert.equal(env.orphan?.namespace, env.id);
       assert.match(env.orphan?.reason ?? "", /not empty/);
+      assert.equal(env.quota?.state, "released");
     }
-    // Legacy orphans are adopted before any new allocation; the global cap is
-    // still full even though none holds a local compute slot.
-    await assert.rejects(
-      run(
-        `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(join(home, "worktree-0"))});`,
-      ),
+    assert.deepEqual(JSON.parse(await readFile(join(home, "quota.json"), "utf8")), {});
+    // New admission must not reclaim capacity for retired journals, including
+    // legacy orphans that never had an installation reservation.
+    const legacy = JSON.parse(await readFile(journals[0]!, "utf8")) as Environment;
+    delete legacy.quota;
+    await writeFile(journals[0]!, JSON.stringify(legacy));
+    await run(
+      `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(join(home, "worktree-0"))});`,
     );
-    const reservations = JSON.parse(await readFile(join(home, "quota.json"), "utf8"));
-    assert.equal(Object.keys(reservations).length, 4);
+    const active = JSON.parse(
+      await readFile(join(home, "worktree-0/.gitmatrix-agent/environment.json"), "utf8"),
+    ) as Environment;
+    assert.deepEqual(Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))), [
+      active.id,
+    ]);
     // Once Cloudflare lets go, the next sweep finishes the deletion; journals stay.
     await rm(refuse);
     await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
@@ -751,13 +767,9 @@ await test("empty namespace orphans free local slots but retain global reservati
       assert.equal(done.resources.artifacts, "deleted");
       assert.equal(done.orphan, undefined);
     }
-    assert.equal(
-      Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))).length,
-      0,
-    );
-    await run(
-      `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(join(home, "worktree-0"))});`,
-    );
+    assert.deepEqual(Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))), [
+      active.id,
+    ]);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
