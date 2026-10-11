@@ -298,6 +298,10 @@ export interface Database {
     account_id: string;
     feature: string;
     model: string;
+    /** Who it was for, when the work knew (CORE-222): the person, their agent, the timeline; '' otherwise. */
+    actor_id: Generated<string>;
+    agent_id: Generated<string>;
+    timeline: Generated<string>;
     calls: Generated<number>;
     input_tokens: Generated<number>;
     output_tokens: Generated<number>;

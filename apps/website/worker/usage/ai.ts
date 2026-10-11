@@ -1,8 +1,10 @@
 // Workers AI calls and tokens per account (CORE-207). Work that runs models
 // for an account declares it once, at its entry point, with `aiWork`; every
 // model call underneath (worker/knowledge/models.ts, the assistant, avatars)
-// then records itself into ai_usage, per UTC day, account, feature and model.
-// A call outside any declared work is recorded under account '' (site).
+// then records itself into ai_usage, per UTC day, account, feature and model,
+// and, when the work knows them, the person, agent and timeline it was for
+// (CORE-222). A call outside any declared work is recorded under account ''
+// (site).
 // Recording never throws and never fails the call it describes.
 //
 // AsyncLocalStorage doesn't follow a Workflow's `step.do` callbacks: the
@@ -19,6 +21,15 @@ export interface AiWork {
   account?: string | null;
   /** The repository, when the account isn't known up front (its owner is looked up once). */
   repo?: string | null;
+  /**
+   * Who asked, when one person or agent did (CORE-222): the person (an agent's
+   * accountable person), the agent acting for them, and the timeline the work
+   * is for. Work that serves several people at once (a build batching pushes)
+   * leaves them unset and counts as not attributed.
+   */
+  actor?: string | null;
+  agent?: string | null;
+  timeline?: string | null;
   /**
    * Also told of every call, after it is recorded (a Knowledge build meters
    * itself, CORE-286). Never throws into the call it describes.
@@ -108,9 +119,10 @@ export async function recordAiCall(
     const total = Math.round(tokens.total ?? input + output);
     await d1
       .prepare(
-        `INSERT INTO ai_usage (day, account_id, feature, model, calls, input_tokens, output_tokens, total_tokens, failed_calls)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-         ON CONFLICT (day, account_id, feature, model) DO UPDATE SET
+        `INSERT INTO ai_usage (day, account_id, feature, model, calls, input_tokens, output_tokens, total_tokens, failed_calls,
+           actor_id, agent_id, timeline)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT (day, account_id, feature, model, actor_id, agent_id, timeline) DO UPDATE SET
            calls = calls + excluded.calls,
            input_tokens = input_tokens + excluded.input_tokens,
            output_tokens = output_tokens + excluded.output_tokens,
@@ -127,6 +139,9 @@ export async function recordAiCall(
         output,
         total,
         options.failed ? (options.calls ?? 1) : 0,
+        context?.actor ?? "",
+        context?.agent ?? "",
+        context?.timeline ?? "",
       )
       .run();
     const calls = options.calls ?? 1;

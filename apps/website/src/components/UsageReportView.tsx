@@ -4,7 +4,9 @@
 // measured, the catalog price used, the retention category that cleans it up).
 
 import type {
+  AttributedSpend,
   KnowledgeUpdateSpend,
+  UsageAttribution,
   UsageCategoryLink,
   UsageCost,
   UsageFigure,
@@ -321,6 +323,166 @@ function KnowledgeUpdates({ spend }: { spend: KnowledgeUpdateSpend }) {
   );
 }
 
+const plural = (n: number, one: string, many = `${one}s`) =>
+  `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+function Spender({ spend, ciOnly }: { spend: AttributedSpend; ciOnly?: boolean }) {
+  const what = [
+    spend.ciJobs > 0 &&
+      `${plural(spend.ciJobs, "CI job")} (${spend.ciMinutes.toLocaleString()} min)`,
+    spend.aiCalls > 0 && plural(spend.aiCalls, "AI call"),
+  ].filter(Boolean);
+  return (
+    <li className="flex min-h-11 flex-wrap items-center gap-x-3 border-t border-line-soft px-4 py-2 first:border-t-0">
+      <span className="min-w-0 flex-1 break-words">
+        <span>{spend.name}</span>
+        {spend.accountable && (
+          <>
+            {" "}
+            <span className="text-ink-muted">for {spend.accountable.name}</span>
+          </>
+        )}
+        {what.length > 0 && (
+          <span className="block text-body-sm text-ink-muted">{what.join(" · ")}</span>
+        )}
+      </span>
+      <span className="text-right tabular-nums">
+        <span className="block font-semibold">{usd(spend.totalUsd)}</span>
+        {!(ciOnly && spend.aiUsd === 0) && (
+          <span className="block text-body-sm text-ink-muted">
+            CI {usd(spend.ciUsd)} · AI {usd(spend.aiUsd)}
+          </span>
+        )}
+      </span>
+    </li>
+  );
+}
+
+function Spenders({
+  id,
+  title,
+  list,
+  empty,
+  ciOnly,
+  children,
+}: {
+  id: string;
+  title: string;
+  list: AttributedSpend[];
+  empty: string;
+  /** Only CI is attributed to these so far. */
+  ciOnly?: boolean;
+  children?: React.ReactNode;
+}) {
+  return (
+    <div aria-labelledby={id} role="group">
+      <h3 id={id} className="m-0 mb-2 text-body font-semibold">
+        {title}
+      </h3>
+      {children}
+      {list.length === 0 ? (
+        <div className="mk-empty">{empty}</div>
+      ) : (
+        <ul className="m-0 list-none overflow-hidden rounded-pane bg-pane p-0">
+          {list.map((spend) => (
+            <Spender key={spend.id} spend={spend} ciOnly={ciOnly} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function Attribution({
+  attribution: a,
+  daysMeasured,
+}: {
+  attribution: UsageAttribution;
+  /** Days the report's own activity figures measured (it extrapolates fewer to 30). */
+  daysMeasured: number;
+}) {
+  const share = a.activityUsd > 0 ? Math.round((a.attributedUsd / a.activityUsd) * 100) : null;
+  return (
+    <section
+      aria-labelledby="usage-attribution"
+      data-usage-attribution
+      className="flex flex-col gap-5"
+    >
+      <div className="flex flex-col gap-1">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h2 id="usage-attribution" className="m-0 text-title">
+            By person, agent and timeline
+          </h2>
+          <span className="text-body-sm text-ink-muted">
+            CI and AI, {day(a.from)} – {day(a.to)}
+          </span>
+        </div>
+        <p className="m-0 text-body-sm" data-usage-attributed>
+          {share === null
+            ? "No CI or AI activity in this window."
+            : `People and agents account for ${usd(a.attributedUsd)} of the ${usd(a.activityUsd)} spent on CI and AI in this window (${share}%). The rest, and storage, belong to the account as a whole: see Not attributed.`}
+        </p>
+        {daysMeasured < 30 && (
+          <p className="m-0 text-body-sm text-ink-muted" data-usage-attribution-recorded>
+            The rest of this page extrapolates {daysMeasured} measured{" "}
+            {daysMeasured === 1 ? "day" : "days"} to 30; these are the costs actually recorded, so
+            they can be lower.
+          </p>
+        )}
+      </div>
+      <Spenders
+        id="usage-people"
+        title="People"
+        list={a.people}
+        empty="No CI or AI was started by a person in this window."
+      />
+      <Spenders
+        id="usage-agents"
+        title="Agents"
+        list={a.agents}
+        empty="No CI or AI was started by an agent in this window."
+      >
+        <p className="m-0 mb-2 text-body-sm text-ink-muted">
+          What an agent does counts here, not under the person it works for.
+        </p>
+      </Spenders>
+      <Spenders
+        id="usage-timelines"
+        title="Timelines"
+        list={a.timelines}
+        empty="No CI ran for a timeline in this window."
+        ciOnly
+      >
+        <p className="m-0 mb-2 text-body-sm text-ink-muted">
+          CI that ran for each timeline: its pushes, previews and landing. The same costs also count
+          under whoever started each run. AI isn't tied to timelines yet.
+        </p>
+      </Spenders>
+      <div aria-labelledby="usage-unattributed" role="group">
+        <h3 id="usage-unattributed" className="m-0 mb-2 text-body font-semibold">
+          Not attributed
+        </h3>
+        <ul className="m-0 list-none overflow-hidden rounded-pane bg-pane p-0">
+          {a.unattributed.map((u) => (
+            <li
+              key={u.id}
+              className="flex min-h-11 flex-wrap items-center gap-x-3 border-t border-line-soft px-4 py-2 first:border-t-0"
+            >
+              <span className="min-w-0 flex-1 break-words">
+                <span>{u.label}</span>
+                <span className="block text-body-sm text-ink-muted">{u.reason}</span>
+              </span>
+              <span className="font-semibold tabular-nums">
+                {u.id === "storage" ? `${usd(u.costUsd)} a month` : usd(u.costUsd)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </section>
+  );
+}
+
 export function UsageReportView({
   report,
   csvHref,
@@ -397,6 +559,10 @@ export function UsageReportView({
             </ul>
           )}
         </section>
+      )}
+
+      {report.attribution && (
+        <Attribution attribution={report.attribution} daysMeasured={report.window.daysMeasured} />
       )}
 
       {report.knowledgeUpdates && <KnowledgeUpdates spend={report.knowledgeUpdates} />}

@@ -29,10 +29,12 @@ import {
   type UsageCost,
   type UsageFigure,
   type UsageLine,
+  type UsageAttribution,
   type UsageReport,
   type UsageTrendDay,
 } from "../../shared/usage.ts";
 import { category } from "../retention/categories.ts";
+import { attributionReport } from "./attribution.ts";
 import { db } from "../schema.ts";
 import { PRICING_PAGES } from "./pages.ts";
 import { catalogVersion, priceOn, priceTimeline } from "./prices.ts";
@@ -667,18 +669,43 @@ export async function accountUsageReport(
           .execute()
       ).map(asRow)
     : [];
+  const report = buildReport({
+    scope: "account",
+    account: { slug: account.slug, displayName: account.display_name },
+    rows,
+    asOf,
+    timeline,
+    version,
+    partial,
+  });
   return {
-    ...buildReport({
-      scope: "account",
-      account: { slug: account.slug, displayName: account.display_name },
-      rows,
-      asOf,
-      timeline,
-      version,
-      partial,
-    }),
+    ...report,
     knowledgeUpdates: await knowledgeUpdateSpend(d1, account.id),
+    attribution: await attributionFor(d1, account.id, report, timeline),
   };
+}
+
+/** The report's window costs by person, agent and timeline (CORE-222), priced like it. */
+async function attributionFor(
+  d1: D1Database,
+  account: string | null,
+  report: UsageReport,
+  timeline: readonly CatalogPrice[],
+): Promise<UsageAttribution | null> {
+  if (!report.asOf) return null;
+  // Attribution reads every job and call in the window: nothing to extrapolate.
+  const p = pricing(timeline, report.asOf, WINDOW_DAYS);
+  return attributionReport(d1, {
+    account,
+    from: report.window.from,
+    to: report.window.to,
+    asOf: report.asOf,
+    storageUsd: report.constructs
+      .flatMap((c) => c.lines)
+      .filter((l) => l.kind === "storage")
+      .reduce((sum, l) => sum + l.monthlyUsd, 0),
+    price: (rows) => priceLines(rows, account ? "account" : "site", p, report.window.from),
+  });
 }
 
 /**
@@ -764,18 +791,20 @@ export async function siteUsageReport(d1: D1Database): Promise<UsageReport> {
     .map((a) => ({ slug: a.slug, displayName: a.display_name, monthlyUsd: totals.get(a.id) ?? 0 }))
     .toSorted((a, b) => b.monthlyUsd - a.monthlyUsd || a.slug.localeCompare(b.slug))
     .slice(0, MAX_ACCOUNTS);
+  const report = buildReport({
+    scope: "site",
+    account: null,
+    rows,
+    asOf,
+    timeline,
+    version,
+    accounts,
+    partial,
+  });
   return {
-    ...buildReport({
-      scope: "site",
-      account: null,
-      rows,
-      asOf,
-      timeline,
-      version,
-      accounts,
-      partial,
-    }),
+    ...report,
     knowledgeUpdates: await knowledgeUpdateSpend(d1, null),
+    attribution: await attributionFor(d1, null, report, timeline),
   };
 }
 

@@ -343,6 +343,51 @@ export interface UsageReport {
   notes: string[];
   /** What Knowledge builds cost per update over the last 30 days (CORE-286). */
   knowledgeUpdates?: KnowledgeUpdateSpend | null;
+  /** The window's costs by person, agent and timeline, and what can't be split that way (CORE-222). */
+  attribution?: UsageAttribution | null;
+}
+
+/** What one person, agent or timeline caused over the window (CORE-222). */
+export interface AttributedSpend {
+  /** An account id, an agent id, or a timeline's slug. */
+  id: string;
+  name: string;
+  /** An agent's accountable person. */
+  accountable: { id: string; name: string } | null;
+  ciUsd: number;
+  aiUsd: number;
+  totalUsd: number;
+  ciJobs: number;
+  ciMinutes: number;
+  aiCalls: number;
+}
+
+/** A cost that belongs to no single person, agent or timeline, and why. */
+export interface UnattributedSpend {
+  id: "storage" | "ci-system" | "ai-builds" | "ai-background" | "ai-unknown";
+  label: string;
+  costUsd: number;
+  reason: string;
+}
+
+/**
+ * The report window's CI and AI costs split by who caused them (CORE-222),
+ * priced like the report. Work an agent did is the agent's (its accountable
+ * person is named beside it), not added to the person's. Timelines are a
+ * second view of the same costs.
+ */
+export interface UsageAttribution {
+  /** Activity days covered, as the report's window. */
+  from: string;
+  to: string;
+  people: AttributedSpend[];
+  agents: AttributedSpend[];
+  timelines: AttributedSpend[];
+  /** CI and AI over the window, and the part people and agents account for. */
+  activityUsd: number;
+  attributedUsd: number;
+  /** What none of them accounts for: storage, and CI and AI no one asked for. */
+  unattributed: UnattributedSpend[];
 }
 
 /**

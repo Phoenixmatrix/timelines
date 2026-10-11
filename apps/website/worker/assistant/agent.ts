@@ -73,6 +73,8 @@ const STATUS_DEADLINE_MS = 4000;
 export interface CliTurn {
   write: boolean;
   repo?: string;
+  /** The agent that asked, when a coding agent ran `gm ask` (CORE-222). */
+  agent?: string;
   emit: (event: AskEvent) => Promise<void>;
 }
 
@@ -148,9 +150,14 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
   /** When the latest turn started (ms), for purgeIfIdle. */
   #turnAt = 0;
 
-  /** Whose model calls these are (CORE-207 metering). */
+  /** Whose model calls these are (CORE-207 metering): the person, or their agent asking (CORE-222). */
   #aiWork(): AiWork {
-    return { feature: "assistant", account: this.owner.userId };
+    return {
+      feature: "assistant",
+      account: this.owner.userId,
+      actor: this.owner.userId,
+      agent: this.cli?.agent ?? null,
+    };
   }
 
   /** "<userId>:<chatId>", fixed by api/assistant.ts. */
@@ -474,7 +481,10 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
    * One turn from `gm ask`, streamed back as newline-delimited AskEvents. It
    * lands in the same transcript, so the chat can be continued on the web.
    */
-  async ask(question: string, options: { write: boolean; repo?: string; url: string }) {
+  async ask(
+    question: string,
+    options: { write: boolean; repo?: string; url: string; agent?: string },
+  ) {
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
@@ -486,7 +496,7 @@ export class Assistant extends AIChatAgent<Env> implements Purgeable {
     this.ctx.waitUntil(
       (async () => {
         await emit({ type: "chat", chatId: this.owner.chatId, url: options.url });
-        this.cli = { write: options.write, repo: options.repo, emit };
+        this.cli = { write: options.write, repo: options.repo, agent: options.agent, emit };
         try {
           const result = await this.saveMessages((messages) => [
             ...messages,

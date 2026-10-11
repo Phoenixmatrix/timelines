@@ -124,4 +124,35 @@ describe("AI metering", () => {
     });
     expect(tokensOf(null)).toEqual({});
   });
+
+  test("who asked is recorded beside the account, each on its own row (CORE-222)", async () => {
+    const work = { feature: "search", account: "acc_o" };
+    await recordAiCall(env, "@cf/e", { total: 10 }, { work: { ...work, actor: "acc_ann" } });
+    await recordAiCall(env, "@cf/e", { total: 20 }, { work: { ...work, actor: "acc_ann" } });
+    await recordAiCall(
+      env,
+      "@cf/e",
+      { total: 5 },
+      { work: { ...work, actor: "acc_ann", agent: "agt_bot", timeline: "search-v2" } },
+    );
+    // Work that serves no one in particular records as before.
+    await recordAiCall(env, "@cf/e", { total: 7 }, { work });
+    expect(
+      sqlite
+        .prepare(
+          "SELECT actor_id, agent_id, timeline, calls, total_tokens FROM ai_usage ORDER BY total_tokens",
+        )
+        .all(),
+    ).toEqual([
+      {
+        actor_id: "acc_ann",
+        agent_id: "agt_bot",
+        timeline: "search-v2",
+        calls: 1,
+        total_tokens: 5,
+      },
+      { actor_id: "", agent_id: "", timeline: "", calls: 1, total_tokens: 7 },
+      { actor_id: "acc_ann", agent_id: "", timeline: "", calls: 2, total_tokens: 30 },
+    ]);
+  });
 });

@@ -4075,7 +4075,8 @@ with the price catalog (CORE-208, `cloudflare_prices`). The report
   the catalog version in effect that day: bytes ÷ 10^9 → GB-months (D1,
   Durable Objects SQLite, R2 Standard, Artifacts, AI Search), stored vector
   dimensions, model input/output tokens (a model that reports only totals is
-  priced as input and marked estimated). Included allowances are account-wide
+  priced as input and marked estimated; a chat model's total, which counts
+  its input and output too, isn't priced again). Included allowances are account-wide
   on the Cloudflare account, so nothing is subtracted (gross list price). A
   price whose billing hasn't started (Artifacts before 2026-10-14, AI Search
   before 2026-11-01) is shown with its start date and left out of totals.
@@ -4114,6 +4115,26 @@ with the price catalog (CORE-208, `cloudflare_prices`). The report
   account (at most 200, highest first).
 - The trend is each of the last 30 days: that day's storage at a thirtieth of
   its monthly cost plus that day's activity.
+- **By person, agent and timeline** (CORE-222, `worker/usage/attribution.ts`):
+  the window's CI and Workers AI, priced like the rest of the report from
+  what was recorded (not extrapolated; the page says so when the report is).
+  CI goes by each sandbox job's run (`ci_runs.actor_id`, `agent_id`; its
+  timeline from a preview's `timeline_slug`, its work source, or the landing
+  it runs for, keyed by owner and slug). Workers AI goes by
+  `ai_usage.actor_id` and `agent_id`, which `aiWork` records when the work
+  knows who asked (the assistant, avatars, knowledge search; `gm ask` from an
+  agent is the agent's). `ai_usage.timeline` exists for work that knows its
+  timeline, but nothing records one yet, so timelines show CI only. An agent's
+  work is listed under the agent with its accountable person, not added to
+  the person's; timelines are a second view of the same costs. In an
+  account's report, people and agents from outside the account (someone
+  searching a public repository, a site administrator) are one "outside this
+  account" row; the site's report names everyone. What no one caused is
+  listed with its reason: storage, CI Gitmatrix started itself, Knowledge and
+  wiki builds (they batch several people's pushes), release notes and
+  merge-queue classification, and AI recorded before attribution or outside
+  anyone's request. Attribution is daily: monthly rollups keep account,
+  feature and model only, so older months show no breakdown.
 
 | Route                           | Contract                                                                                                                      |
 | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |

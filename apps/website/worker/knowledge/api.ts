@@ -433,7 +433,16 @@ knowledge.get("/search", async (c) => {
   const kinds = c.req.query("kinds")?.split(",").filter(Boolean);
 
   const entities = (async () => {
-    const [vector] = await aiWork({ feature: "search", repo: row.id }, () => embed(c.env, [query]));
+    const asker = c.get("actor");
+    const [vector] = await aiWork(
+      {
+        feature: "search",
+        repo: row.id,
+        actor: asker?.id ?? null,
+        agent: asker?.agent?.id ?? null,
+      },
+      () => embed(c.env, [query]),
+    );
     const matches = await c.env.VECTORS.query(vector as number[], {
       topK: 12,
       filter: { repo: row.id, ...(kinds?.length ? { kind: { $in: kinds } } : {}) },

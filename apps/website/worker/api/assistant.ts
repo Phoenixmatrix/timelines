@@ -159,6 +159,7 @@ assistant.post("/ask", async (c) => {
     write: body.write === true,
     repo: body.repo,
     url: `${origin}/?chat=${chatId}`,
+    agent: actor.agent?.id,
   });
   return new Response(stream, {
     headers: { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" },
