@@ -12,6 +12,7 @@ import { fakeRemotes } from "../testing/remote.ts";
 import { aiWork } from "../usage/ai.ts";
 import { buildStopped } from "./build.ts";
 import { KnowledgeCoordinator } from "./coordinator.ts";
+import { parseModelFailureDiagnostic } from "./model-failure.ts";
 import { chatJson, chatText, decide, MODELS } from "./models.ts";
 import { paidSteps, timeoutMs } from "./paid-steps.ts";
 import { paidWork, PaidWorkStopped } from "./paid-work.ts";
@@ -37,6 +38,7 @@ vi.mock("cloudflare:workflows", () => ({
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 const QUESTION = { same: { type: "noul" as const, instructions: "Same?" } };
@@ -160,9 +162,19 @@ describe("attribution across Workflow steps", () => {
     // The gateway log of each call names the same account and feature, so the
     // two records reconcile; a deadline-bearing signal goes with every call.
     expect(calls.map((c) => c.options.gateway?.metadata)).toEqual([
-      { component: "knowledge", account: "", feature: "unattributed" },
-      { component: "knowledge", account: "acc_o", feature: "knowledge" },
-      { component: "knowledge", account: "acc_o", feature: "knowledge" },
+      { component: "knowledge", account: "", feature: "unattributed", attempt: expect.any(String) },
+      {
+        component: "knowledge",
+        account: "acc_o",
+        feature: "knowledge",
+        attempt: expect.any(String),
+      },
+      {
+        component: "knowledge",
+        account: "acc_o",
+        feature: "knowledge",
+        attempt: expect.any(String),
+      },
     ]);
     expect(calls.every((c) => c.options.signal instanceof AbortSignal)).toBe(true);
     expect(calls.every((c) => c.options.extraHeaders)).toBe(true);
@@ -215,6 +227,112 @@ describe("metered attempts", () => {
   });
 });
 
+describe("safe failed-attempt evidence", () => {
+  test("a successful retry retains one sanitized event correlated to the failed gateway attempt", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const secret = "https://private.example/token?key=credential\nprivate prompt";
+    const error = new Error(`3021: Rate limit reached ${secret}`, { cause: { secret } });
+    error.stack = secret;
+    let attempts = 0;
+    const { sqlite, env, calls } = setup(async () => {
+      if (++attempts === 1) throw error;
+      return ANSWER;
+    });
+    try {
+      const result = aiWork({ feature: "knowledge", account: "acc_o" }, () =>
+        decide(env, {}, QUESTION),
+      );
+      await vi.runAllTimersAsync();
+      await result;
+      expect(warn).toHaveBeenCalledTimes(1);
+      const line = warn.mock.calls[0]![0] as string;
+      expect(line.startsWith('{"event":"ai.model.failed",')).toBe(true);
+      expect(line).not.toContain("private");
+      expect(line).not.toContain("credential");
+      expect(line).not.toContain("\\n");
+      const diagnostic = parseModelFailureDiagnostic(JSON.parse(line));
+      expect(diagnostic).toMatchObject({
+        provider: "workers-ai",
+        model: MODELS.classify,
+        account: "acc_o",
+        feature: "knowledge",
+        dispatched: true,
+        kind: "rate_limit",
+        code: 3021,
+        name: "Error",
+        attempt: calls[0]!.options.gateway!.metadata!.attempt,
+      });
+      expect(calls[1]!.options.gateway!.metadata!.attempt).not.toBe(diagnostic!.attempt);
+      expect(usage(sqlite)).toEqual([
+        expect.objectContaining({ calls: 1, failed_calls: 1, input_tokens: 40 }),
+      ]);
+    } finally {
+      sqlite.close();
+    }
+  });
+
+  test.each(["deadline", "expired", "stopped"] as const)(
+    "distinguishes %s without relying on provider abort text",
+    async (kind) => {
+      vi.useFakeTimers();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      let sent!: () => void;
+      const dispatched = new Promise<void>((resolve) => {
+        sent = resolve;
+      });
+      const { sqlite, env } = setup((call) => {
+        sent();
+        return hangs(call);
+      });
+      try {
+        const outcome = aiWork({ feature: "knowledge", account: "acc_o" }, () =>
+          paidWork({}, async (guard) => {
+            const call = chatText(env, "reason", "s", "u");
+            const caught = call.catch((error: unknown) => error);
+            await dispatched;
+            if (kind !== "deadline") guard.stop(kind, "private cancellation reason");
+            return caught;
+          }),
+        );
+        await vi.runAllTimersAsync();
+        const error = await outcome;
+        if (kind === "deadline") expect(String(error)).toMatch(/timed out/);
+        else expect(error).toBeInstanceOf(PaidWorkStopped);
+        expect(warn).toHaveBeenCalledTimes(1);
+        const line = warn.mock.calls[0]![0] as string;
+        expect(parseModelFailureDiagnostic(JSON.parse(line))).toMatchObject({
+          kind:
+            kind === "deadline" ? "deadline" : kind === "expired" ? "work_expired" : "work_stopped",
+          dispatched: true,
+        });
+        expect(line).not.toContain("private");
+        expect(usage(sqlite)).toEqual([expect.objectContaining({ calls: 0, failed_calls: 1 })]);
+      } finally {
+        sqlite.close();
+      }
+    },
+  );
+
+  test("diagnostic logging failure cannot mask the original rejection or skip metering", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {
+      throw new Error("logger unavailable");
+    });
+    const original = new Error("provider rejected secret content");
+    const { sqlite, env } = setup(async () => {
+      throw original;
+    });
+    try {
+      await expect(
+        aiWork({ feature: "knowledge", account: "acc_o" }, () => chatText(env, "fast", "s", "u")),
+      ).rejects.toBe(original);
+      expect(usage(sqlite)).toEqual([expect.objectContaining({ calls: 0, failed_calls: 1 })]);
+    } finally {
+      sqlite.close();
+    }
+  });
+});
+
 describe("call deadlines", () => {
   test("a writing call on the fast model gets the writing deadline, then is aborted and metered", async () => {
     vi.useFakeTimers();
@@ -237,6 +355,7 @@ describe("a stopped build stops paying", () => {
   test.each(["repos", "site_ai_log_bodies"])(
     "stopping during %s preparation neither dispatches nor meters a model attempt",
     async (table) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const { sqlite, env, calls } = setup(async (call) => {
         call.options.signal?.throwIfAborted();
         return ANSWER;
@@ -260,6 +379,20 @@ describe("a stopped build stops paying", () => {
         expect(stopped).toBe(true);
         expect(calls).toHaveLength(0);
         expect(usage(sqlite)).toEqual([]);
+        if (table === "site_ai_log_bodies") {
+          expect(warn).toHaveBeenCalledTimes(1);
+          expect(
+            parseModelFailureDiagnostic(JSON.parse(warn.mock.calls[0]![0] as string)),
+          ).toMatchObject({
+            dispatched: false,
+            kind: "work_stopped",
+            account: "acc_o",
+            feature: "knowledge",
+          });
+        } else {
+          // Attribution precedes the existing attempt boundary.
+          expect(warn).not.toHaveBeenCalled();
+        }
       } finally {
         sqlite.close();
       }

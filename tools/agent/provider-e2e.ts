@@ -28,6 +28,7 @@ import { runAtlasProviderE2E } from "./atlas-provider-e2e.ts";
 import { command, validateEnvironment, type Environment } from "./environment.ts";
 import { runQueueAiE2E } from "./queue-ai-e2e.ts";
 import { collectGatewayLogs, reconcileUsage, type UsageRow } from "./usage-reconciliation.ts";
+import { collectModelFailureEvidence, modelFailureAttempt } from "./model-failure-evidence.ts";
 import type { Outcome, Selection, StageDefinition } from "./ai-stages.ts";
 
 const WORKER = "apps/website/worker";
@@ -240,7 +241,7 @@ interface GatewayLog {
   provider: string;
   success: boolean;
   cached: boolean;
-  metadata?: { component?: string; account?: string; feature?: string };
+  metadata?: { component?: string; account?: string; feature?: string; attempt?: string };
   request: string;
   response: string;
   response_content_type: string;
@@ -263,6 +264,7 @@ interface GatewayLogSummary {
   cost?: number;
   account?: string;
   feature?: string;
+  attempt?: string;
 }
 
 // List metadata only: never persist request/response bodies or raw cf output.
@@ -343,6 +345,7 @@ async function gatewayLogs(
         cost: log.cost,
         account: log.metadata?.account,
         feature: log.metadata?.feature,
+        attempt: modelFailureAttempt(log.metadata?.attempt),
       },
     ];
   });
@@ -4094,6 +4097,7 @@ export async function runProviderE2E(
       } catch (error) {
         evidence.cost = { error: error instanceof Error ? error.message : String(error) };
       }
+      evidence.modelFailures = await collectModelFailureEvidence(ctx.artifacts);
     }
     evidence.finishedAt = new Date().toISOString();
     let serialized = JSON.stringify(evidence, null, 2);

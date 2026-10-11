@@ -2380,6 +2380,20 @@ push ─▶ git proxy ─▶ KnowledgeCoordinator (Durable Object, one per repo)
   `sum(neurons)`: that dataset is adaptively sampled and its aggregates are
   already weighted by `sampleInterval`. Multiplying by it again squares the
   weight, which overstated spend about 7× in CORE-284.
+- **Failed-attempt evidence** (CORE-347): the model invocation boundary emits
+  a single `ai.model.failed` JSON warning before retries can discard the failure.
+  It records a unique attempt ID (also attached to Workers AI Gateway metadata),
+  account/feature/model attribution, whether dispatch occurred, and finite
+  failure categories and numeric codes. Local deadlines and stopped/expired
+  work are distinguished from provider rejection; unknown failures stay unknown.
+  Raw error messages, stacks, causes, prompts and responses are not included.
+  Accounting, retries and the original exception are unchanged. `test-ai`
+  retains the allowlisted records as `ai-e2e.json.modelFailures` on success
+  and failure before owned-resource cleanup. Collection is bounded to the
+  final 8 MiB of the server log, 4 KiB per line and 256 events; missing reads,
+  invalid records and omissions are explicit, not evidence of zero failures.
+  A missing Gateway record still fails strict reconciliation and does not,
+  by itself, establish a provider outage.
 - **Timeline overlays** (`worker/knowledge/overlay.ts`, CORE-83): a push to an
   owned work source recomputes that timeline's graph diff against main's indexed
   graph using its explicit logical-base/source snapshot. `timeline/<slug>` is
