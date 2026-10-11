@@ -686,7 +686,7 @@ await test("legacy AI journals require recreation for use but remain valid for c
   }
 });
 
-await test("retired namespace orphans release quota without losing cleanup or being readopted", async () => {
+await test("retired orphans survive failed retries and release crashes without blocking admission", async () => {
   const home = await mkdtemp(join(tmpdir(), "gitmatrix-orphan-"));
   try {
     const directory = join(home, ".local/state/gitmatrix-agent/environments");
@@ -694,11 +694,31 @@ await test("retired namespace orphans release quota without losing cleanup or be
     await Promise.all([directory, bin].map((path) => mkdir(path, { recursive: true })));
     const calls = join(home, "calls");
     const refuse = join(home, "refuse");
+    const providerFailure = join(home, "provider-failure");
     await writeFile(refuse, "");
     // Lists nothing, but refuses the namespace while `refuse` exists.
     await writeFile(
       join(bin, "cf"),
-      `#!${process.execPath}\nconst fs=require('node:fs'); const args=process.argv.slice(2); if(args[0]==='auth'){console.log(JSON.stringify({authenticated:true,tokenValid:true,accounts:[{id:'${"a".repeat(32)}'}]}));process.exit(0)} fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n'); if(args[0]==='artifacts'&&args[2]==='delete'&&fs.existsSync(${JSON.stringify(refuse)})){console.error('Namespace is not empty');process.exit(1)} console.log(args.includes('list')?'[]':'{}');\n`,
+      `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] === 'auth') {
+  console.log(JSON.stringify({authenticated: true, tokenValid: true, accounts: [{id: '${"a".repeat(32)}'}]}));
+  process.exit(0);
+}
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + '\\n');
+const failure = fs.existsSync(${JSON.stringify(providerFailure)})
+  ? fs.readFileSync(${JSON.stringify(providerFailure)}, 'utf8') : null;
+if (failure && args.includes(failure) && args.some(arg => arg.startsWith('gma-mga'))) {
+  console.error('provider ' + failure + ' unavailable');
+  process.exit(1);
+}
+if (args[0] === 'artifacts' && args[2] === 'delete' && fs.existsSync(${JSON.stringify(refuse)})) {
+  console.error('Namespace is not empty');
+  process.exit(1);
+}
+console.log(args.includes('list') ? '[]' : '{}');
+`,
       { mode: 0o700 },
     );
     await quotaFixture(home);
@@ -749,17 +769,42 @@ await test("retired namespace orphans release quota without losing cleanup or be
     const legacy = JSON.parse(await readFile(journals[0]!, "utf8")) as Environment;
     delete legacy.quota;
     await writeFile(journals[0]!, JSON.stringify(legacy));
-    await run(
-      `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(join(home, "worktree-0"))});`,
-    );
-    const active = JSON.parse(
-      await readFile(join(home, "worktree-0/.gitmatrix-agent/environment.json"), "utf8"),
-    ) as Environment;
-    assert.deepEqual(Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))), [
-      active.id,
-    ]);
+    // releaseQuota persists its acknowledgement before destroyEnvironment writes
+    // the terminal status. Recover that on-disk crash state, not just an orphan.
+    const interrupted = JSON.parse(await readFile(journals[1]!, "utf8")) as Environment;
+    interrupted.status = "deleting";
+    await writeFile(journals[1]!, JSON.stringify(interrupted));
+    await writeFile(join(interrupted.dir, "environment.json"), JSON.stringify(interrupted));
+    const activeIds: string[] = [];
+    for (const [index, failure] of ["list", "delete"].entries()) {
+      await writeFile(providerFailure, failure);
+      await assert.rejects(
+        run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`),
+        new RegExp(`provider ${failure} unavailable`),
+      );
+      const root = join(home, `worktree-${index}`);
+      await run(
+        `import {createEnvironment} from ${JSON.stringify(module)}; await createEnvironment(${JSON.stringify(root)});`,
+      );
+      const active = JSON.parse(
+        await readFile(join(root, ".gitmatrix-agent/environment.json"), "utf8"),
+      ) as Environment;
+      assert.equal(active.status, "ready");
+      activeIds.push(active.id);
+      assert.deepEqual(
+        Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))),
+        activeIds,
+      );
+      for (const journal of journals) {
+        const retry = JSON.parse(await readFile(journal, "utf8")) as Environment;
+        assert.equal(retry.status, "orphaned");
+        assert.equal(retry.resources.artifacts, "orphaned");
+        assert.equal(retry.quota?.state, journal === journals[0] ? undefined : "released");
+      }
+    }
     // Once Cloudflare lets go, the next sweep finishes the deletion; journals stay.
     await rm(refuse);
+    await rm(providerFailure);
     await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
     for (const journal of journals) {
       const done = JSON.parse(await readFile(journal, "utf8")) as Environment;
@@ -767,9 +812,10 @@ await test("retired namespace orphans release quota without losing cleanup or be
       assert.equal(done.resources.artifacts, "deleted");
       assert.equal(done.orphan, undefined);
     }
-    assert.deepEqual(Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))), [
-      active.id,
-    ]);
+    assert.deepEqual(
+      Object.keys(JSON.parse(await readFile(join(home, "quota.json"), "utf8"))),
+      activeIds,
+    );
   } finally {
     await rm(home, { recursive: true, force: true });
   }

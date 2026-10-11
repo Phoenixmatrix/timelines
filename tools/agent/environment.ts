@@ -57,9 +57,13 @@ export interface Environment {
   quota?: QuotaReservation;
 }
 
-/** Done with: nothing of it is live, so it holds none of the environment slots. */
+/** Acknowledged cleanup release survives an interrupted terminal status write. */
 function retired(env: Environment): boolean {
-  return env.status === "deleted" || env.status === "orphaned";
+  return (
+    env.status === "deleted" ||
+    env.status === "orphaned" ||
+    (env.status === "deleting" && env.quota?.state === "released")
+  );
 }
 
 /** Whether the environment binds paid AI: Knowledge builds and other model calls run. */
@@ -514,7 +518,8 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
   validateEnvironment(env);
   if (env.status === "deleted") return;
   await stopEnvironment(env);
-  env.status = "deleting";
+  if (!retired(env)) env.status = "deleting";
+  else if (env.resources.artifacts === "orphaned") env.status = "orphaned";
   await persist(env);
   const failures: string[] = [];
   // Continue independent deletions even if one provider is unavailable.
