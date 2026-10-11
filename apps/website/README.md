@@ -111,8 +111,9 @@ pattern, handler)`, a URLPattern pathname), then, with `{ world: true }`, to
   `vite/browser-commands.ts`). Requests act as the world's persona (marco by
   default; `server.as()` switches, and `server.call(..., as)` acts as someone
   else once). An explicit `null` persona means signed out; omitting the per-request
-  persona uses the world's current one. `server.requests` records every request,
-  for "it read only this" assertions.
+  persona uses the world's current one. `server.requests` records completed,
+  unaborted requests for "it read only this" assertions; count handler entries
+  separately when checking in-flight or cancelled requests.
 - A world's repositories (`server.repo()`) have refs (`server.push()`) and
   accept ref-only pushes, but no git objects: file listings and history are
   canned (`cannedFiles()` in `git.ts`). No model, index or CI runner exists
@@ -135,6 +136,12 @@ and `expect.poll(() => el.getAttribute(...)).toMatch(...)` for patterns.
 Pass a timeout to `expect.element(locator, { timeout })`, not the matcher.
 Locator text with an apostrophe is safer as a RegExp. Restore what a test
 changes in the page (viewport, theme, emulated media) in a `finally`.
+
+Polling tests should fake only their interval clocks, leaving runner timeouts
+and browser actions on real time. Hold a response behind a promise to exercise
+the busy state and its elapsed-time bound; release it in `onTestFinished` too.
+Assert pause, no overlapping checks and manual recovery—not one request per
+timer tick, since busy revalidation deliberately skips ticks.
 
 ## Recent agent presence
 

@@ -241,41 +241,55 @@ for (const state of ["disabled", "idle", "failed"] as const) {
 
 test("pending highlights poll within a bound, then offer a manual check and stop when ready", async () => {
   const server = await TestServer.start({ world: true });
-  server.on("GET", orgApi, overview({ status: { state: "generating", generatedAt: null } }));
+  const pending = overview({ status: { state: "generating", generatedAt: null } });
+  server.on("GET", orgApi, pending);
   const clock = controlPolling();
-  const app = renderApp("/tracker/orbit/highlights");
+  renderApp("/tracker/orbit/highlights");
   await expect
     .element(page.getByRole("button", { name: "Check for updates", exact: true }))
     .toBeVisible();
   await expect
     .element(page.getByRole("article", { name: "Release highlights" }))
     .not.toBeInTheDocument();
-  for (let tick = 1; tick <= 12; tick++) {
-    await clock.tick();
-    // A loaded CI host can take longer than poll's default second to deliver the request.
-    await expect
-      .poll(() => server.requests.filter((request) => request.url.pathname === orgApi).length, {
-        timeout: 10_000,
-      })
-      .toBe(tick + 1);
-    await expect.poll(() => app.router.state.revalidation).toBe("idle");
-    await expect
-      .element(page.getByRole("button", { name: "Check for updates", exact: true }))
-      .toBeEnabled();
-  }
-  await expect.poll(() => app.router.state.revalidation).toBe("idle");
+  // Busy checks still consume the one-minute budget; a tick need not start a request.
+  let release!: () => void;
+  const response = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  onTestFinished(() => release());
+  let checks = 0;
+  server.on("GET", orgApi, async () => {
+    checks++;
+    await response;
+    return pending;
+  });
+  await clock.tick();
+  await expect.element(page.getByRole("button", { name: "Checking…", exact: true })).toBeDisabled();
+  await expect.poll(() => checks).toBe(1);
+  const paused = page.getByText(/Automatic checking has paused/);
+  await clock.tick(54_999);
+  await expect.element(paused).not.toBeInTheDocument();
+  expect(checks).toBe(1);
+  await clock.tick(1);
+  await expect.element(paused).toBeVisible();
+  expect(checks).toBe(1);
+  release();
+  await expect
+    .element(page.getByRole("button", { name: "Check for updates", exact: true }))
+    .toBeEnabled();
+  await expect
+    .poll(() => server.requests.filter((request) => request.url.pathname === orgApi).length)
+    .toBe(2);
   const count = server.requests.filter((request) => request.url.pathname === orgApi).length;
-  expect(count).toBe(13);
   await clock.tick(60_000);
+  expect(checks).toBe(1);
   expect(server.requests.filter((request) => request.url.pathname === orgApi).length).toBe(count);
   server.on("GET", orgApi, overview());
   await page.getByRole("button", { name: "Check for updates", exact: true }).click();
   await expect.element(page.getByRole("article", { name: "Release highlights" })).toBeVisible();
-  await expect
-    .poll(() => server.requests.filter((request) => request.url.pathname === orgApi).length, {
-      timeout: 10_000,
-    })
-    .toBe(count + 1);
+  expect(server.requests.filter((request) => request.url.pathname === orgApi).length).toBe(
+    count + 1,
+  );
   const readyCount = server.requests.filter((request) => request.url.pathname === orgApi).length;
   await clock.tick(60_000);
   expect(server.requests.filter((request) => request.url.pathname === orgApi).length).toBe(
