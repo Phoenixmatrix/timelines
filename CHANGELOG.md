@@ -28,7 +28,9 @@
   Frozen tracker records and replica cursors remain unchanged.
 - GitHub backup renames run through the mirror administrator API, fenced by the
   expected remote repository ID and mirror lease. One-operation administration
-  credentials do not replace the stored push credential.
+  credentials do not replace the stored push credential. Provider redirects
+  are rejected using Workers-supported manual redirect handling, without
+  forwarding credentials.
 
 ### CORE-150: bounded release-highlights proof cleanup and scheduling
 

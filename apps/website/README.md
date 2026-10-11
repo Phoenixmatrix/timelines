@@ -3680,6 +3680,8 @@ Repository administrators can rename an existing GitHub backup with
 The numeric GitHub repository ID is required to prevent a stale/reused name
 from targeting another repository. Only `https://github.com` targets are
 accepted, and the existing mirror lease excludes simultaneous syncs.
+Provider requests use Workers-supported manual redirect handling: every non-2xx
+response is rejected, so credentials never follow a redirected destination.
 An optional `token` grants administration access for that operation only;
 it is neither persisted nor substituted for the sealed push credential.
 The response retains the remote ID and updates the mirror's clone URL without
