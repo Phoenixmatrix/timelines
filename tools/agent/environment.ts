@@ -57,9 +57,13 @@ export interface Environment {
   quota?: QuotaReservation;
 }
 
-/** Acknowledged release retires capacity even if the terminal status write was interrupted. */
+/** Acknowledged cleanup release survives an interrupted terminal status write. */
 function retired(env: Environment): boolean {
-  return env.status === "deleted" || env.status === "orphaned" || env.quota?.state === "released";
+  return (
+    env.status === "deleted" ||
+    env.status === "orphaned" ||
+    (env.status === "deleting" && env.quota?.state === "released")
+  );
 }
 
 /** Whether the environment binds paid AI: Knowledge builds and other model calls run. */
