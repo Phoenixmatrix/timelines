@@ -175,7 +175,7 @@ mirrors.post("/:owner/:name/mirror/rename", async (c) => {
     const endpoint = `https://api.github.com/repos/${parts[1]}/${parts[2]}`;
     const before = await fetch(endpoint, {
       headers,
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.timeout(30_000),
     });
     if (!before.ok)
@@ -191,7 +191,7 @@ mirrors.post("/:owner/:name/mirror/rename", async (c) => {
       method: "PATCH",
       headers,
       body: JSON.stringify({ name: body.name }),
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.timeout(30_000),
     });
     if (!renamed.ok)
