@@ -60,7 +60,12 @@ function fixture() {
         if (job.type === "release-highlights") sent.push(job);
       },
     },
-    TRACKER: { getByName: () => ({ workspaceSlugs: async () => ({ ok: true, value: [] }) }) },
+    TRACKER: {
+      getByName: () => ({
+        workspaceSlugs: async () => ({ ok: true, value: [] }),
+        teamNames: async () => ({ ok: true, value: [] }),
+      }),
+    },
   } as unknown as Env;
   const job: ReleaseHighlightsJob = {
     type: "release-highlights",

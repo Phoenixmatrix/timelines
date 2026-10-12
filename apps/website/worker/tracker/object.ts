@@ -300,6 +300,9 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   workspaceSlugs() {
     return this.reply(() => this.store.workspaceSlugs());
   }
+  teamNames() {
+    return this.reply(() => this.store.teamNames());
+  }
   searchIssues(query: SearchQuery, limit: number) {
     return this.reply(() => this.store.searchIssues(query, limit));
   }

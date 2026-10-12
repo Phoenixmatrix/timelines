@@ -28,6 +28,8 @@ export interface FeedContext {
   visibleRepoIds: Set<string>;
   /** Workspace id → slug, for the account's tracker. */
   workspaces: Map<string, string>;
+  /** Team key → name, for the account's tracker: a facet reads "Core", not "CORE" (CORE-395). */
+  teams: Map<string, string>;
   query: ParsedReleaseQuery;
   /** Independent landed-timeline scope, ANDed with the explicit query. */
   timeline?: string;
@@ -130,7 +132,16 @@ export function buildFeed(rows: FeedRow[], context: FeedContext): Omit<ReleaseFe
     entries: all.slice(0, context.limit),
     truncated: all.length > context.limit,
     facets: {
-      teams: facet((e) => (e.issue ? [[e.issue.team.key.toLowerCase(), e.issue.team.key]] : [])),
+      teams: facet((e) =>
+        e.issue
+          ? [
+              [
+                e.issue.team.key.toLowerCase(),
+                context.teams.get(e.issue.team.key) ?? e.issue.team.key,
+              ],
+            ]
+          : [],
+      ),
       repos: facet((e) =>
         e.repos.map((r) => [`${r.owner}/${r.name}`.toLowerCase(), `${r.owner}/${r.name}`]),
       ),
@@ -261,14 +272,16 @@ export async function releaseFeed(
       select = select.where("e.category", "=", filter.value as EntryRow["category"]);
     if (filter.key === "team") select = select.where("e.team_key", "=", filter.value.toUpperCase());
   }
-  const [rows, workspaces] = await Promise.all([
+  const [rows, workspaces, teams] = await Promise.all([
     select.orderBy("e.shipped_at", "desc").limit(SCAN_LIMIT).execute(),
     trackerObject(env, owner.id).workspaceSlugs(),
+    trackerObject(env, owner.id).teamNames(),
   ]);
   const feed = buildFeed(rows, {
     trackers,
     visibleRepoIds,
     workspaces: new Map(workspaces.ok ? workspaces.value.map((w) => [w.id, w.slug]) : []),
+    teams: new Map(teams.ok ? teams.value.map((t) => [t.key, t.name]) : []),
     query,
     timeline,
     now: Date.now(),
