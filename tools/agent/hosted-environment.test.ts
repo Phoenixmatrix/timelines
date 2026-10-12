@@ -440,6 +440,26 @@ await test("hosted ownership journal exports resource ownership without local ca
   `);
 });
 
+await test("a hosted journal is on disk before its ownership record, as setup's probe lists it (CORE-374)", async () => {
+  await isolated(`
+    const { execFileSync } = await import('node:child_process');
+    const { journalProbe } = await import(${JSON.stringify(new URL("./remote.ts", import.meta.url).href)});
+    const listed = () => JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', journalProbe],
+      { encoding: 'utf8' }).trim().split('\\n').at(-1));
+    // Nothing journaled yet: the directory is missing, not an error.
+    assert.deepEqual(listed(), { event: 'environment.journals', ids: [] });
+    let seen;
+    globalThis.fetch = async (url) => {
+      assert.equal(url, 'http://127.0.0.1:8787/ownership');
+      seen = listed().ids;
+      return new Response(null, { status: 204 });
+    };
+    await markServer(env, process.pid);
+    // When the ownership record is written, the probe already lists its journal.
+    assert.deepEqual(seen, [env.id]);
+  `);
+});
+
 for (const failure of ["http", "transport"] as const) {
   await test(`hosted ownership ${failure} failure rejects without committing local state`, async () => {
     await isolated(`

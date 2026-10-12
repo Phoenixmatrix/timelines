@@ -20,6 +20,8 @@ import {
   remoteOutstanding,
   remoteQuotaAuthority,
   ensureRemoteAdmission,
+  advanceResources,
+  retireStaleChildren,
 } from "./remote-environment.ts";
 import type { RemoteEnvironment, OwnedResources } from "./remote-environment.ts";
 import { syncSources, retrieveArtifact } from "./remote-sync.ts";
@@ -369,15 +371,16 @@ async function collectOwnership(record: RemoteEnvironment, request: RemoteReques
     throw new Error("Invalid remote resource metadata response.");
   for (const item of data.environments) {
     validateOwnedResources(item, record.account);
+    const index = record.resources.findIndex((old) => old.id === item.id);
+    const previous = record.resources[index];
     const clean: OwnedResources = {
       id: item.id,
       account: item.account,
-      resources: { ...item.resources },
+      // Forward-only too: a lost container's record never undoes a host deletion (CORE-374).
+      resources: advanceResources(previous?.resources, item.resources),
       ...(item.expires !== undefined ? { expires: item.expires } : {}),
       ...(item.quota ? { quota: { ...item.quota } } : {}),
     };
-    const index = record.resources.findIndex((old) => old.id === item.id);
-    const previous = record.resources[index];
     if (previous?.quota) {
       if (clean.quota && clean.quota.authority !== previous.quota.authority)
         throw new Error("Remote child quota authority changed; refusing ownership replacement.");
@@ -499,6 +502,172 @@ async function follow(
     write("", true);
   }
 }
+/**
+ * Lists the ids of every environment journal on the container's current disk,
+ * deleted ones included. Builtins only, so it runs before `vp install`; the path
+ * is environment.ts's `registry`, under the runtime's fixed HOME=/root.
+ */
+export const journalProbe = `import { readdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+const directory = join(homedir(), ".local", "state", "gitmatrix-agent", "environments");
+const names = await readdir(directory).catch((error) => {
+  if (error.code === "ENOENT") return [];
+  throw error;
+});
+const ids = names.filter((name) => name.endsWith(".json")).map((name) => name.slice(0, -5));
+console.log(JSON.stringify({ event: "environment.journals", ids }));
+`;
+
+/** A stopped command that is still running: the runtime refuses the next foreground command. */
+export class RemoteCommandStuck extends Error {}
+
+export interface CaptureTiming {
+  timeoutMs?: number;
+  /** How long a stopped command may take to end before setup gives up. */
+  settleMs?: number;
+  now?: () => number;
+  pause?: (milliseconds: number) => Promise<void>;
+}
+
+/** Run one short command, keeping a bounded tail of its output instead of streaming it. */
+export async function capture(
+  request: RemoteRequest,
+  argv: string[],
+  timing: CaptureTiming = {},
+): Promise<{ code: number; text: string }> {
+  const {
+    timeoutMs = 60_000,
+    settleMs = 45_000,
+    now = Date.now,
+    pause = (milliseconds) => delay(milliseconds),
+  } = timing;
+  const id = randomBytes(16).toString("hex");
+  const processPath = `/processes/${encodeURIComponent(id)}`;
+  await json(request, "/commands", {
+    id,
+    argv,
+    cwd: "/workspace/repo",
+    kind: "foreground",
+    env: {},
+    timeoutMs,
+  });
+  let offset = 0;
+  let text = "";
+  const read = async () => {
+    const chunk = await json<LogChunk>(request, `${processPath}/logs?offset=${offset}`);
+    if (!Number.isSafeInteger(chunk.nextOffset) || chunk.nextOffset < offset)
+      throw new Error("Invalid remote log cursor.");
+    offset = chunk.nextOffset;
+    text = (text + chunk.text).slice(-64 * 1024);
+    return chunk;
+  };
+  const deadline = now() + timeoutMs;
+  for (;;) {
+    const chunk = await read();
+    if (chunk.done) return { code: commandExit(chunk), text };
+    if (now() >= deadline) break;
+    await pause(250);
+  }
+  await json(request, `${processPath}/stop`, {}).catch(() => {});
+  // A stop can outlast its own request deadline; until the command has ended,
+  // the runtime refuses setup's next foreground command (409).
+  const settled = now() + settleMs;
+  for (;;) {
+    if (
+      await read().then(
+        (chunk) => chunk.done,
+        () => false,
+      )
+    )
+      throw new Error("Remote command did not finish in time; it was stopped.");
+    if (now() >= settled)
+      throw new RemoteCommandStuck(
+        `Remote command ${id} is still running after it was stopped; no other command can start. Retry setup once it ends, or stop the environment.`,
+      );
+    await pause(1000);
+  }
+}
+
+const childId = /^gma-[a-z0-9]+-[a-f0-9]{12}$/;
+
+/** The journal ids on the container's current disk, or a failure: never a guess. */
+async function probeJournals(request: RemoteRequest, timing?: CaptureTiming): Promise<Set<string>> {
+  const { code, text } = await capture(
+    request,
+    ["node", "--input-type=module", "-e", journalProbe],
+    timing,
+  );
+  if (code !== 0) throw new Error(`Journal probe exited with status ${code}.`);
+  for (const line of text.split("\n").reverse()) {
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !("event" in value) ||
+      value.event !== "environment.journals"
+    )
+      continue;
+    // Redaction or a stray file must never turn a live id into an apparently stale one.
+    if (
+      !("ids" in value) ||
+      !Array.isArray(value.ids) ||
+      !value.ids.every((id: unknown) => typeof id === "string" && childId.test(id))
+    )
+      throw new Error("Journal probe listed an unrecognized environment id.");
+    return new Set(value.ids as string[]);
+  }
+  throw new Error("Journal probe printed no journal listing.");
+}
+
+/**
+ * Before setup creates a hosted child, release the children a lost container
+ * disk stranded (CORE-374): their journals are gone, so the container can never
+ * destroy them, yet their ownership records still show live resources and slots.
+ *
+ * Always probes, even after an explicit stop: a later setup that failed after
+ * `/start` may already have created a child on the current disk.
+ */
+export async function retireLostChildren(
+  record: RemoteEnvironment,
+  request: RemoteRequest,
+  timing?: CaptureTiming,
+): Promise<void> {
+  // Collect first, then list: every collected child wrote its journal before
+  // its ownership record, so one missing from the later listing is stale.
+  await collectOwnership(record, request);
+  let live: Set<string>;
+  try {
+    live = await probeJournals(request, timing);
+  } catch (error) {
+    // Setup's next command would only hit the runtime's 409; fail clearly instead.
+    if (error instanceof RemoteCommandStuck) throw error;
+    console.error(
+      JSON.stringify({
+        event: "remote.child_retire_skipped",
+        id: record.id,
+        message: safeMessage(error),
+        note: "Stranded children keep their reservations until a later setup or destroy retires them.",
+      }),
+    );
+    return;
+  }
+  await retireStaleChildren(record, live, {
+    persist: persistRemote,
+    async removeChild(owned) {
+      const failures = await removeOwnedChild(record, owned);
+      if (failures.length)
+        throw new Error(`Remote resource cleanup remains pending:\n${failures.join("\n")}`);
+    },
+    log: (event) => console.log(safeMessage(new Error(JSON.stringify(event)))),
+  });
+}
+
 async function deploy(record: RemoteEnvironment, root: string): Promise<void> {
   const env = { CLOUDFLARE_ACCOUNT_ID: record.account };
   const data = JSON.parse(
@@ -553,7 +722,14 @@ async function deploy(record: RemoteEnvironment, root: string): Promise<void> {
   }
 }
 
-async function removeOwned(record: RemoteEnvironment): Promise<void> {
+/**
+ * Delete one hosted child's resources with this host's cf login, persisting each
+ * deletion. Returns what remains pending; deletion continues past a failure.
+ */
+async function removeOwnedChild(
+  record: RemoteEnvironment,
+  owned: OwnedResources,
+): Promise<string[]> {
   const options = { profile: record.profile, env: { CLOUDFLARE_ACCOUNT_ID: record.account } };
   const failures: string[] = [];
   const remove = async (args: string[]) => {
@@ -563,75 +739,79 @@ async function removeOwned(record: RemoteEnvironment): Promise<void> {
       if (!cfApiNotFound(safeMessage(error))) throw error;
     }
   };
-  for (const owned of record.resources) {
-    validateOwnedResources(owned, record.account);
-    for (const resource of ["search", "gateway", "vectors", "artifacts"]) {
-      if (!owned.resources[resource] || owned.resources[resource] === "deleted") continue;
-      try {
-        if (resource === "search") {
-          for (;;) {
-            let items: { id: string }[];
-            try {
-              items = JSON.parse(
-                await cf(["ai-search", "list", "--name", owned.id, "--per-page", "100"], options),
-              ) as { id: string }[];
-            } catch (error) {
-              if (cfApiNotFound(safeMessage(error))) break;
-              throw error;
-            }
-            if (!items.length) break;
-            for (const item of items)
-              await remove(["ai-search", "delete", item.id, "--name", owned.id, "--force"]);
+  validateOwnedResources(owned, record.account);
+  for (const resource of ["search", "gateway", "vectors", "artifacts"]) {
+    if (!owned.resources[resource] || owned.resources[resource] === "deleted") continue;
+    try {
+      if (resource === "search") {
+        for (;;) {
+          let items: { id: string }[];
+          try {
+            items = JSON.parse(
+              await cf(["ai-search", "list", "--name", owned.id, "--per-page", "100"], options),
+            ) as { id: string }[];
+          } catch (error) {
+            if (cfApiNotFound(safeMessage(error))) break;
+            throw error;
           }
-          await remove(["ai-search", "namespace", "delete", owned.id, "--force"]);
-        } else if (resource === "gateway")
-          await remove(["ai-gateway", "gateways", "delete", owned.id, "--force"]);
-        else if (resource === "vectors") await remove(["vectorize", "delete", owned.id, "--force"]);
-        else {
-          for (;;) {
-            let repos: { name: string }[];
-            try {
-              repos = JSON.parse(
-                await cf(
-                  [
-                    "artifacts",
-                    "namespaces",
-                    "repos",
-                    "list",
-                    "--namespace",
-                    owned.id,
-                    "--limit",
-                    "100",
-                  ],
-                  options,
-                ),
-              ) as { name: string }[];
-            } catch (error) {
-              if (cfApiNotFound(safeMessage(error))) break;
-              throw error;
-            }
-            if (!repos.length) break;
-            for (const repo of repos)
-              await remove([
-                "artifacts",
-                "namespaces",
-                "repos",
-                "delete",
-                repo.name,
-                "--namespace",
-                owned.id,
-                "--force",
-              ]);
-          }
-          await remove(["artifacts", "namespaces", "delete", owned.id, "--force"]);
+          if (!items.length) break;
+          for (const item of items)
+            await remove(["ai-search", "delete", item.id, "--name", owned.id, "--force"]);
         }
-        owned.resources[resource] = "deleted";
-        await persistRemote(record);
-      } catch (error) {
-        failures.push(`${owned.id}/${resource}: ${safeMessage(error)}`);
+        await remove(["ai-search", "namespace", "delete", owned.id, "--force"]);
+      } else if (resource === "gateway")
+        await remove(["ai-gateway", "gateways", "delete", owned.id, "--force"]);
+      else if (resource === "vectors") await remove(["vectorize", "delete", owned.id, "--force"]);
+      else {
+        for (;;) {
+          let repos: { name: string }[];
+          try {
+            repos = JSON.parse(
+              await cf(
+                [
+                  "artifacts",
+                  "namespaces",
+                  "repos",
+                  "list",
+                  "--namespace",
+                  owned.id,
+                  "--limit",
+                  "100",
+                ],
+                options,
+              ),
+            ) as { name: string }[];
+          } catch (error) {
+            if (cfApiNotFound(safeMessage(error))) break;
+            throw error;
+          }
+          if (!repos.length) break;
+          for (const repo of repos)
+            await remove([
+              "artifacts",
+              "namespaces",
+              "repos",
+              "delete",
+              repo.name,
+              "--namespace",
+              owned.id,
+              "--force",
+            ]);
+        }
+        await remove(["artifacts", "namespaces", "delete", owned.id, "--force"]);
       }
+      owned.resources[resource] = "deleted";
+      await persistRemote(record);
+    } catch (error) {
+      failures.push(`${owned.id}/${resource}: ${safeMessage(error)}`);
     }
   }
+  return failures;
+}
+
+async function removeOwned(record: RemoteEnvironment): Promise<void> {
+  const failures: string[] = [];
+  for (const owned of record.resources) failures.push(...(await removeOwnedChild(record, owned)));
   if (failures.length)
     throw new Error(`Remote resource cleanup remains pending:\n${failures.join("\n")}`);
 }
@@ -919,6 +1099,8 @@ export async function remoteMain(root: string, args: string[]): Promise<void> {
         await json(request, "/start", {});
         await publishCredentials(request, credentials, record);
         await syncSources(root, request);
+        // Before the new child's admission: a stranded child's slot may be the one it needs.
+        await retireLostChildren(record, request);
         const installation = await launch(record, request, ["vp", "install"]);
         const installCode = await follow(record, request, installation, true);
         if (installCode) {
