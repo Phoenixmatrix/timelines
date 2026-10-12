@@ -40,6 +40,36 @@ export interface Span {
   captured: boolean;
   /** Known only from the live feed so far: its full context hasn't loaded. */
   partial: boolean;
+  harness: string | null;
+  model: string | null;
+}
+
+/**
+ * When an instruction or steering was given (CORE-398): the time the harness
+ * (or the person) recorded with it, if it's a real one. An agent's retelling
+ * has no trustworthy time.
+ */
+export function givenAt(entry: ContextEntry): number | null {
+  if (entry.source === "agent" || !entry.at) return null;
+  const at = Date.parse(entry.at);
+  return Number.isFinite(at) ? at : null;
+}
+
+/** How long before its step a moment of steering is still drawn on the trace. */
+const STEERING_WINDOW = 12 * 60 * 60 * 1000;
+
+/**
+ * The moments a person steered a span, as drawn on its lane: given, and within
+ * twelve hours before the step (to a minute after). Older or odd times stay in
+ * the step's details but don't stretch the trace.
+ */
+export function steeredAt(span: Span): { at: number; text: string }[] {
+  return span.steering.flatMap((entry) => {
+    const at = givenAt(entry);
+    return at !== null && at >= span.at - STEERING_WINDOW && at <= span.at + 60_000
+      ? [{ at, text: entry.text }]
+      : [];
+  });
 }
 
 const ciSummary = (step: Step): StepTestSummary | null => {
@@ -84,6 +114,8 @@ export function spanFromStep(repo: string, step: Step): Span {
     ci,
     captured: context.coverage.instructions.startsWith("hook:"),
     partial: false,
+    harness: context.harness,
+    model: context.model,
   };
 }
 
@@ -109,6 +141,8 @@ export function spanFromFeed(record: StepFeedRecord): Span {
     ci: null,
     captured: false,
     partial: true,
+    harness: null,
+    model: null,
   };
 }
 
@@ -190,6 +224,7 @@ export function domainOf(
 ): [number, number] {
   const times = [
     ...spans.map((span) => span.at),
+    ...spans.flatMap((span) => steeredAt(span).map((moment) => moment.at)),
     ...checkpoints.map((view) => Date.parse(view.checkpoint.createdAt)),
   ].filter(Number.isFinite);
   if (!times.length) return [0, 1];

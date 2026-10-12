@@ -24,6 +24,7 @@ import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { sourceUrl } from "../../lib/refs.ts";
 import { readTrackerShortcuts } from "./preferences.ts";
 import { StepVisuals } from "./StepVisuals.tsx";
+import { givenAt } from "./timelineSpans.ts";
 
 /** The filters' "no filter" value. */
 const ALL = "*";
@@ -573,7 +574,11 @@ function Context({ step }: { step: Step | null }) {
         <ul className="m-0 pl-4 text-body-sm">
           {list.map((entry, n) => (
             <li key={n} className="[overflow-wrap:anywhere]">
-              {entry.text} <span className="text-micro text-ink-faint">({entry.source})</span>
+              {entry.text}{" "}
+              <span className="text-micro text-ink-faint">
+                ({entry.source}
+                <EntryTime at={givenAt(entry)} />)
+              </span>
             </li>
           ))}
         </ul>
@@ -608,6 +613,11 @@ function Context({ step }: { step: Step | null }) {
             ))}
           </ul>
         </>
+      )}
+      {(context.harness || context.model) && (
+        <p className="mt-3 mb-0 text-micro text-ink-faint">
+          Made with {[context.harness, context.model].filter(Boolean).join(" running ")}
+        </p>
       )}
       {missing && (
         <p className="mt-3 mb-0 rounded-md bg-sunken p-2 text-micro text-ink-muted" role="note">
@@ -692,5 +702,19 @@ function DiffFileView({ file }: { file: DiffFile }) {
         </div>
       )}
     </details>
+  );
+}
+
+/** When an instruction or steering was given (CORE-398), if known. */
+function EntryTime({ at }: { at: number | null }) {
+  if (at === null) return null;
+  const iso = new Date(at).toISOString();
+  return (
+    <>
+      {" · "}
+      <time dateTime={iso} title={fullDate(iso)}>
+        {timeAgo(iso)}
+      </time>
+    </>
   );
 }

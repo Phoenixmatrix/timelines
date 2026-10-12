@@ -494,6 +494,13 @@ test("the timeline inspector's Checkpoints: previews per checkpoint, and revivin
 
   const revive = item(1).getByRole("button", { name: "Revive preview" });
   await focusOn(revive);
+  // Two readers list the checkpoints on opening, this panel and the timeline's
+  // observability view (CORE-396): both first reads are done before counting.
+  const reads = () =>
+    server.requests.filter(
+      (r) => r.method === "GET" && r.url.pathname.endsWith("/timelines/search/checkpoints"),
+    ).length;
+  await expect.poll(reads).toBeGreaterThanOrEqual(2);
   const mark = server.requests.length;
   await press("Enter");
   await expect

@@ -123,7 +123,13 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
     timeline: slug,
     issue: "ENG-7",
     instructions: [{ text: "Rank search results by recency", source: "hook" }],
-    steering: [{ text: "Keep score as the tie-breaker", source: "hook" }],
+    steering: [
+      {
+        text: "Keep score as the tie-breaker",
+        source: "hook",
+        at: new Date(at(1.8) * 1000).toISOString(),
+      },
+    ],
     why: "People look for what changed lately, not what matches best.",
     challenges: "The index had no updated_at.",
     tests: [
@@ -194,7 +200,12 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
     .element(context)
     .toMatchTextContent(/WhyPeople look for what changed lately, not what matches best\./);
   await expect.element(context).toMatchTextContent(/Rank search results by recency \(hook\)/);
-  await expect.element(context).toMatchTextContent(/Keep score as the tie-breaker \(hook\)/);
+  // When the person steered (CORE-398), and what made the step (CORE-397).
+  await expect
+    .element(context)
+    // Relative ("3 weeks ago", "last month"): the time is there, whatever its wording.
+    .toMatchTextContent(/Keep score as the tie-breaker \(hook · [^)]+\)/);
+  await expect.element(context).toMatchTextContent(/Made with claude-code/);
   await expect.element(context).toMatchTextContent(/ChallengesThe index had no updated_at\./);
   await expect.element(context).toMatchTextContent(/Passed vp test run search · 12 passed/);
   await expect.element(context.getByRole("note")).not.toBeInTheDocument();
