@@ -3359,8 +3359,10 @@ expiry ─▶ preview run (teardown) ─▶ preview-teardown job ─▶ … prev
   `GITMATRIX_ACCESS_TOKEN` for the preview's HTTP and Git requests. `gm` comes
   from the job owner's generic registry (the newest gm main published, checked
   against its SHA-256) unless `GITMATRIX_PREVIEW_GM` names one.
-- **A failed create** records the checkpoint's preview as `failed`, and the
-  job fails. Re-run it, or revive the checkpoint.
+- **A failed create** records the checkpoint's preview as `failed`, deletes
+  what it made (CORE-385; within ten minutes, else it logs
+  `preview.create.rollback-failed`), and the job fails. Re-run it, or revive
+  the checkpoint.
 - **Reconciling leaks** (CORE-372). Some data outlives its record: a create
   that fails and can't record the failure, a `failed` record (it never
   expires, so no teardown comes), and an Artifacts namespace Cloudflare won't
@@ -3373,7 +3375,11 @@ expiry ─▶ preview run (teardown) ─▶ preview-teardown job ─▶ … prev
   `gitmatrix-preview-*` resource that no live timeline's slug names (through
   `names()`, so a name two slugs share stays while either is live), that no
   Preview without a live timeline might own, and that is at least two hours
-  old; a D1 by the uuid it listed. Nothing serializes it with creates (it
+  old; a D1 by the uuid it listed. A `timeline-*` Preview no live timeline
+  explains (a create killed, or whose cleanup failed, after it deployed) goes
+  first, by the id listed, once every D1 it might own is a day old (a create
+  makes its D1 just before it deploys); then its data can go in the same run.
+  One with a younger D1, or none, stays and is logged (CORE-388). Nothing serializes it with creates (it
   holds no concurrency group, so a teardown never supersedes a waiting
   create): a create times out after 40 minutes, and makes its D1 before the
   bucket and namespace that share the D1's name, so a young D1 keeps them
