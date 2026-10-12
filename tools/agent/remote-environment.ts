@@ -251,6 +251,129 @@ export async function ensureRemoteDeployment(
   await deploy(record);
 }
 
+/** Release a hosted child's slot from the host, journaling it in the parent's record. */
+async function releaseChild(
+  record: RemoteEnvironment,
+  owned: OwnedResources,
+  persist: (record: RemoteEnvironment) => Promise<void>,
+  release: typeof releaseQuota = releaseQuota,
+): Promise<void> {
+  if (!owned.quota) return;
+  const owner = {
+    id: owned.id,
+    account: owned.account,
+    root: record.root,
+    expires: owned.expires!,
+    quota: owned.quota,
+  };
+  await release(owner, async () => {
+    owned.quota = owner.quota;
+    await persist(record);
+  });
+}
+
+const resourceProgress = { pending: 0, created: 1, orphaned: 2, deleted: 3 } as const;
+/**
+ * Merge a collected child's resource states onto the host's: a state only moves
+ * forward (pending, created, orphaned, deleted). A lagging ownership record, such
+ * as a lost container's, never undoes a deletion the host already made (CORE-374).
+ */
+export function advanceResources(
+  previous: OwnedResources["resources"] | undefined,
+  next: OwnedResources["resources"],
+): OwnedResources["resources"] {
+  const merged = { ...next };
+  for (const [key, state] of Object.entries(previous ?? {})) {
+    const current = merged[key];
+    if (current === undefined || resourceProgress[state] > resourceProgress[current])
+      merged[key] = state;
+  }
+  return merged;
+}
+
+/**
+ * Whether a child still holds a slot or any resource that is not deleted. A
+ * child its container already retired as orphaned (CORE-302: slot released, only
+ * an Artifacts namespace Cloudflare refuses to delete) holds no slot; that
+ * namespace belongs to orphan handling, not to retiring on every setup.
+ */
+function childOutstanding(owned: OwnedResources): boolean {
+  if (owned.quota && owned.quota.state !== "released") return true;
+  const released = owned.quota?.state === "released";
+  return Object.entries(owned.resources).some(
+    ([key, state]) =>
+      state !== "deleted" && !(released && key === "artifacts" && state === "orphaned"),
+  );
+}
+
+/**
+ * Retire hosted children whose container lost its disk (CORE-374). Inside the
+ * container their journals are gone, so nothing there can ever destroy them.
+ *
+ * `live` lists the journal ids on the container's current disk. It must be
+ * listed AFTER `record` was last collected, with no collection in between: a
+ * child writes its journal before its ownership record (environment.ts persist),
+ * so a collected child absent from that later listing has no journal left. That
+ * is never true of a child mid-setup on the current disk.
+ *
+ * Each stale child's resources are deleted first, persisting each; only then is
+ * its slot released. A child whose deletion fails keeps its resources and its
+ * slot; the others still proceed. Parent teardown deletes the same resources
+ * before releasing anything, so a namespace Cloudflare refuses to delete
+ * (CORE-302) also fails the parent's destroy: it stays `deleting`, retried by the
+ * hourly cleanup, and holds both slots until Cloudflare allows the delete.
+ */
+export async function retireStaleChildren(
+  record: RemoteEnvironment,
+  live: ReadonlySet<string>,
+  actions: {
+    persist: (record: RemoteEnvironment) => Promise<void>;
+    /** Delete one child's resources, persisting each; throw when any remains. */
+    removeChild: (owned: OwnedResources) => Promise<void>;
+    log: (event: Record<string, unknown>) => void;
+    release?: typeof releaseQuota;
+  },
+): Promise<{ retired: string[]; failed: string[] }> {
+  validateRemoteEnvironment(record);
+  const retired: string[] = [];
+  const failed: string[] = [];
+  for (const owned of record.resources) {
+    if (live.has(owned.id) || !childOutstanding(owned)) continue;
+    actions.log({
+      event: "remote.child_stale",
+      parent: record.id,
+      id: owned.id,
+      resources: { ...owned.resources },
+      ...(owned.quota ? { quota: owned.quota.state } : {}),
+    });
+    try {
+      await actions.removeChild(owned);
+      if (Object.values(owned.resources).some((state) => state !== "deleted"))
+        throw new Error("Child resources remain after cleanup.");
+      await releaseChild(record, owned, actions.persist, actions.release);
+      retired.push(owned.id);
+      actions.log({
+        event: "remote.child_released",
+        parent: record.id,
+        id: owned.id,
+        ...(owned.quota ? { quota: owned.quota.state } : {}),
+      });
+    } catch (error) {
+      failed.push(owned.id);
+      actions.log({
+        event: "remote.child_retire_failed",
+        parent: record.id,
+        id: owned.id,
+        resources: { ...owned.resources },
+        ...(owned.quota ? { quota: owned.quota.state } : {}),
+        message: error instanceof Error ? error.message : String(error),
+        note: "Its resources and reservation stay journaled; parent destroy retries the deletion and releases the slot only once it succeeds.",
+      });
+    }
+  }
+  return { retired, failed };
+}
+
 /** Commit the last runtime-dependent cleanup before deleting its only endpoint. */
 export async function teardownRemote(
   record: RemoteEnvironment,
@@ -285,20 +408,7 @@ export async function teardownRemote(
   }
   // Worker deletion leaves its separately billed Container application behind.
   await actions.deleteApplication();
-  for (const owned of record.resources) {
-    if (!owned.quota) continue;
-    const owner = {
-      id: owned.id,
-      account: owned.account,
-      root: record.root,
-      expires: owned.expires!,
-      quota: owned.quota,
-    };
-    await releaseQuota(owner, async () => {
-      owned.quota = owner.quota;
-      await actions.persist(record);
-    });
-  }
+  for (const owned of record.resources) await releaseChild(record, owned, actions.persist);
   await releaseQuota(record, actions.persist);
   record.status = "deleted";
   await actions.persist(record);

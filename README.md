@@ -592,6 +592,26 @@ before stopping; reconnect is not a backup or a promise of persistent disk.
 Restart requires source synchronization and installation again. Disconnecting
 a client is not a stop or a teardown; remote processes can keep running.
 
+A lost disk also loses the hosted `gma-` child journals, so the new container
+cannot destroy the children it replaces. Before installing, remote setup collects
+the control Worker's ownership records and then lists the child journals on the
+current disk. A child that still holds resources or a slot but has no journal
+there is stale: its resources are deleted from this host with your `cf` login,
+and only then is its reservation released (`remote.child_stale`,
+`remote.child_released`). A child mid-setup on the current disk always has its
+journal, since a child writes its journal before its ownership record. If the
+listing fails, or lists anything but `gma-` ids, setup logs
+`remote.child_retire_skipped` and continues; a listing command still running
+after it was stopped fails setup instead. A child whose deletion fails keeps its
+resources and slot (`remote.child_retire_failed`), and `destroy` retries the
+deletion before releasing anything. An Artifacts namespace Cloudflare refuses to
+delete therefore also fails the parent's `destroy`: the parent stays `deleting`,
+the hourly cleanup retries it, and both slots stay reserved until Cloudflare
+allows the delete. A child its container already retired as orphaned (slot
+released, only such a namespace left) is not retried by setup. Collected
+resource states only move forward, so a lost container's record never undoes a
+deletion.
+
 Use `destroy` for owned app-resource, control Worker and Container application
 cleanup; `stop` alone is not cleanup. Child and parent quota reservations are
 released only after physical cleanup succeeds and the pinned authority

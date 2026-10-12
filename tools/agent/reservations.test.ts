@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { advanceQuota } from "./quota.ts";
+import type { QuotaOwner } from "./quota.ts";
+import { retireStaleChildren } from "./remote-environment.ts";
+import type { RemoteEnvironment } from "./remote-environment.ts";
 import { mergeOwnershipQuota } from "./remote-protocol.ts";
 import {
   EXPIRED_GRACE_MS,
@@ -104,6 +107,58 @@ await test("missing journal directories are empty, not an error", async () => {
     const view = await readJournals(root);
     assert.equal(view.live.size, 0);
     assert.equal(view.released.size, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+await test("a stale child the host retired classifies as released-locally (CORE-374)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "gitmatrix-reservations-retired-"));
+  try {
+    await mkdir(join(root, "remote", "environments"), { recursive: true });
+    const child = (n: number) => ({
+      id: `gma-mga0000${n}-${String(n).repeat(12)}`,
+      account: "b".repeat(32),
+      expires: 86_401_000,
+      quota: quota("reserved"),
+      resources: { artifacts: "created" as const },
+    });
+    const record: RemoteEnvironment = {
+      version: 1,
+      id: `gmr-${"a".repeat(24)}`,
+      root: "/work/tree",
+      account: "b".repeat(32),
+      token: "c".repeat(64),
+      previewToken: "d".repeat(64),
+      created: 1000,
+      expires: 86_401_000,
+      status: "ready",
+      installed: true,
+      quota: quota("reserved"),
+      resources: [child(1), child(2)],
+    };
+    const [stale, replacement] = record.resources.map((owned) => owned.id) as [string, string];
+    const persist = (value: RemoteEnvironment) =>
+      writeFile(join(root, "remote", "environments", `${value.id}.json`), JSON.stringify(value));
+    await retireStaleChildren(record, new Set([replacement]), {
+      persist,
+      async removeChild(owned) {
+        owned.resources.artifacts = "deleted";
+        await persist(record);
+      },
+      log: () => {},
+      async release<T extends QuotaOwner>(owner: T, write: (value: T) => Promise<void>) {
+        owner.quota!.state = "released";
+        await write(owner);
+      },
+    });
+    const view = await readJournals(root);
+    const classify = (id: string) => classifyReservation({ id, host: null }, view, host, authority);
+    // Its row (if the authority still lists it) is safe to release again; the
+    // replacement and the parent stay live.
+    assert.equal(classify(stale), "released-locally");
+    assert.equal(classify(replacement), "live");
+    assert.equal(classify(record.id), "live");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

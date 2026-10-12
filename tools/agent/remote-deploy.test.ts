@@ -7,8 +7,13 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { teardownRemote, validateRemoteEnvironment } from "./remote-environment.ts";
-import type { RemoteEnvironment } from "./remote-environment.ts";
+import {
+  retireStaleChildren,
+  teardownRemote,
+  validateRemoteEnvironment,
+} from "./remote-environment.ts";
+import type { OwnedResources, RemoteEnvironment } from "./remote-environment.ts";
+import type { QuotaOwner } from "./quota.ts";
 import {
   authenticate,
   nextCredentialRefresh,
@@ -760,5 +765,166 @@ await describe("cf-managed OAuth renewal", async () => {
       nextCredentialRefresh({ token: "access", account: "account", expires: 1000 }, 1000),
       1000,
     );
+  });
+});
+
+await describe("stale hosted child retirement (CORE-374)", async () => {
+  const authority = "https://quota.example";
+  const child = (n: number, quota: "reserved" | "released", artifacts: "created" | "deleted") => ({
+    id: `gma-mga0000${n}-${String(n).repeat(12)}`,
+    account: "b".repeat(32),
+    expires: 86_401_000,
+    quota: { authority, state: quota },
+    resources: { artifacts, vectors: "deleted" },
+  });
+  function fixture() {
+    let disk: RemoteEnvironment = {
+      version: 1,
+      id: `gmr-${"a".repeat(24)}`,
+      root: "/work/tree",
+      account: "b".repeat(32),
+      token: "c".repeat(64),
+      previewToken: "d".repeat(64),
+      created: 1000,
+      expires: 86_401_000,
+      status: "ready",
+      installed: true,
+      quota: { authority, state: "reserved" },
+      resources: [
+        child(1, "reserved", "created"),
+        child(2, "reserved", "created"),
+        child(3, "released", "deleted"),
+        child(4, "reserved", "created"),
+      ] as OwnedResources[],
+    };
+    const events: string[] = [];
+    const logs: Record<string, unknown>[] = [];
+    const refuse = new Set<string>();
+    const failRelease = new Set<string>();
+    return {
+      events,
+      logs,
+      refuse,
+      failRelease,
+      read: () => structuredClone(disk),
+      async run(live: string[]) {
+        const record = structuredClone(disk);
+        return retireStaleChildren(record, new Set(live), {
+          async persist(value) {
+            validateRemoteEnvironment(value);
+            disk = structuredClone(value);
+          },
+          async removeChild(owned) {
+            events.push(`remove ${owned.id}`);
+            if (refuse.has(owned.id)) throw new Error("namespace is not empty");
+            owned.resources.artifacts = "deleted";
+            disk = structuredClone(record);
+          },
+          log: (event) => logs.push(event),
+          async release<T extends QuotaOwner>(owner: T, persist: (value: T) => Promise<void>) {
+            events.push(`release ${owner.id}`);
+            if (failRelease.has(owner.id)) throw new Error("release interrupted");
+            owner.quota!.state = "released";
+            await persist(owner);
+          },
+        });
+      },
+    };
+  }
+  const id = (n: number) => child(n, "reserved", "created").id;
+  const states = (record: RemoteEnvironment) =>
+    Object.fromEntries(
+      record.resources.map((owned) => [owned.id, [owned.resources.artifacts, owned.quota?.state]]),
+    );
+
+  await it("deletes before releasing, and only children absent from the disk", async () => {
+    const state = fixture();
+    const result = await state.run([id(2)]);
+    assert.deepEqual(result, { retired: [id(1), id(4)], failed: [] });
+    assert.deepEqual(state.events, [
+      `remove ${id(1)}`,
+      `release ${id(1)}`,
+      `remove ${id(4)}`,
+      `release ${id(4)}`,
+    ]);
+    assert.deepEqual(states(state.read()), {
+      [id(1)]: ["deleted", "released"],
+      [id(2)]: ["created", "reserved"],
+      [id(3)]: ["deleted", "released"],
+      [id(4)]: ["deleted", "released"],
+    });
+    assert.deepEqual(
+      state.logs.map((event) => [event.event, event.id]),
+      [
+        ["remote.child_stale", id(1)],
+        ["remote.child_released", id(1)],
+        ["remote.child_stale", id(4)],
+        ["remote.child_released", id(4)],
+      ],
+    );
+  });
+
+  await it("keeps a refused child's resources and slot, and still retires the others", async () => {
+    const state = fixture();
+    state.refuse.add(id(1));
+    const result = await state.run([id(2)]);
+    assert.deepEqual(result, { retired: [id(4)], failed: [id(1)] });
+    assert.ok(!state.events.includes(`release ${id(1)}`));
+    assert.deepEqual(states(state.read())[id(1)], ["created", "reserved"]);
+    assert.deepEqual(states(state.read())[id(4)], ["deleted", "released"]);
+    const failure = state.logs.find((event) => event.event === "remote.child_retire_failed");
+    assert.equal(failure?.id, id(1));
+    assert.match(String(failure?.message), /namespace is not empty/);
+  });
+
+  await it("leaves a child its container already orphaned, unless it still holds a slot", async () => {
+    const orphan = (n: number, quota: "reserved" | "released") => ({
+      ...child(n, quota, "deleted"),
+      resources: { artifacts: "orphaned" as const, vectors: "deleted" as const },
+    });
+    const record: RemoteEnvironment = {
+      ...fixture().read(),
+      // CORE-302 inside the container: slot released, only a refused namespace left.
+      resources: [orphan(5, "released"), orphan(6, "reserved")],
+    };
+    const removed: string[] = [];
+    const result = await retireStaleChildren(record, new Set(), {
+      persist: async () => {},
+      async removeChild(owned) {
+        removed.push(owned.id);
+        throw new Error("namespace is not empty");
+      },
+      log: () => {},
+      release: async () => assert.fail("released a child whose namespace remains"),
+    });
+    // The orphan holds no slot: its namespace is orphan handling's, not setup's.
+    assert.deepEqual(removed, [orphan(6, "reserved").id]);
+    assert.deepEqual(result, { retired: [], failed: [orphan(6, "reserved").id] });
+  });
+
+  await it("never releases a child whose cleanup left a resource behind", async () => {
+    const state = fixture();
+    const result = await retireStaleChildren(state.read(), new Set([id(2), id(4)]), {
+      persist: async () => {},
+      removeChild: async () => {},
+      log: () => {},
+      release: async () => assert.fail("released with resources left"),
+    });
+    assert.deepEqual(result, { retired: [], failed: [id(1)] });
+  });
+
+  await it("resumes an interrupted release, and a retired child is never touched again", async () => {
+    const state = fixture();
+    state.failRelease.add(id(1));
+    assert.deepEqual(await state.run([id(2), id(4)]), { retired: [], failed: [id(1)] });
+    assert.deepEqual(states(state.read())[id(1)], ["deleted", "reserved"]);
+    state.failRelease.clear();
+    state.events.length = 0;
+    assert.deepEqual(await state.run([id(2), id(4)]), { retired: [id(1)], failed: [] });
+    assert.deepEqual(state.events, [`remove ${id(1)}`, `release ${id(1)}`]);
+    assert.deepEqual(states(state.read())[id(1)], ["deleted", "released"]);
+    state.events.length = 0;
+    assert.deepEqual(await state.run([id(2), id(4)]), { retired: [], failed: [] });
+    assert.deepEqual(state.events, []);
   });
 });

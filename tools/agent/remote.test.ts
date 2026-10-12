@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -11,7 +11,13 @@ import {
   validateRemoteEnvironment,
 } from "./remote-environment.ts";
 import type { RemoteEnvironment } from "./remote-environment.ts";
-import { commandExit, credentialFile, remoteRequest } from "./remote.ts";
+import {
+  RemoteCommandStuck,
+  capture,
+  commandExit,
+  credentialFile,
+  remoteRequest,
+} from "./remote.ts";
 import { unitTestEnvironment } from "./environment.ts";
 
 function environment(): RemoteEnvironment {
@@ -735,6 +741,8 @@ if (args.join(' ') === '-o json api GET /environments') {
         await remoteMain(record.root, ["logs", "fixture"]);
         const journal = JSON.parse(await readFile(join(remoteRegistry, "environments", record.id + ".json"), "utf8"));
         assert.deepEqual(journal.resources.map((owned) => owned.quota.state), ["released", "reserved", "reserved"]);
+        // Resource states are forward-only too: a lagging "created" never undoes a deletion (CORE-374).
+        assert.deepEqual(journal.resources.map((owned) => owned.resources.artifacts), ["deleted", "created", "created"]);
         const longAgo = Date.now() - 3 * 86_400_000;
         const rowsPath = ${JSON.stringify(join(directory, "rows.json"))};
         const initialRows = JSON.stringify([
@@ -801,4 +809,280 @@ if (args.join(' ') === '-o json api GET /environments') {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+await it("setup retires children a lost container disk stranded, never live or unprobed ones (CORE-374)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "remote-stale-children-"));
+  try {
+    const parent = environment();
+    const child = (n: number) => `gma-mga0000${n}-${String(n).repeat(12)}`;
+    await writeFile(join(directory, "machine-id"), "fixture-machine\n");
+    await writeFile(
+      join(directory, "rows.json"),
+      JSON.stringify([1, 2, 5].map((n) => ({ id: child(n), host: null }))),
+    );
+    // Fixture quota authority: lists rows.json, records each DELETE.
+    await writeFile(
+      join(directory, "gm"),
+      `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (process.env.GM_SERVER !== 'https://quota.example') process.exit(3);
+const path = ${JSON.stringify(join(directory, "rows.json"))};
+const rows = JSON.parse(fs.readFileSync(path, 'utf8'));
+if (args.join(' ') === '-o json api GET /environments') {
+  console.log(JSON.stringify({ maximum: 4, used: rows.length, reservations: rows }));
+} else if (args.slice(0, 4).join(' ') === '-o json api DELETE') {
+  const id = args[4].split('/').at(-1);
+  fs.writeFileSync(path, JSON.stringify(rows.filter((row) => row.id !== id)));
+  console.log(JSON.stringify({ id, released: true, removed: rows.some((row) => row.id === id) }));
+} else process.exit(4);
+`,
+      { mode: 0o700 },
+    );
+    // Fixture cf: records every call; the namespaces list no repositories.
+    await writeFile(
+      join(directory, "cf"),
+      `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(join(directory, "cf.log"))}, JSON.stringify(args) + '\\n');
+console.log(args.includes('repos') && args.includes('list') ? '[]' : '{}');
+`,
+      { mode: 0o700 },
+    );
+    await promisify(execFile)(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `
+        import assert from "node:assert/strict";
+        import { mkdir, readFile, writeFile } from "node:fs/promises";
+        import { join } from "node:path";
+        import { journalProbe, remoteRequest, retireLostChildren } from ${JSON.stringify(new URL("./remote.ts", import.meta.url).href)};
+        import { persistRemote, remoteRegistry } from ${JSON.stringify(new URL("./remote-environment.ts", import.meta.url).href)};
+        const authority = "https://quota.example";
+        const state = join(process.env.HOME, ".local/state/gitmatrix-agent");
+        await mkdir(state, { recursive: true });
+        await writeFile(join(state, "limits.json"), JSON.stringify({ maximum: 4, authority }));
+        const record = ${JSON.stringify(parent)};
+        record.root = process.env.HOME;
+        record.created = Date.now();
+        record.expires = record.created + 60_000;
+        record.quota = { authority, state: "reserved" };
+        const owned = (id, quota, artifacts) => ({ id, account: record.account, expires: record.expires,
+          quota: { authority, state: quota }, resources: { artifacts, vectors: "deleted" } });
+        const [stale, present, done, unprobed] = [${[1, 2, 3, 5].map((n) => JSON.stringify(child(n))).join(", ")}];
+        record.resources = [owned(stale, "reserved", "pending"), owned(present, "reserved", "created"),
+          owned(done, "released", "deleted")];
+        await persistRemote(record);
+        // The lost container's ownership records never change again.
+        const reported = [owned(stale, "reserved", "created"), owned(present, "reserved", "created")];
+        let probe = { text: "", exitCode: 0 };
+        const commands = [];
+        const routes = [];
+        let stopped = false;
+        globalThis.fetch = async (input, init = {}) => {
+          const route = new URL(input).pathname.replace("/__remote", "");
+          routes.push(route.replace(/[a-f0-9]{32}/, "ID"));
+          if (route === "/ownership") return Response.json({ environments: reported });
+          if (route === "/commands") {
+            stopped = false;
+            commands.push(JSON.parse(init.body));
+            return Response.json({ id: commands.at(-1).id });
+          }
+          if (/^\\/processes\\/[a-f0-9]{32}\\/stop$/.test(route)) {
+            stopped = true;
+            return Response.json({ running: false });
+          }
+          assert.match(route, /^\\/processes\\/[a-f0-9]{32}\\/logs$/);
+          const done = !probe.hang || (probe.hang === "until-stop" && stopped);
+          return Response.json({ text: probe.text, exitCode: probe.exitCode, nextOffset: probe.text.length, done });
+        };
+        const cfCalls = async () => (await readFile(${JSON.stringify(join(directory, "cf.log"))}, "utf8").catch(() => ""))
+          .split("\\n").filter(Boolean).map((line) => JSON.parse(line));
+        const rows = async () => JSON.parse(await readFile(${JSON.stringify(join(directory, "rows.json"))}, "utf8")).map((row) => row.id);
+        const journal = async () => Object.fromEntries(JSON.parse(await readFile(join(remoteRegistry, "environments", record.id + ".json"), "utf8"))
+          .resources.map((child) => [child.id, [child.resources.artifacts, child.quota.state]]));
+        const output = [];
+        const capture = async (action) => {
+          const [log, error] = [console.log, console.error];
+          console.log = console.error = (line) => output.push(JSON.parse(line));
+          try { await action(); } finally { [console.log, console.error] = [log, error]; }
+        };
+        const listing = (...ids) => "installing\\n" + JSON.stringify({ event: "environment.journals", ids }) + "\\n";
+
+        // A child mid-setup on the current disk is listed, so only the lost one is retired.
+        probe = { text: listing(present, done), exitCode: 0 };
+        await capture(() => retireLostChildren(record, remoteRequest(record)));
+        // Collected strictly before the listing: the order is what makes absence mean stale.
+        assert.deepEqual(routes, ["/ownership", "/commands", "/processes/ID/logs"]);
+        assert.deepEqual(commands[0].argv, ["node", "--input-type=module", "-e", journalProbe]);
+        assert.equal(commands[0].kind, "foreground");
+        assert.deepEqual(await cfCalls(), [
+          ["artifacts", "namespaces", "repos", "list", "--namespace", stale, "--limit", "100"],
+          ["artifacts", "namespaces", "delete", stale, "--force"],
+        ]);
+        assert.deepEqual(await rows(), [present, unprobed]);
+        assert.deepEqual(await journal(), { [stale]: ["deleted", "released"],
+          [present]: ["created", "reserved"], [done]: ["deleted", "released"] });
+        assert.deepEqual(output.map((line) => [line.event, line.id]),
+          [["remote.child_stale", stale], ["remote.child_released", stale]]);
+
+        // Retired is final: the lagging records cannot resurrect it, and nothing repeats.
+        output.length = 0;
+        await capture(() => retireLostChildren(record, remoteRequest(record)));
+        assert.equal((await cfCalls()).length, 2);
+        assert.deepEqual(await journal(), { [stale]: ["deleted", "released"],
+          [present]: ["created", "reserved"], [done]: ["deleted", "released"] });
+        assert.deepEqual(output, []);
+
+        // Without a trustworthy listing nothing is retired, and setup continues.
+        reported.push(owned(unprobed, "reserved", "created"));
+        // Redaction or a stray file must never make a live id look stale.
+        for (const failed of [{ text: listing(), exitCode: 1 }, { text: "no listing\\n", exitCode: 0 },
+          { text: listing(present, "gma-[redacted]"), exitCode: 0 }, { text: listing(present, "registry.lock"), exitCode: 0 }]) {
+          probe = failed;
+          output.length = 0;
+          await capture(() => retireLostChildren(record, remoteRequest(record)));
+          assert.deepEqual(output.map((line) => line.event), ["remote.child_retire_skipped"]);
+          assert.equal((await cfCalls()).length, 2);
+          assert.deepEqual(await rows(), [present, unprobed]);
+          assert.deepEqual((await journal())[unprobed], ["created", "reserved"]);
+        }
+
+        // A probe stopped at its deadline that then ends is only a failed listing.
+        let clock = 0;
+        const timing = { timeoutMs: 1_000, settleMs: 5_000, now: () => clock, pause: async (ms) => { clock += ms; } };
+        probe = { text: "", exitCode: 0, hang: "until-stop" };
+        output.length = 0;
+        routes.length = 0;
+        await capture(() => retireLostChildren(record, remoteRequest(record), timing));
+        assert.deepEqual(output.map((line) => line.event), ["remote.child_retire_skipped"]);
+        assert.match(output[0].message, /it was stopped/);
+        assert.equal(routes.filter((route) => route === "/processes/ID/stop").length, 1);
+        // One still running after its stop fails setup clearly, not as vp install's 409.
+        probe = { text: "", exitCode: 0, hang: "forever" };
+        output.length = 0;
+        routes.length = 0;
+        clock = 0;
+        await assert.rejects(capture(() => retireLostChildren(record, remoteRequest(record), timing)),
+          /still running after it was stopped/);
+        assert.deepEqual(output, []);
+        assert.equal(routes.filter((route) => route === "/processes/ID/stop").length, 1);
+        assert.ok(clock >= 6_000 && clock <= 7_000, String(clock));
+        assert.equal((await cfCalls()).length, 2);
+        assert.deepEqual((await journal())[unprobed], ["created", "reserved"]);
+        `,
+      ],
+      {
+        env: {
+          ...unitTestEnvironment(process.env),
+          HOME: directory,
+          PATH: `${directory}:${process.env.PATH}`,
+          GITMATRIX_AGENT_MACHINE_ID_FILE: join(directory, "machine-id"),
+        },
+        timeout: 15_000,
+      },
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+await it("setup retires stranded children after syncing sources and before installing (CORE-374)", async () => {
+  const source = await readFile(new URL("./remote.ts", import.meta.url), "utf8");
+  const setup = source.slice(source.indexOf('if (operation === "setup") {'));
+  const order = [
+    'await json(request, "/start", {});',
+    "await syncSources(root, request);",
+    "await retireLostChildren(record, request);",
+    'launch(record, request, ["vp", "install"])',
+    '"tools/agent/main.ts", "setup"',
+  ].map((step) => setup.indexOf(step));
+  assert.ok(
+    order.every((index) => index >= 0),
+    String(order),
+  );
+  assert.deepEqual(
+    order,
+    order.toSorted((a, b) => a - b),
+  );
+});
+
+await describe("bounded remote command capture (CORE-374)", async () => {
+  function runtime(logs: (offset: number, stopped: boolean) => unknown) {
+    const calls: string[] = [];
+    let stopped = false;
+    let clock = 0;
+    const request = async (path: string, init: RequestInit = {}) => {
+      const route = path.replace(/[a-f0-9]{32}/, "ID");
+      calls.push(`${init.method ?? "GET"} ${route}`);
+      if (path === "/commands") return Response.json({});
+      if (route === "/processes/ID/stop") {
+        stopped = true;
+        return Response.json({ running: false });
+      }
+      const offset = Number(new URL(path, "https://runtime.invalid").searchParams.get("offset"));
+      const chunk = logs(offset, stopped);
+      if (chunk instanceof Error) throw chunk;
+      return Response.json(chunk);
+    };
+    const timing = {
+      timeoutMs: 1_000,
+      settleMs: 5_000,
+      now: () => clock,
+      pause: async (milliseconds: number) => {
+        clock += milliseconds;
+      },
+    };
+    return { calls, request, timing, clock: () => clock };
+  }
+
+  await it("accumulates every chunk from its cursor and keeps a bounded tail", async () => {
+    const chunks = [
+      { text: "x".repeat(70_000), nextOffset: 70_000, done: false },
+      { text: "a\n", nextOffset: 70_002, done: false },
+      { text: "END", nextOffset: 70_005, done: true, exitCode: 0 },
+    ];
+    const offsets: number[] = [];
+    const fake = runtime((offset) => {
+      offsets.push(offset);
+      return chunks[offsets.length - 1];
+    });
+    const { code, text } = await capture(fake.request, ["true"], fake.timing);
+    assert.equal(code, 0);
+    assert.deepEqual(offsets, [0, 70_000, 70_002]);
+    assert.equal(text.length, 64 * 1024);
+    assert.ok(text.endsWith("xa\nEND"));
+    assert.ok(!fake.calls.some((call) => call.endsWith("/stop")));
+  });
+
+  await it("stops a command at its deadline and reports it once it has ended", async () => {
+    const fake = runtime((offset, stopped) =>
+      stopped
+        ? { text: "", nextOffset: offset, done: true, exitCode: 143 }
+        : { text: "", nextOffset: offset, done: false },
+    );
+    const failure = await capture(fake.request, ["sleep", "inf"], fake.timing).catch(
+      (error: unknown) => error,
+    );
+    assert.ok(failure instanceof Error && !(failure instanceof RemoteCommandStuck));
+    assert.match(failure.message, /did not finish in time; it was stopped/);
+    assert.equal(fake.calls.filter((call) => call === "POST /processes/ID/stop").length, 1);
+  });
+
+  await it("fails as stuck when a stopped command outlives the settle bound", async () => {
+    let reads = 0;
+    const fake = runtime((offset, stopped) =>
+      // An unreadable log while settling is not evidence that the command ended.
+      stopped && ++reads % 2 === 0
+        ? new Error("log unavailable")
+        : { text: "", nextOffset: offset, done: false },
+    );
+    await assert.rejects(capture(fake.request, ["sleep", "inf"], fake.timing), RemoteCommandStuck);
+    assert.equal(fake.calls.filter((call) => call === "POST /processes/ID/stop").length, 1);
+    assert.ok(fake.clock() >= 6_000 && fake.clock() <= 7_000, String(fake.clock()));
+  });
 });
