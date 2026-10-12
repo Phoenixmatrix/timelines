@@ -202,6 +202,20 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
   await expect.element(diff).toMatchTextContent(/src\/rank\.ts/);
   await expect.element(diff.getByText("+byRecency()")).toBeVisible();
   await visual("Timeline story - step open");
+  // The diff gets the step's width, below its context, however wide the
+  // screen (CORE-394): it was a narrow strip beside the context.
+  for (const width of [1280, 1600]) {
+    await page.viewport(width, 900);
+    await expect
+      .poll(() => {
+        const panel = step.element().getBoundingClientRect();
+        const changes = diff.element().getBoundingClientRect();
+        const why = context.element().getBoundingClientRect();
+        return changes.width >= panel.width - 64 && why.bottom <= changes.top;
+      })
+      .toBe(true);
+  }
+  await page.viewport(1280, 900);
   const commitLink = step.getByRole("link", { name: rank.slice(0, 7), exact: true });
   const commitUrl = new URL(commitLink.element().getAttribute("href")!, location.origin);
   expect(commitUrl.searchParams.get("source")).toBe(source.sourceId);
