@@ -83,6 +83,8 @@ const feed = (q: string) =>
     trackers: new Map([["orbit", "orbit"]]),
     visibleRepoIds: new Set(["engine", "website"]),
     workspaces: new Map([["ws-platform", "platform"]]),
+    // OPS is unknown here: its facet falls back to the key.
+    teams: new Map([["ENG", "Engineering"]]),
     query: parseReleaseQuery(q),
     now: Date.parse("2026-10-01T00:00:00Z"),
     limit: 50,
@@ -137,6 +139,7 @@ describe("release feed", () => {
           trackers,
           visibleRepoIds: new Set(["engine"]),
           workspaces: new Map(),
+          teams: new Map(),
           query: parseReleaseQuery(q),
           now: Date.parse("2026-10-01T00:00:00Z"),
           limit: 50,
@@ -185,6 +188,7 @@ describe("release feed", () => {
         trackers: new Map([["orbit", "orbit"]]),
         visibleRepoIds: new Set(["engine"]),
         workspaces: new Map(),
+        teams: new Map(),
         query: parseReleaseQuery(q),
         timeline,
         now: 0,
@@ -218,8 +222,9 @@ describe("release feed", () => {
       ["Faster search (draft)", "website", "@day:2026-09-21"],
       ["Bump deps", "engine", "@day:2026-09-20"],
     ]);
+    // Teams read by name, so "Engineering 2" can't pass for an issue key like ENG-2 (CORE-395).
     expect(all.facets.teams).toEqual([
-      { value: "eng", label: "ENG", count: 2 },
+      { value: "eng", label: "Engineering", count: 2 },
       { value: "ops", label: "OPS", count: 1 },
     ]);
     expect(all.facets.releases.map((f) => f.label)).toEqual(["2026-09-20", "2026-09-21"]);
@@ -260,6 +265,7 @@ describe("release feed", () => {
       trackers: new Map([["orbit", "orbit"]]),
       visibleRepoIds: new Set(["engine", "website"]),
       workspaces: new Map(),
+      teams: new Map(),
       query: parseReleaseQuery(""),
       now: 0,
       limit: 1,
@@ -282,6 +288,7 @@ describe("release feed", () => {
         trackers: new Map([["orbit", "orbit"]]),
         visibleRepoIds: new Set(["engine"]),
         workspaces: new Map(),
+        teams: new Map(),
         query: parseReleaseQuery(q),
         now: 0,
         limit: 50,
@@ -327,7 +334,12 @@ describe("release feed", () => {
       DB: d1(sqlite),
       AI: {},
       JOBS: { send: async (body: unknown) => void sent.push(body) },
-      TRACKER: { getByName: () => ({ workspaceSlugs: async () => ({ ok: true, value: [] }) }) },
+      TRACKER: {
+        getByName: () => ({
+          workspaceSlugs: async () => ({ ok: true, value: [] }),
+          teamNames: async () => ({ ok: true, value: [] }),
+        }),
+      },
     } as unknown as Env;
     const actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
     await expect(releaseFeed(env, null, "orbit", "")).rejects.toMatchObject({ status: 401 });

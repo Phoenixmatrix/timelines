@@ -48,7 +48,12 @@ function fixture() {
     DB: d1(sqlite),
     AI: {},
     JOBS: { send: async () => {} },
-    TRACKER: { getByName: () => ({ workspaceSlugs: async () => ({ ok: true, value: [] }) }) },
+    TRACKER: {
+      getByName: () => ({
+        workspaceSlugs: async () => ({ ok: true, value: [] }),
+        teamNames: async () => ({ ok: true, value: [] }),
+      }),
+    },
   } as unknown as Env;
   vi.mocked(chatText).mockImplementation(async (e) => {
     await recordAiCall(e, "test-model", { input: 100, output: 40 });

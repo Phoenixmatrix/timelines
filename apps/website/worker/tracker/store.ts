@@ -1296,6 +1296,10 @@ export class TrackerStore {
   workspaceSlugs(): { id: string; slug: string }[] {
     return this.all<Workspace>("workspace").map(({ id, slug }) => ({ id, slug }));
   }
+  /** Every team's key and name, archived ones included, for labelling filters (CORE-395). */
+  teamNames(): { key: string; name: string }[] {
+    return this.all<Team>("team").map(({ key, name }) => ({ key, name }));
+  }
   /** Issues by key, as release notes see them; unknown keys are skipped. */
   issuesByKey(keys: string[]): ShippedIssue[] {
     if (keys.length > 500) fail("invalid_input", "Look up at most 500 keys at once.");
