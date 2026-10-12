@@ -257,8 +257,148 @@ describe("issue completion credit", () => {
     later(1);
     t.store.landTimeline(t.ann, "fix");
     t.end(fix.id);
-    expect(t.issue("a")).toMatchObject({ status: "done", completion: credit });
+    expect(t.issue("a")).toMatchObject({
+      status: "done",
+      completion: credit,
+      doneIn: null,
+      claim: null,
+    });
     expect(credit.at > old.at).toBe(true);
+  });
+
+  describe("abandoning a timeline that finished again what main had finished (CORE-375)", () => {
+    const leases = (t: ReturnType<typeof setup>) =>
+      (t.db.prepare(`SELECT count(*) AS n FROM leases WHERE issue_id = 'a'`).get() as { n: number })
+        .n;
+    /** Ann finishes `a` on main (or cancels it); the agent finishes it again in `fix`. */
+    const refinished = (t: ReturnType<typeof setup>, mainStatus = "done") => {
+      t.status(t.ann, "a", mainStatus);
+      const old = t.issue("a").completion ?? null;
+      const fix = t.fork("fix");
+      later(1);
+      t.status(t.ann, "a", "todo", "fix");
+      t.finish(t.agent, "a", "fix");
+      expect(t.issue("a", "fix")).toMatchObject({
+        status: "done",
+        completion: { actorId: "agt-bot" },
+      });
+      return { old, fix };
+    };
+
+    test.each(["done", "canceled"])("main keeps its %s status and credit", (mainStatus) => {
+      const t = setup();
+      const { old, fix } = refinished(t, mainStatus);
+      // As stored before the fix too: main names the timeline, which holds the lease.
+      expect(t.issue("a")).toMatchObject({
+        status: mainStatus,
+        doneIn: { id: fix.id, slug: "fix" },
+        claim: { retainedIn: { id: fix.id, slug: "fix" } },
+      });
+      expect(leases(t)).toBe(1);
+      later(1);
+      value(t.tracker.abandonTimeline(t.ann, "fix", {}));
+      expect(t.issue("a")).toMatchObject({ status: mainStatus, doneIn: null, claim: null });
+      // Ann's credit (none for a cancel) stays: the agent's was the timeline's.
+      expect(t.issue("a").completion ?? null).toEqual(old);
+      expect(leases(t)).toBe(0);
+      // Not "ready again": it isn't.
+      expect(t.view().comments.filter((c) => c.issueId === "a" && c.kind === "comment")).toEqual(
+        [],
+      );
+      // The abandoned timeline still lists it as it finished it.
+      expect(value(t.tracker.timeline("fix", 0, 10)).issues).toMatchObject([
+        { id: "a", status: "done" },
+      ]);
+      // Abandoning again changes nothing.
+      const version = t.issue("a").version;
+      value(t.tracker.abandonTimeline(t.ann, "fix", {}));
+      expect(t.issue("a").version).toBe(version);
+    });
+
+    test("merged into a timeline abandoned first, then abandoned itself", () => {
+      const t = setup();
+      const ui = t.fork("ui");
+      const { old, fix } = refinished(t);
+      t.merge("fix", "ui");
+      expect(t.issue("a")).toMatchObject({
+        status: "done",
+        doneIn: { id: ui.id },
+        claim: { retainedIn: { id: ui.id } },
+      });
+      // Still done in fix, which merged it: fix holds it again.
+      value(t.tracker.abandonTimeline(t.ann, "ui", {}));
+      expect(t.issue("a")).toMatchObject({
+        status: "done",
+        completion: old,
+        doneIn: { id: fix.id, slug: "fix" },
+        claim: { retainedIn: { id: fix.id, slug: "fix" } },
+      });
+      value(t.tracker.abandonTimeline(t.ann, "fix", {}));
+      expect(t.issue("a")).toMatchObject({
+        status: "done",
+        completion: old,
+        doneIn: null,
+        claim: null,
+      });
+      expect(leases(t)).toBe(0);
+    });
+
+    test("merged into a timeline, abandoned before it", () => {
+      const t = setup();
+      const ui = t.fork("ui");
+      const { old } = refinished(t);
+      t.merge("fix", "ui");
+      // ui has the work now: abandoning fix leaves it with ui.
+      value(t.tracker.abandonTimeline(t.ann, "fix", {}));
+      expect(t.issue("a")).toMatchObject({ status: "done", doneIn: { id: ui.id } });
+      value(t.tracker.abandonTimeline(t.ann, "ui", {}));
+      expect(t.issue("a")).toMatchObject({
+        status: "done",
+        completion: old,
+        doneIn: null,
+        claim: null,
+      });
+      expect(leases(t)).toBe(0);
+    });
+
+    test("reopened and claimed on main since: the live claim is main's", () => {
+      const t = setup();
+      refinished(t);
+      // Main reopens it (dropping the lease fix kept) and the agent takes it on.
+      t.status(t.ann, "a", "todo");
+      t.mutate(t.agent, undefined, { kind: "issue.claim", id: "a", data: { agent: "desk" } });
+      expect(t.issue("a")).toMatchObject({
+        status: "in_progress",
+        doneIn: { slug: "fix" },
+        claim: { actorId: "agt-bot", agent: "desk" },
+      });
+      expect(t.issue("a").claim?.retainedIn).toBeUndefined();
+      value(t.tracker.abandonTimeline(t.ann, "fix", {}));
+      expect(t.issue("a")).toMatchObject({
+        status: "in_progress",
+        doneIn: null,
+        claim: { actorId: "agt-bot", agent: "desk" },
+      });
+      expect(t.issue("a").completion ?? null).toBeNull();
+      expect(leases(t)).toBe(1);
+      expect(t.view().comments.filter((c) => c.issueId === "a" && c.kind === "comment")).toEqual(
+        [],
+      );
+    });
+
+    test("a claim the timeline didn't keep stays", () => {
+      const t = setup();
+      refinished(t);
+      // No mutation leaves main done naming fix under a claim fix didn't keep
+      // (claiming needs todo; any status change on main drops the claim), so
+      // make that row directly: the guard must not release someone else's lease.
+      t.db.exec(`UPDATE issues SET data = json_remove(data, '$.claim.retainedIn') WHERE id = 'a'`);
+      const claim = t.issue("a").claim;
+      expect(t.issue("a")).toMatchObject({ status: "done", doneIn: { slug: "fix" } });
+      value(t.tracker.abandonTimeline(t.ann, "fix", {}));
+      expect(t.issue("a")).toMatchObject({ status: "done", doneIn: null, claim });
+      expect(leases(t)).toBe(1);
+    });
   });
 
   test("a person finishing again in a timeline what an agent had done takes the credit on landing", () => {

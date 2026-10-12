@@ -1518,7 +1518,9 @@ export class TrackerStore {
   /**
    * After a timeline is abandoned (CORE-74): its finished issues are ready on
    * main again, their leases released, with a note linking the timeline.
-   * Work a timeline merged into it still has stays done in that one.
+   * Work a timeline merged into it still has stays done in that one. An
+   * issue whose status on main is main's own keeps it, with its credit
+   * and claim (CORE-375).
    * Running it again changes nothing.
    */
   timelineAbandoned(access: Access, timeline: Timeline): TrackerEvent[] {
@@ -1549,10 +1551,23 @@ export class TrackerStore {
           (t) => (view(t).get("issue", issue.id) as Issue | null | undefined)?.status === "done",
         );
         const next: Issue = { ...issue, version: issue.version + 1, updatedAt: now };
+        // Only a status the timeline gave main is the timeline's to take back
+        // (CORE-375). Main had it done or canceled before the timeline finished
+        // it again, or has moved it since: that status, its credit and any live
+        // claim are main's. Only the lease the timeline kept goes.
+        const mains = issue.status !== "done_in_timeline";
         if (keeper) {
           next.doneIn = { id: keeper.id, slug: keeper.slug };
           // The timeline that merged the work keeps holding its lease (CORE-75).
           if (next.claim?.retainedIn) next.claim = { ...next.claim, retainedIn: next.doneIn };
+        } else if (mains) {
+          next.doneIn = null;
+          if (next.claim?.retainedIn?.id === timeline.id) {
+            next.claim = null;
+            next.handoff = null;
+            run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", issue.id));
+            run(this.sql, tracker.deleteFrom("offers").where("issue_id", "=", issue.id));
+          }
         } else {
           next.status = "todo";
           next.doneIn = null;
@@ -1562,7 +1577,9 @@ export class TrackerStore {
           run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", issue.id));
           run(this.sql, tracker.deleteFrom("offers").where("issue_id", "=", issue.id));
         }
+        // Its event still names the timeline (`before.doneIn`), which keeps listing it.
         events.push(this.write(meta, "issue", next));
+        if (mains && !keeper) continue;
         const note: Comment = {
           id: crypto.randomUUID(),
           issueId: issue.id,

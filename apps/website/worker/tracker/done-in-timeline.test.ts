@@ -336,6 +336,33 @@ describe("done in a timeline", () => {
     expect(t.view().comments.filter((c) => c.kind === "comment")).toHaveLength(1);
   });
 
+  test("abandoning leaves what main had finished itself done, and returns the rest", () => {
+    const t = setup();
+    t.finish("a");
+    const search = t.fork("search");
+    t.mutate("search", {
+      kind: "issue.update",
+      id: "a",
+      expectedVersion: t.issue("a", "search").version,
+      data: { status: "todo" },
+    });
+    t.finish("a", "search");
+    t.finish("b", "search");
+    expect(t.issue("a")).toMatchObject({ status: "done", doneIn: { id: search.id } });
+    expect(t.issue("b")).toMatchObject({ status: "done_in_timeline", doneIn: { id: search.id } });
+    value(t.tracker.abandonTimeline(t.access, "search", {}));
+    expect(t.issue("a")).toMatchObject({ status: "done", doneIn: null, claim: null });
+    expect(t.issue("b")).toMatchObject({ status: "todo", doneIn: null, claim: null });
+    const notes = t.view().comments.filter((c) => c.kind === "comment");
+    expect(notes.map((c) => c.issueId)).toEqual(["b"]);
+    expect(t.next()).toMatchObject({ issueId: "b" });
+    // Both stay listed with the status they had in it.
+    expect(value(t.tracker.timeline("search", 0, 10)).issues).toMatchObject([
+      { id: "a", status: "done" },
+      { id: "b", status: "done" },
+    ]);
+  });
+
   test("abandoning a timeline something merged into leaves that work done where it was", () => {
     const t = setup();
     const search = t.fork("search");
