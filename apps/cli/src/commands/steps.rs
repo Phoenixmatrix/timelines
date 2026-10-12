@@ -469,7 +469,14 @@ pub fn record(ws: &Workspace, oid: Oid, context: Value) -> Result<()> {
         upload.insert("harness".into(), json!(harness));
     }
     if !upload.contains_key("model") {
-        upload.insert("model".into(), json!(std::env::var("GM_MODEL").ok()));
+        let harness = upload
+            .get("harness")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        upload.insert(
+            "model".into(),
+            json!(crate::profile::step_model(harness.as_deref())),
+        );
     }
     upload.insert("changeId".into(), json!(ws.change_id(&ws.commit(oid)?)));
     upload.insert("commitOid".into(), json!(oid.to_string()));

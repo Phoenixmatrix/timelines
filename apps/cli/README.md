@@ -1021,6 +1021,12 @@ gm context sync                                     # retries uploads a push cou
   It reconnects from the last step it printed; `--count N` stops after N, and
   a feed the reader can't see is an error rather than a retry.
 
+- **The model** a step was made with is what's declared, never guessed
+  (CORE-397): the context's own `model`, else `GM_MODEL`, else, for a step an
+  agent's harness made, this checkout's agent profile (`gm agent configure
+--model`), then the harness's own setting (`ANTHROPIC_MODEL` for Claude
+  Code). A person's own commit carries none.
+
 - **Harness hooks** capture what the person tells the agent (CORE-241). For
   Claude Code, `gm agent setup` adds a `UserPromptSubmit` hook to
   `.claude/settings.json` (`gm hook claude-code`, run only if gm is

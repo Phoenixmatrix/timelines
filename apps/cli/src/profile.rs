@@ -258,6 +258,35 @@ pub fn declared_model(harness: Option<&str>) -> Option<String> {
         .filter(|model| !model.is_empty() && model.chars().count() <= 120)
 }
 
+/// The model a step was made with (CORE-397), as declared, never inferred:
+/// GM_MODEL; else, for a step an agent's harness made, this checkout's agent
+/// profile (`gm agent configure --model`), then the harness's own setting.
+pub fn step_model(harness: Option<&str>) -> Option<String> {
+    pick_model(
+        std::env::var("GM_MODEL").ok(),
+        harness,
+        harness.and_then(|_| current().1.model),
+        declared_model,
+    )
+}
+
+/// [`step_model`]'s choice, from what it was given.
+fn pick_model(
+    env: Option<String>,
+    harness: Option<&str>,
+    profile: Option<String>,
+    declared: impl Fn(Option<&str>) -> Option<String>,
+) -> Option<String> {
+    let clean = |model: String| {
+        let model = model.trim().to_string();
+        (!model.is_empty() && model.chars().count() <= 120).then_some(model)
+    };
+    env.and_then(clean).or_else(|| {
+        harness?;
+        profile.and_then(clean).or_else(|| declared(harness))
+    })
+}
+
 /// When an agent drives gm in a checkout whose agent has no model on record:
 /// what to tell it, so it records the model it knows it runs.
 pub fn model_notice() -> Option<String> {
@@ -454,6 +483,40 @@ fn resolve(project: &Project, local: &Local) -> Defaults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_steps_model_is_declared_never_inferred() {
+        let declared = |h: Option<&str>| (h == Some("claude-code")).then(|| "from-env".to_string());
+        // GM_MODEL wins, for anyone.
+        assert_eq!(
+            pick_model(
+                Some(" opus-x ".into()),
+                None,
+                Some("profile".into()),
+                declared
+            )
+            .as_deref(),
+            Some("opus-x")
+        );
+        // A person's own commit (no harness) carries no model.
+        assert_eq!(
+            pick_model(None, None, Some("profile".into()), declared),
+            None
+        );
+        // An agent's: its profile, then its harness's own setting.
+        assert_eq!(
+            pick_model(None, Some("codex"), Some("gpt-y".into()), declared).as_deref(),
+            Some("gpt-y")
+        );
+        assert_eq!(
+            pick_model(None, Some("claude-code"), None, declared).as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(
+            pick_model(None, Some("codex"), Some("  ".into()), declared),
+            None
+        );
+    }
 
     #[test]
     fn a_checkout_overrides_the_project() {
