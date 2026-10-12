@@ -34,6 +34,8 @@ import {
   sweepApprovedLandings,
   sweepLandings,
   sweepOwners,
+  sweepStalledLandings,
+  workerDeps,
 } from "./landing.ts";
 
 vi.mock("cloudflare:workers", () => ({
@@ -1471,6 +1473,306 @@ describe("approved but never landed (CORE-390)", () => {
     expect(await landing()).toBeNull();
     return { tracker, begin, mutate, checkpoint, landing };
   }
+
+  /**
+   * CORE-391: an approval whose landing began, but whose reply was lost:
+   * merging, with no merge run saved or started.
+   */
+  async function stalledIn(
+    t: Awaited<ReturnType<typeof setup>>,
+    owner: "orbit" | "ben",
+    repo: string,
+  ) {
+    const approved = await approveIn(t, owner, repo);
+    approved.tracker.beginLanding = ((...args: Parameters<typeof approved.begin>) => {
+      approved.begin(...args);
+      throw new Error("The reply was lost");
+    }) as typeof approved.tracker.beginLanding;
+    await settled(t.env, (deps) => retryApprovedLanding(t.env, deps, owner, "search"));
+    approved.tracker.beginLanding = approved.begin;
+    const landing = () => {
+      const reply = approved.tracker.landing("search");
+      if (!reply.ok) throw new Error(reply.error);
+      return reply.value!;
+    };
+    expect(landing()).toMatchObject({
+      state: "merging",
+      repos: [{ state: "merging", mergeRun: null }],
+    });
+    const runs = () =>
+      (
+        t.sqlite
+          .prepare("SELECT count(*) AS n FROM ci_runs WHERE landing_id = ?")
+          .get(landing().id) as { n: number }
+      ).n;
+    expect(runs()).toBe(0);
+    return { ...approved, stalled: landing, runs };
+  }
+  /** Run `fn` with the clock `minutes` ahead. */
+  async function later<T>(minutes: number, fn: () => Promise<T>): Promise<T> {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + minutes * 60_000);
+      return await fn();
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  test("a landing stalled before its merge run is restarted by the sweep, once (CORE-391)", async () => {
+    const t = await setup();
+    const orbit = await stalledIn(t, "orbit", "app");
+    const sweep = () => settled(t.env, (deps) => sweepLandings(t.env, deps));
+    // Under ten minutes old: it may still be on its way.
+    await sweep();
+    expect(orbit.runs()).toBe(0);
+    await later(11, sweep);
+    expect(orbit.runs()).toBe(1);
+    const moved = orbit.stalled();
+    expect(moved).toMatchObject({
+      state: "merging",
+      repos: [{ mergeRun: { id: expect.any(String) } }],
+    });
+    // Again soon after, and again much later with its run in flight (its
+    // Workflow confirmed): untouched.
+    Object.assign(t.env.CI_RUN, {
+      get: async () => ({ status: async () => ({ status: "running" }) }),
+    });
+    await later(11, sweep);
+    let restarted = -1;
+    await later(30, () =>
+      settled(t.env, async (deps) => {
+        restarted = await sweepStalledLandings(t.env, deps, { hour: 0 });
+      }),
+    );
+    expect(restarted).toBe(0);
+    expect(orbit.runs()).toBe(1);
+    expect(orbit.stalled().version).toBe(moved.version);
+  });
+
+  test("a stopped landing isn't restarted (CORE-391)", async () => {
+    const t = await setup();
+    const orbit = await stalledIn(t, "orbit", "app");
+    const landing = orbit.stalled();
+    const stopped = orbit.tracker.saveLanding(
+      { ...landing, state: "failed", reason: "Gates failed" },
+      landing.version,
+      "ben",
+    );
+    expect(stopped.ok).toBe(true);
+    await later(11, () => settled(t.env, (deps) => sweepStalledLandings(t.env, deps, { hour: 0 })));
+    expect(orbit.runs()).toBe(0);
+    expect(orbit.stalled()).toMatchObject({ state: "failed" });
+  });
+
+  /** The stalled-landing sweep with the clock `minutes` ahead; how many it restarted. */
+  async function sweepStalled(
+    t: Awaited<ReturnType<typeof setup>>,
+    minutes: number,
+    deps?: (base: ReturnType<typeof workerDeps>) => ReturnType<typeof workerDeps>,
+  ) {
+    let restarted = -1;
+    await later(minutes, () =>
+      settled(t.env, async (base) => {
+        // A step that fails is left to the next look at once, not retried after a pause.
+        const using = { ...(deps ? deps(base) : base), stepRetryMs: [] };
+        restarted = await sweepStalledLandings(t.env, using, { hour: 0 });
+      }),
+    );
+    return restarted;
+  }
+
+  test("a stalled landing over a day old waits for a person (CORE-391)", async () => {
+    const t = await setup();
+    const orbit = await stalledIn(t, "orbit", "app");
+    expect(await sweepStalled(t, 25 * 60)).toBe(0);
+    expect(orbit.runs()).toBe(0);
+    expect(await sweepStalled(t, 23 * 60)).toBe(1);
+    expect(orbit.runs()).toBe(1);
+  });
+
+  test("not as a requester who left or can't write, and that costs no budget (CORE-391)", async () => {
+    const t = await setup();
+    const side = await stalledIn(t, "ben", "side");
+    const orbit = await stalledIn(t, "orbit", "app");
+    // Ben can't write to side any more: his own tracker's landing is skipped, free.
+    t.sqlite.exec("UPDATE repos SET owner_id = 'ann' WHERE id = 'side'");
+    let restarted = -1;
+    await later(11, () =>
+      settled(t.env, async (deps) => {
+        restarted = await sweepStalledLandings(t.env, deps, { limit: 1, hour: 0 });
+      }),
+    );
+    t.sqlite.exec("UPDATE repos SET owner_id = 'ben' WHERE id = 'side'");
+    expect(restarted).toBe(1);
+    expect(side.runs()).toBe(0);
+    expect(orbit.runs()).toBe(1);
+    // Ben left orbit: its next stalled landing isn't restarted as him.
+    const fresh = await setup();
+    const left = await stalledIn(fresh, "orbit", "app");
+    fresh.sqlite.exec("DELETE FROM org_members WHERE org_id = 'orbit' AND user_id = 'ben'");
+    expect(await sweepStalled(fresh, 11)).toBe(0);
+    expect(left.runs()).toBe(0);
+  });
+
+  test("a queued merge run without its Workflow is started again, once (CORE-391)", async () => {
+    const t = await setup();
+    const orbit = await stalledIn(t, "orbit", "app");
+    const created: string[] = [];
+    const confirmed = new Set<string>();
+    Object.assign(t.env.CI_RUN, {
+      create: async ({ id }: { id: string }) => {
+        created.push(id);
+        return {};
+      },
+      get: async (id: string) => {
+        if (!confirmed.has(id)) throw new Error("instance.not_found");
+        return { status: async () => ({ status: "queued" }) };
+      },
+    });
+    expect(await sweepStalled(t, 11)).toBe(1);
+    const run = orbit.stalled().repos[0]!.mergeRun!.id;
+    expect(created).toEqual([run]);
+    // Its row stays queued: young, or with its Workflow confirmed, it's left alone.
+    t.sqlite
+      .prepare("UPDATE ci_runs SET created_at = ? WHERE id = ?")
+      .run(new Date(Date.now() + 25 * 60_000).toISOString(), run);
+    expect(await sweepStalled(t, 30)).toBe(0);
+    t.sqlite
+      .prepare("UPDATE ci_runs SET created_at = ? WHERE id = ?")
+      .run(new Date(Date.now() - 3600_000).toISOString(), run);
+    confirmed.add(run);
+    expect(await sweepStalled(t, 30)).toBe(0);
+    expect(created).toEqual([run]);
+    // No Workflow to be found: started again for that same run id.
+    confirmed.delete(run);
+    expect(await sweepStalled(t, 30)).toBe(1);
+    expect(created).toEqual([run, run]);
+    expect(orbit.runs()).toBe(1);
+  });
+
+  test("a merge run's Workflow counts as started only when its status confirms it (CORE-391)", async () => {
+    // Creating it fails, and the handle that comes back can't say how it is.
+    const t = await setup();
+    const orbit = await stalledIn(t, "orbit", "app");
+    Object.assign(t.env.CI_RUN, {
+      create: async () => {
+        throw new Error("instance.already_exists");
+      },
+      get: async () => ({
+        status: async () => {
+          throw new Error("instance.not_found");
+        },
+      }),
+    });
+    await sweepStalled(t, 11);
+    expect(orbit.stalled()).toMatchObject({
+      state: "failed",
+      reason: expect.stringMatching(/Couldn't start the merge job/),
+    });
+    // Creating it fails because it exists, and its status says so: carried on.
+    const u = await setup();
+    const fine = await stalledIn(u, "orbit", "app");
+    Object.assign(u.env.CI_RUN, {
+      create: async () => {
+        throw new Error("instance.already_exists");
+      },
+      get: async () => ({ status: async () => ({ status: "queued" }) }),
+    });
+    await sweepStalled(u, 11);
+    expect(fine.stalled()).toMatchObject({
+      state: "merging",
+      repos: [{ mergeRun: { id: expect.any(String) } }],
+    });
+  });
+
+  test("a gate run saved but never started is started once (CORE-391)", async () => {
+    const t = await setup();
+    const orbit = await stalledIn(t, "orbit", "app");
+    const landing = orbit.stalled();
+    const saved = orbit.tracker.saveLanding(
+      {
+        ...landing,
+        repos: landing.repos.map((repo) => ({
+          ...repo,
+          state: "testing" as const,
+          base: oid(1),
+          merge: oid(9),
+          mergeRun: { id: "merged", number: 1 },
+          gateRun: { id: "gates", number: 0 },
+        })),
+      },
+      landing.version,
+      "ben",
+    );
+    expect(saved.ok).toBe(true);
+    const gates: string[] = [];
+    const spy = (base: ReturnType<typeof workerDeps>) => ({
+      ...base,
+      startGates: async (...args: Parameters<typeof base.startGates>) => {
+        gates.push(args[1].runId);
+        return { skipped: "No pipeline" };
+      },
+    });
+    expect(await sweepStalled(t, 11, spy)).toBe(1);
+    expect(gates).toEqual(["gates"]);
+    expect(orbit.stalled().repos[0]!.state).not.toBe("testing");
+    // Its gates aren't started again.
+    await sweepStalled(t, 30, spy);
+    expect(gates).toEqual(["gates"]);
+  });
+
+  test("a merging landing with every repository tested moves on to advancing (CORE-391)", async () => {
+    const t = await setup();
+    const orbit = await stalledIn(t, "orbit", "app");
+    const landing = orbit.stalled();
+    const saved = orbit.tracker.saveLanding(
+      {
+        ...landing,
+        repos: landing.repos.map((repo) => ({
+          ...repo,
+          state: "tested" as const,
+          base: oid(1),
+          merge: oid(9),
+          mergeRun: { id: "merged", number: 1 },
+          gateRun: null,
+        })),
+      },
+      landing.version,
+      "ben",
+    );
+    expect(saved.ok).toBe(true);
+    const states: string[] = [];
+    const save = orbit.tracker.saveLanding.bind(orbit.tracker);
+    orbit.tracker.saveLanding = ((...args: Parameters<typeof save>) => {
+      states.push(args[0].state);
+      return save(...args);
+    }) as typeof orbit.tracker.saveLanding;
+    expect(await sweepStalled(t, 11)).toBe(1);
+    expect(states[0]).toBe("advancing");
+  });
+
+  test("stalled landings: one tracker failing skips nobody else, and the bound holds (CORE-391)", async () => {
+    const t = await setup();
+    const side = await stalledIn(t, "ben", "side");
+    const orbit = await stalledIn(t, "orbit", "app");
+    // Hour 0 starts with ben. With a bound of one, only ben's is restarted.
+    let restarted = -1;
+    await later(11, () =>
+      settled(t.env, async (deps) => {
+        restarted = await sweepStalledLandings(t.env, deps, { limit: 1, hour: 0 });
+      }),
+    );
+    expect(restarted).toBe(1);
+    expect(side.runs()).toBe(1);
+    expect(orbit.runs()).toBe(0);
+    // Now ben's tracker fails: orbit's is still restarted.
+    side.tracker.stalledLandings = () => {
+      throw new Error("Durable Object overloaded");
+    };
+    await later(11, () => settled(t.env, (deps) => sweepStalledLandings(t.env, deps, { hour: 0 })));
+    expect(orbit.runs()).toBe(1);
+  });
 
   test("the sweep's budget is for landing attempts, and where it starts rotates", async () => {
     const t = await setup();

@@ -713,6 +713,10 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   activeLandings() {
     return this.reply(() => this.timelines.activeLandings());
   }
+  /** Merging or testing landings last moved between `since` and `before` (CORE-391). */
+  stalledLandings(since: string, before: string, limit: number) {
+    return this.reply(() => this.timelines.stalledLandings(since, before, limit));
+  }
   /** Approved (since `since`), current heads that never began landing (CORE-390). */
   approvedUnlanded(limit: number, since: string) {
     return this.reply(() => this.timelines.approvedUnlanded(limit, since));
