@@ -7,12 +7,19 @@ import type {
   HumanRequest,
   OpenRequest,
   OpenRequests,
+  RequestHistory,
   RequestSummary,
   TrackerList,
   TrackerView,
   TrackerOwner,
 } from "../../shared/tracker.ts";
-import { TrackerError, validateRequest, type Access } from "./store.ts";
+import {
+  TrackerError,
+  validateRequest,
+  type Access,
+  type OpenRequestItem,
+  closedKey,
+} from "./store.ts";
 import { accessFor } from "./access.ts";
 import type { TrackerReply } from "./object.ts";
 import { trackerObject } from "./stub.ts";
@@ -155,65 +162,136 @@ tracker.get("/requests/summary", async (c) => {
   }
   return c.json(summary);
 });
-/** Open requests to people across every tracker you're in: yours first, then the rest. */
+/**
+ * Requests on Needs you from one tracker, as the page shows them: an
+ * approval of a timeline checkpoint with its commits, CI runs, previews and
+ * summary.
+ */
+async function needsYouItems(
+  c: Context<AppEnv>,
+  owner: { id: string; slug: string; displayName: string },
+  items: OpenRequestItem[],
+): Promise<OpenRequest[] | Response> {
+  const stub = trackerObject(c.env, owner.id);
+  // History shows a closed approval's answer, not its checkpoint.
+  const pinned = items.flatMap(({ request }) =>
+    request.checkpoint && request.status === "open" ? [request.checkpoint.id] : [],
+  );
+  const checkpoints = new Map<string, OpenRequest["checkpoint"]>();
+  if (pinned.length) {
+    const states = await stub.checkpointStates(pinned);
+    if (!states.ok) return response(c, states);
+    const current = await currentRepositoryNames(
+      c.env.DB,
+      owner.id,
+      states.value.map(({ state }) => state.checkpoint),
+    );
+    for (const [index, { state, timeline }] of states.value.entries())
+      checkpoints.set(
+        state.checkpoint.id,
+        await checkpointView(c.env, { ...state, checkpoint: current[index]! }, timeline),
+      );
+  }
+  return items.map((item) => {
+    const checkpoint = item.request.checkpoint && checkpoints.get(item.request.checkpoint.id);
+    return {
+      tracker: { slug: owner.slug, displayName: owner.displayName },
+      ...item,
+      ...(checkpoint ? { checkpoint } : {}),
+    };
+  });
+}
+
+/** Names for the people and agents requests mention: "builder for Ann Lee" for an agent. */
+async function requestNames(
+  db: D1Database,
+  requests: OpenRequest[],
+): Promise<Record<string, string>> {
+  const ids = [
+    ...new Set(
+      requests.flatMap(({ request, work }) => [
+        request.askedBy,
+        request.routeTo,
+        ...(request.answeredBy ? [request.answeredBy] : []),
+        ...(work?.holder ? [work.holder.actorId] : []),
+        ...(work?.latest ? [work.latest.actorId] : []),
+        ...(work?.next ? [work.next.actorId] : []),
+      ]),
+    ),
+  ];
+  const names: Record<string, string> = {};
+  if (!ids.length) return names;
+  const k = gitmatrixDb(db);
+  const [people, agents] = await Promise.all([
+    k.selectFrom("accounts").select(["id", "display_name"]).where("id", "in", ids).execute(),
+    k
+      .selectFrom("agents as g")
+      .innerJoin("accounts as a", "a.id", "g.accountable_id")
+      .select(["g.id", "g.name", "a.display_name"])
+      .where("g.id", "in", ids)
+      .execute(),
+  ]);
+  for (const p of people) names[p.id] = p.display_name;
+  for (const g of agents) names[g.id] = `${g.name} for ${g.display_name}`;
+  return names;
+}
+
+/**
+ * Open requests to people across every tracker you're in: yours first, then
+ * the rest, each with what its work is doing (CORE-386).
+ */
 tracker.get("/requests", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to see what needs you." }, 401);
   const requests: OpenRequest[] = [];
   for (const owner of await accessible(c.env.DB, actor)) {
-    const stub = trackerObject(c.env, owner.id);
-    const result = await stub.openRequests();
+    const result = await trackerObject(c.env, owner.id).neededRequests({ open: true });
     if (!result.ok) return response(c, result);
-    // An approval of a timeline checkpoint shows its commits, CI runs, previews and summary.
-    const pinned = result.value.flatMap(({ request }) =>
-      request.checkpoint ? [request.checkpoint.id] : [],
-    );
-    const checkpoints = new Map<string, OpenRequest["checkpoint"]>();
-    if (pinned.length) {
-      const states = await stub.checkpointStates(pinned);
-      if (!states.ok) return response(c, states);
-      const current = await currentRepositoryNames(
-        c.env.DB,
-        owner.id,
-        states.value.map(({ state }) => state.checkpoint),
-      );
-      for (const [index, { state, timeline }] of states.value.entries())
-        checkpoints.set(
-          state.checkpoint.id,
-          await checkpointView(c.env, { ...state, checkpoint: current[index]! }, timeline),
-        );
-    }
-    for (const item of result.value) {
-      const checkpoint = item.request.checkpoint && checkpoints.get(item.request.checkpoint.id);
-      requests.push({
-        tracker: { slug: owner.slug, displayName: owner.displayName },
-        ...item,
-        ...(checkpoint ? { checkpoint } : {}),
-      });
-    }
+    const items = await needsYouItems(c, owner, result.value);
+    if (items instanceof Response) return items;
+    requests.push(...items);
   }
   requests.sort(
     (a, b) =>
       Number(b.request.routeTo === actor.id) - Number(a.request.routeTo === actor.id) ||
       a.request.createdAt.localeCompare(b.request.createdAt),
   );
-  const ids = [...new Set(requests.flatMap(({ request }) => [request.askedBy, request.routeTo]))];
-  const names: Record<string, string> = {};
-  if (ids.length) {
-    const k = gitmatrixDb(c.env.DB);
-    const [people, agents] = await Promise.all([
-      k.selectFrom("accounts").select(["id", "display_name"]).where("id", "in", ids).execute(),
-      k
-        .selectFrom("agents as g")
-        .innerJoin("accounts as a", "a.id", "g.accountable_id")
-        .select(["g.id", "g.name", "a.display_name"])
-        .where("g.id", "in", ids)
-        .execute(),
-    ]);
-    for (const p of people) names[p.id] = p.display_name;
-    for (const g of agents) names[g.id] = `${g.name} for ${g.display_name}`;
+  return c.json<OpenRequests>({ requests, names: await requestNames(c.env.DB, requests) });
+});
+
+/** How many closed requests a history page shows. */
+const HISTORY_PAGE = 25;
+
+/**
+ * Answered and withdrawn requests across every tracker you're in (CORE-387),
+ * newest first, a page at a time: `before` is the last page's `next`.
+ */
+tracker.get("/requests/history", async (c) => {
+  const actor = c.get("actor");
+  if (!actor) return c.json({ error: "Sign in to see what needed you." }, 401);
+  const before = c.req.query("before") ?? null;
+  if (before !== null && (before.length > 200 || !before.includes("|")))
+    throw new TrackerError(400, "invalid_input", "before is the last page's next.");
+  const closed: OpenRequest[] = [];
+  for (const owner of await accessible(c.env.DB, actor)) {
+    const result = await trackerObject(c.env, owner.id).neededRequests({
+      open: false,
+      before,
+      limit: HISTORY_PAGE + 1,
+    });
+    if (!result.ok) return response(c, result);
+    const items = await needsYouItems(c, owner, result.value);
+    if (items instanceof Response) return items;
+    closed.push(...items);
   }
-  return c.json<OpenRequests>({ requests, names });
+  closed.sort((a, b) => closedKey(b.request).localeCompare(closedKey(a.request)));
+  const requests = closed.slice(0, HISTORY_PAGE);
+  const next = closed.length > HISTORY_PAGE ? closedKey(requests.at(-1)!.request) : null;
+  return c.json<RequestHistory>({
+    requests,
+    names: await requestNames(c.env.DB, requests),
+    next,
+  });
 });
 /**
  * Which open issues each of your agents can take (CORE-32), in every tracker

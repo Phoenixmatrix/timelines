@@ -137,7 +137,7 @@ textarea.mk-input { height: auto; min-height: var(--size-field); padding: 10px 1
   cursor: pointer; transition: background-color 150ms, color 150ms;
 }
 .mk-segment:hover { color: var(--ink); }
-.mk-segment[aria-checked="true"] { background: var(--raised); color: var(--ink); }
+.mk-segment[aria-checked="true"], .mk-segment[aria-current="page"] { background: var(--raised); color: var(--ink); }
 .mk-segment .mk-count { font-family: var(--font-mono); font-size: 0.6875rem; font-weight: 400; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
 
 /* ---- Chips ----------------------------------------------------------- */

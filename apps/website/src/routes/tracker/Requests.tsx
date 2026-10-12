@@ -4,12 +4,12 @@
 
 import { useState } from "react";
 import type { CheckpointView } from "../../../shared/timelines.ts";
-import type { HumanRequest } from "../../../shared/tracker.ts";
+import type { HumanRequest, RequestNote, RequestWork } from "../../../shared/tracker.ts";
 import { FormError } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
 import { fullDate, timeAgo } from "../../lib/format.ts";
 import { CheckpointPanel, CheckpointRef } from "./Checkpoint.tsx";
-import { MarkdownText } from "./ui.tsx";
+import { MarkdownText, statusLabel } from "./ui.tsx";
 
 export type Answer = { answer?: string; choice?: string; approved?: boolean; stored?: boolean };
 type Outcome = { ok: boolean; error?: string };
@@ -28,6 +28,7 @@ export function RequestCard({
   onCancel,
   heading,
   checkpoint,
+  work,
 }: {
   request: HumanRequest;
   /** How to name an actor id: a person, or "builder for Ann Lee". */
@@ -39,6 +40,8 @@ export function RequestCard({
   heading?: React.ReactNode;
   /** For an approval of a timeline checkpoint: its details, and the tracker it's in. */
   checkpoint?: { view: CheckpointView; tracker: string };
+  /** What the work behind it is doing (CORE-386), on pages away from the issue. */
+  work?: RequestWork;
 }) {
   const open = request.status === "open";
   return (
@@ -61,6 +64,7 @@ export function RequestCard({
         </time>
       </header>
       {heading}
+      {work && <WorkContext work={work} name={name} />}
       <div className="max-w-[72ch] text-body">
         <MarkdownText text={request.prompt} />
       </div>
@@ -98,7 +102,102 @@ export function RequestCard({
           )}
         </p>
       )}
+      {work?.next !== undefined && (
+        <Note
+          label="Next on the issue"
+          note={work.next}
+          name={name}
+          empty="Nothing has been said on the issue since."
+        />
+      )}
     </article>
+  );
+}
+
+/**
+ * Why it was asked (CORE-386): who holds the issue and in which session, where
+ * the issue stands, and its newest checkpoint, which says what the work is doing.
+ */
+function WorkContext({ work, name }: { work: RequestWork; name: (id: string) => string }) {
+  return (
+    <section
+      aria-label="The work behind it"
+      className="flex max-w-[72ch] flex-col gap-1 border-l-2 border-line-soft pl-3 text-body-sm text-ink-muted"
+    >
+      <p className="m-0">
+        {work.holder ? (
+          <>
+            <strong className="text-ink">{name(work.holder.actorId)}</strong> is on it
+            {work.holder.agent && (
+              <>
+                {" "}
+                in session <span className="font-mono">{work.holder.agent}</span>
+              </>
+            )}
+          </>
+        ) : (
+          "Nobody holds the issue now"
+        )}
+        {" · "}
+        {statusLabel({ status: work.status, doneIn: null })}
+      </p>
+      <Note
+        label="Latest checkpoint"
+        note={work.latest}
+        name={name}
+        // Named just above when it's the holder's own.
+        author={work.latest?.actorId !== work.holder?.actorId}
+        empty="No checkpoint yet: the issue's description says what it's for."
+      />
+    </section>
+  );
+}
+
+/** A note quoted from the issue: its first line, and the rest on request. */
+function Note({
+  label,
+  note,
+  name,
+  empty,
+  author = true,
+}: {
+  label: string;
+  note: RequestNote | null;
+  name: (id: string) => string;
+  empty: string;
+  /** Whether to say who wrote it. */
+  author?: boolean;
+}) {
+  if (!note) return <p className="m-0 text-body-sm text-ink-faint">{empty}</p>;
+  const [first = "", ...lines] = note.body.trim().split("\n");
+  const rest = lines.join("\n").trim();
+  const heading = (
+    <>
+      {label}
+      {author && ` from ${name(note.actorId)}`},{" "}
+      <time dateTime={note.createdAt} title={fullDate(note.createdAt)}>
+        {timeAgo(note.createdAt)}
+      </time>
+      :{" "}
+    </>
+  );
+  if (!rest)
+    return (
+      <p className="m-0 text-body-sm text-ink-muted">
+        {heading}
+        <span className="text-ink">{first}</span>
+      </p>
+    );
+  return (
+    <details className="text-body-sm text-ink-muted">
+      <summary className="cursor-pointer">
+        {heading}
+        <span className="text-ink">{first}</span>
+      </summary>
+      <div className="mt-1 text-ink">
+        <MarkdownText text={rest} />
+      </div>
+    </details>
   );
 }
 
