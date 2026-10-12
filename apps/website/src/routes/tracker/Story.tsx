@@ -536,9 +536,12 @@ function StepDetail({
           />
         </div>
       )}
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]">
-        <Diff base={base} oid={version} sourceId={repo.source?.sourceId} />
+      {/* The context reads first, at a reading width; the diff below gets the
+          step's whole width (CORE-394): beside a context column it was left a
+          narrow strip at every width the page reaches. */}
+      <div className="flex flex-col gap-4">
         <Context step={step} />
+        <Diff base={base} oid={version} sourceId={repo.source?.sourceId} />
       </div>
       <StepVisuals step={step} earlier={earlier} />
     </section>
@@ -548,7 +551,7 @@ function StepDetail({
 function Context({ step }: { step: Step | null }) {
   if (!step)
     return (
-      <aside aria-label="Context" className="text-body-sm text-ink-muted order-first">
+      <aside aria-label="Context" className="max-w-[80ch] text-body-sm text-ink-muted">
         <p className="m-0">
           No context was recorded for this commit. Agents attach it with{" "}
           <span className="mk-mono">gm commit --context</span>.
@@ -557,7 +560,7 @@ function Context({ step }: { step: Step | null }) {
     );
   if (step.deleted)
     return (
-      <aside aria-label="Context" className="text-body-sm text-ink-muted order-first">
+      <aside aria-label="Context" className="max-w-[80ch] text-body-sm text-ink-muted">
         <p className="m-0">An admin removed this step's context.</p>
       </aside>
     );
@@ -585,7 +588,7 @@ function Context({ step }: { step: Step | null }) {
     );
   const missing = !byHook(context.coverage.instructions) || !byHook(context.coverage.steering);
   return (
-    <aside aria-label="Context" className="min-w-0 order-first">
+    <aside aria-label="Context" className="min-w-0 max-w-[80ch]">
       {text("Why", context.why)}
       {entries("Instructions", context.instructions)}
       {entries("Steering", context.steering)}
