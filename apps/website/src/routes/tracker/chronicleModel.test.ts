@@ -2,6 +2,7 @@ import { describe, expect, test } from "vite-plus/test";
 import type { ChronicleIssue } from "../../../shared/chronicle.ts";
 import {
   DAY,
+  checkpointInWindow,
   groupRows,
   hitInRow,
   HOUR,
@@ -117,6 +118,20 @@ describe("rows as of the playhead", () => {
     ],
     markers: [
       { id: "e:9", at: "2026-10-01T10:30:00.000Z", kind: "checkpoint", actorId: "agt", text: "x" },
+      {
+        id: "t:1",
+        at: "2026-10-01T10:35:00.000Z",
+        kind: "timeline-checkpoint",
+        actorId: "agt",
+        text: "Review",
+      },
+      {
+        id: "e:10",
+        at: "2026-10-01T11:00:00.000Z",
+        kind: "evidence",
+        actorId: "agt",
+        text: "Verified",
+      },
     ],
   });
   const b = issue({ id: "b", key: "ENG-10" });
@@ -145,12 +160,25 @@ describe("rows as of the playhead", () => {
     expect(team[0]).toMatchObject({ kind: "group", label: "ENG", count: 2 });
   });
 
-  test("a marker under the pointer wins over the span it sits on", () => {
+  test("visible markers win over spans, but checkpoint summaries leave their spans clickable", () => {
     const x = (t: number) => (t - at("2026-10-01T00:00:00.000Z")) / 60_000;
-    const marker = hitInRow(a, x, x(at("2026-10-01T10:30:00.000Z")) + 2, NOW);
-    expect(marker && "marker" in marker && marker.marker.kind).toBe("checkpoint");
-    const span = hitInRow(a, x, x(at("2026-10-01T11:45:00.000Z")), NOW);
-    expect(span && "span" in span && span.span.id).toBe("a:5");
+    const marker = hitInRow(a, x, x(at("2026-10-01T11:00:00.000Z")) + 2, NOW);
+    expect(marker && "marker" in marker && marker.marker.kind).toBe("evidence");
+    for (const time of ["10:30", "10:35", "11:45"]) {
+      expect(hitInRow(a, x, x(at(`2026-10-01T${time}:00.000Z`)), NOW)).toEqual({
+        span: a.spans[0],
+      });
+    }
     expect(hitInRow(a, x, x(at("2026-10-01T15:00:00.000Z")), NOW)).toBeNull();
+  });
+
+  test("checkpoint counts exclude padded history outside the visible window and other events", () => {
+    const view = { from: at("2026-10-01T10:30:00.000Z"), to: at("2026-10-01T10:35:00.000Z") };
+    expect(
+      a.markers
+        .filter((marker) => checkpointInWindow(marker, view.from, view.to))
+        .map((marker) => marker.id),
+    ).toEqual(["e:9", "t:1"]);
+    expect(a.markers.filter((marker) => checkpointInWindow(marker, view.to + 1, NOW))).toEqual([]);
   });
 });

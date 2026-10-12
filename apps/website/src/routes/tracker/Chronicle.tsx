@@ -303,7 +303,7 @@ export function Chronicle({
           ))}
         </div>
         <p
-          className="m-0 ml-auto flex items-center gap-1 text-body-sm text-ink-muted tabular-nums max-md:basis-full"
+          className="m-0 ml-auto flex min-w-0 flex-wrap items-center gap-1 text-body-sm text-ink-muted tabular-nums max-md:basis-full"
           aria-live="off"
           data-chronicle-playhead={new Date(at).toISOString()}
         >
@@ -312,10 +312,10 @@ export function Chronicle({
           {range && (
             <button
               type="button"
-              className="mk-btn mk-btn--ghost mk-btn--sm ml-1"
+              className="mk-btn mk-btn--ghost mk-btn--sm ml-1 h-auto min-h-8 max-w-full py-1.5 whitespace-normal"
               onClick={() => commit({ range: null })}
             >
-              <span className="font-mono text-micro tabular-nums">
+              <span className="min-w-0 font-mono text-micro tabular-nums">
                 {moment(range.from)} → {moment(range.to)}
               </span>
               <XIcon weight="bold" aria-hidden />
@@ -455,6 +455,10 @@ export function Chronicle({
               closeHref={closeHref}
               spanHref={spanHref}
               openIssueHref={openIssueHref(selected)}
+              window={view}
+              checkpointHref={(marker) =>
+                `${base}/issues/${encodeURIComponent(selected.id)}${search(withAddress({ at: Date.parse(marker.at), span: null }))}#chronicle-checkpoints`
+              }
             />
           ) : data ? (
             <RangeSummary data={data} range={summaryRange} now={now} issueHref={issueHref} />

@@ -6,7 +6,7 @@
 import { Link } from "react-router";
 import { SPAN_END_LABEL, actorText, type WorkSpan } from "../../../shared/chronicle.ts";
 import type { Loaded } from "./chronicleData.ts";
-import { duration, stamp, stateAsOf, type Row } from "./chronicleModel.ts";
+import { checkpointInWindow, duration, stamp, stateAsOf, type Row } from "./chronicleModel.ts";
 import { STATE_LABEL } from "./query.ts";
 import { StateDot } from "./Log.tsx";
 
@@ -60,6 +60,10 @@ export function ChronicleList({
     const startState = stateAsOf(issue, view.from, now);
     const endState = stateAsOf(issue, end, now);
     const selected = selection.issue === issue.id;
+    const checkpoints = issue.markers.reduce(
+      (count, marker) => count + Number(checkpointInWindow(marker, view.from, view.to)),
+      0,
+    );
     group?.items.push(
       <li
         key={issue.id}
@@ -144,6 +148,16 @@ export function ChronicleList({
               );
             })}
           </ul>
+        )}
+        {checkpoints > 0 && (
+          <Link
+            to={`${issueHref(issue.id)}#chronicle-checkpoints`}
+            preventScrollReset
+            aria-label={`Read ${checkpoints} checkpoint${checkpoints === 1 ? "" : "s"} for ${issue.key}`}
+            className="gm-link flex min-h-11 items-center self-start text-body-sm"
+          >
+            {checkpoints} checkpoint{checkpoints === 1 ? "" : "s"}
+          </Link>
         )}
         {issue.markers.length > 0 && (
           <p className="m-0 text-micro text-ink-faint">

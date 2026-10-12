@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### CORE-277: readable History checkpoints
+
+- History collects issue and timeline checkpoints into one count per issue,
+  rather than drawing overlapping flags on the chart. The count opens dated,
+  attributed summaries in the inspector; long summaries wrap.
+- Each checkpoint can move the playhead to its time without losing the visible
+  window or selected range. Keyboard access, browser back/forward, and the
+  phone/List layout use the same checkpoint details.
+- Counts follow the visible window, not the extra history loaded for panning.
+  Work spans and other event markers retain their existing chart interactions.
+
 ### AI cancellation before dispatch
 
 - Cancellation during account attribution or Gateway-policy preparation prevents

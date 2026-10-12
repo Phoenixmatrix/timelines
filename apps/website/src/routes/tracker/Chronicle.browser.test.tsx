@@ -1,5 +1,6 @@
 import { expect, test, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
+import type { Snapshot } from "../../../shared/tracker.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
 import { mutate } from "../../testing/timelines.ts";
@@ -156,6 +157,101 @@ test.each([
       navigation.mockRestore();
       if (held) await userEvent.keyboard(`{/${direction}}`);
       for (const acknowledge of pending) await acknowledge();
+    }
+  },
+);
+
+test.each(["chart", "list", "phone"] as const)(
+  "%s checkpoints disclose readable summaries and navigate time without losing the range",
+  async (layout) => {
+    await page.viewport(layout === "phone" ? 390 : 1280, 900);
+    try {
+      const server = await TestServer.start({ world: true });
+      const summary =
+        "The selected range survives checkpoint navigation. Keyboard and touch access work, and this summary wraps so the next person can read the outcome.";
+      await mutate(server, [
+        {
+          kind: "team.create",
+          id: "checkpoint-team",
+          data: { key: "CP", name: "Checkpoints", memberIds: ["acc_marco"] },
+        },
+        {
+          kind: "issue.create",
+          id: "checkpoint-work",
+          data: { teamId: "checkpoint-team", title: "Read progress without overlapping flags" },
+        },
+        {
+          kind: "comment.add",
+          id: "checkpoint-first",
+          data: { issueId: "checkpoint-work", kind: "checkpoint", body: summary },
+        },
+        {
+          kind: "comment.add",
+          id: "checkpoint-second",
+          data: {
+            issueId: "checkpoint-work",
+            kind: "checkpoint",
+            body: "Ready for the next person.",
+          },
+        },
+        {
+          kind: "comment.add",
+          id: "checkpoint-evidence",
+          data: { issueId: "checkpoint-work", kind: "evidence", body: "Verified separately." },
+        },
+      ]);
+      const snapshot = await server.call<Snapshot>("GET", "/api/tracker/orbit/snapshot");
+      const checkpointTime = snapshot.comments.find(
+        (comment) => comment.id === "checkpoint-first",
+      )!.createdAt;
+      const time = Date.parse(checkpointTime);
+      const params = new URLSearchParams({
+        view: "chronicle",
+        q: "",
+        from: new Date(time - 3_600_000).toISOString(),
+        to: new Date(time + 3_600_000).toISOString(),
+        at: new Date(time - 1_800_000).toISOString(),
+        rs: new Date(time - 600_000).toISOString(),
+        re: new Date(time + 600_000).toISOString(),
+        ...(layout === "list" ? { layout: "list" } : {}),
+      });
+      const app = renderApp(`/tracker/orbit?${params}`);
+      const entry = page.getByRole("link", { name: "Read 2 checkpoints for CP-1" });
+      await expect.element(entry).toBeVisible();
+      if (layout === "chart") {
+        await focusOn(entry);
+        await press("Enter");
+      } else {
+        expect(entry.element().getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
+        await entry.click();
+      }
+      const section = page.getByRole("region", { name: "Checkpoints 2", exact: true });
+      await expect.element(section).toBeVisible();
+      await expect.poll(() => document.activeElement?.id).toBe("chronicle-checkpoints");
+      const text = section.getByText(summary, { exact: true });
+      await expect.element(text).toBeVisible();
+      const content = text.element() as HTMLElement;
+      expect(content.scrollWidth).toBeLessThanOrEqual(content.clientWidth);
+      expect(content.getBoundingClientRect().height).toBeGreaterThan(
+        Number.parseFloat(getComputedStyle(content).lineHeight) * 2,
+      );
+      await expect.element(section.getByText("Verified separately.")).not.toBeInTheDocument();
+      const jump = section.getByRole("link", { name: /^Go to checkpoint at / }).first();
+      await jump.click();
+      const selected = await app.waitForUrl((url) => url.searchParams.get("at") === checkpointTime);
+      expect(selected.pathname).toBe("/tracker/orbit/issues/checkpoint-work");
+      expect(selected.searchParams.get("from")).toBe(params.get("from"));
+      expect(selected.searchParams.get("to")).toBe(params.get("to"));
+      expect(selected.searchParams.get("rs")).toBe(params.get("rs"));
+      expect(selected.searchParams.get("re")).toBe(params.get("re"));
+      await app.back();
+      await app.waitForUrl((url) => url.searchParams.get("at") === params.get("at"));
+      await expect.element(section).toBeVisible();
+      await app.forward();
+      await app.waitForUrl((url) => url.searchParams.get("at") === checkpointTime);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+    } finally {
+      await page.viewport(1280, 900);
     }
   },
 );
