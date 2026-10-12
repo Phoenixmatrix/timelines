@@ -9,7 +9,7 @@ import { d1, migratedDatabase } from "../testing/d1.ts";
 import { initializeWorkSource, type WorkSourceRow } from "./sources.ts";
 import { retainProgress } from "../git/source-push.ts";
 import type { RepoRow } from "../db.ts";
-import { greenness, progress, type LandingDeps } from "./landing.ts";
+import { greenness, progress, sweepOwners, type LandingDeps } from "./landing.ts";
 import { measure } from "./checkpoints.ts";
 import { lsRefs } from "../artifacts.ts";
 import type * as Artifacts from "../artifacts.ts";
@@ -1822,5 +1822,74 @@ describe("greenness", () => {
       ok: false,
       why: expect.stringMatching(/org\/app/),
     });
+  });
+});
+
+describe("the trackers the approved-landings sweep looks in (CORE-392)", () => {
+  test("450 trackers, a window of 200: every one within 3 consecutive hours, from any hour", async () => {
+    const sqlite = migratedDatabase();
+    const insert = sqlite.prepare(
+      `INSERT INTO timeline_work_sources (source_id, repo_id, timeline_id, timeline_slug, owner_id,
+         artifacts_name, artifacts_remote, state, allocation_operation_id, fork_source_id,
+         fork_commit, fork_tree, fork_ref, initial_source_id, initial_commit, initial_tree,
+         initial_ref, created_at, updated_at)
+       VALUES (?, 'repo', ?, 'search', ?, ?, NULL, ?, ?, 'canonical', ?, ?, 'refs/heads/main',
+         'canonical', ?, ?, 'refs/heads/main', '2026-10-12T00:00:00Z', '2026-10-12T00:00:00Z')`,
+    );
+    const owners = Array.from({ length: 450 }, (_, i) => `acc_${String(i).padStart(3, "0")}`);
+    for (const [i, owner] of owners.entries()) {
+      insert.run(
+        `src_${i}`,
+        `tl_${i}`,
+        owner,
+        `a_${i}`,
+        "ready",
+        `op_${i}`,
+        oid(1),
+        oid(1),
+        oid(1),
+        oid(1),
+      );
+      // A second live source of the same tracker, and an archived one elsewhere: neither counts twice.
+      if (i % 50 === 0)
+        insert.run(
+          `src_${i}b`,
+          `tl_${i}b`,
+          owner,
+          `a_${i}b`,
+          "ready",
+          `op_${i}b`,
+          oid(1),
+          oid(1),
+          oid(1),
+          oid(1),
+        );
+    }
+    insert.run(
+      "src_gone",
+      "tl_gone",
+      "acc_gone",
+      "a_gone",
+      "archived",
+      "op_gone",
+      oid(1),
+      oid(1),
+      oid(1),
+      oid(1),
+    );
+    const d = d1(sqlite);
+    for (const first of [0, 1, 7, 1000]) {
+      const seen = new Set<string>();
+      for (let hour = first; hour < first + 3; hour++) {
+        const window = await sweepOwners(d, 200, hour);
+        expect(window.length).toBe(200);
+        expect(new Set(window).size).toBe(200);
+        for (const owner of window) seen.add(owner);
+      }
+      expect(seen.size).toBe(450);
+      expect(seen.has("acc_gone")).toBe(false);
+    }
+    // Fewer trackers than the window: all of them, every hour.
+    expect((await sweepOwners(d, 1000, 5)).length).toBe(450);
   });
 });

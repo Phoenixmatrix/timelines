@@ -1823,8 +1823,22 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   retried: landing on main deploys, so an older one waits for a person to run
   `gm timeline land`. Not when the approver left the tracker or can't write to
   every repository; a stopped landing stays a person's to retry. The sweep
-  makes at most 25 landing attempts per run (skips cost nothing) across up to
-  200 trackers, starting one tracker further on each hour.
+  makes at most 25 landing attempts per run (only a real beginLanding counts;
+  skips cost nothing and don't hide later candidates within the lookahead of
+  four times the remaining budget) across up to 200 trackers, each hour's
+  window starting where the last one ended, so each tracker is reached within
+  ceil(total/window) hours while the number of trackers is stable. An
+  unexpected failure in a tracker ends that tracker's turn for the run.
+  The same sweep restarts, as its requester, a landing that stalled before its
+  run (its `beginLanding` reply was lost, or a step threw before the run
+  started; CORE-391): merging or testing, unmoved for 10 minutes but moved in
+  the last 24 hours, with no run recorded at its stage, a run row still queued
+  whose Workflow can't be confirmed, or every unadvanced repository tested. Not
+  when the requester's account is gone, they left the tracker or can't write
+  to every repository; older ones wait for a person (`gm timeline land`). At
+  most 25 per run. It never starts from an advancing or stopped landing, though
+  progress follows a landing that moves on to advancing, where compare-and-swap
+  and receipts guard main.
   - _Approve when green_ (CORE-378, `worker/timelines/auto-approve.ts`): a
     person may turn on, for themselves in one tracker (Preferences, or the
     `automation.approveWhenGreen` mutation with their own id), approving the

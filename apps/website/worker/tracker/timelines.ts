@@ -1885,7 +1885,13 @@ export class TimelineStore {
     const busy = new Set(this.sourcePushes().map((operation) => operation.timelineId));
     for (const timeline of candidates) {
       if (found.length >= limit) break;
-      if (busy.has(timeline.id) || timeline.migrationState === "frozen") continue;
+      // What beginLanding refuses (migration_required, source_busy) isn't retried.
+      if (
+        busy.has(timeline.id) ||
+        timeline.migrationState === "frozen" ||
+        timeline.repos.some((repo) => !repo.source)
+      )
+        continue;
       const head = this.latest(timeline.id);
       if (!head || this.everLanded(timeline.id, head.id)) continue;
       const previous = this.landing(timeline.slug);
@@ -1952,6 +1958,26 @@ export class TimelineStore {
     )
       .map((row) => JSON.parse(row.data) as Landing)
       .filter((landing) => LANDING_ACTIVE.includes(landing.state));
+  }
+  /**
+   * Landings merging or testing last moved between `since` and `before`
+   * (CORE-391): the candidates for a landing that stalled before its run
+   * started. Older ones wait for a person. Oldest first, at most `limit`; the
+   * Worker checks their runs and requester.
+   */
+  stalledLandings(since: string, before: string, limit: number): Landing[] {
+    if (limit <= 0) return [];
+    return all(
+      this.sql,
+      tracker
+        .selectFrom("timeline_landings")
+        .select("data")
+        .where(json("data", "$.state"), "in", ["merging", "testing"])
+        .where(json("data", "$.updatedAt"), "<", before)
+        .where(json("data", "$.updatedAt"), ">=", since)
+        .orderBy(json("data", "$.updatedAt"))
+        .limit(limit),
+    ).map((row) => JSON.parse(row.data) as Landing);
   }
   /** The landing a CI run belongs to: a merge or the gates of one of its repositories. */
   landingForRun(slug: string, runId: string): Landing | null {

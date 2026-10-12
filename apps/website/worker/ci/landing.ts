@@ -184,7 +184,10 @@ export async function startMergeRun(
     try {
       await startWorkflow(env, options.runId);
     } catch (error) {
-      const started = await env.CI_RUN.get(options.runId).catch(() => null);
+      // A handle alone is not evidence that the exact instance exists (CORE-391).
+      const started = await env.CI_RUN.get(options.runId)
+        .then((workflow) => workflow.status())
+        .catch(() => null);
       if (!started) throw error;
     }
   return { number: row?.number ?? 0 };

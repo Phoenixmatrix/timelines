@@ -6,8 +6,8 @@
 
 import { lsRefs } from "../artifacts.ts";
 import { runOutcome, startMergeRun } from "../ci/landing.ts";
-import { startRun } from "../ci/trigger.ts";
-import { actorFromRow, type Actor } from "../db.ts";
+import { startRun, startWorkflow } from "../ci/trigger.ts";
+import { actorFromRow, type AccountRow, type Actor } from "../db.ts";
 import { afterPush, type PushedRepo } from "../git/effects.ts";
 import { db } from "../schema.ts";
 import {
@@ -197,6 +197,11 @@ interface Context {
   ownerId: string;
   rows: Map<string, PushedRepo>;
   metadata: RevisionMetadata;
+  /**
+   * Queued runs whose Workflow the stalled-landing sweep couldn't confirm
+   * (CORE-391): started again, once each, when this look reaches them.
+   */
+  restartQueued?: Set<string>;
 }
 
 function recordCasOutcome(
@@ -460,6 +465,8 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
       continue;
     }
     if (run.status === "queued" || run.status === "running") {
+      if (run.status === "queued" && ctx.restartQueued?.delete(repo.mergeRun.id))
+        await restartWorkflow(ctx.env, repo.mergeRun.id);
       if (repo.mergeRun.number !== run.number)
         return save(
           ctx,
@@ -569,6 +576,8 @@ async function step(ctx: Context, landing: Landing): Promise<Landing | null> {
     }
     const gateRun = { id: repo.gateRun.id, number: run.number };
     if (run.status === "queued" || run.status === "running") {
+      if (run.status === "queued" && ctx.restartQueued?.delete(repo.gateRun.id))
+        await restartWorkflow(ctx.env, repo.gateRun.id);
       if (repo.gateRun.number !== run.number)
         return save(ctx, landing, withRepo(landing, repo.id, { gateRun }));
       continue;
@@ -918,6 +927,7 @@ export async function progress(
   deps: LandingDeps,
   ownerId: string,
   landing: Landing,
+  options: { restartQueued?: readonly string[] } = {},
 ): Promise<Landing> {
   if (landing.state === "landed") {
     await publishCompleted(env, ownerId, landing);
@@ -946,6 +956,7 @@ export async function progress(
       env.DB,
       landing.repos.map((repo) => repo.id),
     ),
+    ...(options.restartQueued?.length ? { restartQueued: new Set(options.restartQueued) } : {}),
   };
   const retryMs = deps.stepRetryMs ?? STEP_RETRY_MS;
   let retries = 0;
@@ -1099,8 +1110,8 @@ export async function afterRun(env: Env, deps: LandingDeps, runId: string): Prom
 /**
  * The hourly look (worker/index.ts): landings whose runs ended in the last
  * day, in case a run's end didn't move them on; then approvals whose landing
- * never began (CORE-390). Each part on its own: one failing never skips the
- * other.
+ * never began (CORE-390); then landings that stalled before their run started
+ * (CORE-391). Each part on its own: one failing never skips the others.
  */
 export async function sweepLandings(env: Env, deps: LandingDeps): Promise<void> {
   try {
@@ -1112,6 +1123,11 @@ export async function sweepLandings(env: Env, deps: LandingDeps): Promise<void> 
     await sweepApprovedLandings(env, deps);
   } catch (error) {
     console.error("Landing: sweeping approved timelines failed", error);
+  }
+  try {
+    await sweepStalledLandings(env, deps);
+  } catch (error) {
+    console.error("Landing: sweeping stalled landings failed", error);
   }
 }
 
@@ -1144,6 +1160,13 @@ async function sweepStartedLandings(env: Env, deps: LandingDeps): Promise<void> 
 
 /** Landing attempts the hourly sweep makes per run, at most (CORE-390). */
 const APPROVED_SWEEP_LIMIT = 25;
+/**
+ * Candidates it lists per tracker for each attempt left (CORE-392): skipped
+ * ones (an approver who left, say) mustn't hide landable ones behind them.
+ */
+const APPROVED_SWEEP_LOOKAHEAD = 4;
+/** And at most this many per tracker per run. */
+const APPROVED_SWEEP_LISTED = 100;
 /** Trackers it looks in per run, at most; where it starts rotates hourly. */
 const APPROVED_SWEEP_OWNERS = 200;
 /**
@@ -1155,8 +1178,10 @@ export const APPROVAL_RETRY_MS = 24 * 3600_000;
 
 /**
  * The trackers with live timeline work the sweep looks in this `hour`: at
- * most `window`, in id order, starting `hour` places in and wrapping round,
- * so every tracker is reached however many there are.
+ * most `window`, in id order, from where the last hour's window ended,
+ * wrapping round. While the number of trackers is stable, each is reached
+ * within ceil(trackers / window) hours; when all fit, the first one rotates
+ * hourly.
  */
 export async function sweepOwners(d1: D1Database, window: number, hour: number): Promise<string[]> {
   const live = () => db(d1).selectFrom("timeline_work_sources").where("state", "=", "ready");
@@ -1165,7 +1190,10 @@ export async function sweepOwners(d1: D1Database, window: number, hour: number):
     .executeTakeFirst();
   const total = Number(counted?.owners ?? 0);
   if (!total) return [];
-  const start = hour % total;
+  // More trackers than fit: each hour's window starts where the last one
+  // ended. All of them fit: only the order rotates, a tracker an hour, so the
+  // attempt budget isn't always spent on the same first ones.
+  const start = total > window ? (hour * window) % total : hour % total;
   const page = async (offset: number, limit: number) =>
     (
       await live()
@@ -1186,9 +1214,12 @@ export async function sweepOwners(d1: D1Database, window: number, hour: number):
  * The hourly retry of approvals whose landing never began (CORE-390): in the
  * trackers with live timeline work, each approval timeline whose head was
  * approved in the last day, is still current and has no landing, queued again
- * for its approver. At most `limit` landing attempts per run; what's skipped
- * without one (an approver who left, say) costs nothing. A tracker that fails
- * is logged and passed over. Returns the attempts made.
+ * for its approver. At most `limit` landing attempts per run: only a real
+ * beginLanding counts, and what's skipped before one (an approver who left,
+ * say) costs nothing and doesn't hide later candidates within the lookahead
+ * of four times the remaining budget. A tracker that fails, including an
+ * unexpected failure before a landing was asked for, is logged and passed
+ * over for this run. Returns the attempts made.
  */
 export async function sweepApprovedLandings(
   env: Env,
@@ -1206,7 +1237,12 @@ export async function sweepApprovedLandings(
   for (const ownerId of owners) {
     if (left <= 0) break;
     try {
-      const listed = unwrap(await trackerObject(env, ownerId).approvedUnlanded(left, since));
+      const listed = unwrap(
+        await trackerObject(env, ownerId).approvedUnlanded(
+          Math.min(left * APPROVED_SWEEP_LOOKAHEAD, APPROVED_SWEEP_LISTED),
+          since,
+        ),
+      );
       for (const { slug } of listed) {
         if (left <= 0) break;
         if ((await retryApprovedLanding(env, deps, ownerId, slug, since)).attempted) {
@@ -1223,6 +1259,11 @@ export async function sweepApprovedLandings(
 
 /** What retrying an approval's landing did: whether it tried, and the landing if one began. */
 export interface ApprovalRetry {
+  /**
+   * Whether it asked beginLanding to land it and that counted: not when it
+   * was skipped before, failed before, or found the checkpoint already had a
+   * landing or had moved on (`landing_exists`, `checkpoint_moved`).
+   */
   attempted: boolean;
   landing: Landing | null;
 }
@@ -1235,7 +1276,9 @@ export interface ApprovalRetry {
  * that person is no longer a member or can't write to every repository of the
  * checkpoint. beginLanding checks again in its transaction that this exact
  * checkpoint never had a landing (`onlyIfUnlanded`) and refuses anything stale.
- * Never throws; why it didn't is logged.
+ * Why it didn't is logged. Throws only an unexpected failure before a landing
+ * was asked for (a failing tracker or D1), not counted as an attempt, so the
+ * sweep gives up on that tracker for this run instead of grinding on.
  */
 export async function retryApprovedLanding(
   env: Env,
@@ -1303,12 +1346,13 @@ export async function retryApprovedLanding(
       if (
         error instanceof TrackerError &&
         ["landing_exists", "checkpoint_moved"].includes(error.code)
-      )
+      ) {
         console.info("Landing: no retry, the checkpoint moved on", {
           ...where,
           why: error.message,
         });
-      else if (error instanceof TrackerError)
+        return skipped;
+      } else if (error instanceof TrackerError)
         console.warn("Landing: an approved checkpoint can't land", {
           ...where,
           code: error.code,
@@ -1318,9 +1362,204 @@ export async function retryApprovedLanding(
       return { attempted: true, landing: null };
     }
   } catch (error) {
-    console.error("Landing: retrying an approved checkpoint failed", { ownerId, slug, error });
-    return { attempted: true, landing: null };
+    // Before any landing was asked for: nothing attempted. A tracker's refusal
+    // is this candidate's; anything else is the tracker or D1 failing.
+    if (!(error instanceof TrackerError)) throw error;
+    console.warn("Landing: an approved timeline can't be retried", {
+      ownerId,
+      slug,
+      code: error.code,
+      why: error.message,
+    });
+    return skipped;
   }
+}
+
+/** Landings the hourly sweep restarts per run, at most (CORE-391). */
+const STALLED_SWEEP_LIMIT = 25;
+/** How long a landing (or its queued run) must have sat unmoved before the sweep restarts it. */
+export const STALLED_AFTER_MS = 10 * 60_000;
+/**
+ * How recently a stalled landing must have moved for the sweep to restart it
+ * unattended: landing on main deploys, so an older one waits for a person
+ * (`gm timeline land`), as an older approval does.
+ */
+export const STALLED_MAX_AGE_MS = APPROVAL_RETRY_MS;
+
+/** Whether a CI run's Workflow instance exists: a handle alone is not evidence. */
+export async function workflowConfirmed(env: Env, runId: string): Promise<boolean> {
+  try {
+    return !!(await (await env.CI_RUN.get(runId)).status());
+  } catch {
+    return false;
+  }
+}
+
+/** Start a queued run's Workflow again, for that same run id, unless one is confirmed. */
+async function restartWorkflow(env: Env, runId: string): Promise<void> {
+  try {
+    await startWorkflow(env, runId);
+  } catch (error) {
+    if (!(await workflowConfirmed(env, runId))) throw error;
+  }
+}
+
+/**
+ * Whether a landing stalled before its run started (CORE-391), and the queued
+ * runs to start again; null when it isn't. A landing merging or testing stalls
+ * when every repository at that stage either has no run recorded (never saved,
+ * or saved but never started) or has its run still queued after
+ * STALLED_AFTER_MS with no Workflow to confirm; a running or ended run moves it
+ * on itself (afterRun). It also stalls merging with every unadvanced
+ * repository tested: its next look saves the move to advancing. Advancing and
+ * stopped landings never qualify.
+ */
+async function stalledBeforeRun(
+  env: Env,
+  landing: Landing,
+  now: number,
+): Promise<{ restartQueued: string[] } | null> {
+  if (landing.state !== "merging" && landing.state !== "testing") return null;
+  const waiting = landing.repos.flatMap((repo) =>
+    repo.state === "merging"
+      ? [repo.mergeRun?.id ?? null]
+      : repo.state === "testing"
+        ? [repo.gateRun?.id ?? null]
+        : [],
+  );
+  if (!waiting.length) {
+    const left = landing.repos.filter((repo) => repo.state !== "advanced");
+    return landing.state === "merging" &&
+      left.length > 0 &&
+      left.every((repo) => repo.state === "tested")
+      ? { restartQueued: [] }
+      : null;
+  }
+  const ids = waiting.filter((id): id is string => id !== null);
+  if (!ids.length) return { restartQueued: [] };
+  const recorded = await db(env.DB)
+    .selectFrom("ci_runs")
+    .select(["id", "status", "created_at"])
+    .where("id", "in", ids)
+    .execute();
+  const restartQueued: string[] = [];
+  for (const run of recorded) {
+    if (run.status !== "queued" || Date.parse(run.created_at) > now - STALLED_AFTER_MS) return null;
+    if (await workflowConfirmed(env, run.id)) return null;
+    restartQueued.push(run.id);
+  }
+  return { restartQueued };
+}
+
+/**
+ * Why the sweep mustn't restart a landing as its requester (CORE-391), or
+ * null: their account is gone, they left the tracker, or they can't write to
+ * every repository of the landing. The same checks as retrying an approval.
+ */
+async function requesterRefuses(
+  env: Env,
+  owner: AccountRow,
+  landing: Landing,
+): Promise<string | null> {
+  const personId = landing.requestedBy.accountableId;
+  const person = await db(env.DB)
+    .selectFrom("accounts")
+    .selectAll()
+    .where("id", "=", personId)
+    .executeTakeFirst();
+  if (!person || person.kind !== "user") return "the requester's account is gone";
+  const access = await accessFor(env.DB, owner, person.id, null);
+  if (!access.members.some((member) => member.id === person.id))
+    return "the requester left the tracker";
+  const writable = await writableRepoIds(env.DB, actorFromRow(person), owner.id);
+  const unwritable = landing.repos.find((repo) => !writable.includes(repo.id));
+  return unwritable
+    ? `the requester can't write to ${unwritable.owner}/${unwritable.name} any more`
+    : null;
+}
+
+/**
+ * The hourly look for landings that stalled before their run started
+ * (CORE-391): beginLanding committed but its reply was lost, or a step threw
+ * before a merge or gate run was recorded or its Workflow started, so no run's
+ * end will move them. In the same trackers as the approvals sweep, each
+ * merging or testing landing last moved between STALLED_MAX_AGE_MS and
+ * STALLED_AFTER_MS ago that stalledBeforeRun finds stalled is moved on by
+ * progress(), as its requester, exactly as the normal path would: saving a
+ * run id is version-checked, a run is recorded once by its id (startMergeRun,
+ * startRun), and a queued run's Workflow is started for that same id. Not when
+ * the requester's account is gone, they left or can't write (skipped and
+ * logged, free). At most `limit` restarts per run; each tracker and each
+ * landing on its own. One that still can't move stays as it is, logged.
+ * Returns how many it restarted.
+ */
+export async function sweepStalledLandings(
+  env: Env,
+  deps: LandingDeps,
+  options: { limit?: number; owners?: number; hour?: number } = {},
+): Promise<number> {
+  let left = options.limit ?? STALLED_SWEEP_LIMIT;
+  let restarted = 0;
+  const now = Date.now();
+  const before = new Date(now - STALLED_AFTER_MS).toISOString();
+  const since = new Date(now - STALLED_MAX_AGE_MS).toISOString();
+  const owners = await sweepOwners(
+    env.DB,
+    options.owners ?? APPROVED_SWEEP_OWNERS,
+    options.hour ?? Math.floor(now / 3600_000),
+  );
+  for (const ownerId of owners) {
+    if (left <= 0) break;
+    try {
+      const listed = unwrap(
+        await trackerObject(env, ownerId).stalledLandings(
+          since,
+          before,
+          Math.min(left * APPROVED_SWEEP_LOOKAHEAD, APPROVED_SWEEP_LISTED),
+        ),
+      );
+      if (!listed.length) continue;
+      const owner = await db(env.DB)
+        .selectFrom("accounts")
+        .selectAll()
+        .where("id", "=", ownerId)
+        .executeTakeFirst();
+      if (!owner) {
+        console.warn("Landing: the tracker's account is gone", { ownerId });
+        continue;
+      }
+      for (const landing of listed) {
+        if (left <= 0) break;
+        const where = { ownerId, slug: landing.slug, landing: landing.id, state: landing.state };
+        try {
+          const stalled = await stalledBeforeRun(env, landing, now);
+          if (!stalled) continue;
+          const refused = await requesterRefuses(env, owner, landing);
+          if (refused) {
+            console.warn("Landing: a stalled landing waits for a person", {
+              ...where,
+              why: refused,
+            });
+            continue;
+          }
+          left--;
+          restarted++;
+          console.warn("Landing: restarting a landing that stalled before its run started", {
+            ...where,
+            restartQueued: stalled.restartQueued,
+          });
+          const after = await progress(env, deps, ownerId, landing, stalled);
+          if (after.version === landing.version && !stalled.restartQueued.length)
+            console.error("Landing: a stalled landing still didn't move", where);
+        } catch (error) {
+          console.error("Landing: restarting a stalled landing failed", { ...where, error });
+        }
+      }
+    } catch (error) {
+      console.error("Landing: sweeping a tracker's stalled landings failed", { ownerId, error });
+    }
+  }
+  return restarted;
 }
 
 /** Work for a step or the cron: run `fn` with Worker deps and wait for what it set off. */
