@@ -313,6 +313,26 @@ class Pages {
 }
 
 /**
+ * Ask for exactly the Preview listed to go, by its id. A success or a 404
+ * proves nothing: only a fresh list says it's gone (reconcile checks one).
+ */
+async function deletePreviewById(
+  cloudflare: Cloudflare,
+  account: string,
+  worker: string,
+  preview: Preview,
+): Promise<void> {
+  const { status, body } = await cloudflare.api(
+    "DELETE",
+    `/accounts/${account}/workers/workers/${worker}/previews/${encodeURIComponent(preview.id)}`,
+  );
+  if (!ok(status) && status !== 404)
+    throw new Error(
+      `Deleting Preview ${preview.name} returned HTTP ${status}: ${JSON.stringify(body)}`,
+    );
+}
+
+/**
  * Delete the Worker Preview and its deployments. `cf previews` can only
  * deploy, so this calls the API (as cf's own unexposed delete does): find the
  * Preview by name in the Worker's list, delete it by id, and confirm it's gone.
@@ -382,7 +402,10 @@ export async function teardown(
 // record when a create fails and can't record the failure (main's `.catch`),
 // under a failed record, which never expires (the sweep tears down only
 // active, sleeping and expired records), and in a namespace Cloudflare won't
-// delete (CORE-302), retried here every run. Which timelines are live comes
+// delete (CORE-302), retried here every run. A Preview outlives its record
+// when a create is killed, or its cleanup fails, after deploying (CORE-385):
+// a timeline-* Preview no live record explains goes once every D1 it may own
+// is a day old (CORE-388), and its data with it. Which timelines are live comes
 // from every source of the repository (deployments/live-timelines): since
 // CORE-255 a timeline's records live in its own work source. A live timeline
 // whose Preview isn't listed (Cloudflare deletes the oldest at its
@@ -410,6 +433,8 @@ const REGISTRY_PREFIX = "gitmatrix-preview-registry-";
 export const RECONCILE_MIN_AGE_MS = 2 * 60 * 60 * 1000;
 /** Deletions per run. */
 export const RECONCILE_MAX = 20;
+/** A Preview no live record explains goes once every D1 it may own is this old (CORE-388). */
+export const STALE_PREVIEW_MS = 24 * 60 * 60 * 1000;
 /**
  * No deletion starts after this long: the job (15 minutes, pnpm install
  * included) must end, or the teardown run it's part of fails and the sweep
@@ -700,8 +725,9 @@ function described(error: unknown): string {
 }
 
 /**
- * Delete the gitmatrix-preview-* resources no live preview owns, and report
- * live timelines whose Preview isn't listed. A name a live timeline's slug
+ * Delete the gitmatrix-preview-* resources no live preview owns, and the
+ * timeline-* Previews no live record explains once their D1s are a day old
+ * (CORE-388); report live timelines whose Preview isn't listed. A name a live timeline's slug
  * maps to is always kept, even when it also maps to another slug (CORE-377).
  * Fails closed: any listing error, or no live timeline while the Worker has
  * Previews, deletes nothing. A live timeline names() rejects owns nothing: it
@@ -730,15 +756,19 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRes
 
   // Everything the decision needs, or no decision.
   let timelines: string[];
-  let previews: Set<string>;
+  let worker: string | null;
+  let previews: Map<string, Preview>;
   let resources: Resource[];
   try {
     // Every source's live timelines (a timeline's records live in its own).
     timelines = await deployments.liveTimelines();
-    const worker = await workerId(cloudflare, account);
-    previews = new Set(
+    worker = await workerId(cloudflare, account);
+    previews = new Map(
       worker
-        ? (await listPreviews(cloudflare, account, worker)).map((preview) => preview.name)
+        ? (await listPreviews(cloudflare, account, worker)).map((preview) => [
+            preview.name,
+            preview,
+          ])
         : [],
     );
     resources = [
@@ -765,7 +795,7 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRes
   // also be a name of), and whatever a Preview no live record explains may own.
   const kept = new Set<string>();
   for (const slug of live) for (const name of Object.values(names(slug))) kept.add(name);
-  const unexplained = [...previews].filter((preview) => !kept.has(preview));
+  const unexplained = [...previews.keys()].filter((preview) => !kept.has(preview));
 
   // A live timeline whose Preview isn't listed: reported, never acted on.
   // The Preview may still serve (CORE-216), or sleep on purpose, and the
@@ -784,11 +814,97 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRes
       .filter((resource) => resource.created !== null && now - resource.created < minAge)
       .map((resource) => resource.name),
   );
+  const deadline = started + budget;
+  let deletions = 0;
+
+  // Stale Previews (CORE-388): a timeline-* Preview no live record explains
+  // (a create that failed, or was killed, after deploying) goes once every D1
+  // it may own is over a day old. A create makes its D1 just before it
+  // deploys, and tears the old Preview down before that, so the D1's age is
+  // the Preview's. Deleted by the id listed: a create since has a new one.
+  const gone = new Set<string>();
+  const asked: Preview[] = [];
+  const databases = resources.filter((resource) => resource.kind === "database");
+  // In a new order each run, so Previews that always fail can't starve the rest.
+  for (const name of shuffled(unexplained)) {
+    // A Preview names() didn't make could be anyone's.
+    if (!name.startsWith("timeline-")) continue;
+    const event = { kind: "preview", name };
+    const own = databases.filter((database) => mayOwn(name, database.name));
+    let reason: string | null = null;
+    if (!own.length) reason = "no D1 it may own tells its age";
+    else if (own.some((database) => database.created === null))
+      reason = "a D1 it may own has no creation time";
+    else if (own.some((database) => now - database.created! < STALE_PREVIEW_MS))
+      reason = "a D1 it may own is under a day old";
+    if (reason) {
+      log({ event: "preview.reconcile.skipped", ...event, reason });
+      continue;
+    }
+    result.candidates.push(`preview ${name}`);
+    log({
+      event: "preview.reconcile.candidate",
+      ...event,
+      reason: "no live record explains it, and every D1 it may own is over a day old",
+    });
+    // A dry run lists the data a real run would then reach.
+    if (dryRun) {
+      gone.add(name);
+      continue;
+    }
+    if (deletions >= max) {
+      log({ event: "preview.reconcile.skipped", ...event, reason: `over --max ${max}` });
+      continue;
+    }
+    if (clock() >= deadline) {
+      log({ event: "preview.reconcile.skipped", ...event, reason: "out of time" });
+      continue;
+    }
+    try {
+      deletions++;
+      await deletePreviewById(cloudflare, account, worker!, previews.get(name)!);
+      asked.push(previews.get(name)!);
+    } catch (error) {
+      result.failures.push(`preview ${name}: ${redact(described(error))}`);
+      log({ event: "preview.reconcile.failed", ...event, error: redact(described(error)) });
+    }
+  }
+  // Only a fresh list says a Preview is gone (CORE-216): its id no longer
+  // listed (a create's new one by its name is another Preview). Until then
+  // it still owns its data.
+  if (asked.length) {
+    let listed: Set<string> | null = null;
+    try {
+      listed = new Set(
+        (await listPreviews(cloudflare, account, worker!)).map((preview) => preview.id),
+      );
+    } catch (error) {
+      for (const preview of asked) {
+        const why = `couldn't confirm it's gone: ${redact(described(error))}`;
+        result.failures.push(`preview ${preview.name}: ${why}`);
+        log({ event: "preview.reconcile.failed", kind: "preview", name: preview.name, error: why });
+      }
+    }
+    for (const preview of listed ? asked : []) {
+      const event = { kind: "preview", name: preview.name };
+      if (listed!.has(preview.id)) {
+        const why = "still listed after its delete";
+        result.failures.push(`preview ${preview.name}: ${why}`);
+        log({ event: "preview.reconcile.failed", ...event, error: why });
+        continue;
+      }
+      gone.add(preview.name);
+      result.deleted.push(`preview ${preview.name}`);
+      log({ event: "preview.reconcile.deleted", ...event, outcome: "deleted" });
+    }
+  }
+  const owners = unexplained.filter((name) => !gone.has(name));
+
   const orphans: Resource[] = [];
   for (const resource of resources) {
     if (kept.has(resource.name)) continue;
     const event = { kind: resource.kind, name: resource.name };
-    const preview = unexplained.find((name) => mayOwn(name, resource.name));
+    const preview = owners.find((name) => mayOwn(name, resource.name));
     let reason: string | null = null;
     if (preview) reason = `Preview ${preview}, which no live record explains, may own it`;
     else if (resource.created === null && resource.kind !== "namespace")
@@ -807,8 +923,6 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRes
   const groups = new Map<string, Resource[]>();
   for (const resource of orphans)
     groups.set(resource.name, [...(groups.get(resource.name) ?? []), resource]);
-  const deadline = started + budget;
-  let deletions = 0;
   for (const resource of (options.order ?? shuffled)([...groups.values()]).flat()) {
     const event = { kind: resource.kind, name: resource.name };
     result.candidates.push(`${resource.kind} ${resource.name}`);

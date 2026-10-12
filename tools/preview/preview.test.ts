@@ -955,6 +955,8 @@ await test("a failed record call is checked in the job's own source and run", ()
 // reconcile (CORE-372)
 
 const NOW = Date.parse("2026-10-11T12:00:00.000Z");
+/** A creation time `hours` before NOW, as Cloudflare lists it. */
+const HOURS_AGO = (hours: number) => new Date(NOW - hours * 60 * 60 * 1000).toISOString();
 const RECENT = "2026-10-11T11:30:00.000Z";
 
 /** Every resource names() gives a slug, as the fake account holds them. */
@@ -1341,7 +1343,11 @@ await test("reconcile keeps another source's live timeline with no Preview liste
 await test("Previews are listed to an empty or short page, never to total_count", async () => {
   const all = ["p1", "p2", "p3", "p4", "p5", "p6"].map((slug) => names(slug).preview);
   for (const shape of ["no total_count", "no result_info", "a wrong total_count"] as const) {
-    const fake = account(["alive", "p6"], { previews: all });
+    // p6's D1 is old enough to delete, too young for its Preview to go (CORE-388).
+    const fake = account(["alive", "p6"], {
+      previews: all,
+      created: { [names("p6").db]: HOURS_AGO(3) },
+    });
     const base = fake.cloudflare.api.bind(fake.cloudflare);
     fake.cloudflare.api = async (method, path) => {
       const reply = await base(method, path);
@@ -1543,9 +1549,11 @@ await test("reconcile never deletes a live name, even one another slug also maps
 });
 
 await test("reconcile keeps what a Preview without a readable record may own", async () => {
-  // A Preview whose record is in a source this job doesn't read.
+  // A Preview no live record explains, whose D1 is under a day old: a create
+  // that may still record it, or failed recently. It and its data stay.
   const elsewhere = account(["alive", "other-source", "gone"], {
     previews: [names("alive").preview, names("other-source").preview],
+    created: { [names("other-source").db]: HOURS_AGO(3) },
   });
   const kept = await reconciling(
     elsewhere,
@@ -1570,6 +1578,7 @@ await test("reconcile keeps what a Preview without a readable record may own", a
   for (const long of [`${"l".repeat(40)}-${"m".repeat(20)}`, `${"k".repeat(45)}`]) {
     const hashed = account(["alive", long, "gone"], {
       previews: [names("alive").preview, names(long).preview],
+      created: { [names(long).db]: HOURS_AGO(3) },
     });
     assert.ok(!names(long).preview.endsWith(long));
     const unknown = await reconciling(
@@ -1717,4 +1726,161 @@ await test("a rollback stops at its deadline when a bucket won't empty", async (
   // The rest went: the Preview and the databases.
   assert.equal(fake.previews.size, 0);
   assert.deepEqual(fake.databases, []);
+});
+
+await test("reconcile deletes a day-old Preview no live record explains, then its data (CORE-388)", async () => {
+  const fake = account(["alive", "failed", "fresh", "dataless", "timeless"], {
+    previews: [
+      names("alive").preview,
+      names("failed").preview,
+      names("fresh").preview,
+      "timeline-dataless-preview",
+      names("timeless").preview,
+    ],
+    // fresh's create may still record it: under a day. timeless's D1 doesn't say.
+    created: { [names("fresh").db]: HOURS_AGO(3), [names("timeless").db]: "unknown" },
+  });
+  // A Preview whose D1s are gone tells no age: kept.
+  fake.databases.splice(
+    0,
+    fake.databases.length,
+    ...fake.databases.filter((d) => !d.name.includes("dataless")),
+  );
+  const { result, of } = await reconciling(
+    fake,
+    fakeDeployments([
+      { id: 1, timeline: "alive" },
+      { id: 2, timeline: "failed", status: "failed" },
+    ]).deployments,
+  );
+  assert.deepEqual(
+    [...fake.previews.keys()].toSorted(),
+    [
+      names("alive").preview,
+      names("fresh").preview,
+      "timeline-dataless-preview",
+      names("timeless").preview,
+    ].toSorted(),
+  );
+  // The Preview first, then everything it may have owned.
+  assert.equal(result.deleted[0], `preview ${names("failed").preview}`);
+  for (const name of [names("failed").db, names("failed").registryDb, names("failed").bucket])
+    assert.ok(!left(fake).includes(name), name);
+  // fresh's data stays with its Preview.
+  assert.ok(left(fake).includes(names("fresh").db));
+  const reasons = Object.fromEntries(
+    of("preview.reconcile.skipped")
+      .filter((e) => e.kind === "preview")
+      .map((e) => [e.name, e.reason]),
+  );
+  assert.equal(reasons[names("fresh").preview], "a D1 it may own is under a day old");
+  assert.equal(reasons["timeline-dataless-preview"], "no D1 it may own tells its age");
+  assert.equal(reasons[names("timeless").preview], "a D1 it may own has no creation time");
+});
+
+await test("reconcile never deletes a live timeline's Preview, however old its D1 (CORE-388)", async () => {
+  const fake = account(["alive", "asleep"], {
+    previews: [names("alive").preview, names("asleep").preview],
+  });
+  const { result } = await reconciling(
+    fake,
+    fakeDeployments([
+      { id: 1, timeline: "alive", source: "work-a" },
+      { id: 2, timeline: "asleep", status: "sleeping" },
+    ]).deployments,
+  );
+  assert.deepEqual(result.deleted, []);
+  assert.equal(fake.previews.size, 2);
+});
+
+await test("reconcile deletes the Preview it listed, never one a create deployed since", async () => {
+  const fake = account(["alive", "failed"], {
+    previews: [names("alive").preview, names("failed").preview],
+  });
+  const listedId = fake.previews.get(names("failed").preview)!.id;
+  const base = fake.cloudflare.api.bind(fake.cloudflare);
+  let replaced = false;
+  fake.cloudflare.api = async (method, path) => {
+    // A create tears the listed Preview down and deploys anew between the
+    // listing and the delete.
+    if (method === "DELETE" && !replaced) {
+      replaced = true;
+      fake.previews.set(names("failed").preview, {
+        id: "pv-new",
+        name: names("failed").preview,
+        slug: names("failed").preview,
+      });
+    }
+    return base(method, path);
+  };
+  const { result } = await reconciling(
+    fake,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+  );
+  assert.ok(replaced);
+  assert.notEqual(listedId, "pv-new");
+  // The old id was already gone (404, and not listed): the new Preview stays.
+  assert.equal(fake.previews.get(names("failed").preview)?.id, "pv-new");
+  assert.ok(result.deleted.includes(`preview ${names("failed").preview}`));
+});
+
+await test("a Preview still listed after its delete keeps its data (CORE-216)", async () => {
+  for (const answer of [200, 404]) {
+    const fake = account(["alive", "failed"], {
+      previews: [names("alive").preview, names("failed").preview],
+    });
+    const base = fake.cloudflare.api.bind(fake.cloudflare);
+    fake.cloudflare.api = async (method, path) =>
+      // The delete answers, but the Preview stays listed.
+      method === "DELETE"
+        ? { status: answer, body: { success: answer === 200 } }
+        : base(method, path);
+    const { result, of } = await reconciling(
+      fake,
+      fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+    );
+    assert.ok(fake.previews.has(names("failed").preview), String(answer));
+    assert.ok(!result.deleted.includes(`preview ${names("failed").preview}`), String(answer));
+    assert.ok(
+      of("preview.reconcile.failed").some(
+        (e) => e.name === names("failed").preview && e.error === "still listed after its delete",
+      ),
+      String(answer),
+    );
+    // Its data stays with it.
+    for (const name of [names("failed").db, names("failed").bucket, names("failed").artifacts])
+      assert.ok(left(fake).includes(name), `${answer} ${name}`);
+  }
+});
+
+await test("stale Previews count toward --max and the deadline, and a dry run lists their data", async () => {
+  const slugs = ["a", "b", "c"];
+  const make = () =>
+    account(["alive", ...slugs], {
+      previews: [names("alive").preview, ...slugs.map((slug) => names(slug).preview)],
+    });
+  const deployments = fakeDeployments([{ id: 1, timeline: "alive" }]).deployments;
+  const capped = make();
+  const one = await reconciling(capped, deployments, { max: 1, order: (groups) => groups });
+  assert.equal(one.result.deleted.length, 1);
+  assert.equal(capped.previews.size, 3);
+  assert.ok(one.of("preview.reconcile.skipped").some((e) => e.reason === "over --max 1"));
+
+  const late = make();
+  let now = 0;
+  const timed = await reconciling(late, deployments, {
+    clock: () => (now += 60_000),
+    budgetMs: 90_000,
+  });
+  assert.ok(timed.of("preview.reconcile.skipped").some((e) => e.reason === "out of time"));
+  assert.ok(late.previews.size > 1);
+
+  const dry = make();
+  const listed = await reconciling(dry, deployments, { dryRun: true });
+  assert.equal(dry.previews.size, 4);
+  for (const slug of slugs) {
+    assert.ok(listed.result.candidates.includes(`preview ${names(slug).preview}`), slug);
+    assert.ok(listed.result.candidates.includes(`database ${names(slug).db}`), slug);
+  }
+  assert.deepEqual(listed.result.deleted, []);
 });
