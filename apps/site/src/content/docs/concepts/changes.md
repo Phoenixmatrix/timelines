@@ -123,8 +123,8 @@ Bookmarks are git branches. `HEAD` sits on `@`'s parent, so `git status` and `gi
 `gm worktree add` creates a parallel working directory without cloning objects again. Each worktree has its own files, `@` and undo log; objects and bookmarks are shared. This suits several agents working in one repository.
 
 ```sh
-gm worktree add ../feature            # a new change on the current @ snapshot
-gm worktree add ../clean -r trunk     # start from trunk instead
+gm worktree add ../feature            # a sibling of @, on its parent (no uncommitted edits)
+gm worktree add ../clean -r trunk     # start from trunk instead (-r @ carries uncommitted edits)
 gm -C ../feature status
 gm worktree list
 gm worktree remove ../feature

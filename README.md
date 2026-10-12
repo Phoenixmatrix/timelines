@@ -303,7 +303,8 @@ or elapsed TTL alone never frees a reservation. See
 ### Local create, run and inspect
 
 ```bash
-# In the source workspace; gm snapshots the current working copy.
+# In the source workspace; the new worktree is a sibling of @, on its parent
+# (uncommitted edits are not carried; pass -r @ to carry them).
 gm worktree add ../gitmatrix-feature
 cd ../gitmatrix-feature
 vp install

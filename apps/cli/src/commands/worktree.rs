@@ -191,12 +191,12 @@ pub fn run(ctx: &Ctx, command: &WorktreeCommand) -> Result<WorktreeResult> {
             path,
             revision,
             include,
-        } => add(ctx, path, revision, *include),
+        } => add(ctx, path, revision.as_deref(), *include),
         WorktreeCommand::Remove { path, force } => remove(ctx, path, *force),
     }
 }
 
-fn add(ctx: &Ctx, path: &Path, revision: &str, include: bool) -> Result<WorktreeResult> {
+fn add(ctx: &Ctx, path: &Path, revision: Option<&str>, include: bool) -> Result<WorktreeResult> {
     let target = std::path::absolute(ctx.cwd.join(path))?;
     if target.symlink_metadata().is_ok()
         && (!target.is_dir() || fs::read_dir(&target)?.next().is_some())
@@ -215,7 +215,28 @@ fn add(ctx: &Ctx, path: &Path, revision: &str, include: bool) -> Result<Worktree
     } else {
         Workspace::open(&ctx.cwd)?
     };
-    let base = revset::resolve(&ws, revision)?.to_string();
+    let base = match revision {
+        Some(revision) => revset::resolve(&ws, revision)?,
+        None => {
+            let parents: Vec<_> = ws.commit(ws.wc())?.parent_ids().collect();
+            match parents.as_slice() {
+                [only] => *only,
+                [] => {
+                    return Err(GmError::usage(
+                        "The working copy has no parent to build on; pass -r.",
+                    ));
+                }
+                _ => {
+                    return Err(GmError::new(
+                        "ambiguous_revision",
+                        "The working copy is a merge; choose a base with -r (for example -r trunk).",
+                    )
+                    .exit(exit::USAGE));
+                }
+            }
+        }
+    }
+    .to_string();
     let mut paths = if include {
         worktree_include::plan(&ws.repo)?
     } else {

@@ -3325,8 +3325,7 @@
       "mutates": true,
       "options": [
         {
-          "default": "@",
-          "description": "Revision to build on; defaults to the current working-copy snapshot",
+          "description": "Revision to build on; defaults to the parent of the current working copy, so the new worktree is a sibling of it (as `jj workspace add`). Pass `-r @` to carry this checkout's uncommitted changes",
           "flag": false,
           "multiple": false,
           "name": "--revision",

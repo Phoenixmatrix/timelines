@@ -183,9 +183,11 @@ pub enum WorktreeCommand {
     Add {
         /// Destination directory, relative to --cwd.
         path: PathBuf,
-        /// Revision to build on; defaults to the current working-copy snapshot.
-        #[arg(short, long, default_value = "@")]
-        revision: String,
+        /// Revision to build on; defaults to the parent of the current working copy, so the
+        /// new worktree is a sibling of it (as `jj workspace add`). Pass `-r @` to carry
+        /// this checkout's uncommitted changes.
+        #[arg(short, long)]
+        revision: Option<String>,
         /// Copy ignored files matching the source checkout's .worktreeinclude.
         /// The checkout's agent (.gitmatrix/agent.local.yml) is always copied.
         #[arg(long)]

@@ -456,7 +456,7 @@ fn search_and_schema_describe_the_cli() {
 }
 
 #[test]
-fn worktree_creation_snapshots_source_and_includes_only_when_requested() {
+fn worktree_creation_with_at_snapshots_source_and_includes_only_when_requested() {
     let s = Sandbox::new();
     s.write(".gitignore", ".env\ncache/\n");
     s.write(
@@ -467,10 +467,18 @@ fn worktree_creation_snapshots_source_and_includes_only_when_requested() {
     s.write("cache/config", "ready\n");
     s.write("cache/private", "do not copy\n");
     s.write("pending.txt", "source edits\n");
-    let preview = s.ok(&["worktree", "add", "../preview", "--include", "--dry-run"]);
+    let preview = s.ok(&[
+        "worktree",
+        "add",
+        "../preview",
+        "-r",
+        "@",
+        "--include",
+        "--dry-run",
+    ]);
     assert_eq!(preview["dry_run"], true);
     assert!(!s.root.join("preview").exists());
-    let added = s.ok(&["worktree", "add", "../with spaces", "--include"]);
+    let added = s.ok(&["worktree", "add", "../with spaces", "-r", "@", "--include"]);
     let target = s.root.join("with spaces");
     assert_eq!(
         fs::read_to_string(target.join("pending.txt")).unwrap(),
@@ -502,6 +510,64 @@ fn worktree_creation_snapshots_source_and_includes_only_when_requested() {
         .collect();
     assert!(paths.contains(&(target.to_str().unwrap(), true)));
     assert!(paths.contains(&(s.work().to_str().unwrap(), false)));
+}
+
+fn commit_id(dir: &Path, rev: &str) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", rev])
+        .output()
+        .expect("git runs");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn worktree_defaults_to_a_sibling_of_the_working_copy() {
+    let s = Sandbox::new();
+    let trunk = commit_id(&s.work(), "origin/main");
+    s.write("pending.txt", "source edits\n");
+    let preview = s.ok(&["worktree", "add", "../side", "--dry-run"]);
+    assert_eq!(preview["base"], trunk);
+    let added = s.ok(&["worktree", "add", "../side"]);
+    assert_eq!(added["base"], trunk);
+    let side = s.root.join("side");
+    assert!(!side.join("pending.txt").exists());
+    let wc = added["working_copy"].as_str().unwrap().to_string();
+    assert_eq!(commit_id(&side, &format!("{wc}^")), trunk);
+
+    // Snapshotting the source's edits must not rebase the new worktree.
+    s.write("pending.txt", "more source edits\n");
+    s.ok(&["status"]);
+    let side_status = s.ok(&["-C", side.to_str().unwrap(), "status"]);
+    let short = side_status["working_copy"]["commit_id"].as_str().unwrap();
+    assert!(wc.starts_with(short));
+    assert_eq!(commit_id(&side, &format!("{wc}^")), trunk);
+
+    // `-r @` carries the uncommitted changes.
+    s.ok(&["worktree", "add", "../carry", "-r", "@"]);
+    assert_eq!(
+        fs::read_to_string(s.root.join("carry/pending.txt")).unwrap(),
+        "more source edits\n"
+    );
+}
+
+#[test]
+fn worktree_without_a_revision_refuses_a_merge_working_copy() {
+    let s = Sandbox::new();
+    s.write("a.txt", "one\n");
+    s.ok(&["commit", "-m", "Add a"]);
+    s.ok(&["new", "trunk", "-m", "Add b"]);
+    s.write("b.txt", "two\n");
+    let a = s.change("Add a");
+    let b = s.change("Add b");
+    s.ok(&["new", &a, &b, "-m", "Merge"]);
+    assert_eq!(
+        s.err(&["worktree", "add", "../side"]).1,
+        "ambiguous_revision"
+    );
+    assert!(!s.root.join("side").exists());
+    s.ok(&["worktree", "add", "../side", "-r", "trunk"]);
 }
 
 #[test]

@@ -1299,9 +1299,12 @@ gm worktree remove ../feature
 ```
 
 `add` creates a detached Git worktree and initializes gm there. It defaults to
-a **new change on the source checkout's current `@` snapshot**, including
-pending source edits. Pass `-r trunk`, a bookmark, a change id or a commit id
-to choose another base. Paths are relative to `--cwd`; creation also works
+a **sibling of the source checkout's `@`**: a new change on `@`'s parent, so
+the source's uncommitted edits are not carried and later snapshots of the
+source never rebase the new worktree. Pass `-r @` to carry the source's
+uncommitted changes (a snapshot of them), or `-r trunk`, a bookmark, a change
+id or a commit id to choose another base. A merge working copy has no single
+parent, so it needs `-r`. Paths are relative to `--cwd`; creation also works
 from a linked checkout or its subdirectories. The source must be initialized
 with `gm init` or `gm clone`. Existing worktrees created with Git can be
 adopted independently with `gm -C <path> init`.
@@ -1349,8 +1352,9 @@ trust boundary.
 ### Preview, removal and recovery
 
 `gm worktree add ../feature --include --dry-run` lists the selected base and
-files without snapshotting or creating the worktree. Its `@` is the last
-stored snapshot, so unsnapshotted source edits can change the actual base.
+files without snapshotting or creating the worktree. The base is the working
+copy's parent; uncommitted source edits are not carried unless `-r @`, whose
+dry-run base is the last stored snapshot, so unsnapshotted edits can change it.
 `worktree list` includes main, bare and plain-Git worktrees and reports current,
 initialized, locked and prunable state without snapshotting them.
 
