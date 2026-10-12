@@ -13,6 +13,11 @@
 //   reconcile delete gitmatrix-preview-* resources no live preview owns
 //             (CORE-372).
 //
+// A create that fails once it has started provisioning records a failed
+// deployment, then deletes what it made (unless its live record may have been
+// stored). A killed job or a failed cleanup can still leave resources behind:
+// preview.create.rollback-failed names them.
+//
 // Names derive from the timeline's slug alone, so a create after a teardown, a
 // revival or a retry finds and replaces what an earlier one left. Each create
 // starts with a teardown: a preview shows a checkpoint's code on migrations
@@ -338,14 +343,18 @@ export async function deletePreview(
 }
 
 /** Delete the data resources a create made (all of them, whether or not they exist). */
-export async function deleteData(cloudflare: Cloudflare, names: Names): Promise<void> {
+export async function deleteData(
+  cloudflare: Cloudflare,
+  names: Names,
+  guard: Pick<Guard, "deadline" | "clock"> = {},
+): Promise<void> {
   const failures: string[] = [];
   // Independent: one failing doesn't keep the others.
   for (const [what, work] of [
     ["database", () => deleteDatabase(cloudflare, names.db)],
     ["registry database", () => deleteDatabase(cloudflare, names.registryDb)],
-    ["bucket", () => deleteBucket(cloudflare, names.bucket)],
-    ["Artifacts namespace", () => deleteNamespace(cloudflare, names.artifacts)],
+    ["bucket", () => deleteBucket(cloudflare, names.bucket, guard)],
+    ["Artifacts namespace", () => deleteNamespace(cloudflare, names.artifacts, guard)],
   ] as const) {
     try {
       await work();
@@ -357,10 +366,15 @@ export async function deleteData(cloudflare: Cloudflare, names: Names): Promise<
 }
 
 /** teardown: the Preview first (so nothing serves from half-deleted data), then its data. */
-export async function teardown(cloudflare: Cloudflare, account: string, slug: string) {
+export async function teardown(
+  cloudflare: Cloudflare,
+  account: string,
+  slug: string,
+  guard: Pick<Guard, "deadline" | "clock"> = {},
+) {
   const all = names(slug);
   await deletePreview(cloudflare, account, all.preview);
-  await deleteData(cloudflare, all);
+  await deleteData(cloudflare, all, guard);
   return all;
 }
 
@@ -1098,30 +1112,98 @@ export interface CreateDeps {
   seed(origin: string, resources: PreviewResources, headers: Record<string, string>): Promise<void>;
   /** `gm deploy record`, with the job's variables. */
   record(args: string[]): Promise<void>;
+  /** Whether this run stored a live record at `url`: null when that can't be told. */
+  recorded(url: string): Promise<boolean | null>;
+  /** The rollback's clock (tests). */
+  clock?: () => number;
   wait(origin: string, resources: PreviewResources, headers: Record<string, string>): Promise<void>;
   secret?: string;
 }
 
-/** create: tear down, provision, deploy in preview mode, seed, record. Returns the URL. */
+/**
+ * create: tear down, provision, deploy in preview mode, seed, record. Returns
+ * the URL. A failed create records a failed deployment first (so a slow
+ * cleanup can't keep the checkpoint from saying so), then undoes what it made
+ * (CORE-385): no live record accounts for it, so the sweep would never tear it
+ * down. Only when its own live record may exist (the record call failed but
+ * may have landed) does it keep the preview. Creates for one source run one at
+ * a time, so the slug's names are this create's.
+ */
 export async function create(deps: CreateDeps, job: Job): Promise<string> {
-  const access = previewAccess(job.env);
-  const headers = accessHeaders(job.env);
-  const all = await teardown(deps.cloudflare, job.account, job.slug);
-  const secret = deps.secret ?? randomBytes(32).toString("hex");
-  hide(secret);
-  const resources = await provision(deps.cloudflare, all, secret, access);
-  // isPreview builds cloudflare.config.ts's preview mode, bound to these resources.
-  const output = await deps.cloudflare.cf(
-    ["previews", "deploy", all.preview],
-    previewVariables(resources),
-  );
-  const url = previewUrl(output);
-  await deps.wait(url, resources, headers);
-  await deps.seed(url, resources, headers);
-  // GITMATRIX_TIMELINE and GITMATRIX_CHECKPOINT file it under timeline/<slug>.
-  // Access protects the hostname; recorded links contain no bearer capability.
-  await deps.record(["deploy", "record", "--url", url]);
-  return url;
+  let made = false;
+  let url: string | undefined;
+  let recording = false;
+  try {
+    const access = previewAccess(job.env);
+    const headers = accessHeaders(job.env);
+    const all = await teardown(deps.cloudflare, job.account, job.slug);
+    const secret = deps.secret ?? randomBytes(32).toString("hex");
+    hide(secret);
+    made = true;
+    const resources = await provision(deps.cloudflare, all, secret, access);
+    // isPreview builds cloudflare.config.ts's preview mode, bound to these resources.
+    const output = await deps.cloudflare.cf(
+      ["previews", "deploy", all.preview],
+      previewVariables(resources),
+    );
+    url = previewUrl(output);
+    await deps.wait(url, resources, headers);
+    await deps.seed(url, resources, headers);
+    // GITMATRIX_TIMELINE and GITMATRIX_CHECKPOINT file it under timeline/<slug>.
+    // Access protects the hostname; recorded links contain no bearer capability.
+    recording = true;
+    await deps.record(["deploy", "record", "--url", url]);
+    return url;
+  } catch (error) {
+    // A record call that failed may still have stored the live record.
+    const live = recording && url ? await deps.recorded(url).catch(() => null) : false;
+    // The checkpoint shows a failed preview rather than none; the job still fails.
+    if (live !== true)
+      await deps.record(["deploy", "record", "--status", "failed"]).catch(() => {});
+    if (made && live === false) await rollBack(deps.cloudflare, job, deps.clock);
+    else if (made)
+      console.error(
+        JSON.stringify({
+          event: "preview.create.kept",
+          ...names(job.slug),
+          reason:
+            live === true ? "its live record was stored" : "its live record may have been stored",
+        }),
+      );
+    throw error;
+  }
+}
+
+/** How long a failed create spends deleting what it made. */
+const ROLLBACK_MS = 10 * 60_000;
+
+/**
+ * Undo a failed create: its Preview and data. The create's own error is the
+ * one reported; a rollback that fails too says what it left, for a person or
+ * reconcile (CORE-372) to delete.
+ */
+async function rollBack(
+  cloudflare: Cloudflare,
+  job: Job,
+  clock: () => number = Date.now,
+): Promise<void> {
+  try {
+    // Bounded: a bucket or namespace that won't empty mustn't hold the
+    // repository's preview slot until the job's own deadline.
+    const all = await teardown(cloudflare, job.account, job.slug, {
+      deadline: clock() + ROLLBACK_MS,
+      clock,
+    });
+    console.error(JSON.stringify({ event: "preview.create.rolled-back", ...all }));
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        event: "preview.create.rollback-failed",
+        ...names(job.slug),
+        error: redact(error instanceof Error ? error.message : String(error)),
+      }),
+    );
+  }
 }
 
 function run(
@@ -1209,6 +1291,28 @@ export function jobFrom(env: NodeJS.ProcessEnv): Job & { action: "create" | "tea
   return { action, slug, account, env };
 }
 
+/**
+ * The API path listing this run's live deployment records, in the job's own
+ * source (a timeline's preview runs in its work source; the list defaults to
+ * canonical, which `gm deploy list` can't change). Null without the job's
+ * variables.
+ */
+export function liveRecordsPath(env: NodeJS.ProcessEnv): string | null {
+  const repo = env.GITMATRIX_REPOSITORY;
+  const source = env.GITMATRIX_SOURCE_ID;
+  const run = env.GITMATRIX_RUN_NUMBER;
+  if (
+    !repo ||
+    !source ||
+    !run ||
+    !/^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/.test(repo) ||
+    !/^\d+$/.test(run)
+  )
+    return null;
+  const query = new URLSearchParams({ run, status: "active", source, limit: "100" });
+  return `/repos/${repo}/deployments?${query}`;
+}
+
 /** The job's environment for gm, which needs none of Cloudflare's credentials. */
 function withoutCloudflare(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const rest = { ...env };
@@ -1279,37 +1383,41 @@ async function main(argv: string[]): Promise<void> {
         JSON.stringify({ event: "preview.recorded", deployment: id ? Number(id) : null }),
       );
     };
-    try {
-      const url = await create(
-        {
-          cloudflare,
-          record,
-          wait: (origin, resources, headers) => waitForPreview(origin, resources, { headers }),
-          seed: async (origin, resources, headers) => {
-            await seedFixtures({
-              id: resources.name,
-              secret: resources.secret,
-              origin,
-              gm,
-              dir: join(scratch, "seed"),
-              work: scratch,
-              env: {
-                ...gmEnv,
-                GITMATRIX_ACCESS_ORIGIN: origin,
-                GITMATRIX_ACCESS_TOKEN: job.env.GITMATRIX_ACCESS_TOKEN,
-              },
-              headers,
-            });
-          },
+    const url = await create(
+      {
+        cloudflare,
+        record,
+        // This run's live records: the one a failed record call may have stored.
+        recorded: async (url) => {
+          const path = liveRecordsPath(job.env);
+          if (!path) return null;
+          const listed = JSON.parse(
+            await run(gm, ["api", "GET", path, "-o", "json"], { env: gmEnv, timeout: 120_000 }),
+          ) as { deployments?: { url: string | null }[] };
+          if (!Array.isArray(listed.deployments)) return null;
+          return listed.deployments.some((deployment) => deployment.url === url);
         },
-        job,
-      );
-      console.log(JSON.stringify({ event: "preview.created", url, ...names(job.slug) }));
-    } catch (error) {
-      // The checkpoint shows a failed preview rather than none; the job still fails.
-      await record(["deploy", "record", "--status", "failed"]).catch(() => {});
-      throw error;
-    }
+        wait: (origin, resources, headers) => waitForPreview(origin, resources, { headers }),
+        seed: async (origin, resources, headers) => {
+          await seedFixtures({
+            id: resources.name,
+            secret: resources.secret,
+            origin,
+            gm,
+            dir: join(scratch, "seed"),
+            work: scratch,
+            env: {
+              ...gmEnv,
+              GITMATRIX_ACCESS_ORIGIN: origin,
+              GITMATRIX_ACCESS_TOKEN: job.env.GITMATRIX_ACCESS_TOKEN,
+            },
+            headers,
+          });
+        },
+      },
+      job,
+    );
+    console.log(JSON.stringify({ event: "preview.created", url, ...names(job.slug) }));
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
