@@ -232,7 +232,17 @@ const eventLabels: Record<string, string> = {
   "request.cancel": "withdrew a request",
   "link.add": "added a relation",
   "link.remove": "removed a relation",
+  "automation.approveWhenGreen": "changed approve-when-green",
+  "request.autoApproveSkipped": "left an approval to its person (approve-when-green)",
 };
+
+/** What an event did, in words; an approval answered by approve-when-green says so (CORE-378). */
+function eventLabel(event: IssueAuditEvent): string {
+  const entity = event.entity as { via?: string } | null;
+  if (event.kind === "request.answer" && entity?.via === "auto-approve")
+    return "approved a request automatically (approve-when-green)";
+  return eventLabels[event.kind] ?? event.kind.replaceAll(/[._]/g, " ");
+}
 
 function AuditEntry({ event, snapshot }: { event: IssueAuditEvent; snapshot: Snapshot }) {
   const [open, setOpen] = useState(false);
@@ -266,9 +276,7 @@ function AuditEntry({ event, snapshot }: { event: IssueAuditEvent; snapshot: Sna
             <span className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
               <span className="min-w-0 [overflow-wrap:anywhere]">
                 <AuditIdentity actor={event.actor} snapshot={snapshot} compact />{" "}
-                <span className="text-ink-muted">
-                  {eventLabels[event.kind] ?? event.kind.replaceAll(/[._]/g, " ")}
-                </span>
+                <span className="text-ink-muted">{eventLabel(event)}</span>
               </span>
               <time
                 className="text-label text-ink-muted tabular-nums"
@@ -295,8 +303,13 @@ function AuditEntry({ event, snapshot }: { event: IssueAuditEvent; snapshot: Sna
               <AuditIdentity actor={event.actor} snapshot={snapshot} />
             </p>
             <p className="mt-1 mb-0 text-label text-ink-muted">
-              Source: {event.source === "unknown" ? "Unknown (not recorded)" : event.source}
-              {" · Client-reported, not proof of identity"}
+              Source:{" "}
+              {event.source === "unknown"
+                ? "Unknown (not recorded)"
+                : event.source === "automation"
+                  ? "Automation (their approve-when-green setting)"
+                  : event.source}
+              {event.source !== "automation" && " · Client-reported, not proof of identity"}
               {event.mutationKind !== event.kind && <> · Triggered by {event.mutationKind}</>}
             </p>
             <p className="mt-1 mb-0 text-label text-ink-muted [overflow-wrap:anywhere]">

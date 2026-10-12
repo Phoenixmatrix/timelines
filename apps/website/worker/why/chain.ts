@@ -274,6 +274,7 @@ export async function resolveChain(sources: WhySources, request: ChainRequest): 
             by: state.approval.by,
             at: state.approval.at,
             note: state.approval.note,
+            ...(state.approval.via ? { via: state.approval.via } : {}),
           },
         });
       }

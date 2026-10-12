@@ -1,4 +1,5 @@
 import type {
+  ApprovalAutomation,
   EntityType,
   Issue,
   MutationResult,
@@ -51,8 +52,17 @@ export function acknowledge(snapshot: Snapshot, result: MutationResult): Snapsho
     for (const entity of [event.entity, event.view?.entity])
       for (const label of (entity as Issue | null | undefined)?.labels ?? []) labels.add(label);
   }
+  // Approve-when-green turned on or off (CORE-378): who has it, as the server now says.
+  let green = snapshot.approveWhenGreen;
+  for (const event of result.events) {
+    if (event.entityType !== "automation" || event.cursor <= snapshot.cursor) continue;
+    const setting = event.entity as ApprovalAutomation | null;
+    const others = (green ?? []).filter((id) => id !== event.entityId);
+    green = setting?.approveWhenGreen ? [...others, event.entityId].sort() : others;
+  }
   return {
     ...snapshot,
+    ...(green === undefined ? {} : { approveWhenGreen: green }),
     labels: [...labels].sort(),
     teams: apply(snapshot.teams, "team"),
     workspaces: apply(snapshot.workspaces, "workspace"),

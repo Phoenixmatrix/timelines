@@ -9,7 +9,7 @@ import { d1, migratedDatabase } from "../testing/d1.ts";
 import { initializeWorkSource, type WorkSourceRow } from "./sources.ts";
 import { retainProgress } from "../git/source-push.ts";
 import type { RepoRow } from "../db.ts";
-import { progress, type LandingDeps } from "./landing.ts";
+import { greenness, progress, type LandingDeps } from "./landing.ts";
 import { measure } from "./checkpoints.ts";
 import { lsRefs } from "../artifacts.ts";
 import type * as Artifacts from "../artifacts.ts";
@@ -1730,5 +1730,97 @@ describe("exact nested admission", () => {
         canonical,
       ),
     ).rejects.toThrow("blocked_dependency");
+  });
+});
+
+describe("greenness", () => {
+  function runs() {
+    const sqlite = migratedDatabase();
+    sqlite.exec(`INSERT INTO accounts(id,kind,slug,display_name) VALUES('org','org','org','Org');
+      INSERT INTO repos(id,owner_id,name,visibility,artifacts_name,artifacts_remote) VALUES
+        ('app','org','app','private','r-app','https://app'),
+        ('lib','org','lib','private','r-lib','https://lib');`);
+    let number = 0;
+    const run = (
+      repoId: string,
+      status: string,
+      step = 0,
+      commit = oid(9),
+      preview: "create" | "teardown" | null = null,
+    ) =>
+      sqlite
+        .prepare(
+          "INSERT INTO ci_runs(id,repo_id,number,commit_oid,ref,trigger,status,step,source_id,preview_action) VALUES(?,?,?,?,'work',?,?,?,?,?)",
+        )
+        .run(
+          `run-${++number}`,
+          repoId,
+          number,
+          commit,
+          preview ? "manual" : "push",
+          status,
+          step,
+          "canonical",
+          preview,
+        );
+    const repo = (id: string) => ({
+      id,
+      owner: "org",
+      name: id,
+      commit: oid(9),
+      source: { sourceId: "canonical" },
+    });
+    const state = {
+      checkpoint: { number: 3, repos: [repo("app"), repo("lib")] },
+    } as unknown as Parameters<typeof greenness>[2];
+    const check = (requireRun?: boolean) =>
+      greenness(d1(sqlite), { slug: "search" }, state, requireRun ? { requireRun } : {});
+    return { run, check };
+  }
+
+  test("a repository without a run is green for auto landing, not for approving on a person's behalf", async () => {
+    const f = runs();
+    f.run("app", "succeeded");
+    expect(await f.check()).toEqual({ ok: true, why: null });
+    expect(await f.check(true)).toMatchObject({
+      ok: false,
+      why: expect.stringMatching(/org\/lib/),
+    });
+    // A light step run, or a run of another commit, isn't the checkpoint's CI.
+    f.run("lib", "succeeded", 1);
+    f.run("lib", "succeeded", 0, oid(8));
+    expect((await f.check(true)).ok).toBe(false);
+    f.run("lib", "succeeded");
+    expect(await f.check(true)).toEqual({ ok: true, why: null });
+  });
+
+  test("the newest run decides: pending or red is not green either way", async () => {
+    const f = runs();
+    f.run("app", "succeeded");
+    f.run("lib", "succeeded");
+    f.run("lib", "running");
+    expect(await f.check(true)).toMatchObject({ ok: false, why: expect.stringMatching(/running/) });
+    expect((await f.check()).ok).toBe(false);
+    f.run("lib", "failed");
+    expect(await f.check(true)).toMatchObject({ ok: false, why: expect.stringMatching(/failed/) });
+  });
+
+  test("a preview's deploy is never the checkpoint's CI, for auto landing or approving", async () => {
+    const f = runs();
+    f.run("app", "failed");
+    f.run("lib", "succeeded");
+    // The checkpoint's preview deployed after its push run failed.
+    f.run("app", "succeeded", 0, oid(9), "create");
+    f.run("app", "succeeded", 0, oid(9), "teardown");
+    expect(await f.check()).toMatchObject({ ok: false, why: expect.stringMatching(/failed/) });
+    expect(await f.check(true)).toMatchObject({ ok: false, why: expect.stringMatching(/failed/) });
+    // Only previews: no run at all, as far as green goes.
+    const g = runs();
+    g.run("app", "succeeded", 0, oid(9), "create");
+    g.run("lib", "succeeded");
+    expect(await g.check(true)).toMatchObject({
+      ok: false,
+      why: expect.stringMatching(/org\/app/),
+    });
   });
 });

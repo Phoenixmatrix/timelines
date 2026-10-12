@@ -139,12 +139,19 @@ export function ReviveButton({
 export function CheckpointPanel({
   view,
   tracker,
+  name,
 }: {
   view: CheckpointView;
   /** The tracker account's slug, for the timeline link. */
   tracker: string;
+  /** How to name a person by id, for who approved it. */
+  name?: (id: string) => string;
 }) {
   const { checkpoint, timeline } = view;
+  // Approved by the approver's own approve-when-green setting (CORE-378).
+  const automatic = view.approved && view.approval?.via === "auto-approve";
+  const approver = view.approval?.by ? (name?.(view.approval.by) ?? view.approval.by) : "someone";
+  const whose = approver === "you" ? "your" : `${approver}\u2019s`;
   useRefreshWhile(view.knowledge.some(pagesPending));
   return (
     <section
@@ -169,8 +176,17 @@ export function CheckpointPanel({
             Superseded
           </span>
         )}
-        {view.approved && <span className="mk-chip mk-chip--tag">Approved</span>}
+        {view.approved && (
+          <span className="mk-chip mk-chip--tag">
+            {automatic ? "Approved automatically" : "Approved"}
+          </span>
+        )}
       </header>
+      {automatic && (
+        <p className="m-0 text-body-sm text-ink-muted">
+          Approved automatically: {whose} approve-when-green setting, once its CI was green.
+        </p>
+      )}
       {!view.current && (
         <p className="m-0 text-body-sm text-ink-muted">
           The timeline has moved past this checkpoint. It can't be approved any more; its agent

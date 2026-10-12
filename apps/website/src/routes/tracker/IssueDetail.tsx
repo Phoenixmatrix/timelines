@@ -7,6 +7,7 @@ import {
   claimAttribution,
   CLOSE_REASONS,
   ISSUE_PICKUPS,
+  autoApprovable,
   issuePickup,
   issueTimeline,
   issueTimelineText,
@@ -1407,6 +1408,10 @@ export function IssueDetail({
                 key={request.id}
                 request={request}
                 name={(id) => actorName(snapshot, id)}
+                approvesWhenGreen={
+                  !!snapshot.approveWhenGreen?.includes(request.routeTo) &&
+                  autoApprovable(request, snapshot.agents)
+                }
                 onAnswer={(answer) =>
                   settleRequest(mutate([{ kind: "request.answer", id: request.id, data: answer }]))
                 }

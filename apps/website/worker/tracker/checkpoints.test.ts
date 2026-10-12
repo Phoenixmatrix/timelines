@@ -11,7 +11,7 @@ import { ownedTimeline, ownedCheckpointRepo } from "../testing/timeline-source.t
 
 const oid = (n: number) => n.toString(16).padStart(40, "0");
 
-function setup() {
+function setup(options: { policy?: "auto" | "approval" } = {}) {
   const { sql, transactionSync } = durableStorage();
   let now = Date.parse("2026-10-03T00:00:00Z");
   const clock = () => (now += 1000);
@@ -27,6 +27,14 @@ function setup() {
       id: "agt_bot",
       name: "bot",
       accountable: people[1]!,
+      capabilities: null,
+      capabilitiesUpdatedAt: null,
+      revokedAt: null,
+    },
+    {
+      id: "agt_annbot",
+      name: "annbot",
+      accountable: people[0]!,
       capabilities: null,
       capabilitiesUpdatedAt: null,
       revokedAt: null,
@@ -56,6 +64,7 @@ function setup() {
   const timeline = ownedTimeline(timelines, bot, {
     slug: "search",
     parent: null,
+    ...(options.policy ? { policy: options.policy } : {}),
     repos: [{ id: "app", owner: "org", name: "app" }],
     commits: { app: oid(1) },
   });
@@ -115,8 +124,11 @@ function setup() {
     });
   const request = (id: string) =>
     tracker.snapshot(ben).requests.find((r) => r.id === id) as HumanRequest;
+  const approveWhenGreen = (access: Access, enabled: boolean, person = access.principalId) =>
+    mutate(access, { kind: "automation.approveWhenGreen", id: person, data: { enabled } });
   return {
     sql,
+    approveWhenGreen,
     tracker,
     timelines,
     as,
@@ -452,5 +464,384 @@ describe("approvals pinned to a checkpoint", () => {
       }),
     ).toThrow(/Only approval requests name a checkpoint/);
     expect(() => t.ask("cp_missing")).toThrow(/No checkpoint cp_missing/);
+  });
+});
+
+test("a client can't pre-claim the withdrawal of a superseded approval", () => {
+  const t = setup();
+  t.push(2);
+  const first = t.checkpoint(2).checkpoint;
+  const id = t.ask(first.id);
+  // An agent uses the withdrawal's old operation id first.
+  t.tracker.mutate(t.bot, {
+    operationId: `superseded:${id}`,
+    mutations: [{ kind: "comment.add", id: "squat", data: { issueId: "issue", body: "mine" } }],
+  });
+  expect(() =>
+    t.tracker.mutate(t.bot, {
+      operationId: `@superseded:${id}`,
+      mutations: [{ kind: "comment.add", id: "squat2", data: { issueId: "issue", body: "x" } }],
+    }),
+  ).toThrow(/IDs must use letters/);
+  // New commits still withdraw it, under the reserved spelling.
+  t.push(3);
+  expect(t.request(id)).toMatchObject({ status: "canceled" });
+  const withdrawn = t.tracker
+    .history(t.ben, "issue", null, 50)
+    .events.find((event) => event.kind === "request.cancel" && event.entityId === id);
+  expect(withdrawn).toMatchObject({ operationId: `@superseded:${id}` });
+  // Again: nothing open to withdraw, so nothing happens.
+  t.push(3);
+  expect(t.request(id)).toMatchObject({ status: "canceled" });
+});
+
+describe("approved but never landed (CORE-390)", () => {
+  const begin = (t: ReturnType<typeof setup>) =>
+    t.timelines.beginLanding(t.ben, "search", {
+      trigger: "approval",
+      green: { ok: true, why: null },
+      agentId: null,
+    }).landing;
+
+  test("an approved, current head with no landing is listed with its approver until one begins", () => {
+    const t = setup({ policy: "approval" });
+    expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+    t.answer(t.ben, id, true);
+    const listed = t.timelines.approvedUnlanded(10, "");
+    expect(listed).toEqual([
+      {
+        slug: "search",
+        checkpointId: checkpoint.id,
+        approverId: "ben",
+        approvedAt: expect.any(String),
+      },
+    ]);
+    // Approved before `since`: left to a person.
+    const later = new Date(Date.parse(listed[0]!.approvedAt) + 1).toISOString();
+    expect(t.timelines.approvedUnlanded(10, later)).toEqual([]);
+    expect(t.timelines.approvedUnlanded(0, "")).toEqual([]);
+    expect(begin(t).checkpointId).toBe(checkpoint.id);
+    expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+  });
+
+  test.each(["failed", "landed"] as const)(
+    "a head whose landing %s is the landing's (or a person's) to retry, not the sweep's",
+    (state) => {
+      const t = setup({ policy: "approval" });
+      t.push(2);
+      const { checkpoint } = t.checkpoint(2);
+      t.answer(t.ben, t.ask(checkpoint.id), true);
+      const started = begin(t);
+      t.timelines.saveLanding(
+        {
+          ...started,
+          state,
+          repos: started.repos.map((repo) => ({
+            ...repo,
+            state: "advanced",
+            base: oid(1),
+            merge: oid(3),
+          })),
+        },
+        started.version,
+        "ben",
+      );
+      expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+    },
+  );
+
+  test("a retry lands only that checkpoint, only if it never had a landing", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    t.answer(t.ben, t.ask(checkpoint.id), true);
+    const retry = (onlyIfUnlanded: string) =>
+      t.timelines.beginLanding(t.ben, "search", {
+        trigger: "approval",
+        green: { ok: true, why: null },
+        agentId: null,
+        onlyIfUnlanded,
+      });
+    expect(() => retry("cp_other")).toThrow(/newer checkpoint than the one to retry/);
+    const started = begin(t);
+    t.timelines.saveLanding({ ...started, state: "failed" }, started.version, "ben");
+    expect(() => retry(checkpoint.id)).toThrow(/already has a landing; it isn't retried/);
+    expect(t.timelines.landing("search")).toMatchObject({ id: started.id, state: "failed" });
+  });
+
+  test("a stale approved checkpoint, or an auto timeline, is never listed", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    t.answer(t.ben, t.ask(checkpoint.id), true);
+    t.push(3);
+    expect(t.timelines.checkpoint("search", "1")).toMatchObject({ approved: false });
+    expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+    const auto = setup({ policy: "auto" });
+    auto.push(2);
+    const head = auto.checkpoint(2).checkpoint;
+    auto.answer(auto.ben, auto.ask(head.id), true);
+    expect(auto.timelines.approvedUnlanded(10, "")).toEqual([]);
+  });
+});
+
+describe("approve when green (CORE-378)", () => {
+  test("only the person turns their own setting on or off, and each change is in the log", () => {
+    const t = setup({ policy: "approval" });
+    // Not an agent for its person, not an owner for someone else.
+    expect(() => t.approveWhenGreen(t.bot, true)).toThrow(/Agents can't do that/);
+    expect(() => t.approveWhenGreen(t.as("ann"), true, "ben")).toThrow(/you can only change yours/);
+    expect(t.tracker.snapshot(t.ben).approveWhenGreen).toEqual([]);
+
+    const on = t.approveWhenGreen(t.ben, true);
+    expect(on.events).toMatchObject([
+      {
+        kind: "automation.approveWhenGreen",
+        entityType: "automation",
+        entityId: "ben",
+        actorId: "ben",
+        actor: { kind: "person" },
+        before: { id: "ben", approveWhenGreen: false, enabledAt: null },
+        entity: { id: "ben", approveWhenGreen: true, enabledAt: expect.any(String) },
+      },
+    ]);
+    const since = (on.events[0]!.entity as { enabledAt: string }).enabledAt;
+    expect(t.tracker.snapshot(t.as("ann")).approveWhenGreen).toEqual(["ben"]);
+    // Again keeps when it was first turned on.
+    expect(t.approveWhenGreen(t.ben, true).events[0]!.entity).toMatchObject({ enabledAt: since });
+    const off = t.approveWhenGreen(t.ben, false);
+    expect(off.events[0]).toMatchObject({
+      before: { approveWhenGreen: true, enabledAt: since },
+      entity: { approveWhenGreen: false, enabledAt: null },
+    });
+    expect(t.tracker.snapshot(t.ben).approveWhenGreen).toEqual([]);
+    expect(() =>
+      t.tracker.mutate(t.ben, {
+        operationId: "bad",
+        mutations: [
+          { kind: "automation.approveWhenGreen", id: "ben", data: { enabled: "yes" as never } },
+        ],
+      }),
+    ).toThrow(/enabled must be true or false/);
+  });
+
+  test("approves the pinned head for its routed person, marked, as them", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    const auto = (access = t.as("ben")) => t.tracker.autoApprove(access, id, checkpoint.id);
+
+    // Off: nothing happens.
+    expect(auto()).toBeNull();
+    expect(t.request(id).status).toBe("open");
+
+    t.approveWhenGreen(t.ben, true);
+    // Never as the asking agent, and never for someone it isn't routed to.
+    expect(auto(t.bot)).toBeNull();
+    expect(auto(t.as("ann"))).toBeNull();
+    expect(t.tracker.autoApprove(t.as("ben"), id, "cp_other")).toBeNull();
+
+    const result = auto()!;
+    expect(result.events[0]).toMatchObject({
+      kind: "request.answer",
+      operationId: `@auto-approve:${id}`,
+      actorId: "ben",
+      source: "automation",
+    });
+    expect(t.request(id)).toMatchObject({
+      status: "answered",
+      answeredBy: "ben",
+      via: "auto-approve",
+      answer: "approved · Checkpoint #1's CI is green.",
+    });
+    expect(t.timelines.checkpoint("search", "1")).toMatchObject({
+      approved: true,
+      approval: { requestId: id, state: "approved", by: "ben", via: "auto-approve" },
+    });
+    expect(t.timelines.detail("search", 0, 50).events.at(-1)).toMatchObject({
+      kind: "approval",
+      outcome: "approved",
+      via: "auto-approve",
+      actorId: "ben",
+      accountableId: "ben",
+    });
+    // Answered once: a second run ending finds nothing open.
+    expect(auto()).toBeNull();
+  });
+
+  test("a hand answer never carries the marker, even when the setting is on", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    t.approveWhenGreen(t.ben, true);
+    // No client can claim the marker.
+    expect(() =>
+      t.tracker.mutate(t.ben, {
+        operationId: "claimed",
+        mutations: [
+          {
+            kind: "request.answer",
+            id,
+            data: { approved: true, via: "auto-approve" } as never,
+          },
+        ],
+      }),
+    ).toThrow(/via/);
+    t.answer(t.ben, id, true);
+    expect(t.request(id).via).toBeUndefined();
+    expect(t.timelines.checkpoint("search", "1").approval?.via).toBeUndefined();
+  });
+
+  test("turning it off before CI completes means no approval", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    t.approveWhenGreen(t.ben, true);
+    t.approveWhenGreen(t.ben, false);
+    expect(t.tracker.autoApprove(t.as("ben"), id, checkpoint.id)).toBeNull();
+    expect(t.request(id).status).toBe("open");
+    expect(t.timelines.checkpoint("search", "1").approved).toBe(false);
+  });
+
+  test("a stale checkpoint is never approved", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    t.approveWhenGreen(t.ben, true);
+    // Admitted but unsettled source write: the head is fenced.
+    const operation = t.admit(3);
+    expect(t.tracker.autoApprove(t.as("ben"), id, checkpoint.id)).toBeNull();
+    expect(t.timelines.checkpoint("search", "1").approved).toBe(false);
+    // Once the push lands, the request is withdrawn: still nothing to approve.
+    t.timelines.finishSourcePush(operation, "accepted");
+    expect(t.request(id).status).toBe("canceled");
+    expect(t.tracker.autoApprove(t.as("ben"), id, checkpoint.id)).toBeNull();
+  });
+
+  test("why it was left to its person is noted once per reason, only for that person", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    const why = "Changes CI configuration (.gitmatrix/ci.yml in org/app): approve it yourself.";
+    const note = (access: Access, reason = why) =>
+      t.tracker.noteAutoApproveSkipped(access, id, checkpoint.id, reason);
+    expect(note(t.bot)).toBe(false);
+    expect(note(t.as("ann"))).toBe(false);
+    expect(t.tracker.noteAutoApproveSkipped(t.as("ben"), id, "cp_other", why)).toBe(false);
+    expect(note(t.as("ben"))).toBe(true);
+    expect(t.request(id)).toMatchObject({
+      status: "open",
+      autoApproveSkipped: { checkpointId: checkpoint.id, reason: why },
+    });
+    expect(note(t.as("ben"))).toBe(false);
+    const history = t.tracker.history(t.ben, "issue", null, 50).events;
+    expect(history.filter((event) => event.kind === "request.autoApproveSkipped")).toMatchObject([
+      { actorId: "ben", source: "automation", entityId: id },
+    ]);
+    // Answered by hand: nothing more to note.
+    t.answer(t.ben, id, true);
+    expect(note(t.as("ben"), "Something else.")).toBe(false);
+  });
+
+  test("only what the person or one of their own agents asked", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    t.approveWhenGreen(t.ben, true);
+    const askAs = (access: Access, id: string) =>
+      t.tracker.mutate(access, {
+        operationId: `ask-${id}`,
+        mutations: [
+          {
+            kind: "request.open",
+            id,
+            data: {
+              issueId: "issue",
+              kind: "approval",
+              prompt: "Ship it?",
+              checkpoint: checkpoint.id,
+              routeTo: "ben",
+            },
+          },
+        ],
+      });
+    askAs(t.as("ann"), "from-ann");
+    askAs(t.as("agt_annbot", "ann"), "from-annbot");
+    askAs(t.ben, "from-ben");
+    const auto = (id: string) => t.tracker.autoApprove(t.as("ben"), id, checkpoint.id);
+    expect(auto("from-ann")).toBeNull();
+    expect(auto("from-annbot")).toBeNull();
+    expect(t.tracker.noteAutoApproveSkipped(t.as("ben"), "from-ann", checkpoint.id, "x")).toBe(
+      false,
+    );
+    expect(t.request("from-ann").status).toBe("open");
+    expect(t.request("from-annbot").status).toBe("open");
+    expect(auto("from-ben")).not.toBeNull();
+    expect(t.request("from-ben")).toMatchObject({ status: "answered", via: "auto-approve" });
+  });
+
+  test("its operation id is one no client can use or pre-claim", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    t.approveWhenGreen(t.ben, true);
+    const team = { kind: "team.update", id: "team", expectedVersion: 1, data: { name: "Eng" } };
+    expect(() =>
+      t.tracker.mutate(t.bot, { operationId: `@auto-approve:${id}`, mutations: [team as never] }),
+    ).toThrow(/IDs must use letters/);
+    // The old spelling is just another client id: it claims nothing.
+    t.tracker.mutate(t.as("ann"), {
+      operationId: `auto-approve:${id}`,
+      mutations: [team as never],
+    });
+    expect(t.tracker.autoApprove(t.as("ben"), id, checkpoint.id)?.events[0]).toMatchObject({
+      operationId: `@auto-approve:${id}`,
+      kind: "request.answer",
+    });
+  });
+
+  test("someone found no longer a member loses the setting, logged, and rejoining doesn't restore it", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    t.approveWhenGreen(t.ben, true);
+    const cursor = t.tracker.snapshot(t.ben).cursor;
+    const gone = { ...t.as("ben"), members: [{ id: "ann", slug: "ann", displayName: "Ann" }] };
+    expect(t.tracker.autoApprove(gone, id, checkpoint.id)).toBeNull();
+    expect(t.tracker.changes(cursor, 10).events).toMatchObject([
+      {
+        kind: "automation.approveWhenGreen",
+        entityType: "automation",
+        entityId: "ben",
+        source: "automation",
+        before: { approveWhenGreen: true },
+        entity: { approveWhenGreen: false, enabledAt: null },
+      },
+    ]);
+    // Back as a member: off until Ben turns it on again.
+    expect(t.tracker.snapshot(t.ben).approveWhenGreen).toEqual([]);
+    expect(t.tracker.autoApprove(t.as("ben"), id, checkpoint.id)).toBeNull();
+    expect(t.request(id).status).toBe("open");
+  });
+
+  test("only approval timelines", () => {
+    const t = setup({ policy: "auto" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    t.approveWhenGreen(t.ben, true);
+    expect(t.tracker.autoApprove(t.as("ben"), id, checkpoint.id)).toBeNull();
+    expect(t.request(id).status).toBe("open");
   });
 });

@@ -131,6 +131,8 @@ export interface WhyApproval {
   by: string | null;
   at: string | null;
   note: string | null;
+  /** Approved by `by`'s approve-when-green setting (CORE-378). */
+  via?: "auto-approve";
 }
 
 /** A checkpoint that pinned the change (by change id, so a later rewrite still matches). */

@@ -571,6 +571,7 @@ function describe(
   event: TimelineEvent,
   self: Timeline,
   byId: Map<string, Timeline>,
+  actor: (id: string) => string = (id) => id,
 ): { verb: string; other: Timeline | null | undefined } {
   const of = (id: string | null) => (id === null ? null : byId.get(id));
   switch (event.kind) {
@@ -583,6 +584,20 @@ function describe(
       return { verb: event.intoId === null ? "Landed on" : "Merged into", other: of(event.intoId) };
     case "abandon":
       return { verb: "Abandoned", other: undefined };
+    case "approval": {
+      // Who answered, and whether by hand or by their approve-when-green setting (CORE-378).
+      const by = event.actorId ? actor(event.actorId) : null;
+      const how =
+        event.via === "auto-approve"
+          ? ` automatically by ${by ?? "someone"}\u2019s approve-when-green setting`
+          : event.outcome !== "superseded" && by
+            ? ` by ${by}`
+            : "";
+      return {
+        verb: `Checkpoint #${event.number} ${event.outcome}${how}${event.note && event.outcome !== "approved" ? ` — ${event.note}` : ""}`,
+        other: undefined,
+      };
+    }
     case "landing":
       return {
         verb: `Checkpoint #${event.number}: ${event.outcome === "blocked_dependency" ? "blocked by dependency" : event.outcome.replaceAll("_", " ")}${event.note ? ` — ${event.note}` : ""}`,
@@ -787,7 +802,7 @@ function TimelineDetails({
 
       <LiveNow owner={data.owner.slug} timeline={timeline} />
 
-      <TimelineCheckpoints owner={data.owner.slug} timeline={timeline} />
+      <TimelineCheckpoints owner={data.owner.slug} timeline={timeline} actor={actor} />
 
       <LandingPanel owner={data.owner.slug} timeline={timeline} onChange={onChange} />
 
@@ -803,7 +818,7 @@ function TimelineDetails({
       ) : (
         <ol className="m-0 max-h-72 list-none overflow-y-auto p-0">
           {events.map((event) => {
-            const { verb, other } = describe(event, timeline, byId);
+            const { verb, other } = describe(event, timeline, byId, actor);
             const repo = eventRepo(event, [timeline, other]);
             return (
               <li
@@ -855,7 +870,16 @@ function TimelineDetails({
  * The timeline's checkpoints with their previews (CORE-79): any checkpoint's
  * preview can be revived from here, landed and abandoned timelines included.
  */
-function TimelineCheckpoints({ owner, timeline }: { owner: string; timeline: Timeline }) {
+function TimelineCheckpoints({
+  owner,
+  timeline,
+  actor,
+}: {
+  owner: string;
+  timeline: Timeline;
+  /** A person's or agent's name, for who approved a checkpoint. */
+  actor: (id: string) => string;
+}) {
   const [list, setList] = useState<CheckpointList | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState(0);
@@ -902,6 +926,17 @@ function TimelineCheckpoints({ owner, timeline }: { owner: string; timeline: Tim
               >
                 {timeAgo(view.checkpoint.createdAt)}
               </time>
+              {view.approved &&
+                (view.approval?.via === "auto-approve" ? (
+                  <span
+                    className="mk-chip mk-chip--tag"
+                    title={`Approved automatically: ${view.approval.by ? actor(view.approval.by) : "someone"}\u2019s approve-when-green setting`}
+                  >
+                    Approved automatically
+                  </span>
+                ) : (
+                  <span className="mk-chip mk-chip--tag">Approved</span>
+                ))}
               {view.previews.length === 0 ? (
                 <span className="text-ink-faint">No preview</span>
               ) : (

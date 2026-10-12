@@ -135,3 +135,21 @@ describe("committed mutation acknowledgements", () => {
     expect(acknowledge(snapshot([main]), receipt).issues).toEqual([main]);
   });
 });
+
+describe("approve-when-green (CORE-378)", () => {
+  it("follows the setting's own events, without a refresh", () => {
+    const setting = (cursor: number, id: string, on: boolean) =>
+      event(
+        cursor,
+        id,
+        { id, approveWhenGreen: on, enabledAt: on ? now : null },
+        { entityType: "automation", kind: "automation.approveWhenGreen" },
+      );
+    const before = { ...snapshot([]), approveWhenGreen: ["ann"] };
+    const on = acknowledge(before, result([setting(11, "ben", true)]));
+    expect(on.approveWhenGreen).toEqual(["ann", "ben"]);
+    expect(acknowledge(on, result([setting(12, "ann", false)])).approveWhenGreen).toEqual(["ben"]);
+    // Already seen: nothing changes.
+    expect(acknowledge(on, result([setting(9, "ben", false)]))).toBe(on);
+  });
+});

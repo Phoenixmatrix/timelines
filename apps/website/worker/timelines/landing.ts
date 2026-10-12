@@ -7,7 +7,7 @@
 import { lsRefs } from "../artifacts.ts";
 import { runOutcome, startMergeRun } from "../ci/landing.ts";
 import { startRun } from "../ci/trigger.ts";
-import type { Actor } from "../db.ts";
+import { actorFromRow, type Actor } from "../db.ts";
 import { afterPush, type PushedRepo } from "../git/effects.ts";
 import { db } from "../schema.ts";
 import {
@@ -27,6 +27,7 @@ import { trackerObject } from "../tracker/stub.ts";
 import { logPush } from "./activity.ts";
 import { writeRefs, type RefWrite, type RefWriteResult } from "./bookmarks.ts";
 import { getWorkSource } from "./sources.ts";
+import { writableRepoIds } from "./checkpoints.ts";
 import {
   completeReceipts,
   receiptFor,
@@ -145,14 +146,17 @@ async function repoRows(d1: D1Database, ids: string[]): Promise<Map<string, Push
 
 /**
  * Whether a checkpoint is green: each repository's newest CI run of its
- * commit on the timeline's bookmark succeeded. A repository with no run of it
- * has no CI to wait for. Green only queues the landing: the gates still run
- * on the merge before main moves.
+ * commit on the timeline's bookmark succeeded (not a step run, and not a
+ * preview's deploy). A repository with no run of it
+ * has no CI to wait for, unless `requireRun`: approving on a person's behalf
+ * (CORE-378) needs a run that succeeded in every repository. Green only queues
+ * the landing: the gates still run on the merge before main moves.
  */
 export async function greenness(
   d1: D1Database,
   _timeline: Pick<Timeline, "slug">,
   state: CheckpointState,
+  options: { requireRun?: boolean } = {},
 ): Promise<{ ok: boolean; why: string | null }> {
   const branch = "work";
   for (const repo of state.checkpoint.repos) {
@@ -163,12 +167,19 @@ export async function greenness(
       .where("commit_oid", "=", repo.commit)
       .where("source_id", "=", repo.source?.sourceId ?? "migration-required")
       .where("ref", "=", branch)
-      // Step runs are light checks per push, not the timeline's CI (CORE-235).
+      // Step runs are light checks per push, not the timeline's CI (CORE-235),
+      // and a preview's create or teardown deploys, never tests (CORE-79, CORE-378).
       .where("step", "=", 0)
+      .where("preview_action", "is", null)
       .orderBy("number", "desc")
       .executeTakeFirst();
-    if (!run || run.status === "succeeded") continue;
     const where = `${repo.owner}/${repo.name}`;
+    if (!run && options.requireRun)
+      return {
+        ok: false,
+        why: `Checkpoint #${state.checkpoint.number} has no CI run on ${where} yet: approve-when-green waits for one to succeed.`,
+      };
+    if (!run || run.status === "succeeded") continue;
     return {
       ok: false,
       why:
@@ -1041,14 +1052,15 @@ export async function maybeLand(
 /**
  * A CI run ended (ci/workflow.ts): if it was a landing's merge or gates, move
  * that landing on; if it was a timeline's own run, an `auto` timeline may now
- * be green. Never throws.
+ * be green, or an approval routed to someone with approve-when-green on may now
+ * be approvable. Never throws.
  */
 export async function afterRun(env: Env, deps: LandingDeps, runId: string): Promise<void> {
   try {
     const run = await db(env.DB)
       .selectFrom("ci_runs as c")
       .innerJoin("repos as r", "r.id", "c.repo_id")
-      .select(["c.ref", "c.repo_id", "c.source_id", "r.owner_id", "c.step"])
+      .select(["c.ref", "c.repo_id", "c.source_id", "r.owner_id", "c.step", "c.preview_action"])
       .where("c.id", "=", runId)
       .executeTakeFirst();
     // A step run is a light check, not the timeline's CI: it never lands one.
@@ -1059,10 +1071,25 @@ export async function afterRun(env: Env, deps: LandingDeps, runId: string): Prom
       if (reply.ok && reply.value) await progress(env, deps, run.owner_id, reply.value);
       return;
     }
+    // A preview deploys a checkpoint; it says nothing about whether it's green.
+    if (run.preview_action) return;
     if (run.source_id !== "canonical") {
       const source = await getWorkSource(env, run.repo_id, run.source_id);
-      if (source?.state === "ready")
-        await maybeLand(env, deps, run.owner_id, source.timeline_slug, "auto");
+      if (source?.state === "ready") {
+        const { timeline } = unwrap(
+          await trackerObject(env, run.owner_id).timeline(source.timeline_slug, 0, 1),
+        );
+        if (timeline.policy === "auto")
+          await maybeLand(env, deps, run.owner_id, timeline.slug, "auto");
+        else {
+          // An approval timeline's checkpoint may now be green for someone's
+          // approve-when-green setting (CORE-378). Loaded only then.
+          const { maybeAutoApprove } = await import("./auto-approve.ts");
+          await maybeAutoApprove(env, deps, run.owner_id, { slug: timeline.slug });
+          // An approval whose landing never began (CORE-390): try it again.
+          await retryApprovedLanding(env, deps, run.owner_id, timeline.slug);
+        }
+      }
     }
   } catch (error) {
     console.error("Landing: after a CI run", { runId, error });
@@ -1071,9 +1098,24 @@ export async function afterRun(env: Env, deps: LandingDeps, runId: string): Prom
 
 /**
  * The hourly look (worker/index.ts): landings whose runs ended in the last
- * day, in case a run's end didn't move them on.
+ * day, in case a run's end didn't move them on; then approvals whose landing
+ * never began (CORE-390). Each part on its own: one failing never skips the
+ * other.
  */
 export async function sweepLandings(env: Env, deps: LandingDeps): Promise<void> {
+  try {
+    await sweepStartedLandings(env, deps);
+  } catch (error) {
+    console.error("Landing: sweeping landings failed", error);
+  }
+  try {
+    await sweepApprovedLandings(env, deps);
+  } catch (error) {
+    console.error("Landing: sweeping approved timelines failed", error);
+  }
+}
+
+async function sweepStartedLandings(env: Env, deps: LandingDeps): Promise<void> {
   // Receipt completion is a cross-store outbox, not dependent on a recent CI
   // callback. Include old/partially advanced operations without a time cutoff.
   const pending = await env.DB.prepare(`SELECT DISTINCT r.landing_id,w.owner_id,w.timeline_slug
@@ -1098,6 +1140,187 @@ export async function sweepLandings(env: Env, deps: LandingDeps): Promise<void> 
     .limit(200)
     .execute();
   for (const run of runs) await afterRun(env, deps, run.id);
+}
+
+/** Landing attempts the hourly sweep makes per run, at most (CORE-390). */
+const APPROVED_SWEEP_LIMIT = 25;
+/** Trackers it looks in per run, at most; where it starts rotates hourly. */
+const APPROVED_SWEEP_OWNERS = 200;
+/**
+ * How recent an approval must be for its landing to be retried unattended:
+ * landing on main deploys, so an older approval waits for a person
+ * (`gm timeline land`).
+ */
+export const APPROVAL_RETRY_MS = 24 * 3600_000;
+
+/**
+ * The trackers with live timeline work the sweep looks in this `hour`: at
+ * most `window`, in id order, starting `hour` places in and wrapping round,
+ * so every tracker is reached however many there are.
+ */
+export async function sweepOwners(d1: D1Database, window: number, hour: number): Promise<string[]> {
+  const live = () => db(d1).selectFrom("timeline_work_sources").where("state", "=", "ready");
+  const counted = await live()
+    .select((eb) => eb.fn.count<number>("owner_id").distinct().as("owners"))
+    .executeTakeFirst();
+  const total = Number(counted?.owners ?? 0);
+  if (!total) return [];
+  const start = hour % total;
+  const page = async (offset: number, limit: number) =>
+    (
+      await live()
+        .select("owner_id")
+        .distinct()
+        .orderBy("owner_id")
+        .limit(limit)
+        .offset(offset)
+        .execute()
+    ).map((row) => row.owner_id);
+  const owners = await page(start, window);
+  if (owners.length < window && start > 0)
+    owners.push(...(await page(0, Math.min(window - owners.length, start))));
+  return owners;
+}
+
+/**
+ * The hourly retry of approvals whose landing never began (CORE-390): in the
+ * trackers with live timeline work, each approval timeline whose head was
+ * approved in the last day, is still current and has no landing, queued again
+ * for its approver. At most `limit` landing attempts per run; what's skipped
+ * without one (an approver who left, say) costs nothing. A tracker that fails
+ * is logged and passed over. Returns the attempts made.
+ */
+export async function sweepApprovedLandings(
+  env: Env,
+  deps: LandingDeps,
+  options: { limit?: number; owners?: number; hour?: number } = {},
+): Promise<number> {
+  let left = options.limit ?? APPROVED_SWEEP_LIMIT;
+  let attempts = 0;
+  const since = new Date(Date.now() - APPROVAL_RETRY_MS).toISOString();
+  const owners = await sweepOwners(
+    env.DB,
+    options.owners ?? APPROVED_SWEEP_OWNERS,
+    options.hour ?? Math.floor(Date.now() / 3600_000),
+  );
+  for (const ownerId of owners) {
+    if (left <= 0) break;
+    try {
+      const listed = unwrap(await trackerObject(env, ownerId).approvedUnlanded(left, since));
+      for (const { slug } of listed) {
+        if (left <= 0) break;
+        if ((await retryApprovedLanding(env, deps, ownerId, slug, since)).attempted) {
+          left--;
+          attempts++;
+        }
+      }
+    } catch (error) {
+      console.error("Landing: sweeping a tracker's approved timelines failed", { ownerId, error });
+    }
+  }
+  return attempts;
+}
+
+/** What retrying an approval's landing did: whether it tried, and the landing if one began. */
+export interface ApprovalRetry {
+  attempted: boolean;
+  landing: Landing | null;
+}
+
+/**
+ * Queue the landing an approval should have queued (CORE-390): an approval
+ * timeline whose head was approved since `since` (the last day by default),
+ * is still current and never had a landing, lands for the person who
+ * approved it, as `maybeLand(…, "approval")` does after an answer. Not when
+ * that person is no longer a member or can't write to every repository of the
+ * checkpoint. beginLanding checks again in its transaction that this exact
+ * checkpoint never had a landing (`onlyIfUnlanded`) and refuses anything stale.
+ * Never throws; why it didn't is logged.
+ */
+export async function retryApprovedLanding(
+  env: Env,
+  deps: LandingDeps,
+  ownerId: string,
+  slug: string,
+  since = new Date(Date.now() - APPROVAL_RETRY_MS).toISOString(),
+): Promise<ApprovalRetry> {
+  const skipped: ApprovalRetry = { attempted: false, landing: null };
+  try {
+    const tracker = trackerObject(env, ownerId);
+    const { timeline, head, everLanded } = unwrap(await tracker.headCheckpoint(slug));
+    if (
+      timeline.policy !== "approval" ||
+      timeline.status === "landed" ||
+      timeline.status === "abandoned"
+    )
+      return skipped;
+    if (!head?.approved || !head.approval?.by || !head.approval.at || everLanded) return skipped;
+    const where = { ownerId, slug, checkpoint: head.checkpoint.number };
+    if (head.approval.at < since) {
+      console.info("Landing: an approval over a day old waits for a person to land it", where);
+      return skipped;
+    }
+    const approverId = head.approval.by;
+    const [owner, person] = await Promise.all(
+      [ownerId, approverId].map((id) =>
+        db(env.DB).selectFrom("accounts").selectAll().where("id", "=", id).executeTakeFirst(),
+      ),
+    );
+    if (!owner) {
+      console.warn("Landing: the tracker's account is gone", where);
+      return skipped;
+    }
+    if (!person || person.kind !== "user") {
+      console.warn("Landing: the approver's account is gone", { ...where, approverId });
+      return skipped;
+    }
+    const access = await accessFor(env.DB, owner, person.id, null);
+    if (!access.members.some((member) => member.id === person.id)) {
+      console.warn("Landing: the approver left the tracker", { ...where, approverId });
+      return skipped;
+    }
+    const writable = await writableRepoIds(env.DB, actorFromRow(person), owner.id);
+    const unwritable = head.checkpoint.repos.find((repo) => !writable.includes(repo.id));
+    if (unwritable) {
+      console.warn("Landing: the approver can't write to the checkpoint any more", {
+        ...where,
+        approverId,
+        repo: `${unwritable.owner}/${unwritable.name}`,
+      });
+      return skipped;
+    }
+    try {
+      const result = unwrap(
+        await tracker.beginLanding(access, timeline.slug, {
+          trigger: "approval",
+          green: { ok: true, why: null },
+          agentId: null,
+          onlyIfUnlanded: head.checkpoint.id,
+        }),
+      );
+      return { attempted: true, landing: await progress(env, deps, owner.id, result.landing) };
+    } catch (error) {
+      if (
+        error instanceof TrackerError &&
+        ["landing_exists", "checkpoint_moved"].includes(error.code)
+      )
+        console.info("Landing: no retry, the checkpoint moved on", {
+          ...where,
+          why: error.message,
+        });
+      else if (error instanceof TrackerError)
+        console.warn("Landing: an approved checkpoint can't land", {
+          ...where,
+          code: error.code,
+          why: error.message,
+        });
+      else console.error("Landing: retrying an approved checkpoint failed", { ...where, error });
+      return { attempted: true, landing: null };
+    }
+  } catch (error) {
+    console.error("Landing: retrying an approved checkpoint failed", { ownerId, slug, error });
+    return { attempted: true, landing: null };
+  }
 }
 
 /** Work for a step or the cron: run `fn` with Worker deps and wait for what it set off. */

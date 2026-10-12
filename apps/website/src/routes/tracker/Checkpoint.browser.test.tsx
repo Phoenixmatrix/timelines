@@ -308,6 +308,69 @@ test("a superseded checkpoint can't be approved, and the withdrawn request says 
   expect(withdrawn.getByRole("button", { name: "Approve" }).elements()).toHaveLength(0);
 });
 
+test("a checkpoint approved by approve-when-green says whose setting approved it (CORE-378)", async () => {
+  const server = await TestServer.start({ world: true });
+  const timeline = await timelineWorld(server);
+  const made = await checkpoint(server, timeline, "Ready");
+  await askApproval(server, timeline, made.checkpoint.id);
+  // As a second open request on it would show it: approved by Marco's own setting.
+  server.on("GET", "/api/requests", async () => {
+    const open = await server.call<OpenRequests>("GET", "/api/requests");
+    for (const item of open.requests)
+      if (item.checkpoint)
+        item.checkpoint = {
+          ...item.checkpoint,
+          approved: true,
+          approval: {
+            requestId: "earlier",
+            state: "approved",
+            by: "acc_marco",
+            at: new Date().toISOString(),
+            note: null,
+            via: "auto-approve",
+          },
+        };
+    return open;
+  });
+  renderApp("/needs-you");
+  await expect.element(card()).toBeVisible();
+  await expect.element(card().getByText("Approved automatically", { exact: true })).toBeVisible();
+  await expect
+    .element(card())
+    .toMatchTextContent(
+      "Approved automatically: your approve-when-green setting, once its CI was green.",
+    );
+});
+
+test("a checkpoint that changes CI configuration says to approve it yourself (CORE-378)", async () => {
+  const server = await TestServer.start({ world: true });
+  const timeline = await timelineWorld(server);
+  const made = await checkpoint(server, timeline, "Ready");
+  await askApproval(server, timeline, made.checkpoint.id);
+  const reason =
+    "Changes CI configuration (.gitmatrix/ci.yml in orbit/engine): approve it yourself.";
+  server.on("GET", "/api/requests", async () => {
+    const open = await server.call<OpenRequests>("GET", "/api/requests");
+    for (const item of open.requests) {
+      item.approvesWhenGreen = true;
+      item.request.autoApproveSkipped = {
+        checkpointId: made.checkpoint.id,
+        reason,
+        at: new Date().toISOString(),
+      };
+    }
+    return open;
+  });
+  renderApp("/needs-you");
+  const request = page.getByRole("article", { name: "Approval for you" });
+  await expect.element(request.getByText("Approve it yourself", { exact: true })).toBeVisible();
+  await expect.element(request.getByText(reason, { exact: true })).toBeVisible();
+  await expect
+    .element(request.getByText("Approves when green", { exact: true }))
+    .not.toBeInTheDocument();
+  await expect.element(page.getByRole("button", { name: "Approve" })).toBeEnabled();
+});
+
 test("an auto timeline's card says it lands when green; Revive preview starts a rebuild", async () => {
   const server = await TestServer.start({ world: true });
   const timeline = await timelineWorld(server, { policy: "auto", names: ["engine", "web"] });

@@ -116,6 +116,12 @@ export interface LandingRequest {
   green: { ok: boolean; why: string | null };
   /** The agent asking, when an agent asks (the access's actor otherwise). */
   agentId: string | null;
+  /**
+   * Retrying an approval's landing (CORE-390): land only this checkpoint, and
+   * only if it never had a landing in any state. Otherwise refused with
+   * `landing_exists` (or `checkpoint_moved`), in the same transaction.
+   */
+  onlyIfUnlanded?: string;
 }
 
 /** Statuses a checkpoint's approval moves a timeline between; the rest belong to landing. */
@@ -1535,6 +1541,7 @@ export class TimelineStore {
       by: answered.actorId,
       at: answered.createdAt,
       note: answered.note,
+      ...(answered.via ? { via: answered.via } : {}),
     };
   }
   private state(checkpoint: Checkpoint): CheckpointState {
@@ -1772,6 +1779,7 @@ export class TimelineStore {
     approved: boolean,
     note: string | null,
     writableRepoIds: string[] | undefined,
+    via?: "auto-approve",
   ) {
     const pinned = request.checkpoint!;
     const checkpoint = this.findCheckpoint(pinned.id);
@@ -1802,6 +1810,7 @@ export class TimelineStore {
         requestId: request.id,
         outcome: approved ? "approved" : "rejected",
         note,
+        ...(via ? { via } : {}),
         actorId: access.actorId,
         accountableId: access.principalId,
         createdAt: this.now(),
@@ -1812,6 +1821,87 @@ export class TimelineStore {
 
   // ---- landing (CORE-77) -----------------------------------------------------
 
+  /** Whether any landing of this checkpoint was ever begun, in any state. */
+  private everLanded(timelineId: string, checkpointId: string): boolean {
+    return !!first(
+      this.sql,
+      tracker
+        .selectFrom("timeline_landings")
+        .select("id")
+        .where("timeline_id", "=", timelineId)
+        .where(json("data", "$.checkpointId"), "=", checkpointId)
+        .limit(1),
+    );
+  }
+  /**
+   * What retrying an approval's landing reads (CORE-390): the timeline's
+   * policy and status, its head checkpoint's state (null without one), and
+   * whether that head ever had a landing.
+   */
+  headCheckpoint(slug: string): {
+    timeline: Pick<Timeline, "id" | "slug" | "policy" | "status">;
+    head: CheckpointState | null;
+    everLanded: boolean;
+  } {
+    const timeline = this.get(slug);
+    const head = this.latest(timeline.id);
+    return {
+      timeline: {
+        id: timeline.id,
+        slug: timeline.slug,
+        policy: timeline.policy,
+        status: timeline.status,
+      },
+      head: head ? this.state(head) : null,
+      everLanded: head ? this.everLanded(timeline.id, head.id) : false,
+    };
+  }
+  /**
+   * Approval timelines whose head checkpoint was approved since `since` and
+   * is still current, but never began landing (CORE-390): what an approval
+   * should have queued when its first try failed. A head with any landing,
+   * running, landed or stopped, is the landing's to finish or a person's to
+   * retry; so is one beginLanding would refuse for now (a source write being
+   * reconciled, an earlier landing left partly advanced). Newest first, at
+   * most `limit`, each with who approved it and when.
+   */
+  approvedUnlanded(
+    limit: number,
+    since: string,
+  ): { slug: string; checkpointId: string; approverId: string; approvedAt: string }[] {
+    const found: { slug: string; checkpointId: string; approverId: string; approvedAt: string }[] =
+      [];
+    if (limit <= 0) return found;
+    const candidates = all(
+      this.sql,
+      tracker
+        .selectFrom("timelines")
+        .select("data")
+        .where(json("data", "$.policy"), "=", "approval")
+        .where(json("data", "$.status"), "not in", ENDED),
+    )
+      .map((row) => decodeTimeline(row.data))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.slug.localeCompare(b.slug));
+    const busy = new Set(this.sourcePushes().map((operation) => operation.timelineId));
+    for (const timeline of candidates) {
+      if (found.length >= limit) break;
+      if (busy.has(timeline.id) || timeline.migrationState === "frozen") continue;
+      const head = this.latest(timeline.id);
+      if (!head || this.everLanded(timeline.id, head.id)) continue;
+      const previous = this.landing(timeline.slug);
+      if (previous?.repos.some((repo) => repo.state === "advanced" || repo.casIntent)) continue;
+      const state = this.state(head);
+      const approval = state.approval;
+      if (!state.approved || !approval?.by || !approval.at || approval.at < since) continue;
+      found.push({
+        slug: timeline.slug,
+        checkpointId: head.id,
+        approverId: approval.by,
+        approvedAt: approval.at,
+      });
+    }
+    return found;
+  }
   /** A timeline's newest landing, if it was ever queued. */
   landing(slug: string): Landing | null {
     const timeline = this.get(slug);
@@ -1892,6 +1982,23 @@ export class TimelineStore {
         fail("source_busy", "A source mutation awaits reconciliation.", 409);
       if (ENDED.includes(timeline.status))
         fail("timeline_ended", `${timeline.slug} is ${timeline.status}.`, 409);
+      // A retry lands only a checkpoint that never had a landing (CORE-390).
+      if (request.onlyIfUnlanded !== undefined) {
+        if (timeline.policy !== "approval")
+          fail("invalid_input", "Only an approval timeline's landing is retried.", 409);
+        if (this.latest(timeline.id)?.id !== request.onlyIfUnlanded)
+          fail(
+            "checkpoint_moved",
+            `${timeline.slug} has a newer checkpoint than the one to retry.`,
+            409,
+          );
+        if (this.everLanded(timeline.id, request.onlyIfUnlanded))
+          fail(
+            "landing_exists",
+            `That checkpoint of ${timeline.slug} already has a landing; it isn't retried.`,
+            409,
+          );
+      }
       const previous = this.landing(slug);
       if (previous && LANDING_ACTIVE.includes(previous.state))
         return { landing: previous, queued: false };

@@ -3,6 +3,7 @@
 // later, like a landing (timelines/landing.ts).
 
 import { avatarUrl } from "../avatars/api.ts";
+import { chunk } from "../knowledge/util.ts";
 import type { AccountRow } from "../db.ts";
 import { db as gitmatrixDb } from "../schema.ts";
 import type { TrackerAgent, TrackerIdentity } from "../../shared/tracker.ts";
@@ -78,4 +79,32 @@ async function agentsOf(d1: D1Database, members: TrackerIdentity[]): Promise<Tra
     capabilitiesUpdatedAt: row.capabilities_updated_at,
     revokedAt: row.revoked_at,
   }));
+}
+
+/** Ids per `IN (…)` lookup: well under D1's limit on bound parameters. */
+export const LOOKUP_CHUNK = 50;
+
+/**
+ * The agents among `ids` (anything else is skipped): whom each answers to and
+ * whether it was revoked, `size` ids per query. Approve-when-green asks this
+ * of whoever asked an approval (CORE-378).
+ */
+export async function agentsAmong(
+  d1: D1Database,
+  ids: readonly string[],
+  size = LOOKUP_CHUNK,
+): Promise<{ id: string; accountable: { id: string }; revokedAt: string | null }[]> {
+  const found: { id: string; accountable: { id: string }; revokedAt: string | null }[] = [];
+  for (const part of chunk([...new Set(ids)], size))
+    for (const row of await gitmatrixDb(d1)
+      .selectFrom("agents")
+      .select(["id", "accountable_id", "revoked_at"])
+      .where("id", "in", part)
+      .execute())
+      found.push({
+        id: row.id,
+        accountable: { id: row.accountable_id },
+        revokedAt: row.revoked_at,
+      });
+  return found;
 }

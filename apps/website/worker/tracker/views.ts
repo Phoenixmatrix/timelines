@@ -14,6 +14,7 @@
 import {
   TIMELINE_SCOPED_ISSUE_FIELDS,
   TIMELINE_SCOPED_TYPES,
+  type ApprovalAutomation,
   type EntityType,
   type Issue,
   type TimelineScope,
@@ -22,7 +23,8 @@ import {
 import type { Timeline, TimelineEvent } from "../../shared/timelines.ts";
 import { all, first, json, tracker, type SqlDatabase } from "./sql.ts";
 
-type Entity = NonNullable<TrackerEvent["entity"]>;
+/** What views store: a person's settings (CORE-378) are the tracker's alone. */
+type Entity = Exclude<NonNullable<TrackerEvent["entity"]>, ApprovalAutomation>;
 export type ScopedType = (typeof TIMELINE_SCOPED_TYPES)[number];
 
 const tables = { issue: "issues", link: "links", comment: "comments" } as const;
@@ -68,7 +70,7 @@ function replay(
   change: NonNullable<TrackerEvent["view"]>,
 ): Entity | null {
   if (!change.entity) return null;
-  if (!current) return structuredClone(change.entity);
+  if (!current) return structuredClone(change.entity) as Entity;
   if (type !== "issue") return current;
   // A creation sets every scoped field; the shared ones stay the newest known.
   const next = { ...current } as Record<string, unknown>;
@@ -215,7 +217,7 @@ export function latestEntity(sql: SqlDatabase, type: ScopedType, id: string): En
   );
   if (!row) return null;
   const event = JSON.parse(row.data) as TrackerEvent;
-  return event.entity ?? event.view?.entity ?? null;
+  return (event.entity ?? event.view?.entity ?? null) as Entity | null;
 }
 
 /** A timeline's view, as differences from main's tables. */

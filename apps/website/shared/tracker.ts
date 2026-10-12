@@ -22,6 +22,11 @@ export interface OpenRequest {
   checkpoint?: CheckpointView;
   /** What the work behind it is doing (CORE-386). */
   work?: RequestWork;
+  /**
+   * The person it's routed to has approve-when-green on in this tracker
+   * (CORE-378): it's approved for them once the checkpoint's CI is green.
+   */
+  approvesWhenGreen?: boolean;
 }
 /** A note on an issue, as Needs you quotes it: a comment, checkpoint or evidence. */
 export interface RequestNote {
@@ -220,8 +225,12 @@ export interface AuditActor {
   name: string | null;
   accountable: TrackerIdentity | null;
 }
-/** Client-reported transport, not an authorization signal. Old events have no recorded source. */
-export type AuditSource = "web" | "cli" | "api" | "assistant" | "unknown";
+/**
+ * Client-reported transport, not an authorization signal. Old events have no
+ * recorded source. `automation` is the server acting on a person's own setting
+ * (CORE-378); no client can claim it.
+ */
+export type AuditSource = "web" | "cli" | "api" | "assistant" | "automation" | "unknown";
 export interface Issue extends TrackerEntity {
   key: string;
   /** Immutable creator; legacy records without a creation event remain unknown. */
@@ -397,6 +406,52 @@ export interface HumanRequest {
    * it is still the timeline's head.
    */
   checkpoint?: RequestCheckpoint;
+  /**
+   * How an answered approval was given, when not by hand: `auto-approve` is the
+   * routed person's approve-when-green setting (CORE-378), answering as them.
+   */
+  via?: "auto-approve";
+  /**
+   * Why approve-when-green left this approval to its person (CORE-378): its
+   * checkpoint changes CI configuration, or that couldn't be checked. Set by
+   * the tracker, for that checkpoint; the person approves it by hand.
+   */
+  autoApproveSkipped?: { checkpointId: string; reason: string; at: string };
+}
+/**
+ * Whether approve-when-green may answer this request for its person
+ * (CORE-378): a checkpoint approval asked by that person or by one of their
+ * own agents, not since revoked. Asked by anyone else, it stays theirs to
+ * answer by hand.
+ */
+export function autoApprovable(
+  request: Pick<HumanRequest, "kind" | "checkpoint" | "askedBy" | "routeTo">,
+  agents: readonly { id: string; accountable: { id: string }; revokedAt: string | null }[],
+): boolean {
+  return (
+    request.kind === "approval" &&
+    !!request.checkpoint &&
+    (request.askedBy === request.routeTo ||
+      agents.some(
+        (agent) =>
+          agent.id === request.askedBy &&
+          agent.accountable.id === request.routeTo &&
+          // A revoked agent's requests are its person's to answer by hand.
+          !agent.revokedAt,
+      ))
+  );
+}
+/**
+ * A person's approve-when-green setting in one tracker (CORE-378): their
+ * pending checkpoint approvals here are approved for them once CI is green.
+ * Only they can turn it on or off, never their agents or an admin.
+ */
+export interface ApprovalAutomation {
+  /** The person's id. */
+  id: string;
+  approveWhenGreen: boolean;
+  /** When it was turned on; null when off. */
+  enabledAt: string | null;
 }
 /** The checkpoint an approval request pins. */
 export interface RequestCheckpoint {
@@ -447,6 +502,8 @@ export interface Snapshot {
   comments: Comment[];
   requests: HumanRequest[];
   subscriptions: Subscription[];
+  /** People with approve-when-green on in this tracker (CORE-378); absent from older servers. */
+  approveWhenGreen?: string[];
   cursor: number;
   serverTime: string;
   /**
@@ -525,7 +582,9 @@ export type EntityType =
   | "link"
   | "comment"
   | "request"
-  | "subscription";
+  | "subscription"
+  /** A person's approve-when-green setting (CORE-378); its id is theirs. */
+  | "automation";
 export interface TrackerEvent {
   cursor: number;
   operationId: string;
@@ -533,7 +592,16 @@ export interface TrackerEvent {
   kind: string;
   entityType: EntityType;
   entityId: string;
-  entity: Team | Workspace | Issue | Link | Comment | HumanRequest | Subscription | null;
+  entity:
+    | Team
+    | Workspace
+    | Issue
+    | Link
+    | Comment
+    | HumanRequest
+    | Subscription
+    | ApprovalAutomation
+    | null;
   createdAt: string;
   actor?: AuditActor;
   source?: AuditSource;
@@ -682,6 +750,11 @@ export type Mutation =
       data: { answer?: string; choice?: string; approved?: boolean; stored?: boolean };
     }
   | { kind: "request.cancel"; id: string }
+  /**
+   * Turn your own approve-when-green on or off in this tracker (CORE-378); `id`
+   * is your person id. People only, for themselves: agents and admins can't.
+   */
+  | { kind: "automation.approveWhenGreen"; id: string; data: { enabled: boolean } }
   /**
    * Hand the lease on: returns a single-use code. The giver keeps the lease (and
    * can withdraw) until the code is accepted; then its token stops working.

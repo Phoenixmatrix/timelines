@@ -31,6 +31,12 @@ function sideband(band: number, text: string): string {
 export function fakeRemotes() {
   const remotes = new Map<string, FakeRemote>();
   const commits = new Set<string>();
+  /**
+   * Trees, content-addressed like git's, so shared by every repository: a
+   * commit's root tree (the empty tree when unlisted) and each tree's entries.
+   */
+  const treeOf = new Map<string, string>();
+  const trees = new Map<string, ArtifactsTreeEntry[]>();
   const names = new Map<string, string>();
   const add = (
     url: string,
@@ -217,15 +223,16 @@ export function fakeRemotes() {
           )
             ? {
                 hash,
-                treeHash: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                treeHash: treeOf.get(hash) ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
                 parents: [...(remote?.parents.get(hash) ?? [])],
                 message: "Fixture commit",
               }
             : null,
-        readTree: async (): Promise<ArtifactsTreeEntry[]> => [],
+        readTree: async (hash?: string): Promise<ArtifactsTreeEntry[]> =>
+          (hash && trees.get(hash)) || [],
         [Symbol.dispose]() {},
       };
     },
   };
-  return { remotes, commits, add, getByName, fetch, artifacts };
+  return { remotes, commits, add, getByName, fetch, artifacts, treeOf, trees };
 }

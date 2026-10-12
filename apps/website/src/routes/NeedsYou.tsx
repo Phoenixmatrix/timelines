@@ -82,6 +82,7 @@ function Waiting({ requests, names }: OpenRequests) {
       name={name}
       checkpoint={item.checkpoint && { view: item.checkpoint, tracker: item.tracker.slug }}
       work={item.work}
+      approvesWhenGreen={item.approvesWhenGreen}
       heading={<IssueLink item={item} />}
       onAnswer={(answer: Answer) =>
         send(item, { kind: "request.answer", id: item.request.id, data: answer })

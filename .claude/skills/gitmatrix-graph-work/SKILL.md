@@ -242,12 +242,15 @@ another timeline.
   summary of what it holds and why: `gm timeline checkpoint -m '…'`. In an
   `approval` timeline, ask for approval of exactly that checkpoint:
   `gm issue ask <issue> --kind approval --checkpoint <id> --prompt '…'`. Only a
-  person approves, and only while the checkpoint is the timeline's head: push
+  person approves — directly, or through their own approve-when-green setting
+  in that tracker — and only while the checkpoint is the timeline's head: push
   more and the open request is withdrawn (your lease unparks); make a new
-  checkpoint and ask again.
+  checkpoint and ask again. An agent can't turn that setting on or answer for
+  them; with it on, the request is approved once the checkpoint's CI is green,
+  unless the checkpoint changes CI configuration (then the person approves).
 - Landing is automatic once it's allowed: an `auto` timeline lands when its
   checkpoint's CI is green, an `approval` one when a person approves the
-  checkpoint. `gm timeline land` queues it by hand or says why it can't land
+  checkpoint (by hand, or by their approve-when-green setting). `gm timeline land` queues it by hand or says why it can't land
   yet. Main only moves to a merge that passed the gates. If the merge with main
   conflicts, landing stops and asks for a sync: merge main in when asked
   (`gm timeline merge main`), resolve conflicts, and push. For canonical-rooted

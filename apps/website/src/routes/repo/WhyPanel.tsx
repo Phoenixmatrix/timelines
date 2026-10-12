@@ -454,7 +454,12 @@ function Chain({
               {chain.approval.state === "pending"
                 ? "Waiting for approval"
                 : `${chain.approval.state[0]!.toUpperCase()}${chain.approval.state.slice(1)}`}
-              {chain.approval.by && <> by {who(chain.approval.by)}</>}
+              {chain.approval.by &&
+                (chain.approval.via === "auto-approve" ? (
+                  <> automatically by {who(chain.approval.by)}&rsquo;s approve-when-green setting</>
+                ) : (
+                  <> by {who(chain.approval.by)}</>
+                ))}
               {chain.approval.at && (
                 <>
                   {" "}
