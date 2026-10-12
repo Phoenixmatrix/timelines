@@ -68,6 +68,7 @@ These are JSON API endpoints, not browser pages. Link people to the Releases pag
 - GET /tracker — trackers you can use. GET /tracker/:owner/snapshot — everything (teams, workspaces, issues, links, comments, requests, members, agents). GET /tracker/:owner/view — a lighter view. GET /tracker/:owner/tags — the tag catalog with counts {tags: [{name, issues, open}]}; issue tags (the issue field is "labels", its old name; writes accept "tags" too), agent tags and requirement tag: values come from it.
 - POST /tracker/:owner/mutate {operationId: uuid, mutations: [...]}: kinds team.create|update, workspace.create|update, issue.create {id: uuid, data: {teamId, title, ...}} | issue.update {id, expectedVersion, data} , link.add {id, data: {fromId, toId, kind}} | link.remove, comment.add {id, data: {issueId, body, kind}}, subscription.add|remove, request.answer|cancel. Prefer the dedicated issue tools; use this for teams, workspaces and bulk changes.
 - GET /requests — open requests waiting on the person ("Needs you").
+- GET /agent-work?since=14d[&agent=<name>][&tracker=<owner>] — issues the person's agents finished lately, across trackers: {agents, trackers, items: [{tracker, issue, completion {actorId, accountableId, agent, at}, timeline, evidence}]}. Issue queries also take done-by:me|mine|<agent> and done:14d.
 - Claims, leases and handoffs (issue.claim, renew, complete…) belong to agents doing the work with gm, not to this chat.
 
 ## People
@@ -170,7 +171,7 @@ Answer with the Markdown itself (a short lead-in is fine) so the person can copy
       "Timelines' pages and their paths: for links in answers and for opening pages with navigate.",
     body: `# Pages
 
-- Home / ; Issue tracker /tracker and /tracker/<owner> ; an issue /tracker/<owner>/issues/<KEY> ; Needs you /needs-you ; Packages /packages
+- Home / ; Issue tracker /tracker and /tracker/<owner> ; an issue /tracker/<owner>/issues/<KEY> ; Needs you /needs-you ; Agent work (what your agents finished lately; ?since=7d|14d|30d&agent=<name>&tracker=<owner>&type=<type>) /agent-work ; Packages /packages
 - Account or organization /<owner> ; its packages /<owner>/-/packages ; a package /<owner>/-/packages/<format>/<name>
 - Repository /<owner>/<repo> ; folder /<owner>/<repo>/tree/<ref>/<path> ; file /<owner>/<repo>/blob/<ref>/<path>#L10-L20 ; commits /<owner>/<repo>/commits/<ref> ; changes /<owner>/<repo>/changes ; CI /<owner>/<repo>/ci and /<owner>/<repo>/ci/<number> ; wiki /<owner>/<repo>/wiki/<slug> ; knowledge map /<owner>/<repo>/knowledge ; settings /<owner>/<repo>/settings
 - Repository release notes /<owner>/<repo>/releases ; a daily update or tag /<owner>/<repo>/releases/<name> (URL-encode the exact name returned by the release-notes API, including @day: for a daily update)

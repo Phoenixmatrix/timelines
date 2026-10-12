@@ -8,6 +8,7 @@ import type { RefContext, RefTarget } from "../../shared/refs.ts";
 /** First path segments that are app places, not account slugs (src/appRoutes.tsx). */
 const PLACES = new Set([
   "-",
+  "agent-work",
   "cli-auth",
   "device",
   "needs-you",

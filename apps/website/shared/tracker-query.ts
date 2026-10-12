@@ -12,6 +12,8 @@
 //   parent:CORE-12   numbers/full keys match tickets exactly (case-insensitive);
 //   requires:ux|tag:ux|memory>=16GiB|none   eligible:builder|me (CORE-32: which
 //   agents meet an issue's requirements and pickup policy);
+//   done-by:me|mine|builder|jun  done:14d   (CORE-220: who finished it and when,
+//   from `completion`; mine is the agents you answer for);
 //   other words match key, title and tags; - excludes.
 
 import {
@@ -25,6 +27,7 @@ import {
   actorName,
   claimHolder,
   hasActiveClaim,
+  isFinished,
   isOpen,
   leasedAncestor,
   issuePickup,
@@ -267,6 +270,8 @@ export const QUERY_KEYS = [
   "parent",
   "requires",
   "eligible",
+  "done-by",
+  "done",
 ] as const;
 export type QueryKey = (typeof QUERY_KEYS)[number];
 /** Other spellings of a key; `label:` is the old name of `tag:` (CORE-271). */
@@ -278,6 +283,7 @@ export const QUERY_ALIASES: Record<string, QueryKey> = {
   label: "tag",
   labels: "tag",
   tags: "tag",
+  doneby: "done-by",
 };
 /** The key a written key means, aliases included; undefined when it isn't one. */
 export function queryKey(name: string): QueryKey | undefined {
@@ -300,7 +306,7 @@ export interface ParsedQuery {
 
 export function tokenize(query: string): string[] {
   const tokens: string[] = [];
-  for (const match of query.matchAll(/(-?[A-Za-z]+:)?"([^"]*)"|\S+/g)) {
+  for (const match of query.matchAll(/(-?[A-Za-z][A-Za-z-]*:)?"([^"]*)"|\S+/g)) {
     tokens.push(match[2] !== undefined ? `${match[1] ?? ""}${match[2]}` : match[0]);
   }
   return tokens;
@@ -309,7 +315,7 @@ export function tokenize(query: string): string[] {
 export function parseQuery(query: string): ParsedQuery {
   const parsed: ParsedQuery = { filters: [], words: [], unknown: [] };
   for (const token of tokenize(query)) {
-    const match = /^(-?)([A-Za-z]+):(.*)$/.exec(token);
+    const match = /^(-?)([A-Za-z][A-Za-z-]*):(.*)$/.exec(token);
     if (!match) {
       const negated = token.length > 1 && token.startsWith("-");
       parsed.words.push({ text: (negated ? token.slice(1) : token).toLowerCase(), negated });
@@ -331,7 +337,7 @@ export function filterToken(key: QueryKey, value: string, negated = false): stri
 
 /** A token with its key in the canonical spelling: `label:ux` reads `tag:ux`. */
 export function canonicalToken(token: string): string {
-  const match = /^(-?)([A-Za-z]+):(.*)$/.exec(token);
+  const match = /^(-?)([A-Za-z][A-Za-z-]*):(.*)$/.exec(token);
   const key = match && queryKey(match[2]!);
   return key ? `${match[1]}${key}:${match[3]}` : token;
 }
@@ -355,7 +361,7 @@ export function queryTokenSet(query: string): Set<string> {
 }
 /** A tokenized `key:value` written back the way filterToken writes it (quotes kept). */
 function filterTokenOf(token: string): string {
-  const match = /^(-?[A-Za-z]+:)(.*)$/.exec(token);
+  const match = /^(-?[A-Za-z][A-Za-z-]*:)(.*)$/.exec(token);
   return match && /\s/.test(match[2]!) ? `${match[1]}"${match[2]}"` : token;
 }
 
@@ -363,7 +369,7 @@ function filterTokenOf(token: string): string {
 export function withoutKeys(query: string, keys: QueryKey[]): string {
   return tokenize(query)
     .filter((t) => {
-      const match = /^-?([A-Za-z]+):/.exec(t);
+      const match = /^-?([A-Za-z][A-Za-z-]*):/.exec(t);
       const key = match && queryKey(match[1]!);
       return !key || !keys.includes(key);
     })
@@ -435,6 +441,37 @@ function predicate(filter: Filter, index: IssueIndex, viewerId: string, now: num
       // People bypass capability requirements, but never the not-ready policy.
       if (v === "me" && !agents.length) return (i) => issuePickup(i) !== "not_ready";
       return (i) => agents.some((agent) => agentEligible(i, agent));
+    }
+    case "done-by": {
+      // Only finished work with a credit on record (CORE-220).
+      const credit = (i: Issue) => (isFinished(i.status) ? (i.completion ?? null) : null);
+      if (v === "me") return (i) => credit(i)?.actorId === viewerId;
+      if (v === "mine") {
+        // An agent viewing counts its person's agents.
+        const person =
+          index.people.agents.find((a) => a.id === viewerId)?.accountable.id ?? viewerId;
+        return (i) => credit(i)?.accountableId === person;
+      }
+      const ids = new Set([
+        ...index.people.agents
+          .filter((a) => a.id.toLowerCase() === v || a.name.toLowerCase() === v)
+          .map((a) => a.id),
+        ...index.people.members
+          .filter((m) => m.id.toLowerCase() === v || m.slug.toLowerCase() === v)
+          .map((m) => m.id),
+      ]);
+      return (i) => {
+        const by = credit(i)?.actorId;
+        return !!by && (ids.has(by) || by.toLowerCase() === v);
+      };
+    }
+    case "done": {
+      const t = parseWhen(v, now);
+      if (t === null) return () => true;
+      return (i) => {
+        const at = isFinished(i.status) ? i.completion?.at : undefined;
+        return !!at && Date.parse(at) >= t;
+      };
     }
   }
 }
@@ -828,5 +865,6 @@ export const VIEWS: { label: string; query: string }[] = [
   { label: "Claimed", query: "is:claimed" },
   { label: "Blocked", query: "is:blocked" },
   { label: "Closed lately", query: "is:closed since:14d" },
+  { label: "My agents' work", query: "done-by:mine done:14d" },
   { label: "Everything", query: "" },
 ];

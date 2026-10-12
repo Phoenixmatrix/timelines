@@ -11,6 +11,7 @@ import { Card, ConfirmDialog, CopyField, FormError, TextField } from "../compone
 import { api, attempt, field, load } from "../lib/api.ts";
 import { fullDate, timeAgo } from "../lib/format.ts";
 import { requireViewer } from "../lib/session.ts";
+import { agentWorkPath } from "./AgentWork.tsx";
 
 export async function agentsLoader({ request }: { request: Request }) {
   await requireViewer(request);
@@ -74,7 +75,8 @@ export function Agents() {
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
         An agent works on its own: it claims tracker work, comments and checkpoints as itself, and
         everywhere it shows up it names you as accountable for it. It signs in with its own tokens
-        and has your access.
+        and has your access. <Link to={agentWorkPath()}>Agent work</Link> shows what they finished
+        lately.
       </p>
 
       <div className="mt-8 flex flex-col gap-6">
@@ -194,6 +196,13 @@ function AgentRow({ agent, eligibility }: { agent: Agent; eligibility: AgentElig
                 {" · "}profile from {timeAgo(agent.capabilitiesUpdatedAt)}
               </span>
             )}
+            {" · "}
+            <Link
+              className="text-ink-muted underline-offset-2 hover:underline"
+              to={agentWorkPath(agent.name)}
+            >
+              What it finished
+            </Link>
           </div>
           {agent.capabilities && <Profile profile={agent.capabilities} eligibility={eligibility} />}
           {!revoked && <TrackerWork agent={agent} eligibility={eligibility} />}

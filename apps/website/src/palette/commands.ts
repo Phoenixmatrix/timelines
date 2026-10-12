@@ -119,6 +119,7 @@ const pages: CommandSource = ({ viewer, pathname }) => {
     page("home", "Home", "/", ["dashboard"]),
     page("tracker", "Issue tracker", "/tracker", ["issues", "tickets"]),
     page("needs-you", "Needs you", "/needs-you", ["requests", "inbox", "approvals"]),
+    page("agent-work", "Agent work", "/agent-work", ["finished", "completed", "done", "agents"]),
     page("packages", "Packages", "/packages", ["registry"]),
     page("new", "New repository", "/new", ["create", "import"]),
     page("repos", "Your repositories", `/${viewer.slug}`, ["profile"]),

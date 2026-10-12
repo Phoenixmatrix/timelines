@@ -270,6 +270,10 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   openRequests() {
     return this.reply(() => this.store.openRequests());
   }
+  /** Finished work credited to a person's agents (CORE-220). */
+  completedWork(filter: { since: string; accountableId: string; actorIds: string[] | null }) {
+    return this.reply(() => this.store.completedWork(filter));
+  }
   /** The tag catalog with usage counts (CORE-271). */
   tagCatalog() {
     return this.reply(() => this.store.tagCatalog());

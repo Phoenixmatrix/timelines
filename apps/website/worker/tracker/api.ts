@@ -3,6 +3,7 @@ import type { AppEnv } from "../auth.ts";
 import { findAccountBySlug, findRepo, roleFor, visibleRepos, type Actor } from "../db.ts";
 import { db as gitmatrixDb } from "../schema.ts";
 import type {
+  CompletedWorkList,
   HumanRequest,
   OpenRequest,
   OpenRequests,
@@ -16,7 +17,7 @@ import { accessFor } from "./access.ts";
 import type { TrackerReply } from "./object.ts";
 import { trackerObject } from "./stub.ts";
 import { CHRONICLE_PAGE, type LinkedWork } from "../../shared/chronicle.ts";
-import { agentWork, type AgentEligibility } from "../../shared/tracker-query.ts";
+import { agentWork, parseWhen, type AgentEligibility } from "../../shared/tracker-query.ts";
 import { linkedWork } from "./work.ts";
 import {
   clearPreferences,
@@ -241,6 +242,64 @@ tracker.get("/agent-eligibility", async (c) => {
       tags: result.value.labels,
     });
   }
+  return c.json(out);
+});
+/**
+ * What your agents finished lately (CORE-220), in every tracker you're in:
+ * `?since=14d` (a duration or date), `?agent=<id or name>` for one of them,
+ * `?tracker=<slug>` for one tracker. An agent signed in sees only its own.
+ */
+tracker.get("/agent-work", async (c) => {
+  const actor = c.get("actor");
+  if (!actor) return c.json({ error: "Sign in to see your agents' work." }, 401);
+  const range = (c.req.query("since") || "14d").toLowerCase();
+  const start = parseWhen(range, Date.now());
+  if (start === null)
+    throw new TrackerError(400, "invalid_input", "since must be a duration like 14d, or a date.");
+  const since = new Date(start).toISOString();
+  const rows = await gitmatrixDb(c.env.DB)
+    .selectFrom("agents")
+    .select(["id", "name", "revoked_at"])
+    .where("accountable_id", "=", actor.id)
+    .orderBy("name")
+    .execute();
+  let agents = rows
+    .filter((agent) => !actor.agent || agent.id === actor.agent.id)
+    .map((agent) => ({ id: agent.id, name: agent.name, revoked: agent.revoked_at !== null }));
+  const wanted = c.req.query("agent");
+  if (wanted) {
+    agents = agents.filter((agent) => agent.id === wanted || agent.name === wanted);
+    if (!agents.length) throw new TrackerError(404, "not_found", `You have no agent ${wanted}.`);
+  }
+  const only = c.req.query("tracker");
+  const trackers = (await accessible(c.env.DB, actor)).filter(
+    (owner) => !only || owner.slug === only,
+  );
+  if (only && !trackers.length)
+    throw new TrackerError(404, "not_found", `You aren't in a tracker ${only}.`);
+  const filter = {
+    since,
+    accountableId: actor.id,
+    actorIds: actor.agent || wanted ? agents.map((agent) => agent.id) : null,
+  };
+  const results = await Promise.all(
+    trackers.map((owner) => trackerObject(c.env, owner.id).completedWork(filter)),
+  );
+  const out: CompletedWorkList = {
+    since,
+    agents,
+    trackers: trackers.map(({ slug, displayName }) => ({ slug, displayName })),
+    items: [],
+    truncated: false,
+  };
+  for (const [index, result] of results.entries()) {
+    if (!result.ok) return response(c, result);
+    const owner = trackers[index]!;
+    const where = { slug: owner.slug, displayName: owner.displayName };
+    out.items.push(...result.value.items.map((item) => ({ tracker: where, ...item })));
+    out.truncated ||= result.value.truncated;
+  }
+  out.items.sort((a, b) => b.completion.at.localeCompare(a.completion.at));
   return c.json(out);
 });
 // A single authenticated browser request, without the repository list or a session preflight.

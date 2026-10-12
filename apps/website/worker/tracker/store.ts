@@ -6,7 +6,9 @@ import {
   issuePickup,
   SETTABLE_STATUSES,
   TIMELINE_USES,
+  completionBy,
   hasActiveClaim,
+  isFinished,
   isOpen,
   isRetained,
   leasedAncestor,
@@ -38,6 +40,7 @@ import {
   type TrackerIdentity,
   type Workspace,
   type ClaimEffect,
+  type CompletedWork,
 } from "../../shared/tracker.ts";
 import type { ShippedIssue } from "../../shared/release-notes.ts";
 import {
@@ -76,6 +79,7 @@ import {
 } from "../../shared/timelines.ts";
 import { TimelineStore } from "./timelines.ts";
 import { buildChronicle, type ChronicleOptions } from "./chronicle.ts";
+import { backfillCompletions } from "./completions.ts";
 import {
   CHRONICLE_MAX_PAGE,
   CHRONICLE_MAX_RANGE_MS,
@@ -91,6 +95,7 @@ import {
   overlayOf,
   type Overlay,
   type ScopedType,
+  viewTimelines,
 } from "./views.ts";
 
 export type { SqlDatabase } from "./sql.ts";
@@ -260,6 +265,8 @@ const WORK_LANDINGS = 10;
 
 /** After its last request is answered, a parked lease's holder has this long to resume. */
 export const RESUME_WINDOW_SECONDS = 3600;
+/** Finished issues one tracker returns for the agent work page (CORE-220). */
+export const COMPLETED_WORK_LIMIT = 200;
 
 /**
  * Done in a timeline is locked wherever the issue shows it (CORE-74): only the
@@ -318,6 +325,7 @@ export class TrackerStore {
       CREATE INDEX IF NOT EXISTS parents ON issues(json_extract(data, '$.parentId'));
       CREATE INDEX IF NOT EXISTS request_issues ON requests(json_extract(data, '$.issueId'));
       CREATE INDEX IF NOT EXISTS issue_keys ON issues(json_extract(data, '$.key'));
+      CREATE INDEX IF NOT EXISTS issue_completions ON issues(json_extract(data, '$.completion.at'));
       CREATE INDEX IF NOT EXISTS comment_issues ON comments(json_extract(data, '$.issueId'));
       CREATE INDEX IF NOT EXISTS event_entities ON events(json_extract(data, '$.entityId'));
       CREATE INDEX IF NOT EXISTS event_times ON events(json_extract(data, '$.createdAt'));
@@ -344,6 +352,13 @@ export class TrackerStore {
           WHERE json_extract(events.data, '$.entityType') = 'issue' AND label.type = 'text';`);
         run(sql, tracker.insertInto("tracker_migrations").values({ name: "labels-v1" }));
       });
+    }
+    // Credit issues finished before completions were stamped (CORE-220), a batch
+    // per start. It's bookkeeping: a failure is retried next start, never fatal.
+    try {
+      backfillCompletions(sql, transaction);
+    } catch (error) {
+      console.error("completion backfill failed; retrying next start", error);
     }
     this.timelines = new TimelineStore(sql, transaction, clock, (ids, reason, actorId) =>
       this.withdrawSuperseded(ids, reason, actorId),
@@ -764,6 +779,104 @@ export class TrackerStore {
         return { request, issue: { id: issue.id, key: issue.key, title: issue.title } };
       });
   }
+  /**
+   * Main's issues finished since `since` by agents `accountableId` answers for
+   * (CORE-220), newest first: only `actorIds` among them when given. Each with
+   * the unlanded timeline it was done in and its latest evidence's first line.
+   * At most `limit`; `truncated` when there were more.
+   */
+  completedWork(
+    filter: { since: string; accountableId: string; actorIds: string[] | null },
+    limit = COMPLETED_WORK_LIMIT,
+  ): { items: Omit<CompletedWork, "tracker">[]; truncated: boolean } {
+    if (filter.actorIds && !filter.actorIds.length) return { items: [], truncated: false };
+    let query = tracker
+      .selectFrom("issues")
+      .select("data")
+      .where(json("data", "$.completion.at"), ">=", filter.since)
+      .where(json("data", "$.completion.accountableId"), "=", filter.accountableId)
+      .where(json("data", "$.status"), "in", ["done", "done_in_timeline"]);
+    if (filter.actorIds)
+      query = query.where(json("data", "$.completion.actorId"), "in", filter.actorIds);
+    const rows = all(
+      this.sql,
+      query.orderBy(json("data", "$.completion.at"), "desc").limit(limit + 1),
+    ).map((row) => JSON.parse(row.data) as Issue);
+    // The timelines each unlanded timeline's view shows, worked out once per timeline.
+    const views = new Map<string, string[]>();
+    const viewOf = (doneIn: Issue["doneIn"]) => {
+      if (!doneIn) return [];
+      if (!views.has(doneIn.id)) {
+        const timeline = findTimeline(this.sql, doneIn.id);
+        views.set(doneIn.id, timeline ? viewTimelines(this.sql, timeline) : []);
+      }
+      return views.get(doneIn.id)!;
+    };
+    const items = rows.slice(0, limit).map((issue) => {
+      const body =
+        issue.status === "done_in_timeline"
+          ? this.timelineEvidence(issue.id, viewOf(issue.doneIn))
+          : this.mainEvidence(issue.id);
+      const line = (body ?? "").split("\n").find((text) => text.trim()) ?? "";
+      return {
+        issue: {
+          id: issue.id,
+          key: issue.key,
+          title: issue.title,
+          type: issue.type,
+          status: issue.status,
+        },
+        completion: issue.completion!,
+        timeline:
+          issue.status === "done_in_timeline"
+            ? (issue.doneIn ?? issue.claim?.retainedIn ?? null)
+            : null,
+        evidence: line.trim().slice(0, 300) || null,
+      };
+    });
+    return { items, truncated: rows.length > limit };
+  }
+  /** An issue's latest completion evidence on main. */
+  private mainEvidence(issueId: string): string | null {
+    const row = first(
+      this.sql,
+      tracker
+        .selectFrom("comments")
+        .select("data")
+        .where(json("data", "$.issueId"), "=", issueId)
+        .where(json("data", "$.kind"), "=", "evidence")
+        .orderBy(json("data", "$.createdAt"), "desc")
+        .limit(1),
+    );
+    return row ? (JSON.parse(row.data) as Comment).body : null;
+  }
+  /**
+   * An issue's latest completion evidence in a timeline's view: comments made
+   * in a timeline live in its events until it lands, found through the
+   * issue's history index rather than a scan of the timeline's events.
+   */
+  private timelineEvidence(issueId: string, timelines: string[]): string | null {
+    if (!timelines.length) return null;
+    // The issue's history index drives it (issue_id, cursor, newest first); the
+    // evidence test runs in SQL, so any number of newer comments can't hide it.
+    const row = first(
+      this.sql,
+      tracker
+        .selectFrom("issue_events as i")
+        .innerJoin("events as e", "e.cursor", "i.cursor")
+        .select("e.data")
+        .where("i.issue_id", "=", issueId)
+        .where(json("e.data", "$.entityType"), "=", "comment")
+        .where(json("e.data", "$.view.entity.kind"), "=", "evidence")
+        .where(json("e.data", "$.view.entity.issueId"), "=", issueId)
+        .where(json("e.data", "$.timelineId"), "in", jsonList(timelines))
+        .orderBy("i.cursor", "desc")
+        .limit(1),
+    );
+    if (!row) return null;
+    return ((JSON.parse(row.data) as TrackerEvent).view?.entity as Comment | null)?.body ?? null;
+  }
+
   /** Account navigation needs team identity only, not a private issue snapshot. */
   teamDirectory(): { id: string; key: string; name: string }[] {
     return this.all<Team>("team")
@@ -1251,7 +1364,12 @@ export class TrackerStore {
       // it; and what lands done is no longer waiting on another timeline.
       // A lease retained by what lands is released as done (CORE-75).
       const released = new Set<string>();
+      // Who finished it stays credited (CORE-220); landing reopened work drops the credit.
       const landed = (issue: Issue): Issue => {
+        const out = landing(issue);
+        return out.completion && !isFinished(out.status) ? { ...out, completion: null } : out;
+      };
+      const landing = (issue: Issue): Issue => {
         if (overlay.includes(issue.claim?.retainedIn ?? null)) {
           released.add(issue.id);
           issue = { ...issue, claim: null, handoff: null };
@@ -1438,6 +1556,7 @@ export class TrackerStore {
         } else {
           next.status = "todo";
           next.doneIn = null;
+          if (next.completion) next.completion = null;
           next.claim = null;
           next.handoff = null;
           run(this.sql, tracker.deleteFrom("leases").where("issue_id", "=", issue.id));
@@ -1585,10 +1704,25 @@ export class TrackerStore {
         const seen = overlay.has(type, entityId) ? overlay.get(type, entityId)! : before;
         const finish = type === "issue" ? finishing(overlay, seen as Issue | null, changed) : null;
         view = { before: seen, entity: changed };
+        // The credit is per view, like the status it follows (CORE-220): the
+        // timeline's finish is credited in its view, and lands with it.
+        if (type === "issue")
+          credit(
+            seen as Issue | null,
+            (before ?? seen) as Issue | null,
+            changed as Issue | null,
+            kind,
+          );
         entity = mainAfter(type, before, changed);
         if (finish && entity) finish(entity as Issue);
+        // Main's own credit moves only with main's status: done in the timeline
+        // credits there and then; work main already had done keeps its credit
+        // until the timeline that finished it again lands.
+        if (type === "issue")
+          credit(before as Issue | null, before as Issue | null, entity as Issue | null, kind);
         overlay.set(type, entityId, changed);
-      }
+      } else if (type === "issue")
+        credit(before as Issue | null, before as Issue | null, changed as Issue | null, kind);
       if (entity)
         run(
           this.sql,
@@ -1617,6 +1751,29 @@ export class TrackerStore {
           ...(view ? { view } : {}),
         }),
       );
+    };
+    /**
+     * Credit for finishing (CORE-220). Becoming done (or done in a timeline)
+     * stamps who finished it: the claim's holder, when it had a claim it
+     * completed or still held, else the actor. Leaving done clears it. Moves
+     * within done, like a timeline landing, keep it.
+     */
+    const credit = (prior: Issue | null, held: Issue | null, next: Issue | null, kind: string) => {
+      if (!next) return;
+      if (isFinished(next.status) && !isFinished(prior?.status)) {
+        // The lease is shared by every view: main's copy is the current one.
+        const holder = held ?? prior;
+        const claim =
+          holder?.claim && (kind === "issue.complete" || hasActiveClaim(holder, now))
+            ? holder.claim
+            : null;
+        next.completion = completionBy(
+          claim,
+          { id: access.actorId, accountableId: access.principalId },
+          access.agents,
+          now,
+        );
+      } else if (!isFinished(next.status) && next.completion) next.completion = null;
     };
     /**
      * An issue changing in a timeline's view (CORE-74). Finished there, it is

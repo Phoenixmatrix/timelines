@@ -13,6 +13,7 @@ import {
   subIssueLabel,
   subIssueProgress,
   toggleToken,
+  VIEWS,
   tokenize,
   whyNotReady,
   withoutKeys,
@@ -512,6 +513,76 @@ describe("query language", () => {
     // People can always claim; an agent viewer is checked itself.
     expect(keys("eligible:me")).toEqual(["CORE-1", "CORE-2", "CORE-3", "CORE-4"]);
     expect(keys("eligible:me", "agt-ux")).toEqual(["CORE-1", "CORE-3"]);
+  });
+
+  it("selects work by who finished it and when (CORE-220)", () => {
+    const credit = (actorId: string, accountableId: string | null, days: number) => ({
+      actorId,
+      accountableId,
+      agent: accountableId ? "laptop" : null,
+      at: ago(days),
+    });
+    const issues = [
+      // Priya's agent, recently; and in a timeline that hasn't landed.
+      issue("CORE-1", { status: "done", completion: credit("agt-ux", "m-priya", 2) }),
+      issue("CORE-2", { status: "done_in_timeline", completion: credit("agt-ux", "m-priya", 1) }),
+      // Priya herself, and Jun's agent.
+      issue("CORE-3", { status: "done", completion: credit("m-priya", null, 3) }),
+      issue("CORE-4", { status: "done", completion: credit("agt-jun", "m-jun", 4) }),
+      // Long ago; finished before credit was recorded; reopened.
+      issue("CORE-5", { status: "done", completion: credit("agt-ux", "m-priya", 30) }),
+      issue("CORE-6", { status: "done" }),
+      issue("CORE-7", { status: "todo", completion: credit("agt-ux", "m-priya", 1) }),
+    ];
+    const snap = snapshot(issues);
+    const accountable = { id: "m-priya", slug: "priya", displayName: "Priya Raman" };
+    snap.agents = [
+      {
+        id: "agt-ux",
+        name: "designer",
+        accountable,
+        capabilities: null,
+        capabilitiesUpdatedAt: null,
+        revokedAt: null,
+      },
+      {
+        id: "agt-jun",
+        name: "builder",
+        accountable: { id: "m-jun", slug: "jun", displayName: "Jun Park" },
+        capabilities: null,
+        capabilitiesUpdatedAt: null,
+        revokedAt: null,
+      },
+    ];
+    const index = buildIndex(snap, snap.serverTime);
+    const keys = (q: string, viewer = "m-priya") => {
+      const c = compile(q, index, viewer, NOW);
+      return issues.filter((i) => c.matches(i)).map((i) => i.key);
+    };
+    expect(parseQuery("done-by:mine -done-by:me").filters).toEqual([
+      { key: "done-by", value: "mine", negated: false },
+      { key: "done-by", value: "me", negated: true },
+    ]);
+    expect(keys("done-by:mine")).toEqual(["CORE-1", "CORE-2", "CORE-5"]);
+    expect(keys("done-by:mine done:14d")).toEqual(["CORE-1", "CORE-2"]);
+    expect(keys("done-by:me")).toEqual(["CORE-3"]);
+    expect(keys("done-by:designer")).toEqual(["CORE-1", "CORE-2", "CORE-5"]);
+    expect(keys("done-by:agt-jun")).toEqual(["CORE-4"]);
+    expect(keys("done-by:jun")).toEqual([]);
+    expect(keys("done-by:priya")).toEqual(["CORE-3"]);
+    expect(keys("doneby:builder")).toEqual(["CORE-4"]);
+    expect(keys("done:3d")).toEqual(["CORE-1", "CORE-2", "CORE-3"]);
+    expect(keys("done:2026-09-01")).toEqual(["CORE-1", "CORE-2", "CORE-3", "CORE-4"]);
+    expect(keys("done-by:mine -done:14d")).toEqual(["CORE-5"]);
+    // An agent viewing counts its person's agents as "mine", and itself as "me".
+    expect(keys("done-by:mine", "agt-ux")).toEqual(["CORE-1", "CORE-2", "CORE-5"]);
+    expect(keys("done-by:me", "agt-jun")).toEqual(["CORE-4"]);
+    // The saved view, and hyphenated keys through the token helpers.
+    expect(VIEWS.find((v) => v.label === "My agents' work")?.query).toBe("done-by:mine done:14d");
+    expect(toggleToken("done:14d", "done-by", "mine")).toBe("done:14d done-by:mine");
+    expect(toggleToken("done:14d DONEBY:mine", "done-by", "mine")).toBe("done:14d");
+    expect(withoutKeys("is:open -done-by:me done:7d", ["done-by"])).toBe("is:open done:7d");
+    expect(tokenize('done-by:"x y" z')).toEqual(["done-by:x y", "z"]);
   });
 
   it("toggles tokens and strips keys", () => {
