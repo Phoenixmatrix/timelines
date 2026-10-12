@@ -3289,15 +3289,15 @@ recorded them, the person and agent accountable, and an expiry. Expiring a
 preview changes its status; the record stays. `shared/deployments.ts` defines
 the wire types (`worker/deployments/`).
 
-| Route                                                          | Contract                                                                                                                               |
-| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /api/repos/:o/:n/deployments`                             | Newest first; filters `environment`, `timeline`, `commit` (up to 80, comma-separated), `run`, `status`; pages with `before`, `limit`   |
-| `POST /api/repos/:o/:n/deployments`                            | `{url, commit?, environment?, timeline?, checkpoint?, status?, expiresAt?}`                                                            |
-| `GET /api/repos/:o/:n/deployments/live-timelines`              | `{timelines}`: slugs with an active or sleeping record in any source, nothing else; readers and the repository's CI jobs (CORE-372)    |
-| `GET`, `PATCH /api/repos/:o/:n/deployments/:id`                | One record; `PATCH {status?, url?, expiresAt?}`                                                                                        |
-| `GET /api/repos/:o/:n/environments`                            | `production` and each recorded environment, with its newest deployment                                                                 |
-| `GET`, `PATCH /api/accounts/:slug/settings/previews`           | Preview retention `{endedDays, idleDays}`: 2 and 7 by default; org owners change them                                                  |
-| `POST /api/tracker/:o/timelines/:slug/checkpoints/:ref/revive` | Rebuild a checkpoint's preview: `{checkpoint, runs: [{repoId, number, runId} \| {repoId, skipped}]}`; write access to every repository |
+| Route                                                          | Contract                                                                                                                                                                                |
+| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/repos/:o/:n/deployments`                             | Newest first; filters `environment`, `timeline`, `commit` (up to 80, comma-separated), `run`, `status`, `version` (provider version id); pages with `before`, `limit`                   |
+| `POST /api/repos/:o/:n/deployments`                            | `{url, commit?, environment?, timeline?, checkpoint?, status?, expiresAt?, provider?, artifact?, deployedAt?, exposedFrom?, exposedUntil?, percentage?, replaces?}` (provenance, below) |
+| `GET /api/repos/:o/:n/deployments/live-timelines`              | `{timelines}`: slugs with an active or sleeping record in any source, nothing else; readers and the repository's CI jobs (CORE-372)                                                     |
+| `GET`, `PATCH /api/repos/:o/:n/deployments/:id`                | One record; `PATCH {status?, url?, expiresAt?, exposedFrom?, exposedUntil?, percentage?}`; provenance fields answer `409`                                                               |
+| `GET /api/repos/:o/:n/environments`                            | `production` and each recorded environment, with its newest deployment and, for a canary, `split`: every live record of its provider deployment                                         |
+| `GET`, `PATCH /api/accounts/:slug/settings/previews`           | Preview retention `{endedDays, idleDays}`: 2 and 7 by default; org owners change them                                                                                                   |
+| `POST /api/tracker/:o/timelines/:slug/checkpoints/:ref/revive` | Rebuild a checkpoint's preview: `{checkpoint, runs: [{repoId, number, runId} \| {repoId, skipped}]}`; write access to every repository                                                  |
 
 - **Who records.** Anyone with write access, with a personal or agent token
   (systems outside Timelines too), or a CI job with its own credential
@@ -3321,6 +3321,79 @@ the wire types (`worker/deployments/`).
 - **Expiry.** A timeline preview follows the account's retention (below)
   unless the recorder pins an `expiresAt` (on record or by `PATCH`); other
   records don't expire unless told.
+
+#### Deployment provenance (CORE-351)
+
+A record can also say what ran and what was shipped, so runtime evidence
+(Observability, below) can name the exact code. Everything is optional and
+nothing is inferred or backfilled: a record without a provider version is
+**uninstrumented**, and evidence about it is at best temporal or ambiguous,
+never explicit (CORE-348: the provider version id plus repo/source/commit, and
+the artifact digest when present, are what explicit attribution needs).
+
+- **`provider: {name, service, versionId, deploymentId}`**: the immutable ids
+  the provider assigned (`cloudflare`; the Worker script; its version id; the
+  deployment that put it out, required with the version so a canary's members
+  share it and a rollback to an earlier version is a record of its own). No
+  connection or binding is stored: observability reads (CORE-352/353) resolve
+  the binding from (repository, service, environment) when they read, under
+  current authorization, and a version counts as explicit only once the
+  reader finds it under the bound service.
+- **Retries.** One record per provider deployment of a version per source (a
+  unique index). Recording the same provider deployment again answers the
+  first record, unchanged (`200`), when its commit, environment, artifact,
+  percentage and replaced version match; any of those differing is `409`.
+  Times a producer recomputes on each run (`deployedAt`, exposure,
+  `expiresAt` from `--expires 2d`) and the address and status, which `PATCH`
+  owns, are not compared.
+- **`artifact: {publishId | packageId + version, digest?}`**: the registry
+  publication deployed. It must be this repository's CI publish from the
+  record's own source and commit (`publishes.source_id`, recorded since this
+  change), not deleted, with `digest` equal to the publication's. A person's
+  publish, one from before publishes recorded their source, one from another
+  repository, source or commit, a sibling built from the same commit, and an
+  unknown id are all answered alike: no such publication. A publication that
+  records no digest (npm and other catalog formats) refuses a given one
+  ("this publication records no digest"): omit it. Several matches are `409`
+  (name it by `publishId` or `digest`).
+- **Who sees an artifact.** A record's artifact coordinates (package name,
+  version, digest) are shown to everyone who can read the repository, even
+  when the package lives in a private feed of a public repository. Naming the
+  artifact on a deployment is the owner's choice to disclose them.
+- **Times and traffic.** `createdAt` is when Gitmatrix recorded it.
+  `deployedAt`, `exposedFrom`/`exposedUntil` (strict UTC) and a canary's
+  `percentage` (0–100) are the recorder's claim at deploy time, not a
+  snapshot of provider telemetry; the provider's live deployment history
+  (CORE-352) is authoritative while it has them. A canary is one record per
+  version, sharing `provider.deploymentId`. `replaces` names the provider
+  version a deployment replaced (a rollback replaces a newer one) and links
+  its record when one exists in the same source and environment. `percentage`
+  and `replaces` need `provider`.
+- **Fencing and immutability.** A CI job records an artifact only for its own
+  run's commit. It records a provider version for its own commit, or for
+  another commit only when a record in its source and environment already
+  maps that version to that commit (a canary's older member, a rollback to a
+  known version); anything else is `403`. `PATCH` may set `exposedFrom` once
+  while it's unknown (no earlier than `deployedAt`, not in the future; it may
+  precede the record, which a producer makes after deploying), then
+  `exposedUntil` once, and a share while none is recorded; provider,
+  artifact, commit, `deployedAt` and `replaces` never change (`409`).
+- **gm.** Record with `--service`, `--provider-version` and
+  `--provider-deployment` (all three together), optionally `--artifact`
+  (a publish id or `package-id@version`) with `--digest`, and the claims
+  `--deployed-at`, `--exposed-from`, `--percentage` and `--replaces`.
+  `gm deploy update` takes `--exposed-from` and `--exposed-until`;
+  `gm deploy list` takes `--provider-version` and `--source`.
+- **Next (step 2, not yet done).** The producers start sending provider
+  versions once this gm is published and installed: the production deploy job
+  (`tools/agent/deploy.ts`) records each Worker it actually deploys
+  (`gitmatrix`, `gitmatrix-site`) after `cf deploy`, taking the version id and
+  percentage from `cf workers deployments list` only when its `workers/tag`
+  is the deployed commit, with the previously deployed version as `replaces`
+  and nothing when the deploy was skipped; it installs gm as
+  `tools/preview/preview.ts` does. Preview creates add the Preview's version
+  and deployment ids once the real `cf previews deploy` output is confirmed to
+  carry them.
 
 #### The preview contract
 
@@ -4053,12 +4126,15 @@ the Cloudflare reader (CORE-352) returns it, and History and the entity views
   link prefixes and provider links. Malformed shapes are refused with an
   `ObservabilityError`, never a crash.
 
-**Handoffs.** `Deployment.sourceId` is optional in `shared/deployments.ts`
-though the API always sets it, the type has no `repoId` or exposure
-interval, and `WorkDeployment`/`WorkPackage` in `shared/chronicle.ts` carry a
-bare `commit`; registry publishes record no source. CORE-351 (deployment and
-artifact provenance) and CORE-353 (the work join) close those gaps; until
-then their commits are not identities this contract accepts.
+**Handoffs.** Deployment records carry their full commit identity (`repoId`,
+`sourceId`, `commit`), the provider version that ran (`provider`, with no
+connection or binding: resolve it from repository, service and environment
+when reading, and treat a version as explicit only once the reader finds it
+under the bound service), the registry publication shipped, and the
+recorder's deploy and exposure claims, which the provider's live history
+overrides (CORE-351; "Deployment provenance" above). Registry publishes record
+their source from CORE-351 on; older ones and `WorkPackage` still carry no
+source, so CORE-353 treats them as derived at best.
 
 ### OpenTelemetry mapping
 

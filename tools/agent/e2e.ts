@@ -1740,7 +1740,8 @@ export async function runE2E(
           env: { AGENT_GM: ctx.gm },
           steps: [
             {
-              run: '"$AGENT_GM" deploy record --url "https://agent-e2e.example.com/run-$GITMATRIX_RUN_NUMBER" --environment staging --expires 2d',
+              // What ran (CORE-351): a canary's provider version, replacing an older one.
+              run: '"$AGENT_GM" deploy record --url "https://agent-e2e.example.com/run-$GITMATRIX_RUN_NUMBER" --environment staging --expires 2d --service agent-e2e --provider-version "ver-$GITMATRIX_RUN_NUMBER" --provider-deployment "dep-$GITMATRIX_RUN_NUMBER" --percentage 10 --replaces ver-0 --exposed-from now',
             },
           ],
         },
@@ -1759,6 +1760,26 @@ export async function runE2E(
     assert.equal(deployment.job, "deploy");
     assert.equal(deployment.commit, run.commit);
     assert(deployment.expiresAt, "--expires sets the expiry");
+    assert.deepEqual(deployment.provider, {
+      name: "cloudflare",
+      service: "agent-e2e",
+      versionId: `ver-${number}`,
+      deploymentId: `dep-${number}`,
+    });
+    assert.equal(deployment.percentage, 10);
+    assert.deepEqual(deployment.replaces, { versionId: "ver-0", deploymentId: null });
+    assert(deployment.exposedFrom, "--exposed-from records the exposure start");
+    assert(deployment.repoId, "A record names its repository");
+    assert.equal(deployment.sourceId, "canonical");
+    const byVersion = await json<DeploymentList>(
+      `${api}/deployments?version=ver-${number}`,
+      ownerToken,
+    );
+    assert.deepEqual(
+      byVersion.deployments.map((d) => d.id),
+      [deployment.id],
+      "The provider version finds its record",
+    );
     record({ deployment });
 
     // Outside CI: a person records for an explicit commit, and marks the
@@ -1779,6 +1800,8 @@ export async function runE2E(
     ) as Deployment;
     assert.equal(recorded.environment, "timeline/agent-e2e");
     assert.equal(recorded.run, null);
+    assert.equal(recorded.repoId, deployment.repoId);
+    assert.equal(recorded.provider, null, "A record that names no version stays uninstrumented");
     await gm(["deploy", "update", String(recorded.id), "--status", "expired", "-R", fullName]);
     const kept = await json<Deployment>(`${api}/deployments/${recorded.id}`, ownerToken);
     assert.equal(kept.status, "expired");

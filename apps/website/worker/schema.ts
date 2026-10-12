@@ -1007,6 +1007,29 @@ export interface Database {
     teardown_run_id: Generated<string | null>;
     teardown_completed_at: Generated<string | null>;
     teardown_unmanaged_at: Generated<string | null>;
+    /**
+     * What ran (CORE-351): the provider, its service and the immutable
+     * version and deployment ids it assigned; null for uninstrumented records.
+     */
+    provider: Generated<"cloudflare" | null>;
+    provider_service: Generated<string | null>;
+    provider_version_id: Generated<string | null>;
+    provider_deployment_id: Generated<string | null>;
+    /** The producer's claim at deploy time; the provider's live history is authoritative. */
+    deployed_at: Generated<string | null>;
+    exposed_from: Generated<string | null>;
+    exposed_until: Generated<string | null>;
+    percentage: Generated<number | null>;
+    /** The provider version it replaced, and that version's record in the same repo, source and environment. */
+    replaces_version_id: Generated<string | null>;
+    replaces_deployment_id: Generated<number | null>;
+    /** The registry publication deployed, checked against this repo, source and commit. */
+    artifact_publish_id: Generated<string | null>;
+    artifact_package_id: Generated<string | null>;
+    artifact_format: Generated<string | null>;
+    artifact_name: Generated<string | null>;
+    artifact_version: Generated<string | null>;
+    artifact_digest: Generated<string | null>;
   };
   /** Per-account settings; a missing row means the defaults. */
   /** Issue keys commit messages name, resolved to tracker issues on push (CORE-22). */

@@ -419,11 +419,25 @@ export interface WorkRun {
 
 export interface WorkDeployment {
   repo: WorkRepo;
+  /**
+   * The record's commit identity: repository, work source and commit
+   * (CommitRef in observability.ts), never a bare SHA. A record matches a
+   * linked commit by repository and commit id, in whichever source recorded
+   * it (a timeline's previews live in its own source, CORE-255).
+   */
+  repoId: string;
+  sourceId: string;
   id: number;
   environment: string;
   status: "active" | "sleeping" | "expired" | "failed";
   commit: string;
   url: string | null;
+  /** The provider version that ran, as recorded; null when none was (uninstrumented). */
+  provider: { name: string; service: string; versionId: string } | null;
+  /** The registry publication deployed, as recorded and checked; null when none was. */
+  artifact: { name: string; version: string; digest: string | null } | null;
+  /** A canary's share (0–100), as the recorder claimed it. */
+  percentage: number | null;
   createdAt: string;
   /** The preview itself while it's up, else the run that deployed it, else the repository's CI. */
   href: string;

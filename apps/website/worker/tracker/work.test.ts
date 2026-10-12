@@ -76,6 +76,13 @@ function world() {
     INSERT INTO deployments (repo_id, environment, timeline_slug, timeline_id, checkpoint_id, commit_oid, url, status, run_id, created_at) VALUES
       ('r-engine', 'timeline-search', 'search', NULL, NULL, '${oid(2)}', 'https://search.preview.test', 'active', NULL, '2026-09-01T11:00:00.000Z'),
       ('r-secret', 'timeline-search', 'search', NULL, NULL, '${oid(3)}', 'https://hidden.preview.test', 'active', NULL, '2026-09-01T11:00:00.000Z');
+    -- What ran, as recorded (CORE-351).
+    UPDATE deployments SET provider = 'cloudflare', provider_service = 'engine',
+      provider_version_id = 'ver-2', provider_deployment_id = 'dep-2', percentage = 10,
+      artifact_publish_id = 'pub',
+      artifact_package_id = 'pkg', artifact_format = 'npm', artifact_name = '@orbit/ranker',
+      artifact_version = '1.2.0', artifact_digest = NULL
+      WHERE repo_id = 'r-engine';
   `);
   registry.exec(`
     INSERT INTO repositories (id, owner_id, key, format, kind, visibility, config, created_at, updated_at) VALUES
@@ -270,10 +277,15 @@ describe("an issue's linked work", () => {
     ]);
     expect(work.deployments).toMatchObject([
       {
+        repoId: "r-engine",
+        sourceId: "canonical",
         environment: "timeline-search",
         status: "active",
         commit: oid(2),
         href: "https://search.preview.test",
+        provider: { name: "cloudflare", service: "engine", versionId: "ver-2" },
+        artifact: { name: "@orbit/ranker", version: "1.2.0", digest: null },
+        percentage: 10,
       },
     ]);
     expect(work.packages).toMatchObject([

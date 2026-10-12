@@ -338,11 +338,30 @@ export async function linkedWork(
       const run = row.run_id ? runRows.find((r) => r.id === row.run_id) : undefined;
       return {
         repo,
+        repoId: row.repo_id,
+        sourceId: row.source_id,
         id: row.id,
         environment: row.environment,
         status: row.status,
         commit: row.commit_oid,
         url: row.url,
+        provider:
+          row.provider && row.provider_service && row.provider_version_id
+            ? {
+                name: row.provider,
+                service: row.provider_service,
+                versionId: row.provider_version_id,
+              }
+            : null,
+        artifact:
+          row.artifact_name && row.artifact_version
+            ? {
+                name: row.artifact_name,
+                version: row.artifact_version,
+                digest: row.artifact_digest,
+              }
+            : null,
+        percentage: row.percentage,
         createdAt: row.created_at,
         href: live
           ? row.url!

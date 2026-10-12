@@ -72,7 +72,13 @@ function items(w: LinkedWork): Item[] {
       group: "Deployments",
       key: `deploy:${d.id}`,
       label: d.environment,
-      meta: `${d.repo.owner}/${d.repo.name} · ${d.status} · ${short(d.commit)}`,
+      meta: [
+        `${d.repo.owner}/${d.repo.name} · ${d.status} · ${short(d.commit)}`,
+        d.provider
+          ? `${d.provider.service} ${d.provider.versionId.slice(0, 8)}${d.percentage !== null ? ` (${d.percentage}%)` : ""}`
+          : "no provider version recorded",
+        ...(d.artifact ? [`${d.artifact.name}@${d.artifact.version}`] : []),
+      ].join(" · "),
       href: d.href,
       at: d.createdAt,
       external: /^https?:/.test(d.href),

@@ -3,6 +3,13 @@
 //! runs, commits and timelines. Inside a CI job gm records as the job (its
 //! GITMATRIX_TOKEN): the server fills in the repository's run, commit and
 //! branch. Elsewhere it records as you, for an explicit commit.
+//!
+//! A record may also name what ran (CORE-351): the provider version
+//! (`--provider-version`, with its `--service`) and the registry publication
+//! deployed (`--artifact`). The server checks both: a job attaches them only
+//! for its own commit, and an artifact must be this repository's CI publish
+//! from the same source and commit. Exposure times and a canary's share are
+//! the recorder's claim; the provider's own history is authoritative.
 
 use super::Ctx;
 use super::ci::commit_of;
@@ -18,7 +25,7 @@ use serde_json::{Map, Value, json};
 #[derive(Subcommand)]
 pub enum DeployCommand {
     /// Record a deployment: where a commit is deployed (from a CI job, or with --commit)
-    Record(RecordArgs),
+    Record(Box<RecordArgs>),
     /// Deployments, newest first, filtered by environment, timeline, commit, run or status
     List(ListArgs),
     /// Change a deployment's status, URL or expiry (e.g. mark a torn-down preview expired)
@@ -42,6 +49,60 @@ impl Status {
             Status::Failed => "failed",
         }
     }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum Provider {
+    Cloudflare,
+}
+
+impl Provider {
+    fn as_str(self) -> &'static str {
+        match self {
+            Provider::Cloudflare => "cloudflare",
+        }
+    }
+}
+
+/// What ran and what was shipped: provider identity, artifact and exposure.
+#[derive(Args, Default)]
+pub struct ProvenanceArgs {
+    /// The provider that ran it (default with --provider-version: cloudflare).
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
+    /// The provider's service: the Worker script that ran it. Required with --provider-version.
+    #[arg(long)]
+    pub service: Option<String>,
+    /// The immutable version id the provider assigned (a Worker version id).
+    #[arg(long)]
+    pub provider_version: Option<String>,
+    /// The provider deployment that put the version out (shared by a canary's versions).
+    /// Required with --provider-version.
+    #[arg(long)]
+    pub provider_deployment: Option<String>,
+    /// The registry publication deployed: its publish id, or `<package id>@<version>`.
+    /// It must be this repository's CI publish from the same source and commit.
+    #[arg(long)]
+    pub artifact: Option<String>,
+    /// The artifact's digest (`sha256:…`); must equal the publication's. Omit it for a
+    /// publication that records none (npm and other catalog formats).
+    #[arg(long)]
+    pub digest: Option<String>,
+    /// When the provider deployed it (an ISO time, or `now`).
+    #[arg(long)]
+    pub deployed_at: Option<String>,
+    /// When it started serving traffic (an ISO time, or `now`).
+    #[arg(long)]
+    pub exposed_from: Option<String>,
+    /// When it stopped serving traffic (an ISO time, or `now`).
+    #[arg(long)]
+    pub exposed_until: Option<String>,
+    /// A canary's traffic share, 0–100 (needs --provider-version).
+    #[arg(long)]
+    pub percentage: Option<f64>,
+    /// The provider version this one replaced (a rollback replaces a newer one).
+    #[arg(long)]
+    pub replaces: Option<String>,
 }
 
 #[derive(Args)]
@@ -71,6 +132,8 @@ pub struct RecordArgs {
     /// Deployed revision or full commit hash (default in CI: the job's commit). Required outside CI.
     #[arg(short, long)]
     pub commit: Option<String>,
+    #[command(flatten)]
+    pub provenance: ProvenanceArgs,
     /// Repository as owner/name (default: $GITMATRIX_REPOSITORY, then this repository's origin).
     #[arg(short = 'R', long)]
     pub repo: Option<String>,
@@ -91,6 +154,12 @@ pub struct ListArgs {
     pub run: Option<u64>,
     #[arg(long, value_enum)]
     pub status: Option<Status>,
+    /// A provider version id: the records of that version.
+    #[arg(long)]
+    pub provider_version: Option<String>,
+    /// A work source id (default: canonical).
+    #[arg(long)]
+    pub source: Option<String>,
     #[arg(short = 'n', long, default_value_t = 20)]
     pub limit: usize,
     #[arg(short = 'R', long)]
@@ -109,6 +178,15 @@ pub struct UpdateArgs {
     /// An ISO time, a duration from now (`2d`), or `never`.
     #[arg(long)]
     pub expires: Option<String>,
+    /// When it started serving traffic (an ISO time, or `now`); set once while unknown.
+    #[arg(long)]
+    pub exposed_from: Option<String>,
+    /// When it stopped serving traffic (an ISO time, or `now`); set once.
+    #[arg(long)]
+    pub exposed_until: Option<String>,
+    /// A canary's traffic share, 0–100; only while none is recorded.
+    #[arg(long)]
+    pub percentage: Option<f64>,
     #[arg(short = 'R', long)]
     pub repo: Option<String>,
 }
@@ -185,6 +263,150 @@ pub fn expiry(spec: &str, now: DateTime<Utc>) -> Result<Value> {
     ))
 }
 
+/// A UTC instant for the API (`…Z`): an RFC 3339 time in any offset, or `now`.
+pub fn utc_time(spec: &str, flag: &str, now: DateTime<Utc>) -> Result<Value> {
+    let spec = spec.trim();
+    let time = if spec.eq_ignore_ascii_case("now") {
+        now
+    } else {
+        DateTime::parse_from_rfc3339(spec)
+            .map_err(|_| {
+                GmError::usage(format!(
+                    "{flag} takes an ISO time like 2026-10-12T20:00:00Z, or `now`."
+                ))
+            })?
+            .with_timezone(&Utc)
+    };
+    Ok(json!(time.to_rfc3339_opts(SecondsFormat::Millis, true)))
+}
+
+fn percentage(value: f64) -> Result<Value> {
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        return Err(GmError::usage("--percentage is a share from 0 to 100."));
+    }
+    Ok(json!(value))
+}
+
+/// The provenance fields of a record's body; checked again by the server.
+pub fn provenance_body(args: &ProvenanceArgs, now: DateTime<Utc>) -> Result<Map<String, Value>> {
+    let mut body = Map::new();
+    match (
+        &args.provider_version,
+        &args.service,
+        &args.provider_deployment,
+    ) {
+        (Some(version), Some(service), Some(deployment)) => {
+            let mut provider = Map::new();
+            let name = args.provider.unwrap_or(Provider::Cloudflare);
+            provider.insert("name".into(), json!(name.as_str()));
+            provider.insert("service".into(), json!(service));
+            provider.insert("versionId".into(), json!(version));
+            provider.insert("deploymentId".into(), json!(deployment));
+            body.insert("provider".into(), Value::Object(provider));
+        }
+        (Some(_), None, _) => {
+            return Err(GmError::usage(
+                "Name the provider's service (the Worker script) with --service.",
+            ));
+        }
+        (Some(_), Some(_), None) => {
+            return Err(GmError::usage(
+                "Name the provider deployment that put the version out with --provider-deployment.",
+            ));
+        }
+        (None, _, _)
+            if args.provider.is_some()
+                || args.service.is_some()
+                || args.provider_deployment.is_some() =>
+        {
+            return Err(GmError::usage(
+                "--provider, --service and --provider-deployment describe a --provider-version.",
+            ));
+        }
+        (None, _, _) if args.percentage.is_some() || args.replaces.is_some() => {
+            return Err(GmError::usage(
+                "--percentage and --replaces describe a --provider-version.",
+            ));
+        }
+        (None, _, _) => {}
+    }
+    match (&args.artifact, &args.digest) {
+        (Some(artifact), digest) => {
+            let mut value = Map::new();
+            match artifact.split_once('@') {
+                Some((package, version)) if !package.is_empty() && !version.is_empty() => {
+                    value.insert("packageId".into(), json!(package));
+                    value.insert("version".into(), json!(version));
+                }
+                Some(_) => {
+                    return Err(GmError::usage(
+                        "--artifact is a publish id or <package id>@<version>.",
+                    ));
+                }
+                None => {
+                    value.insert("publishId".into(), json!(artifact));
+                }
+            }
+            if let Some(digest) = digest {
+                value.insert("digest".into(), json!(digest));
+            }
+            body.insert("artifact".into(), Value::Object(value));
+        }
+        (None, Some(_)) => {
+            return Err(GmError::usage("--digest is the digest of an --artifact."));
+        }
+        (None, None) => {}
+    }
+    for (key, flag, value) in [
+        ("deployedAt", "--deployed-at", &args.deployed_at),
+        ("exposedFrom", "--exposed-from", &args.exposed_from),
+        ("exposedUntil", "--exposed-until", &args.exposed_until),
+    ] {
+        if let Some(spec) = value {
+            body.insert(key.into(), utc_time(spec, flag, now)?);
+        }
+    }
+    if let Some(share) = args.percentage {
+        body.insert("percentage".into(), percentage(share)?);
+    }
+    if let Some(replaces) = &args.replaces {
+        body.insert("replaces".into(), json!(replaces));
+    }
+    Ok(body)
+}
+
+/// The body of `gm deploy update`.
+pub fn update_body(args: &UpdateArgs, now: DateTime<Utc>) -> Result<Map<String, Value>> {
+    let mut body = Map::new();
+    if let Some(st) = args.status {
+        body.insert("status".into(), json!(st.as_str()));
+    }
+    if let Some(url) = &args.url {
+        body.insert("url".into(), json!(url));
+    }
+    if let Some(spec) = &args.expires {
+        body.insert("expiresAt".into(), expiry(spec, now)?);
+    }
+    if let Some(spec) = &args.exposed_from {
+        body.insert("exposedFrom".into(), utc_time(spec, "--exposed-from", now)?);
+    }
+    if let Some(spec) = &args.exposed_until {
+        body.insert(
+            "exposedUntil".into(),
+            utc_time(spec, "--exposed-until", now)?,
+        );
+    }
+    if let Some(share) = args.percentage {
+        body.insert("percentage".into(), percentage(share)?);
+    }
+    if body.is_empty() {
+        return Err(GmError::usage(
+            "Change something: --status, --url, --expires, --exposed-from, --exposed-until or --percentage.",
+        ));
+    }
+    Ok(body)
+}
+
 fn bad_expiry(spec: &str) -> GmError {
     GmError::usage(format!("Can't read the expiry `{spec}`.")).hint(
         "Use an ISO time (2026-10-09T12:00:00Z), a duration from now (30m, 12h, 2d, 1w) or `never`.",
@@ -196,8 +418,28 @@ fn s<'a>(v: &'a Value, key: &str) -> &'a str {
 }
 
 fn line(d: &Value) -> String {
+    let provider = &d["provider"];
+    let version = provider["versionId"]
+        .as_str()
+        .map(|v| {
+            format!(
+                "  {} {}{}",
+                provider["service"].as_str().unwrap_or(""),
+                v.get(..8).unwrap_or(v),
+                d["percentage"]
+                    .as_f64()
+                    .map(|p| format!(" ({p}%)"))
+                    .unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+    let artifact = &d["artifact"];
+    let artifact = match (artifact["name"].as_str(), artifact["version"].as_str()) {
+        (Some(name), Some(version)) => format!("  {name}@{version}"),
+        _ => String::new(),
+    };
     format!(
-        "#{:<5} {:<9} {:<24} {}  {}{}{}",
+        "#{:<5} {:<9} {:<24} {}  {}{}{}{}{}",
         d["id"],
         s(d, "status"),
         s(d, "environment"),
@@ -212,6 +454,8 @@ fn line(d: &Value) -> String {
         } else {
             ""
         },
+        version,
+        artifact,
     )
 }
 
@@ -261,6 +505,12 @@ pub fn run(ctx: &Ctx, command: &DeployCommand) -> Result<Shown> {
             if let Some(st) = args.status {
                 add("status", st.as_str());
             }
+            if let Some(v) = &args.provider_version {
+                add("version", v);
+            }
+            if let Some(source) = &args.source {
+                add("source", source);
+            }
             let value = call(&config, "GET", &format!("{base}/deployments{query}"), None)?;
             let list = value["deployments"].as_array().cloned().unwrap_or_default();
             let text = if list.is_empty() {
@@ -272,21 +522,7 @@ pub fn run(ctx: &Ctx, command: &DeployCommand) -> Result<Shown> {
         }
         DeployCommand::Update(args) => {
             let base = repo_arg(ctx, &args.repo)?;
-            let mut body = Map::new();
-            if let Some(st) = args.status {
-                body.insert("status".into(), json!(st.as_str()));
-            }
-            if let Some(url) = &args.url {
-                body.insert("url".into(), json!(url));
-            }
-            if let Some(spec) = &args.expires {
-                body.insert("expiresAt".into(), expiry(spec, Utc::now())?);
-            }
-            if body.is_empty() {
-                return Err(GmError::usage(
-                    "Change something: --status, --url or --expires.",
-                ));
-            }
+            let body = update_body(args, Utc::now())?;
             let path = format!("{base}/deployments/{}", args.id);
             if ctx.dry_run {
                 let value =
@@ -354,6 +590,7 @@ fn record(ctx: &Ctx, config: &Config, args: &RecordArgs) -> Result<Shown> {
     if let Some(spec) = &args.expires {
         body.insert("expiresAt".into(), expiry(spec, Utc::now())?);
     }
+    body.extend(provenance_body(&args.provenance, Utc::now())?);
     if args.url.is_none() && !matches!(args.status, Some(Status::Failed)) {
         return Err(GmError::usage(
             "Give the deployment's address with --url (only --status failed may omit it).",
@@ -394,5 +631,154 @@ mod tests {
         for bad in ["", "d", "0d", "-1h", "2y", "soon", "日"] {
             assert!(expiry(bad, now).is_err(), "{bad} should not parse");
         }
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-12T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn provenance_bodies() {
+        let args = ProvenanceArgs {
+            service: Some("gitmatrix".into()),
+            provider_version: Some("v-2".into()),
+            provider_deployment: Some("d-9".into()),
+            artifact: Some("pkg_1@1.2.3".into()),
+            digest: Some("sha256:abc".into()),
+            deployed_at: Some("2026-10-12T21:00:00+01:00".into()),
+            exposed_from: Some("now".into()),
+            percentage: Some(10.0),
+            replaces: Some("v-1".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            Value::Object(provenance_body(&args, now()).unwrap()),
+            json!({
+                "provider": {
+                    "name": "cloudflare",
+                    "service": "gitmatrix",
+                    "versionId": "v-2",
+                    "deploymentId": "d-9"
+                },
+                "artifact": { "packageId": "pkg_1", "version": "1.2.3", "digest": "sha256:abc" },
+                "deployedAt": "2026-10-12T20:00:00.000Z",
+                "exposedFrom": "2026-10-12T20:00:00.000Z",
+                "percentage": 10.0,
+                "replaces": "v-1"
+            })
+        );
+        let by_id = ProvenanceArgs {
+            artifact: Some("01PUBLISH".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            Value::Object(provenance_body(&by_id, now()).unwrap()),
+            json!({ "artifact": { "publishId": "01PUBLISH" } })
+        );
+        assert!(
+            provenance_body(&ProvenanceArgs::default(), now())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn refuses_incomplete_provenance() {
+        let bad = [
+            ProvenanceArgs {
+                provider_version: Some("v".into()),
+                ..Default::default()
+            },
+            ProvenanceArgs {
+                provider_version: Some("v".into()),
+                service: Some("gitmatrix".into()),
+                ..Default::default()
+            },
+            ProvenanceArgs {
+                service: Some("gitmatrix".into()),
+                ..Default::default()
+            },
+            ProvenanceArgs {
+                percentage: Some(10.0),
+                ..Default::default()
+            },
+            ProvenanceArgs {
+                replaces: Some("v-1".into()),
+                ..Default::default()
+            },
+            ProvenanceArgs {
+                digest: Some("sha256:abc".into()),
+                ..Default::default()
+            },
+            ProvenanceArgs {
+                artifact: Some("@1.0.0".into()),
+                ..Default::default()
+            },
+            ProvenanceArgs {
+                service: Some("gitmatrix".into()),
+                provider_version: Some("v".into()),
+                provider_deployment: Some("d".into()),
+                percentage: Some(100.5),
+                ..Default::default()
+            },
+            ProvenanceArgs {
+                exposed_until: Some("yesterday".into()),
+                ..Default::default()
+            },
+        ];
+        for args in &bad {
+            assert!(provenance_body(args, now()).is_err());
+        }
+    }
+
+    #[test]
+    fn update_bodies() {
+        let args = UpdateArgs {
+            id: 4,
+            status: Some(Status::Expired),
+            url: None,
+            expires: None,
+            exposed_from: Some("now".into()),
+            exposed_until: Some("2026-10-12T20:30:00Z".into()),
+            percentage: Some(50.0),
+            repo: None,
+        };
+        assert_eq!(
+            Value::Object(update_body(&args, now()).unwrap()),
+            json!({
+                "status": "expired",
+                "exposedFrom": "2026-10-12T20:00:00.000Z",
+                "exposedUntil": "2026-10-12T20:30:00.000Z",
+                "percentage": 50.0
+            })
+        );
+        let empty = UpdateArgs {
+            status: None,
+            exposed_from: None,
+            exposed_until: None,
+            percentage: None,
+            ..args
+        };
+        assert!(update_body(&empty, now()).is_err());
+    }
+
+    #[test]
+    fn lines_show_provenance() {
+        let record = json!({
+            "id": 3, "status": "active", "environment": "production",
+            "commit": "0123456789abcdef0123456789abcdef01234567", "url": "https://a.example",
+            "run": 7, "revived": false,
+            "provider": { "name": "cloudflare", "service": "gitmatrix", "versionId": "4f1c2d3e-aaaa" },
+            "percentage": 10.0,
+            "artifact": { "name": "app", "version": "1.2.3" }
+        });
+        let text = line(&record);
+        assert!(text.contains("gitmatrix 4f1c2d3e (10%)"), "{text}");
+        assert!(text.ends_with("app@1.2.3"), "{text}");
+        let plain = json!({ "id": 4, "status": "failed", "environment": "staging",
+            "commit": "0123456789abcdef0123456789abcdef01234567", "url": null, "provider": null });
+        assert!(!line(&plain).contains('%'));
     }
 }

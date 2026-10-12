@@ -5812,7 +5812,8 @@
       "examples": [
         "gm deploy record --url \"$PREVIEW_URL\"",
         "gm deploy record --url https://app.example.com --environment production --commit @-",
-        "gm deploy record --status failed --timeline fast-search"
+        "gm deploy record --status failed --timeline fast-search",
+        "gm deploy record --url https://app.example.com --service app --provider-version \"$VERSION_ID\" --provider-deployment \"$DEPLOYMENT_ID\" --exposed-from now --replaces \"$PREVIOUS_VERSION_ID\""
       ],
       "mutates": true,
       "options": [
@@ -5874,6 +5875,86 @@
           "short": "c"
         },
         {
+          "choices": [
+            "cloudflare"
+          ],
+          "description": "The provider that ran it (default with --provider-version: cloudflare)",
+          "flag": false,
+          "multiple": false,
+          "name": "--provider",
+          "required": false
+        },
+        {
+          "description": "The provider's service: the Worker script that ran it. Required with --provider-version",
+          "flag": false,
+          "multiple": false,
+          "name": "--service",
+          "required": false
+        },
+        {
+          "description": "The immutable version id the provider assigned (a Worker version id)",
+          "flag": false,
+          "multiple": false,
+          "name": "--provider-version",
+          "required": false
+        },
+        {
+          "description": "The provider deployment that put the version out (shared by a canary's versions). Required with --provider-version",
+          "flag": false,
+          "multiple": false,
+          "name": "--provider-deployment",
+          "required": false
+        },
+        {
+          "description": "The registry publication deployed: its publish id, or `<package id>@<version>`. It must be this repository's CI publish from the same source and commit",
+          "flag": false,
+          "multiple": false,
+          "name": "--artifact",
+          "required": false
+        },
+        {
+          "description": "The artifact's digest (`sha256:…`); must equal the publication's. Omit it for a publication that records none (npm and other catalog formats)",
+          "flag": false,
+          "multiple": false,
+          "name": "--digest",
+          "required": false
+        },
+        {
+          "description": "When the provider deployed it (an ISO time, or `now`)",
+          "flag": false,
+          "multiple": false,
+          "name": "--deployed-at",
+          "required": false
+        },
+        {
+          "description": "When it started serving traffic (an ISO time, or `now`)",
+          "flag": false,
+          "multiple": false,
+          "name": "--exposed-from",
+          "required": false
+        },
+        {
+          "description": "When it stopped serving traffic (an ISO time, or `now`)",
+          "flag": false,
+          "multiple": false,
+          "name": "--exposed-until",
+          "required": false
+        },
+        {
+          "description": "A canary's traffic share, 0–100 (needs --provider-version)",
+          "flag": false,
+          "multiple": false,
+          "name": "--percentage",
+          "required": false
+        },
+        {
+          "description": "The provider version this one replaced (a rollback replaces a newer one)",
+          "flag": false,
+          "multiple": false,
+          "name": "--replaces",
+          "required": false
+        },
+        {
           "description": "Repository as owner/name (default: $GITMATRIX_REPOSITORY, then this repository's origin)",
           "flag": false,
           "multiple": false,
@@ -5892,7 +5973,8 @@
         "gm deploy list",
         "gm deploy list --timeline fast-search",
         "gm deploy list --run 12",
-        "gm deploy list --environment production --status active"
+        "gm deploy list --environment production --status active",
+        "gm deploy list --provider-version \"$VERSION_ID\""
       ],
       "mutates": false,
       "options": [
@@ -5940,6 +6022,20 @@
           "required": false
         },
         {
+          "description": "A provider version id: the records of that version",
+          "flag": false,
+          "multiple": false,
+          "name": "--provider-version",
+          "required": false
+        },
+        {
+          "description": "A work source id (default: canonical)",
+          "flag": false,
+          "multiple": false,
+          "name": "--source",
+          "required": false
+        },
+        {
           "default": "20",
           "description": "",
           "flag": false,
@@ -5973,7 +6069,9 @@
       "command": "gm deploy update",
       "examples": [
         "gm deploy update 42 --status expired",
-        "gm deploy update 42 --expires 2d"
+        "gm deploy update 42 --expires 2d",
+        "gm deploy update 42 --exposed-from 2026-10-12T20:00:00Z",
+        "gm deploy update 42 --exposed-until now"
       ],
       "mutates": true,
       "options": [
@@ -6002,6 +6100,27 @@
           "flag": false,
           "multiple": false,
           "name": "--expires",
+          "required": false
+        },
+        {
+          "description": "When it started serving traffic (an ISO time, or `now`); set once while unknown",
+          "flag": false,
+          "multiple": false,
+          "name": "--exposed-from",
+          "required": false
+        },
+        {
+          "description": "When it stopped serving traffic (an ISO time, or `now`); set once",
+          "flag": false,
+          "multiple": false,
+          "name": "--exposed-until",
+          "required": false
+        },
+        {
+          "description": "A canary's traffic share, 0–100; only while none is recorded",
+          "flag": false,
+          "multiple": false,
+          "name": "--percentage",
           "required": false
         },
         {

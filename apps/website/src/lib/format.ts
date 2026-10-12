@@ -23,6 +23,23 @@ export function fullDate(when: string | number): string {
   return new Date(ms).toLocaleString("en", { dateStyle: "medium", timeStyle: "short" });
 }
 
+/**
+ * A time in the viewer's zone with the zone named ("Oct 12, 2026, 8:00 PM
+ * GMT+2"), for stored UTC instants whose zone matters; UTC is its title.
+ */
+export function zonedDate(when: string, timeZone?: string): string {
+  return new Date(Date.parse(when)).toLocaleString("en", {
+    // dateStyle/timeStyle can't be combined with timeZoneName.
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+    ...(timeZone ? { timeZone } : {}),
+  });
+}
+
 export function bytes(size: number): string {
   if (size < 1024) return `${size} bytes`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;

@@ -398,11 +398,95 @@ test("on a work source's page it reads the commit from that source (CORE-296)", 
   await expect.poll(() => read("/ci")).toContain("work_1");
 });
 
+const UNINSTRUMENTED = {
+  provider: null,
+  artifact: null,
+  deployedAt: null,
+  exposedFrom: null,
+  exposedUntil: null,
+  percentage: null,
+  replaces: null,
+} satisfies Partial<Deployment>;
+
+test("deployment provenance shows exactly what was recorded, and says when no version was", async () => {
+  const { server, head } = await world();
+  const now = new Date().toISOString();
+  const base = {
+    ...UNINSTRUMENTED,
+    repoId: "repo_engine",
+    sourceId: "canonical",
+    timeline: null,
+    timelineId: null,
+    checkpoint: null,
+    commit: head,
+    status: "active" as const,
+    run: null,
+    job: null,
+    actor: "marco",
+    agent: null,
+    expiresAt: null,
+    expiryPinned: false,
+    revived: false,
+    rebuiltFrom: null,
+    tornDownAt: null,
+    teardownRun: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const deployments: Deployment[] = [
+    {
+      ...base,
+      id: 51,
+      environment: "production",
+      url: "https://canary.example.dev",
+      provider: {
+        name: "cloudflare",
+        service: "engine",
+        versionId: "4f1c2d3e-0000-4000-8000-000000000002",
+        deploymentId: "dep-2",
+      },
+      percentage: 10,
+      replaces: { versionId: "9a8b7c6d-0000-4000-8000-000000000001", deploymentId: 50 },
+      artifact: {
+        publishId: "01PUB",
+        packageId: "pkg_engine",
+        format: "npm",
+        name: "engine",
+        version: "1.2.3",
+        digest: `sha256:${"ab".repeat(32)}`,
+      },
+      deployedAt: "2026-10-12T20:00:00.000Z",
+      exposedFrom: "2026-10-12T20:01:00.000Z",
+    },
+    { ...base, id: 52, environment: "staging", url: "https://staging.example.dev" },
+  ];
+  server.on("GET", "/api/repos/:owner/:name/deployments", () => ({ deployments, next: null }));
+  renderApp(`/orbit/engine?commit=${head}`);
+  const section = panel(head).getByRole("region", { name: /Deployments and previews/ });
+  await expect.element(section.getByText("engine 4f1c2d3e", { exact: true })).toBeVisible();
+  await expect.element(section.getByText("10% of traffic")).toBeVisible();
+  await expect.element(section.getByText("9a8b7c6d", { exact: true })).toBeVisible();
+  await expect.element(section.getByText(/engine@1\.2\.3/)).toBeVisible();
+  // Local time with the zone named, UTC on hover.
+  const deployed = section
+    .getByText(/^deployed/)
+    .element()
+    .querySelector("time")!;
+  expect(deployed.getAttribute("datetime")).toBe("2026-10-12T20:00:00.000Z");
+  expect(deployed.getAttribute("title")).toBe("2026-10-12T20:00:00Z (UTC)");
+  expect(deployed.textContent).toMatch(/(GMT|UTC|[A-Z]{2,5})/);
+  // An uninstrumented record never looks definite.
+  await expect.element(section.getByText("No provider version recorded")).toBeVisible();
+  expect(section.getByText("No provider version recorded").elements()).toHaveLength(1);
+});
+
 test("non-CI deployment observers are lazy, source-scoped and poll only the expanded row", async () => {
   const { server, head } = await world();
   const now = new Date().toISOString();
   const deployments: Deployment[] = [41, 42].map((id) => ({
+    ...UNINSTRUMENTED,
     id,
+    repoId: "repo_engine",
     sourceId: `source_${id}`,
     environment: `external-${id}`,
     timeline: null,
