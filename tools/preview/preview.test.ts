@@ -72,7 +72,8 @@ function fakeCloudflare(state: {
       if (command.startsWith("d1 migrations")) return "";
       if (command === "r2 objects list") {
         const bucket = buckets[flag(args, "--bucket-name")];
-        if (!bucket) throw new Error("HTTP 404: The specified bucket does not exist.");
+        if (!bucket)
+          throw new Error("APIError\n[10006] The specified bucket does not exist.\n404 Not Found");
         return JSON.stringify(bucket.slice(0, 2).map((key) => ({ key })));
       }
       if (command === "r2 objects bulk-delete") {
@@ -82,7 +83,8 @@ function fakeCloudflare(state: {
         return "";
       }
       if (command === "r2 buckets delete") {
-        if (!buckets[args[3]!]) throw new Error("HTTP 404: no such bucket");
+        if (!buckets[args[3]!])
+          throw new Error("APIError\n[10006] The specified bucket does not exist.\n404 Not Found");
         if (buckets[args[3]!]!.length) throw new Error("bucket not empty");
         delete buckets[args[3]!];
         return "";

@@ -28,7 +28,17 @@ import {
   type PreviewAccess,
   type PreviewResources,
 } from "../../apps/website/vite/preview.ts";
+import {
+  absent,
+  deleteArtifactsNamespace,
+  ignoringAbsent,
+  listArtifactsRepos,
+  refusedNotEmpty,
+} from "../agent/cloudflare-delete.ts";
 import { seedFixtures } from "../agent/seed.ts";
+
+/** Shared with tools/agent (CORE-371): what counts as "not there", and the CORE-302 refusal. */
+export { absent, refusedNotEmpty };
 
 /** The Worker the previews belong to. */
 export const WORKER = "gitmatrix";
@@ -84,19 +94,6 @@ export interface Cloudflare {
   api(method: string, path: string): Promise<{ status: number; body: unknown }>;
 }
 
-/** Only an explicit "not there" is idempotent; permission and network errors fail. */
-export function absent(error: unknown): boolean {
-  return /\b404\b|not found|does not exist|no such|10025|10007/i.test(String(error));
-}
-
-async function ignoringAbsent(work: Promise<unknown>): Promise<void> {
-  try {
-    await work;
-  } catch (error) {
-    if (!absent(error)) throw error;
-  }
-}
-
 function json<T>(text: string): T {
   return JSON.parse(text) as T;
 }
@@ -150,68 +147,22 @@ async function deleteBucket(cloudflare: Cloudflare, name: string): Promise<void>
   await ignoringAbsent(cloudflare.cf(["r2", "buckets", "delete", name, "--force"]));
 }
 
-/** Cloudflare's refusal to delete a namespace that still counts a repository (CORE-302). */
-export function refusedNotEmpty(error: unknown): boolean {
-  return /namespace is not empty/i.test(String(error));
-}
-
-/** A namespace's repositories (up to 100), or null when it doesn't exist. */
-async function listRepos(cloudflare: Cloudflare, name: string): Promise<{ name: string }[] | null> {
-  try {
-    return json(
-      await cloudflare.cf([
-        "artifacts",
-        "namespaces",
-        "repos",
-        "list",
-        "--namespace",
-        name,
-        "--limit",
-        "100",
-      ]),
-    );
-  } catch (error) {
-    if (absent(error)) return null;
-    throw error;
-  }
-}
-
-/** Delete a namespace's repositories, then the namespace (as tools/agent/environment.ts). */
+/** Delete a namespace's repositories, then the namespace (shared with tools/agent). */
 async function deleteNamespace(cloudflare: Cloudflare, name: string): Promise<void> {
-  for (;;) {
-    const repos = await listRepos(cloudflare, name);
-    if (!repos) return;
-    if (!repos.length) break;
-    for (const repo of repos)
-      await ignoringAbsent(
-        cloudflare.cf([
-          "artifacts",
-          "namespaces",
-          "repos",
-          "delete",
-          repo.name,
-          "--namespace",
-          name,
-          "--force",
-        ]),
-      );
-  }
-  try {
-    await ignoringAbsent(cloudflare.cf(["artifacts", "namespaces", "delete", name, "--force"]));
-  } catch (error) {
+  await deleteArtifactsNamespace((args) => cloudflare.cf(args), name, {
     // A known Artifacts bug: the namespace counts a repository that no list
     // shows. Names come from the slug alone, so provision reuses the namespace
     // rather than failing every later create, revival and teardown.
-    if (!refusedNotEmpty(error) || (await listRepos(cloudflare, name))?.length) throw error;
-    console.error(
-      JSON.stringify({
-        event: "preview.namespace.orphaned",
-        namespace: name,
-        message:
-          "Cloudflare refuses to delete this Artifacts namespace although it lists no repositories; create reuses it.",
-      }),
-    );
-  }
+    onOrphan: () =>
+      console.error(
+        JSON.stringify({
+          event: "preview.namespace.orphaned",
+          namespace: name,
+          message:
+            "Cloudflare refuses to delete this Artifacts namespace although it lists no repositories; create reuses it.",
+        }),
+      ),
+  });
 }
 
 function ok(status: number): boolean {
@@ -342,7 +293,7 @@ export async function provision(
   await cloudflare.cf(["r2", "buckets", "create", "--name", all.bucket]);
   // Teardown leaves a namespace Cloudflare won't delete once it lists nothing
   // (see deleteNamespace): reuse it rather than fail on its name.
-  const leftover = await listRepos(cloudflare, all.artifacts);
+  const leftover = await listArtifactsRepos((args) => cloudflare.cf(args), all.artifacts);
   if (!leftover)
     await cloudflare.cf(["artifacts", "namespaces", "create", "--namespace", all.artifacts]);
   else if (leftover.length)
