@@ -573,7 +573,19 @@ function Context({ step }: { step: Step | null }) {
         <ul className="m-0 pl-4 text-body-sm">
           {list.map((entry, n) => (
             <li key={n} className="[overflow-wrap:anywhere]">
-              {entry.text} <span className="text-micro text-ink-faint">({entry.source})</span>
+              {entry.text}{" "}
+              <span className="text-micro text-ink-faint">
+                ({entry.source}
+                {entry.at && (
+                  <>
+                    {" · "}
+                    <time dateTime={entry.at} title={fullDate(entry.at)}>
+                      {timeAgo(entry.at)}
+                    </time>
+                  </>
+                )}
+                )
+              </span>
             </li>
           ))}
         </ul>
@@ -608,6 +620,11 @@ function Context({ step }: { step: Step | null }) {
             ))}
           </ul>
         </>
+      )}
+      {(context.harness || context.model) && (
+        <p className="mt-3 mb-0 text-micro text-ink-faint">
+          Made with {[context.harness, context.model].filter(Boolean).join(" running ")}
+        </p>
       )}
       {missing && (
         <p className="mt-3 mb-0 rounded-md bg-sunken p-2 text-micro text-ink-muted" role="note">

@@ -52,7 +52,8 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
       summary: "Rank results by recency",
       committedAt: minutes(40),
       why: "People look for what changed lately.",
-      steering: [{ text: "keep score as the tie-breaker", source: "hook" }],
+      steering: [{ text: "keep score as the tie-breaker", source: "hook", at: minutes(45) }],
+      model: "claude-opus-5-5",
       tests: [{ command: "vp test run search", exit: 0, summary: "12 passed", origin: "local" }],
     }),
   ])
@@ -165,6 +166,22 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
   await expect.element(span).toMatchTextContent(/Retry the flaky ranking test/);
   await userEvent.click(builder.getByRole("button", { name: /^Rank results by recency/ }));
   await expect.element(span).toMatchTextContent(/People look for what changed lately\./);
+  // Which harness and model made it, and when the person steered it (CORE-397, CORE-398).
+  await expect.element(span).toMatchTextContent(/claude-code running claude-opus-5-5/);
+  const steeredClock = new Date(Date.parse(minutes(45))).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  await expect.element(span.getByRole("time").filter({ hasText: steeredClock })).toBeVisible();
+  await expect
+    .element(
+      builder.getByRole("button", { name: new RegExp(`steered once \\(at ${steeredClock}\\)`) }),
+    )
+    .toBeVisible();
+  expect(
+    builder.element().querySelectorAll('[title^="Steered "]'),
+    "the moment is marked on the lane",
+  ).toHaveLength(1);
   await expect
     .element(span)
     .toMatchTextContent(/“keep score as the tie-breaker”\s*captured by the harness/);

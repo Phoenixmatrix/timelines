@@ -40,6 +40,16 @@ export interface Span {
   captured: boolean;
   /** Known only from the live feed so far: its full context hasn't loaded. */
   partial: boolean;
+  harness: string | null;
+  model: string | null;
+}
+
+/** When a person steered, where the harness recorded it (CORE-398). */
+export function steeredAt(span: Span): { at: number; text: string }[] {
+  return span.steering.flatMap((entry) => {
+    const at = entry.at ? Date.parse(entry.at) : NaN;
+    return Number.isFinite(at) && entry.source !== "agent" ? [{ at, text: entry.text }] : [];
+  });
 }
 
 const ciSummary = (step: Step): StepTestSummary | null => {
@@ -84,6 +94,8 @@ export function spanFromStep(repo: string, step: Step): Span {
     ci,
     captured: context.coverage.instructions.startsWith("hook:"),
     partial: false,
+    harness: context.harness,
+    model: context.model,
   };
 }
 
@@ -109,6 +121,8 @@ export function spanFromFeed(record: StepFeedRecord): Span {
     ci: null,
     captured: false,
     partial: true,
+    harness: null,
+    model: null,
   };
 }
 
@@ -190,6 +204,7 @@ export function domainOf(
 ): [number, number] {
   const times = [
     ...spans.map((span) => span.at),
+    ...spans.flatMap((span) => steeredAt(span).map((moment) => moment.at)),
     ...checkpoints.map((view) => Date.parse(view.checkpoint.createdAt)),
   ].filter(Number.isFinite);
   if (!times.length) return [0, 1];

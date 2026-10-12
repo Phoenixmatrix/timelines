@@ -19,6 +19,7 @@ import {
   mergeSpans,
   spanFromFeed,
   spanFromStep,
+  steeredAt,
   tickLabel,
   ticksOf,
   vitalsOf,
@@ -299,6 +300,13 @@ export function TimelineObservability({
               />
               a person steered
             </li>
+            <li className="flex items-center gap-1.5">
+              <span
+                className="inline-block h-3 w-[3px] rounded-full"
+                style={{ background: "var(--timelines-amber)" }}
+              />
+              when they did
+            </li>
           </ul>
         </div>
         {everyRepoFailed ? (
@@ -460,10 +468,25 @@ function Lane({
           aria-hidden
           className="absolute inset-x-0 top-1/2 h-0.5 -translate-y-1/2 rounded-full bg-line-soft"
         />
+        {spans.flatMap((span) =>
+          steeredAt(span).map((moment, n) => (
+            <li
+              key={`${span.key}#${n}`}
+              aria-hidden
+              title={`Steered ${clock(moment.at)}: ${moment.text}`}
+              className="absolute top-1/2 h-6 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded-full opacity-80"
+              style={{
+                left: `${pos(moment.at).toFixed(3)}%`,
+                background: "var(--timelines-amber)",
+              }}
+            />
+          )),
+        )}
         {placed.map(({ span, at, offset }) => {
           const steered = span.steering.length > 0;
           const isNew = fresh(span.key);
-          const label = `${span.summary}, ${HEALTH[span.health].word}${steered ? `, steered ${span.steering.length === 1 ? "once" : `${span.steering.length} times`}` : ""}, ${timeAgo(new Date(span.at).toISOString())}${isNew ? ", new" : ""}`;
+          const moments = steeredAt(span).map((moment) => clock(moment.at));
+          const label = `${span.summary}, ${HEALTH[span.health].word}${steered ? `, steered ${span.steering.length === 1 ? "once" : `${span.steering.length} times`}${moments.length ? ` (at ${moments.join(", ")})` : ""}` : ""}, ${timeAgo(new Date(span.at).toISOString())}${isNew ? ", new" : ""}`;
           return (
             <li
               key={span.key}
@@ -526,6 +549,9 @@ function Inspector({ span, story, multiRepo }: { span: Span; story: string; mult
           </time>
           <span className="mk-mono">{shortOid(span.commitOid)}</span>
           {multiRepo && <span>{span.repo}</span>}
+          {(span.harness || span.model) && (
+            <span>{[span.harness, span.model].filter(Boolean).join(" running ")}</span>
+          )}
           {span.issue && <span className="mk-chip mk-chip--tag">{span.issue}</span>}
         </p>
         <h4 className={heading}>Why</h4>
@@ -538,7 +564,7 @@ function Inspector({ span, story, multiRepo }: { span: Span; story: string; mult
             <ul className="m-0 max-w-[72ch] pl-4 text-body-sm">
               {span.instructions.slice(0, 3).map((entry, n) => (
                 <li key={n} className="[overflow-wrap:anywhere]">
-                  {entry.text}
+                  {entry.text} <When at={entry.at} />
                 </li>
               ))}
             </ul>
@@ -561,11 +587,12 @@ function Inspector({ span, story, multiRepo }: { span: Span; story: string; mult
                 {entry.source === "agent" ? entry.text : `“${entry.text}”`}{" "}
                 <span className="text-micro text-ink-faint">
                   {entry.source === "agent"
-                    ? "as the agent recorded it"
+                    ? "as the agent recorded it, time not recorded"
                     : entry.source === "hook"
                       ? "captured by the harness"
                       : "from a person"}
-                </span>
+                </span>{" "}
+                {entry.source !== "agent" && <When at={entry.at} />}
               </li>
             ))}
           </ul>
@@ -678,4 +705,19 @@ function duration(ms: number): string {
   const seconds = Math.round(ms / 1000);
   if (seconds < 60) return `${seconds}s`;
   return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+/** A time of day, for a moment on the trace. */
+function clock(at: number): string {
+  return new Date(at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+/** When an entry was given, if the harness recorded it. */
+function When({ at }: { at?: string }) {
+  if (!at || !Number.isFinite(Date.parse(at))) return null;
+  return (
+    <time className="text-micro text-ink-faint" dateTime={at} title={fullDate(at)}>
+      {clock(Date.parse(at))}
+    </time>
+  );
 }

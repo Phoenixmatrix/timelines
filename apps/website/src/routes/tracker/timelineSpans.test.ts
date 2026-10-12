@@ -7,6 +7,7 @@ import {
   mergeSpans,
   spanFromFeed,
   spanFromStep,
+  steeredAt,
   ticksOf,
   vitalsOf,
   jobBars,
@@ -247,4 +248,28 @@ test("long traces keep to a handful of ticks, and multi-day ones say the day wit
     const labels = ticks.map((tick) => tickLabel(tick, domain));
     expect(new Set(labels).size, `${days} days: ${labels.join(" | ")}`).toBe(labels.length);
   }
+});
+
+test("steering moments are the harness's, with a time; an agent's retelling has none", () => {
+  const span = spanFromStep(
+    "orbit/engine",
+    step({
+      context: {
+        harness: "claude-code",
+        model: "claude-opus-5-5",
+        steering: [
+          { text: "keep score as the tie-breaker", source: "hook", at: "2026-10-12T11:40:00.000Z" },
+          { text: "the person said so earlier", source: "agent", at: "2026-10-12T11:41:00.000Z" },
+          { text: "no time", source: "hook" },
+        ],
+      },
+    }),
+  );
+  expect(span.harness).toBe("claude-code");
+  expect(span.model).toBe("claude-opus-5-5");
+  expect(steeredAt(span)).toEqual([
+    { at: Date.parse("2026-10-12T11:40:00.000Z"), text: "keep score as the tie-breaker" },
+  ]);
+  // The trace reaches back to when they steered, before the commit.
+  expect(domainOf([span], [], null)[0]).toBeLessThan(Date.parse("2026-10-12T11:40:00.000Z"));
 });
