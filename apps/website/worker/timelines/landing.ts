@@ -1144,6 +1144,13 @@ async function sweepStartedLandings(env: Env, deps: LandingDeps): Promise<void> 
 
 /** Landing attempts the hourly sweep makes per run, at most (CORE-390). */
 const APPROVED_SWEEP_LIMIT = 25;
+/**
+ * Candidates it lists per tracker for each attempt left (CORE-392): skipped
+ * ones (an approver who left, say) mustn't hide landable ones behind them.
+ */
+const APPROVED_SWEEP_LOOKAHEAD = 4;
+/** And at most this many per tracker per run. */
+const APPROVED_SWEEP_LISTED = 100;
 /** Trackers it looks in per run, at most; where it starts rotates hourly. */
 const APPROVED_SWEEP_OWNERS = 200;
 /**
@@ -1155,8 +1162,10 @@ export const APPROVAL_RETRY_MS = 24 * 3600_000;
 
 /**
  * The trackers with live timeline work the sweep looks in this `hour`: at
- * most `window`, in id order, starting `hour` places in and wrapping round,
- * so every tracker is reached however many there are.
+ * most `window`, in id order, from where the last hour's window ended,
+ * wrapping round. While the number of trackers is stable, each is reached
+ * within ceil(trackers / window) hours; when all fit, the first one rotates
+ * hourly.
  */
 export async function sweepOwners(d1: D1Database, window: number, hour: number): Promise<string[]> {
   const live = () => db(d1).selectFrom("timeline_work_sources").where("state", "=", "ready");
@@ -1165,7 +1174,10 @@ export async function sweepOwners(d1: D1Database, window: number, hour: number):
     .executeTakeFirst();
   const total = Number(counted?.owners ?? 0);
   if (!total) return [];
-  const start = hour % total;
+  // More trackers than fit: each hour's window starts where the last one
+  // ended. All of them fit: only the order rotates, a tracker an hour, so the
+  // attempt budget isn't always spent on the same first ones.
+  const start = total > window ? (hour * window) % total : hour % total;
   const page = async (offset: number, limit: number) =>
     (
       await live()
@@ -1186,9 +1198,12 @@ export async function sweepOwners(d1: D1Database, window: number, hour: number):
  * The hourly retry of approvals whose landing never began (CORE-390): in the
  * trackers with live timeline work, each approval timeline whose head was
  * approved in the last day, is still current and has no landing, queued again
- * for its approver. At most `limit` landing attempts per run; what's skipped
- * without one (an approver who left, say) costs nothing. A tracker that fails
- * is logged and passed over. Returns the attempts made.
+ * for its approver. At most `limit` landing attempts per run: only a real
+ * beginLanding counts, and what's skipped before one (an approver who left,
+ * say) costs nothing and doesn't hide later candidates within the lookahead
+ * of four times the remaining budget. A tracker that fails, including an
+ * unexpected failure before a landing was asked for, is logged and passed
+ * over for this run. Returns the attempts made.
  */
 export async function sweepApprovedLandings(
   env: Env,
@@ -1206,7 +1221,12 @@ export async function sweepApprovedLandings(
   for (const ownerId of owners) {
     if (left <= 0) break;
     try {
-      const listed = unwrap(await trackerObject(env, ownerId).approvedUnlanded(left, since));
+      const listed = unwrap(
+        await trackerObject(env, ownerId).approvedUnlanded(
+          Math.min(left * APPROVED_SWEEP_LOOKAHEAD, APPROVED_SWEEP_LISTED),
+          since,
+        ),
+      );
       for (const { slug } of listed) {
         if (left <= 0) break;
         if ((await retryApprovedLanding(env, deps, ownerId, slug, since)).attempted) {
@@ -1223,6 +1243,11 @@ export async function sweepApprovedLandings(
 
 /** What retrying an approval's landing did: whether it tried, and the landing if one began. */
 export interface ApprovalRetry {
+  /**
+   * Whether it asked beginLanding to land it and that counted: not when it
+   * was skipped before, failed before, or found the checkpoint already had a
+   * landing or had moved on (`landing_exists`, `checkpoint_moved`).
+   */
   attempted: boolean;
   landing: Landing | null;
 }
@@ -1235,7 +1260,9 @@ export interface ApprovalRetry {
  * that person is no longer a member or can't write to every repository of the
  * checkpoint. beginLanding checks again in its transaction that this exact
  * checkpoint never had a landing (`onlyIfUnlanded`) and refuses anything stale.
- * Never throws; why it didn't is logged.
+ * Why it didn't is logged. Throws only an unexpected failure before a landing
+ * was asked for (a failing tracker or D1), not counted as an attempt, so the
+ * sweep gives up on that tracker for this run instead of grinding on.
  */
 export async function retryApprovedLanding(
   env: Env,
@@ -1303,12 +1330,13 @@ export async function retryApprovedLanding(
       if (
         error instanceof TrackerError &&
         ["landing_exists", "checkpoint_moved"].includes(error.code)
-      )
+      ) {
         console.info("Landing: no retry, the checkpoint moved on", {
           ...where,
           why: error.message,
         });
-      else if (error instanceof TrackerError)
+        return skipped;
+      } else if (error instanceof TrackerError)
         console.warn("Landing: an approved checkpoint can't land", {
           ...where,
           code: error.code,
@@ -1318,8 +1346,16 @@ export async function retryApprovedLanding(
       return { attempted: true, landing: null };
     }
   } catch (error) {
-    console.error("Landing: retrying an approved checkpoint failed", { ownerId, slug, error });
-    return { attempted: true, landing: null };
+    // Before any landing was asked for: nothing attempted. A tracker's refusal
+    // is this candidate's; anything else is the tracker or D1 failing.
+    if (!(error instanceof TrackerError)) throw error;
+    console.warn("Landing: an approved timeline can't be retried", {
+      ownerId,
+      slug,
+      code: error.code,
+      why: error.message,
+    });
+    return skipped;
   }
 }
 

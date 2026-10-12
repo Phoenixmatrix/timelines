@@ -33,6 +33,7 @@ import {
   settled,
   sweepApprovedLandings,
   sweepLandings,
+  sweepOwners,
 } from "./landing.ts";
 
 vi.mock("cloudflare:workers", () => ({
@@ -1516,8 +1517,127 @@ describe("approved but never landed (CORE-390)", () => {
       if (query.includes("source_integration_receipts")) throw new Error("D1 overloaded");
       return prepare(query);
     };
-    await settled(t.env, (deps) => sweepLandings(t.env, deps));
+    // Pinned to an hour whose sweep starts with ben (two trackers: even hours
+    // start with the first by id), so ben's failure comes before orbit's turn.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const next = Math.floor(Date.now() / 3600_000) + 1;
+      vi.setSystemTime((next + (next % 2)) * 3600_000);
+      expect(await sweepOwners(t.env.DB, 200, Math.floor(Date.now() / 3600_000))).toEqual([
+        "ben",
+        "orbit",
+      ]);
+      await settled(t.env, (deps) => sweepLandings(t.env, deps));
+    } finally {
+      vi.useRealTimers();
+    }
     expect(await orbit.landing()).toMatchObject({ trigger: "approval" });
+  });
+
+  test("a failure before beginLanding isn't an attempt; a failing tracker ends its turn (CORE-392)", async () => {
+    const t = await setup();
+    const side = await approveIn(t, "ben", "side");
+    const orbit = await approveIn(t, "orbit", "app");
+    // A tracker's refusal is the candidate's: skipped, not an attempt.
+    side.tracker.headCheckpoint = () => ({
+      ok: false,
+      status: 404,
+      code: "not_found",
+      error: "No timeline search.",
+      details: {},
+    });
+    let retried: Awaited<ReturnType<typeof retryApprovedLanding>> | null = null;
+    await settled(t.env, async (deps) => {
+      retried = await retryApprovedLanding(t.env, deps, "ben", "search");
+    });
+    expect(retried).toEqual({ attempted: false, landing: null });
+    // The tracker itself failing: thrown, so the sweep stops there for this run.
+    let calls = 0;
+    side.tracker.headCheckpoint = () => {
+      calls++;
+      throw new Error("Durable Object overloaded");
+    };
+    await expect(
+      settled(t.env, (deps) => retryApprovedLanding(t.env, deps, "ben", "search")),
+    ).rejects.toThrow("Durable Object overloaded");
+    calls = 0;
+    side.tracker.approvedUnlanded = () => ({
+      ok: true,
+      value: ["one", "two", "three"].map((slug) => ({
+        slug,
+        checkpointId: "cp",
+        approverId: "ben",
+        approvedAt: new Date().toISOString(),
+      })),
+    });
+    // Hour 0 starts with ben: its first failure ends its turn, and orbit still lands.
+    await settled(t.env, (deps) => sweepApprovedLandings(t.env, deps, { hour: 0 }));
+    expect(calls).toBe(1);
+    expect(await orbit.landing()).toMatchObject({ trigger: "approval" });
+  });
+
+  test("skipped candidates don't hide a landable one behind them (CORE-392)", async () => {
+    const t = await setup();
+    // Cat can write to app, so she can approve.
+    t.sqlite.exec(
+      "INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('app', 'cat', 'write')",
+    );
+    const mutate = (who: "ann" | "ben" | "cat" | "bot", ...mutations: unknown[]) =>
+      t.raw(who, "POST", "/tracker/orbit/mutate", { operationId: crypto.randomUUID(), mutations });
+    await mutate("ann", { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } });
+    await mutate("bot", {
+      kind: "issue.create",
+      id: "issue",
+      data: { teamId: "team", title: "S" },
+    });
+    // No approval's landing begins when it's answered.
+    const tracker = t.trackers.get("orbit")!;
+    const begin = tracker.beginLanding.bind(tracker);
+    let failing = true;
+    tracker.beginLanding = ((...args: Parameters<typeof begin>) => {
+      if (failing) throw new Error("Durable Object reset");
+      return begin(...args);
+    }) as typeof tracker.beginLanding;
+    const approve = async (slug: string, approver: "ben" | "cat") => {
+      await t.call("bot", "POST", "", { slug, repos: ["orbit/app"] });
+      t.work(slug, "app").commits.add(oid(9));
+      t.work(slug, "app").refs.set("refs/heads/work", oid(9));
+      await t.call("bot", "POST", `/${slug}/checkpoints`, { summary: "Ready" });
+      const made = (await t.call("ben", "GET", `/${slug}/checkpoints/1`)).body as CheckpointView;
+      await mutate("bot", {
+        kind: "request.open",
+        id: `req-${slug}`,
+        data: {
+          issueId: "issue",
+          kind: "approval",
+          prompt: "Land?",
+          checkpoint: made.checkpoint.id,
+          routeTo: approver,
+        },
+      });
+      await mutate(approver, {
+        kind: "request.answer",
+        id: `req-${slug}`,
+        data: { approved: true },
+      });
+    };
+    // Ben's is the oldest, so listed last; Cat's two come first.
+    await approve("zeta", "ben");
+    await approve("alpha", "cat");
+    await approve("beta", "cat");
+    failing = false;
+    // Cat leaves orbit: her approvals are skipped, without an attempt.
+    t.sqlite.exec("DELETE FROM org_members WHERE org_id = 'orbit' AND user_id = 'cat'");
+    let attempts = -1;
+    await settled(t.env, async (deps) => {
+      attempts = await sweepApprovedLandings(t.env, deps, { limit: 1, hour: 0 });
+    });
+    expect(attempts).toBe(1);
+    const landing = async (slug: string) =>
+      (await t.call("ben", "GET", `/${slug}/landing`)).body.landing as Landed;
+    expect(await landing("zeta")).toMatchObject({ trigger: "approval" });
+    expect(await landing("alpha")).toBeNull();
+    expect(await landing("beta")).toBeNull();
   });
 
   test("not after a rejection or a new ask, and not once abandoned", async () => {
@@ -1597,7 +1717,8 @@ describe("approved but never landed (CORE-390)", () => {
     await settled(t.env, async (deps) => {
       retried = await retryApprovedLanding(t.env, deps, "orbit", "search");
     });
-    expect(retried).toEqual({ attempted: true, landing: null });
+    // Refused as already landing: not an attempt against the sweep's budget.
+    expect(retried).toEqual({ attempted: false, landing: null });
     const landing = await orbit.landing();
     expect(landing).toMatchObject({ state: "failed", trigger: "request" });
     // Nor by the sweep later.

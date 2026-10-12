@@ -573,6 +573,19 @@ describe("approved but never landed (CORE-390)", () => {
     expect(t.timelines.landing("search")).toMatchObject({ id: started.id, state: "failed" });
   });
 
+  test("a timeline with a repository without a source isn't listed: landing it needs a migration", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    t.answer(t.ben, t.ask(checkpoint.id), true);
+    expect(t.timelines.approvedUnlanded(10, "")).toHaveLength(1);
+    t.sql.exec(
+      "UPDATE timelines SET data = json_remove(data, '$.repos[0].source') WHERE json_extract(data, '$.slug') = 'search'",
+    );
+    expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+    expect(() => begin(t)).toThrow(/Migrate the legacy timeline before landing/);
+  });
+
   test("a stale approved checkpoint, or an auto timeline, is never listed", () => {
     const t = setup({ policy: "approval" });
     t.push(2);

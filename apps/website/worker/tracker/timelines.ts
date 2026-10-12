@@ -1885,7 +1885,13 @@ export class TimelineStore {
     const busy = new Set(this.sourcePushes().map((operation) => operation.timelineId));
     for (const timeline of candidates) {
       if (found.length >= limit) break;
-      if (busy.has(timeline.id) || timeline.migrationState === "frozen") continue;
+      // What beginLanding refuses (migration_required, source_busy) isn't retried.
+      if (
+        busy.has(timeline.id) ||
+        timeline.migrationState === "frozen" ||
+        timeline.repos.some((repo) => !repo.source)
+      )
+        continue;
       const head = this.latest(timeline.id);
       if (!head || this.everLanded(timeline.id, head.id)) continue;
       const previous = this.landing(timeline.slug);
