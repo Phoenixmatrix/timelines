@@ -7,19 +7,24 @@
 //! pending entries: a session's first prompt as an instruction, later ones as
 //! steering. The next `gm commit --context` or `gm step` takes them in.
 //!
-//! It never fails the person's prompt and never prints: Claude Code adds a
-//! UserPromptSubmit hook's stdout to the conversation.
+//! It never fails the person's prompt. It prints only lease updates (CORE-261,
+//! `lease_updates`): Claude Code adds a UserPromptSubmit hook's stdout to the
+//! conversation, so the agent reads what others changed on the issues it holds
+//! with the person's prompt. `gm hook claude-code updates`, its PostToolUse
+//! hook, does the same between prompts.
 //!
 //! The same contract serves Codex (CORE-242: its UserPromptSubmit hook in
 //! `.codex/hooks.json` sends the same fields; the person trusts it once with
 //! `/hooks`) and Oh My Pi (`.omp/extensions/gitmatrix-steps.ts` runs
 //! `gm hook pi` from its `input` event with the same JSON).
 
-use super::{Ctx, steps};
+use super::{Ctx, lease_updates, steps};
+use crate::remote::Config;
 use crate::repo::Workspace;
 use serde_json::{Value, json};
 use std::io::Read;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// The harnesses `gm hook` captures for, by the id `agent::detect` gives them.
 pub const HARNESSES: [&str; 3] = ["claude-code", "codex", "pi"];
@@ -48,6 +53,58 @@ pub fn capture(ctx: &Ctx, harness: &str) {
     };
     let session = event["session_id"].as_str().unwrap_or("");
     let _ = steps::capture_prompt(&ws, harness, session, prompt);
+    // Only Claude Code is known to read a prompt hook's stdout as context.
+    if harness == "claude-code" {
+        let _ = std::env::set_current_dir(&cwd);
+        let config = Config::load();
+        if let Some(scope) = lease_updates::Scope::hook(&config)
+            && lease_updates::holds_any(&config, &scope)
+        {
+            lease_updates::for_hook(&config, &scope, |news| print!("{news}"));
+        }
+    }
+}
+
+/// How often the PostToolUse hook may ask the server, per identity.
+const UPDATES_EVERY: Duration = Duration::from_secs(60);
+
+/// Claude Code's PostToolUse hook (CORE-261): news on the issues this
+/// checkout's identity holds, as context beside the tool result. Asks the
+/// server at most once a minute and only while a lease is held; never inside a
+/// subagent, whose context the lead wouldn't see; never fails the tool call.
+pub fn updates(harness: &str) {
+    if harness != "claude-code" {
+        return;
+    }
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return;
+    }
+    let Ok(event) = serde_json::from_str::<Value>(&input) else {
+        return;
+    };
+    if event["agent_id"].as_str().is_some_and(|id| !id.is_empty()) {
+        return;
+    }
+    if let Some(cwd) = event["cwd"].as_str() {
+        let _ = std::env::set_current_dir(cwd);
+    }
+    let config = Config::load();
+    let Some(scope) = lease_updates::Scope::hook(&config) else {
+        return;
+    };
+    if !lease_updates::holds_any(&config, &scope)
+        || !lease_updates::due(&config, &scope.identity, UPDATES_EVERY)
+    {
+        return;
+    }
+    lease_updates::for_hook(&config, &scope, |news| {
+        println!("{}", post_tool_use_context(news))
+    });
+}
+
+fn post_tool_use_context(news: &str) -> Value {
+    json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": news}})
 }
 
 /// The Claude Code settings entry `gm agent setup` keeps in
@@ -55,24 +112,29 @@ pub fn capture(ctx: &Ctx, harness: &str) {
 pub const CLAUDE_HOOK_COMMAND: &str =
     "command -v gm >/dev/null 2>&1 && gm hook claude-code || true";
 
+/// Claude Code's lease-update hook, after each tool call (CORE-261).
+pub const CLAUDE_UPDATES_COMMAND: &str =
+    "command -v gm >/dev/null 2>&1 && gm hook claude-code updates || true";
+
 /// The same for Codex, in `.codex/hooks.json`.
 pub const CODEX_HOOK_COMMAND: &str = "command -v gm >/dev/null 2>&1 && gm hook codex || true";
 
 /// `settings` with the Claude Code step hook added once, everything else kept.
 pub fn with_claude_hook(settings: &str) -> String {
-    with_prompt_hook(settings, CLAUDE_HOOK_COMMAND)
+    let settings = with_hook(settings, "UserPromptSubmit", CLAUDE_HOOK_COMMAND);
+    with_hook(&settings, "PostToolUse", CLAUDE_UPDATES_COMMAND)
 }
 
 /// `.codex/hooks.json` with the Codex step hook added once (Codex reads the
 /// same `hooks.UserPromptSubmit` shape as Claude Code).
 pub fn with_codex_hook(settings: &str) -> String {
-    with_prompt_hook(settings, CODEX_HOOK_COMMAND)
+    with_hook(settings, "UserPromptSubmit", CODEX_HOOK_COMMAND)
 }
 
 /// Oh My Pi's step extension: `.omp/extensions/gitmatrix-steps.ts`.
 pub const OMP_EXTENSION: &str = include_str!("../../assets/omp-steps-extension.ts");
 
-fn with_prompt_hook(settings: &str, command: &str) -> String {
+fn with_hook(settings: &str, event: &str, command: &str) -> String {
     let mut value: Value = serde_json::from_str(settings).unwrap_or_else(|_| json!({}));
     if !value.is_object() {
         value = json!({});
@@ -88,7 +150,7 @@ fn with_prompt_hook(settings: &str, command: &str) -> String {
     let list = hooks
         .as_object_mut()
         .expect("object")
-        .entry("UserPromptSubmit")
+        .entry(event)
         .or_insert_with(|| json!([]));
     if !list.is_array() {
         *list = json!([]);
@@ -137,6 +199,10 @@ mod tests {
             json!(CLAUDE_HOOK_COMMAND)
         );
         assert!(with_claude_hook("").contains("gm hook claude-code"));
+        assert_eq!(
+            value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            json!(CLAUDE_UPDATES_COMMAND)
+        );
         // Codex: the same shape, its own command, beside a Claude hook if both are there.
         let both = with_codex_hook(&once);
         let value: Value = serde_json::from_str(&both).unwrap();
@@ -146,5 +212,17 @@ mod tests {
         );
         assert_eq!(with_codex_hook(&both), both);
         assert!(OMP_EXTENSION.contains("gm\", [\"hook\", \"pi\"]"));
+        // Codex gets no PostToolUse hook: only the prompt hook.
+        assert_eq!(value["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn updates_reach_claude_code_as_post_tool_use_context() {
+        let shown = post_tool_use_context("CORE-1 changed");
+        assert_eq!(shown["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        assert_eq!(
+            shown["hookSpecificOutput"]["additionalContext"],
+            "CORE-1 changed"
+        );
     }
 }

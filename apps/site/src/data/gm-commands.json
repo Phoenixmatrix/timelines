@@ -1230,6 +1230,48 @@
     {
       "arguments": [
         {
+          "description": "Only this issue (key or ID); default: every lease gm keeps for you here",
+          "flag": false,
+          "multiple": false,
+          "name": "issue",
+          "required": false
+        }
+      ],
+      "command": "gm issue updates",
+      "examples": [
+        "gm issue updates",
+        "gm issue updates ENG-1 -o json"
+      ],
+      "mutates": false,
+      "options": [
+        {
+          "description": "Tracker account/organization slug; otherwise use saved tracker context",
+          "flag": false,
+          "multiple": false,
+          "name": "--owner",
+          "required": false
+        },
+        {
+          "description": "Use only this private SQLite replica. Never automatically falls back offline",
+          "flag": true,
+          "multiple": false,
+          "name": "--offline",
+          "required": false
+        },
+        {
+          "description": "Work in a timeline (its slug): read its view of the issues, and make changes in it. Defaults to GM_TIMELINE, then this checkout's timeline (`gm timeline use`); `main` is main's view",
+          "flag": false,
+          "multiple": false,
+          "name": "--timeline",
+          "required": false
+        }
+      ],
+      "summary": "What others changed on the issues you hold since gm last told you (online): comments, field edits, answered requests, a claim taken over. Shown once, then marked told",
+      "usage": "gm issue updates [OPTIONS] [ISSUE]"
+    },
+    {
+      "arguments": [
+        {
           "description": "Canonical ID or issue key",
           "flag": false,
           "multiple": false,
@@ -4437,18 +4479,26 @@
           "multiple": false,
           "name": "harness",
           "required": true
+        },
+        {
+          "description": "`updates`: Claude Code's PostToolUse hook, telling the agent what others changed on issues it holds (CORE-261). Default: the prompt hook",
+          "flag": false,
+          "multiple": false,
+          "name": "event",
+          "required": false
         }
       ],
       "command": "gm hook",
       "examples": [
         "gm hook claude-code",
+        "gm hook claude-code updates",
         "gm hook codex",
         "gm hook pi"
       ],
       "mutates": true,
       "options": [],
       "summary": "Harness hooks (installed by `gm agent setup`); not for direct use",
-      "usage": "gm hook <HARNESS>"
+      "usage": "gm hook <HARNESS> [EVENT]"
     },
     {
       "arguments": [],

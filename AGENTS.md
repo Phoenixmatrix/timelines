@@ -160,7 +160,9 @@ Work is tracked in Gitmatrix: matrixorg, team CORE. The loop, in brief (the
    you (then read the description or PRD). Record it with a checkpoint:
    `'Timeline: <slug>'`, or `'Timeline: main, because …'`.
 3. Work it: `gm issue checkpoint <issue> '<done; next>'` as you go, and
-   `gm issue renew <issue>` before the lease (1 hour) ends.
+   `gm issue renew <issue>` before the lease (1 hour) ends. When gm says others
+   changed an issue you hold (in renew's output, `gm issue updates`, or a hook
+   notice), re-read it with `gm issue show <issue>` and adapt.
 4. Need to find something out (where code lives, why CI failed, what an issue
    depends on)? `gm ask "<question>"` asks the Gitmatrix assistant. For human
    input, follow the current claim's `intervention` mode and guidance below.

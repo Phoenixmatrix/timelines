@@ -127,6 +127,9 @@ pub enum Command {
     Hook {
         /// The harness: claude-code, codex or pi (Oh My Pi).
         harness: String,
+        /// `updates`: Claude Code's PostToolUse hook, telling the agent what
+        /// others changed on issues it holds (CORE-261). Default: the prompt hook.
+        event: Option<String>,
     },
     /// Sign in to a Timelines server
     #[command(subcommand)]

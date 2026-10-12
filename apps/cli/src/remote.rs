@@ -234,6 +234,23 @@ impl Config {
         Ok(Identity::Person)
     }
 
+    /// The identity requests would use, without provisioning: None when the
+    /// checkout names an agent this machine holds no token for yet.
+    pub fn known_identity(&self) -> Option<Identity> {
+        if matches!(self.acting, Acting::Token(_)) || env_token().is_some() {
+            return Some(Identity::Env);
+        }
+        if matches!(self.acting, Acting::Auto)
+            && let Some(name) = crate::profile::acting_agent()
+        {
+            return self
+                .agent_tokens()
+                .contains_key(&name)
+                .then_some(Identity::Agent { name });
+        }
+        Some(Identity::Person)
+    }
+
     /// This configuration, acting as `identity` instead.
     pub fn acting_as(&self, identity: &Identity) -> Result<Config> {
         let mut config = self.clone();
@@ -722,7 +739,7 @@ fn api_at(
             "Is the dev server running? Start it with `vp dev` in apps/website, or set GM_SERVER.",
         ),
     };
-    let mut response = match (method.to_uppercase().as_str(), body) {
+    let response = match (method.to_uppercase().as_str(), body) {
         ("GET", _) => get_with_retries(&agent, &url, auth.as_deref()).map_err(unreachable)?,
         ("DELETE", None) => {
             let mut req = agent.delete(&url);
@@ -746,6 +763,11 @@ fn api_at(
                 .map_err(unreachable)?
         }
     };
+    reply(response)
+}
+
+/// A JSON API reply: the body, or the server's error.
+fn reply(mut response: ureq::http::Response<ureq::Body>) -> Result<Value> {
     let status = response.status().as_u16();
     let text = response.body_mut().read_to_string().unwrap_or_default();
     let value: Value = if text.trim().is_empty() {
@@ -757,6 +779,30 @@ fn api_at(
         return Ok(value);
     }
     Err(status_error(status, &value))
+}
+
+/// GET `path` once, giving up after `wait`: for hooks that run inside an
+/// agent's tool calls, where a slow or unreachable server must never hold the
+/// agent up (no read retries, no long timeouts).
+pub fn get_briefly(config: &Config, path: &str, wait: std::time::Duration) -> Result<Value> {
+    let (token, _) = credential(config)?;
+    let server = config.server();
+    let url = format!("{server}/api{path}");
+    let mut req = agent(&url, false)?
+        .get(&url)
+        .config()
+        .timeout_global(Some(wait))
+        .build();
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let response = req.call().map_err(|e| {
+        GmError::new(
+            "server_unreachable",
+            format!("Could not reach {server}: {e}"),
+        )
+    })?;
+    reply(response)
 }
 
 /// POST JSON and hand each line of the streamed response to `on_line` as it

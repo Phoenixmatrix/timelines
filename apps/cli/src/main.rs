@@ -180,8 +180,12 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
             Ok(())
         }
         Command::Step(a) => out(f, commands::test::step(ctx, &a)),
-        Command::Hook { harness } => {
-            commands::hooks::capture(ctx, &harness);
+        Command::Hook { harness, event } => {
+            match event.as_deref() {
+                Some("updates") => commands::hooks::updates(&harness),
+                Some(_) => {}
+                None => commands::hooks::capture(ctx, &harness),
+            }
             Ok(())
         }
         Command::Steps(a) if a.follow => commands::steps::follow(ctx, &a),

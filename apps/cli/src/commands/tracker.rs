@@ -29,7 +29,32 @@ impl Render for Shown {
         if let (Some(owner), Some(tags)) = (self.0["catalog"].as_str(), self.0["tags"].as_array()) {
             return catalog_text(owner, tags);
         }
+        if let (Some(updates), Some(held)) =
+            (self.0["leaseUpdates"].as_array(), self.0["held"].as_u64())
+        {
+            let errors: String = updates
+                .iter()
+                .filter_map(|u| {
+                    Some(format!(
+                        "{}: {}\n",
+                        u["issue"].as_str()?,
+                        u["error"].as_str()?
+                    ))
+                })
+                .collect();
+            return match super::lease_updates::text(updates) {
+                Some(news) => format!("{news}{errors}"),
+                None if held == 0 => "gm keeps no leases for you on this machine.\n".into(),
+                None => format!("No changes by others on the issues you hold.\n{errors}"),
+            };
+        }
         let mut body = serde_json::to_string_pretty(&self.0).unwrap_or_default();
+        if let Some(news) = self.0["leaseUpdates"]
+            .as_array()
+            .and_then(|updates| super::lease_updates::text(updates))
+        {
+            body = format!("{news}Mark them read with `gm issue updates`.\n\n{body}");
+        }
         if self.0["claimEffect"].is_object() {
             body = format!("{}\n\n{body}", claim_effect_text(&self.0["claimEffect"]));
         }
@@ -299,12 +324,25 @@ fn private_file(path: &Path) -> Result<fs::File> {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Kept {
     token: String,
-    identity: remote::Identity,
+    pub(crate) identity: remote::Identity,
     /// The issue's key, for people reading `gm auth status`.
     #[serde(default)]
-    issue: String,
+    pub(crate) issue: String,
     #[serde(default)]
     expires_at: Option<String>,
+    /// The tracker it's held in, and by whom (the claim's actor): what lease
+    /// updates (CORE-261) read, and whose own changes they leave out.
+    #[serde(default)]
+    pub(crate) owner: String,
+    #[serde(default)]
+    pub(crate) actor: Option<String>,
+    /// The newest tracker cursor the holder has been told about: changes after
+    /// it are news. Set when the lease is taken; renewing keeps it.
+    #[serde(default)]
+    pub(crate) seen: Option<u64>,
+    /// The checkout it was taken in: hooks there tell its session.
+    #[serde(default)]
+    pub(crate) checkout: Option<String>,
 }
 
 fn data_dir() -> Result<PathBuf> {
@@ -322,6 +360,15 @@ fn data_dir() -> Result<PathBuf> {
 fn leases_dir(config: &Config) -> Result<PathBuf> {
     Ok(data_dir()?.join("leases").join(digest(&config.server())))
 }
+/// When the update hook last asked the server, for this server and identity.
+pub(crate) fn hook_check_path(config: &Config, identity: &remote::Identity) -> Option<PathBuf> {
+    let dir = leases_dir(config).ok()?;
+    private_dir(&dir).ok()?;
+    Some(dir.join(format!(
+        "checked-{}",
+        &digest(&serde_json::to_string(identity).ok()?)[..16]
+    )))
+}
 fn checked(issue_id: &str) -> Result<&str> {
     if issue_id.is_empty()
         || !issue_id
@@ -332,7 +379,7 @@ fn checked(issue_id: &str) -> Result<&str> {
     }
     Ok(issue_id)
 }
-fn keep_lease(config: &Config, issue_id: &str, kept: &Kept) -> Result<()> {
+pub(crate) fn keep_lease(config: &Config, issue_id: &str, kept: &Kept) -> Result<()> {
     let dir = leases_dir(config)?;
     private_dir(&dir)?;
     let mut file = private_file(&dir.join(format!("{}.json", checked(issue_id)?)))?;
@@ -344,7 +391,7 @@ fn keep_lease(config: &Config, issue_id: &str, kept: &Kept) -> Result<()> {
     }
     Ok(())
 }
-fn kept_lease(config: &Config, issue_id: &str) -> Option<Kept> {
+pub(crate) fn kept_lease(config: &Config, issue_id: &str) -> Option<Kept> {
     let id = checked(issue_id).ok()?;
     if let Some(kept) = fs::read_to_string(leases_dir(config).ok()?.join(format!("{id}.json")))
         .ok()
@@ -359,7 +406,22 @@ fn kept_lease(config: &Config, issue_id: &str) -> Option<Kept> {
         identity: config.identity().unwrap_or(remote::Identity::Person),
         issue: String::new(),
         expires_at: None,
+        owner: String::new(),
+        actor: None,
+        seen: None,
+        checkout: None,
     })
+}
+/// Change a kept lease as it is on disk now, if it still is; `change` says
+/// whether to write it back. Never recreates a lease that has ended.
+pub(crate) fn update_kept(config: &Config, issue_id: &str, change: impl FnOnce(&mut Kept) -> bool) {
+    let Some(mut kept) = kept_lease(config, issue_id) else {
+        return;
+    };
+    if kept.owner.is_empty() || !change(&mut kept) {
+        return;
+    }
+    let _ = keep_lease(config, issue_id, &kept);
 }
 fn drop_lease(config: &Config, issue_id: &str) {
     let Ok(id) = checked(issue_id) else { return };
@@ -380,13 +442,29 @@ fn stale(expires_at: Option<&str>, cutoff: DateTime<Utc>) -> bool {
 
 /// Every kept lease on this server, pruning those a day past expiry.
 pub(crate) fn kept_leases(config: &Config) -> Vec<Kept> {
+    held_leases(config)
+        .into_iter()
+        .map(|(_, kept)| kept)
+        .collect()
+}
+/// Every kept lease on this server by issue ID, pruning those a day past expiry.
+pub(crate) fn held_leases(config: &Config) -> Vec<(String, Kept)> {
     let Ok(dir) = leases_dir(config) else {
         return Vec::new();
     };
     let cutoff = Utc::now() - chrono::Duration::days(1);
     let mut out = Vec::new();
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-        let Some(kept) = fs::read_to_string(entry.path())
+        let path = entry.path();
+        let Some(issue_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(kept) = fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str::<Kept>(&text).ok())
         else {
@@ -394,9 +472,9 @@ pub(crate) fn kept_leases(config: &Config) -> Vec<Kept> {
         };
         let stale = stale(kept.expires_at.as_deref(), cutoff);
         if stale {
-            let _ = fs::remove_file(entry.path());
+            let _ = fs::remove_file(&path);
         } else {
-            out.push(kept);
+            out.push((issue_id, kept));
         }
     }
     out
@@ -2495,6 +2573,17 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
         }
         return Ok(Shown(remote::api(&config, "GET", &path, None)?));
     }
+    if let IssueCommand::Updates { issue } = &args.command {
+        if args.scope.offline {
+            return Err(GmError::usage(
+                "Lease updates come from the server's history; drop --offline.",
+            ));
+        }
+        return Ok(Shown(super::lease_updates::command(
+            &Config::load(),
+            issue.as_deref(),
+        )?));
+    }
     let lease_command = matches!(
         args.command,
         IssueCommand::Claim { .. }
@@ -2581,7 +2670,9 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                 }
                 return Ok(shown);
             }
-            IssueCommand::History { .. } => unreachable!("handled before opening the replica"),
+            IssueCommand::History { .. } | IssueCommand::Updates { .. } => {
+                unreachable!("handled before opening the replica")
+            }
             IssueCommand::Tags => return Ok(Shown(tag_catalog(&snapshot, &r.owner))),
             IssueCommand::Create(a) => {
                 if a.description_file.as_deref() == Some(Path::new("-"))
@@ -2921,14 +3012,43 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
                             .and_then(|i| i["key"].as_str())
                             .or(result["key"].as_str())
                             .unwrap_or(issue);
+                        // The holder's lease renewed, parked, resumed or accepted keeps
+                        // what it has been told (a resume's fresh token included); a new
+                        // claim starts from now (CORE-261).
+                        let identity = holder.clone().unwrap_or(current.clone());
+                        let before = kept_lease(&r.config, issue)
+                            .filter(|k| k.identity == identity && k.seen.is_some());
+                        let checkout =
+                            before
+                                .as_ref()
+                                .and_then(|k| k.checkout.clone())
+                                .or_else(|| {
+                                    crate::profile::root().map(|root| root.display().to_string())
+                                });
+                        let (actor, seen) = match before {
+                            Some(k) => (k.actor, k.seen),
+                            None => (
+                                response["events"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .find_map(|e| e["actorId"].as_str())
+                                    .map(str::to_string),
+                                response["cursor"].as_u64(),
+                            ),
+                        };
                         keep_lease(
                             &r.config,
                             issue,
                             &Kept {
                                 token: token.to_string(),
-                                identity: holder.clone().unwrap_or(current.clone()),
+                                identity,
                                 issue: key.to_string(),
                                 expires_at: expires_at.map(str::to_string),
+                                owner: r.owner.clone(),
+                                actor,
+                                seen,
+                                checkout,
                             },
                         )?;
                     }
@@ -2936,6 +3056,29 @@ pub fn issue(ctx: &Ctx, args: &IssueArgs) -> Result<Shown> {
             }
             if let Some(identity) = &switched {
                 response["actedAs"] = json!(identity.describe());
+            }
+            // Renewing mentions what others changed (CORE-261), without marking it told:
+            // a renewal loop's output often goes nowhere. With nothing to say, the
+            // holder's own changes are marked told, so they never pile up.
+            if let IssueCommand::Renew { .. } = args.command {
+                let scope = super::lease_updates::Scope {
+                    identity: holder.clone().unwrap_or(current.clone()),
+                    only: Some(&target),
+                    checkout: None,
+                };
+                let mut updates = Vec::new();
+                for (_, news) in
+                    super::lease_updates::gather(&r.config, &scope, Some(Duration::from_secs(3)))
+                {
+                    match news {
+                        Ok(news) if news.is_news() => updates.push(news.to_json()),
+                        Ok(news) => super::lease_updates::mark_told(&r.config, &news),
+                        Err(_) => {}
+                    }
+                }
+                if !updates.is_empty() {
+                    response["leaseUpdates"] = json!(updates);
+                }
             }
             if let IssueCommand::Next { .. } = args.command {
                 let mut shown = next_result(&snapshot, &response);
@@ -3208,6 +3351,10 @@ mod tests {
                 name: "builder".into(),
             },
             issue: "CORE-1".into(),
+            owner: String::new(),
+            actor: None,
+            seen: None,
+            checkout: None,
             expires_at: Some("2026-10-02T12:00:00Z".into()),
         };
         let text = serde_json::to_string(&kept).unwrap();
@@ -3296,6 +3443,10 @@ mod tests {
                 token: "secret".into(),
                 identity: remote::Identity::Person,
                 issue: "ENG-1".into(),
+                owner: String::new(),
+                actor: None,
+                seen: None,
+                checkout: None,
                 expires_at: None,
             })
         };

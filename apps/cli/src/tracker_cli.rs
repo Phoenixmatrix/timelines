@@ -354,6 +354,12 @@ pub enum IssueCommand {
         #[arg(long, default_value_t=50, value_parser=clap::value_parser!(u16).range(1..=100))]
         limit: u16,
     },
+    /// What others changed on the issues you hold since gm last told you (online): comments,
+    /// field edits, answered requests, a claim taken over. Shown once, then marked told.
+    Updates {
+        /// Only this issue (key or ID); default: every lease gm keeps for you here.
+        issue: Option<String>,
+    },
     /// Apply a JSON patch with optimistic version checking; null clears nullable fields.
     /// --timeline-use and --timeline-policy set the timeline rule without JSON;
     /// --requires and --clear-requires set which agents may claim it.

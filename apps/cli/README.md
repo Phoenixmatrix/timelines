@@ -370,6 +370,20 @@ related comments, requests, and links). JSON preserves the entire server respons
 Lease and credential secrets are excluded by the audit API. Unknown legacy
 actors/sources remain unknown rather than being guessed.
 
+```bash
+gm issue updates
+gm issue updates ENG-1 -o json
+```
+
+`gm issue updates` tells an agent what others changed on the issues it holds
+(CORE-261): comments, field edits, answered requests, links, sub-issues, a claim
+taken over. gm keeps, with each lease, the claim's actor and the newest change
+the holder has been told about, and leaves the holder's own changes out. The
+news is shown once, then marked told; `gm issue history` keeps everything.
+`gm issue renew` lists the same news as `leaseUpdates` without marking it told,
+since a renewal loop's output often goes nowhere. Claude Code hears it without
+asking: see "Harness hooks".
+
 gm HTTP calls declare `X-Gitmatrix-Source: cli`. This is a provenance hint, not
 authentication: recorded actor identity still comes from the authenticated server
 session.
@@ -1014,10 +1028,18 @@ gm context sync                                     # retries uploads a push cou
   redacted, to the journal's `pending.json`: a session's first prompt as an
   instruction, later ones as steering. The next `gm commit --context` or
   `gm step` puts them first in its instructions and steering, marked `hook`,
-  sets coverage to `hook:claude-code` and clears them. The hook never prints
-  (Claude Code would add its output to the conversation) and never fails a
+  sets coverage to `hook:claude-code` and clears them. It prints only lease
+  updates (Claude Code adds its output to the conversation) and never fails a
   prompt. Without a hook, the agent records them itself (`agent`), and the
   Story notes that some context may be missing.
+
+  The hooks also deliver lease updates (`gm issue updates`): the prompt hook
+  prints them with the person's next prompt, and `gm agent setup` adds a
+  `PostToolUse` hook (`gm hook claude-code updates`) for the stretches between
+  prompts. While the checkout's identity holds a lease, it asks the server at
+  most once a minute (one try, two seconds) and adds any news beside the tool
+  result. It skips subagents' tool calls, so the lead agent hears it.
+
 - **Codex and Oh My Pi** use the same contract (CORE-242), each under its own
   harness id. For Codex (0.114+), `gm agent setup` adds the same
   `UserPromptSubmit` hook to `.codex/hooks.json` (`gm hook codex`); Codex runs
