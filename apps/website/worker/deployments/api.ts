@@ -4,6 +4,10 @@
 //                                 status; pages with before= and limit=
 //   POST   /deployments           record one (write access, or the repository's
 //                                 CI job credential)
+//   GET    /deployments/live-timelines
+//                                 {timelines}: slugs with a live (active or
+//                                 sleeping) record in ANY source at once
+//                                 (CORE-372, below)
 //   GET    /deployments/:id       one record
 //   PATCH  /deployments/:id       {status?, url?, expiresAt?} (same access)
 //   GET    /environments          `production` and every environment recorded,
@@ -31,6 +35,7 @@ import {
   type DeploymentStatus,
   type Environment,
   type EnvironmentList,
+  type LiveTimelineList,
   previewExpiry,
 } from "../../shared/deployments.ts";
 import { timelineSlugOf, type Timeline } from "../../shared/timelines.ts";
@@ -331,6 +336,36 @@ deployments.get("/deployments", async (c) => {
   return c.json<DeploymentList>({
     deployments: list,
     next: rows.length > limit ? (list.at(-1)?.id ?? null) : null,
+  });
+});
+
+/**
+ * Which timelines still have a live preview, in ANY source of the repository,
+ * in one answer. Since CORE-255 a timeline's preview runs, and the records
+ * they make, live in that timeline's own work source. GET /deployments reads
+ * one source per request (`?source=`, which a job's credential may also set
+ * to another source's id), and nothing here lists the sources, so a preview
+ * janitor (tools/preview/preview.ts reconcile, CORE-372) couldn't otherwise
+ * know every live timeline before it deletes what no live preview owns. This
+ * answers slugs only, never URLs, commits, sources or any other field, to the
+ * repository's own CI jobs and to its readers. Any environment counts: a
+ * protective list errs towards live. It is also reconcile's kill switch:
+ * anything but a 200 here, and reconcile deletes nothing.
+ */
+deployments.get("/deployments/live-timelines", async (c) => {
+  const repo = await reader(c);
+  if (repo instanceof Response) return repo;
+  const rows = await db(c.env.DB)
+    .selectFrom("deployments")
+    .select("timeline_slug")
+    .distinct()
+    .where("repo_id", "=", repo.id)
+    .where("status", "in", ["active", "sleeping"])
+    .where("timeline_slug", "is not", null)
+    .orderBy("timeline_slug")
+    .execute();
+  return c.json<LiveTimelineList>({
+    timelines: rows.flatMap((row) => (row.timeline_slug ? [row.timeline_slug] : [])),
   });
 });
 

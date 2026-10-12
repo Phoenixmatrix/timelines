@@ -3193,6 +3193,7 @@ the wire types (`worker/deployments/`).
 | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /api/repos/:o/:n/deployments`                             | Newest first; filters `environment`, `timeline`, `commit` (up to 80, comma-separated), `run`, `status`; pages with `before`, `limit`   |
 | `POST /api/repos/:o/:n/deployments`                            | `{url, commit?, environment?, timeline?, checkpoint?, status?, expiresAt?}`                                                            |
+| `GET /api/repos/:o/:n/deployments/live-timelines`              | `{timelines}`: slugs with an active or sleeping record in any source, nothing else; readers and the repository's CI jobs (CORE-372)    |
 | `GET`, `PATCH /api/repos/:o/:n/deployments/:id`                | One record; `PATCH {status?, url?, expiresAt?}`                                                                                        |
 | `GET /api/repos/:o/:n/environments`                            | `production` and each recorded environment, with its newest deployment                                                                 |
 | `GET`, `PATCH /api/accounts/:slug/settings/previews`           | Preview retention `{endedDays, idleDays}`: 2 and 7 by default; org owners change them                                                  |
@@ -3327,6 +3328,9 @@ checkpoint ─▶ preview run (create) ─▶ preview job ─▶ node tools/prev
 expiry ─▶ preview run (teardown) ─▶ preview-teardown job ─▶ … preview.ts teardown
    delete the Preview (Cloudflare API: `cf previews` can only deploy),
    then the D1s, the bucket (emptied first) and the namespace (repositories first)
+         └──▶ preview-reconcile job ─▶ … preview.ts reconcile --max 20
+   delete gitmatrix-preview-* resources no live preview owns; report live
+   records whose Preview isn't listed
 ```
 
 - **One preview per timeline.** The Worker Preview is named
@@ -3342,8 +3346,8 @@ expiry ─▶ preview run (teardown) ─▶ preview-teardown job ─▶ … prev
   earlier checkpoint, including the Preview's own Durable Objects. Email is
   off, so people sign in as a persona (`DEV_MODE`), as in development, once
   they are past the access gate (below).
-- **Only in production CI.** Both jobs require `runner == "sandbox"`, so a
-  local server's preview runs deploy nothing. Creates share the `preview`
+- **Only in production CI.** All three jobs require `runner == "sandbox"`, so
+  a local server's preview runs deploy nothing. Creates share the `preview`
   concurrency group: one at a time per repository, and a waiting create gives
   way to a newer one for the same timeline. The jobs use the deploy job's
   `CLOUDFLARE_API_TOKEN` (D1, R2, Artifacts and Workers edit), plus
@@ -3352,6 +3356,43 @@ expiry ─▶ preview run (teardown) ─▶ preview-teardown job ─▶ … prev
   against its SHA-256) unless `GITMATRIX_PREVIEW_GM` names one.
 - **A failed create** records the checkpoint's preview as `failed`, and the
   job fails. Re-run it, or revive the checkpoint.
+- **Reconciling leaks** (CORE-372). Some data outlives its record: a create
+  that fails and can't record the failure, a `failed` record (it never
+  expires, so no teardown comes), and an Artifacts namespace Cloudflare won't
+  delete (CORE-302). After each teardown, the `preview-reconcile` job asks
+  `deployments/live-timelines` which timelines have a live record in any
+  source at once (since CORE-255 a timeline's records live in its own work
+  source; `GET …/deployments` reads one `?source=` per request and nothing
+  lists the sources; this answers slugs only), and lists the Worker's
+  Previews, D1s, buckets and namespaces, every page. It deletes each
+  `gitmatrix-preview-*` resource that no live timeline's slug names (through
+  `names()`, so a name two slugs share stays while either is live), that no
+  Preview without a live timeline might own, and that is at least two hours
+  old; a D1 by the uuid it listed. Nothing serializes it with creates (it
+  holds no concurrency group, so a teardown never supersedes a waiting
+  create): a create times out after 40 minutes, and makes its D1 before the
+  bucket and namespace that share the D1's name, so a young D1 keeps them
+  (namespaces carry no creation time), and so does a D1 of that exact name
+  found when reconcile reaches them; a bucket goes only while its creation
+  date is still the one listed. It deletes at most 20 per run, trying names
+  in a new order each run so one stuck resource can't starve the rest, and
+  after 8 minutes starts no deletion, nor any further call inside one (the
+  resource is logged as failed). A live timeline whose Preview isn't listed
+  (Cloudflare deletes the oldest at its 500-Preview cap) is only reported,
+  `preview.reconcile.preview_missing`: a Preview can drop out of the API while
+  it still serves (below), and the records' own expiry tears it down. It
+  fails closed: a listing error (including a server without
+  live-timelines), or no live timeline while Previews exist deletes nothing;
+  a live timeline `names()` rejects owns nothing and is logged as
+  `.ignored_slug`. The teardown run completes only once the job ends, so the
+  reconcile step exits 0 whatever happens to it (setup errors included,
+  logged as skipped); the job can still fail before it, e.g. in
+  `pnpm install`. A teardown runs the torn-down checkpoint's own reconcile
+  code, as a create runs the timeline's code with the same credentials:
+  inherent in the contract. The server's kill switch is live-timelines:
+  anything but a 200 and reconcile deletes nothing. `--dry-run` logs instead.
+  Events: `preview.reconcile.candidate`, `.deleted`, `.skipped`, `.failed`,
+  `.preview_missing` and `.ignored_slug`, and a `preview.reconcile` summary.
 
 **Cloudflare Access, independent of preview lifetime.** The account's
 `Gitmatrix previews` self-hosted Access application protects
