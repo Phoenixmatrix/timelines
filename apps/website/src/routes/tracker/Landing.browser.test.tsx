@@ -140,7 +140,9 @@ test("an approved checkpoint lands: queued and merging, a conflict asks for a sy
 
   // Queued: merging into main, with its merge run, and nothing to press.
   let app = inspect(timeline);
-  await expect.element(inspector()).toMatchTextContent("searchLandingLands after approval");
+  await expect
+    .element(inspector())
+    .toMatchTextContent(/Search\s*Landing[\s\S]*Lands\s*after approval/);
   await expect.element(panel()).toMatchTextContent("Checkpoint #1: Preparing the result on main");
   await expect.element(repoRow("engine")).toMatchTextContent("orbit/enginemerging");
   await expect
@@ -159,7 +161,9 @@ test("an approved checkpoint lands: queued and merging, a conflict asks for a sy
     .toMatchTextContent(
       `Checkpoint #1 conflicts with orbit/engine's main (CI run #${first} lists the files). Explicitly sync/rebase the owned work source, resolve conflicts, and renew the checkpoint and approval.`,
     );
-  await expect.element(inspector()).toMatchTextContent("searchActiveLands after approval");
+  await expect
+    .element(inspector())
+    .toMatchTextContent(/Search\s*Active[\s\S]*Lands\s*after approval/);
 
   // Land again, by keyboard: the same approved checkpoint's landing, retried.
   const again = panel().getByRole("button", { name: "Land again" });
@@ -190,7 +194,9 @@ test("an approved checkpoint lands: queued and merging, a conflict asks for a sy
     .toBeVisible();
   expect(landButton().elements()).toHaveLength(0);
   // The timeline is landing again: the inspector re-read it.
-  await expect.element(inspector()).toMatchTextContent("searchLandingLands after approval");
+  await expect
+    .element(inspector())
+    .toMatchTextContent(/Search\s*Landing[\s\S]*Lands\s*after approval/);
   app.unmount();
 
   // This merge fails outright: stopped, with what to do.
@@ -325,7 +331,9 @@ describe("the later states, with the runs that merged and tested them", () => {
       engine: { state: "advanced", merge: merge.engine, mergeRun: run(3), gateRun: run(4) },
       web: { state: "merging", attempt: 2, mergeRun: run(7) },
     });
-    await expect.element(inspector()).toMatchTextContent("searchPartly landedLands after approval");
+    await expect
+      .element(inspector())
+      .toMatchTextContent(/Search\s*Partly landed[\s\S]*Lands\s*after approval/);
     await expect.element(panel()).toMatchTextContent("Checkpoint #1: Preparing the result on main");
     await expect.element(repoRow("engine")).toMatchTextContent("orbit/enginemain advanced");
     await expect.element(repoRow("web")).toMatchTextContent("orbit/webmerging");

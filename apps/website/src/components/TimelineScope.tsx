@@ -1,9 +1,9 @@
-// The app-wide timeline switcher and banner (CORE-82). The switcher sits in
-// the rail on every page; while a timeline is selected (`?tl=<slug>`, see
-// lib/timelineScope.ts) the banner above the page names it and says what the
-// scope means where you are, and the rail's switcher carries a dot, so the
-// scope is never out of sight (TIMELINES-RESEARCH.md, "Where it wouldn't
-// work": mode errors).
+// The app-wide timeline switcher and banner (CORE-82). The rail's Timelines
+// place opens the graph (CORE-402); while a timeline is selected
+// (`?tl=<slug>`, see lib/timelineScope.ts) the banner above the page names it,
+// says what the scope means where you are and offers the switcher, and the
+// rail's place carries a dot, so the scope is never out of sight
+// (TIMELINES-RESEARCH.md, "Where it wouldn't work": mode errors).
 
 import { Popover } from "@base-ui/react/popover";
 import { CaretDownIcon, CheckIcon, GitForkIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
@@ -24,8 +24,7 @@ import {
   switchScope,
 } from "../lib/timelineScope.ts";
 import { STATUS_LABEL } from "../routes/tracker/timelineGraph.ts";
-import { TimelinesMark } from "./GitmatrixLogo.tsx";
-import { Tip, popMotion } from "./ui.tsx";
+import { popMotion } from "./ui.tsx";
 
 // ---- data ------------------------------------------------------------------
 
@@ -324,39 +323,18 @@ function Meta({ children }: { children: React.ReactNode }) {
   return <span className="shrink-0 text-micro text-ink-faint tabular-nums">{children}</span>;
 }
 
-/** The shared picker in the rail, scope banner, or an inline filter. */
-export function TimelineSwitcher({
-  variant,
-  active = false,
-}: {
-  variant: "rail" | "banner" | "filter";
-  active?: boolean;
-}) {
+/** The shared picker in the scope banner, or an inline filter. (The rail opens the graph.) */
+export function TimelineSwitcher({ variant }: { variant: "banner" | "filter" }) {
   const [open, setOpen] = useState(false);
   const scope = useScope(open);
   const name = scope.timeline?.name ?? scope.slug;
-  const label = `Timeline: ${name ?? "main"}. Timelines: switch timeline or open graph`;
   const onOpenChange = (next: boolean) => {
     // Fresh each time it opens: timelines start and end while you work.
     if (next && scope.owner) refreshTimelines(scope.owner);
     setOpen(next);
   };
   const trigger =
-    variant === "rail" ? (
-      <Popover.Trigger
-        className="mk-place relative max-sm:before:hidden"
-        aria-label={label}
-        aria-current={active ? "page" : undefined}
-      >
-        <TimelinesMark className="size-7" />
-        {scope.slug && (
-          <span
-            className="absolute top-2 right-2 size-2.5 rounded-full bg-signal ring-2 ring-rail"
-            aria-hidden
-          />
-        )}
-      </Popover.Trigger>
-    ) : variant === "filter" ? (
+    variant === "filter" ? (
       <Popover.Trigger
         className="mk-btn mk-btn--secondary min-w-0 max-w-full max-sm:min-h-11"
         aria-label={`Filter release notes by timeline: ${name ?? "main (all notes)"}`}
@@ -370,20 +348,9 @@ export function TimelineSwitcher({
     );
   return (
     <Popover.Root open={open} onOpenChange={onOpenChange}>
-      {variant === "rail" ? (
-        <Tip label={label} side="right">
-          {trigger}
-        </Tip>
-      ) : (
-        trigger
-      )}
+      {trigger}
       <Popover.Portal>
-        <Popover.Positioner
-          side={variant === "rail" ? "right" : "bottom"}
-          align={variant === "rail" ? "start" : "end"}
-          sideOffset={variant === "rail" ? 12 : 6}
-          className="z-50"
-        >
+        <Popover.Positioner side="bottom" align="end" sideOffset={6} className="z-50">
           <Popover.Popup className={`mk-popup ${popMotion} w-[min(22rem,calc(100vw-2rem))]`}>
             <SwitcherPanel
               scope={scope}

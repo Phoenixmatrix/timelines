@@ -99,11 +99,12 @@ test("a person turns it on for one tracker; it answers their green approvals, ma
     .toHaveAttribute("title", "Approved automatically: Marco Bellini’s approve-when-green setting");
   await expect
     .element(
-      page.getByText(
-        "Checkpoint #1 approved automatically by Marco Bellini’s approve-when-green setting",
-      ),
+      page
+        .getByRole("region", { name: "Timeline graph" })
+        .getByRole("listitem")
+        .filter({ hasText: /#1 approved/ }),
     )
-    .toBeVisible();
+    .toMatchTextContent(/#1 approved\s*by Marco Bellini’s approve-when-green setting/);
   app.unmount();
 
   renderApp(`/tracker/orbit/issues/${timeline.issue}`);

@@ -4936,8 +4936,10 @@ export async function runE2E(
       await expect(page.getByRole("link", { name: "README.md" }).first()).toBeVisible();
       await expect(banner).toHaveCount(0);
 
-      await page.getByRole("button", { name: /^Timeline: main/ }).click();
-      await page.getByRole("link", { name: new RegExp(name) }).click();
+      // The command palette switches this page to the timeline in place (CORE-402).
+      await page.keyboard.press("Control+k");
+      await page.keyboard.type(name);
+      await page.getByRole("option", { name: new RegExp(`Switch to timeline ${name}`) }).click();
       await page.waitForURL((url) => url.searchParams.get("tl") === slug);
       await expect(banner).toBeVisible();
       await expect(page.getByLabel("Branch or tag")).toContainText(bookmark);
@@ -4949,6 +4951,11 @@ export async function runE2E(
       assert.equal(new URL(page.url()).searchParams.get("source"), source.sourceId);
 
       await page.goto(`/tracker/${fixtures.tracker.owner}/timelines?tl=${slug}`);
+      // The switch is in the panel's Settings section, closed until opened.
+      await page
+        .getByRole("region", { name: "Selected timeline" })
+        .locator("summary", { hasText: /^Settings/ })
+        .click();
       const flag = page.getByRole("switch", { name: "Experimental" });
       await expect(flag).toHaveAttribute("aria-checked", "false");
       await flag.click();

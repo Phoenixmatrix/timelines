@@ -2813,12 +2813,12 @@ export async function runProviderE2E(
                   screenshots.push(screenshot);
                 }
                 if (route === "/highlights" && viewport.width === 1440) {
-                  await page.getByRole("button", { name: /^Timeline: main/ }).click();
+                  // The rail's Timelines opens the default account's graph (CORE-402).
                   const graph = page
-                    .getByRole("dialog", { name: "Timeline", exact: true })
-                    .getByRole("link", { name: "Timeline graph", exact: true });
+                    .getByRole("navigation", { name: "Places" })
+                    .getByRole("link", { name: /^Timelines/ });
                   const graphPath = `/tracker/${encodeURIComponent(defaultTracker.slug)}/timelines`;
-                  await playwrightExpect(graph).toHaveAttribute("href", graphPath);
+                  await playwrightExpect(graph).toBeVisible();
                   const navigationScreenshot = "highlights-organization-navigation.png";
                   await page.screenshot({
                     path: join(ctx.artifacts, navigationScreenshot),

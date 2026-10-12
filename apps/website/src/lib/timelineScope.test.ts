@@ -82,7 +82,17 @@ describe("the timeline scope", () => {
       expect(scopeOwner(`/settings/${page}`, "?owner=orbit")).toBe("orbit");
     expect(scopeOwner("/settings/preferences", "?owner=orbit&tracker=marco")).toBe("orbit");
     expect(scopeOwner("/settings/ai", "?tracker=orbit")).toBeNull();
-    for (const page of ["/", "/highlights", "/needs-you", "/packages", "/settings/tokens", "/new"])
+    for (const page of [
+      "/",
+      "/highlights",
+      "/needs-you",
+      "/packages",
+      "/settings/tokens",
+      "/new",
+      "/timelines",
+      "/release-notes",
+      "/-/go/CORE-1",
+    ])
       expect(scopeOwner(page)).toBeNull();
   });
 

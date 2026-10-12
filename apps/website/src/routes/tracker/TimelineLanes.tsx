@@ -6,15 +6,28 @@ import type { ReactNode } from "react";
 import type { Timeline, TimelineEvent, TimelineStatus } from "../../../shared/timelines.ts";
 import { STATUS_LABEL, type Lane, type Row, type TimelineGraph } from "./timelineGraph.ts";
 
-export const ROW_HEIGHT = 48;
-const LANE_WIDTH = 16;
-const PAD = 12;
+/** A row's first line: where its node sits; an expanded row grows below it. */
+export const ROW_HEIGHT = 56;
+const PAD = 14;
 
-export function graphWidth(graph: Pick<TimelineGraph, "min" | "max">): number {
-  return PAD * 2 + (graph.max - graph.min) * LANE_WIDTH;
+/** Room per lane: generous for the two or three a graph usually draws (CORE-402). */
+export function laneWidth(graph: Pick<TimelineGraph, "min" | "max">): number {
+  const lanes = graph.max - graph.min + 1;
+  return lanes <= 4 ? 36 : lanes <= 8 ? 24 : 16;
 }
 
-const xOf = (column: number, min: number) => PAD + (column - min) * LANE_WIDTH;
+export function graphWidth(graph: Pick<TimelineGraph, "min" | "max">): number {
+  return PAD * 2 + (graph.max - graph.min) * laneWidth(graph);
+}
+
+/**
+ * Where each row starts, measured (an expanded row is taller than the rest),
+ * and the bottom of the last; without it, every row is ROW_HEIGHT.
+ */
+export interface RowGeometry {
+  tops: number[];
+  total: number;
+}
 
 /** The repository an event happened in, from the timelines that name it. */
 export function eventRepo(
@@ -109,14 +122,32 @@ export function LaneDrawing({
   graph,
   selected,
   hovered,
+  geometry,
 }: {
   graph: TimelineGraph;
   selected: string | null;
   hovered: string | null;
+  geometry?: RowGeometry | null;
 }) {
   const width = graphWidth(graph);
-  const height = graph.rows.length * ROW_HEIGHT;
-  const x = (column: number) => xOf(column, graph.min);
+  const pitch = laneWidth(graph);
+  const x = (column: number) => PAD + (column - graph.min) * pitch;
+  const measured = geometry && geometry.tops.length === graph.rows.length ? geometry : null;
+  const height = measured ? measured.total : graph.rows.length * ROW_HEIGHT;
+  // A row's top edge; past the last row, the bottom.
+  const edge = (row: number) =>
+    measured
+      ? row < measured.tops.length
+        ? measured.tops[row]!
+        : measured.total
+      : row * ROW_HEIGHT;
+  // A position in rows (0.5 is the first row's node) in pixels: whole rows are
+  // edges, the fraction is within a row's first line, so lanes run unbroken
+  // through an expanded row.
+  const y = (rows: number) => {
+    const row = Math.floor(rows);
+    return edge(row) + (rows - row) * ROW_HEIGHT;
+  };
   const strokes = new Map(graph.lanes.map((l) => [l.id, laneStroke(l, selected, hovered)]));
   // Selected and hovered lanes draw last, above the others.
   const lanes = [...graph.lanes].sort(
@@ -140,8 +171,8 @@ export function LaneDrawing({
             data-lane={lane.timeline?.slug ?? "main"}
             x1={x(lane.column)}
             x2={x(lane.column)}
-            y1={lane.top * ROW_HEIGHT}
-            y2={lane.bottom * ROW_HEIGHT}
+            y1={y(lane.top)}
+            y2={y(lane.bottom)}
             stroke={stroke.color}
             strokeWidth={stroke.width}
             strokeDasharray={lane.dashed ? "5 4" : undefined}
@@ -152,9 +183,9 @@ export function LaneDrawing({
       {graph.rows.map((row, r) => {
         if (row.link === null) return null;
         const x1 = x(row.node);
-        const y1 = (r + 0.5) * ROW_HEIGHT;
+        const y1 = y(r + 0.5);
         const x2 = x(row.link);
-        const y2 = (r + 1) * ROW_HEIGHT;
+        const y2 = edge(r + 1);
         // The connector takes the style of the timeline the row is about.
         const lane = row.timeline ? graph.lanes.find((l) => l.id === row.timeline!.id) : undefined;
         const stroke = lane ? strokes.get(lane.id)! : strokes.get("main")!;
@@ -171,7 +202,7 @@ export function LaneDrawing({
       })}
       {graph.rows.map((row, r) => (
         <g key={`node:${row.key}`} data-kind={row.kind}>
-          <Node row={row} x={x(row.node)} y={(r + 0.5) * ROW_HEIGHT} />
+          <Node row={row} x={x(row.node)} y={y(r + 0.5)} />
         </g>
       ))}
     </svg>
