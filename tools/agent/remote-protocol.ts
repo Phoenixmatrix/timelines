@@ -52,3 +52,25 @@ export interface ProcessLogs {
   done: boolean;
   exitCode?: number;
 }
+
+export interface OwnershipQuota {
+  authority: string;
+  state: string;
+}
+/**
+ * The ownership Durable Object's merge of a written quota onto the stored one
+ * (CORE-368). State only moves forward (pending, reserved, released), and a
+ * write never drops or re-pins a stored reservation: `conflict` means the write
+ * named a different authority, which the caller must refuse, keeping `quota`.
+ * Pure, so it is shared with tests; the Worker cannot import client modules.
+ */
+export function mergeOwnershipQuota(
+  stored: OwnershipQuota | undefined,
+  written: OwnershipQuota | undefined,
+): { quota?: OwnershipQuota; conflict: boolean } {
+  if (!stored) return { ...(written ? { quota: written } : {}), conflict: false };
+  if (!written) return { quota: stored, conflict: false };
+  if (stored.authority !== written.authority) return { quota: stored, conflict: true };
+  const rank = (state: string) => ["pending", "reserved", "released"].indexOf(state);
+  return { quota: rank(stored.state) > rank(written.state) ? stored : written, conflict: false };
+}

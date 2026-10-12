@@ -26,6 +26,7 @@ import {
 import type { Environment } from "./environment.ts";
 import type { HarnessContext } from "./types.ts";
 import { installMaintenance, maintenanceStatus, uninstallMaintenance } from "./maintenance.ts";
+import { parseReservationArgs, reconcileReservations } from "./reservations.ts";
 import { pruneBrowsers } from "./browsers.ts";
 import { seed } from "./seed.ts";
 import { runE2E } from "./e2e.ts";
@@ -77,6 +78,12 @@ const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
   vp run agent destroy            Delete owned remote resources and local credentials/state
   vp run agent cleanup --expired  Sweep all expired owned environments, including removed worktrees
   vp run agent maintenance install|status|uninstall
+  vp run agent maintenance reservations [--release [--expired]]
+                                  List your installation reservations against this machine's journals
+                                  (live, released-locally, own-orphan, expired-foreign, foreign); --release
+                                  frees only released-locally and own-orphan rows, as the hourly sweep does.
+                                  --expired also frees expired-foreign rows: no journal here and more
+                                  than a day past their expiry. Never in sweeps; live rows are never freed
   vp run agent prune-browsers [--dry-run] [--include-other-installs]
                                   Delete Playwright browser revisions no worktree or other live install uses
 24-hour hard lifetime; default limits: four installation-wide and four local per OS user/machine.
@@ -687,7 +694,13 @@ try {
     if (args[0] === "install") await installMaintenance();
     else if (args[0] === "uninstall") await uninstallMaintenance();
     else if (args[0] === "status") console.log(await maintenanceStatus());
-    else throw new Error("Use maintenance install|status|uninstall.");
+    else if (args[0] === "reservations") {
+      const { release, expired } = parseReservationArgs(args.slice(1));
+      console.log(JSON.stringify(await reconcileReservations(release, { expired }), null, 2));
+    } else
+      throw new Error(
+        "Use maintenance install|status|uninstall|reservations [--release [--expired]].",
+      );
   } else if (operation === "prune-browsers") {
     const flags = new Set(args);
     for (const flag of flags)

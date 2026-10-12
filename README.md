@@ -293,7 +293,13 @@ machine's legacy inventory.
 
 Failed provisioning, interrupted cleanup and expired reservations conservatively
 retain installation capacity until cleanup succeeds and the authority acknowledges
-release. A stopped application whose only remaining resource is an Artifacts
+release. A release acknowledgement reports whether it `removed` a row; when it
+removed nothing, the client confirms the row is no longer listed before recording
+the release. A journal's reservation only moves forward (pending, reserved,
+released): no stale copy, ownership record or later command re-reserves a released
+slot. Each reservation records the reserving machine's host id (hosted children
+record none), which `maintenance reservations` uses to find reservations whose
+journals were deleted (see [cleanup and cost bounds](#cleanup-and-cost-bounds)). A stopped application whose only remaining resource is an Artifacts
 namespace that refuses deletion while listing no repositories is retired as
 **orphaned**: it releases its development slot but retains its ownership journal
 and cleanup retries. Other cleanup failures still hold capacity. An offline host
@@ -901,6 +907,7 @@ vp run agent reset [--ai]        # destroy owned data/resources, then fresh setu
 vp run agent destroy             # delete this worktree's interactive environment
 vp run agent cleanup --expired   # sweep expired environments across worktrees
 vp run agent maintenance status
+vp run agent maintenance reservations [--release [--expired]]  # reconcile installation reservations
 ```
 
 - Every environment has a **24-hour maximum lifetime**, with no silent renewal.
@@ -939,6 +946,38 @@ vp run agent maintenance status
   resource accumulation, **not a hard currency budget or provider-side TTL**.
 - `maintenance uninstall` refuses while owned live environments remain. Do not
   remove the central journal to silence cleanup failures.
+- `maintenance reservations` lists your installation reservations at the configured
+  authority as JSON and classifies each against **every** journal on this machine
+  (local `environments/`, remote `gmr-` parents and the hosted `gma-` children
+  their `resources[]` record): `live` (a journal still holds it), `released-locally`
+  (its journal recorded the release, yet the row remains), `own-orphan` (reserved
+  by this machine, with no journal left), `expired-foreign` (a `foreign` row more
+  than a day past its expiry) or `foreign` (another machine's, or a row
+  without a host: legacy rows and hosted children). `--release` frees only
+  `released-locally` and `own-orphan` rows. The hourly local and remote sweeps run
+  the same release, best effort, before taking the registry lock. A deleted local
+  journal is pruned only once that listing shows its reservation gone from the
+  authority the journal pinned: a journal pinned to another authority than the
+  one configured now is kept, as is every journal when the listing fails.
+- Each machine's host id is `~/.local/state/gitmatrix-agent/host.json`, stored
+  with a digest of the Linux machine id (`/etc/machine-id`, else
+  `/var/lib/dbus/machine-id`) and the uid that minted it. A home directory copied
+  to another machine (VM or WSL clone, restored backup, dotfile sync) mints a new
+  id there rather than sharing one, so neither machine can mistake the other's
+  live rows for its own orphans. A machine without a machine id records no host.
+  Replacing or deleting `host.json` turns that machine's existing rows `foreign`,
+  never `own-orphan`. An unreadable `host.json` fails with its path; an empty one
+  is replaced.
+- `maintenance reservations --release --expired` is the explicit, opt-in path for
+  host-less rows leaked before reservations recorded a host: it also frees your
+  `expired-foreign` rows. A row's expiry already marks the end of its
+  environment's 24-hour lifetime; the grace is one more day past that, for its
+  owning machine's hourly janitor to clean it up. The sweeps never use it, and no
+  row any journal on this machine still holds is released, however long ago it
+  expired. It cannot see another machine's journals: run it only once those
+  machines have finished cleanup (or are gone), since their resources may outlive
+  the slot it frees. A `foreign` row within the grace is released only from its
+  owning machine.
 
 `.worktreeinclude` copies no credentials or mutable state by default; `gm worktree
 add` always copies the checkout's agent (`.gitmatrix/agent.local.yml`, a name and

@@ -63,6 +63,7 @@ function runtime(env: Environment): Record<string, string> {
 }
 
 // Unit transport fixture only; integration checks use the real gm and quota API.
+// quota.json holds the authority's rows; GET lists them as the API does.
 async function quotaFixture(home: string, maximum = 4): Promise<void> {
   const directory = join(home, ".local/state/gitmatrix-agent");
   await mkdir(directory, { recursive: true });
@@ -90,6 +91,10 @@ if (fs.existsSync(failurePath)) {
 let acknowledgement;
 if (args[3] === 'POST') {
   const body = JSON.parse(args[args.indexOf('--data') + 1]);
+  // An authority older than CORE-368 rejects unknown fields.
+  if (fs.existsSync(${JSON.stringify(join(home, "quota-legacy"))}) && Object.hasOwn(body, 'host')) {
+    console.error(JSON.stringify({ error: { code: 'server_error', message: 'HTTP 400: Provide an owned environment id, Cloudflare account, local/remote backend and expiry (maximum 24 hours).' } })); process.exit(1);
+  }
   if (!rows[body.id] && Object.keys(rows).length >= ${maximum}) {
     console.error(JSON.stringify({ error: { code: 'conflict', message: 'Installation environment limit reached (' + Object.keys(rows).length + '/${maximum}). Destroy unused environments on their owning machines, or ask a site administrator to change gm settings environments set --site --max. Expired reservations still require cleanup.' } })); process.exit(1);
   }
@@ -97,8 +102,13 @@ if (args[3] === 'POST') {
   acknowledgement = { reserved: true, id: body.id };
 } else if (args[3] === 'DELETE') {
   const id = args[4].split('/').at(-1);
-  delete rows[id];
-  acknowledgement = { released: true, id };
+  const removed = Object.hasOwn(rows, id);
+  // A stuck authority acknowledges without removing anything.
+  if (!fs.existsSync(${JSON.stringify(join(home, "quota-stuck"))})) delete rows[id];
+  acknowledgement = { released: true, id, removed };
+} else if (args[3] === 'GET' && args[4] === '/environments') {
+  acknowledgement = { maximum: ${maximum}, used: Object.keys(rows).length,
+    reservations: Object.values(rows).map(({ id, backend, expires, host }) => ({ id, backend, expires, host: host ?? null })) };
 } else throw new Error('unexpected quota method');
 fs.writeFileSync(path, JSON.stringify(rows));
 const overridePath = ${JSON.stringify(join(home, "quota-response.json"))};
@@ -1278,6 +1288,421 @@ console.log(args[0] === 'auth'
       "released",
       "matching released:true acknowledgement completes cleanup",
     );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+async function quotaHome(prefix: string) {
+  const home = await mkdtemp(join(tmpdir(), prefix));
+  await quotaFixture(home);
+  await writeFile(
+    join(home, "bin/cf"),
+    `#!${process.execPath}
+const args = process.argv.slice(2);
+console.log(args[0] === 'auth'
+  ? JSON.stringify({ authenticated: true, tokenValid: true, accounts: [{ id: '${"a".repeat(32)}' }] })
+  : args.includes('list') ? '[]' : '{}');
+`,
+    { mode: 0o700 },
+  );
+  const environment = fileURLToPath(new URL("./environment.ts", import.meta.url));
+  const reservations = fileURLToPath(new URL("./reservations.ts", import.meta.url));
+  const quota = fileURLToPath(new URL("./quota.ts", import.meta.url));
+  // A fixture machine id: the runner may have none (containers often don't).
+  await writeFile(join(home, "machine-id"), "fixture-machine\n");
+  const env = {
+    ...unitTestEnvironment(process.env),
+    HOME: home,
+    PATH: `${join(home, "bin")}:${process.env.PATH}`,
+    GITMATRIX_AGENT_MACHINE_ID_FILE: join(home, "machine-id"),
+  };
+  const run = (code: string) =>
+    command(process.execPath, ["--input-type=module", "-e", code], { env });
+  /** This fixture machine's reservation host id, minted on first use. */
+  const host = async () =>
+    (
+      await run(`import {hostId} from ${JSON.stringify(quota)}; console.log(await hostId() ?? '');`)
+    ).trim();
+  const rows = async () =>
+    JSON.parse(await readFile(join(home, "quota.json"), "utf8")) as Record<
+      string,
+      { host?: string }
+    >;
+  return { home, env, environment, reservations, quota, run, rows, host };
+}
+
+await test("a release is recorded only once the authority no longer lists it (CORE-368)", async () => {
+  const { home, environment, run, rows } = await quotaHome("gitmatrix-quota-removed-");
+  try {
+    const root = join(home, "worktree");
+    await mkdir(root);
+    await run(
+      `import {createEnvironment} from ${JSON.stringify(environment)}; await createEnvironment(${JSON.stringify(root)});`,
+    );
+    const journalPath = join(root, ".gitmatrix-agent/environment.json");
+    const env = JSON.parse(await readFile(journalPath, "utf8")) as Environment;
+    const host = JSON.parse(
+      await readFile(join(home, ".local/state/gitmatrix-agent/host.json"), "utf8"),
+    ) as { id: string };
+    assert.match(host.id, /^[a-f0-9]{32}$/);
+    assert.equal((await rows())[env.id]?.host, host.id, "every reservation names its host");
+    const destroy = `import {destroyEnvironment, registryLock} from ${JSON.stringify(environment)}; import {readFile} from 'node:fs/promises'; const env = JSON.parse(await readFile(${JSON.stringify(journalPath)}, 'utf8')); await registryLock(() => destroyEnvironment(env));`;
+    // Acknowledged, removed nothing, and the row is still there: not released.
+    await writeFile(join(home, "quota-stuck"), "");
+    await writeFile(
+      join(home, "quota-response.json"),
+      JSON.stringify({ DELETE: '{"id":"$ID","released":true,"removed":false}' }),
+    );
+    await assert.rejects(run(destroy), /still lists it/);
+    let journal = JSON.parse(await readFile(journalPath, "utf8")) as Environment;
+    assert.equal(journal.status, "deleting");
+    assert.equal(journal.quota?.state, "reserved");
+    assert.ok((await rows())[env.id], "the reservation is retained for retry");
+    // Removed nothing because the row is already gone: verified absent, so released.
+    await rm(join(home, "quota-stuck"));
+    await run(destroy);
+    journal = JSON.parse(await readFile(journalPath, "utf8")) as Environment;
+    assert.equal(journal.status, "deleted");
+    assert.equal(journal.quota?.state, "released");
+    assert.deepEqual(await rows(), {});
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("a stale copy never re-reserves or un-releases a released reservation (CORE-368)", async () => {
+  const { home, environment, run, rows } = await quotaHome("gitmatrix-quota-forward-");
+  try {
+    const root = join(home, "worktree");
+    await mkdir(root);
+    await run(
+      `import {createEnvironment} from ${JSON.stringify(environment)}; await createEnvironment(${JSON.stringify(root)});`,
+    );
+    const stale = JSON.parse(
+      await readFile(join(root, ".gitmatrix-agent/environment.json"), "utf8"),
+    ) as Environment;
+    assert.equal(stale.quota?.state, "reserved");
+    const central = join(home, ".local/state/gitmatrix-agent/environments", `${stale.id}.json`);
+    // An inconsistent journal: still ready, but its release was acknowledged.
+    await writeFile(
+      central,
+      JSON.stringify({ ...stale, quota: { ...stale.quota, state: "released" } }),
+    );
+    await writeFile(join(home, "quota.json"), "{}");
+    const withStale = (body: string) =>
+      run(
+        `import {context, markServer} from ${JSON.stringify(environment)}; const env = ${JSON.stringify(stale)}; ${body}`,
+      );
+    await assert.rejects(withStale("await context(env);"), /already released/);
+    assert.deepEqual(await rows(), {}, "context must not POST a released reservation");
+    // Any other journal write merges forward: the stale reserved copy loses.
+    await withStale(
+      "await markServer(env, process.pid); if (env.quota.state !== 'released') throw new Error('in-memory quota regressed');",
+    );
+    const merged = JSON.parse(await readFile(central, "utf8")) as Environment;
+    assert.equal(merged.quota?.state, "released");
+    assert.equal(merged.server?.pid !== undefined, true);
+    // Without a central journal, an in-memory release alone still refuses.
+    await rm(central);
+    await assert.rejects(
+      run(
+        `import {context} from ${JSON.stringify(environment)}; await context(${JSON.stringify({ ...stale, quota: { ...stale.quota, state: "released" } })});`,
+      ),
+      /already released/,
+    );
+    assert.deepEqual(await rows(), {});
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("the sweep releases only released-locally and own-orphan reservations (CORE-368)", async () => {
+  const {
+    home,
+    environment,
+    reservations,
+    run,
+    rows,
+    host: hostOf,
+  } = await quotaHome("gitmatrix-reconcile-");
+  try {
+    const state = join(home, ".local/state/gitmatrix-agent");
+    const local = join(state, "environments");
+    const remote = join(state, "remote/environments");
+    await mkdir(local, { recursive: true });
+    await mkdir(remote, { recursive: true, mode: 0o700 });
+    const host = await hostOf();
+    assert.match(host, /^[a-f0-9]{32}$/);
+    const quota = (state: "reserved" | "released") => ({
+      authority: "https://quota.example",
+      state,
+    });
+    const journal = async (id: string, edit: (env: Environment) => void) => {
+      const env = owned(join(home, id));
+      env.id = id;
+      env.dir = join(env.root, ".gitmatrix-agent");
+      edit(env);
+      await writeFile(join(local, `${id}.json`), JSON.stringify(env));
+      return env;
+    };
+    const live = await journal("gma-mga00001-111111111111", (env) => {
+      env.quota = quota("reserved");
+    });
+    const released = await journal("gma-mga00002-222222222222", (env) => {
+      env.status = "deleted";
+      env.resources = { artifacts: "deleted", vectors: "deleted", search: "deleted" };
+      env.quota = quota("released");
+    });
+    // Deleted long ago and due for pruning, but its row was never really freed.
+    const old = await journal("gma-mga00003-333333333333", (env) => {
+      env.status = "deleted";
+      env.resources = { artifacts: "deleted", vectors: "deleted", search: "deleted" };
+      env.created -= 10 * 86_400_000;
+      env.expires -= 10 * 86_400_000;
+      env.quota = quota("released");
+    });
+    const parent = "gmr-" + "4".repeat(24);
+    const child = "gma-mga00004-444444444444";
+    const releasedChild = "gma-mga00007-777777777777";
+    await writeFile(
+      join(remote, `${parent}.json`),
+      JSON.stringify({
+        id: parent,
+        quota: quota("reserved"),
+        resources: [
+          { id: child, account: "a".repeat(32), quota: quota("reserved"), resources: {} },
+          { id: releasedChild, account: "a".repeat(32), quota: quota("released"), resources: {} },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    const orphan = "gma-mga00005-555555555555";
+    const legacy = "gma-mga00006-666666666666";
+    const elsewhere = "gma-mga00008-888888888888";
+    // Expired long ago, host-less and unjournaled: only `--release --expired` frees it.
+    const stale = "gma-mga00009-999999999999";
+    // Deleted long ago: one pinned to another authority, one never admitted.
+    const moved = await journal("gma-mga0000a-aaaaaaaaaaaa", (env) => {
+      env.status = "deleted";
+      env.resources = { artifacts: "deleted", vectors: "deleted", search: "deleted" };
+      env.created -= 10 * 86_400_000;
+      env.expires -= 10 * 86_400_000;
+      env.quota = { authority: "https://other.example", state: "released" };
+    });
+    const unadmitted = await journal("gma-mga0000b-bbbbbbbbbbbb", (env) => {
+      env.status = "deleted";
+      env.resources = { artifacts: "deleted", vectors: "deleted", search: "deleted" };
+      env.created -= 10 * 86_400_000;
+      env.expires -= 10 * 86_400_000;
+    });
+    const row = (id: string, rowHost?: string, expires = Date.now()) => ({
+      id,
+      account: "a".repeat(32),
+      backend: "local",
+      expires,
+      ...(rowHost ? { host: rowHost } : {}),
+    });
+    const initial = {
+      [live.id]: row(live.id, host),
+      [released.id]: row(released.id, host),
+      [old.id]: row(old.id),
+      [parent]: row(parent, host),
+      // Even tagged with this host, a child its parent still holds is live.
+      [child]: row(child, host),
+      [releasedChild]: row(releasedChild),
+      [orphan]: row(orphan, host),
+      [legacy]: row(legacy),
+      [elsewhere]: row(elsewhere, "another-machine"),
+      [stale]: row(stale, undefined, Date.now() - 3 * 86_400_000),
+    };
+    await writeFile(join(home, "quota.json"), JSON.stringify(initial));
+    const report = JSON.parse(
+      await run(
+        `import {reconcileReservations} from ${JSON.stringify(reservations)}; console.log(JSON.stringify(await reconcileReservations(false)));`,
+      ),
+    ) as { host: string; reservations: { id: string; class: string }[]; released: unknown[] };
+    assert.equal(report.host, host);
+    assert.deepEqual(
+      Object.fromEntries(report.reservations.map(({ id, class: kind }) => [id, kind])),
+      {
+        [live.id]: "live",
+        [released.id]: "released-locally",
+        [old.id]: "released-locally",
+        [parent]: "live",
+        [child]: "live",
+        [releasedChild]: "released-locally",
+        [orphan]: "own-orphan",
+        [legacy]: "foreign",
+        [elsewhere]: "foreign",
+        [stale]: "expired-foreign",
+      },
+    );
+    assert.deepEqual(report.released, [], "listing alone releases nothing");
+    assert.deepEqual(Object.keys(await rows()).sort(), Object.keys(initial).sort());
+    // An unreadable listing is not an empty one: release and prune nothing.
+    await writeFile(join(home, "quota-response.json"), JSON.stringify({ GET: "<html>" }));
+    const sweep = `import {cleanupExpired} from ${JSON.stringify(environment)}; await cleanupExpired();`;
+    await run(sweep);
+    assert.deepEqual(Object.keys(await rows()).sort(), Object.keys(initial).sort());
+    await readFile(join(local, `${old.id}.json`));
+    await rm(join(home, "quota-response.json"));
+    await run(sweep);
+    assert.deepEqual(
+      Object.keys(await rows()).sort(),
+      [live.id, child, legacy, elsewhere, parent, stale].sort(),
+      "the sweep never releases expired-foreign rows",
+    );
+    await assert.rejects(readFile(join(local, `${old.id}.json`)), { code: "ENOENT" });
+    await assert.rejects(readFile(join(local, `${unadmitted.id}.json`)), { code: "ENOENT" });
+    // Its authority was not listed, so nothing proves that reservation is gone.
+    await readFile(join(local, `${moved.id}.json`));
+    const kept = JSON.parse(
+      await readFile(join(local, `${released.id}.json`), "utf8"),
+    ) as Environment;
+    assert.equal(kept.quota?.state, "released");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("an authority without host support still admits, recording no host (CORE-368)", async () => {
+  const { home, environment, run, rows } = await quotaHome("gitmatrix-quota-legacy-");
+  try {
+    await writeFile(join(home, "quota-legacy"), "");
+    const root = join(home, "worktree");
+    await mkdir(root);
+    await run(
+      `import {createEnvironment} from ${JSON.stringify(environment)}; await createEnvironment(${JSON.stringify(root)});`,
+    );
+    const env = JSON.parse(
+      await readFile(join(root, ".gitmatrix-agent/environment.json"), "utf8"),
+    ) as Environment;
+    assert.equal(env.quota?.state, "reserved");
+    assert.equal(Object.hasOwn((await rows())[env.id]!, "host"), false);
+    // Other refusals are never retried as a different request.
+    await writeFile(
+      join(home, "quota-error.json"),
+      JSON.stringify({ error: { code: "server_error", message: "HTTP 500: unavailable" } }),
+    );
+    const other = join(home, "other");
+    await mkdir(other);
+    await assert.rejects(
+      run(
+        `import {createEnvironment} from ${JSON.stringify(environment)}; await createEnvironment(${JSON.stringify(other)});`,
+      ),
+      /refused POST/,
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("maintenance reservations --release --expired frees only expired unjournaled rows (CORE-368)", async () => {
+  const { home, env, rows } = await quotaHome("gitmatrix-reservations-expired-");
+  try {
+    const state = join(home, ".local/state/gitmatrix-agent");
+    await mkdir(join(state, "environments"), { recursive: true });
+    const live = owned(join(home, "live"));
+    live.quota = { authority: "https://quota.example", state: "reserved" };
+    await writeFile(join(state, "environments", `${live.id}.json`), JSON.stringify(live));
+    const longAgo = Date.now() - 3 * 86_400_000;
+    const legacy = "gma-mga00009-999999999999";
+    const recent = "gma-mga00008-888888888888";
+    const row = (id: string, expires: number) => ({
+      id,
+      account: "a".repeat(32),
+      backend: "local",
+      expires,
+    });
+    // The live row expired long ago too: its journal, not its clock, decides.
+    await writeFile(
+      join(home, "quota.json"),
+      JSON.stringify({
+        [live.id]: row(live.id, longAgo),
+        [legacy]: row(legacy, longAgo),
+        [recent]: row(recent, Date.now() - 3_600_000),
+      }),
+    );
+    const main = fileURLToPath(new URL("./main.ts", import.meta.url));
+    const maintenance = async (...flags: string[]) =>
+      JSON.parse(
+        await command(process.execPath, [main, "maintenance", "reservations", ...flags], { env }),
+      ) as { reservations: { id: string; class: string }[]; released: { id: string }[] };
+    const listing = await maintenance();
+    assert.deepEqual(
+      Object.fromEntries(listing.reservations.map(({ id, class: kind }) => [id, kind])),
+      { [live.id]: "live", [legacy]: "expired-foreign", [recent]: "foreign" },
+    );
+    assert.deepEqual((await maintenance("--release")).released, []);
+    assert.equal(Object.keys(await rows()).length, 3, "--release alone keeps expired-foreign rows");
+    assert.deepEqual(
+      (await maintenance("--release", "--expired")).released.map(({ id }) => id),
+      [legacy],
+    );
+    assert.deepEqual(Object.keys(await rows()).sort(), [live.id, recent].sort());
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("the reservation host id belongs to one machine and is published atomically (CORE-368)", async () => {
+  const { home, env, quota, host } = await quotaHome("gitmatrix-host-id-");
+  try {
+    const path = join(home, ".local/state/gitmatrix-agent/host.json");
+    const stored = async () => JSON.parse(await readFile(path, "utf8")) as Record<string, string>;
+    // Concurrent first use: every process ends up with the one published id.
+    const ids = await Promise.all(Array.from({ length: 8 }, () => host()));
+    assert.equal(new Set(ids).size, 1);
+    const [id] = ids;
+    assert.match(id!, /^[a-f0-9]{32}$/);
+    assert.equal((await stored()).id, id);
+    assert.match((await stored()).machine!, /^[a-f0-9]{64}$/);
+    assert.ok(!JSON.stringify(await stored()).includes("fixture-machine"), "only a digest is kept");
+    assert.equal(await host(), id, "stable across calls");
+    const { readdir } = await import("node:fs/promises");
+    assert.deepEqual(
+      (await readdir(join(home, ".local/state/gitmatrix-agent"))).filter((name) =>
+        name.startsWith("host.json"),
+      ),
+      ["host.json"],
+      "no temporary files are left behind",
+    );
+    // A home copied from another machine never reuses that machine's id.
+    await writeFile(path, JSON.stringify({ id: "copied-id", machine: "f".repeat(64) }));
+    const fresh = await host();
+    assert.notEqual(fresh, "copied-id");
+    assert.match(fresh, /^[a-f0-9]{32}$/);
+    assert.equal((await stored()).id, fresh);
+    // Nor does one minted before fingerprints existed.
+    await writeFile(path, JSON.stringify({ id: fresh }));
+    assert.notEqual(await host(), fresh);
+    // Concurrent replacement of a foreign file still converges on one id.
+    await writeFile(path, JSON.stringify({ id: "copied-id", machine: "f".repeat(64) }));
+    await Promise.all(Array.from({ length: 6 }, () => host()));
+    const settled = (await stored()).id;
+    assert.notEqual(settled, "copied-id");
+    assert.equal(await host(), settled);
+    // A provably empty file is absent; a garbled one is an error naming it.
+    await writeFile(path, "");
+    assert.match(await host(), /^[a-f0-9]{32}$/);
+    await writeFile(path, "{");
+    await assert.rejects(host(), (error: Error) => error.message.includes(path));
+    await writeFile(path, JSON.stringify({ id: "has space" }));
+    await assert.rejects(host(), /Unreadable reservation host id/);
+    // Without a machine id there is no host at all, and nothing is written.
+    await rm(path);
+    const none = await command(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import {hostId} from ${JSON.stringify(quota)}; console.log(JSON.stringify(await hostId() ?? null));`,
+      ],
+      { env: { ...env, GITMATRIX_AGENT_MACHINE_ID_FILE: join(home, "missing-machine-id") } },
+    );
+    assert.equal(none.trim(), "null");
+    await assert.rejects(readFile(path), { code: "ENOENT" });
   } finally {
     await rm(home, { recursive: true, force: true });
   }
