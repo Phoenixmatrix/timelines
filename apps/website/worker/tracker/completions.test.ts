@@ -266,25 +266,25 @@ describe("issue completion credit", () => {
     expect(credit.at > old.at).toBe(true);
   });
 
-  describe("abandoning a timeline that finished again what main had finished (CORE-375)", () => {
-    const leases = (t: ReturnType<typeof setup>) =>
-      (t.db.prepare(`SELECT count(*) AS n FROM leases WHERE issue_id = 'a'`).get() as { n: number })
-        .n;
-    /** Ann finishes `a` on main (or cancels it); the agent finishes it again in `fix`. */
-    const refinished = (t: ReturnType<typeof setup>, mainStatus = "done") => {
-      t.status(t.ann, "a", mainStatus);
-      const old = t.issue("a").completion ?? null;
-      const fix = t.fork("fix");
-      later(1);
-      t.status(t.ann, "a", "todo", "fix");
-      t.finish(t.agent, "a", "fix");
-      expect(t.issue("a", "fix")).toMatchObject({
-        status: "done",
-        completion: { actorId: "agt-bot" },
-      });
-      return { old, fix };
-    };
+  const leases = (t: ReturnType<typeof setup>) =>
+    (t.db.prepare(`SELECT count(*) AS n FROM leases WHERE issue_id = 'a'`).get() as { n: number })
+      .n;
+  /** Ann finishes `a` on main (or cancels it); the agent finishes it again in `fix`. */
+  const refinished = (t: ReturnType<typeof setup>, mainStatus = "done") => {
+    t.status(t.ann, "a", mainStatus);
+    const old = t.issue("a").completion ?? null;
+    const fix = t.fork("fix");
+    later(1);
+    t.status(t.ann, "a", "todo", "fix");
+    t.finish(t.agent, "a", "fix");
+    expect(t.issue("a", "fix")).toMatchObject({
+      status: "done",
+      completion: { actorId: "agt-bot" },
+    });
+    return { old, fix };
+  };
 
+  describe("abandoning a timeline that finished again what main had finished (CORE-375)", () => {
     test.each(["done", "canceled"])("main keeps its %s status and credit", (mainStatus) => {
       const t = setup();
       const { old, fix } = refinished(t, mainStatus);
@@ -364,12 +364,13 @@ describe("issue completion credit", () => {
     test("reopened and claimed on main since: the live claim is main's", () => {
       const t = setup();
       refinished(t);
-      // Main reopens it (dropping the lease fix kept) and the agent takes it on.
+      // Main reopens it (dropping the lease fix kept, and since CORE-376 its
+      // doneIn) and the agent takes it on.
       t.status(t.ann, "a", "todo");
       t.mutate(t.agent, undefined, { kind: "issue.claim", id: "a", data: { agent: "desk" } });
       expect(t.issue("a")).toMatchObject({
         status: "in_progress",
-        doneIn: { slug: "fix" },
+        doneIn: null,
         claim: { actorId: "agt-bot", agent: "desk" },
       });
       expect(t.issue("a").claim?.retainedIn).toBeUndefined();
@@ -398,6 +399,96 @@ describe("issue completion credit", () => {
       value(t.tracker.abandonTimeline(t.ann, "fix", {}));
       expect(t.issue("a")).toMatchObject({ status: "done", doneIn: null, claim });
       expect(leases(t)).toBe(1);
+    });
+  });
+
+  describe("landing a timeline that finished again what main has moved since (CORE-376)", () => {
+    const land = (t: ReturnType<typeof setup>, id: string) => {
+      t.store.landTimeline(t.ann, "fix");
+      t.end(id);
+    };
+    /** After fix finishes `a` again, Ann reopens it on main and the agent claims it there. */
+    const reclaimed = (t: ReturnType<typeof setup>) => {
+      const { fix } = refinished(t);
+      t.status(t.ann, "a", "todo");
+      const { leaseToken } = t.mutate(t.agent, undefined, {
+        kind: "issue.claim",
+        id: "a",
+        data: { agent: "desk" },
+      }).results[0]!;
+      // Main's own move ends the timeline's finish on main.
+      expect(t.issue("a")).toMatchObject({ status: "in_progress", doneIn: null });
+      return { fix, leaseToken: leaseToken! };
+    };
+
+    test("main's reopen and live claim stand; the timeline's other edits land", () => {
+      const t = setup();
+      const { fix, leaseToken } = reclaimed(t);
+      t.mutate(t.ann, "fix", {
+        kind: "issue.update",
+        id: "a",
+        expectedVersion: t.issue("a", "fix").version,
+        data: { title: "A, fixed" },
+      });
+      const claim = t.issue("a").claim;
+      land(t, fix.id);
+      expect(t.issue("a")).toMatchObject({
+        status: "in_progress",
+        title: "A, fixed",
+        doneIn: null,
+        claim,
+      });
+      expect(t.issue("a").completion ?? null).toBeNull();
+      expect(leases(t)).toBe(1);
+      // Landing again changes nothing.
+      const version = t.issue("a").version;
+      t.store.landTimeline(t.ann, "fix");
+      expect(t.issue("a").version).toBe(version);
+      // The holder finishes it on main, and is credited.
+      t.mutate(t.agent, undefined, { kind: "issue.complete", id: "a", data: { leaseToken } });
+      expect(t.issue("a")).toMatchObject({
+        status: "done",
+        completion: { actorId: "agt-bot", agent: "desk" },
+      });
+    });
+
+    test("a cancel on main since stands", () => {
+      const t = setup();
+      const { fix } = refinished(t);
+      t.status(t.ann, "a", "canceled");
+      expect(t.issue("a")).toMatchObject({ status: "canceled", doneIn: null });
+      land(t, fix.id);
+      expect(t.issue("a")).toMatchObject({
+        status: "canceled",
+        closeReason: "obsolete",
+        doneIn: null,
+      });
+      expect(t.issue("a").completion ?? null).toBeNull();
+    });
+
+    test("a row reopened on main before main's moves cleared doneIn keeps main's status", () => {
+      const t = setup();
+      const { fix } = reclaimed(t);
+      // As stored before CORE-376: open on main, still naming the timeline.
+      t.db
+        .prepare(`UPDATE issues SET data = json_set(data, '$.doneIn', json(?)) WHERE id = 'a'`)
+        .run(JSON.stringify({ id: fix.id, slug: "fix" }));
+      const claim = t.issue("a").claim;
+      land(t, fix.id);
+      expect(t.issue("a")).toMatchObject({ status: "in_progress", doneIn: null, claim });
+      expect(leases(t)).toBe(1);
+    });
+
+    test("main's cancel from before the timeline finished it gives way", () => {
+      const t = setup();
+      const { fix } = refinished(t, "canceled");
+      land(t, fix.id);
+      expect(t.issue("a")).toMatchObject({
+        status: "done",
+        completion: { actorId: "agt-bot" },
+        doneIn: null,
+        claim: null,
+      });
     });
   });
 

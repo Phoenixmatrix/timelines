@@ -1484,14 +1484,31 @@ export class TrackerStore {
       // A lease retained by what lands is released as done (CORE-75).
       const released = new Set<string>();
       // Who finished it stays credited (CORE-220); landing reopened work drops the credit.
-      const landed = (issue: Issue): Issue => {
-        const out = landing(issue);
+      const landed = (issue: Issue, main: Issue | null): Issue => {
+        const out = landing(issue, main);
         return out.completion && !isFinished(out.status) ? { ...out, completion: null } : out;
       };
-      const landing = (issue: Issue): Issue => {
+      /**
+       * Main moved the status itself after what lands finished the issue
+       * (CORE-376): main's status stands, with the claim someone may hold on
+       * it. Moving the status clears doneIn; a row still naming what lands
+       * while open was reopened before that rule. Main's cancel from before
+       * the timeline finished it gives way, as a done does.
+       */
+      const moved = (issue: Issue, main: Issue | null): main is Issue =>
+        !!main &&
+        issue.status === "done" &&
+        main.status !== "done" &&
+        main.status !== "done_in_timeline" &&
+        !(main.status === "canceled" && overlay.includes(main.doneIn ?? null));
+      const landing = (issue: Issue, main: Issue | null): Issue => {
         if (overlay.includes(issue.claim?.retainedIn ?? null)) {
           released.add(issue.id);
           issue = { ...issue, claim: null, handoff: null };
+        }
+        if (moved(issue, main)) {
+          const { status, closeReason, completion } = main;
+          return { ...issue, status, closeReason, completion, doneIn: null };
         }
         if (overlay.includes(issue.doneIn))
           return {
@@ -1512,12 +1529,13 @@ export class TrackerStore {
         if (!overlay.has("issue", row.id))
           changes.push(["issue", row.id, JSON.parse(row.data) as Issue]);
       for (const [type, entityId, viewed] of changes) {
-        let entity = type === "issue" && viewed ? landed(viewed as Issue) : viewed;
         const prior = first(
           this.sql,
           tracker.selectFrom(tables[type]).select("data").where("id", "=", entityId),
         );
         const before = prior ? (JSON.parse(prior.data) as Entity) : null;
+        let entity =
+          type === "issue" && viewed ? landed(viewed as Issue, before as Issue | null) : viewed;
         if (JSON.stringify(before) === JSON.stringify(entity)) continue;
         // An issue main already had changes under readers holding its version.
         if (type === "issue" && before && entity)
@@ -1857,8 +1875,14 @@ export class TrackerStore {
         if (type === "issue")
           credit(before as Issue | null, before as Issue | null, entity as Issue | null, kind);
         overlay.set(type, entityId, changed);
-      } else if (type === "issue")
+      } else if (type === "issue") {
         credit(before as Issue | null, before as Issue | null, changed as Issue | null, kind);
+        // Main moving the status itself supersedes the timeline's finish
+        // (CORE-376): only done_in_timeline, which is locked, is the timeline's.
+        const was = before as Issue | null;
+        const next = changed as Issue | null;
+        if (was?.doneIn && next?.doneIn && next.status !== was.status) next.doneIn = null;
+      }
       if (entity)
         run(
           this.sql,

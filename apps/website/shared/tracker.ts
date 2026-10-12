@@ -266,7 +266,8 @@ export interface Issue extends TrackerEntity {
   /**
    * The unlanded timeline it was finished in (CORE-74). Shared by every view,
    * like the lease: main's status is then `done_in_timeline`, and so is the
-   * status of any timeline whose view doesn't include that one.
+   * status of any timeline whose view doesn't include that one. Main moving
+   * the status itself clears it, and that status survives the landing (CORE-376).
    */
   doneIn?: DoneIn | null;
   /** Latest trusted queue failure; global across timeline views and never client-writable. */
