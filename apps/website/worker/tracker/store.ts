@@ -19,6 +19,9 @@ import {
   type AuditSource,
   type Comment,
   type HumanRequest,
+  type IssueStatus,
+  type RequestNote,
+  type RequestWork,
   type IssueClaim,
   type IssueCloseReason,
   type IssueTimelineUse,
@@ -99,6 +102,22 @@ import {
 } from "./views.ts";
 
 export type { SqlDatabase } from "./sql.ts";
+
+/** A request on Needs you, with what its work is doing (CORE-386). */
+export type OpenRequestItem = {
+  request: HumanRequest;
+  issue: Pick<Issue, "id" | "key" | "title">;
+  work: RequestWork;
+};
+
+/**
+ * How a closed request sorts in Needs you's history (CORE-387): when it closed
+ * (answered, withdrawn, or for one withdrawn before canceledAt, asked), then
+ * its id, so a page boundary never splits or repeats a moment.
+ */
+export function closedKey(request: HumanRequest): string {
+  return `${request.answeredAt ?? request.canceledAt ?? request.createdAt}|${request.id}`;
+}
 
 const closeReasons = Object.keys(CLOSE_REASONS) as IssueCloseReason[];
 const timelineUses = Object.keys(TIMELINE_USES) as IssueTimelineUse[];
@@ -778,6 +797,106 @@ export class TrackerStore {
         const issue = this.anyIssue(request.issueId);
         return { request, issue: { id: issue.id, key: issue.key, title: issue.title } };
       });
+  }
+  /**
+   * Requests for Needs you, each with its issue and what the work on it is
+   * doing (CORE-386): the active claim's holder and session, where the issue
+   * stands, and the newest checkpoint. Open ones: all of them. Closed ones
+   * (CORE-387): answered and withdrawn, newest first, strictly before `before`
+   * (a closedKey), at most `limit`, each with the first note on the issue after
+   * it closed. A request whose issue can't be found any more is left out.
+   */
+  neededRequests(
+    filter: { open: true } | { open: false; before: string | null; limit: number },
+  ): OpenRequestItem[] {
+    let requests = this.all<HumanRequest>("request").filter((request) =>
+      filter.open ? request.status === "open" : request.status !== "open",
+    );
+    if (!filter.open) {
+      const { before, limit } = filter;
+      requests = requests
+        .map((request) => ({ request, key: closedKey(request) }))
+        .filter(({ key }) => before === null || key < before)
+        .sort((a, b) => b.key.localeCompare(a.key))
+        .slice(0, limit)
+        .map(({ request }) => request);
+    }
+    const now = new Date(this.clock()).toISOString();
+    const work = new Map<string, ReturnType<typeof this.workOn>>();
+    return requests.flatMap((request) => {
+      let issue: Issue;
+      try {
+        issue = this.anyIssue(request.issueId);
+      } catch {
+        return [];
+      }
+      let seen = work.get(issue.id);
+      if (!seen) work.set(issue.id, (seen = this.workOn(issue)));
+      const context: RequestWork = {
+        status: seen.status,
+        holder:
+          issue.claim && hasActiveClaim(issue, now)
+            ? { actorId: issue.claim.actorId, agent: issue.claim.agent }
+            : null,
+        latest: seen.notes.findLast((note) => note.kind === "checkpoint") ?? null,
+      };
+      // Withdrawn before canceledAt: when it closed isn't known, so neither is what came next.
+      const closed = request.answeredAt ?? request.canceledAt;
+      if (request.status !== "open" && closed)
+        context.next = seen.notes.find((note) => note.createdAt > closed) ?? null;
+      return [
+        {
+          request,
+          issue: { id: issue.id, key: issue.key, title: issue.title },
+          work: context,
+        },
+      ];
+    });
+  }
+  /**
+   * An issue as its work sees it (CORE-386): its notes, oldest first, and its
+   * latest status, in whichever view each was made. Work in a timeline writes
+   * there, never to main's tables, so this reads the issue's own history (the
+   * audit index), plus main's comments for any whose events retention pruned.
+   */
+  private workOn(issue: Issue): { notes: RequestNote[]; status: IssueStatus } {
+    const notes = new Map<string, RequestNote>();
+    const note = ({ kind, body, actorId, createdAt }: Comment): RequestNote => ({
+      kind,
+      body,
+      actorId,
+      createdAt,
+    });
+    for (const row of all(
+      this.sql,
+      tracker.selectFrom("comments").select("data").where(json("data", "$.issueId"), "=", issue.id),
+    )) {
+      const comment = JSON.parse(row.data) as Comment;
+      notes.set(comment.id, note(comment));
+    }
+    let status = issue.status;
+    for (const row of all(
+      this.sql,
+      tracker
+        .selectFrom("issue_events as i")
+        .innerJoin("events as e", "e.cursor", "i.cursor")
+        .select("e.data")
+        .where("i.issue_id", "=", issue.id)
+        .orderBy("i.cursor"),
+    )) {
+      const event = JSON.parse(row.data) as TrackerEvent;
+      // In a timeline, the change as that timeline saw it.
+      const entity = event.view ? event.view.entity : event.entity;
+      if (event.entityType === "comment") {
+        if (entity) notes.set(event.entityId, note(entity as Comment));
+        else notes.delete(event.entityId);
+      } else if (event.entityType === "issue" && event.entityId === issue.id && entity)
+        status = (entity as Issue).status;
+    }
+    return {
+      notes: [...notes.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      status,
+    };
   }
   /**
    * Main's issues finished since `since` by agents `accountableId` answers for
@@ -2988,6 +3107,7 @@ export class TrackerStore {
             if (request.askedBy !== access.actorId && !access.canAdmin)
               fail("forbidden", "Only whoever asked can cancel a request.", 403);
             request.status = "canceled";
+            request.canceledAt = now;
             // Superseded by new commits: say why (the timeline settles its own status).
             if (this.withdrawing !== null) request.answer = this.withdrawing;
           } else {

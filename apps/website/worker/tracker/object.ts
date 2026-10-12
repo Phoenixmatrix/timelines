@@ -270,6 +270,10 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   openRequests() {
     return this.reply(() => this.store.openRequests());
   }
+  /** Requests for Needs you with their work's context (CORE-386, CORE-387). */
+  neededRequests(filter: { open: true } | { open: false; before: string | null; limit: number }) {
+    return this.reply(() => this.store.neededRequests(filter));
+  }
   /** Finished work credited to a person's agents (CORE-220). */
   completedWork(filter: { since: string; accountableId: string; actorIds: string[] | null }) {
     return this.reply(() => this.store.completedWork(filter));

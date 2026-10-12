@@ -1363,7 +1363,12 @@ read as `agent_decides`.
     for an hour for its holder to `issue.resume` with a fresh token. Only people
     answer, on Needs you (`/needs-you`, `GET /api/requests`), on the issue, or
     with `gm request`. Credentials go to the named repository secret; the tracker
-    records only where.
+    records only where. On Needs you each request says what the work behind it is
+    doing (CORE-386): who holds the issue and in which session, its status, and
+    its latest checkpoint. Its History (`/needs-you?view=history`,
+    `GET /api/requests/history?before=`) lists answered and withdrawn requests,
+    newest first, 25 at a time, each with the first note on the issue after it
+    closed (CORE-387); a withdrawal records `canceledAt`.
   - _Handoff:_ `issue.offer` returns a single-use code bound to the current
     lease token; `issue.accept` moves the lease (and its accountability) with a
     fresh token and fences the giver's at that moment.

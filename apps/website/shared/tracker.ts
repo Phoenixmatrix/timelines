@@ -20,6 +20,32 @@ export interface OpenRequest {
   issue: { id: string; key: string; title: string };
   /** For a checkpoint's approval: its commits, CI runs, previews and summary. */
   checkpoint?: CheckpointView;
+  /** What the work behind it is doing (CORE-386). */
+  work?: RequestWork;
+}
+/** A note on an issue, as Needs you quotes it: a comment, checkpoint or evidence. */
+export interface RequestNote {
+  kind: Comment["kind"];
+  body: string;
+  actorId: string;
+  createdAt: string;
+}
+/**
+ * Why a request was asked (CORE-386): the issue's status, who holds its claim
+ * and in which session, and the newest checkpoint, which says what the work is
+ * doing. A closed request (CORE-387) adds what was said on the issue after it.
+ */
+export interface RequestWork {
+  status: IssueStatus;
+  holder: { actorId: string; agent: string } | null;
+  latest: RequestNote | null;
+  /** For an answered or withdrawn request: the first note on the issue after it closed. */
+  next?: RequestNote | null;
+}
+/** Answered and withdrawn requests, newest first (CORE-387). */
+export interface RequestHistory extends OpenRequests {
+  /** Pass as `before` for older ones; null when there are none. */
+  next: string | null;
 }
 /** Counts behind the rail's Needs you badge (CORE-301): routed to you, and open to anyone. */
 export interface RequestSummary {
@@ -359,6 +385,8 @@ export interface HumanRequest {
   answer: string | null;
   answeredBy: string | null;
   answeredAt: string | null;
+  /** When it was withdrawn; absent on requests withdrawn before CORE-387. */
+  canceledAt?: string;
   createdAt: string;
   /** Opened by the tracker after repeated failed attempts; answering resets the count. */
   escalation?: boolean;
