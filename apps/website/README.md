@@ -3946,6 +3946,140 @@ cannot invoke it. After an uncertain response, inspect the remote before
 retrying; if GitHub renamed it but local configuration changed concurrently,
 confirm its ID and use the existing mirror update endpoint to repair the URL.
 
+## Observability
+
+Gitmatrix reads a hosted repository's runtime evidence from the provider it
+runs on, live, and shows it next to the commits, deployments, packages,
+releases and issues it belongs to (CORE-122; decisions on CORE-348).
+`shared/observability.ts` defines the provider-neutral contract (CORE-349):
+the Cloudflare reader (CORE-352) returns it, and History and the entity views
+(CORE-353..356) consume it without any Cloudflare SQL or payload type.
+
+- **Connections.** Each one is a customer-supplied, restricted, read-only
+  credential (Cloudflare only) with explicit repository → service/environment
+  bindings. There is no instance-operated or same-account mode: Gitmatrix
+  observes its own deployment as an ordinary hosted repository. Only Space
+  admins with an explicit Space grant manage connections; the credential is
+  never shown back. Anyone who can read a bound repository reads its
+  service's evidence.
+- **Scope.** A connection, and an issue's link to an observation, carry an
+  opaque `spaceId`; reads are keyed by `repoId`, `connectionId` and
+  `bindingId`. The Organization/Space cutover (CORE-361/362) makes `spaceId`
+  `spaces.id`. Until then the server derives it from `repos.owner_id`, on the
+  CORE-360 mapping manifest's proposal that a legacy owner's id is reused as
+  its default Space id. That proposal awaits operator approval and is not
+  settled; if the approved mapping differs, stored values move with it.
+  Authorization (`worker/permissions.ts` `repoRole`, through `loadRepo`) is
+  re-checked on every read, link and cursor. A repository or connection the
+  caller can't read looks exactly like a missing one; `denied` means only
+  that the provider refused the credential. Bindings and evidence candidates
+  list only repositories the caller can read and never count hidden ones.
+- **Cursors.** A reader's cursor is provider-scoped and opaque. The server API
+  must never return it bare: it wraps it in an envelope it signs, bound to a
+  `CursorBinding` (principal, authorization version, repository, connection,
+  binding, `cursorRequestDigest` of the request, and when it was issued). On
+  every continuation the server re-checks that the caller can read the
+  repository, then `checkCursorBinding`: a different binding fails closed as
+  `cursor_invalid`, one older than an hour as `cursor_expired`. The
+  authorization version is required to be the Space's
+  `authorization_version` (CORE-360's `spaces.authorization_version`,
+  introduced by CORE-361), so that a grant change ends open cursors. Until
+  CORE-361 lands the server binds a constant there, and the repository read
+  re-check is what ends cursors after a grant change or revocation.
+- **Nothing persisted.** Gitmatrix stores connection metadata, sealed
+  credential references, bindings and explicit issue links (`ObservationRef`).
+  An `ObservationRef` is a reference with no payload; it keeps the dataset
+  and the binding's repository, service and environment. Re-reading it
+  targets the stored dataset (`errorGroup` by fingerprint over its interval,
+  an occurrence or trace by id, a series) and answers `binding_changed` if
+  the binding now names something else (`observationBindingCheck`). Once
+  `retentionSplit(ref.interval)` says the interval has expired, the server
+  answers `expired_at_provider` itself, even where a by-id read would say
+  `not_found`. Gitmatrix keeps no aggregates, caches or
+  evidence snapshots and no raw logs or bodies. Retention is the provider's
+  live history: past it, evidence is `expired_at_provider`, never zero, and an
+  item read by id that the provider no longer has is `not_found`.
+- **Separate signals.** Worker exceptions over invocations, edge and origin 5xx
+  over request counts, wall/CPU/request latency and tracker bug events (from
+  Gitmatrix) are separate `MetricId`s; there is no combined index. A rate
+  without its denominator has no value, and a null point is never drawn as
+  zero. Series carry sampling (`exact`, `estimated`, `unknown`), coverage,
+  expiry and freshness, and can be filtered to one provider version.
+- **Lists.** Every request names its dataset, and every page and item read by
+  id names its dataset and its stability, so beta datasets are labelled
+  wherever they show and an issue link records where its observation came
+  from. An answer naming a different dataset than the request is a reader
+  bug, and the server refuses it. A page also carries the
+  expired part of the window and `freshThrough`: an empty page over a partly
+  expired or unsettled window is not "no errors". Error groups come most
+  occurrences first, occurrences and traces newest first, provider
+  deployments newest first; an error group's `count` covers the requested
+  window, while its `firstSeen`/`lastSeen` may fall outside it. Provider
+  deployments record exposure, canary share and the version a rollback
+  replaced.
+- **Evidence, not causes.** Evidence lists candidates (commit, provider
+  version, artifact, deployment record, times, canary weight). `attribution`
+  is `explicit` (exactly one candidate whose recorded provider version or
+  artifact digest matches), `temporal` (exactly one candidate matched by its
+  deployment or exposure time) or `ambiguous` (one or more visible
+  candidates). Candidates the caller can't read are omitted first; a single
+  visible candidate can stay ambiguous because of hidden ones, without saying
+  how many. With no visible candidate the evidence is omitted entirely. `join` is
+  `direct` (each candidate names its deployment record) or `derived`
+  (existing provenance). Commit-message mentions stay separate. An error
+  fingerprint is not an issue. Commit, receipt, publication, deployment,
+  exposure and observation times are kept apart.
+- **Time.** Stored and transmitted as canonical UTC ISO instants
+  (`…T20:00:00.000Z`) over half-open intervals; the UI shows the viewer's
+  local zone, named. Buckets align to the UTC epoch, so a History brush snaps
+  to UTC-aligned ranges (a day bucket is a UTC day) while its labels are
+  local.
+- **Links.** Each connection declares full https URL prefixes for the
+  provider's own links, each to an account path (a bare origin is refused),
+  as normalized URLs: lowercase punycode host, no default port, no userinfo,
+  query, fragment, dot segments or encoded `/` and `\` (`validateLinkPrefixes`).
+  `safeProviderLink` accepts only https URLs without userinfo (even an empty
+  `@`), whitespace, control characters or an encoded `/` or `\` (`%2F`,
+  `%5C`, which the text comparison wouldn't decode) in the path, under a
+  declared prefix on a path-segment boundary. Readers pass the prefixes to
+  `validateProviderDeployment` so deployment links are checked too. Keeping
+  credentials out of query strings is the reader's responsibility.
+- **Validation.** Pure validators with unit tests: strict UTC instants
+  (canonical on output), interval and bucket bounds and alignment, page
+  limits, capabilities, commits as repoId + sourceId + full object id,
+  evidence and provider deployments, series consistency (merged coverage, a
+  zero only where covered, rates 0–1 with denominators, `freshThrough` not in
+  the future), cursor request digests and bindings, observation bindings,
+  link prefixes and provider links. Malformed shapes are refused with an
+  `ObservabilityError`, never a crash.
+
+**Handoffs.** `Deployment.sourceId` is optional in `shared/deployments.ts`
+though the API always sets it, the type has no `repoId` or exposure
+interval, and `WorkDeployment`/`WorkPackage` in `shared/chronicle.ts` carry a
+bare `commit`; registry publishes record no source. CORE-351 (deployment and
+artifact provenance) and CORE-353 (the work join) close those gaps; until
+then their commits are not identities this contract accepts.
+
+### OpenTelemetry mapping
+
+OTLP is an export protocol, with no standard query API, so there is no "otel"
+provider and no OTel reader or test. A future named backend that stores OTel
+data (Tempo, Honeycomb, ClickHouse…) would implement `ObservabilityReader`
+through its own documented query API and declare its `DatasetCapability`s:
+
+| Contract                           | OpenTelemetry                                                                   |
+| ---------------------------------- | ------------------------------------------------------------------------------- |
+| `ServiceBinding.service`           | resource `service.name`                                                         |
+| `ServiceBinding.environment`       | resource `deployment.environment.name` (formerly `deployment.environment`)      |
+| `ProviderVersionRef.versionId`     | resource `service.version`                                                      |
+| `TraceRef.traceId`, `spanId`       | span `trace_id`, `span_id` (W3C trace context)                                  |
+| `ErrorGroup.fingerprint`           | the backend's grouping of `exception.type`/`exception.stacktrace`               |
+| `http.requests`, `http.origin_5xx` | server spans or `http.server.request.duration` by `http.response.status_code`   |
+| `http.edge_5xx`                    | none in OTel itself: only a backend that also has its edge's logs can answer it |
+| `latency.request`                  | `http.server.request.duration`                                                  |
+
+A backend that can't answer a capability reports `unsupported`, never zero.
+
 ## Data retention
 
 Everything Timelines keeps costs storage, so data past its useful life can be
@@ -4558,6 +4692,7 @@ preview's teardown, a killed purge resumed, the name reused) and the
 - `worker/tracker/*`: account-level authority, transactional graph store and sync API
 - `worker/search/*`, `shared/search.ts`: global search providers, ranking and `/api/search`
 - `shared/tracker.ts`: shared tracker entities, mutations and readiness semantics
+- `shared/observability.ts`: provider-neutral runtime observability read contracts and validators
 - `src/routes/tracker/*`: issue workbench, graph and tracker administration
 - `scripts/git-login.ts`: points the git CLI at Gitmatrix as a persona
 - `src/`: React Router (data mode), Base UI and Tailwind, styled with MatrixKit Neo
