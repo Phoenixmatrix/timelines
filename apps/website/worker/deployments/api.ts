@@ -154,11 +154,14 @@ async function writer(c: Context<AppEnv>): Promise<Writer | Response> {
   return { kind: "person", repo: repo.row, actorId: actor.id, agentId: actor.agent?.id ?? null };
 }
 
-/** The repository to read: a job reads its own, anyone else needs read access. */
-async function reader(c: Context<AppEnv>): Promise<RepoRow | Response> {
+/** A job reads its own repository and, for lists, source; stable ids use recordSource. */
+async function reader(c: Context<AppEnv>, sourceId?: string): Promise<RepoRow | Response> {
   if (jobSecret(c.req.header("authorization"))) {
     const found = await writer(c);
-    return found instanceof Response ? found : found.repo;
+    if (found instanceof Response) return found;
+    if (found.kind === "job" && sourceId !== undefined && found.job.sourceId !== sourceId)
+      return fail(c, 403, "A job may read only its own source's deployments.");
+    return found.repo;
   }
   const repo = await loadRepo(c);
   return repo instanceof Response ? repo : repo.row;
@@ -300,14 +303,15 @@ deployments.onError((error, c) => {
 });
 
 deployments.get("/deployments", async (c) => {
-  const repo = await reader(c);
+  const sourceId = c.req.query("source") ?? "canonical";
+  const repo = await reader(c, sourceId);
   if (repo instanceof Response) return repo;
   const q = (name: string) => c.req.query(name)?.trim() || undefined;
   const before = Number(q("before")) || Number.MAX_SAFE_INTEGER;
   const limit = Math.min(MAX_PAGE, Math.max(1, Number(q("limit")) || PAGE));
   const kdb = db(c.env.DB);
   let query = selectDeployments(kdb).where("d.repo_id", "=", repo.id).where("d.id", "<", before);
-  query = query.where("d.source_id", "=", c.req.query("source") ?? "canonical");
+  query = query.where("d.source_id", "=", sourceId);
   const environment = q("environment");
   if (environment) query = query.where("d.environment", "=", environment);
   const timeline = q("timeline");
@@ -538,7 +542,8 @@ deployments.patch("/deployments/:id{[0-9]+}", async (c) => {
 });
 
 deployments.get("/environments", async (c) => {
-  const repo = await reader(c);
+  const sourceId = c.req.query("source") ?? "canonical";
+  const repo = await reader(c, sourceId);
   if (repo instanceof Response) return repo;
   const kdb = db(c.env.DB);
   const groups = await kdb
@@ -550,7 +555,7 @@ deployments.get("/environments", async (c) => {
       sql<number>`sum(status IN ('active', 'sleeping'))`.as("live"),
     ])
     .where("repo_id", "=", repo.id)
-    .where("source_id", "=", c.req.query("source") ?? "canonical")
+    .where("source_id", "=", sourceId)
     .groupBy("environment")
     .orderBy("latest", "desc")
     .limit(MAX_ENVIRONMENTS)

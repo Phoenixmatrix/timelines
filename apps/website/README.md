@@ -3210,6 +3210,11 @@ the wire types (`worker/deployments/`).
   `Feature/Add login` deploys to `branch/feature/add-login`). An explicit
   `environment` always wins. A `branch/<name>` given by hand must already be
   in that form.
+- **Source-scoped reads.** Deployment and environment lists select `?source=<id>`
+  (default: `canonical`). A CI job may list only its run's source; selecting
+  another source returns `403`, including through an environment's latest
+  deployment. A native work-source job must supply its source ID explicitly.
+  Personal and agent tokens retain the repository's ordinary read access.
 - **`gm deploy record --url <url>`** in a job; outside CI add `--commit`.
   `gm deploy list` and `gm deploy update <id> --status expired` read and
   change records.

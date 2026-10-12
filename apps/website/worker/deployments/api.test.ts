@@ -324,6 +324,85 @@ describe("recording deployments", () => {
 });
 
 describe("reading and updating", () => {
+  test.each(["deployments", "environments"])(
+    "%s lists enforce the job's source without restricting repository readers",
+    async (route) => {
+      const t = await setup();
+      try {
+        const callers = [{ source: "canonical", token: t.tokens.deploy }];
+        for (const [index, source] of ["work-a", "work-b"].entries()) {
+          t.sqlite
+            .prepare(
+              `INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,
+                artifacts_name,artifacts_remote,state,initial_token_revoked,allocation_operation_id,
+                fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
+                VALUES(?,'repo',?,?,'acc_org',?,'https://owned','ready',1,?,
+                  'canonical','head','tree','refs/heads/main','canonical','head','tree','refs/heads/main','now','now')`,
+            )
+            .run(source, source, source, source, source);
+          t.sqlite
+            .prepare(
+              `INSERT INTO ci_runs(id,repo_id,source_id,number,commit_oid,ref,trigger,status)
+                VALUES(?,'repo',?,?,?,'work','manual','running')`,
+            )
+            .run(source, source, 20 + index, oid(20 + index));
+          t.sqlite
+            .prepare(
+              `INSERT INTO ci_jobs(id,run_id,repo_id,source_id,name,spec,status,runner)
+                VALUES(?,?,'repo',?,'deploy','{}','running','sandbox')`,
+            )
+            .run(source, source, source);
+          callers.push({ source, token: await mintJobToken(t.env.DB, source, 30) });
+        }
+        const made = new Map<string, Deployment>();
+        for (const { source, token } of callers) {
+          const created = await t.call(token, "POST", "/api/repos/orbit/app/deployments", {
+            url: `https://${source}.example.com`,
+          });
+          expect(created.status).toBe(201);
+          made.set(source, created.json as Deployment);
+        }
+        const records = (json: DeploymentList | EnvironmentList) =>
+          "deployments" in json
+            ? json.deployments
+            : json.environments.flatMap((environment) =>
+                environment.latest ? [environment.latest] : [],
+              );
+        const path = `/api/repos/orbit/app/${route}`;
+        for (const caller of callers) {
+          for (const { source } of callers) {
+            const response = await t.call(caller.token, "GET", `${path}?source=${source}`);
+            if (source === caller.source) {
+              expect(response.status).toBe(200);
+              expect(records(response.json)).toEqual([made.get(source)]);
+            } else {
+              expect(response.status).toBe(403);
+              expect(response.json).toEqual({ error: expect.any(String) });
+            }
+          }
+          // Omitting the selector still means canonical, not the caller's work source.
+          const implicit = await t.call(caller.token, "GET", path);
+          expect(implicit.status).toBe(caller.source === "canonical" ? 200 : 403);
+          if (implicit.status === 200)
+            expect(records(implicit.json)).toEqual([made.get("canonical")]);
+        }
+        for (const token of [t.tokens.cat, t.tokens.agent]) {
+          for (const { source } of callers) {
+            const response = await t.call(token, "GET", `${path}?source=${source}`);
+            expect(response.status).toBe(200);
+            expect(records(response.json)).toEqual([made.get(source)]);
+          }
+        }
+        expect((await t.call(t.tokens.ended, "GET", path)).status).toBe(401);
+        expect((await t.call(t.tokens.deploy, "GET", path.replace("/app/", "/site/"))).status).toBe(
+          403,
+        );
+      } finally {
+        t.sqlite.close();
+      }
+    },
+  );
+
   test("filters, pages, and keeps records after a preview expires", async () => {
     const t = await setup();
     const path = "/api/repos/orbit/app/deployments";
