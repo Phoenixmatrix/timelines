@@ -27,7 +27,13 @@ import { mintJobToken } from "../ci/registry.ts";
 import { deliverRecoveredSourcePush } from "../git/source-push-delivery.ts";
 import { drainDeletedRepoSources } from "../retention/work-sources.ts";
 import { onPush } from "../ci/trigger.ts";
-import { afterRun, settled } from "./landing.ts";
+import {
+  afterRun,
+  retryApprovedLanding,
+  settled,
+  sweepApprovedLandings,
+  sweepLandings,
+} from "./landing.ts";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -1352,6 +1358,300 @@ describe("approve when green (CORE-378)", () => {
     });
     expect(reply.status).toBe(200);
     expect((await t.request("for-ann")).status).toBe("open");
+  });
+});
+
+describe("approved but never landed (CORE-390)", () => {
+  /** Ben approves search's checkpoint #1; the landing that should follow fails to begin once. */
+  async function approvedUnlanded() {
+    const t = await setup();
+    await t.call("bot", "POST", "", { slug: "search", repos: ["orbit/app"] });
+    t.work().commits.add(oid(9));
+    t.work().refs.set("refs/heads/work", oid(9));
+    await t.call("bot", "POST", "/search/checkpoints", { summary: "Ready" });
+    const checkpoint = (await t.call("ben", "GET", "/search/checkpoints/1")).body as CheckpointView;
+    const mutate = (who: "ann" | "ben" | "bot", ...mutations: unknown[]) =>
+      t.raw(who, "POST", "/tracker/orbit/mutate", { operationId: crypto.randomUUID(), mutations });
+    await mutate("ann", { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng" } });
+    await mutate("bot", {
+      kind: "issue.create",
+      id: "issue",
+      data: { teamId: "team", title: "S" },
+    });
+    await mutate("bot", {
+      kind: "request.open",
+      id: "req",
+      data: {
+        issueId: "issue",
+        kind: "approval",
+        prompt: "Land?",
+        checkpoint: checkpoint.checkpoint.id,
+      },
+    });
+    // The Durable Object resets mid-call, once: the approval's landing never begins.
+    const tracker = t.trackers.get("orbit")!;
+    const begin = tracker.beginLanding.bind(tracker);
+    let failures = 1;
+    tracker.beginLanding = ((...args: Parameters<typeof begin>) => {
+      if (failures-- > 0) throw new Error("Durable Object reset");
+      return begin(...args);
+    }) as typeof tracker.beginLanding;
+    expect(
+      (await mutate("ben", { kind: "request.answer", id: "req", data: { approved: true } })).status,
+    ).toBe(200);
+    const landing = async () =>
+      (await t.call("ben", "GET", "/search/landing")).body.landing as {
+        id: string;
+        checkpointId: string;
+        trigger: string;
+        requestedBy: { accountableId: string; agentId: string | null };
+      } | null;
+    expect(await landing()).toBeNull();
+    expect((await t.call("ben", "GET", "/search/checkpoints/1")).body).toMatchObject({
+      approved: true,
+    });
+    const sweep = () => settled(t.env, (deps) => sweepLandings(t.env, deps));
+    return { ...t, checkpoint, landing, sweep };
+  }
+
+  type Landed = { id: string; checkpointId: string; state: string; trigger: string } | null;
+  /**
+   * In an existing world: Ben approves checkpoint #1 of a timeline in `owner`'s
+   * tracker, on `repo` (its id), and the landing fails to begin `failures` times.
+   */
+  async function approveIn(
+    t: Awaited<ReturnType<typeof setup>>,
+    owner: "orbit" | "ben",
+    repo: string,
+    failures = 1,
+  ) {
+    const base = `/tracker/${owner}/timelines`;
+    await t.raw("bot", "POST", base, { slug: "search", repos: [`${owner}/${repo}`] });
+    t.work("search", repo).commits.add(oid(9));
+    t.work("search", repo).refs.set("refs/heads/work", oid(9));
+    await t.raw("bot", "POST", `${base}/search/checkpoints`, { summary: "Ready" });
+    const mutate = (who: "ann" | "ben" | "bot", ...mutations: unknown[]) =>
+      t.raw(who, "POST", `/tracker/${owner}/mutate`, {
+        operationId: crypto.randomUUID(),
+        mutations,
+      });
+    const checkpoint = (await t.raw("ben", "GET", `${base}/search/checkpoints/1`))
+      .body as CheckpointView;
+    await mutate(owner === "orbit" ? "ann" : "ben", {
+      kind: "team.create",
+      id: "team",
+      data: { key: "ENG", name: "Eng" },
+    });
+    await mutate("bot", {
+      kind: "issue.create",
+      id: "issue",
+      data: { teamId: "team", title: "S" },
+    });
+    await mutate("bot", {
+      kind: "request.open",
+      id: "req",
+      data: {
+        issueId: "issue",
+        kind: "approval",
+        prompt: "Land?",
+        checkpoint: checkpoint.checkpoint.id,
+      },
+    });
+    const tracker = t.trackers.get(owner)!;
+    const begin = tracker.beginLanding.bind(tracker);
+    let left = failures;
+    tracker.beginLanding = ((...args: Parameters<typeof begin>) => {
+      if (left-- > 0) throw new Error("Durable Object reset");
+      return begin(...args);
+    }) as typeof tracker.beginLanding;
+    await mutate("ben", { kind: "request.answer", id: "req", data: { approved: true } });
+    const landing = async () =>
+      (await t.raw("ben", "GET", `${base}/search/landing`)).body.landing as Landed;
+    expect(await landing()).toBeNull();
+    return { tracker, begin, mutate, checkpoint, landing };
+  }
+
+  test("the sweep's budget is for landing attempts, and where it starts rotates", async () => {
+    const t = await setup();
+    // Ben's own tracker is stuck: every landing attempt fails. Orbit's isn't.
+    const stuck = await approveIn(t, "ben", "side", Infinity);
+    const orbit = await approveIn(t, "orbit", "app");
+    const sweep = (hour: number) =>
+      settled(t.env, (deps) => sweepApprovedLandings(t.env, deps, { limit: 1, hour }));
+    // Hour 0 starts with ben (by id): its one failed attempt spends the budget.
+    await sweep(0);
+    expect(await stuck.landing()).toBeNull();
+    expect(await orbit.landing()).toBeNull();
+    // Hour 1 starts with orbit: it lands, though ben is still stuck.
+    await sweep(1);
+    expect(await orbit.landing()).toMatchObject({ trigger: "approval" });
+    expect(await stuck.landing()).toBeNull();
+  });
+
+  test("skips that try nothing cost nothing: an approver who left doesn't block the next", async () => {
+    const t = await setup();
+    const side = await approveIn(t, "ben", "side");
+    const orbit = await approveIn(t, "orbit", "app");
+    // Ben can't write to side any more (it moved to Ann): skipped without trying.
+    t.sqlite.exec("UPDATE repos SET owner_id = 'ann' WHERE id = 'side'");
+    let attempts = -1;
+    await settled(t.env, async (deps) => {
+      attempts = await sweepApprovedLandings(t.env, deps, { limit: 1, hour: 0 });
+    });
+    t.sqlite.exec("UPDATE repos SET owner_id = 'ben' WHERE id = 'side'");
+    expect(attempts).toBe(1);
+    expect(await side.landing()).toBeNull();
+    expect(await orbit.landing()).toMatchObject({ trigger: "approval" });
+  });
+
+  test("one tracker failing, or the landings sweep before it failing, skips nobody else", async () => {
+    const t = await setup();
+    const side = await approveIn(t, "ben", "side");
+    const orbit = await approveIn(t, "orbit", "app");
+    side.tracker.approvedUnlanded = () => {
+      throw new Error("Durable Object overloaded");
+    };
+    const prepare = t.env.DB.prepare.bind(t.env.DB);
+    (t.env.DB as { prepare: typeof prepare }).prepare = (query: string) => {
+      if (query.includes("source_integration_receipts")) throw new Error("D1 overloaded");
+      return prepare(query);
+    };
+    await settled(t.env, (deps) => sweepLandings(t.env, deps));
+    expect(await orbit.landing()).toMatchObject({ trigger: "approval" });
+  });
+
+  test("not after a rejection or a new ask, and not once abandoned", async () => {
+    const t = await setup();
+    const orbit = await approveIn(t, "orbit", "app");
+    const sweep = () => settled(t.env, (deps) => sweepApprovedLandings(t.env, deps, { hour: 0 }));
+    // Asked again: the approval no longer stands until answered.
+    await orbit.mutate("bot", {
+      kind: "request.open",
+      id: "again",
+      data: {
+        issueId: "issue",
+        kind: "approval",
+        prompt: "Again?",
+        checkpoint: orbit.checkpoint.checkpoint.id,
+      },
+    });
+    await sweep();
+    expect(await orbit.landing()).toBeNull();
+    // Rejected: still nothing.
+    await orbit.mutate("ben", { kind: "request.answer", id: "again", data: { approved: false } });
+    await sweep();
+    expect(await orbit.landing()).toBeNull();
+    const fresh = await setup();
+    const abandoned = await approveIn(fresh, "orbit", "app");
+    expect((await fresh.call("ben", "POST", "/search/abandon")).status).toBe(200);
+    await settled(fresh.env, (deps) => sweepApprovedLandings(fresh.env, deps, { hour: 0 }));
+    expect(await abandoned.landing()).toBeNull();
+  });
+
+  test("an approval over a day old waits for a person: neither the sweep nor a CI run lands it", async () => {
+    const t = await setup();
+    const orbit = await approveIn(t, "orbit", "app");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 25 * 3600_000);
+      await settled(t.env, (deps) => sweepLandings(t.env, deps));
+      expect(await orbit.landing()).toBeNull();
+      t.sqlite
+        .prepare(
+          "INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step, source_id) VALUES ('run', 'app', 1, ?, 'work', 'push', 'succeeded', 0, ?)",
+        )
+        .run(oid(9), t.work("search", "app").sourceId);
+      await settled(t.env, (deps) => afterRun(t.env, deps, "run"));
+      expect(await orbit.landing()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+    // A person still can.
+    expect((await t.call("ben", "POST", "/search/land")).status).toBe(202);
+    expect(await orbit.landing()).toMatchObject({ trigger: "request" });
+  });
+
+  test("a landing that began and stopped between the check and the retry isn't restarted", async () => {
+    const t = await setup();
+    const orbit = await approveIn(t, "orbit", "app");
+    // Someone lands it by hand just before the retry's call, and it stops.
+    orbit.tracker.beginLanding = ((...args: Parameters<typeof orbit.begin>) => {
+      const [access, slug, request] = args;
+      if (request.onlyIfUnlanded) {
+        const started = orbit.begin(access, slug, {
+          trigger: "request",
+          green: { ok: true, why: null },
+          agentId: null,
+        });
+        if (!started.ok) throw new Error(started.error);
+        const stopped = orbit.tracker.saveLanding(
+          { ...started.value.landing, state: "failed", reason: "Gates failed" },
+          started.value.landing.version,
+          "ben",
+        );
+        if (!stopped.ok) throw new Error(stopped.error);
+      }
+      return orbit.begin(...args);
+    }) as typeof orbit.tracker.beginLanding;
+    let retried: Awaited<ReturnType<typeof retryApprovedLanding>> | null = null;
+    await settled(t.env, async (deps) => {
+      retried = await retryApprovedLanding(t.env, deps, "orbit", "search");
+    });
+    expect(retried).toEqual({ attempted: true, landing: null });
+    const landing = await orbit.landing();
+    expect(landing).toMatchObject({ state: "failed", trigger: "request" });
+    // Nor by the sweep later.
+    await settled(t.env, (deps) => sweepApprovedLandings(t.env, deps, { hour: 0 }));
+    expect(await orbit.landing()).toEqual(landing);
+  });
+
+  test("the hourly sweep queues it for the approver, once", async () => {
+    const t = await approvedUnlanded();
+    await t.sweep();
+    const queued = await t.landing();
+    expect(queued).toMatchObject({
+      checkpointId: t.checkpoint.checkpoint.id,
+      trigger: "approval",
+      requestedBy: { accountableId: "ben", agentId: null },
+    });
+    expect((await t.call("ben", "GET", "/search")).body.timeline.status).toBe("landing");
+    // Swept again: the landing already under way answers for it.
+    await t.sweep();
+    expect((await t.landing())?.id).toBe(queued!.id);
+  });
+
+  test("the timeline's next CI run ending queues it too", async () => {
+    const t = await approvedUnlanded();
+    t.sqlite
+      .prepare(
+        "INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status, step, source_id) VALUES ('run', 'app', 1, ?, 'work', 'push', 'succeeded', 0, ?)",
+      )
+      .run(oid(9), t.work().sourceId);
+    await settled(t.env, (deps) => afterRun(t.env, deps, "run"));
+    expect(await t.landing()).toMatchObject({
+      checkpointId: t.checkpoint.checkpoint.id,
+      trigger: "approval",
+      requestedBy: { accountableId: "ben" },
+    });
+  });
+
+  test("not for an approver who left the tracker or can't write to it any more", async () => {
+    const t = await approvedUnlanded();
+    t.sqlite.exec("DELETE FROM org_members WHERE org_id = 'orbit' AND user_id = 'ben'");
+    await t.sweep();
+    t.sqlite.exec(
+      "INSERT INTO org_members (org_id, user_id, role) VALUES ('orbit', 'ben', 'member')",
+    );
+    expect(await t.landing()).toBeNull();
+    t.sqlite.exec("DELETE FROM repo_collaborators WHERE repo_id = 'app' AND user_id = 'ben'");
+    await t.sweep();
+    expect(await t.landing()).toBeNull();
+    // Write access back: it lands.
+    t.sqlite.exec(
+      "INSERT INTO repo_collaborators (repo_id, user_id, role) VALUES ('app', 'ben', 'write')",
+    );
+    await t.sweep();
+    expect(await t.landing()).toMatchObject({ requestedBy: { accountableId: "ben" } });
   });
 });
 

@@ -1815,6 +1815,16 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   requires a person's approval of that exact head. New work supersedes approval,
   and admitted landing fences source writes. Manual `gm timeline land`, the
   inspector and `POST …/land` use the same checks.
+  An approval queues the landing once; if that fails to begin, the
+  timeline's next CI run ending and the hourly sweep (`sweepApprovedLandings`)
+  retry it for the approver, while the head is approved, current and never had
+  a landing (CORE-390); beginLanding re-checks that last part in its
+  transaction (`onlyIfUnlanded`). Only approvals from the last 24 hours are
+  retried: landing on main deploys, so an older one waits for a person to run
+  `gm timeline land`. Not when the approver left the tracker or can't write to
+  every repository; a stopped landing stays a person's to retry. The sweep
+  makes at most 25 landing attempts per run (skips cost nothing) across up to
+  200 trackers, starting one tracker further on each hour.
   - _Approve when green_ (CORE-378, `worker/timelines/auto-approve.ts`): a
     person may turn on, for themselves in one tracker (Preferences, or the
     `automation.approveWhenGreen` mutation with their own id), approving the

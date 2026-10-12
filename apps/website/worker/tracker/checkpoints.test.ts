@@ -495,6 +495,100 @@ test("a client can't pre-claim the withdrawal of a superseded approval", () => {
   expect(t.request(id)).toMatchObject({ status: "canceled" });
 });
 
+describe("approved but never landed (CORE-390)", () => {
+  const begin = (t: ReturnType<typeof setup>) =>
+    t.timelines.beginLanding(t.ben, "search", {
+      trigger: "approval",
+      green: { ok: true, why: null },
+      agentId: null,
+    }).landing;
+
+  test("an approved, current head with no landing is listed with its approver until one begins", () => {
+    const t = setup({ policy: "approval" });
+    expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    const id = t.ask(checkpoint.id);
+    expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+    t.answer(t.ben, id, true);
+    const listed = t.timelines.approvedUnlanded(10, "");
+    expect(listed).toEqual([
+      {
+        slug: "search",
+        checkpointId: checkpoint.id,
+        approverId: "ben",
+        approvedAt: expect.any(String),
+      },
+    ]);
+    // Approved before `since`: left to a person.
+    const later = new Date(Date.parse(listed[0]!.approvedAt) + 1).toISOString();
+    expect(t.timelines.approvedUnlanded(10, later)).toEqual([]);
+    expect(t.timelines.approvedUnlanded(0, "")).toEqual([]);
+    expect(begin(t).checkpointId).toBe(checkpoint.id);
+    expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+  });
+
+  test.each(["failed", "landed"] as const)(
+    "a head whose landing %s is the landing's (or a person's) to retry, not the sweep's",
+    (state) => {
+      const t = setup({ policy: "approval" });
+      t.push(2);
+      const { checkpoint } = t.checkpoint(2);
+      t.answer(t.ben, t.ask(checkpoint.id), true);
+      const started = begin(t);
+      t.timelines.saveLanding(
+        {
+          ...started,
+          state,
+          repos: started.repos.map((repo) => ({
+            ...repo,
+            state: "advanced",
+            base: oid(1),
+            merge: oid(3),
+          })),
+        },
+        started.version,
+        "ben",
+      );
+      expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+    },
+  );
+
+  test("a retry lands only that checkpoint, only if it never had a landing", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    t.answer(t.ben, t.ask(checkpoint.id), true);
+    const retry = (onlyIfUnlanded: string) =>
+      t.timelines.beginLanding(t.ben, "search", {
+        trigger: "approval",
+        green: { ok: true, why: null },
+        agentId: null,
+        onlyIfUnlanded,
+      });
+    expect(() => retry("cp_other")).toThrow(/newer checkpoint than the one to retry/);
+    const started = begin(t);
+    t.timelines.saveLanding({ ...started, state: "failed" }, started.version, "ben");
+    expect(() => retry(checkpoint.id)).toThrow(/already has a landing; it isn't retried/);
+    expect(t.timelines.landing("search")).toMatchObject({ id: started.id, state: "failed" });
+  });
+
+  test("a stale approved checkpoint, or an auto timeline, is never listed", () => {
+    const t = setup({ policy: "approval" });
+    t.push(2);
+    const { checkpoint } = t.checkpoint(2);
+    t.answer(t.ben, t.ask(checkpoint.id), true);
+    t.push(3);
+    expect(t.timelines.checkpoint("search", "1")).toMatchObject({ approved: false });
+    expect(t.timelines.approvedUnlanded(10, "")).toEqual([]);
+    const auto = setup({ policy: "auto" });
+    auto.push(2);
+    const head = auto.checkpoint(2).checkpoint;
+    auto.answer(auto.ben, auto.ask(head.id), true);
+    expect(auto.timelines.approvedUnlanded(10, "")).toEqual([]);
+  });
+});
+
 describe("approve when green (CORE-378)", () => {
   test("only the person turns their own setting on or off, and each change is in the log", () => {
     const t = setup({ policy: "approval" });

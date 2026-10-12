@@ -710,6 +710,14 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   activeLandings() {
     return this.reply(() => this.timelines.activeLandings());
   }
+  /** Approved (since `since`), current heads that never began landing (CORE-390). */
+  approvedUnlanded(limit: number, since: string) {
+    return this.reply(() => this.timelines.approvedUnlanded(limit, since));
+  }
+  /** A timeline's policy, head checkpoint state and whether it ever landed (CORE-390). */
+  headCheckpoint(slug: string) {
+    return this.reply(() => this.timelines.headCheckpoint(slug));
+  }
   beginLanding(access: Access, slug: string, request: LandingRequest) {
     return this.reply(() => this.timelines.beginLanding(access, slug, request));
   }
