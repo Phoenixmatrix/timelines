@@ -12,6 +12,7 @@ import {
   installGm,
   hide,
   jobFrom,
+  liveRecordsPath,
   names,
   previewUrl,
   reconcile,
@@ -301,6 +302,7 @@ await test("create tears down, provisions fresh data, deploys in preview mode, s
       record: async (args) => {
         steps.push(`gm ${args.join(" ")}`);
       },
+      recorded: async () => assert.fail("only after a failed record"),
     },
     { slug: "faster-search", account: "acct", env: accessEnv },
   );
@@ -593,7 +595,10 @@ await test("invalid Access configuration cannot replace an existing preview", as
           cloudflare: fake.cloudflare,
           wait: async () => assert.fail("must fail before deploy"),
           seed: async () => assert.fail("must fail before seed"),
-          record: async () => assert.fail("must fail before record"),
+          // Only the failed deployment, which leaves the existing preview alone.
+          record: async (args) =>
+            assert.deepEqual(args, ["deploy", "record", "--status", "failed"]),
+          recorded: async () => assert.fail("must fail before record"),
         },
         { slug: "faster-search", account: "acct", env },
       ),
@@ -648,6 +653,7 @@ const deps = (cloudflare: Cloudflare) => ({
   cloudflare,
   seed: async () => {},
   record: async () => {},
+  recorded: async () => false as boolean | null,
   wait: async () => {},
   secret: "s".repeat(64),
 });
@@ -707,7 +713,8 @@ await test("create refuses a leftover namespace that lists repositories again", 
         refused = true;
         throw error;
       });
-    // Empty for teardown's own check, then a repository appears before provisioning.
+    // Empty for teardown's own check, then a repository appears before
+    // provisioning, and stays listed however often it's deleted.
     if (refused && command === "artifacts namespaces repos" && args[3] === "list")
       return JSON.stringify(++lists > 1 ? [{ name: "late" }] : []);
     return base(args, env);
@@ -718,6 +725,17 @@ await test("create refuses a leftover namespace that lists repositories again", 
   } finally {
     stderr.restore();
   }
+  // The rollback deleted the databases and bucket, and gave up on the
+  // namespace rather than deleting "late" forever (CORE-385).
+  assert.deepEqual(fake.databases, []);
+  assert.deepEqual(fake.buckets, {});
+  const events = stderr.lines
+    .join("")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const failed = events.find((event) => event.event === "preview.create.rollback-failed");
+  assert.match(failed.error, /still lists repository late/);
 });
 
 await test("a namespace Cloudflare won't delete fails teardown when a fresh list shows a repository", async () => {
@@ -746,7 +764,192 @@ await test("create still fails when the namespace create fails for another reaso
       throw new Error("HTTP 403: forbidden");
     return base(args, env);
   };
-  await assert.rejects(create(deps(fake.cloudflare), job), /forbidden/);
+  const stderr = captureStderr();
+  try {
+    await assert.rejects(create(deps(fake.cloudflare), job), /forbidden/);
+  } finally {
+    stderr.restore();
+  }
+  // The databases and bucket it had made went with it (CORE-385).
+  assert.deepEqual(fake.databases, []);
+  assert.deepEqual(fake.buckets, {});
+});
+
+await test("a create that fails after deploying deletes what it made (CORE-385)", async () => {
+  for (const stage of ["deploy", "wait", "seed", "record"] as const) {
+    const fake = fakeCloudflare({});
+    const base = fake.cloudflare.cf.bind(fake.cloudflare);
+    fake.cloudflare.cf = async (args, env) => {
+      if (stage === "deploy" && args[0] === "previews") throw new Error("deploy broke");
+      return base(args, env);
+    };
+    const broken = async () => {
+      throw new Error(`${stage} broke`);
+    };
+    const stderr = captureStderr();
+    try {
+      await assert.rejects(
+        create(
+          { ...deps(fake.cloudflare), ...(stage === "deploy" ? {} : { [stage]: broken }) },
+          job,
+        ),
+        new RegExp(`${stage} broke`),
+      );
+    } finally {
+      stderr.restore();
+    }
+    assert.equal(fake.previews.size, 0, stage);
+    assert.deepEqual(fake.databases, [], stage);
+    assert.deepEqual(fake.buckets, {}, stage);
+    assert.deepEqual(fake.namespaces, {}, stage);
+    const events = stderr.lines
+      .join("")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(events.at(-1).event, "preview.create.rolled-back", stage);
+  }
+});
+
+await test("a failed rollback reports what it left, and the create's own error", async () => {
+  const fake = fakeCloudflare({});
+  const base = fake.cloudflare.cf.bind(fake.cloudflare);
+  let deployed = false;
+  fake.cloudflare.cf = async (args, env) => {
+    if (args[0] === "previews") deployed = true;
+    // Once deployed, the only D1 calls are the rollback's deletes.
+    else if (deployed && args[0] === "d1")
+      throw new Error(`Authentication error [code: 10000] ${"s".repeat(64)}`);
+    return base(args, env);
+  };
+  const stderr = captureStderr();
+  try {
+    await assert.rejects(
+      create(
+        {
+          ...deps(fake.cloudflare),
+          seed: async () => {
+            throw new Error("seed broke");
+          },
+        },
+        job,
+      ),
+      /seed broke/,
+    );
+  } finally {
+    stderr.restore();
+  }
+  const events = stderr.lines
+    .join("")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const failed = events.find((event) => event.event === "preview.create.rollback-failed");
+  assert.ok(failed, "the rollback's failure is reported");
+  assert.equal(failed.preview, "timeline-faster-search");
+  assert.equal(failed.db, "gitmatrix-preview-faster-search");
+  assert.match(failed.error, /Authentication error/);
+  assert.ok(!JSON.stringify(events).includes("s".repeat(64)), "no secret in the report");
+});
+
+await test("a failed create records the failure before it cleans up", async () => {
+  const fake = fakeCloudflare({});
+  const order: string[] = [];
+  const base = fake.cloudflare.cf.bind(fake.cloudflare);
+  fake.cloudflare.cf = async (args, env) => {
+    if (args[0] === "d1" && args[1] === "delete") order.push("rollback");
+    return base(args, env);
+  };
+  const stderr = captureStderr();
+  try {
+    await assert.rejects(
+      create(
+        {
+          ...deps(fake.cloudflare),
+          seed: async () => {
+            throw new Error("seed broke");
+          },
+          record: async (args) => {
+            order.push(args.join(" "));
+          },
+        },
+        job,
+      ),
+      /seed broke/,
+    );
+  } finally {
+    stderr.restore();
+  }
+  assert.equal(order[0], "deploy record --status failed");
+  assert.ok(order.includes("rollback"));
+});
+
+await test("a record call that may have stored the live record keeps the preview", async () => {
+  for (const [stored, failedRecord] of [
+    [true, false],
+    [null, true],
+    [false, true],
+  ] as const) {
+    const fake = fakeCloudflare({});
+    const records: string[] = [];
+    const stderr = captureStderr();
+    try {
+      await assert.rejects(
+        create(
+          {
+            ...deps(fake.cloudflare),
+            record: async (args) => {
+              records.push(args.join(" "));
+              if (args.includes("--url")) throw new Error("gm timed out");
+            },
+            recorded: async (url) => {
+              assert.equal(url, "https://timeline-faster-search-gitmatrix.example.workers.dev");
+              return stored;
+            },
+          },
+          job,
+        ),
+        /gm timed out/,
+      );
+    } finally {
+      stderr.restore();
+    }
+    const kept = stored !== false;
+    assert.equal(fake.previews.size, kept ? 1 : 0, String(stored));
+    assert.equal(fake.databases.length, kept ? 2 : 0, String(stored));
+    assert.equal(records.includes("deploy record --status failed"), failedRecord, String(stored));
+    const events = stderr.lines
+      .join("")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(
+      events.at(-1).event,
+      kept ? "preview.create.kept" : "preview.create.rolled-back",
+      String(stored),
+    );
+  }
+});
+
+await test("a failed record call is checked in the job's own source and run", () => {
+  assert.equal(
+    liveRecordsPath({
+      GITMATRIX_REPOSITORY: "matrixorg/timelines",
+      GITMATRIX_SOURCE_ID: "work-abc",
+      GITMATRIX_RUN_NUMBER: "583",
+    }),
+    "/repos/matrixorg/timelines/deployments?run=583&status=active&source=work-abc&limit=100",
+  );
+  // Without the job's variables nobody can tell: the preview is kept.
+  assert.equal(liveRecordsPath({ GITMATRIX_REPOSITORY: "matrixorg/timelines" }), null);
+  assert.equal(
+    liveRecordsPath({
+      GITMATRIX_REPOSITORY: "../x",
+      GITMATRIX_SOURCE_ID: "s",
+      GITMATRIX_RUN_NUMBER: "1",
+    }),
+    null,
+  );
 });
 
 // reconcile (CORE-372)
@@ -1465,4 +1668,53 @@ await test("reconcileMain never fails its job: setup errors are logged as skippe
   assert.match(String(events[0]?.error), /reconcile \[--dry-run\]/);
   assert.match(String(events[1]?.error), /CLOUDFLARE_ACCOUNT_ID/);
   assert.match(String(events[2]?.error), /GITMATRIX_URL/);
+});
+
+await test("a rollback stops at its deadline when a bucket won't empty", async () => {
+  const fake = fakeCloudflare({});
+  const bucket = names("faster-search").bucket;
+  const base = fake.cloudflare.cf.bind(fake.cloudflare);
+  let deployed = false;
+  let lists = 0;
+  fake.cloudflare.cf = async (args, env) => {
+    const command = args.slice(0, 3).join(" ");
+    if (args[0] === "previews") deployed = true;
+    // After the deploy, the bucket's objects come back however often they're deleted.
+    if (deployed && command === "r2 objects list" && args.includes(bucket)) {
+      lists++;
+      return JSON.stringify([{ key: "back" }]);
+    }
+    if (deployed && command === "r2 objects bulk-delete") return "";
+    return base(args, env);
+  };
+  let now = 0;
+  const stderr = captureStderr();
+  try {
+    await assert.rejects(
+      create(
+        {
+          ...deps(fake.cloudflare),
+          seed: async () => {
+            throw new Error("seed broke");
+          },
+          clock: () => (now += 60_000),
+        },
+        job,
+      ),
+      /seed broke/,
+    );
+  } finally {
+    stderr.restore();
+  }
+  assert.ok(lists > 0 && lists < 20, String(lists));
+  const events = stderr.lines
+    .join("")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const failed = events.find((event) => event.event === "preview.create.rollback-failed");
+  assert.match(failed.error, /ran out of time/);
+  // The rest went: the Preview and the databases.
+  assert.equal(fake.previews.size, 0);
+  assert.deepEqual(fake.databases, []);
 });
