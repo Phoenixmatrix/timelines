@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { HarnessContext } from "./types.ts";
+import { absent, deleteArtifactsNamespace } from "./cloudflare-delete.ts";
 import { withFileLock } from "./heavy.ts";
 import {
   advanceQuota,
@@ -435,16 +436,6 @@ async function cf(env: Environment, args: string[], retryAuth = false): Promise<
 async function cfJson<T>(env: Environment, args: string[], retryAuth = false): Promise<T> {
   return JSON.parse(await cf(env, args, retryAuth)) as T;
 }
-function absent(error: unknown): boolean {
-  // Only explicit resource absence is idempotent, never permission/network failures.
-  return /\b404\b|resource not found|namespace not found|index not found|instance not found|gateway not found/i.test(
-    String(error),
-  );
-}
-/** Cloudflare's refusal to delete a namespace that still counts a repository (CORE-302). */
-function refusedNotEmpty(error: unknown): boolean {
-  return /namespace is not empty/i.test(String(error));
-}
 async function deleteIfPresent(env: Environment, args: string[]): Promise<void> {
   try {
     await cf(env, args, true);
@@ -562,59 +553,31 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
       } else if (resource === "vectors") {
         await deleteIfPresent(env, ["vectorize", "delete", env.id, "--force"]);
       } else {
-        const listed = async () => {
-          try {
-            return await cfJson<{ name: string }[]>(
-              env,
-              ["artifacts", "namespaces", "repos", "list", "--namespace", env.id, "--limit", "100"],
-              true,
-            );
-          } catch (error) {
-            if (absent(error)) return null;
-            throw error;
-          }
-        };
-        for (;;) {
-          const repos = await listed();
-          if (!repos?.length) break;
-          for (const repo of repos)
-            await deleteIfPresent(env, [
-              "artifacts",
-              "namespaces",
-              "repos",
-              "delete",
-              repo.name,
-              "--namespace",
-              env.id,
-              "--force",
-            ]);
-        }
-        try {
-          await deleteIfPresent(env, ["artifacts", "namespaces", "delete", env.id, "--force"]);
-          delete env.orphan;
-        } catch (error) {
-          // A known Artifacts bug: the namespace counts a repository that no list
-          // shows. Rather than hold a slot forever, orphan it once nothing listable
-          // is left: the journal keeps it, and every cleanup retries it.
-          if (!refusedNotEmpty(error) || (await listed())?.length) throw error;
-          env.resources.artifacts = "orphaned";
-          env.orphan ??= {
-            namespace: env.id,
-            at: new Date().toISOString(),
-            reason: redact(String(error)).slice(0, 500),
-          };
-          await persist(env);
-          console.error(
-            JSON.stringify({
-              event: "environment.orphaned",
-              id: env.id,
+        // A known Artifacts bug: the namespace counts a repository that no list
+        // shows. Rather than hold a slot forever, orphan it once nothing listable
+        // is left: the journal keeps it, and every cleanup retries it.
+        const outcome = await deleteArtifactsNamespace((args) => cf(env, args, true), env.id, {
+          onOrphan: async (error) => {
+            env.resources.artifacts = "orphaned";
+            env.orphan ??= {
               namespace: env.id,
-              message:
-                "Cloudflare refuses to delete this Artifacts namespace although it lists no repositories; its ownership journal is retained for cleanup retries.",
-            }),
-          );
-          continue;
-        }
+              at: new Date().toISOString(),
+              reason: redact(String(error)).slice(0, 500),
+            };
+            await persist(env);
+            console.error(
+              JSON.stringify({
+                event: "environment.orphaned",
+                id: env.id,
+                namespace: env.id,
+                message:
+                  "Cloudflare refuses to delete this Artifacts namespace although it lists no repositories; its ownership journal is retained for cleanup retries.",
+              }),
+            );
+          },
+        });
+        if (outcome === "orphaned") continue;
+        delete env.orphan;
       }
       env.resources[resource] = "deleted";
       await persist(env);

@@ -19,9 +19,10 @@
 # janitor both apply.
 #
 # Previews (CORE-80): each checkpoint of a timeline gets a preview of the app
-# (`on: preview`, the preview and preview-teardown jobs below), the reference
-# implementation of the preview contract; apps/website/README.md, "Gitmatrix's
-# own previews". Preview runs run only those two jobs.
+# (`on: preview`, the preview, preview-teardown and preview-reconcile jobs
+# below), the reference implementation of the preview contract;
+# apps/website/README.md, "Gitmatrix's own previews". Preview runs run only
+# those three jobs.
 #
 # Steps (CORE-237): every push to a timeline/<slug> bookmark also gets a step
 # run, the light check an agent's step deserves (CORE-235): only the step-*
@@ -216,3 +217,31 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Delete the timeline's preview
         run: node tools/preview/preview.ts teardown
+
+  # After each teardown: delete gitmatrix-preview-* resources no live preview
+  # owns (a create whose failure went unrecorded, a failed record, which never
+  # expires, a namespace Cloudflare wouldn't delete). Live timelines come from
+  # every source (deployments/live-timelines); one whose Preview isn't listed
+  # is only reported (CORE-216). No concurrency group, so a teardown never
+  # supersedes a waiting create: anything under two hours old (creates time out
+  # at 40 minutes), or sharing a name with something that young, is left. At
+  # most 20 deletions, none started (nor any cf call inside one) after 8
+  # minutes, and a short timeout: the teardown run completes only once this job
+  # ends, and ci.yml has no allow-failure. So the reconcile step exits 0
+  # whatever happens to it: any listing error deletes nothing, and skips, setup
+  # errors and failed deletions are logged (a failed teardown run makes the
+  # sweep start another). The job can still fail, e.g. if `pnpm install` does.
+  # A teardown runs the torn-down checkpoint's own reconcile code; answering
+  # anything but 200 from live-timelines stops it. See tools/preview/preview.ts.
+  preview-reconcile:
+    if: trigger == "preview" && action == "teardown" && runner == "sandbox"
+    needs: [preview-teardown]
+    timeout_minutes: 15
+    secrets: [CLOUDFLARE_API_TOKEN]
+    env:
+      CLOUDFLARE_ACCOUNT_ID: "0e28c6400ae60277d5330899f4db57e4"
+    steps:
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Delete what no live preview owns
+        run: node tools/preview/preview.ts reconcile --max 20

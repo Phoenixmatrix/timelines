@@ -21,11 +21,15 @@ function running(context: Partial<ConditionContext>): string[] {
   return pipeline.jobs.filter((job) => jobRuns(job, full)).map((job) => job.name);
 }
 
-test("a preview run runs only its action's job, and only in a Sandbox", () => {
+test("a preview run runs only its action's jobs, and only in a Sandbox", () => {
   expect(running({})).toEqual(["preview"]);
-  expect(running({ action: "teardown" })).toEqual(["preview-teardown"]);
+  // A teardown, then the reconcile of what no live preview owns (CORE-372).
+  expect(running({ action: "teardown" })).toEqual(["preview-teardown", "preview-reconcile"]);
   // After a timeline lands, its teardown and revivals run on main: still never a deploy.
-  expect(running({ action: "teardown", branch: "main" })).toEqual(["preview-teardown"]);
+  expect(running({ action: "teardown", branch: "main" })).toEqual([
+    "preview-teardown",
+    "preview-reconcile",
+  ]);
   expect(running({ branch: "main" })).toEqual(["preview"]);
   // A local server's preview runs deploy nothing (and run no E2E).
   expect(running({ runner: "local" })).toEqual([]);

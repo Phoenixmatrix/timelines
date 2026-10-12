@@ -395,6 +395,60 @@ describe("reading and updating", () => {
   });
 });
 
+describe("live timelines", () => {
+  test("a job sees every source's live timeline slugs, and nothing else", async () => {
+    const t = await setup();
+    t.sqlite.exec(`
+      INSERT INTO timeline_work_sources(source_id,repo_id,timeline_id,timeline_slug,owner_id,artifacts_name,artifacts_remote,state,allocation_operation_id,fork_source_id,fork_commit,fork_tree,fork_ref,initial_source_id,initial_commit,initial_tree,initial_ref,created_at,updated_at)
+      VALUES('work_a','repo','tl_a','search','acc_org','work-a','https://work-a','ready','allocate','canonical','c','t','refs/heads/main','canonical','c','t','refs/heads/main','2026-01-01','2026-01-01');
+      INSERT INTO deployments(repo_id,source_id,environment,timeline_slug,commit_oid,url,status) VALUES
+        ('repo','work_a','timeline/search','search','${oid(1)}','https://secret-a.example','active'),
+        ('repo','work_a','timeline/search','search','${oid(2)}','https://secret-b.example','sleeping'),
+        ('repo','canonical','timeline/zebra','zebra','${oid(3)}','https://z.example','sleeping'),
+        ('repo','canonical','timeline/gone','gone','${oid(4)}','https://g.example','expired'),
+        ('repo','canonical','timeline/broken','broken','${oid(5)}',NULL,'failed'),
+        ('repo','canonical','production',NULL,'${oid(6)}','https://app.example','active'),
+        ('other','canonical','timeline/elsewhere','elsewhere','${oid(7)}','https://e.example','active');
+      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, actor_id, status)
+        VALUES ('run9', 'other', 1, '${oid(9)}', 'main', 'push', 'acc_ann', 'running');
+      INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner)
+        VALUES ('job9', 'run9', 'other', 'reconcile', '{}', 'running', 'sandbox');
+    `);
+    const path = "/api/repos/orbit/app/deployments/live-timelines";
+    // The canonical source's job reads the work source's live timeline too.
+    const job = await t.call(t.tokens.preview, "GET", path);
+    expect(job.status).toBe(200);
+    expect(job.json).toEqual({ timelines: ["search", "zebra"] });
+    // Slugs only: no URL, commit, source or record crosses sources.
+    expect(JSON.stringify(job.json)).not.toMatch(/secret|example|work_a|0000/);
+    // Readers may ask too.
+    expect((await t.call(t.tokens.cat, "GET", path)).json).toEqual({
+      timelines: ["search", "zebra"],
+    });
+    // Another repository's job may not; nor may a job that has ended.
+    const other = await mintJobToken(t.env.DB, "job9", 30);
+    expect((await t.call(other, "GET", path)).status).toBe(403);
+    expect((await t.call(t.tokens.ended, "GET", path)).status).toBe(401);
+    expect(
+      (await t.call(other, "GET", "/api/repos/orbit/site/deployments/live-timelines")).json,
+    ).toEqual({ timelines: ["elsewhere"] });
+
+    // A work source's own job (the timeline's preview runs, since CORE-255)
+    // sees every source's too.
+    t.sqlite.exec(`
+      UPDATE timeline_work_sources SET initial_token_revoked=1 WHERE source_id='work_a';
+      INSERT INTO ci_runs (id, repo_id, source_id, number, commit_oid, ref, trigger, actor_id, status)
+        VALUES ('run10', 'repo', 'work_a', 10, '${oid(10)}', 'work', 'push', 'acc_ann', 'running');
+      INSERT INTO ci_jobs (id, run_id, repo_id, source_id, name, spec, status, runner)
+        VALUES ('job10', 'run10', 'repo', 'work_a', 'preview-reconcile', '{}', 'running', 'sandbox');
+    `);
+    const work = await mintJobToken(t.env.DB, "job10", 30);
+    const fromWork = await t.call(work, "GET", path);
+    expect(fromWork.status).toBe(200);
+    expect(fromWork.json).toEqual({ timelines: ["search", "zebra"] });
+  });
+});
+
 describe("placement", () => {
   test("infers the environment from the timeline, the environment, or the job's branch", () => {
     const job = { ref: "main", defaultBranch: "main" };

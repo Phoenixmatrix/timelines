@@ -14,10 +14,17 @@ import {
   jobFrom,
   names,
   previewUrl,
+  reconcile,
+  reconcileArgs,
+  liveDeployments,
+  reconcileMain,
+  RECONCILE_MAX,
   redact,
   teardown,
   waitForPreview,
   type Cloudflare,
+  type Deployments,
+  type ReconcileOptions,
 } from "./preview.ts";
 
 const WORKER_ID = "826276d4ee384ccd9e1f6635ab45011a";
@@ -38,6 +45,12 @@ function fakeCloudflare(state: {
   previews?: string[];
   /** Namespaces that count a repository no list shows (CORE-302): delete refuses. */
   stuck?: string[];
+  /** Creation times by name, for D1s, buckets and (with namespaceTimes) namespaces; else long ago. */
+  created?: Record<string, string>;
+  /** Whether the namespace listing carries created_at (its shape is undocumented). */
+  namespaceTimes?: boolean;
+  /** API listings (by path prefix) that fail with HTTP 500. */
+  failing?: string[];
 }) {
   const stuck = new Set(state.stuck ?? []);
   const databases = state.databases ?? [];
@@ -63,16 +76,17 @@ function fakeCloudflare(state: {
         return JSON.stringify({ uuid, name });
       }
       if (command.startsWith("d1 delete")) {
-        databases.splice(
-          databases.findIndex((d) => d.uuid === args[2]),
-          1,
-        );
+        const index = databases.findIndex((d) => d.uuid === args[2]);
+        if (index < 0)
+          throw new Error("APIError\n[7404] The database could not be found.\n404 Not Found");
+        databases.splice(index, 1);
         return "";
       }
       if (command.startsWith("d1 migrations")) return "";
       if (command === "r2 objects list") {
         const bucket = buckets[flag(args, "--bucket-name")];
-        if (!bucket) throw new Error("HTTP 404: The specified bucket does not exist.");
+        if (!bucket)
+          throw new Error("APIError\n[10006] The specified bucket does not exist.\n404 Not Found");
         return JSON.stringify(bucket.slice(0, 2).map((key) => ({ key })));
       }
       if (command === "r2 objects bulk-delete") {
@@ -82,7 +96,8 @@ function fakeCloudflare(state: {
         return "";
       }
       if (command === "r2 buckets delete") {
-        if (!buckets[args[3]!]) throw new Error("HTTP 404: no such bucket");
+        if (!buckets[args[3]!])
+          throw new Error("APIError\n[10006] The specified bucket does not exist.\n404 Not Found");
         if (buckets[args[3]!]!.length) throw new Error("bucket not empty");
         delete buckets[args[3]!];
         return "";
@@ -130,6 +145,70 @@ function fakeCloudflare(state: {
     },
     async api(method, path) {
       calls.push(`${method} ${path}`);
+      if (state.failing?.some((prefix) => path.startsWith(prefix)))
+        return {
+          status: 500,
+          body: { success: false, errors: [{ code: 10000, message: "down" }] },
+        };
+      const created = (name: string) => state.created?.[name] ?? "2026-01-01T00:00:00.000Z";
+      // Listings come in pages of two, whatever was asked, so tests cover paging.
+      const url = new URL(path, "https://api.example");
+      const cursor = Number(url.searchParams.get("cursor") ?? 0);
+      const paged = <T>(all: T[]) => ({
+        page: all.slice(cursor, cursor + 2),
+        next: cursor + 2 < all.length ? String(cursor + 2) : null,
+      });
+      if (method === "GET" && url.pathname === "/accounts/acct/d1/database") {
+        const page = Number(url.searchParams.get("page"));
+        const all = databases.filter((d) => d.name.includes(url.searchParams.get("name") ?? ""));
+        return {
+          status: 200,
+          body: {
+            success: true,
+            result: all
+              .slice((page - 1) * 2, page * 2)
+              .map((d) => ({ ...d, created_at: created(d.name) })),
+            result_info: { page, per_page: 2, total_count: all.length },
+          },
+        };
+      }
+      const bucket = /^\/accounts\/acct\/r2\/buckets\/([^/]+)$/.exec(url.pathname);
+      if (method === "GET" && bucket) {
+        const name = decodeURIComponent(bucket[1]!);
+        return buckets[name]
+          ? { status: 200, body: { success: true, result: { name, creation_date: created(name) } } }
+          : {
+              status: 404,
+              body: { success: false, errors: [{ code: 10006, message: "NoSuchBucket" }] },
+            };
+      }
+      if (method === "GET" && url.pathname === "/accounts/acct/r2/buckets") {
+        const contains = url.searchParams.get("name_contains") ?? "";
+        const { page, next } = paged(
+          Object.keys(buckets).filter((name) => name.includes(contains)),
+        );
+        return {
+          status: 200,
+          body: {
+            success: true,
+            result: { buckets: page.map((name) => ({ name, creation_date: created(name) })) },
+            result_info: next ? { cursor: next, per_page: 2 } : { per_page: 2 },
+          },
+        };
+      }
+      if (method === "GET" && url.pathname === "/accounts/acct/artifacts/namespaces") {
+        const { page, next } = paged(Object.keys(namespaces));
+        return {
+          status: 200,
+          body: {
+            success: true,
+            result: page.map((name) =>
+              state.namespaceTimes ? { name, created_at: created(name) } : { name },
+            ),
+            result_info: next ? { cursor: next, count: page.length } : { count: page.length },
+          },
+        };
+      }
       const base = "/accounts/acct/workers/workers/";
       if (method === "GET" && path === `${base}gitmatrix`)
         return {
@@ -668,4 +747,722 @@ await test("create still fails when the namespace create fails for another reaso
     return base(args, env);
   };
   await assert.rejects(create(deps(fake.cloudflare), job), /forbidden/);
+});
+
+// reconcile (CORE-372)
+
+const NOW = Date.parse("2026-10-11T12:00:00.000Z");
+const RECENT = "2026-10-11T11:30:00.000Z";
+
+/** Every resource names() gives a slug, as the fake account holds them. */
+function resourcesOf(slug: string, uuid = slug) {
+  const all = names(slug);
+  return {
+    databases: [
+      { uuid: `${uuid}-db`, name: all.db },
+      { uuid: `${uuid}-registry`, name: all.registryDb },
+    ],
+    buckets: { [all.bucket]: ["k"] },
+    namespaces: { [all.artifacts]: ["r"] },
+  };
+}
+
+function account(slugs: string[], extra: Parameters<typeof fakeCloudflare>[0] = {}) {
+  const merged = slugs.map((slug) => resourcesOf(slug));
+  return fakeCloudflare({
+    ...extra,
+    databases: [...merged.flatMap((r) => r.databases), ...(extra.databases ?? [])],
+    buckets: Object.assign({}, ...merged.map((r) => r.buckets), extra.buckets),
+    namespaces: Object.assign({}, ...merged.map((r) => r.namespaces), extra.namespaces),
+  });
+}
+
+/** Deployment records in any source; live-timelines answers the live ones' slugs. */
+function fakeDeployments(
+  records: { id: number; timeline: string | null; status?: string; source?: string }[],
+  options: { fail?: boolean | number } = {},
+) {
+  let asked = 0;
+  const deployments: Deployments = {
+    async liveTimelines() {
+      asked++;
+      if (options.fail === true) throw new Error("Listing live timelines returned HTTP 503.");
+      if (typeof options.fail === "number")
+        throw new Error(`Listing live timelines returned HTTP ${options.fail}.`);
+      return [
+        ...new Set(
+          records
+            .filter((r) => ["active", "sleeping"].includes(r.status ?? "active"))
+            .flatMap((r) => (r.timeline ? [r.timeline] : [])),
+        ),
+      ].toSorted();
+    },
+  };
+  return { deployments, asked: () => asked };
+}
+
+async function reconciling(
+  fake: ReturnType<typeof fakeCloudflare>,
+  deployments: Deployments,
+  options: Partial<ReconcileOptions> = {},
+) {
+  const events: Record<string, unknown>[] = [];
+  const result = await reconcile({
+    cloudflare: fake.cloudflare,
+    account: "acct",
+    deployments,
+    now: NOW,
+    log: (event) => events.push(event),
+    ...options,
+  });
+  const of = (name: string) => events.filter((event) => event.event === name);
+  return { result, events, of };
+}
+
+function left(fake: ReturnType<typeof fakeCloudflare>) {
+  return [
+    ...fake.databases.map((d) => d.name),
+    ...Object.keys(fake.buckets),
+    ...Object.keys(fake.namespaces),
+  ].toSorted();
+}
+
+await test("reconcile keeps live previews' resources and deletes every page of orphans", async () => {
+  const live = ["alive", "asleep", "third"];
+  const dead = ["gone", "gone-too"];
+  const fake = account([...live, ...dead], {
+    previews: live.map((slug) => names(slug).preview),
+    // Not a preview's: never listed for deletion.
+    databases: [{ uuid: "prod", name: "gitmatrix" }],
+  });
+  const { deployments, asked } = fakeDeployments([
+    { id: 1, timeline: "alive" },
+    { id: 2, timeline: "alive", source: "work-a" },
+    { id: 3, timeline: "third" },
+    { id: 4, timeline: "asleep", status: "sleeping" },
+    // A record with no timeline (production) says nothing about previews.
+    { id: 5, timeline: null },
+  ]);
+  const { result, of } = await reconciling(fake, deployments);
+  assert.equal(result.skipped, undefined);
+  assert.equal(asked(), 1);
+  const doomed = dead.flatMap((slug) => {
+    const all = names(slug);
+    return [
+      `database ${all.db}`,
+      `database ${all.registryDb}`,
+      `bucket ${all.bucket}`,
+      `namespace ${all.artifacts}`,
+    ];
+  });
+  assert.deepEqual(result.deleted.toSorted(), doomed.toSorted());
+  assert.equal(of("preview.reconcile.deleted").length, 8);
+  assert.equal(of("preview.reconcile.candidate").length, 8);
+  assert.deepEqual(
+    left(fake),
+    [
+      ...live.flatMap((slug) => [
+        names(slug).db,
+        names(slug).registryDb,
+        names(slug).bucket,
+        names(slug).artifacts,
+      ]),
+      "gitmatrix",
+    ].toSorted(),
+  );
+});
+
+await test("reconcile leaves young resources and their same-named siblings", async () => {
+  const fake = account(["alive", "fresh", "stale"], {
+    previews: [names("alive").preview],
+    // A create in flight (perhaps in another source): its D1 is new, and its
+    // namespace, whose listing carries no time, shares the D1's name.
+    created: { [names("fresh").db]: RECENT },
+  });
+  const { deployments } = fakeDeployments([{ id: 1, timeline: "alive" }]);
+  const { result, of } = await reconciling(fake, deployments);
+  const fresh = names("fresh");
+  assert.ok(left(fake).includes(fresh.db));
+  assert.ok(left(fake).includes(fresh.artifacts));
+  assert.ok(
+    of("preview.reconcile.skipped").some(
+      (e) => e.name === fresh.artifacts && e.reason === "created recently",
+    ),
+  );
+  // The registry D1 is old: nothing says a create still owns it.
+  assert.ok(result.deleted.includes(`database ${fresh.registryDb}`));
+  assert.ok(result.deleted.includes(`namespace ${names("stale").artifacts}`));
+  // With creation times, a namespace's own age counts too.
+  const timed = account(["alive", "new"], {
+    previews: [names("alive").preview],
+    namespaceTimes: true,
+    created: { [names("new").artifacts]: RECENT },
+  });
+  const again = await reconciling(
+    timed,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+  );
+  assert.ok(!again.result.deleted.some((d) => d.includes(names("new").artifacts)));
+  assert.ok(again.result.deleted.includes(`database ${names("new").registryDb}`));
+});
+
+await test("reconcile deletes the D1 it listed, and leaves a create's that replaced it", async () => {
+  // The reviewer's repro: x's D1 is listed as uuid "old"; before reconcile
+  // reaches it, a create starts and recreates it as "new".
+  const fake = account(["alive", "x", "gone"], { previews: [names("alive").preview] });
+  const x = names("x");
+  fake.databases.find((d) => d.name === x.db)!.uuid = "old";
+  const api = fake.cloudflare.api.bind(fake.cloudflare);
+  let listed = false;
+  fake.cloudflare.api = async (method, path) => {
+    const reply = await api(method, path);
+    if (path.startsWith("/accounts/acct/artifacts/namespaces") && !listed) {
+      // Reconcile's listings are done: the create runs.
+      listed = true;
+      fake.databases.find((d) => d.uuid === "old")!.uuid = "new";
+    }
+    return reply;
+  };
+  const { result, of } = await reconciling(
+    fake,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+  );
+  // Only the listed uuid was asked for; the create's D1, bucket and namespace stay.
+  const deletes = fake.calls.filter((call) => call.startsWith("d1 delete"));
+  assert.ok(deletes.includes("d1 delete old --force"));
+  assert.ok(!deletes.some((call) => call.includes(" new ")));
+  assert.ok(fake.databases.some((d) => d.uuid === "new" && d.name === x.db));
+  for (const name of [x.bucket, x.artifacts]) assert.ok(left(fake).includes(name), name);
+  assert.equal(
+    of("preview.reconcile.skipped").filter((e) => e.reason === "a D1 of its name exists now")
+      .length,
+    2,
+  );
+  // Nothing stops the true orphan: its D1 went first, then its bucket and namespace.
+  assert.ok(result.deleted.includes(`namespace ${names("gone").artifacts}`));
+  assert.ok(result.deleted.includes(`bucket ${names("gone").bucket}`));
+});
+
+await test("the D1 recheck reads every page, and fails closed", async () => {
+  // Many D1s contain "x"'s name (substring matches): the exact one is on the
+  // last page, so a lookup that read one page would miss it.
+  const x = names("x");
+  const fake = account(["alive", "x"], {
+    previews: [names("alive").preview],
+    databases: Array.from({ length: 7 }, (_, i) => ({ uuid: `c${i}`, name: `${x.db}-${i}` })),
+    // Young, so they stay listed through the recheck.
+    created: Object.fromEntries(Array.from({ length: 7 }, (_, i) => [`${x.db}-${i}`, RECENT])),
+  });
+  // x's own D1 is made after the listing (as by a create), so it lists last.
+  const api = fake.cloudflare.api.bind(fake.cloudflare);
+  const own = fake.databases.findIndex((d) => d.name === x.db);
+  const [made] = fake.databases.splice(own, 1);
+  let listed = false;
+  fake.cloudflare.api = async (method, path) => {
+    const reply = await api(method, path);
+    if (path.startsWith("/accounts/acct/artifacts/namespaces") && !listed) {
+      listed = true;
+      fake.databases.push(made!);
+    }
+    return reply;
+  };
+  const { of } = await reconciling(
+    fake,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+  );
+  for (const name of [x.bucket, x.artifacts]) assert.ok(left(fake).includes(name), name);
+  assert.ok(
+    of("preview.reconcile.skipped").some((e) => e.reason === "a D1 of its name exists now"),
+  );
+  // Eight matches in pages of two: the recheck read every page.
+  const rechecks = fake.calls.filter((call) =>
+    call.startsWith(`GET /accounts/acct/d1/database?name=${x.db}&`),
+  );
+  assert.ok(
+    rechecks.some((call) => call.endsWith("&page=4")),
+    rechecks.join("\n"),
+  );
+  // A lookup that fails leaves the bucket and namespace too.
+  const failing = account(["alive", "y"], { previews: [names("alive").preview] });
+  const y = names("y");
+  failing.databases.splice(
+    failing.databases.findIndex((d) => d.name === y.db),
+    1,
+  );
+  const base = failing.cloudflare.api.bind(failing.cloudflare);
+  // Only the recheck (by y's exact name) fails; the listings work.
+  failing.cloudflare.api = async (method, path) =>
+    path.startsWith(`/accounts/acct/d1/database?name=${y.db}&`)
+      ? { status: 500, body: { success: false } }
+      : base(method, path);
+  const failed = await reconciling(
+    failing,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+  );
+  assert.equal(failed.result.skipped, undefined);
+  for (const name of [y.bucket, y.artifacts]) assert.ok(left(failing).includes(name), name);
+  assert.equal(failed.result.failures.length, 2);
+});
+
+await test("reconcile ignores a live timeline names() rejects, and goes on", async () => {
+  const fake = account(["alive", "gone"], { previews: [names("alive").preview] });
+  const long = "x".repeat(65);
+  const { result, of } = await reconciling(
+    fake,
+    fakeDeployments([
+      { id: 1, timeline: "alive" },
+      { id: 2, timeline: long },
+      { id: 3, timeline: "Not_A_Slug" },
+    ]).deployments,
+  );
+  assert.equal(result.skipped, undefined);
+  assert.deepEqual(
+    of("preview.reconcile.ignored_slug").map((e) => e.timeline),
+    [JSON.stringify("Not_A_Slug"), JSON.stringify(long)].toSorted(),
+  );
+  assert.equal(result.deleted.length, 4);
+  assert.ok(left(fake).includes(names("alive").db));
+});
+
+await test("reconcile deletes at most --max per run", async () => {
+  const dead = ["a1", "a2", "a3"];
+  const fake = account(["alive", ...dead], { previews: [names("alive").preview] });
+  const { result, of } = await reconciling(
+    fake,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+    { max: 5 },
+  );
+  assert.equal(result.deleted.length, 5);
+  assert.equal(result.candidates.length, 12);
+  assert.equal(
+    of("preview.reconcile.skipped").filter((e) => e.reason === "over --max 5").length,
+    7,
+  );
+  assert.equal(RECONCILE_MAX, 20);
+});
+
+await test("reconcile fails closed: a listing error deletes nothing", async () => {
+  for (const failing of [
+    { deployments: true as boolean | number },
+    // A server older than live-timelines.
+    { deployments: 404 },
+    { path: "/accounts/acct/artifacts/namespaces" },
+    { path: "/accounts/acct/d1/database" },
+    { path: "/accounts/acct/r2/buckets" },
+    { path: "/accounts/acct/workers/workers/" },
+  ]) {
+    const fake = account(["alive", "gone"], {
+      previews: [names("alive").preview],
+      failing: failing.path ? [failing.path] : [],
+    });
+    const before = left(fake);
+    const { deployments } = fakeDeployments([{ id: 1, timeline: "alive" }], {
+      fail: failing.deployments,
+    });
+    const { result, of } = await reconciling(fake, deployments);
+    assert.equal(result.skipped, "a listing failed", JSON.stringify(failing));
+    assert.deepEqual(left(fake), before);
+    assert.equal(of("preview.reconcile.skipped").length, 1);
+    assert.ok(!fake.calls.some((call) => / delete |DELETE|bulk-delete/.test(call)));
+  }
+});
+
+await test("reconcile fails closed with no live record while the Worker has Previews", async () => {
+  const fake = account(["alive", "gone"], { previews: [names("alive").preview] });
+  const before = left(fake);
+  const { result } = await reconciling(fake, fakeDeployments([]).deployments);
+  assert.match(result.skipped ?? "", /no live deployment records/);
+  assert.deepEqual(left(fake), before);
+  // A timeline names() rejects owns nothing: it doesn't count as live.
+  const odd = await reconciling(
+    fake,
+    fakeDeployments([{ id: 1, timeline: "Not A Slug" }]).deployments,
+  );
+  assert.match(odd.result.skipped ?? "", /no live deployment records/);
+  assert.deepEqual(left(fake), before);
+  // No records and no Previews: everything is an orphan.
+  const empty = account(["gone"]);
+  const none = await reconciling(empty, fakeDeployments([]).deployments);
+  assert.equal(none.result.deleted.length, 4);
+});
+
+await test("reconcile reports live timelines whose Preview isn't listed, and acts on nothing of theirs", async () => {
+  const fake = account(["alive", "capped", "dozing"], {
+    previews: [names("alive").preview],
+  });
+  const before = left(fake);
+  const { deployments } = fakeDeployments([
+    { id: 1, timeline: "alive" },
+    { id: 2, timeline: "capped" },
+    { id: 3, timeline: "capped" },
+    // Sleeping: its Preview may be gone on purpose; reported all the same.
+    { id: 5, timeline: "dozing", status: "sleeping" },
+  ]);
+  const { result, of } = await reconciling(fake, deployments);
+  // Not listed isn't deleted (CORE-216): reported once per timeline, and the
+  // records' own expiry tears it down.
+  assert.deepEqual(
+    of("preview.reconcile.preview_missing").map((e) => [e.timeline, e.preview]),
+    [
+      ["capped", names("capped").preview],
+      ["dozing", names("dozing").preview],
+    ],
+  );
+  assert.deepEqual(result.deleted, []);
+  assert.deepEqual(left(fake), before);
+  // Read only: nothing but GETs reached the API.
+  assert.ok(
+    fake.calls.filter((call) => /^[A-Z]+ /.test(call)).every((call) => call.startsWith("GET ")),
+  );
+});
+
+await test("reconcile keeps another source's live timeline with no Preview listed at all", async () => {
+  // Since CORE-255 a timeline's records live in its work source. Its slug
+  // comes back from live-timelines all the same, with the Worker listing no
+  // Previews (CORE-216, or asleep), so nothing of it may go.
+  const fake = account(["elsewhere", "gone"]);
+  const { result, of } = await reconciling(
+    fake,
+    fakeDeployments([{ id: 1, timeline: "elsewhere", source: "work-b" }]).deployments,
+  );
+  assert.equal(result.skipped, undefined);
+  for (const name of Object.values(names("elsewhere")))
+    if (name !== names("elsewhere").preview) assert.ok(left(fake).includes(name), name);
+  assert.equal(result.deleted.length, 4);
+  assert.deepEqual(
+    of("preview.reconcile.preview_missing").map((e) => e.timeline),
+    ["elsewhere"],
+  );
+});
+
+await test("Previews are listed to an empty or short page, never to total_count", async () => {
+  const all = ["p1", "p2", "p3", "p4", "p5", "p6"].map((slug) => names(slug).preview);
+  for (const shape of ["no total_count", "no result_info", "a wrong total_count"] as const) {
+    const fake = account(["alive", "p6"], { previews: all });
+    const base = fake.cloudflare.api.bind(fake.cloudflare);
+    fake.cloudflare.api = async (method, path) => {
+      const reply = await base(method, path);
+      if (!/\/previews\?/.test(path)) return reply;
+      const body = { ...(reply.body as { result_info: Record<string, unknown> }) };
+      if (shape === "no total_count")
+        body.result_info = { ...body.result_info, total_count: undefined };
+      else if (shape === "no result_info") delete (body as { result_info?: unknown }).result_info;
+      else body.result_info = { ...body.result_info, total_count: 2 };
+      return { ...reply, body };
+    };
+    // p6's Preview is on the last page (of three, in pages of two), with no
+    // record: its resources stay only if every page was read.
+    const { result } = await reconciling(
+      fake,
+      fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+    );
+    assert.deepEqual(result.deleted, [], shape);
+    assert.ok(left(fake).includes(names("p6").db), shape);
+    const pages = fake.calls.filter((call) => /\/previews\?/.test(call)).length;
+    // A full last page needs one more, empty, to end.
+    assert.equal(pages, 4, shape);
+  }
+});
+
+await test("a short page ends a listing only once total_count is reached, and a repeated page throws", async () => {
+  const previewPages = (calls: string[]) =>
+    calls.filter((call) => /\/previews\?/.test(call)).length;
+  const five = ["p1", "p2", "p3", "p4", "p5"].map((slug) => names(slug).preview);
+  for (const [total, pages] of [
+    [5, 3], // short third page, total reached: done
+    [9, 4], // short third page, but total says more: read on to the empty page
+    [undefined, 3], // no total: the short page ends it
+  ] as const) {
+    const fake = account(["alive"], { previews: five });
+    const base = fake.cloudflare.api.bind(fake.cloudflare);
+    fake.cloudflare.api = async (method, path) => {
+      const reply = await base(method, path);
+      if (!/\/previews\?/.test(path)) return reply;
+      const body = reply.body as { result_info: Record<string, unknown> };
+      return {
+        ...reply,
+        body: { ...body, result_info: { ...body.result_info, total_count: total } },
+      };
+    };
+    // deletePreview (create's and teardown's) finds the Preview on the last page.
+    await deletePreview(fake.cloudflare, "acct", names("p5").preview);
+    assert.ok(!fake.previews.has(names("p5").preview), String(total));
+    // Its own two listings (find, then confirm it's gone with one fewer).
+    assert.ok(previewPages(fake.calls) >= pages, `${total}: ${previewPages(fake.calls)}`);
+  }
+  // A server that answers the same page whatever is asked would loop forever.
+  const looping = account(["alive", "gone"], { previews: five });
+  const base = looping.cloudflare.api.bind(looping.cloudflare);
+  looping.cloudflare.api = (method, path) =>
+    base(method, /\/previews\?/.test(path) ? path.replace(/&page=\d+/, "&page=1") : path);
+  await assert.rejects(
+    deletePreview(looping.cloudflare, "acct", names("p5").preview),
+    /repeated a page/,
+  );
+  const before = left(looping);
+  const { result } = await reconciling(
+    looping,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+  );
+  assert.equal(result.skipped, "a listing failed");
+  assert.deepEqual(left(looping), before);
+});
+
+await test("a full last page ends the Previews listing when the next page is refused or repeated", async () => {
+  // At exactly a multiple of the page size (as at the 500-Preview cap) every
+  // listing asks for one page more; a server that refuses it, or answers the
+  // last page again, has already shown all it counted.
+  const four = ["p1", "p2", "p3", "p4"].map((slug) => names(slug).preview);
+  for (const past of ["refused", "repeated"] as const) {
+    const fake = account(["alive"], { previews: four });
+    const base = fake.cloudflare.api.bind(fake.cloudflare);
+    fake.cloudflare.api = async (method, path) => {
+      if (!/\/previews\?/.test(path) || !/&page=3\b/.test(path)) return base(method, path);
+      if (past === "refused") return { status: 400, body: { success: false, errors: [] } };
+      return base(method, path.replace(/&page=3\b/, "&page=2"));
+    };
+    await deletePreview(fake.cloudflare, "acct", names("p4").preview);
+    assert.ok(!fake.previews.has(names("p4").preview), past);
+  }
+  // Below the counted total, a refused page is still an error.
+  const short = account(["alive"], { previews: four });
+  const base = short.cloudflare.api.bind(short.cloudflare);
+  short.cloudflare.api = async (method, path) =>
+    /\/previews\?/.test(path) && /&page=2\b/.test(path)
+      ? { status: 500, body: { success: false, errors: [] } }
+      : base(method, path);
+  await assert.rejects(
+    deletePreview(short.cloudflare, "acct", names("p4").preview),
+    /returned HTTP 500/,
+  );
+});
+
+await test("reconcile stops inside a deletion at its deadline, and no resource goes first every run", async () => {
+  // A bucket that never empties (its objects come back): without a deadline
+  // the loop would run forever, and every later teardown with it.
+  const fake = account(["alive", "stuck", "other"], { previews: [names("alive").preview] });
+  const stuck = names("stuck").bucket;
+  const cf = fake.cloudflare.cf.bind(fake.cloudflare);
+  let lists = 0;
+  fake.cloudflare.cf = async (args, env) => {
+    if (args.slice(0, 3).join(" ") === "r2 objects list" && args.includes(stuck)) lists++;
+    if (args.slice(0, 3).join(" ") === "r2 objects bulk-delete" && args.includes(stuck)) return "";
+    return cf(args, env);
+  };
+  let now = 0;
+  const clock = () => (now += 1_000);
+  // The stuck name first.
+  const first = (name: string) => (groups: { name: string }[][]) =>
+    groups.toSorted((a, b) => Number(b[0]!.name === name) - Number(a[0]!.name === name));
+  const run = await reconciling(fake, fakeDeployments([{ id: 1, timeline: "alive" }]).deployments, {
+    clock,
+    budgetMs: 60_000,
+    order: first(stuck) as never,
+  });
+  assert.ok(lists > 0 && lists < 60, String(lists));
+  assert.ok(
+    run.result.failures.some((f) => f.startsWith(`bucket ${stuck}`) && /ran out of time/.test(f)),
+  );
+  assert.ok(run.of("preview.reconcile.skipped").some((e) => e.reason === "out of time"));
+  // Another run in another order gets to the rest first.
+  now = 0;
+  const next = await reconciling(
+    fake,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+    {
+      clock,
+      budgetMs: 60_000,
+      order: first(names("other").db) as never,
+    },
+  );
+  assert.ok(next.result.deleted.includes(`bucket ${names("other").bucket}`));
+  assert.ok(next.result.deleted.includes(`namespace ${names("other").artifacts}`));
+});
+
+await test("reconcile leaves a bucket recreated since it was listed", async () => {
+  const created: Record<string, string> = {};
+  const fake = account(["alive", "x"], { previews: [names("alive").preview], created });
+  const x = names("x");
+  // x's D1 is gone already (a create's teardown); its bucket is recreated
+  // after reconcile's listing.
+  fake.databases.splice(
+    fake.databases.findIndex((d) => d.name === x.db),
+    1,
+  );
+  const api = fake.cloudflare.api.bind(fake.cloudflare);
+  fake.cloudflare.api = async (method, path) => {
+    const reply = await api(method, path);
+    if (path.startsWith("/accounts/acct/artifacts/namespaces")) created[x.bucket] = RECENT;
+    return reply;
+  };
+  const { result, of } = await reconciling(
+    fake,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+  );
+  assert.deepEqual(fake.buckets[x.bucket], ["k"]);
+  assert.ok(!fake.calls.some((call) => call.startsWith("r2 objects") && call.includes(x.bucket)));
+  assert.ok(
+    of("preview.reconcile.skipped").some(
+      (e) => e.name === x.bucket && /isn't the one listed/.test(String(e.reason)),
+    ),
+  );
+  assert.ok(!result.deleted.includes(`bucket ${x.bucket}`));
+});
+
+await test("reconcile --dry-run logs candidates and changes nothing", async () => {
+  const fake = account(["alive", "gone", "capped"], { previews: [names("alive").preview] });
+  const before = left(fake);
+  const { deployments } = fakeDeployments([
+    { id: 1, timeline: "alive" },
+    { id: 2, timeline: "capped" },
+  ]);
+  const { result, of } = await reconciling(fake, deployments, { dryRun: true });
+  assert.deepEqual(left(fake), before);
+  assert.equal(result.candidates.length, 4);
+  assert.equal(of("preview.reconcile.candidate").length, 4);
+  assert.equal(of("preview.reconcile.deleted").length, 0);
+  assert.equal(of("preview.reconcile").at(-1)?.dryRun, true);
+});
+
+await test("reconcile never deletes a live name, even one another slug also maps to (CORE-377)", async () => {
+  // "registry-foo"'s D1 has the name of "foo"'s registry D1.
+  const fake = account(["registry-foo", "foo"], {
+    previews: [names("registry-foo").preview],
+  });
+  assert.equal(names("registry-foo").db, names("foo").registryDb);
+  const { result } = await reconciling(
+    fake,
+    fakeDeployments([{ id: 1, timeline: "registry-foo" }]).deployments,
+  );
+  assert.ok(left(fake).includes(names("registry-foo").db));
+  assert.ok(result.deleted.includes(`database ${names("foo").db}`));
+  assert.ok(!result.deleted.includes(`database ${names("foo").registryDb}`));
+});
+
+await test("reconcile keeps what a Preview without a readable record may own", async () => {
+  // A Preview whose record is in a source this job doesn't read.
+  const elsewhere = account(["alive", "other-source", "gone"], {
+    previews: [names("alive").preview, names("other-source").preview],
+  });
+  const kept = await reconciling(
+    elsewhere,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+  );
+  for (const name of Object.values(names("other-source")))
+    if (name !== names("other-source").preview) assert.ok(left(elsewhere).includes(name), name);
+  assert.equal(kept.result.deleted.length, 4);
+  // A Preview names() didn't make could own anything.
+  const foreign = account(["alive", "gone"], {
+    previews: [names("alive").preview, "someone-elses"],
+  });
+  const before = left(foreign);
+  const all = await reconciling(
+    foreign,
+    fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+  );
+  assert.deepEqual(all.result.deleted, []);
+  assert.deepEqual(left(foreign), before);
+  // A hashed name looks like a plain one, so a long slug's names can't be
+  // read back; its hashed Preview still protects all of them.
+  for (const long of [`${"l".repeat(40)}-${"m".repeat(20)}`, `${"k".repeat(45)}`]) {
+    const hashed = account(["alive", long, "gone"], {
+      previews: [names("alive").preview, names(long).preview],
+    });
+    assert.ok(!names(long).preview.endsWith(long));
+    const unknown = await reconciling(
+      hashed,
+      fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+    );
+    for (const name of [names(long).db, names(long).registryDb, names(long).artifacts])
+      assert.ok(left(hashed).includes(name), name);
+    assert.ok(
+      unknown
+        .of("preview.reconcile.skipped")
+        .some((e) => e.name === names(long).db && /no live record explains/.test(String(e.reason))),
+    );
+    assert.ok(unknown.result.deleted.includes(`database ${names("gone").db}`));
+  }
+});
+
+await test("reconcile reports an orphaned namespace Cloudflare won't delete, and goes on", async () => {
+  const fake = account(["alive", "stuck-one", "gone"], {
+    previews: [names("alive").preview],
+    stuck: [names("stuck-one").artifacts],
+  });
+  const stderr = captureStderr();
+  try {
+    const { result, of } = await reconciling(
+      fake,
+      fakeDeployments([{ id: 1, timeline: "alive" }]).deployments,
+    );
+    assert.ok(
+      of("preview.reconcile.deleted").some(
+        (e) => e.name === names("stuck-one").artifacts && e.outcome === "orphaned",
+      ),
+    );
+    assert.ok(result.deleted.includes(`namespace ${names("gone").artifacts}`));
+    assert.deepEqual(result.failures, []);
+  } finally {
+    stderr.restore();
+  }
+});
+
+await test("reconcile takes --dry-run and --max", () => {
+  assert.deepEqual(reconcileArgs([]), { dryRun: false, max: 20 });
+  assert.deepEqual(reconcileArgs(["--dry-run", "--max", "3"]), { dryRun: true, max: 3 });
+  for (const bad of [["--max"], ["--max", "0"], ["--max", "x"], ["--force"]])
+    assert.throws(() => reconcileArgs(bad), /reconcile \[--dry-run\] \[--max N\]/);
+});
+
+await test("liveDeployments asks live-timelines with the job's credential, and a timeout", async () => {
+  const requests: { url: string; auth: string | null; signal: boolean }[] = [];
+  let answer: Response = Response.json({ timelines: ["a", "b"] });
+  const request = (async (input: string | URL | Request, init?: RequestInit) => {
+    requests.push({
+      url: input instanceof Request ? input.url : input.toString(),
+      auth: new Headers(init?.headers).get("authorization"),
+      signal: init?.signal instanceof AbortSignal,
+    });
+    return answer;
+  }) as typeof fetch;
+  const live = liveDeployments(
+    {
+      GITMATRIX_URL: "https://gm.example/",
+      GITMATRIX_REPOSITORY: "matrixorg/timelines",
+      GITMATRIX_TOKEN: "gmj_secret",
+    },
+    request,
+  );
+  assert.deepEqual(await live.liveTimelines(), ["a", "b"]);
+  assert.deepEqual(requests, [
+    {
+      url: "https://gm.example/api/repos/matrixorg/timelines/deployments/live-timelines",
+      auth: "Bearer gmj_secret",
+      signal: true,
+    },
+  ]);
+  // An older server has no such route: an error, so reconcile skips.
+  answer = Response.json({ error: "Not found" }, { status: 404 });
+  await assert.rejects(live.liveTimelines(), /HTTP 404/);
+  answer = Response.json({ timelines: [1] });
+  await assert.rejects(live.liveTimelines(), /isn't a list of slugs/);
+  assert.throws(
+    () => liveDeployments({ GITMATRIX_URL: "https://gm.example" }),
+    /GITMATRIX_REPOSITORY/,
+  );
+});
+
+await test("reconcileMain never fails its job: setup errors are logged as skipped", async () => {
+  const events: Record<string, unknown>[] = [];
+  const log = (event: Record<string, unknown>) => events.push(event);
+  await reconcileMain(["--max", "nope"], {}, log);
+  await reconcileMain([], {}, log);
+  await reconcileMain([], { CLOUDFLARE_ACCOUNT_ID: "acct", CLOUDFLARE_API_TOKEN: "t" }, log);
+  assert.deepEqual(
+    events.map((e) => [e.event, e.reason]),
+    Array(3).fill(["preview.reconcile.skipped", "an error stopped it"]),
+  );
+  assert.match(String(events[0]?.error), /reconcile \[--dry-run\]/);
+  assert.match(String(events[1]?.error), /CLOUDFLARE_ACCOUNT_ID/);
+  assert.match(String(events[2]?.error), /GITMATRIX_URL/);
 });

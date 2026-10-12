@@ -100,6 +100,15 @@ export interface DeploymentList {
   next: number | null;
 }
 
+/**
+ * GET /api/repos/:owner/:name/deployments/live-timelines: the slugs of the
+ * timelines with an active or sleeping deployment in any of the repository's
+ * sources, and nothing else (CORE-372).
+ */
+export interface LiveTimelineList {
+  timelines: string[];
+}
+
 /** POST /api/repos/:owner/:name/deployments. */
 export interface RecordDeployment {
   /** Default: the job's commit inside CI; required otherwise. */

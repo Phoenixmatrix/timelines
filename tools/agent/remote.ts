@@ -27,6 +27,7 @@ import type { RemoteEnvironment, OwnedResources } from "./remote-environment.ts"
 import { syncSources, retrieveArtifact } from "./remote-sync.ts";
 import type { RemoteRequest } from "./remote-protocol.ts";
 import { writeRemoteBuild } from "./remote-build.ts";
+import { deleteArtifactsNamespace } from "./cloudflare-delete.ts";
 import { installRemoteMaintenance } from "./maintenance.ts";
 import { advanceQuota, readEnvironmentLimits } from "./quota.ts";
 import { parseReservationArgs, reconcileReservations, sweepReservations } from "./reservations.ts";
@@ -763,42 +764,11 @@ async function removeOwnedChild(
         await remove(["ai-gateway", "gateways", "delete", owned.id, "--force"]);
       else if (resource === "vectors") await remove(["vectorize", "delete", owned.id, "--force"]);
       else {
-        for (;;) {
-          let repos: { name: string }[];
-          try {
-            repos = JSON.parse(
-              await cf(
-                [
-                  "artifacts",
-                  "namespaces",
-                  "repos",
-                  "list",
-                  "--namespace",
-                  owned.id,
-                  "--limit",
-                  "100",
-                ],
-                options,
-              ),
-            ) as { name: string }[];
-          } catch (error) {
-            if (cfApiNotFound(safeMessage(error))) break;
-            throw error;
-          }
-          if (!repos.length) break;
-          for (const repo of repos)
-            await remove([
-              "artifacts",
-              "namespaces",
-              "repos",
-              "delete",
-              repo.name,
-              "--namespace",
-              owned.id,
-              "--force",
-            ]);
-        }
-        await remove(["artifacts", "namespaces", "delete", owned.id, "--force"]);
+        // No onOrphan: a namespace Cloudflare refuses as not empty stays
+        // pending and is retried, as every other failure here.
+        await deleteArtifactsNamespace((args) => cf(args, options), owned.id, {
+          absent: (error) => cfApiNotFound(safeMessage(error)),
+        });
       }
       owned.resources[resource] = "deleted";
       await persistRemote(record);
