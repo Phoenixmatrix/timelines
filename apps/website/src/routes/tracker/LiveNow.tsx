@@ -106,8 +106,17 @@ export function latestByAgent(records: StepFeedRecord[]) {
   return [...byAgent.values()].sort((a, b) => b.latest.at.localeCompare(a.latest.at));
 }
 
-export function LiveNow({ owner, timeline }: { owner: string; timeline: Timeline }) {
-  const { records, live } = useStepFeed(timeline);
+/** The feed is the page's (useStepFeed), shared with the timeline's observability view. */
+export function LiveNow({
+  owner,
+  timeline,
+  feed,
+}: {
+  owner: string;
+  timeline: Timeline;
+  feed: ReturnType<typeof useStepFeed>;
+}) {
+  const { records, live } = feed;
   // Relative times move on.
   const [, tick] = useState(0);
   useEffect(() => {

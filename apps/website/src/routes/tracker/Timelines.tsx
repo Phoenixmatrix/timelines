@@ -48,7 +48,8 @@ import { DoneInTimelineIcon, statusLabel } from "./ui.tsx";
 import { PreviewLink, ReviveButton } from "./Checkpoint.tsx";
 import { LandingPanel } from "./Landing.tsx";
 import { useRememberPlace } from "../../lib/recentPlaces.ts";
-import { LiveNow } from "./LiveNow.tsx";
+import { LiveNow, useStepFeed } from "./LiveNow.tsx";
+import { TimelineObservability } from "./TimelineObservability.tsx";
 import { PersonLink } from "../../components/PersonLink.tsx";
 import { RecentAgents } from "../../components/RecentAgents.tsx";
 
@@ -99,6 +100,13 @@ function StatusDot({ status }: { status: TimelineStatus }) {
   return <span className={`size-2 shrink-0 rounded-full ${STATUS_DOT[status]}`} aria-hidden />;
 }
 
+/** No timeline selected: a feed with nothing to read. */
+const NO_TIMELINE: Pick<Timeline, "slug" | "repos" | "status"> = {
+  slug: "",
+  repos: [],
+  status: "landed",
+};
+
 export function TrackerTimelines() {
   const data = useLoaderData<typeof trackerTimelinesLoader>();
   const navigate = useNavigate();
@@ -112,6 +120,8 @@ export function TrackerTimelines() {
   const base = `/tracker/${encodeURIComponent(owner)}/timelines`;
   const slug = params.get("tl");
   const selected = slug ? (data.timelines.find((t) => t.slug === slug) ?? null) : null;
+  // One live feed for the selected timeline: Live now and its observability view share it.
+  const feed = useStepFeed(selected ?? NO_TIMELINE);
   const byId = useMemo(() => new Map(data.timelines.map((t) => [t.id, t])), [data.timelines]);
   useRememberPlace(
     selected
@@ -318,117 +328,128 @@ export function TrackerTimelines() {
           </div>
 
           <div className="grid min-w-0 items-start gap-4 xl:grid-cols-[minmax(0,1fr)_22rem]">
-            <section
-              className="min-w-0 overflow-x-auto rounded-pane bg-pane"
-              aria-label="Timeline graph"
-            >
-              <p className="m-0 border-b border-line-soft px-3 py-2 text-body-sm text-ink-muted">
-                Select a row to view a timeline and use it across the app.
-              </p>
-              <ol
-                className="relative m-0 list-none p-0"
-                style={{ minWidth: width + 240 }}
-                onMouseLeave={() => setHovered(null)}
+            <div className="flex min-w-0 flex-col gap-4">
+              <section
+                className="min-w-0 overflow-x-auto rounded-pane bg-pane"
+                aria-label="Timeline graph"
               >
-                <LaneDrawing graph={graph} selected={selected?.id ?? null} hovered={hovered} />
-                {graph.rows.map((row, r) => {
-                  const t = row.timeline;
-                  const isSelected = r === selectedRow && (selected ? true : row.kind === "main");
-                  const selectable =
-                    row.kind === "main" ||
-                    row.kind === "head" ||
-                    row.kind === "abandon" ||
-                    row.kind === "landing" ||
-                    row.kind === "landed";
-                  return (
-                    <li
-                      key={row.key}
-                      data-kind={row.kind}
-                      className={`relative flex items-center gap-2 border-t border-line-soft pr-3 text-body-sm first:border-t-0 ${isSelected ? "bg-signal-wash" : "hover:bg-raised"}`}
-                      style={{ height: ROW_HEIGHT, paddingLeft: width + 4 }}
-                      onMouseEnter={() => setHovered(t?.id ?? null)}
-                    >
-                      {selectable && (
-                        <Link
-                          to={select(t)}
-                          aria-label={`Select ${t?.name ?? "main"}`}
-                          aria-current={isSelected ? "true" : undefined}
-                          className="absolute inset-0 z-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-signal"
-                          title={t ? `${t.name} (${t.slug})` : "main"}
-                        />
-                      )}
-                      <span
-                        className={`min-w-0 flex-1 truncate ${selectable ? "pointer-events-none" : ""}`}
+                <p className="m-0 border-b border-line-soft px-3 py-2 text-body-sm text-ink-muted">
+                  Select a row to view a timeline and use it across the app.
+                </p>
+                <ol
+                  className="relative m-0 list-none p-0"
+                  style={{ minWidth: width + 240 }}
+                  onMouseLeave={() => setHovered(null)}
+                >
+                  <LaneDrawing graph={graph} selected={selected?.id ?? null} hovered={hovered} />
+                  {graph.rows.map((row, r) => {
+                    const t = row.timeline;
+                    const isSelected = r === selectedRow && (selected ? true : row.kind === "main");
+                    const selectable =
+                      row.kind === "main" ||
+                      row.kind === "head" ||
+                      row.kind === "abandon" ||
+                      row.kind === "landing" ||
+                      row.kind === "landed";
+                    return (
+                      <li
+                        key={row.key}
+                        data-kind={row.kind}
+                        className={`relative flex items-center gap-2 border-t border-line-soft pr-3 text-body-sm first:border-t-0 ${isSelected ? "bg-signal-wash" : "hover:bg-raised"}`}
+                        style={{ height: ROW_HEIGHT, paddingLeft: width + 4 }}
+                        onMouseEnter={() => setHovered(t?.id ?? null)}
                       >
-                        {row.kind === "main" ? (
-                          <>
-                            <span className="font-mono font-semibold text-ink">main</span>
-                            <span className="text-ink-faint"> where every timeline lands</span>
-                          </>
-                        ) : (
-                          <RowText
-                            row={row}
-                            name={(timeline) =>
-                              selectable && timeline?.id === t?.id ? (
-                                <span className="font-semibold text-ink">{timeline?.name}</span>
-                              ) : (
-                                name(timeline, row.kind === "head")
-                              )
-                            }
-                            commit={rowMeta(row)}
+                        {selectable && (
+                          <Link
+                            to={select(t)}
+                            aria-label={`Select ${t?.name ?? "main"}`}
+                            aria-current={isSelected ? "true" : undefined}
+                            className="absolute inset-0 z-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-signal"
+                            title={t ? `${t.name} (${t.slug})` : "main"}
                           />
                         )}
-                        {t?.experimental && row.kind === "head" && (
-                          <span className="mk-chip mk-chip--tag ml-2">Experimental</span>
-                        )}
-                      </span>
-                      {selectable && (
                         <span
-                          className={`pointer-events-none shrink-0 text-micro ${isSelected ? "font-semibold text-signal" : "text-ink-muted"}`}
+                          className={`min-w-0 flex-1 truncate ${selectable ? "pointer-events-none" : ""}`}
                         >
-                          {isSelected ? "Selected" : "Select"}
+                          {row.kind === "main" ? (
+                            <>
+                              <span className="font-mono font-semibold text-ink">main</span>
+                              <span className="text-ink-faint"> where every timeline lands</span>
+                            </>
+                          ) : (
+                            <RowText
+                              row={row}
+                              name={(timeline) =>
+                                selectable && timeline?.id === t?.id ? (
+                                  <span className="font-semibold text-ink">{timeline?.name}</span>
+                                ) : (
+                                  name(timeline, row.kind === "head")
+                                )
+                              }
+                              commit={rowMeta(row)}
+                            />
+                          )}
+                          {t?.experimental && row.kind === "head" && (
+                            <span className="mk-chip mk-chip--tag ml-2">Experimental</span>
+                          )}
                         </span>
-                      )}
-                      {t && row.kind === "landed" && (
-                        <button
-                          type="button"
-                          className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
-                          aria-label={`Draw ${t.name}'s lane`}
-                          onClick={() => toggleExpanded(t.id)}
-                        >
-                          Show lane
-                        </button>
-                      )}
-                      {t && row.kind === "landing" && expanded.has(t.id) && (
-                        <button
-                          type="button"
-                          className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
-                          aria-label={`Fold ${t.name} onto main`}
-                          onClick={() => toggleExpanded(t.id)}
-                        >
-                          Fold
-                        </button>
-                      )}
-                      {row.at && (
-                        <time
-                          className="pointer-events-none shrink-0 text-micro text-ink-faint tabular-nums max-sm:hidden"
-                          dateTime={row.at}
-                          title={fullDate(row.at)}
-                        >
-                          {timeAgo(row.at)}
-                        </time>
-                      )}
-                    </li>
-                  );
-                })}
-              </ol>
-            </section>
+                        {selectable && (
+                          <span
+                            className={`pointer-events-none shrink-0 text-micro ${isSelected ? "font-semibold text-signal" : "text-ink-muted"}`}
+                          >
+                            {isSelected ? "Selected" : "Select"}
+                          </span>
+                        )}
+                        {t && row.kind === "landed" && (
+                          <button
+                            type="button"
+                            className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
+                            aria-label={`Draw ${t.name}'s lane`}
+                            onClick={() => toggleExpanded(t.id)}
+                          >
+                            Show lane
+                          </button>
+                        )}
+                        {t && row.kind === "landing" && expanded.has(t.id) && (
+                          <button
+                            type="button"
+                            className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
+                            aria-label={`Fold ${t.name} onto main`}
+                            onClick={() => toggleExpanded(t.id)}
+                          >
+                            Fold
+                          </button>
+                        )}
+                        {row.at && (
+                          <time
+                            className="pointer-events-none shrink-0 text-micro text-ink-faint tabular-nums max-sm:hidden"
+                            dateTime={row.at}
+                            title={fullDate(row.at)}
+                          >
+                            {timeAgo(row.at)}
+                          </time>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ol>
+              </section>
+              {selected && (
+                <TimelineObservability
+                  key={selected.slug}
+                  owner={owner}
+                  timeline={selected}
+                  feed={feed.records}
+                />
+              )}
+            </div>
 
             <aside className="flex min-w-0 flex-col gap-4 xl:sticky xl:top-[calc(var(--scope-banner)+0.75rem)]">
               <section className="rounded-pane bg-pane p-4" aria-label="Selected timeline">
                 {selected ? (
                   <TimelineDetails
                     timeline={selected}
+                    feed={feed}
                     data={data}
                     byId={byId}
                     name={name}
@@ -656,6 +677,7 @@ function TimelineIssues({ timeline, data }: { timeline: Timeline; data: Timeline
 
 function TimelineDetails({
   timeline,
+  feed,
   data,
   byId,
   name,
@@ -663,6 +685,7 @@ function TimelineDetails({
   onChange,
 }: {
   timeline: Timeline;
+  feed: ReturnType<typeof useStepFeed>;
   data: TimelineGraphData;
   byId: Map<string, Timeline>;
   name: (timeline: Timeline | null) => ReactNode;
@@ -800,7 +823,7 @@ function TimelineDetails({
         })}
       </ul>
 
-      <LiveNow owner={data.owner.slug} timeline={timeline} />
+      <LiveNow owner={data.owner.slug} timeline={timeline} feed={feed} />
 
       <TimelineCheckpoints owner={data.owner.slug} timeline={timeline} actor={actor} />
 
