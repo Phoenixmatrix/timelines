@@ -319,6 +319,23 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   validateQueueIssues(access: Access, issueIds: string[]) {
     return this.reply(() => this.store.validateQueueIssues(access, issueIds));
   }
+  /**
+   * Approve an open checkpoint approval on its person's approve-when-green
+   * setting (CORE-378); `access` is that person's. Null when it no longer applies.
+   */
+  autoApprove(access: Access, requestId: string, checkpointId: string) {
+    return this.reply(() => this.store.autoApprove(access, requestId, checkpointId));
+  }
+  /** Why approve-when-green left an approval to its person (CORE-378). */
+  noteAutoApproveSkipped(access: Access, requestId: string, checkpointId: string, reason: string) {
+    return this.reply(() =>
+      this.store.noteAutoApproveSkipped(access, requestId, checkpointId, reason),
+    );
+  }
+  /** People with approve-when-green on in this tracker (CORE-378). */
+  approvingWhenGreen() {
+    return this.reply(() => this.store.approvingWhenGreen());
+  }
   recordQueueFailure(
     access: Access,
     input: { repoId: string; issueIds: string[]; failure: QueueFailure },

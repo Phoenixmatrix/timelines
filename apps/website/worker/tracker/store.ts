@@ -26,11 +26,12 @@ import {
   type IssueCloseReason,
   type IssueTimelineUse,
   type IssuePickup,
-  type EntityType,
   type Issue,
   type Link,
   type Mutation,
   type MutationRequest,
+  type ApprovalAutomation,
+  autoApprovable,
   type MutationResult,
   type Snapshot,
   type Subscription,
@@ -172,6 +173,8 @@ const tables = {
   request: "requests",
   subscription: "subscriptions",
 } as const;
+/** Entity types kept whole in their own table; `automation` has its own (CORE-378). */
+type StoredType = keyof typeof tables;
 export function fail(code: string, message: string, status: TrackerError["status"] = 400): never {
   throw new TrackerError(status, code, message);
 }
@@ -315,6 +318,8 @@ export class TrackerStore {
   readonly timelines: TimelineStore;
   /** While the tracker withdraws a superseded approval: why. */
   private withdrawing: string | null = null;
+  /** While the tracker answers an approval on its person's approve-when-green setting. */
+  private autoApproving = false;
   constructor(
     sql: SqlDatabase,
     transaction: <T>(fn: () => T) => T,
@@ -336,6 +341,7 @@ export class TrackerStore {
       CREATE TABLE IF NOT EXISTS leases (issue_id TEXT PRIMARY KEY, token TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS offers (issue_id TEXT PRIMARY KEY, code TEXT NOT NULL, lease_token TEXT NOT NULL, to_actor TEXT, expires_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, request TEXT NOT NULL, result TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS approval_automation (person_id TEXT PRIMARY KEY, enabled_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events (cursor INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS team_keys ON teams(json_extract(data, '$.key'));
       CREATE UNIQUE INDEX IF NOT EXISTS workspace_slugs ON workspaces(json_extract(data, '$.slug'));
@@ -471,7 +477,7 @@ export class TrackerStore {
       const originals = issueIds.map((issueId) => this.get<Issue>("issue", issueId));
       const now = new Date(this.clock()).toISOString();
       const actor = auditActor(access);
-      const emit = (type: EntityType, entity: Entity, kind: string) => {
+      const emit = (type: StoredType, entity: Entity, kind: string) => {
         const prior = first(
           this.sql,
           tracker.selectFrom(tables[type]).select("data").where("id", "=", entity.id),
@@ -630,7 +636,10 @@ export class TrackerStore {
       const asked = opened ? (JSON.parse(opened.data) as TrackerEvent).timelineId : undefined;
       const timeline = asked ? findTimeline(this.sql, asked) : null;
       const request: MutationRequest = {
-        operationId: `superseded:${requestId}`,
+        // "@" no client operationId can start with (validateRequest): none can
+        // pre-claim it. Only open requests come here, so receipts made under
+        // the old `superseded:` spelling are never replayed.
+        operationId: `@superseded:${requestId}`,
         mutations: [{ kind: "request.cancel", id: requestId }],
       };
       this.withdrawing = reason;
@@ -641,13 +650,13 @@ export class TrackerStore {
       }
     }
   }
-  private all<T extends Entity>(type: EntityType): T[] {
+  private all<T extends Entity>(type: StoredType): T[] {
     const rows = all(this.sql, tracker.selectFrom(tables[type]).select("data").orderBy("id")).map(
       (r) => JSON.parse(r.data) as T,
     );
     return this.overlay && isScoped(type) ? this.overlay.merge(type, rows) : rows;
   }
-  private get<T extends Entity>(type: EntityType, entityId: string): T {
+  private get<T extends Entity>(type: StoredType, entityId: string): T {
     if (this.overlay && isScoped(type) && this.overlay.has(type, entityId)) {
       const entity = this.overlay.get(type, entityId);
       if (!entity) fail("not_found", `${type} ${entityId} not found in this timeline.`, 404);
@@ -751,6 +760,7 @@ export class TrackerStore {
       comments: this.all("comment"),
       requests: this.all("request"),
       subscriptions: this.all("subscription"),
+      approveWhenGreen: this.approvingWhenGreen(),
       cursor: this.cursor(),
       serverTime: new Date(this.clock()).toISOString(),
       ...(this.overlay ? { timeline: this.overlay.scope() } : {}),
@@ -788,6 +798,181 @@ export class TrackerStore {
     return all(this.sql, tracker.selectFrom("tracker_labels").select("name"))
       .map((row) => ({ name: row.name, ...(counts.get(row.name) ?? { issues: 0, open: 0 }) }))
       .sort((a, b) => a.name.localeCompare(b.name));
+  }
+  /** People with approve-when-green on here (CORE-378). */
+  approvingWhenGreen(): string[] {
+    return all(
+      this.sql,
+      tracker.selectFrom("approval_automation").select("person_id").orderBy("person_id"),
+    ).map((row) => row.person_id);
+  }
+  private approvesWhenGreen(personId: string): string | null {
+    return (
+      first(
+        this.sql,
+        tracker
+          .selectFrom("approval_automation")
+          .select("enabled_at")
+          .where("person_id", "=", personId),
+      )?.enabled_at ?? null
+    );
+  }
+  /**
+   * The open approval approve-when-green may act on for `access`'s person, or
+   * null, inside the caller's transaction (CORE-378): a person (not an agent),
+   * still a member, the request open, pinned to `checkpointId`, routed to them
+   * and asked by them or one of their own agents. Someone who is no longer a
+   * member loses the setting here, audited, so rejoining doesn't restore it.
+   */
+  private eligibleApproval(
+    access: Access,
+    requestId: string,
+    checkpointId: string,
+  ): HumanRequest | null {
+    if (access.actorId !== access.principalId) return null;
+    if (!access.members.some((member) => member.id === access.principalId)) {
+      this.dropApprovalAutomation(access, "no longer a member of this tracker");
+      return null;
+    }
+    const row = first(
+      this.sql,
+      tracker.selectFrom("requests").select("data").where("id", "=", requestId),
+    );
+    const request = row ? (JSON.parse(row.data) as HumanRequest) : null;
+    if (
+      !request ||
+      request.status !== "open" ||
+      request.checkpoint?.id !== checkpointId ||
+      request.routeTo !== access.principalId ||
+      !autoApprovable(request, access.agents)
+    )
+      return null;
+    return request;
+  }
+  /** Turn a person's approve-when-green off on the tracker's own account, logged. */
+  private dropApprovalAutomation(access: Access, why: string) {
+    const personId = access.principalId;
+    const since = this.approvesWhenGreen(personId);
+    if (!since) return;
+    run(this.sql, tracker.deleteFrom("approval_automation").where("person_id", "=", personId));
+    const now = new Date(this.clock()).toISOString();
+    this.record({
+      operationId: `@approval-automation-dropped:${personId}:${crypto.randomUUID()}`,
+      actorId: personId,
+      actor: auditActor(access),
+      source: "automation",
+      mutationKind: `automation.approveWhenGreen (${why})`,
+      before: { id: personId, approveWhenGreen: true, enabledAt: since },
+      kind: "automation.approveWhenGreen",
+      entityType: "automation",
+      entityId: personId,
+      entity: { id: personId, approveWhenGreen: false, enabledAt: null },
+      createdAt: now,
+    });
+  }
+  /**
+   * Approve an open checkpoint approval for the person it's routed to, on
+   * their approve-when-green setting (CORE-378). Internal Worker RPC only: the
+   * Worker builds `access` for that person (never the asker) and has just found
+   * the pinned checkpoint green. Everything else is checked here, in the same
+   * transaction as the answer: still open, pinned to `checkpointId`, routed to
+   * this person, who is still a member, asked by them or one of their own
+   * agents, an approval timeline, the setting on,
+   * the checkpoint still the head. Null when any of that no longer holds; it never rejects.
+   */
+  autoApprove(access: Access, requestId: string, checkpointId: string): MutationResult | null {
+    return this.transaction(() => {
+      if (!this.eligibleApproval(access, requestId, checkpointId)) return null;
+      if (!this.approvesWhenGreen(access.principalId)) return null;
+      const [found] = this.timelines.checkpointStates([checkpointId]);
+      if (
+        !found ||
+        found.timeline.policy !== "approval" ||
+        found.timeline.status === "landed" ||
+        found.timeline.status === "abandoned" ||
+        !found.state.current
+      )
+        return null;
+      // Answered in the view it was asked in, like a withdrawal.
+      const opened = first(
+        this.sql,
+        tracker
+          .selectFrom("events")
+          .select("data")
+          .where(json("data", "$.entityId"), "=", requestId)
+          .where(json("data", "$.kind"), "=", "request.open")
+          .orderBy("cursor")
+          .limit(1),
+      );
+      const asked = opened ? (JSON.parse(opened.data) as TrackerEvent).timelineId : undefined;
+      const timeline = asked ? findTimeline(this.sql, asked) : null;
+      const mutation: MutationRequest = {
+        // No client operationId can start with "@" (validateRequest): none can pre-claim it.
+        operationId: `@auto-approve:${requestId}`,
+        mutations: [
+          {
+            kind: "request.answer",
+            id: requestId,
+            data: {
+              approved: true,
+              answer: `Checkpoint #${found.state.checkpoint.number}'s CI is green.`,
+            },
+          },
+        ],
+      };
+      this.autoApproving = true;
+      try {
+        return this.within(timeline, () =>
+          this.apply({ ...access, source: "automation" }, mutation, canonical(mutation), timeline),
+        );
+      } finally {
+        this.autoApproving = false;
+      }
+    });
+  }
+  /**
+   * Note on an open approval why approve-when-green left it to its person
+   * (CORE-378), e.g. its checkpoint changes CI configuration. Internal Worker
+   * RPC, with the routed person's access like autoApprove; logged as a
+   * `request.autoApproveSkipped` event from `automation`. A repeat of the same
+   * reason for the same checkpoint changes nothing. True when it noted it.
+   */
+  noteAutoApproveSkipped(
+    access: Access,
+    requestId: string,
+    checkpointId: string,
+    reason: string,
+  ): boolean {
+    return this.transaction(() => {
+      const request = this.eligibleApproval(access, requestId, checkpointId);
+      if (!request) return false;
+      const noted = request.autoApproveSkipped;
+      if (noted?.checkpointId === checkpointId && noted.reason === reason) return false;
+      const before = structuredClone(request);
+      const now = new Date(this.clock()).toISOString();
+      request.autoApproveSkipped = { checkpointId, reason: reason.slice(0, 500), at: now };
+      run(
+        this.sql,
+        tracker
+          .updateTable("requests")
+          .set({ data: JSON.stringify(request) })
+          .where("id", "=", requestId),
+      );
+      this.record({
+        operationId: `@auto-approve-skipped:${requestId}:${crypto.randomUUID()}`,
+        actorId: access.actorId,
+        actor: auditActor(access),
+        source: "automation",
+        mutationKind: "request.autoApproveSkipped",
+        before,
+        kind: "request.autoApproveSkipped",
+        entityType: "request",
+        entityId: requestId,
+        entity: request,
+        createdAt: now,
+      });
+      return true;
+    });
   }
   /** Open requests to people, with the issue each is about. */
   openRequests(): { request: HumanRequest; issue: Pick<Issue, "id" | "key" | "title"> }[] {
@@ -1833,7 +2018,7 @@ export class TrackerStore {
      * Store a change and log it. In a timeline, an issue, link or comment
      * changes in the timeline's view; main's copy takes only shared fields.
      */
-    const emit = (type: EntityType, entityId: string, changed: Entity | null, kind: string) => {
+    const emit = (type: StoredType, entityId: string, changed: Entity | null, kind: string) => {
       const prior = first(
         this.sql,
         tracker.selectFrom(tables[type]).select("data").where("id", "=", entityId),
@@ -1983,7 +2168,7 @@ export class TrackerStore {
       if (team.memberIds.length && !team.memberIds.includes(human))
         fail("invalid_member", "Assignee must belong to the owning team.");
     };
-    const unique = (type: EntityType, entityId: string) => {
+    const unique = (type: StoredType, entityId: string) => {
       if (
         all(this.sql, tracker.selectFrom(tables[type]).select("id").where("id", "=", entityId))
           .length ||
@@ -3139,6 +3324,8 @@ export class TrackerStore {
             // Requests are for people: an agent can't answer its own (or another's) question.
             if (access.actorId !== access.principalId)
               fail("forbidden", "Agents can't answer requests; a person has to.", 403);
+            // Only the tracker's own automation path stamps it (CORE-378).
+            const via = this.autoApproving ? ("auto-approve" as const) : undefined;
             if (request.kind === "question") request.answer = text(data.answer, "answer", 20000);
             else if (request.kind === "decision") {
               const picked = text(data.choice, "choice", 100);
@@ -3157,7 +3344,9 @@ export class TrackerStore {
                   data.approved,
                   note,
                   access.writableRepoIds,
+                  via,
                 );
+              if (via) request.via = via;
             } else {
               // The value went to the secret store; the tracker only records where.
               if (data.stored !== true || data.answer !== undefined)
@@ -3177,6 +3366,62 @@ export class TrackerStore {
           settle(issue);
           if (request.checkpoint && this.withdrawing === null)
             this.timelines.settle(request.checkpoint.timelineId, access.actorId);
+          break;
+        }
+        case "automation.approveWhenGreen": {
+          keys(data, ["enabled"]);
+          // A person's own consent (CORE-378): never an agent's, never an admin's for them.
+          if (access.actorId !== access.principalId)
+            fail("forbidden", "Agents can't do that; sign in as their person.", 403);
+          if (entityId !== access.principalId)
+            fail(
+              "forbidden",
+              "Approve-when-green is each person's own setting: you can only change yours.",
+              403,
+            );
+          member(entityId);
+          if (this.overlay)
+            fail("invalid_input", "Approve-when-green is set for the tracker, not in a timeline.");
+          if (typeof data.enabled !== "boolean")
+            fail("invalid_input", "enabled must be true or false.");
+          const since = this.approvesWhenGreen(entityId);
+          const before: ApprovalAutomation = {
+            id: entityId,
+            approveWhenGreen: since !== null,
+            enabledAt: since,
+          };
+          // Turning it on again keeps when it was first turned on.
+          if (data.enabled && !since)
+            run(
+              this.sql,
+              tracker
+                .insertInto("approval_automation")
+                .values({ person_id: entityId, enabled_at: now }),
+            );
+          if (!data.enabled && since)
+            run(
+              this.sql,
+              tracker.deleteFrom("approval_automation").where("person_id", "=", entityId),
+            );
+          events.push(
+            this.record({
+              operationId: request.operationId,
+              actorId: access.actorId,
+              actor,
+              source: access.source ?? "unknown",
+              mutationKind,
+              before,
+              kind: mutation.kind,
+              entityType: "automation",
+              entityId,
+              entity: {
+                id: entityId,
+                approveWhenGreen: data.enabled,
+                enabledAt: data.enabled ? (since ?? now) : null,
+              },
+              createdAt: now,
+            }),
+          );
           break;
         }
         case "issue.offer":

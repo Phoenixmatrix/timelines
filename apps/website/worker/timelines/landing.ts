@@ -145,14 +145,17 @@ async function repoRows(d1: D1Database, ids: string[]): Promise<Map<string, Push
 
 /**
  * Whether a checkpoint is green: each repository's newest CI run of its
- * commit on the timeline's bookmark succeeded. A repository with no run of it
- * has no CI to wait for. Green only queues the landing: the gates still run
- * on the merge before main moves.
+ * commit on the timeline's bookmark succeeded (not a step run, and not a
+ * preview's deploy). A repository with no run of it
+ * has no CI to wait for, unless `requireRun`: approving on a person's behalf
+ * (CORE-378) needs a run that succeeded in every repository. Green only queues
+ * the landing: the gates still run on the merge before main moves.
  */
 export async function greenness(
   d1: D1Database,
   _timeline: Pick<Timeline, "slug">,
   state: CheckpointState,
+  options: { requireRun?: boolean } = {},
 ): Promise<{ ok: boolean; why: string | null }> {
   const branch = "work";
   for (const repo of state.checkpoint.repos) {
@@ -163,12 +166,19 @@ export async function greenness(
       .where("commit_oid", "=", repo.commit)
       .where("source_id", "=", repo.source?.sourceId ?? "migration-required")
       .where("ref", "=", branch)
-      // Step runs are light checks per push, not the timeline's CI (CORE-235).
+      // Step runs are light checks per push, not the timeline's CI (CORE-235),
+      // and a preview's create or teardown deploys, never tests (CORE-79, CORE-378).
       .where("step", "=", 0)
+      .where("preview_action", "is", null)
       .orderBy("number", "desc")
       .executeTakeFirst();
-    if (!run || run.status === "succeeded") continue;
     const where = `${repo.owner}/${repo.name}`;
+    if (!run && options.requireRun)
+      return {
+        ok: false,
+        why: `Checkpoint #${state.checkpoint.number} has no CI run on ${where} yet: approve-when-green waits for one to succeed.`,
+      };
+    if (!run || run.status === "succeeded") continue;
     return {
       ok: false,
       why:
@@ -1041,14 +1051,15 @@ export async function maybeLand(
 /**
  * A CI run ended (ci/workflow.ts): if it was a landing's merge or gates, move
  * that landing on; if it was a timeline's own run, an `auto` timeline may now
- * be green. Never throws.
+ * be green, or an approval routed to someone with approve-when-green on may now
+ * be approvable. Never throws.
  */
 export async function afterRun(env: Env, deps: LandingDeps, runId: string): Promise<void> {
   try {
     const run = await db(env.DB)
       .selectFrom("ci_runs as c")
       .innerJoin("repos as r", "r.id", "c.repo_id")
-      .select(["c.ref", "c.repo_id", "c.source_id", "r.owner_id", "c.step"])
+      .select(["c.ref", "c.repo_id", "c.source_id", "r.owner_id", "c.step", "c.preview_action"])
       .where("c.id", "=", runId)
       .executeTakeFirst();
     // A step run is a light check, not the timeline's CI: it never lands one.
@@ -1059,10 +1070,17 @@ export async function afterRun(env: Env, deps: LandingDeps, runId: string): Prom
       if (reply.ok && reply.value) await progress(env, deps, run.owner_id, reply.value);
       return;
     }
+    // A preview deploys a checkpoint; it says nothing about whether it's green.
+    if (run.preview_action) return;
     if (run.source_id !== "canonical") {
       const source = await getWorkSource(env, run.repo_id, run.source_id);
-      if (source?.state === "ready")
+      if (source?.state === "ready") {
         await maybeLand(env, deps, run.owner_id, source.timeline_slug, "auto");
+        // An approval timeline's checkpoint may now be green for someone's
+        // approve-when-green setting (CORE-378). Loaded only then.
+        const { maybeAutoApprove } = await import("./auto-approve.ts");
+        await maybeAutoApprove(env, deps, run.owner_id, { slug: source.timeline_slug });
+      }
     }
   } catch (error) {
     console.error("Landing: after a CI run", { runId, error });

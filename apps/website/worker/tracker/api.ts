@@ -3,6 +3,7 @@ import type { AppEnv } from "../auth.ts";
 import { findAccountBySlug, findRepo, roleFor, visibleRepos, type Actor } from "../db.ts";
 import { db as gitmatrixDb } from "../schema.ts";
 import type {
+  ApprovalAutomation,
   CompletedWorkList,
   HumanRequest,
   OpenRequest,
@@ -20,11 +21,12 @@ import {
   type OpenRequestItem,
   closedKey,
 } from "./store.ts";
-import { accessFor } from "./access.ts";
+import { accessFor, agentsAmong } from "./access.ts";
 import type { TrackerReply } from "./object.ts";
 import { trackerObject } from "./stub.ts";
 import { CHRONICLE_PAGE, type LinkedWork } from "../../shared/chronicle.ts";
 import { agentWork, parseWhen, type AgentEligibility } from "../../shared/tracker-query.ts";
+import { autoApprovable } from "../../shared/tracker.ts";
 import { linkedWork } from "./work.ts";
 import {
   clearPreferences,
@@ -36,6 +38,7 @@ import {
 import { refreshAfterTrackerMutation } from "../release-notes/queue.ts";
 import { view as checkpointView, writableRepoIds } from "../timelines/checkpoints.ts";
 import { currentRepositoryNames } from "../timelines/names.ts";
+import type { AutoApproveScope } from "../timelines/auto-approve.ts";
 import type { RepoIssueSummary } from "../../shared/api.ts";
 
 export const tracker = new Hono<AppEnv>();
@@ -165,7 +168,7 @@ tracker.get("/requests/summary", async (c) => {
 /**
  * Requests on Needs you from one tracker, as the page shows them: an
  * approval of a timeline checkpoint with its commits, CI runs, previews and
- * summary.
+ * summary, and whether approve-when-green will answer it (CORE-378).
  */
 async function needsYouItems(
   c: Context<AppEnv>,
@@ -192,12 +195,33 @@ async function needsYouItems(
         await checkpointView(c.env, { ...state, checkpoint: current[index]! }, timeline),
       );
   }
+  // Approve when green (CORE-378): whose pending checkpoint approvals answer
+  // themselves. Only those asked by their person or one of that person's own
+  // agents; revoked agents count as nobody's, so their requests stay manual.
+  const automatic = new Set<string>();
+  let askers: Awaited<ReturnType<typeof agentsAmong>> = [];
+  if (pinned.length) {
+    const on = await stub.approvingWhenGreen();
+    if (!on.ok) return response(c, on);
+    for (const id of on.value) automatic.add(id);
+    if (automatic.size)
+      askers = await agentsAmong(
+        c.env.DB,
+        items.map(({ request }) => request.askedBy),
+      );
+  }
   return items.map((item) => {
     const checkpoint = item.request.checkpoint && checkpoints.get(item.request.checkpoint.id);
     return {
       tracker: { slug: owner.slug, displayName: owner.displayName },
       ...item,
       ...(checkpoint ? { checkpoint } : {}),
+      ...(checkpoint &&
+      item.request.status === "open" &&
+      automatic.has(item.request.routeTo) &&
+      autoApprovable(item.request, askers)
+        ? { approvesWhenGreen: true }
+        : {}),
     };
   });
 }
@@ -587,6 +611,29 @@ tracker.post("/tracker/:owner/mutate", async (c) => {
           : [];
       }),
     );
+    // Approve when green (CORE-378): an approval just asked of someone with the
+    // setting on, or the setting just turned on, may already be green.
+    const scopes = result.value.events.flatMap((event): AutoApproveScope[] => {
+      if (event.entityType === "request" && event.kind === "request.open") {
+        const asked = event.entity as HumanRequest | null;
+        return asked?.kind === "approval" && asked.checkpoint ? [{ requestId: asked.id }] : [];
+      }
+      if (event.entityType === "automation") {
+        const now = event.entity as ApprovalAutomation | null;
+        const was = event.before as ApprovalAutomation | null | undefined;
+        return now?.approveWhenGreen && !was?.approveWhenGreen ? [{ personId: now.id }] : [];
+      }
+      return [];
+    });
+    if (scopes.length)
+      c.executionCtx.waitUntil(
+        Promise.all([import("../timelines/auto-approve.ts"), import("../timelines/landing.ts")])
+          .then(async ([{ maybeAutoApprove }, { settled }]) => {
+            for (const scope of scopes)
+              await settled(c.env, (deps) => maybeAutoApprove(c.env, deps, access.owner.id, scope));
+          })
+          .catch((error) => console.error("Auto-approve: after a mutation", error)),
+      );
     // Loaded only then: the queue reaches CI, git and knowledge.
     if (slugs.size)
       c.executionCtx.waitUntil(

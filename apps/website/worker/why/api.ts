@@ -371,6 +371,7 @@ why.get("/why", async (c) => {
               by: checkpoint.approval.by,
               at: checkpoint.approval.at,
               note: checkpoint.approval.note,
+              ...(checkpoint.approval.via ? { via: checkpoint.approval.via } : {}),
             };
             if (!chain.checkpoints.some((item) => item.id === checkpoint.checkpoint.id))
               chain.checkpoints.push({

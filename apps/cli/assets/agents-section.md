@@ -81,6 +81,8 @@ binds this checkout to it: `gm push` then goes to `timeline/<slug>`, never to
 main. `gm timeline use main` goes back. `--queue` is refused in a timeline;
 use its push/checkpoint/land flow. Approval timelines still require a person's
 approval of the exact current checkpoint; generic queue submission never replaces it.
+Only a person approves — directly, or through their own approve-when-green setting in
+that tracker; agents can't change that setting or answer for them.
 
 When an agent harness drives gm here, gm acts as this checkout's agent
 (`gm auth status` shows `actingAs`) and keeps lease tokens for it. If gm says

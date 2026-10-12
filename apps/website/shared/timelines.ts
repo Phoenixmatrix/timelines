@@ -140,6 +140,8 @@ export type TimelineEvent = TimelineEventBase &
         outcome: ApprovalOutcome;
         /** What the person added to their answer, or why it was superseded. */
         note: string | null;
+        /** Approved by the person's approve-when-green setting, not by hand (CORE-378). */
+        via?: "auto-approve";
       }
     | {
         kind: "landing";
@@ -222,6 +224,8 @@ export interface CheckpointApproval {
   by: string | null;
   at: string | null;
   note: string | null;
+  /** Answered by `by`'s approve-when-green setting once CI was green (CORE-378). */
+  via?: "auto-approve";
 }
 
 /** What tracks a checkpoint: whether it's still its timeline's head, and its approval. */

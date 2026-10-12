@@ -1362,8 +1362,9 @@ read as `agent_decides`.
     Asking with the lease token parks it (no expiry); the last answer unparks it
     for an hour for its holder to `issue.resume` with a fresh token. Only people
     answer, on Needs you (`/needs-you`, `GET /api/requests`), on the issue, or
-    with `gm request`. Credentials go to the named repository secret; the tracker
-    records only where. On Needs you each request says what the work behind it is
+    with `gm request`; a checkpoint approval may also be answered by its
+    person's own approve-when-green setting (see Landing). Credentials go to the
+    named repository secret; the tracker records only where. On Needs you each request says what the work behind it is
     doing (CORE-386): who holds the issue and in which session, its status, and
     its latest checkpoint. Its History (`/needs-you?view=history`,
     `GET /api/requests/history?before=`) lists answered and withdrawn requests,
@@ -1814,6 +1815,35 @@ fenceCommit, syncRequired}`. `head` is the proven outcome head, not a promise
   requires a person's approval of that exact head. New work supersedes approval,
   and admitted landing fences source writes. Manual `gm timeline land`, the
   inspector and `POST …/land` use the same checks.
+  - _Approve when green_ (CORE-378, `worker/timelines/auto-approve.ts`): a
+    person may turn on, for themselves in one tracker (Preferences, or the
+    `automation.approveWhenGreen` mutation with their own id), approving the
+    checkpoint approvals routed to them that they or one of their own agents
+    asked for, once the pinned checkpoint is green. Requests from anyone else
+    stay manual. Green here is stricter than `auto` admission: every repository
+    needs a succeeded run of its commit that is neither a step run nor a
+    preview's deploy (`greenness(…, {requireRun: true})`; previews never count
+    for `auto` either). The setting lives in the tracker Durable Object
+    (`approval_automation`), each change an `automation` event in its log;
+    agents, the assistant and tracker owners can't set it for anyone, and
+    someone found no longer a member loses it (logged, source `automation`).
+    A request is still required: the tracker answers it as that person
+    (`source: "automation"`, operation `@auto-approve:<request>`, which no
+    client id can spell, `via: "auto-approve"` on the request, the timeline's
+    approval event and the checkpoint's approval) in the same transaction that
+    re-checks the setting, membership, asker, routing, policy and that the
+    checkpoint is still the head; then landing is queued as for a hand
+    approval. It never approves a checkpoint whose pipeline definition
+    (`CI_DEFINITION_PATHS`: `.gitmatrix/ci.yml`, which has no includes)
+    differs in any repository from that repository's main now, nor one where
+    that can't be read: it fails closed, leaving the request open with
+    `autoApproveSkipped` (a `request.autoApproveSkipped` event) so Needs you
+    says "approve it yourself". It doesn't review the code the pipeline runs
+    (tests, scripts): the approval trusts that code. It runs when a timeline's
+    CI run ends (not a preview's), when an approval is asked, and when the
+    setting is turned on. It never rejects: red, pending or missing CI leaves
+    the request open, and turning the setting off stops what hasn't happened
+    yet.
   1. Pin **B** (explicit logical-base tree), **O** (current canonical main tree)
      and **T** (approved work tree). Trusted materialization applies B→T onto O,
      preserving independent canonical edits and reporting ordinary conflicts.

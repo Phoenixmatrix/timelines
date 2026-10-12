@@ -21,6 +21,9 @@ const KIND_LABEL: Record<HumanRequest["kind"], string> = {
   credential: "Credential",
 };
 
+/** "your", or "Ann Lee’s". */
+const possessive = (who: string) => (who === "you" ? "your" : `${who}\u2019s`);
+
 export function RequestCard({
   request,
   name,
@@ -29,6 +32,7 @@ export function RequestCard({
   heading,
   checkpoint,
   work,
+  approvesWhenGreen = false,
 }: {
   request: HumanRequest;
   /** How to name an actor id: a person, or "builder for Ann Lee". */
@@ -42,8 +46,17 @@ export function RequestCard({
   checkpoint?: { view: CheckpointView; tracker: string };
   /** What the work behind it is doing (CORE-386), on pages away from the issue. */
   work?: RequestWork;
+  /** The routed person has approve-when-green on in this tracker (CORE-378). */
+  approvesWhenGreen?: boolean;
 }) {
   const open = request.status === "open";
+  const automatic =
+    open && approvesWhenGreen && request.kind === "approval" && !!request.checkpoint;
+  // Approve-when-green left this checkpoint to its person (CORE-378): say why.
+  const skipped =
+    automatic && request.autoApproveSkipped?.checkpointId === request.checkpoint?.id
+      ? request.autoApproveSkipped!.reason
+      : null;
   return (
     <article
       className={`flex flex-col gap-2 rounded-pane p-4 ${open ? "bg-signal-wash" : "bg-pane"}`}
@@ -62,14 +75,38 @@ export function RequestCard({
         >
           {timeAgo(request.createdAt)}
         </time>
+        {skipped && (
+          <span className="mk-chip mk-chip--tag" title={skipped}>
+            Approve it yourself
+          </span>
+        )}
+        {automatic && !skipped && (
+          <span
+            className="mk-chip mk-chip--tag"
+            title={
+              name(request.routeTo) === "you"
+                ? "You turned on approve-when-green in this tracker: it's approved for you once the checkpoint's CI is green."
+                : `${name(request.routeTo)} turned on approve-when-green in this tracker: it's approved for them once the checkpoint's CI is green.`
+            }
+          >
+            Approves when green
+          </span>
+        )}
       </header>
       {heading}
       {work && <WorkContext work={work} name={name} />}
+      {skipped && <p className="m-0 text-body-sm text-ink-muted">{skipped}</p>}
+      {/* In the history: approve-when-green left it to its person, and why (CORE-378). */}
+      {!open && request.autoApproveSkipped && request.via !== "auto-approve" && (
+        <p className="m-0 text-body-sm text-ink-muted">
+          Left to {name(request.routeTo)} by approve-when-green: {request.autoApproveSkipped.reason}
+        </p>
+      )}
       <div className="max-w-[72ch] text-body">
         <MarkdownText text={request.prompt} />
       </div>
       {checkpoint ? (
-        <CheckpointPanel view={checkpoint.view} tracker={checkpoint.tracker} />
+        <CheckpointPanel view={checkpoint.view} tracker={checkpoint.tracker} name={name} />
       ) : (
         request.checkpoint && <CheckpointRef pinned={request.checkpoint} />
       )}
@@ -94,7 +131,9 @@ export function RequestCard({
             <>
               <strong className="text-ink">{request.answer}</strong>
               {" · "}
-              {name(request.answeredBy ?? "")}{" "}
+              {request.via === "auto-approve"
+                ? `automatically, by ${possessive(name(request.answeredBy ?? ""))} approve-when-green setting`
+                : name(request.answeredBy ?? "")}{" "}
               <time dateTime={request.answeredAt ?? ""} title={fullDate(request.answeredAt ?? "")}>
                 {timeAgo(request.answeredAt ?? "")}
               </time>

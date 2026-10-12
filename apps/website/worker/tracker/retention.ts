@@ -406,6 +406,7 @@ const PRUNABLE_EVENT = `json_extract(e.data, '$.createdAt') < ?
       WHEN 'team' THEN EXISTS (SELECT 1 FROM teams x WHERE x.id = json_extract(e.data, '$.entityId'))
       WHEN 'workspace' THEN EXISTS (SELECT 1 FROM workspaces x WHERE x.id = json_extract(e.data, '$.entityId'))
       WHEN 'subscription' THEN EXISTS (SELECT 1 FROM subscriptions x WHERE x.id = json_extract(e.data, '$.entityId'))
+      WHEN 'automation' THEN EXISTS (SELECT 1 FROM approval_automation x WHERE x.person_id = json_extract(e.data, '$.entityId'))
       WHEN 'timeline' THEN EXISTS (SELECT 1 FROM timelines x WHERE x.id = json_extract(e.data, '$.entityId'))
       WHEN 'timelineEvent' THEN EXISTS (SELECT 1 FROM timeline_events x WHERE x.id = json_extract(e.data, '$.entityId'))
       ELSE 0 END)`;

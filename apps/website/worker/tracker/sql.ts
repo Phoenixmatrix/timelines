@@ -40,6 +40,8 @@ export interface TrackerDatabase {
     expires_at: string;
   };
   receipts: { id: string; actor_id: string; request: string; result: string };
+  /** People with approve-when-green on (CORE-378): a row while it's on. */
+  approval_automation: { person_id: string; enabled_at: string };
   events: { cursor: Generated<number>; data: string };
   issue_events: { issue_id: string; cursor: number };
   tracker_migrations: { name: string };

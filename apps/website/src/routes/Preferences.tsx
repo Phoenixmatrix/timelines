@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { Link, useLoaderData, useSearchParams, type LoaderFunctionArgs } from "react-router";
-import type { TrackerList, TrackerView } from "../../shared/tracker.ts";
+import type { Snapshot, TrackerList, TrackerView } from "../../shared/tracker.ts";
 import { SettingsPage } from "../components/SettingsPage.tsx";
 import { FormError, SelectField, useToast } from "../components/ui.tsx";
-import { api } from "../lib/api.ts";
+import { api, ApiError } from "../lib/api.ts";
 import { requireViewer, useViewer } from "../lib/session.ts";
 import { TrackerDefaultsForm } from "./tracker/Defaults.tsx";
 import { trackerLoader } from "./tracker/loaders.ts";
@@ -63,6 +63,7 @@ export function Preferences() {
               </Link>
             </div>
             <TrackerPreferences key={data.snapshot.owner.id} data={data} />
+            <ApproveWhenGreen key={`green-${data.snapshot.owner.id}`} snapshot={data.snapshot} />
           </div>
         ) : (
           <p className="m-0 text-ink-muted">No trackers are available for this account.</p>
@@ -129,5 +130,80 @@ function TrackerPreferences({ data }: { data: TrackerView }) {
         toast.add({ title: next ? "Tracker defaults saved" : "Tracker defaults reset" });
       }}
     />
+  );
+}
+
+/**
+ * Approve when green (CORE-378): the viewer's own consent, in this tracker, to
+ * approving the checkpoint approvals routed to them once CI is green. Only the
+ * person changes it; the tracker refuses agents and anyone else.
+ */
+function ApproveWhenGreen({ snapshot }: { snapshot: Snapshot }) {
+  const viewer = useViewer();
+  const toast = useToast();
+  const [on, setOn] = useState(() => !!viewer && !!snapshot.approveWhenGreen?.includes(viewer.id));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const agent = !!viewer?.agent;
+  const save = async (enabled: boolean) => {
+    if (!viewer || agent) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/tracker/${encodeURIComponent(snapshot.owner.slug)}/mutate`, {
+        method: "POST",
+        json: {
+          operationId: crypto.randomUUID(),
+          mutations: [{ kind: "automation.approveWhenGreen", id: viewer.id, data: { enabled } }],
+        },
+      });
+      setOn(enabled);
+      toast.add({ title: enabled ? "Approve when green is on" : "Approve when green is off" });
+    } catch (cause) {
+      setError(
+        cause instanceof ApiError ? cause.message : "Couldn't save this setting. Try again.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="mk-card" aria-labelledby="approve-when-green-title">
+      <h2 id="approve-when-green-title" className="mk-card-title">
+        Approve when green
+      </h2>
+      <label className="mt-3 flex min-h-11 cursor-pointer items-center gap-3">
+        <input
+          type="checkbox"
+          className="m-0 size-4 cursor-pointer accent-signal"
+          checked={on}
+          disabled={busy || agent || !viewer}
+          aria-describedby="approve-when-green-help"
+          onChange={(event) => void save(event.target.checked)}
+        />
+        Approve checkpoints routed to me in {snapshot.owner.displayName} once their CI is green
+      </label>
+      <p
+        id="approve-when-green-help"
+        className="mt-1 mb-0 max-w-[65ch] text-body-sm text-ink-muted"
+      >
+        When you or one of your agents asks you to approve a checkpoint of an approval timeline in
+        this tracker, it is approved in your name once every repository&rsquo;s CI run for that
+        checkpoint has succeeded; the timeline then lands after its gates pass. Requests from anyone
+        else stay yours to answer. It never approves a checkpoint that changes the pipeline
+        definition (.gitmatrix/ci.yml), or one it can&rsquo;t check: those stay with you, saying
+        why. It doesn&rsquo;t review the code the pipeline runs (tests, scripts): approving trusts
+        that code. Failing or pending CI leaves the request with you, and new commits need a new
+        checkpoint and a new approval. Only you can change this, not your agents or the
+        tracker&rsquo;s owners, and you can turn it off at any time: approvals that haven&rsquo;t
+        happened yet then wait for you.
+      </p>
+      {agent && (
+        <p className="mt-2 mb-0 text-body-sm text-ink-muted">
+          Agents can&rsquo;t do that; sign in as their person.
+        </p>
+      )}
+      <FormError message={error} />
+    </section>
   );
 }

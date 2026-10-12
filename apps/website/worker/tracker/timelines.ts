@@ -1535,6 +1535,7 @@ export class TimelineStore {
       by: answered.actorId,
       at: answered.createdAt,
       note: answered.note,
+      ...(answered.via ? { via: answered.via } : {}),
     };
   }
   private state(checkpoint: Checkpoint): CheckpointState {
@@ -1772,6 +1773,7 @@ export class TimelineStore {
     approved: boolean,
     note: string | null,
     writableRepoIds: string[] | undefined,
+    via?: "auto-approve",
   ) {
     const pinned = request.checkpoint!;
     const checkpoint = this.findCheckpoint(pinned.id);
@@ -1802,6 +1804,7 @@ export class TimelineStore {
         requestId: request.id,
         outcome: approved ? "approved" : "rejected",
         note,
+        ...(via ? { via } : {}),
         actorId: access.actorId,
         accountableId: access.principalId,
         createdAt: this.now(),

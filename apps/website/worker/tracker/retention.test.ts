@@ -381,3 +381,26 @@ describe("activity logs and ended timelines", () => {
     ).toBe(true);
   });
 });
+
+describe("approve-when-green settings (CORE-378)", () => {
+  test("keep the newest change of a setting that's on; old changes and ones turned off go", () => {
+    const f = setup();
+    const set = (enabled: boolean) =>
+      f.mutate([{ kind: "automation.approveWhenGreen", id: "ann", data: { enabled } }]);
+    const first = set(true).events[0]!.cursor;
+    const off = set(false).events[0]!.cursor;
+    const on = set(true).events[0]!.cursor;
+    const selected = pages(f, "activity", ACTIVITY, false, 500)
+      .flatMap((page) => page.items)
+      .filter((item) => item.startsWith("e:"))
+      .map((item) => Number(item.slice(2)));
+    expect(selected).toEqual(expect.arrayContaining([first, off]));
+    expect(selected).not.toContain(on);
+    set(false);
+    const after = pages(f, "activity", ACTIVITY, false, 500)
+      .flatMap((page) => page.items)
+      .filter((item) => item.startsWith("e:"))
+      .map((item) => Number(item.slice(2)));
+    expect(after).toContain(on);
+  });
+});
