@@ -44,11 +44,31 @@ export interface Span {
   model: string | null;
 }
 
-/** When a person steered, where the harness recorded it (CORE-398). */
+/**
+ * When an instruction or steering was given (CORE-398): the time the harness
+ * (or the person) recorded with it, if it's a real one. An agent's retelling
+ * has no trustworthy time.
+ */
+export function givenAt(entry: ContextEntry): number | null {
+  if (entry.source === "agent" || !entry.at) return null;
+  const at = Date.parse(entry.at);
+  return Number.isFinite(at) ? at : null;
+}
+
+/** How long before its step a moment of steering is still drawn on the trace. */
+const STEERING_WINDOW = 12 * 60 * 60 * 1000;
+
+/**
+ * The moments a person steered a span, as drawn on its lane: given, and within
+ * twelve hours before the step (to a minute after). Older or odd times stay in
+ * the step's details but don't stretch the trace.
+ */
 export function steeredAt(span: Span): { at: number; text: string }[] {
   return span.steering.flatMap((entry) => {
-    const at = entry.at ? Date.parse(entry.at) : NaN;
-    return Number.isFinite(at) && entry.source !== "agent" ? [{ at, text: entry.text }] : [];
+    const at = givenAt(entry);
+    return at !== null && at >= span.at - STEERING_WINDOW && at <= span.at + 60_000
+      ? [{ at, text: entry.text }]
+      : [];
   });
 }
 

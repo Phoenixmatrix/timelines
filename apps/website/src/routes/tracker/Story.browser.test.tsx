@@ -203,7 +203,8 @@ test("story: steps in order, context beside the diff, keys, filters, versions, p
   // When the person steered (CORE-398), and what made the step (CORE-397).
   await expect
     .element(context)
-    .toMatchTextContent(/Keep score as the tie-breaker \(hook · .+ ago\)/);
+    // Relative ("3 weeks ago", "last month"): the time is there, whatever its wording.
+    .toMatchTextContent(/Keep score as the tie-breaker \(hook · [^)]+\)/);
   await expect.element(context).toMatchTextContent(/Made with claude-code/);
   await expect.element(context).toMatchTextContent(/ChallengesThe index had no updated_at\./);
   await expect.element(context).toMatchTextContent(/Passed vp test run search · 12 passed/);

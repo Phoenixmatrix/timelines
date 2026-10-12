@@ -24,6 +24,7 @@ import { firstLine, fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { sourceUrl } from "../../lib/refs.ts";
 import { readTrackerShortcuts } from "./preferences.ts";
 import { StepVisuals } from "./StepVisuals.tsx";
+import { givenAt } from "./timelineSpans.ts";
 
 /** The filters' "no filter" value. */
 const ALL = "*";
@@ -576,15 +577,7 @@ function Context({ step }: { step: Step | null }) {
               {entry.text}{" "}
               <span className="text-micro text-ink-faint">
                 ({entry.source}
-                {entry.at && (
-                  <>
-                    {" · "}
-                    <time dateTime={entry.at} title={fullDate(entry.at)}>
-                      {timeAgo(entry.at)}
-                    </time>
-                  </>
-                )}
-                )
+                <EntryTime at={givenAt(entry)} />)
               </span>
             </li>
           ))}
@@ -709,5 +702,19 @@ function DiffFileView({ file }: { file: DiffFile }) {
         </div>
       )}
     </details>
+  );
+}
+
+/** When an instruction or steering was given (CORE-398), if known. */
+function EntryTime({ at }: { at: number | null }) {
+  if (at === null) return null;
+  const iso = new Date(at).toISOString();
+  return (
+    <>
+      {" · "}
+      <time dateTime={iso} title={fullDate(iso)}>
+        {timeAgo(iso)}
+      </time>
+    </>
   );
 }

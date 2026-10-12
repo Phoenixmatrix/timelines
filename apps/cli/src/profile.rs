@@ -262,21 +262,29 @@ pub fn declared_model(harness: Option<&str>) -> Option<String> {
 /// GM_MODEL; else, for a step an agent's harness made, this checkout's agent
 /// profile (`gm agent configure --model`), then the harness's own setting.
 pub fn step_model(harness: Option<&str>) -> Option<String> {
+    let local = harness.map(|_| current().1);
     pick_model(
         std::env::var("GM_MODEL").ok(),
         harness,
-        harness.and_then(|_| current().1.model),
+        local.map(|local| (local.harness, local.model)),
         declared_model,
     )
 }
 
-/// [`step_model`]'s choice, from what it was given.
+/// [`step_model`]'s choice, from what it was given. The profile's model counts
+/// only for the harness it was set up for (or one it doesn't name).
 fn pick_model(
     env: Option<String>,
     harness: Option<&str>,
-    profile: Option<String>,
+    profile: Option<(Option<String>, Option<String>)>,
     declared: impl Fn(Option<&str>) -> Option<String>,
 ) -> Option<String> {
+    let profile = profile.and_then(|(set_for, model)| {
+        set_for
+            .as_deref()
+            .is_none_or(|set_for| Some(set_for) == harness)
+            .then_some(model)?
+    });
     let clean = |model: String| {
         let model = model.trim().to_string();
         (!model.is_empty() && model.chars().count() <= 120).then_some(model)
@@ -487,25 +495,29 @@ mod tests {
     #[test]
     fn a_steps_model_is_declared_never_inferred() {
         let declared = |h: Option<&str>| (h == Some("claude-code")).then(|| "from-env".to_string());
+        let profile = |harness: Option<&str>, model: &str| {
+            Some((harness.map(str::to_string), Some(model.to_string())))
+        };
         // GM_MODEL wins, for anyone.
         assert_eq!(
-            pick_model(
-                Some(" opus-x ".into()),
-                None,
-                Some("profile".into()),
-                declared
-            )
-            .as_deref(),
+            pick_model(Some(" opus-x ".into()), None, profile(None, "p"), declared).as_deref(),
             Some("opus-x")
         );
         // A person's own commit (no harness) carries no model.
-        assert_eq!(
-            pick_model(None, None, Some("profile".into()), declared),
-            None
-        );
+        assert_eq!(pick_model(None, None, profile(None, "p"), declared), None);
         // An agent's: its profile, then its harness's own setting.
         assert_eq!(
-            pick_model(None, Some("codex"), Some("gpt-y".into()), declared).as_deref(),
+            pick_model(
+                None,
+                Some("codex"),
+                profile(Some("codex"), "gpt-y"),
+                declared
+            )
+            .as_deref(),
+            Some("gpt-y")
+        );
+        assert_eq!(
+            pick_model(None, Some("codex"), profile(None, "gpt-y"), declared).as_deref(),
             Some("gpt-y")
         );
         assert_eq!(
@@ -513,8 +525,28 @@ mod tests {
             Some("from-env")
         );
         assert_eq!(
-            pick_model(None, Some("codex"), Some("  ".into()), declared),
+            pick_model(None, Some("codex"), profile(Some("codex"), "  "), declared),
             None
+        );
+        // A profile set up for another harness says nothing about this one.
+        assert_eq!(
+            pick_model(
+                None,
+                Some("codex"),
+                profile(Some("claude-code"), "opus"),
+                declared
+            ),
+            None
+        );
+        assert_eq!(
+            pick_model(
+                None,
+                Some("claude-code"),
+                profile(Some("codex"), "gpt-y"),
+                declared
+            )
+            .as_deref(),
+            Some("from-env")
         );
     }
 

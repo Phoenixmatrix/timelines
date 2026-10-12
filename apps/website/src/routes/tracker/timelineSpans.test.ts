@@ -6,6 +6,7 @@ import {
   lanesOf,
   mergeSpans,
   spanFromFeed,
+  givenAt,
   spanFromStep,
   steeredAt,
   ticksOf,
@@ -272,4 +273,28 @@ test("steering moments are the harness's, with a time; an agent's retelling has 
   ]);
   // The trace reaches back to when they steered, before the commit.
   expect(domainOf([span], [], null)[0]).toBeLessThan(Date.parse("2026-10-12T11:40:00.000Z"));
+});
+
+test("only real, nearby steering times are drawn; odd ones don't stretch the trace", () => {
+  const committed = Date.parse("2026-10-12T12:00:00.000Z");
+  const span = spanFromStep(
+    "orbit/engine",
+    step({
+      context: {
+        steering: [
+          { text: "nearby", source: "hook", at: "2026-10-12T11:30:00.000Z" },
+          { text: "days before", source: "hook", at: "2026-10-01T09:00:00.000Z" },
+          { text: "epoch", source: "hook", at: "1970-01-01" },
+          { text: "garbled", source: "person", at: "not a time" },
+        ],
+      },
+    }),
+  );
+  expect(steeredAt(span).map((moment) => moment.text)).toEqual(["nearby"]);
+  expect(domainOf([span], [], null)[0]).toBeGreaterThan(committed - 2 * 3_600_000);
+  expect(givenAt({ text: "x", source: "person", at: "not a time" })).toBeNull();
+  expect(givenAt({ text: "x", source: "agent", at: "2026-10-12T11:30:00.000Z" })).toBeNull();
+  expect(givenAt({ text: "x", source: "hook", at: "2026-10-12T11:30:00.000Z" })).toBe(
+    Date.parse("2026-10-12T11:30:00.000Z"),
+  );
 });

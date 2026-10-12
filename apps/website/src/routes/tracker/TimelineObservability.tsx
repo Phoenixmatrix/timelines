@@ -18,6 +18,7 @@ import {
   lanesOf,
   mergeSpans,
   spanFromFeed,
+  givenAt,
   spanFromStep,
   steeredAt,
   tickLabel,
@@ -564,7 +565,7 @@ function Inspector({ span, story, multiRepo }: { span: Span; story: string; mult
             <ul className="m-0 max-w-[72ch] pl-4 text-body-sm">
               {span.instructions.slice(0, 3).map((entry, n) => (
                 <li key={n} className="[overflow-wrap:anywhere]">
-                  {entry.text} <When at={entry.at} />
+                  {entry.text} <When at={givenAt(entry)} />
                 </li>
               ))}
             </ul>
@@ -587,12 +588,12 @@ function Inspector({ span, story, multiRepo }: { span: Span; story: string; mult
                 {entry.source === "agent" ? entry.text : `“${entry.text}”`}{" "}
                 <span className="text-micro text-ink-faint">
                   {entry.source === "agent"
-                    ? "as the agent recorded it, time not recorded"
+                    ? "as the agent recorded it"
                     : entry.source === "hook"
                       ? "captured by the harness"
                       : "from a person"}
                 </span>{" "}
-                {entry.source !== "agent" && <When at={entry.at} />}
+                <When at={givenAt(entry)} />
               </li>
             ))}
           </ul>
@@ -712,12 +713,13 @@ function clock(at: number): string {
   return new Date(at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
-/** When an entry was given, if the harness recorded it. */
-function When({ at }: { at?: string }) {
-  if (!at || !Number.isFinite(Date.parse(at))) return null;
+/** When an entry was given (givenAt), if known. */
+function When({ at }: { at: number | null }) {
+  if (at === null) return null;
+  const iso = new Date(at).toISOString();
   return (
-    <time className="text-micro text-ink-faint" dateTime={at} title={fullDate(at)}>
-      {clock(Date.parse(at))}
+    <time className="text-micro text-ink-faint" dateTime={iso} title={fullDate(iso)}>
+      {clock(at)}
     </time>
   );
 }
