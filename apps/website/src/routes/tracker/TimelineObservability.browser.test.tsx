@@ -18,7 +18,10 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
   const { agent } = await server.call<{ agent: { id: string } }>("POST", "/api/agents", {
     name: "builder",
   });
-  const minutes = (n: number) => new Date(Date.now() - n * 60_000).toISOString();
+  // One instant for the fixtures and the clock times expected of them: a slow
+  // run can cross a minute between the two.
+  const now = Date.now();
+  const minutes = (n: number) => new Date(now - n * 60_000).toISOString();
   const [index, rank, retry] = [commitId(), commitId(), commitId()];
   const upload = (over: Partial<StepUpload>): StepUpload => ({
     changeId: `change${over.commitOid}`,
