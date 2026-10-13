@@ -46,6 +46,11 @@ try {
   if (mode === "cloudflare") {
     const { remoteMain } = await import("./remote.ts");
     await remoteMain(root, args);
+  } else if (args[0] === "main-e2e" && args[1] === "tick" && args.length === 2) {
+    // The watcher's tick installs dependencies before anything needs them: it
+    // must not load main.ts (Playwright and friends) first (CORE-406).
+    const { tick } = await import("./main-e2e.ts");
+    await tick();
   } else {
     await import("./main.ts");
   }
