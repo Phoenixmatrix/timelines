@@ -28,6 +28,13 @@ export interface JobIdentity {
   ownerId: string;
   repo: string;
   commit: string;
+  /**
+   * The run's work source (CORE-255), read from `ci_runs` when the job's
+   * credential is checked; a registry token issued to the job carries it on.
+   * Absent only on registry tokens issued before this field existed, whose
+   * publishes then record no source.
+   */
+  sourceId?: string;
   /** Branch the run built. */
   ref: string;
   /**

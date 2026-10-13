@@ -225,6 +225,8 @@ export interface Database {
     status: Generated<"active" | "yanked" | "deprecated" | "deleted">;
     git_repo_id: string | null;
     commit_oid: string | null;
+    /** The work source the CI publish was built in; null for people and older publishes. */
+    source_id: Generated<string | null>;
     ref: string | null;
     off_default_branch: Generated<number>;
     ci_run_id: string | null;

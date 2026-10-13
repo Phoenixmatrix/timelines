@@ -27,7 +27,7 @@ import type { Published } from "../../../shared/packages.ts";
 import type { StepAuthor, StepPage } from "../../../shared/steps.ts";
 import type { WhyChain, WhyResponse } from "../../../shared/why.ts";
 import { CiStatusIcon, runLabel } from "../../components/CiStatus.tsx";
-import { DEPLOYMENT_LABEL } from "../../components/Deployments.tsx";
+import { DEPLOYMENT_LABEL, DeploymentProvenance } from "../../components/Deployments.tsx";
 import { RecentAgents } from "../../components/RecentAgents.tsx";
 import { fadeMotion, link, Tip } from "../../components/ui.tsx";
 import { api, ApiError } from "../../lib/api.ts";
@@ -835,6 +835,7 @@ function Deployments({
                     >
                       Agents seen recently
                     </button>
+                    <DeploymentProvenance deployment={deployment} />
                     <div id={`commit-deployment-presence-${deployment.id}`} className="w-full">
                       {expanded === deployment.id && (
                         <RecentAgents

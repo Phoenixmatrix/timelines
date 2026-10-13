@@ -11,7 +11,7 @@ import {
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
 import { mintJobToken } from "../ci/registry.ts";
-import { d1, migratedDatabase } from "../testing/d1.ts";
+import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
 import { deployments, placement } from "./api.ts";
 import { jobRoute } from "./job.ts";
 import { previewSettingsApi } from "./settings.ts";
@@ -47,7 +47,8 @@ async function setup() {
       ('job3', 'run3', 'repo', 'preview', '{}', 'running', 'sandbox'),
       ('job4', 'run1', 'repo', 'done', '{}', 'succeeded', 'sandbox');
   `);
-  const env = { DB: d1(sqlite) } as unknown as Env;
+  const registry = migratedRegistryDatabase();
+  const env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as unknown as Env;
   const app = new Hono<AppEnv>();
   // As worker/app.ts: a job credential passes only to its deployment routes.
   app.use("*", async (c, next) => {
@@ -96,7 +97,7 @@ async function setup() {
     await Promise.all(pending);
     return { status: response.status, json: (await response.json()) as never };
   };
-  return { call, tokens, sqlite, env };
+  return { call, tokens, sqlite, registry, env };
 }
 
 describe("recording deployments", () => {
@@ -469,7 +470,7 @@ describe("reading and updating", () => {
     const t = await setup();
     const { json } = await t.call(t.tokens.cat, "GET", "/api/repos/orbit/site/environments");
     expect((json as EnvironmentList).environments).toEqual([
-      { name: "production", timeline: null, latest: null, live: 0, total: 0 },
+      { name: "production", timeline: null, latest: null, split: [], live: 0, total: 0 },
     ]);
   });
 });
@@ -670,5 +671,537 @@ describe("deployment recent presence", () => {
     } finally {
       t.sqlite.close();
     }
+  });
+});
+
+describe("deployment provenance (CORE-351)", () => {
+  const path = "/api/repos/orbit/app/deployments";
+  const DIGEST = `sha256:${"ab".repeat(32)}`;
+  const OTHER = `sha256:${"cd".repeat(32)}`;
+  const provider = (versionId: string, deploymentId = "dep-1") => ({
+    name: "cloudflare",
+    service: "app",
+    versionId,
+    deploymentId,
+  });
+
+  /** Registry publishes: this repo's CI at each source and commit, a sibling, and strays. */
+  function publishes(t: Awaited<ReturnType<typeof setup>>) {
+    t.registry.exec(`
+      INSERT INTO repositories (id, owner_id, key, format, kind, visibility, config, created_at, updated_at) VALUES
+        ('feed', 'acc_org', 'orbit', 'npm', 'local', 'private', '{}', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+      INSERT INTO packages (id, repo_id, name, normalized_name, created_at, updated_at) VALUES
+        ('pkg', 'feed', '@orbit/app', '@orbit/app', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z'),
+        ('sib', 'feed', '@orbit/sibling', '@orbit/sibling', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+      INSERT INTO publishes (id, feed_id, format, package_id, version, digest, action, status, git_repo_id, source_id, commit_oid, actor, actor_label, via, at) VALUES
+        ('pub-app', 'feed', 'npm', 'pkg', '1.0.0', '${DIGEST}', 'publish', 'active', 'repo', 'canonical', '${oid(7)}', 'job:job1', 'ci', 'job', '2026-10-01T01:00:00Z'),
+        ('pub-sib', 'feed', 'npm', 'sib', '1.0.0', '${OTHER}', 'publish', 'active', 'repo', 'canonical', '${oid(7)}', 'job:job1', 'ci', 'job', '2026-10-01T01:00:00Z'),
+        ('pub-legacy', 'feed', 'npm', 'pkg', '0.9.0', '${DIGEST}', 'publish', 'active', 'repo', NULL, '${oid(7)}', 'job:job1', 'ci', 'job', '2026-09-01T01:00:00Z'),
+        ('pub-work', 'feed', 'npm', 'pkg', '1.1.0', '${DIGEST}', 'publish', 'active', 'repo', 'work_a', '${oid(7)}', 'job:x', 'ci', 'job', '2026-10-01T02:00:00Z'),
+        ('pub-other-repo', 'feed', 'npm', 'pkg', '1.2.0', '${DIGEST}', 'publish', 'active', 'other', 'canonical', '${oid(7)}', 'job:y', 'ci', 'job', '2026-10-01T03:00:00Z'),
+        ('pub-other-commit', 'feed', 'npm', 'pkg', '1.3.0', '${DIGEST}', 'publish', 'active', 'repo', 'canonical', '${oid(8)}', 'job:z', 'ci', 'job', '2026-10-01T04:00:00Z'),
+        ('pub-deleted', 'feed', 'npm', 'pkg', '1.4.0', '${DIGEST}', 'publish', 'deleted', 'repo', 'canonical', '${oid(7)}', 'job:job1', 'ci', 'job', '2026-10-01T05:00:00Z');
+    `);
+  }
+
+  test("a job records the provider version and publication it deployed, and reads round-trip them", async () => {
+    const t = await setup();
+    publishes(t);
+    const made = await t.call(t.tokens.deploy, "POST", path, {
+      url: "https://app.example.com",
+      provider: provider("ver-2"),
+      artifact: { publishId: "pub-app", digest: DIGEST },
+      deployedAt: "2026-10-12T20:00:00Z",
+      exposedFrom: "2026-10-12T20:00:05Z",
+      percentage: 10,
+      replaces: "ver-1",
+    });
+    expect(made.status).toBe(201);
+    const recorded = made.json as Deployment;
+    expect(recorded).toMatchObject({
+      repoId: "repo",
+      sourceId: "canonical",
+      commit: oid(7),
+      run: 7,
+      provider: { name: "cloudflare", service: "app", versionId: "ver-2", deploymentId: "dep-1" },
+      artifact: {
+        publishId: "pub-app",
+        packageId: "pkg",
+        format: "npm",
+        name: "@orbit/app",
+        version: "1.0.0",
+        digest: DIGEST,
+      },
+      deployedAt: "2026-10-12T20:00:00.000Z",
+      exposedFrom: "2026-10-12T20:00:05.000Z",
+      exposedUntil: null,
+      percentage: 10,
+      replaces: { versionId: "ver-1", deploymentId: null },
+    });
+    expect((await t.call(t.tokens.ann, "GET", `${path}/${recorded.id}`)).json).toEqual(recorded);
+    const byVersion = await t.call(t.tokens.ann, "GET", `${path}?version=ver-2`);
+    expect((byVersion.json as DeploymentList).deployments).toEqual([recorded]);
+    expect(
+      ((await t.call(t.tokens.ann, "GET", `${path}?version=ver-9`)).json as DeploymentList)
+        .deployments,
+    ).toEqual([]);
+    // By package and version, without a digest, records the publication's own.
+    const byName = await t.call(t.tokens.ann, "POST", path, {
+      url: "https://b.example.com",
+      commit: oid(7),
+      artifact: { packageId: "pkg", version: "1.0.0" },
+    });
+    expect(byName.status).toBe(201);
+    expect((byName.json as Deployment).artifact).toMatchObject({
+      publishId: "pub-app",
+      digest: DIGEST,
+    });
+    expect((byName.json as Deployment).provider).toBeNull();
+  });
+
+  test("old records and clients stay uninstrumented: nothing is filled in", async () => {
+    const t = await setup();
+    t.sqlite.exec(
+      `INSERT INTO deployments(repo_id,environment,commit_oid,url,status,created_at) VALUES ('repo','production','${oid(3)}','https://old.example','active','2026-01-01T00:00:00.000Z')`,
+    );
+    const list = (await t.call(t.tokens.ann, "GET", path)).json as DeploymentList;
+    expect(list.deployments[0]).toMatchObject({
+      repoId: "repo",
+      sourceId: "canonical",
+      provider: null,
+      artifact: null,
+      deployedAt: null,
+      exposedFrom: null,
+      exposedUntil: null,
+      percentage: null,
+      replaces: null,
+    });
+    const plain = await t.call(t.tokens.deploy, "POST", path, { url: "https://app.example.com" });
+    expect(plain.status).toBe(201);
+    expect((plain.json as Deployment).provider).toBeNull();
+  });
+
+  test.each([
+    ["another source's publication", { publishId: "pub-work" }],
+    ["another repository's publication", { publishId: "pub-other-repo" }],
+    ["another commit's publication", { publishId: "pub-other-commit" }],
+    ["a publication recorded before publishes had a source", { publishId: "pub-legacy" }],
+    ["a deleted publication", { publishId: "pub-deleted" }],
+    ["an unknown publication", { publishId: "nope" }],
+    ["a digest that differs", { publishId: "pub-app", digest: OTHER }],
+    ["a sibling's digest for this package", { packageId: "pkg", version: "1.0.0", digest: OTHER }],
+    ["another source's package version", { packageId: "pkg", version: "1.1.0" }],
+  ])("refuses %s, the same as an unknown one", async (_, artifact) => {
+    const t = await setup();
+    publishes(t);
+    const refused = await t.call(t.tokens.deploy, "POST", path, {
+      url: "https://app.example.com",
+      artifact,
+    });
+    expect(refused.status).toBe(400);
+    expect((refused.json as { error: string }).error).toBe(
+      "No publication from this repository's CI, at this source and commit, matches artifact.",
+    );
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM deployments").get()).toEqual({ n: 0 });
+  });
+
+  test("a sibling built from the same commit is never the deployed artifact", async () => {
+    const t = await setup();
+    publishes(t);
+    const made = await t.call(t.tokens.deploy, "POST", path, {
+      url: "https://app.example.com",
+      artifact: { publishId: "pub-app" },
+    });
+    expect((made.json as Deployment).artifact?.name).toBe("@orbit/app");
+    const list = (await t.call(t.tokens.ann, "GET", path)).json as DeploymentList;
+    expect(list.deployments.map((d) => d.artifact?.publishId)).toEqual(["pub-app"]);
+  });
+
+  test("a job attaches an artifact only for its own commit, and a provider version for another only when known", async () => {
+    const t = await setup();
+    publishes(t);
+    const job = (body: Record<string, unknown>) =>
+      t.call(t.tokens.deploy, "POST", path, { url: "https://app.example.com", ...body });
+    // An earlier commit nothing maps a version to: refused.
+    expect((await job({ commit: oid(6), provider: provider("ver-1", "dep-b") })).status).toBe(403);
+    // An artifact is always the job's own commit's, known or not.
+    expect(
+      (await job({ commit: oid(8), artifact: { publishId: "pub-other-commit" } })).status,
+    ).toBe(403);
+    // Without identity a job may still name another commit, as before.
+    expect((await job({ commit: oid(8) })).status).toBe(201);
+    // A person with write access names any commit of the repository: ver-1 is oid(6)'s.
+    const first = await t.call(t.tokens.ann, "POST", path, {
+      url: "https://app.example.com",
+      commit: oid(6),
+      provider: provider("ver-1", "dep-a"),
+    });
+    expect(first.status).toBe(201);
+    // A canary: the job's new version beside the known older member it keeps serving.
+    expect(
+      (await job({ provider: provider("ver-2", "dep-b"), percentage: 10, replaces: "ver-1" }))
+        .status,
+    ).toBe(201);
+    const older = await job({
+      commit: oid(6),
+      provider: provider("ver-1", "dep-b"),
+      percentage: 90,
+    });
+    expect(older.status).toBe(201);
+    expect((older.json as Deployment).commit).toBe(oid(6));
+    // A known version names only the commit it was recorded for.
+    expect((await job({ commit: oid(8), provider: provider("ver-1", "dep-c") })).status).toBe(403);
+    // Nor in another environment, where nothing maps it yet.
+    expect(
+      (await job({ commit: oid(6), environment: "staging", provider: provider("ver-1", "dep-s") }))
+        .status,
+    ).toBe(403);
+    // A rollback to the known version: allowed.
+    const rollback = await job({
+      commit: oid(6),
+      provider: provider("ver-1", "dep-c"),
+      replaces: "ver-2",
+    });
+    expect(rollback.status).toBe(201);
+    expect((rollback.json as Deployment).replaces?.versionId).toBe("ver-2");
+  });
+
+  test.each([
+    [
+      { provider: { name: "aws", service: "app", versionId: "v", deploymentId: "d" } },
+      /provider.name/,
+    ],
+    [{ provider: { name: "cloudflare", service: "app", deploymentId: "d" } }, /provider.versionId/],
+    [{ provider: { name: "cloudflare", service: "app", versionId: "v" } }, /provider.deploymentId/],
+    [
+      { provider: { name: "cloudflare", service: "a b", versionId: "v", deploymentId: "d" } },
+      /provider.service/,
+    ],
+    [{ provider: { ...provider("v"), connectionId: "c" } }, /Unknown field: provider.connectionId/],
+    [{ percentage: 10 }, /give provider too/],
+    [{ replaces: "v0" }, /give provider too/],
+    [{ provider: provider("v"), replaces: "v" }, /can't replace itself/],
+    [{ provider: provider("v"), percentage: 101 }, /percentage/],
+    [{ deployedAt: "2026-10-12T20:00:00+02:00" }, /deployedAt/],
+    [
+      { deployedAt: "2026-10-12T20:00:00Z", exposedFrom: "2026-10-12T19:00:00Z" },
+      /before the deployment/,
+    ],
+    [{ exposedUntil: "2026-10-12T20:00:00Z" }, /start before it ends/],
+    [{ artifact: { digest: DIGEST } }, /publishId, or by packageId and version/],
+    [{ artifact: { publishId: "p", packageId: "pkg", version: "1" } }, /not both/],
+    [{ artifact: { publishId: "p", digest: "md5" } }, /artifact.digest/],
+  ])("refuses %j", async (extra, message) => {
+    const t = await setup();
+    const refused = await t.call(t.tokens.ann, "POST", path, {
+      url: "https://app.example.com",
+      commit: oid(7),
+      ...extra,
+    });
+    expect(refused.status).toBe(400);
+    expect((refused.json as { error: string }).error).toMatch(message);
+  });
+
+  test("a retry with recomputed times answers the first record unchanged; another identity conflicts", async () => {
+    const t = await setup();
+    publishes(t);
+    // What gm sends on each run: `now` and `--expires 2d` differ every time.
+    const run = (at: number, extra: Record<string, unknown> = {}, token = t.tokens.deploy) => {
+      const now = Date.parse("2026-10-12T20:00:00Z") + at;
+      return t.call(token, "POST", path, {
+        url: "https://app.example.com",
+        provider: provider("ver-2"),
+        artifact: { publishId: "pub-app" },
+        percentage: 10,
+        replaces: "ver-1",
+        deployedAt: new Date(now).toISOString(),
+        exposedFrom: new Date(now).toISOString(),
+        expiresAt: new Date(now + 2 * DAY).toISOString(),
+        ...extra,
+      });
+    };
+    const first = await run(0);
+    expect(first.status).toBe(201);
+    const again = await run(90_000, { url: "https://retried.example.com", status: "sleeping" });
+    expect(again.status).toBe(200);
+    expect(again.json).toEqual(first.json);
+    // A person may name another commit (a job couldn't: 403 first); still a conflict.
+    expect((await run(120_000, { commit: oid(6), artifact: undefined }, t.tokens.ann)).status).toBe(
+      409,
+    );
+    for (const differing of [
+      { environment: "staging" },
+      { artifact: { publishId: "pub-sib" } },
+      { percentage: 20 },
+      { replaces: "ver-0" },
+    ])
+      expect((await run(120_000, differing)).status).toBe(409);
+    // Another provider deployment of the same version is a record of its own.
+    expect((await run(0, { provider: provider("ver-2", "dep-2") })).status).toBe(201);
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM deployments").get()).toEqual({ n: 2 });
+  });
+
+  test("a retry that loses the race to a concurrent one answers the record that won", async () => {
+    const t = await setup();
+    const body = {
+      url: "https://app.example.com",
+      provider: provider("ver-2"),
+      exposedFrom: "2026-10-12T20:00:00Z",
+    };
+    // The other request inserts between this one's lookup and its insert.
+    const real = t.env.DB;
+    let raced = false;
+    (t.env as { DB: D1Database }).DB = {
+      batch: real.batch.bind(real),
+      exec: real.exec.bind(real),
+      prepare(sql: string) {
+        if (!raced && /^insert into "deployments"/i.test(sql)) {
+          raced = true;
+          t.sqlite
+            .exec(`INSERT INTO deployments (repo_id, source_id, environment, commit_oid, url, status,
+              provider, provider_service, provider_version_id, provider_deployment_id, exposed_from)
+            VALUES ('repo', 'canonical', 'production', '${oid(7)}', 'https://app.example.com', 'active',
+              'cloudflare', 'app', 'ver-2', 'dep-1', '2026-10-12T20:00:00.000Z')`);
+        }
+        return real.prepare(sql);
+      },
+    } as D1Database;
+    const answered = await t.call(t.tokens.deploy, "POST", path, body);
+    expect(raced).toBe(true);
+    expect(answered.status).toBe(200);
+    expect(answered.json).toMatchObject({
+      provider: { versionId: "ver-2", deploymentId: "dep-1" },
+    });
+    expect(t.sqlite.prepare("SELECT count(*) AS n FROM deployments").get()).toEqual({ n: 1 });
+    // A racing record with another identity is still a conflict.
+    raced = false;
+    t.sqlite.exec("DELETE FROM deployments");
+    const conflicting = await t.call(t.tokens.deploy, "POST", path, { ...body, percentage: 50 });
+    expect(conflicting.status).toBe(409);
+  });
+
+  test("a rollback is a record of its own, linked to what it replaced", async () => {
+    const t = await setup();
+    const record = (commit: string, versionId: string, deploymentId: string, replaces?: string) =>
+      t.call(t.tokens.ann, "POST", path, {
+        url: "https://app.example.com",
+        commit,
+        provider: provider(versionId, deploymentId),
+        ...(replaces ? { replaces } : {}),
+      });
+    const one = (await record(oid(6), "ver-1", "dep-a")).json as Deployment;
+    const two = (await record(oid(7), "ver-2", "dep-b", "ver-1")).json as Deployment;
+    const back = await record(oid(6), "ver-1", "dep-c", "ver-2");
+    expect(back.status).toBe(201);
+    expect(two.replaces).toEqual({ versionId: "ver-1", deploymentId: one.id });
+    expect((back.json as Deployment).replaces).toEqual({
+      versionId: "ver-2",
+      deploymentId: two.id,
+    });
+    expect((back.json as Deployment).id).not.toBe(one.id);
+    const list = (await t.call(t.tokens.ann, "GET", `${path}?version=ver-1`))
+      .json as DeploymentList;
+    expect(list.deployments.map((d) => d.provider?.deploymentId)).toEqual(["dep-c", "dep-a"]);
+  });
+
+  test("a publication that records no digest refuses one, and is linked without", async () => {
+    const t = await setup();
+    publishes(t);
+    t.registry.exec(`
+      INSERT INTO publishes (id, feed_id, format, package_id, version, digest, action, status, git_repo_id, source_id, commit_oid, actor, actor_label, via, at) VALUES
+        ('pub-npm', 'feed', 'npm', 'pkg', '2.0.0', NULL, 'npm.publish', 'active', 'repo', 'canonical', '${oid(7)}', 'job:job1', 'ci', 'job', '2026-10-01T06:00:00Z');
+    `);
+    for (const artifact of [
+      { publishId: "pub-npm", digest: DIGEST },
+      { packageId: "pkg", version: "2.0.0", digest: DIGEST },
+    ]) {
+      const refused = await t.call(t.tokens.deploy, "POST", path, {
+        url: "https://app.example.com",
+        artifact,
+      });
+      expect(refused.status).toBe(400);
+      expect((refused.json as { error: string }).error).toBe(
+        "This publication records no digest; omit the artifact's digest.",
+      );
+    }
+    const linked = await t.call(t.tokens.deploy, "POST", path, {
+      url: "https://app.example.com",
+      artifact: { publishId: "pub-npm" },
+    });
+    expect(linked.status).toBe(201);
+    expect((linked.json as Deployment).artifact).toMatchObject({
+      publishId: "pub-npm",
+      digest: null,
+    });
+  });
+
+  test("a rollback links the replaced version's record in the same source and environment", async () => {
+    const t = await setup();
+    const older = (
+      await t.call(t.tokens.ann, "POST", path, {
+        url: "https://app.example.com",
+        commit: oid(6),
+        provider: provider("ver-1", "dep-1"),
+      })
+    ).json as Deployment;
+    await t.call(t.tokens.ann, "POST", path, {
+      url: "https://app.example.com",
+      commit: oid(6),
+      environment: "staging",
+      provider: provider("ver-3", "dep-0"),
+    });
+    const rollback = await t.call(t.tokens.deploy, "POST", path, {
+      url: "https://app.example.com",
+      provider: provider("ver-2", "dep-2"),
+      replaces: "ver-1",
+    });
+    expect((rollback.json as Deployment).replaces).toEqual({
+      versionId: "ver-1",
+      deploymentId: older.id,
+    });
+    // Not across environments: staging's ver-3 is no production record.
+    const elsewhere = await t.call(t.tokens.deploy, "POST", path, {
+      url: "https://app.example.com",
+      provider: provider("ver-4", "dep-4"),
+      replaces: "ver-3",
+    });
+    expect((elsewhere.json as Deployment).replaces).toEqual({
+      versionId: "ver-3",
+      deploymentId: null,
+    });
+  });
+
+  test("PATCH ends exposure once, sets a share only while unset, and never rewrites identity", async () => {
+    const t = await setup();
+    publishes(t);
+    const made = (
+      await t.call(t.tokens.deploy, "POST", path, {
+        url: "https://app.example.com",
+        provider: provider("ver-2"),
+        artifact: { publishId: "pub-app" },
+        exposedFrom: "2026-10-12T20:00:00Z",
+      })
+    ).json as Deployment;
+    const at = `${path}/${made.id}`;
+    for (const body of [
+      { provider: provider("ver-9") },
+      { artifact: { publishId: "pub-sib" } },
+      { commit: oid(8) },
+      { deployedAt: "2026-10-12T20:00:00Z" },
+      { exposedFrom: "2026-10-12T21:00:00Z" },
+      { replaces: "ver-0" },
+    ])
+      expect((await t.call(t.tokens.deploy, "PATCH", at, body)).status).toBe(409);
+    expect(
+      (await t.call(t.tokens.deploy, "PATCH", at, { exposedUntil: "2026-10-12T19:00:00Z" })).status,
+    ).toBe(400);
+    const ended = await t.call(t.tokens.deploy, "PATCH", at, {
+      exposedUntil: "2026-10-12T21:00:00Z",
+      percentage: 25,
+    });
+    expect(ended.status).toBe(200);
+    expect(ended.json).toMatchObject({
+      exposedUntil: "2026-10-12T21:00:00.000Z",
+      percentage: 25,
+      provider: { versionId: "ver-2" },
+      artifact: { publishId: "pub-app" },
+    });
+    // The same values again change nothing; different ones conflict.
+    expect(
+      (await t.call(t.tokens.deploy, "PATCH", at, { exposedUntil: "2026-10-12T21:00:00Z" })).status,
+    ).toBe(200);
+    expect(
+      (await t.call(t.tokens.deploy, "PATCH", at, { exposedUntil: "2026-10-12T22:00:00Z" })).status,
+    ).toBe(409);
+    expect((await t.call(t.tokens.deploy, "PATCH", at, { percentage: 50 })).status).toBe(409);
+    // An uninstrumented record has no share to set.
+    const plain = (
+      await t.call(t.tokens.deploy, "POST", path, { url: "https://plain.example.com" })
+    ).json as Deployment;
+    expect(
+      (await t.call(t.tokens.deploy, "PATCH", `${path}/${plain.id}`, { percentage: 5 })).status,
+    ).toBe(400);
+  });
+
+  test("PATCH sets exposedFrom once while unknown, then its end; a missing record is 404 first", async () => {
+    const t = await setup();
+    expect(
+      (await t.call(t.tokens.ann, "PATCH", `${path}/999`, { provider: provider("v") })).status,
+    ).toBe(404);
+    const made = (
+      await t.call(t.tokens.deploy, "POST", path, {
+        url: "https://app.example.com",
+        provider: provider("ver-2"),
+        deployedAt: "2026-10-12T20:00:00Z",
+      })
+    ).json as Deployment;
+    const at = `${path}/${made.id}`;
+    const patch = (body: unknown) => t.call(t.tokens.deploy, "PATCH", at, body);
+    // An end needs a start.
+    expect((await patch({ exposedUntil: "2026-10-12T21:00:00Z" })).status).toBe(400);
+    expect((await patch({ exposedFrom: "2026-10-12T19:00:00Z" })).status).toBe(400);
+    expect(
+      (await patch({ exposedFrom: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString() }))
+        .status,
+    ).toBe(400);
+    const started = await patch({ exposedFrom: "2026-10-12T20:01:00Z" });
+    expect(started.status).toBe(200);
+    expect((started.json as Deployment).exposedFrom).toBe("2026-10-12T20:01:00.000Z");
+    expect((await patch({ exposedFrom: "2026-10-12T20:01:00Z" })).status).toBe(200);
+    expect((await patch({ exposedFrom: "2026-10-12T20:02:00Z" })).status).toBe(409);
+    expect((await patch({ exposedUntil: "2026-10-12T20:00:30Z" })).status).toBe(400);
+    const ended = await patch({ exposedUntil: "2026-10-12T21:00:00Z" });
+    expect((ended.json as Deployment).exposedUntil).toBe("2026-10-12T21:00:00.000Z");
+  });
+
+  test("/environments reads latest records and canary members in bounded chunks", async () => {
+    const t = await setup();
+    const rows = Array.from(
+      { length: 120 },
+      (_, i) =>
+        `('repo','canonical','env-${i}','${oid(7)}','https://e${i}.example','active','cloudflare','app','ver-${i % 2}','dep-${i}')`,
+    );
+    t.sqlite
+      .exec(`INSERT INTO deployments(repo_id,source_id,environment,commit_oid,url,status,provider,provider_service,provider_version_id,provider_deployment_id) VALUES ${rows.join(",")};
+      INSERT INTO deployments(repo_id,source_id,environment,commit_oid,url,status,provider,provider_service,provider_version_id,provider_deployment_id)
+        VALUES ('repo','canonical','env-119','${oid(6)}','https://e119.example','active','cloudflare','app','ver-x','dep-119');`);
+    const { environments } = (
+      await t.call(t.tokens.ann, "GET", "/api/repos/orbit/app/environments")
+    ).json as EnvironmentList;
+    expect(environments.filter((e) => e.latest)).toHaveLength(120);
+    expect(environments.find((e) => e.name === "env-119")!.split).toHaveLength(2);
+    expect(environments.find((e) => e.name === "env-3")!.split).toEqual([]);
+  });
+
+  test("an environment lists every live member of its newest canary split", async () => {
+    const t = await setup();
+    await t.call(t.tokens.ann, "POST", path, {
+      url: "https://app.example.com",
+      commit: oid(6),
+      provider: provider("ver-1", "dep-2"),
+      percentage: 90,
+    });
+    await t.call(t.tokens.ann, "POST", path, {
+      url: "https://app.example.com",
+      commit: oid(7),
+      provider: provider("ver-2", "dep-2"),
+      percentage: 10,
+    });
+    await t.call(t.tokens.ann, "POST", path, {
+      url: "https://staging.example.com",
+      commit: oid(7),
+      environment: "staging",
+      provider: provider("ver-2", "dep-s"),
+    });
+    const { environments } = (
+      await t.call(t.tokens.ann, "GET", "/api/repos/orbit/app/environments")
+    ).json as EnvironmentList;
+    const production = environments.find((e) => e.name === "production")!;
+    expect(production.latest?.provider?.versionId).toBe("ver-2");
+    expect(production.split.map((d) => [d.provider?.versionId, d.percentage])).toEqual([
+      ["ver-2", 10],
+      ["ver-1", 90],
+    ]);
+    expect(environments.find((e) => e.name === "staging")!.split).toEqual([]);
   });
 });

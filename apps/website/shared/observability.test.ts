@@ -25,6 +25,10 @@ import {
   validateInterval,
   validateLinkPrefixes,
   validateProviderDeployment,
+  validateExposure,
+  validateReplaces,
+  providerId,
+  normalizeDigest,
   validateSeries as validateSeriesAt,
   type CursorBinding,
   type DatasetCapability,
@@ -1440,5 +1444,62 @@ describe("safeProviderLink", () => {
       "https://xn--bcher-kva.example/abc/x",
     );
     invalid(() => safeProviderLink(url, ["https://bücher.example/abc"]), /Invalid link prefix/);
+  });
+});
+
+describe("deployment record helpers (CORE-351)", () => {
+  test("an exposure claim: every field may be unknown, none is inferred", () => {
+    expect(validateExposure({})).toEqual({
+      deployedAt: null,
+      exposedFrom: null,
+      exposedUntil: null,
+      percentage: null,
+    });
+    // Without a deployment time, exposure is still checked on its own.
+    expect(
+      validateExposure({
+        exposedFrom: "2026-10-12T18:00:00Z",
+        exposedUntil: "2026-10-12T19:00:00Z",
+      }),
+    ).toEqual({
+      deployedAt: null,
+      exposedFrom: "2026-10-12T18:00:00.000Z",
+      exposedUntil: "2026-10-12T19:00:00.000Z",
+      percentage: null,
+    });
+    expect(validateExposure({ percentage: 0 }).percentage).toBe(0);
+  });
+
+  test.each([
+    [
+      { deployedAt: "2026-10-12T18:00:00Z", exposedFrom: "2026-10-12T17:00:00Z" },
+      /before the deployment/,
+    ],
+    [{ exposedUntil: "2026-10-12T18:00:00Z" }, /start before it ends/],
+    [
+      { exposedFrom: "2026-10-12T18:00:00Z", exposedUntil: "2026-10-12T17:00:00Z" },
+      /start before it ends/,
+    ],
+    [{ deployedAt: "yesterday" }, /deployedAt/],
+    [{ exposedFrom: "2026-10-12T18:00:00+02:00" }, /exposedFrom/],
+    [{ percentage: 100.1 }, /percentage/],
+    [{ percentage: "10" }, /percentage/],
+  ])("refuses the exposure %j", (value, message) =>
+    invalid(() => validateExposure(value), message),
+  );
+
+  test("replaces names another version; ids and digests keep their shape", () => {
+    expect(validateReplaces(undefined, "v2")).toBeNull();
+    expect(validateReplaces(null, "v2")).toBeNull();
+    expect(validateReplaces("v1", "v2")).toBe("v1");
+    invalid(() => validateReplaces("v2", "v2"), /can't replace itself/);
+    invalid(() => validateReplaces("", "v2"), /replaces/);
+    expect(providerId("4f1c2d3e-aaaa", "versionId")).toBe("4f1c2d3e-aaaa");
+    invalid(() => providerId("has space", "versionId"), /versionId/);
+    invalid(() => providerId("x".repeat(257), "versionId"), /versionId/);
+    const digest = `sha256:${"0a".repeat(32)}`;
+    expect(normalizeDigest(digest)).toBe(digest);
+    invalid(() => normalizeDigest("sha256:XYZ"), /artifact digest/);
+    invalid(() => normalizeDigest(7, "digest"), /digest/);
   });
 });

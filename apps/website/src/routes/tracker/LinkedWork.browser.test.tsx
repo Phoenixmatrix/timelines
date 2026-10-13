@@ -88,3 +88,50 @@ test("the issue page lists a mentioning commit with its CI run and package", asy
     await page.viewport(1280, 900);
   }
 });
+
+test("linked deployments show the provider version recorded, or that none was", async () => {
+  const server = await TestServer.start({ world: true });
+  const repo = await server.repo("orbit", "engine");
+  const tip = commitId();
+  await server.push("orbit/engine", "main", tip);
+  await server.call("POST", "/api/tracker/orbit/mutate", {
+    operationId: crypto.randomUUID(),
+    mutations: [
+      { kind: "team.create", id: "team", data: { key: "ENG", name: "Eng", memberIds: [] } },
+      { kind: "issue.create", id: "rank", data: { teamId: "team", title: "Rank search results" } },
+    ],
+  });
+  const [person] = await server.sql<{ id: string }>(
+    "SELECT id FROM accounts WHERE kind = 'user' LIMIT 1",
+  );
+  // An agent's step for ENG-1 makes the commit evidence; two records deploy it.
+  await server.sql(
+    `INSERT INTO step_contexts (repo_id, change_id, commit_oid, author_id, accountable_id, issue_key, summary, committed_at)
+     VALUES (?, 'chg', ?, ?, ?, 'ENG-1', 'Rank by freshness', '2026-10-03T09:00:00.000Z')`,
+    repo.id,
+    tip,
+    person!.id,
+    person!.id,
+  );
+  await server.sql(
+    `INSERT INTO deployments (repo_id, environment, commit_oid, url, status, created_at,
+       provider, provider_service, provider_version_id, provider_deployment_id, percentage)
+     VALUES (?, 'production', ?, 'https://engine.example.dev', 'active', '2026-10-03T10:00:00.000Z',
+       'cloudflare', 'engine', '4f1c2d3e-0000-4000-8000-000000000002', 'dep-2', 10)`,
+    repo.id,
+    tip,
+  );
+  await server.sql(
+    `INSERT INTO deployments (repo_id, environment, commit_oid, url, status, created_at)
+     VALUES (?, 'staging', ?, 'https://staging.example.dev', 'active', '2026-10-03T11:00:00.000Z')`,
+    repo.id,
+    tip,
+  );
+  renderApp("/tracker/orbit/issues/ENG-1");
+  const panel = page.getByRole("region", { name: "Linked work" });
+  const production = panel.getByRole("link", { name: /^production/ });
+  await expect.element(production, { timeout: 10_000 }).toBeVisible();
+  await expect.element(production).toMatchTextContent("engine 4f1c2d3e (10%)");
+  const staging = panel.getByRole("link", { name: /^staging/ });
+  await expect.element(staging).toMatchTextContent("no provider version recorded");
+});

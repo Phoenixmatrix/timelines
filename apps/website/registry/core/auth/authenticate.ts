@@ -60,6 +60,7 @@ async function fromJobToken(db: DB, secret: string): Promise<Actor | null> {
       "r.id as run_id",
       "r.number",
       "r.commit_oid",
+      "r.source_id",
       "r.ref",
       "p.id as repo_id",
       "p.owner_id",
@@ -83,6 +84,7 @@ async function fromJobToken(db: DB, secret: string): Promise<Actor | null> {
     ownerId: row.owner_id,
     repo: fullName,
     commit: row.commit_oid,
+    sourceId: row.source_id,
     ref: row.ref,
     defaultBranch: row.default_branch,
   };

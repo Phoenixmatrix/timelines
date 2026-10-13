@@ -236,6 +236,7 @@ export async function recordPublish(db: DB, record: PublishRecord): Promise<void
       action: record.action ?? `${feed.format}.publish`,
       git_repo_id: job?.repoId ?? null,
       commit_oid: job?.commit ?? null,
+      source_id: job?.sourceId ?? null,
       ref: job?.ref ?? null,
       off_default_branch: movesLatest(actor) ? 0 : 1,
       ci_run_id: job?.runId ?? null,

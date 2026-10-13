@@ -6,7 +6,7 @@ import { ArrowSquareOutIcon, GlobeSimpleIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import type { Deployment, DeploymentList, DeploymentStatus } from "../../shared/deployments.ts";
 import { api } from "../lib/api.ts";
-import { fullDate, timeAgo } from "../lib/format.ts";
+import { fullDate, timeAgo, zonedDate } from "../lib/format.ts";
 import { sourceUrl } from "../lib/refs.ts";
 import { RecentAgents } from "./RecentAgents.tsx";
 
@@ -40,6 +40,76 @@ function Address({ deployment }: { deployment: Deployment }) {
       <span className="truncate">{label}</span>
       <ArrowSquareOutIcon weight="bold" className="shrink-0" aria-hidden />
     </a>
+  );
+}
+
+const CLAIM =
+  "As the deployer recorded it; the provider's own deployment history is authoritative while it has it.";
+
+/** A recorded time, local with its zone named, UTC on hover. */
+function At({ label, at }: { label: string; at: string }) {
+  return (
+    <span>
+      {label}{" "}
+      <time dateTime={at} title={`${at.replace(".000Z", "Z")} (UTC)`}>
+        {zonedDate(at)}
+      </time>
+    </span>
+  );
+}
+
+/**
+ * What ran and what was shipped (CORE-351), exactly as recorded: the provider
+ * version, its canary share and what it replaced, the registry publication,
+ * and the deploy and exposure times. A record that names no provider version
+ * says so: its runtime evidence can't be matched exactly.
+ */
+export function DeploymentProvenance({ deployment }: { deployment: Deployment }) {
+  const { provider, artifact, percentage, replaces, deployedAt, exposedFrom, exposedUntil } =
+    deployment;
+  return (
+    <div
+      className="flex w-full flex-wrap items-center gap-x-2 gap-y-0.5 text-micro text-ink-faint"
+      data-deployment-provenance
+    >
+      {provider ? (
+        <span
+          className="mk-chip mk-chip--tag mk-mono"
+          title={`${provider.name} ${provider.service}, version ${provider.versionId}${provider.deploymentId ? `, deployment ${provider.deploymentId}` : ""}`}
+        >
+          {provider.service} {provider.versionId.slice(0, 8)}
+        </span>
+      ) : (
+        <span>No provider version recorded</span>
+      )}
+      {provider && percentage !== null && (
+        <span className="mk-chip mk-chip--tag" title={CLAIM}>
+          {percentage}% of traffic
+        </span>
+      )}
+      {replaces && (
+        <span title={`Replaced provider version ${replaces.versionId}`}>
+          replaced <span className="mk-mono">{replaces.versionId.slice(0, 8)}</span>
+          {replaces.deploymentId !== null && ` (#${replaces.deploymentId})`}
+        </span>
+      )}
+      {artifact && (
+        <span
+          className="mk-mono"
+          title={`${artifact.format} ${artifact.name}@${artifact.version}${artifact.digest ? ` ${artifact.digest}` : ""}`}
+        >
+          {artifact.name}@{artifact.version}
+          {artifact.digest && ` ${artifact.digest.slice(0, 19)}…`}
+        </span>
+      )}
+      {deployedAt && <At label="deployed" at={deployedAt} />}
+      {exposedFrom && (
+        <span title={CLAIM}>
+          <At label="serving from" at={exposedFrom} />
+          {exposedUntil && <At label=" until" at={exposedUntil} />}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -101,6 +171,7 @@ export function DeploymentsPanel({
             >
               Agents seen recently
             </button>
+            <DeploymentProvenance deployment={deployment} />
             <div id={`deployment-presence-${deployment.id}`} className="w-full">
               {expanded === deployment.id && (
                 <RecentAgents

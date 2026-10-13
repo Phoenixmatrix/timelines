@@ -3,6 +3,15 @@
 // systems record where a commit was deployed, and Gitmatrix shows it next to
 // CI runs, commits, timelines and checkpoints. Records are kept after a
 // preview expires.
+//
+// Provenance (CORE-351; decisions on CORE-348): a record may also say which
+// provider version ran (`provider`) and which registry publication was
+// deployed (`artifact`). Those are what make runtime evidence explicit
+// (shared/observability.ts); a record without them is uninstrumented and its
+// evidence is at best temporal. Nothing is inferred to fill them in: a package
+// built from the same commit is not proof it was deployed.
+
+import type { ObservabilityProvider } from "./observability.ts";
 
 export type DeploymentStatus = "active" | "sleeping" | "expired" | "failed";
 export const DEPLOYMENT_STATUSES: readonly DeploymentStatus[] = [
@@ -53,9 +62,44 @@ export function branchEnvironment(branch: string): string | null {
   return environment.length > MAX_BRANCH_ENVIRONMENT ? null : environment;
 }
 
+/**
+ * The provider version a record ran: immutable ids the provider assigned. No
+ * connection or binding is stored; observability reads resolve the binding
+ * from (repository, service, environment) when they read, and treat the
+ * version as explicit only once the provider lists it under that service.
+ */
+export interface DeploymentProvider {
+  name: ObservabilityProvider;
+  /** The provider's service: a Worker script (OTel `service.name`). */
+  service: string;
+  /** The version that ran (OTel `service.version`). */
+  versionId: string;
+  /**
+   * The provider deployment that put it out: always recorded with the
+   * version, so a canary's members share it and a rollback to an earlier
+   * version is a record of its own.
+   */
+  deploymentId: string;
+}
+
+/**
+ * The registry publication deployed: checked when recorded to be this
+ * repository's CI publish from the same source and commit.
+ */
+export interface DeploymentArtifact {
+  publishId: string;
+  packageId: string;
+  format: string;
+  name: string;
+  version: string;
+  /** `<algorithm>:<hex>` of the primary file or manifest, when the publication has one. */
+  digest: string | null;
+}
+
 export interface Deployment {
   id: number;
-  sourceId?: string;
+  repoId: string;
+  sourceId: string;
   environment: string;
   /** The timeline's slug, as recorded; null outside timelines. */
   timeline: string | null;
@@ -90,6 +134,26 @@ export interface Deployment {
   /** When Gitmatrix expired it, and the cleanup run number if scheduled; neither proves completion. */
   tornDownAt: string | null;
   teardownRun: number | null;
+  /** Null for a record that didn't say (uninstrumented): never guessed. */
+  provider: DeploymentProvider | null;
+  artifact: DeploymentArtifact | null;
+  /**
+   * The recorder's claim when it deployed, not a snapshot of provider data:
+   * when the provider deployed it, when it started and stopped serving traffic,
+   * and a canary's share (0–100; null when unknown or all of it). The
+   * provider's live deployment history is authoritative while it has them.
+   * Each is null when unknown; none defaults to `createdAt`.
+   */
+  deployedAt: string | null;
+  exposedFrom: string | null;
+  exposedUntil: string | null;
+  percentage: number | null;
+  /**
+   * The provider version it replaced (a rollback replaces a newer one), and
+   * that version's record when one exists in the same source and environment.
+   */
+  replaces: { versionId: string; deploymentId: number | null } | null;
+  /** When Gitmatrix recorded it (receipt), and last changed it. */
   createdAt: string;
   updatedAt: string;
 }
@@ -131,6 +195,37 @@ export interface RecordDeployment {
    * for timeline previews, which follow the account's retention.
    */
   expiresAt?: string | null;
+  /** A work source id; a job always records its own. Default: canonical. */
+  source?: string;
+  /**
+   * What the provider deployed: the version and the deployment that put it
+   * out. A job names it for its own commit, or re-asserts a version already
+   * recorded for another commit in this source and environment (a canary's
+   * older member, a rollback). Retrying the same provider deployment answers
+   * its first record, unchanged, unless the commit, environment, artifact,
+   * percentage or replaces differ (409); times and address are not compared.
+   */
+  provider?: {
+    name: ObservabilityProvider;
+    service: string;
+    versionId: string;
+    deploymentId: string;
+  };
+  /**
+   * The registry publication deployed, by id or by package and version; it
+   * must be this repository's CI publish from the same source and commit, and
+   * `digest`, when given, must equal its digest (a publication that records
+   * none, as npm's, refuses one). A job naming it records only its own commit.
+   */
+  artifact?: { publishId?: string; packageId?: string; version?: string; digest?: string };
+  /** UTC ISO times (`…Z`). Exposure starts no earlier than the deployment and ends no earlier than it starts. */
+  deployedAt?: string;
+  exposedFrom?: string;
+  exposedUntil?: string;
+  /** A canary's traffic share, 0–100; needs `provider`. */
+  percentage?: number;
+  /** The provider version this replaced; needs `provider`. */
+  replaces?: string;
 }
 
 /** PATCH /api/repos/:owner/:name/deployments/:id. */
@@ -138,6 +233,15 @@ export interface UpdateDeployment {
   status?: DeploymentStatus;
   url?: string | null;
   expiresAt?: string | null;
+  /**
+   * When it started serving: set once while unknown, no earlier than the
+   * deployment and not in the future (it may precede the record).
+   */
+  exposedFrom?: string;
+  /** When it stopped serving: set once (a UTC ISO time), never moved. */
+  exposedUntil?: string;
+  /** A canary's share, only while none is recorded. Provider and artifact never change. */
+  percentage?: number;
 }
 
 export interface Environment {
@@ -145,6 +249,11 @@ export interface Environment {
   timeline: string | null;
   /** Its newest deployment; null for a `production` that was never deployed. */
   latest: Deployment | null;
+  /**
+   * Every live record of the newest one's provider deployment, newest first,
+   * when that deployment split traffic between versions (a canary); else empty.
+   */
+  split: Deployment[];
   /** Deployments still up (active or sleeping), and every one recorded. */
   live: number;
   total: number;

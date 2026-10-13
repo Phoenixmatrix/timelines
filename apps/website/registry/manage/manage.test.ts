@@ -52,6 +52,21 @@ describe("packages API", () => {
     admin = h.token("dana");
   });
 
+  it("records the work source a CI publish was built in, and none for a person's (CORE-351)", async () => {
+    const job = h.jobToken({ repo: "web" });
+    expect((await deploy("web/3.0.0/web.tgz", job.token)).status).toBe(201);
+    expect((await deploy("web/3.0.1/web.tgz", admin)).status).toBe(201);
+    const { results } = await h.db
+      .prepare(
+        "SELECT version, git_repo_id, source_id, commit_oid FROM publishes WHERE version IN ('3.0.0', '3.0.1') ORDER BY version",
+      )
+      .all();
+    expect(results).toEqual([
+      { version: "3.0.0", git_repo_id: job.repoId, source_id: "canonical", commit_oid: job.commit },
+      { version: "3.0.1", git_repo_id: null, source_id: null, commit_oid: null },
+    ]);
+  });
+
   it("lists an owner's packages with their sources and recent activity", async () => {
     await seed();
     const { status, body } = await call<OwnerPackages>("/test", admin);

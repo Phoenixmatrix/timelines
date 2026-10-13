@@ -299,7 +299,14 @@ export interface ArtifactRef {
   digest: string | null;
 }
 
-/** An immutable version or deployment id the provider assigned. */
+/**
+ * An immutable version or deployment id the provider assigned, read through a
+ * binding. Deployment records (shared/deployments.ts, CORE-351) store only the
+ * provider, service and ids; a reader builds this ref by resolving the binding
+ * from the record's (repoId, service, environment) at read time, under current
+ * authorization, and a recorded version is explicit only once the reader finds
+ * it under the bound service.
+ */
 export interface ProviderVersionRef {
   connectionId: string;
   bindingId: string;
@@ -1031,13 +1038,82 @@ export function validateEvidence(evidence: RuntimeEvidence): RuntimeEvidence {
   return { attribution, join, candidates };
 }
 
+/** A provider-assigned id (a version, deployment or service name): non-empty, no whitespace, at most 256 characters. */
+export function providerId(value: unknown, field: string): string {
+  return id(value, field);
+}
+
+/** An artifact digest, `<algorithm>:<hex>` (`sha256:…`), as registry publishes store it. */
+export function normalizeDigest(value: unknown, field = "artifact digest"): string {
+  if (typeof value !== "string" || !DIGEST.test(value))
+    throw new ObservabilityError(
+      `Invalid ${field} ${JSON.stringify(value)}: use <algorithm>:<hex>.`,
+    );
+  return value;
+}
+
+/**
+ * When a version was deployed and served traffic, and its share, as a
+ * producer or a provider states them. Every field may be unknown (null).
+ */
+export interface ExposureClaim {
+  /** `deployment`: when the provider deployed it. */
+  deployedAt: string | null;
+  /** `exposure`: when it started and stopped serving. */
+  exposedFrom: string | null;
+  exposedUntil: string | null;
+  /** A canary's traffic share, 0–100. */
+  percentage: number | null;
+}
+
+/**
+ * An exposure in canonical form: strict UTC instants; exposure starts no
+ * earlier than the deployment (when both are known) and ends no earlier than
+ * it starts; an end needs a start; a share is a finite 0–100. Missing fields
+ * read as null; nothing is inferred from another field.
+ */
+export function validateExposure(value: {
+  deployedAt?: unknown;
+  exposedFrom?: unknown;
+  exposedUntil?: unknown;
+  percentage?: unknown;
+}): ExposureClaim {
+  const at = (raw: unknown, field: string) =>
+    raw === undefined || raw === null ? null : parseUtcInstant(raw, field);
+  const deployed = at(value.deployedAt, "deployedAt");
+  const from = at(value.exposedFrom, "exposedFrom");
+  const until = at(value.exposedUntil, "exposedUntil");
+  if (from !== null && deployed !== null && from < deployed)
+    throw new ObservabilityError("Invalid deployment: exposure can't start before the deployment.");
+  if (until !== null && (from === null || until < from))
+    throw new ObservabilityError("Invalid deployment: exposure must start before it ends.");
+  const percentage = value.percentage ?? null;
+  if (percentage !== null) within(percentage, 0, 100, "deployment percentage");
+  return {
+    deployedAt: deployed === null ? null : utcInstant(deployed),
+    exposedFrom: from === null ? null : utcInstant(from),
+    exposedUntil: until === null ? null : utcInstant(until),
+    percentage: percentage as number | null,
+  };
+}
+
+/** The provider version a deployment replaced (a rollback's newer one); never the version itself. */
+export function validateReplaces(value: unknown, versionId: string): string | null {
+  if (value === undefined || value === null) return null;
+  const replaces = id(value, "replaces");
+  if (replaces === versionId)
+    throw new ObservabilityError("Invalid deployment: a version can't replace itself.");
+  return replaces;
+}
+
 /**
  * A provider deployment in canonical form: exposure starts no earlier than
  * the deployment and ends no earlier than it starts, an end needs a start, a
- * canary's share is a finite 0–100, and it doesn't replace itself. Missing
- * optional fields read as null. Readers pass the connection's link prefixes so
- * the link is checked with {@link safeProviderLink}; without them only its
- * shape is checked.
+ * canary's share is a finite 0–100, and it doesn't replace itself
+ * ({@link validateExposure}, {@link validateReplaces}). Missing optional
+ * fields read as null. Readers pass the connection's link prefixes so the
+ * link is checked with {@link safeProviderLink}; without them only its shape
+ * is checked.
  */
 export function validateProviderDeployment(
   deployment: ProviderDeployment,
@@ -1045,23 +1121,10 @@ export function validateProviderDeployment(
 ): ProviderDeployment {
   object(deployment, "deployment");
   const version = versionRef(deployment.version);
-  const deployed = parseUtcInstant(deployment.deployedAt, "deployedAt");
-  const exposedFrom = deployment.exposedFrom ?? null;
-  const exposedUntil = deployment.exposedUntil ?? null;
-  const from = exposedFrom === null ? null : parseUtcInstant(exposedFrom, "exposedFrom");
-  const until = exposedUntil === null ? null : parseUtcInstant(exposedUntil, "exposedUntil");
-  if (from !== null && from < deployed)
-    throw new ObservabilityError("Invalid deployment: exposure can't start before the deployment.");
-  if (until !== null && (from === null || until < from))
-    throw new ObservabilityError("Invalid deployment: exposure must start before it ends.");
-  const percentage = deployment.percentage ?? null;
-  if (percentage !== null) within(percentage, 0, 100, "deployment percentage");
+  parseUtcInstant(deployment.deployedAt, "deployedAt");
+  const exposure = validateExposure(deployment);
   const replaces = deployment.replaces;
-  if (replaces !== undefined && replaces !== null) {
-    id(replaces, "replaces");
-    if (replaces === version.versionId)
-      throw new ObservabilityError("Invalid deployment: a version can't replace itself.");
-  }
+  if (replaces !== undefined) validateReplaces(replaces, version.versionId);
   const rawLink = deployment.link ?? null;
   let link: ProviderLink | null = null;
   if (rawLink !== null) {
@@ -1074,10 +1137,10 @@ export function validateProviderDeployment(
   return {
     ...deployment,
     version,
-    deployedAt: utcInstant(deployed),
-    exposedFrom: from === null ? null : utcInstant(from),
-    exposedUntil: until === null ? null : utcInstant(until),
-    percentage,
+    deployedAt: exposure.deployedAt!,
+    exposedFrom: exposure.exposedFrom,
+    exposedUntil: exposure.exposedUntil,
+    percentage: exposure.percentage,
     link,
     ...(replaces === undefined ? {} : { replaces }),
   };
