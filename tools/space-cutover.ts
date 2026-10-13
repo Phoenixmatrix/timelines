@@ -99,10 +99,18 @@ if (values.help || !command) {
         body: body === undefined ? undefined : JSON.stringify(body),
         redirect: "error",
       });
-      if (!response.ok)
+      if (!response.ok) {
+        // The server's own reason names which precondition failed; it never echoes credentials.
+        const reason = await response
+          .json()
+          .then((value: { error?: unknown }) =>
+            typeof value.error === "string" ? value.error : "",
+          )
+          .catch(() => "");
         throw new Error(
-          `Operator request rejected (${response.status}); inspect status, approval and consumer drain. No automatic retry was attempted.`,
+          `Operator request rejected (${response.status})${reason ? `: ${reason.slice(0, 500)}` : ""}; inspect status, approval and consumer drain. No automatic retry was attempted.`,
         );
+      }
       if (cookieOutput) {
         const name = `${origin.protocol === "https:" ? "__Secure-" : ""}gm.cutover_operator`;
         const session = response.headers
