@@ -98,7 +98,8 @@ jobs:
   test:
     verification: context-invariant-v1
     instance: standard-4
-    timeout_minutes: 30
+    # The unit half alone takes about 29 minutes (main run #745 timed out at 30).
+    timeout_minutes: 60
     # The browser tests save a picture of the app at their key states here
     # (src/testing/visual.ts); the last step attaches them to the commit's step
     # for the Story's step view (CORE-383).
