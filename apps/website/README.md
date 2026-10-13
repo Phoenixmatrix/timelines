@@ -3384,16 +3384,40 @@ the artifact digest when present, are what explicit attribution needs).
   `--deployed-at`, `--exposed-from`, `--percentage` and `--replaces`.
   `gm deploy update` takes `--exposed-from` and `--exposed-until`;
   `gm deploy list` takes `--provider-version` and `--source`.
-- **Next (step 2, not yet done).** The producers start sending provider
-  versions once this gm is published and installed: the production deploy job
+- **Who records it here.** The production deploy job
   (`tools/agent/deploy.ts`) records each Worker it actually deploys
-  (`gitmatrix`, `gitmatrix-site`) after `cf deploy`, taking the version id and
-  percentage from `cf workers deployments list` only when its `workers/tag`
-  is the deployed commit, with the previously deployed version as `replaces`
-  and nothing when the deploy was skipped; it installs gm as
-  `tools/preview/preview.ts` does. Preview creates add the Preview's version
-  and deployment ids once the real `cf previews deploy` output is confirmed to
-  carry them.
+  (`gitmatrix` on timelinesapp.fward.dev, `gitmatrix-site` on
+  timelines.fward.dev) in `production`, as the job, for the deployed commit.
+  It deploys both Workers first, then records them, so recording never holds
+  up a deploy. For each it reads `cf workers deployments list`: the newest
+  deployment's id, its version with the most traffic and that version's
+  share, and the deployment's `created_on` as `deployedAt` and
+  `exposedFrom`. It records only when that version's `workers/tag` is the
+  deployed commit, names the version that served before as `--replaces` when
+  it differs, and records nothing for a Worker it skipped. gm is installed
+  the way preview jobs install it (`installGm`, the newest gm published to the
+  owner's registry, loaded and installed only when first needed). Recording
+  has three minutes in all; a record that fails or runs out of time only
+  warns (`deploy.record.skipped`, with the reason), because the Worker is
+  already live.
+- **A missing record stays missing.** Nothing retries a failed or skipped
+  record: rerunning the job finds the Worker already deployed and records
+  nothing. The server's dedupe only makes an explicit re-record safe. To
+  record one by hand, with write access to the repository, take the ids from
+  `cf workers deployments list --worker <worker>` and run:
+
+  ```sh
+  gm deploy record --url <url> --environment production --commit <commit> \
+    --service <worker> --provider-version <version id> \
+    --provider-deployment <deployment id> --percentage <share> \
+    --deployed-at <created_on> --exposed-from <created_on> \
+    [--replaces <previous version id>]
+  ```
+
+- **Previews.** Timeline previews (`tools/preview/preview.ts`) still record
+  no provider version: `cf previews deploy` reports a Preview id and a
+  Preview deployment id but no Worker version id, and a Preview's ids aren't
+  invented into one.
 
 #### The preview contract
 
