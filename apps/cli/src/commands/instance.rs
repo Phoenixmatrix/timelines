@@ -2235,6 +2235,22 @@ fn run_tool(dir: &Path, program: &str, args: &[&str], hint: &str) -> Result<()> 
     }
 }
 
+/// The command that deploys what a dry run reported, flags included: a
+/// target that isn't known to be later needs --allow-downgrade.
+fn upgrade_command(name: &str, args: &UpgradeArgs, forward: bool) -> String {
+    let mut command = format!("gm instance upgrade {name}");
+    if let Some(from) = &args.from {
+        command.push_str(&format!(" --from {from}"));
+    }
+    if let Some(to) = &args.to {
+        command.push_str(&format!(" --to {to}"));
+    }
+    if !forward {
+        command.push_str(" --allow-downgrade");
+    }
+    command
+}
+
 fn upgrade(ctx: &Ctx, args: &UpgradeArgs) -> Result<Shown> {
     let guide = Guide::new();
     let mut instance = load(&args.name)?.ok_or_else(|| {
@@ -2506,25 +2522,17 @@ fn upgrade(ctx: &Ctx, args: &UpgradeArgs) -> Result<Shown> {
             ),
         ));
     }
+    let forward = matches!(direction, Direction::Forward | Direction::Same);
     if ctx.dry_run {
         return Ok(Shown {
             text: format!(
-                "Dry run: nothing changed. Run `gm instance upgrade {}{}{}` to deploy {}.",
-                instance.name,
-                args.from
-                    .as_ref()
-                    .map(|from| format!(" --from {from}"))
-                    .unwrap_or_default(),
-                args.to
-                    .as_ref()
-                    .map(|to| format!(" --to {to}"))
-                    .unwrap_or_default(),
+                "Dry run: nothing changed. Run `{}` to deploy {}.",
+                upgrade_command(&instance.name, args, forward),
                 short(&target)
             ),
             value: json!({ "dry_run": true, "upgrade": summary }),
         });
     }
-    let forward = matches!(direction, Direction::Forward | Direction::Same);
     if !forward && !args.allow_downgrade {
         return Err(GmError::new(
             "not_an_upgrade",
@@ -2831,6 +2839,25 @@ mod tests {
         assert_eq!(
             direction(repo, "0123456789abcdef0123456789abcdef01234567", &b),
             Direction::Unknown
+        );
+    }
+
+    #[test]
+    fn dry_runs_suggest_the_flags_the_upgrade_needs() {
+        let args = |to: Option<&str>| UpgradeArgs {
+            name: "demo".into(),
+            to: to.map(str::to_string),
+            from: Some("https://example.com/timelines.git".into()),
+            allow_downgrade: false,
+            yes: false,
+        };
+        assert_eq!(
+            upgrade_command("demo", &args(None), true),
+            "gm instance upgrade demo --from https://example.com/timelines.git"
+        );
+        assert_eq!(
+            upgrade_command("demo", &args(Some("1a2b3c")), false),
+            "gm instance upgrade demo --from https://example.com/timelines.git --to 1a2b3c --allow-downgrade"
         );
     }
 
