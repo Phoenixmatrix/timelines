@@ -51,8 +51,9 @@ release. Add a tool name to select part of the graph. For example, run
   with `agent inspect` or scoped tracker/issue commands.
 - Before completion, inspect **`vp run ready --dry-run`**, then run
   **`vp run ready`**. Plain `ready` is the required, automatically selective
-  gate: it runs uncached checks, workspace tests/builds and non-AI E2E selected
-  from changed paths and dependencies. Do not routinely prepend or append
+  gate: it runs uncached checks and workspace tests/builds selected from changed
+  paths and dependencies, plus only the non-AI E2E journeys of the areas those
+  paths touch (with their prerequisite scenarios). Do not routinely prepend or append
   blanket `vp check`, `vp test`, recursive builds or `vp run agent test`;
   targeted checks for development/debugging are still appropriate.
   Sync the source workspace and run `vp install` first: selection includes
@@ -61,10 +62,19 @@ release. Add a tool name to select part of the graph. For example, run
   Use `--all` only for deliberately required comprehensive verification.
   Use `--base <ref>` only for the actual integration branch, never to hide
   unlanded changes or force a smaller plan. Unknown/global/shared harness
-  changes automatically fall back to full coverage; accept that selection.
-  Frontend changes keep browser journeys and prerequisites. Server CI skips
-  E2E (too expensive per push), so selected live journeys must pass locally
-  before code lands. See [coverage rules](README.md#completion-gate).
+  changes automatically fall back to full code gates and every E2E journey
+  except the main-only ones and the four heavy area-only ones (which run only when a
+  change reaches their area); harness-only files no local run executes select no
+  E2E, and failed change discovery (including an unreadable task graph) runs
+  everything. Accept that selection. Frontend changes keep
+  browser journeys and prerequisites. Server CI skips E2E (too expensive per
+  push), so selected live journeys must pass locally before code lands. The
+  main-only journeys and the complete suite run on each new main commit through
+  the `vp run agent main-e2e install` watcher, which files failures as P0
+  issues (it retries both environment limits, and a failing run stops at its first
+  failing scenario, so the issue title names only that one); `--all` still runs
+  everything locally. See
+  [coverage rules](README.md#completion-gate).
   For changes to knowledge, wiki, embeddings, AI Search, the assistant,
   release notes, avatars or the Atlas, follow
   `.agents/skills/gitmatrix-ai-verification/SKILL.md` and explicitly run

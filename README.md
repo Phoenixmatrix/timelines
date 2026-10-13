@@ -766,23 +766,49 @@ required by root lint. Website bindings are generated once before consumer check
 Other uncached gates follow workspace dependencies, including the harness and
 preview tools' relative imports of website contracts:
 
-| Change                                                                                         | Selected coverage                                                                                                             |
-| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| CLI source/assets                                                                              | Rust format/clippy, tests/build and full non-AI E2E; no unrelated website tests/build                                         |
-| Website source                                                                                 | Website and dependent harness/preview checks/tests, website build and non-AI E2E; no unrelated Rust checks/release build      |
-| Frontend-only (`src/`, `public/`)                                                              | Website coverage above; browser E2E journeys with their prerequisite scenarios, without unrelated backend scenarios or mirror |
-| Shared formats                                                                                 | Package checks/tests plus dependent website/harness/preview coverage and E2E                                                  |
-| Shared test helpers                                                                            | Package and consumer checks/tests, without production builds or E2E                                                           |
-| Tests only                                                                                     | Their workspace's checks/tests; no builds or live E2E                                                                         |
-| Known root/workspace README, AGENTS, CONTRIBUTING or CHANGELOG                                 | Mandatory checks only; Markdown runtime assets are not exempt                                                                 |
-| Coding-agent Markdown instructions/skills and `.claude/settings.json`                          | Mandatory checks only; executable hooks and scripts are not exempt                                                            |
-| Global/task/dependency configuration, shared harness, unknown paths or failed change discovery | Full suite                                                                                                                    |
+| Change                                                                                                 | Selected coverage                                                                                                                             |
+| ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| CLI source/assets                                                                                      | Rust format/clippy, tests/build and the E2E journeys of the changed commands' areas (every gm journey for shared modules)                     |
+| Website source                                                                                         | Website and dependent harness/preview checks/tests, website build and the changed areas' E2E journeys; no unrelated Rust checks/release build |
+| Frontend-only (`src/`, `public/`)                                                                      | Website coverage above; browser E2E journeys with their prerequisite scenarios, without unrelated backend scenarios or mirror                 |
+| Shared formats                                                                                         | Package checks/tests plus dependent website/harness/preview coverage and E2E                                                                  |
+| Shared test helpers                                                                                    | Package and consumer checks/tests, without production builds or E2E                                                                           |
+| Tests only                                                                                             | Their workspace's checks/tests; no builds or live E2E                                                                                         |
+| Known root/workspace README, AGENTS, CONTRIBUTING or CHANGELOG                                         | Mandatory checks only; Markdown runtime assets are not exempt                                                                                 |
+| Coding-agent Markdown instructions/skills and `.claude/settings.json`                                  | Mandatory checks only; executable hooks and scripts are not exempt                                                                            |
+| Global/task/dependency configuration, shared harness or unknown paths                                  | Full code gates and every E2E journey except the main-only and the four area-only ones                                                        |
+| Harness-only files no local run executes (AI stages, deploys, the main E2E watcher, remote helpers, …) | Full code gates; no E2E                                                                                                                       |
+| `--all`, or failed change discovery (no base, unreadable changes, unreadable task graph)               | Full suite, main-only and area-only journeys included                                                                                         |
 
 Content-only edits to the three audited stylesheets
 `apps/website/src/styles/{app,tokens,matrixkit}.css` preserve all website unit and
 browser tests, the website build and selected live E2E. They omit only the implicit
 agent/preview TypeScript consumer checks. Changed imports, URLs or at-rules,
 renames, and mixed or unknown changes widen coverage instead of taking that shortcut.
+
+Live E2E journeys are selected by area (`tools/agent/ready-e2e.ts`). Each scenario
+lists the areas it exercises (tracker, timelines-landing, sources, ci, git-transport,
+retention, usage, packages, …) and the earlier scenarios whose fixtures it reads; a
+path table maps changes to areas. Worker tracker code selects the tracker and
+timeline journeys, usage code the metering and usage/retention browser journeys,
+`gm`'s command modules their own areas. AI-only code (knowledge, release notes,
+semantic search), the docs site and prose select none, and a selection without
+journeys provisions no environment. An unnamed Worker or shared module selects the
+quick core API journeys. The Worker entry, schema, auth and development API,
+migrations and seed, build/runtime configuration, dependencies, shared packages, the
+E2E harness, repository authorization (`worker/permissions.ts`) and unknown paths
+select every journey except the main-only ones: the
+multi-repository landing recovery matrix and the legacy-source migration (about
+eight minutes together). That widened set is added to whatever the other changed
+paths select, so a merge-queue change beside a migration still runs the queue journey.
+`gm`'s agent, profile and server modules run for every command, so they select every
+gm journey. Agents' `ready` never runs those; `--all`, `agent test` and
+the [main E2E watcher](#full-e2e-on-main) do. Four more heavy journeys (the merge
+queue, source retention, nested timeline admission and source push recovery, about
+seven minutes) run only when a change reaches their own area, never in that
+widened set. To see what the policy costs,
+`node tools/agent/ready-e2e-replay.ts --timings <run>/artifacts/e2e.json` replays
+recent main commits through it with a complete run's measured scenario times.
 
 Route-only changes to `UsageCosts.tsx` select both the usage and retention browser
 journeys; `DataRetention.tsx` selects retention. Global styles and shared UI,
@@ -795,7 +821,8 @@ journeys.
 Unchanged workspaces are skipped, not reported as tested. The selection and its
 reasons print before execution and are saved as `selection.json` beside the gate
 logs under `.gitmatrix-agent/artifacts/gates-<timestamp>/`. `--all` restores complete
-workspace checks, tests/builds and all non-AI CLI/API/browser/mirror E2E.
+workspace checks, tests/builds and all non-AI CLI/API/browser/mirror E2E, main-only
+journeys included.
 Gate `completion.json` records per-gate `elapsedMs`, `wallMs` and `outcome`, plus
 total elapsed time and completion status, including failed cases. These describe
 observed execution, not an assumed speedup from parallel scheduling.
@@ -805,8 +832,8 @@ or extend those waits. Timestamps and persisted expiry times still use wall time
 `agent check` accepts the same flags; `agent test` remains the complete live suite.
 CI/CD gate coverage is retained; candidate proof reuse requires explicit pipeline
 opt-in. Update the workspace policy in `tools/agent/ready-plan.ts` when adding
-workspaces or cross-workspace imports, and the scenario inventory, browser coverage
-and prerequisite map in `ready-e2e.ts` when adding E2E journeys.
+workspaces or cross-workspace imports, and the scenario inventory, prerequisites,
+areas, path rules and browser coverage in `ready-e2e.ts` when adding E2E journeys.
 
 Measured decisions from 2026-10-09 (single local runs, not portable benchmarks):
 
@@ -930,6 +957,41 @@ qualify for recovery.
 Locally, E2E runs on the trusted Linux host with Cloudflare login and user-systemd
 prerequisites. Local runners retain repo/job-scoped Cargo output caches outside
 checkouts; concurrent jobs lease separate slots. Tests still run every time.
+
+### Full E2E on main
+
+`vp run ready` runs only the E2E journeys your change selects. The complete non-AI
+suite runs instead on the trusted host, once per new `origin/main` commit, from a
+user-systemd timer. Install it once per machine (Linux, user systemd, `node`, `cf`,
+`gm` and `vp` installed outside any worktree):
+
+```sh
+vp run agent main-e2e install    # also: status, uninstall
+```
+
+It keeps its own checkout and state in `~/.local/state/gitmatrix-agent/main-e2e/`
+(`gm worktree add` on `origin/main`, never a feature worktree) and every five minutes
+runs `gm sync`; when main moved it runs `vp install` and the same full suite as
+`vp run agent test`, logging to `runs/<sha>.log`. Runs never overlap, and several
+commits that land during a run are tested together as the newest one.
+
+Failures become P0 bug issues tagged `testing` and `main-e2e` on main (never a
+timeline), titled `Main E2E failing: <scenarios>`, with the commit, failed stages and
+scenarios, evidence path, log and reproduction. While an open issue names the same
+failing set, later commits add a comment instead. When main passes again each open
+`main-e2e` issue gets a "Passing again" comment; closing stays a person's decision.
+A run refused for the installation or the machine environment limit files nothing
+and is retried on the next tick. A run stops at its first failing scenario, so the
+issue title names that first failure: a second regression can hide behind it until the
+first is fixed. A run that outlasts its budget (85 minutes) is stopped with SIGTERM so
+it can destroy its environment, then SIGKILL after three minutes, and is reported as
+`Main E2E failing: timeout`; that commit is not retried. If `gm sync` fails or the
+checkout differs from `origin/main` (tracked changes or untracked files), the watcher
+restores it (`gm timeline use main`, `gm restore`, `git clean` inside its own checkout)
+and, failing that, files a P0 `Main E2E watcher stuck: <reason>` issue once and comments
+on it when the checkout recovers. A running suite holds one environment slot for its duration (about
+as long as `vp run agent test`). `uninstall` removes the units and keeps the checkout
+and state.
 
 ### AI capability verification
 

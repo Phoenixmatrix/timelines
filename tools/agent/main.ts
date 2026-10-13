@@ -26,6 +26,7 @@ import {
 import type { Environment } from "./environment.ts";
 import type { HarnessContext } from "./types.ts";
 import { installMaintenance, maintenanceStatus, uninstallMaintenance } from "./maintenance.ts";
+import { installMainE2E, mainE2EStatus, tick, uninstallMainE2E } from "./main-e2e.ts";
 import { parseReservationArgs, reconcileReservations } from "./reservations.ts";
 import { pruneBrowsers } from "./browsers.ts";
 import { seed } from "./seed.ts";
@@ -33,7 +34,7 @@ import { runE2E } from "./e2e.ts";
 import { runProviderE2E, type AiRun } from "./provider-e2e.ts";
 import { ATLAS_PROVIDER_CONFIG } from "./atlas-provider-e2e.ts";
 import { parseReadyOptions, readinessPlan, type ReadyOptions } from "./ready-plan.ts";
-import { selectReadyE2E, type ReadyE2ESelection } from "./ready-e2e.ts";
+import { selectReadyE2E, selectsE2E, type ReadyE2ESelection } from "./ready-e2e.ts";
 import {
   AI_STAGES,
   appendHistory,
@@ -66,8 +67,9 @@ const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
   vp run agent exec -- <command>  Run another tool with isolated Git/XDG/GM settings
   vp run agent inspect [db|registry] [SQL]  Read local data; defaults to table inventory
   vp run agent check [--all] [--dry-run] [--base <ref>]
-                                  Change-aware uncached readiness (also vp run ready); --all runs every gate
-                                  and non-AI E2E, --dry-run explains selection without running or provisioning
+                                  Change-aware uncached readiness (also vp run ready): E2E journeys of the
+                                  changed areas; --all runs every gate and every non-AI E2E journey,
+                                  --dry-run explains selection without running or provisioning
   vp run agent test               Fresh non-AI E2E; no AI resources or inference
   vp run agent test-ai [--stage <id>[,<id>]] [--all] [--resume] [--force] [--dry-run] [--base <ref>]
                                   Paid real-provider verification of the stages your changes (against
@@ -84,6 +86,9 @@ const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
                                   frees only released-locally and own-orphan rows, as the hourly sweep does.
                                   --expired also frees expired-foreign rows: no journal here and more
                                   than a day past their expiry. Never in sweeps; live rows are never freed
+  vp run agent main-e2e install|status|uninstall
+                                  Trusted host only: a systemd timer runs the complete non-AI E2E suite on each
+                                  new origin/main commit in its own checkout and files failures as P0 issues
   vp run agent prune-browsers [--dry-run] [--include-other-installs]
                                   Delete Playwright browser revisions no worktree or other live install uses
 24-hour hard lifetime; default limits: four installation-wide and four local per OS user/machine.
@@ -603,7 +608,9 @@ async function retainReports(artifacts: string): Promise<void> {
 
 async function gates(options: ReadyOptions): Promise<void> {
   const plan = await readinessPlan(root, options);
-  const e2e = plan.e2e ? selectReadyE2E(plan.changed, plan.full) : null;
+  // Only explicit --all (or no change list) runs main-only journeys; other full
+  // fallbacks still select journeys by path.
+  const e2e = plan.e2e ? selectReadyE2E(plan.changed, plan.e2eAll) : null;
   const selection = { ...plan, e2e };
   console.log(JSON.stringify({ event: "ready.selection", ...selection }, null, 2));
   if (options.dryRun) return;
@@ -650,7 +657,8 @@ async function gates(options: ReadyOptions): Promise<void> {
         );
       }
     }
-    if (e2e) await liveTest(false, undefined, e2e);
+    // An empty selection provisions no environment.
+    if (e2e && selectsE2E(e2e)) await liveTest(false, undefined, e2e);
     success = true;
   } catch (error) {
     failure = error;
@@ -701,6 +709,12 @@ try {
       throw new Error(
         "Use maintenance install|status|uninstall|reservations [--release [--expired]].",
       );
+  } else if (operation === "main-e2e") {
+    if (args[0] === "install") await installMainE2E();
+    else if (args[0] === "uninstall") await uninstallMainE2E();
+    else if (args[0] === "status") console.log(await mainE2EStatus());
+    else if (args[0] === "tick") await tick();
+    else throw new Error("Use main-e2e install|status|uninstall.");
   } else if (operation === "prune-browsers") {
     const flags = new Set(args);
     for (const flag of flags)
