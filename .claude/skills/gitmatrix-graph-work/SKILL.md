@@ -47,7 +47,12 @@ restricting pickup. Policy is global across timelines, not a branch-local overri
    keeps a returned lease token for you, so lease commands need no token. A
    missing/empty token or uncertain claim response grants no ownership; inspect
    the issue online. Losing it (`Claim expired, was superseded…`) means someone
-   else may own the work now: stop and re-read the issue.
+   else may own the work now: stop and re-read the issue. Others may change an
+   issue while you hold it (a comment, a new acceptance criterion, an answer, a
+   claim taken over). gm tells you: `gm issue renew` lists their changes,
+   `gm issue updates` shows and marks them read, and in Claude Code gm's hooks
+   add them to your context. When told, re-read the issue
+   (`gm issue show <issue>`) and adapt before you go on.
 4. **Ask the assistant** when you need to find something out, e.g.
    `gm ask "Where is the tracker's readiness computed?"`. It reads the code (and
    its knowledge graph), issues, CI runs and packages for you and answers with
