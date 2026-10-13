@@ -349,18 +349,40 @@ if (values.help || !command) {
         throw new Error("cf is configured for another account; refusing a census of the wrong one");
       const workflows: Record<string, { name: string; instances: ListedInstance[] }> = {};
       for (const workflow of ["ci-run", "knowledge-build", "repo-purge"]) {
+        // A census is many read-only listings: one dropped connection retries it.
+        const retried = (read: () => string): string => {
+          for (let attempt = 1; ; attempt++) {
+            try {
+              return read();
+            } catch (error) {
+              if (attempt >= 3) throw error;
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_000 * attempt);
+            }
+          }
+        };
+        // Everything since before any installation existed, to a minute past now: the
+        // fence lets nothing new start.
+        const range = { from: Date.parse("2020-01-01T00:00:00Z"), to: Date.now() + 60_000 };
         const list = () =>
-          listWorkflowInstances(workflow, ({ cursor, page, perPage }) =>
-            cf([
-              "workflows",
-              "instances",
-              "list",
-              "--workflow-name",
-              workflow,
-              "--per-page",
-              String(perPage),
-              ...(cursor ? ["--cursor", cursor] : page > 1 ? ["--page", String(page)] : []),
-            ]),
+          listWorkflowInstances(
+            workflow,
+            ({ start, end, perPage }) =>
+              retried(() =>
+                cf([
+                  "workflows",
+                  "instances",
+                  "list",
+                  "--workflow-name",
+                  workflow,
+                  "--per-page",
+                  String(perPage),
+                  "--date-start",
+                  start,
+                  "--date-end",
+                  end,
+                ]),
+              ),
+            range,
           );
         const first = list();
         const second = list();

@@ -492,43 +492,60 @@ describe("census export from the provider's lists", () => {
       createdOn: created_on,
     }));
 
-  test("numbered pages continue past a full page, so more than one page is listed whole", () => {
-    const calls: { cursor: string | null; page: number }[] = [];
-    const rows = listWorkflowInstances("ci-run", ({ cursor, page: number }) => {
-      calls.push({ cursor, page: number });
+  // A provider holding `instances`, filtering creation windows as Cloudflare does.
+  const provider = (instances: { id: string; status: string; created_on: string }[]) => {
+    const calls: { start: string; end: string }[] = [];
+    const list = ({ start, end, perPage }: { start: string; end: string; perPage: number }) => {
+      calls.push({ start, end });
+      const [from, to] = [Date.parse(start), Date.parse(end)];
       return JSON.stringify(
-        number === 1 ? page(0, CENSUS_PER_PAGE) : number === 2 ? page(100, 30) : [],
+        instances
+          .filter((row) => Date.parse(row.created_on) >= from && Date.parse(row.created_on) < to)
+          .slice(0, perPage),
       );
-    });
-    expect(rows).toHaveLength(130);
-    expect(calls.map((call) => call.page)).toEqual([1, 2]);
-    expect(rows[129]).toEqual({
-      id: "i-129",
+    };
+    return { calls, list };
+  };
+  const spread = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({
+      id: `i-${index}`,
+      status: index % 7 ? "complete" : "running",
+      created_on: new Date(Date.parse("2026-10-12T00:00:00Z") + index * 997).toISOString(),
+    }));
+  const range = {
+    from: Date.parse("2020-01-01T00:00:00Z"),
+    to: Date.parse("2026-10-13T00:00:00Z"),
+  };
+
+  test("a full window is split until every half fits a page, so all instances are listed once", () => {
+    const { calls, list } = provider(spread(450));
+    const rows = listWorkflowInstances("ci-run", list, range);
+    expect(rows).toHaveLength(450);
+    expect(new Set(rows.map((row) => row.id)).size).toBe(450);
+    expect(calls.length).toBeGreaterThan(1);
+    expect(calls.every((call) => /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(call.start))).toBe(true);
+    expect(listWorkflowInstances("ci-run", provider(spread(30)).list, range)).toHaveLength(30);
+  });
+
+  test("a full one-second window, or a provider filtering otherwise, is refused", () => {
+    const crowded = Array.from({ length: CENSUS_PER_PAGE }, (_, index) => ({
+      id: `i-${index}`,
       status: "running",
-      createdOn: "2026-10-12T11:00:00Z",
-    });
-  });
-
-  test("a cursor continues an enveloped result; a full page without one is refused", () => {
-    const rows = listWorkflowInstances("ci-run", ({ cursor }) =>
-      JSON.stringify(
-        cursor === null
-          ? { result: page(0, CENSUS_PER_PAGE), result_info: { cursor: "next" } }
-          : { result: page(100, 1), result_info: { cursor: null } },
-      ),
+      created_on: "2026-10-12T11:00:00.500Z",
+    }));
+    expect(() => listWorkflowInstances("ci-run", provider(crowded).list, range)).toThrow(
+      "one-second",
     );
-    expect(rows).toHaveLength(101);
+    // Ignoring the window lists an instance outside it, or the same one twice.
     expect(() =>
-      listWorkflowInstances("ci-run", () =>
-        JSON.stringify({ result: page(0, CENSUS_PER_PAGE), result_info: {} }),
-      ),
-    ).toThrow("no continuation");
+      listWorkflowInstances("ci-run", () => JSON.stringify(page(0, 3)), {
+        from: Date.parse("2026-10-13T00:00:00Z"),
+        to: Date.parse("2026-10-14T00:00:00Z"),
+      }),
+    ).toThrow("overlap or leak");
   });
 
-  test("pages that repeat instances, or listings that disagree, are refused", () => {
-    expect(() =>
-      listWorkflowInstances("ci-run", () => JSON.stringify(page(0, CENSUS_PER_PAGE))),
-    ).toThrow("repeated an instance");
+  test("listings that disagree are refused", () => {
     const first = listed(0, 3);
     expect(() => confirmListing("ci-run", first, [...first, ...listed(3, 1)])).toThrow("changed");
     expect(() => confirmListing("ci-run", first, first.slice(1))).toThrow("changed");
