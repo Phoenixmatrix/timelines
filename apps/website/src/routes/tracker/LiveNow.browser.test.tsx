@@ -110,3 +110,74 @@ test("live now says how steps arrive, and stays quiet without access", async () 
   expect(asked).toBe(first);
   app.unmount();
 });
+
+test("live now drops a step an admin deleted, even one removed while it reconnected (CORE-399)", async () => {
+  const server = await TestServer.start({ world: true });
+  await server.repo("orbit", "engine");
+  await server.push("orbit/engine", "main", commitId());
+  const slug = "pruned";
+  await server.call("POST", "/api/tracker/orbit/timelines", {
+    slug,
+    name: "Pruned",
+    repos: ["orbit/engine"],
+  });
+  const now = Date.now();
+  const at = (minutesAgo: number) => new Date(now - minutesAgo * 60_000).toISOString();
+  const record = (seq: number, over: Partial<StepFeedRecord>): StepFeedRecord => ({
+    seq,
+    repo: "orbit/engine",
+    timeline: slug,
+    changeId: `change${seq}`,
+    commitOid: commitId(),
+    summary: `Step ${seq}`,
+    issue: null,
+    author: { id: "agt_builder", kind: "agent", name: "builder" },
+    tests: null,
+    why: "",
+    committedAt: at(30 - seq),
+    at: at(30 - seq),
+    ...over,
+  });
+  const earlier = record(1, { summary: "Index by date", why: "Dates first." });
+  const secret = record(2, { summary: "Paste the API key", why: "The key is hunter2." });
+  const docs = record(3, {
+    author: { id: "agt_docs", kind: "agent", name: "docs-bot" },
+    summary: "Leak the roadmap",
+    why: "Roadmap says Q3.",
+  });
+  const removed = (r: StepFeedRecord) =>
+    `event: removed\ndata: ${JSON.stringify({ repo: r.repo, changeId: r.changeId, commitOid: r.commitOid })}\n\n`;
+  const step = (r: StepFeedRecord) => `id: ${r.seq}\nevent: step\ndata: ${JSON.stringify(r)}\n\n`;
+  // At first: every step, and the docs step already removed after it. Then,
+  // on reconnect: a removal the page missed while it was away.
+  let away = false;
+  let reconnects = 0;
+  server.on("GET", "/api/repos/:owner/:name/steps/live", () => {
+    if (away) reconnects += 1;
+    const body = away
+      ? removed(secret)
+      : [earlier, secret, docs].map(step).join("") + removed(docs);
+    return new Response(`retry: 5000\n\n${body}`, {
+      headers: { "content-type": "text/event-stream" },
+    });
+  });
+
+  const app = renderApp(`/tracker/orbit/timelines?tl=${slug}`);
+  const live = page.getByRole("region", { name: "Live now" });
+  const agents = live.getByRole("listitem");
+  // The docs-bot's only step is gone, so is its row.
+  await expect.element(agents.nth(0)).toMatchTextContent(/builder\s*Paste the API key/);
+  await expect.poll(() => agents.elements().length).toBe(1);
+  await expect.element(live).not.toMatchTextContent(/Leak the roadmap|Roadmap says Q3/);
+  away = true;
+  // Reconnected from its last event, it drops the step removed meanwhile:
+  // builder falls back to its earlier step.
+  await expect
+    .element(agents.nth(0), { timeout: 12_000 })
+    .toMatchTextContent(/builder\s*Index by date/);
+  await expect.element(agents.nth(0)).toMatchTextContent(/Dates first\./);
+  await expect.element(agents.nth(0)).toMatchTextContent(/1 step since/);
+  await expect.element(live).not.toMatchTextContent(/Paste the API key|hunter2/);
+  expect(reconnects).toBeGreaterThanOrEqual(1);
+  app.unmount();
+}, 20_000);

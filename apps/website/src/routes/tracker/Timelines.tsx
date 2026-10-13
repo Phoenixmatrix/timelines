@@ -646,6 +646,7 @@ export function TrackerTimelines() {
                   owner={owner}
                   timeline={selected}
                   feed={feed.records}
+                  removed={feed.removed}
                 />
               </div>
             )}

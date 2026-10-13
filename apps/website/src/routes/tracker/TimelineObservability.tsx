@@ -66,7 +66,12 @@ interface Loaded {
  * The timeline's steps: the newest pages of each repository, then, for each
  * commit the live feed brings that isn't among them, that commit's step, once.
  */
-function useSpans(owner: string, timeline: Timeline, feed: StepFeedRecord[]) {
+function useSpans(
+  owner: string,
+  timeline: Timeline,
+  feed: StepFeedRecord[],
+  removed: ReadonlySet<string>,
+) {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [checkpoints, setCheckpoints] = useState<CheckpointView[]>([]);
   const repos = timeline.repos.map((r) => `${r.owner}/${r.name}`).join(",");
@@ -108,7 +113,7 @@ function useSpans(owner: string, timeline: Timeline, feed: StepFeedRecord[]) {
   const wanted = loaded
     ? feed
         .map((record) => `${record.repo}@${record.commitOid}`)
-        .filter((key) => !loaded.spans.has(key) && !loaded.deleted.has(key))
+        .filter((key) => !loaded.spans.has(key) && !loaded.deleted.has(key) && !removed.has(key))
         .join(",")
     : "";
   useEffect(() => {
@@ -172,6 +177,8 @@ function useSpans(owner: string, timeline: Timeline, feed: StepFeedRecord[]) {
   return { loaded, checkpoints };
 }
 
+const NONE: ReadonlySet<string> = new Set();
+
 /** Adds a page of steps to what's loaded: the deleted ones as such. */
 function take(into: Loaded, repo: string, page: StepPage) {
   for (const step of page.steps) {
@@ -187,24 +194,27 @@ export function TimelineObservability({
   owner,
   timeline,
   feed,
+  removed = NONE,
 }: {
   owner: string;
   timeline: Timeline;
   /** The timeline's live feed records, newest first (useStepFeed). */
   feed: StepFeedRecord[];
+  /** Steps the feed said were deleted since the page opened (CORE-399): hidden, even if loaded. */
+  removed?: ReadonlySet<string>;
 }) {
-  const { loaded, checkpoints } = useSpans(owner, timeline, feed);
+  const { loaded, checkpoints } = useSpans(owner, timeline, feed, removed);
   const spans = useMemo(
     () =>
       loaded
         ? mergeSpans(
-            [...loaded.spans.values()],
+            [...loaded.spans.values()].filter((span) => !removed.has(span.key)),
             feed
               .filter((record) => !loaded.deleted.has(`${record.repo}@${record.commitOid}`))
               .map(spanFromFeed),
           )
         : [],
-    [loaded, feed],
+    [loaded, feed, removed],
   );
   // Every repository the viewer can read failed: nothing to show but that.
   const everyRepoFailed =

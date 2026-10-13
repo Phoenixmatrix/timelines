@@ -81,11 +81,14 @@ export function fakeDurableState(options: { name?: string; container?: FakeConta
       kv();
       return Number(db.prepare("DELETE FROM _cf_KV WHERE key = ?").run(key).changes) > 0;
     },
-    async list(options: { limit?: number } = {}): Promise<Map<string, unknown>> {
+    async list(options: { prefix?: string; limit?: number } = {}): Promise<Map<string, unknown>> {
       kv();
+      const prefix = options.prefix ?? "";
       const rows = db
-        .prepare("SELECT key, value FROM _cf_KV ORDER BY key LIMIT ?")
-        .all(options.limit ?? -1) as { key: string; value: string }[];
+        .prepare(
+          "SELECT key, value FROM _cf_KV WHERE substr(key, 1, length(?)) = ? ORDER BY key LIMIT ?",
+        )
+        .all(prefix, prefix, options.limit ?? -1) as { key: string; value: string }[];
       return new Map(rows.map((r) => [r.key, JSON.parse(r.value)]));
     },
     async deleteAll(): Promise<void> {

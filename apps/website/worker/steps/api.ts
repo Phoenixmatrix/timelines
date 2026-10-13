@@ -521,6 +521,30 @@ async function publishStep(
 }
 
 /**
+ * Tells a timeline's live feed to forget deleted steps (CORE-399), so no
+ * reader sees their summary or why again. A feed that fails is only logged:
+ * the step is deleted either way, and the next reader to connect asks again.
+ */
+async function forgetOnFeed(
+  env: Env,
+  repo: { id: string; owner_slug: string; name: string },
+  timeline: string,
+  deleted: { change_id: string; commit_oid: string }[],
+) {
+  try {
+    await feed(env, repo.id, timeline).forget(
+      deleted.map((d) => ({
+        repo: `${repo.owner_slug}/${repo.name}`,
+        changeId: d.change_id,
+        commitOid: d.commit_oid,
+      })),
+    );
+  } catch (error) {
+    console.error("Steps: removing a deleted step from the live feed failed", error);
+  }
+}
+
+/**
  * GET /live?timeline=<slug>: the timeline's steps in this repository as
  * Server-Sent Events, for anyone who can read it (CORE-239). Each connection
  * is checked; a stream ends after ten minutes and reconnects with
@@ -535,6 +559,19 @@ steps.get("/live", async (c) => {
   const headers = new Headers();
   const last = c.req.header("last-event-id") ?? c.req.query("after");
   if (last && /^\d+$/.test(last)) headers.set("last-event-id", last);
+  // Steps deleted while their record could still be kept: the feed forgets
+  // them first, in case telling it at deletion failed (CORE-399). Usually none.
+  const since = new Date(Date.now() - STEP_FEED_DAYS * 24 * 60 * 60_000).toISOString();
+  const deleted = await db(c.env.DB)
+    .selectFrom("step_contexts")
+    .select(["change_id", "commit_oid"])
+    .where("repo_id", "=", loaded.row.id)
+    .where("timeline", "=", timeline)
+    .where("deleted_at", ">=", since)
+    .orderBy("deleted_at", "desc")
+    .limit(200)
+    .execute();
+  if (deleted.length) await forgetOnFeed(c.env, loaded.row, timeline, deleted);
   const response = await feed(c.env, loaded.row.id, timeline).fetch(
     new Request("https://step-feed/subscribe", { headers }),
   );
@@ -864,14 +901,18 @@ steps.delete("/:changeId/:commitOid", async (c) => {
   if (actor instanceof Response) return actor;
   const loaded = await loadRepo(c, "admin");
   if (loaded instanceof Response) return loaded;
-  const { numUpdatedRows } = await db(c.env.DB)
+  const deleted = await db(c.env.DB)
     .updateTable("step_contexts")
     .set({ context: "{}", summary: "", deleted_at: sqlNow, deleted_by: actor.id })
     .where("repo_id", "=", loaded.row.id)
     .where("change_id", "=", c.req.param("changeId"))
     .where("commit_oid", "=", c.req.param("commitOid"))
     .where("deleted_at", "is", null)
+    .returning(["change_id", "commit_oid", "timeline"])
     .executeTakeFirst();
-  if (!Number(numUpdatedRows)) return fail(c, 404, "No such step, or it's already deleted.");
+  if (!deleted) return fail(c, 404, "No such step, or it's already deleted.");
+  // Its live feed replays records for a week: it forgets this one, before the answer.
+  if (deleted.timeline && Reflect.has(c.env, "STEP_FEED"))
+    await forgetOnFeed(c.env, loaded.row, deleted.timeline, [deleted]);
   return c.body(null, 204);
 });
