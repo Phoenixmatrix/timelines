@@ -282,8 +282,14 @@ export function canonicalCheckpointRow(
     if (space) {
       row.scope_kind = checkpointTextValue("space");
       row.scope_id = row.space_id!;
+    } else if (account && !evidence.people.includes(account)) {
+      // An approved legacy owner's history (an Organization's usage snapshots)
+      // belongs to its mapped Space; any other non-person scope is refused.
+      const mapped = owner(account);
+      if (!mapped) fail(`non-person historical scope in ${source}`);
+      row.scope_kind = checkpointTextValue("space");
+      row.scope_id = checkpointTextValue(mapped.space.id);
     } else if (account) {
-      if (!evidence.people.includes(account)) fail(`non-person historical scope in ${source}`);
       row.scope_kind = checkpointTextValue("person");
       row.scope_id = row.account_id!;
     } else {

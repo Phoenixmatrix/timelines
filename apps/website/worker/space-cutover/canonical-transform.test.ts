@@ -160,13 +160,26 @@ describe("canonical immutable checkpoint cell conversion", () => {
       ),
     ).toEqual([text("organization"), ...cells.slice(1)]);
   });
-  test("rejects company-owned ambiguous historical totals instead of relabeling them personal", () => {
-    expect(() =>
+  test("an approved Organization's historical totals belong to its Space, never relabeled personal", () => {
+    // CORE-341 production: matrixorg's usage snapshots, by the operator's decision.
+    expect(
       canonicalCheckpointRow(
         "usage_monthly",
         "usage_monthly",
         ["account_id", "space_id"],
         [text("legacy-org"), "NULL"],
+        ["scope_kind", "scope_id"],
+        manifest,
+        evidence,
+      ),
+    ).toEqual([text("space"), text("space")]);
+    // A non-person owner the manifest doesn't map is still refused.
+    expect(() =>
+      canonicalCheckpointRow(
+        "usage_monthly",
+        "usage_monthly",
+        ["account_id", "space_id"],
+        [text("stranger-org"), "NULL"],
         ["scope_kind", "scope_id"],
         manifest,
         evidence,
