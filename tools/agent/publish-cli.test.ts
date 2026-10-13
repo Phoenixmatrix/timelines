@@ -43,6 +43,14 @@ await test("Linux CI publishes x86-64 and ARM64; native ARM64 and macOS keep the
   assert.throws(() => releases("win32", "x64"), /Unix only/);
 });
 
+await test("CI from before Spaces (an owner, no Space) skips publication; neither is an error", async () => {
+  const { calls, requests, options } = harness();
+  const { GITMATRIX_SPACE: _, ...env } = options.env;
+  await publish({ ...options, env: { ...env, GITMATRIX_OWNER: "orbit" } });
+  assert.deepEqual([calls, requests], [[], []]);
+  await assert.rejects(publish({ ...options, env }), /registry credentials/);
+});
+
 await test("build both architectures before uploading with the native executable", async () => {
   const { calls, requests, options } = harness();
   await publish(options);

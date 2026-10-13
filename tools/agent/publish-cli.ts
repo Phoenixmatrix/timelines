@@ -46,6 +46,13 @@ export async function publish({
   const server = sourceEnv.GITMATRIX_URL;
   const token = sourceEnv.GITMATRIX_TOKEN;
   const space = sourceEnv.GITMATRIX_SPACE;
+  // CI from before the Organization/Space cutover (CORE-341) names an owner
+  // instead: that server can't take this gm's uploads, so the deploy that
+  // brings in the cutover ships without it, and the next deploy publishes it.
+  if (!space && sourceEnv.GITMATRIX_OWNER) {
+    console.log(JSON.stringify({ event: "cli.publish.skipped", reason: "pre-space-ci" }));
+    return;
+  }
   if (!server || !token || !space)
     throw new Error("CLI publication requires CI registry credentials.");
   const env = {
