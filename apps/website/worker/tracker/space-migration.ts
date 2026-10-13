@@ -348,8 +348,18 @@ export class TrackerSpaceMigration {
           context.migrationEpoch > Number(previous?.migration_epoch ?? 0),
         "Migration epoch must increase",
       );
+      // A restored run this Tracker never entered (its restore only recorded
+      // unchanged evidence) left nothing to release; a newer run supersedes it.
+      const untouched =
+        previous?.state === "restored" &&
+        this.sql
+          .exec(
+            "SELECT seq FROM space_migration_ledger WHERE run_id=? AND phase='unchanged-restored'",
+            previous.run_id as string,
+          )
+          .toArray().length > 0;
       check(
-        !previous || previous.state === "legacy-active",
+        !previous || previous.state === "legacy-active" || untouched,
         "Previous run has not released restored legacy admission",
       );
       check(

@@ -34,6 +34,10 @@ const { values, positionals } = parseArgs({
     worker: { type: "string" },
     "version-id": { type: "string" },
     mode: { type: "string" },
+    // prepare only: the state file of a restored run the new one supersedes.
+    // While it holds the fence, the server admits the operator through its
+    // recovery capability; the new mapping still needs this human session.
+    superseding: { type: "string" },
     help: { type: "boolean" },
   },
 });
@@ -79,6 +83,12 @@ if (values.help || !command) {
           "Enrollment response was interrupted; run status to recover its exact run identity first",
         );
     }
+    const superseded =
+      command === "prepare" && values.superseding
+        ? (JSON.parse(await readFile(values.superseding, "utf8")) as OperatorState)
+        : null;
+    if (superseded && superseded.origin !== origin.origin)
+      throw new Error("Superseded run's state belongs to another installation");
     const cookie =
       values["cookie-file"] && command !== "operator-login"
         ? (await readFile(values["cookie-file"], "utf8")).trim()
@@ -92,6 +102,8 @@ if (values.help || !command) {
       if (cookie) headers.cookie = cookie;
       if (state && !["approve", "prepare"].includes(command!))
         headers["x-space-cutover-recovery"] = state.recoveryToken;
+      if (command === "prepare" && superseded)
+        headers["x-space-cutover-recovery"] = superseded.recoveryToken;
       if (body !== undefined) headers["content-type"] = "application/json";
       const response = await fetch(`${origin.origin}/api/admin/space-cutover${path}`, {
         method: body === undefined ? "GET" : "POST",
