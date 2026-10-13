@@ -5,6 +5,7 @@ import {
   type SpaceMigrationContext,
 } from "../../shared/space-cutover.ts";
 import {
+  ROWS_PER_BLOCK,
   readBlock,
   encodeD1CheckpointPage,
   type ArchiveRows,
@@ -350,7 +351,7 @@ export function canonicalCheckpointRow(
   });
 }
 
-/** One four-row source block or one 64KiB output fragment per call. The caller journals state
+/** One source block or one output fragment per call. The caller journals state
  * only after persisting the emitted page immutably. Original and mapped archives are never mutated. */
 export async function transformCanonicalCheckpointStep(
   context: SpaceMigrationContext,
@@ -487,13 +488,13 @@ export async function transformCanonicalCheckpointStep(
       else {
         state.counts[state.output.table] =
           (state.counts[state.output.table] ?? 0) + state.output.rows.length;
-        if (state.output.rows.length < 4) {
+        if (state.output.rows.length < ROWS_PER_BLOCK) {
           state.table++;
           state.offset = 0;
           state.sourceCursor = null;
           state.sourceDigest = "";
           state.sourceDone = false;
-        } else state.offset += 4;
+        } else state.offset += ROWS_PER_BLOCK;
       }
       state.output = null;
     }
@@ -578,7 +579,7 @@ export async function transformCanonicalCheckpointStep(
     return { state, done: false };
   }
   if (!range) state.sourceDone = true;
-  if (!state.sourceDone && state.buffered.length < 4) {
+  if (!state.sourceDone && state.buffered.length < ROWS_PER_BLOCK) {
     const block = await readBlock(
       context,
       store,
@@ -613,6 +614,11 @@ export async function transformCanonicalCheckpointStep(
     }
     return { state, done: false };
   }
-  state.output = { kind: "rows", table: table.name, columns, rows: state.buffered.splice(0, 4) };
+  state.output = {
+    kind: "rows",
+    table: table.name,
+    columns,
+    rows: state.buffered.splice(0, ROWS_PER_BLOCK),
+  };
   return { state, done: false };
 }

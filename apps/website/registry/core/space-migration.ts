@@ -11,7 +11,7 @@ import {
 
 // Four-row blocks in 64 KB fragments took over 120k steps for production's 485k
 // rows (CORE-341); its rows are at most tens of KB, so 64 rows in 256 KB fragments.
-const ROWS_PER_BLOCK = 64;
+export const ROWS_PER_BLOCK = 64;
 const FRAGMENT_CHARS = 256 * 1024;
 const PAGE_BYTES = 512 * 1024;
 // A block's hex-encoded rows plus their column metadata; a larger one fails closed.

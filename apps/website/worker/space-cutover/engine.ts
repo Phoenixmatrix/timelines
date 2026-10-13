@@ -288,7 +288,7 @@ export async function advanceSpaceCutover(
     if (inspected.result.digest !== mapped.result.digest)
       throw new Error("Mapped archive differs from its full inventory");
     const target = await step(
-      `${store}:canonical-transform`,
+      `${store}:canonical-transform-v2`,
       (state: CanonicalTransformState | null) =>
         transformCanonicalCheckpointStep(
           first,
@@ -297,13 +297,18 @@ export async function advanceSpaceCutover(
           readPages(`${store}:mapped`),
           state,
         ),
-      `${store}:canonical`,
+      `${store}:canonical-v2`,
     );
     if (!target.done) return;
     if (target.result.sourceDigest !== mapped.result.digest)
       throw new Error("Canonical target is not bound to the mapped archive");
-    const installed = await step(`${store}:canonical-install`, (state: D1RestoreState | null) =>
-      checkpoint.restoreStep(first, readPages(`${store}:canonical`), state, target.result.digest),
+    const installed = await step(`${store}:canonical-install-v2`, (state: D1RestoreState | null) =>
+      checkpoint.restoreStep(
+        first,
+        readPages(`${store}:canonical-v2`),
+        state,
+        target.result.digest,
+      ),
     );
     if (installed.done) {
       if (!installed.result.preserved || installed.result.digest !== target.result.digest)
