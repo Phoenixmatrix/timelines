@@ -12,6 +12,7 @@ import {
   type Recorder,
   type WorkerDeployments,
 } from "./deploy.ts";
+import { PRODUCTION } from "../../apps/website/vite/instance.ts";
 
 const dirs = (paths: string[]) => plan(paths).migrations.map((m) => m.dir);
 
@@ -333,7 +334,7 @@ await test("production URLs match each Worker's configured host", () => {
     /PRODUCTION_HOST = "([^"]+)"/.exec(
       readFileSync(join(import.meta.dirname, "../..", path), "utf8"),
     )?.[1];
-  assert.equal(PRODUCTION_URLS.gitmatrix, `https://${host("apps/website/cloudflare.config.ts")}`);
+  assert.equal(PRODUCTION_URLS.gitmatrix, `https://${PRODUCTION.host}`);
   assert.equal(
     PRODUCTION_URLS["gitmatrix-site"],
     `https://${host("apps/site/cloudflare.config.ts")}`,

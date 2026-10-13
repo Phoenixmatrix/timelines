@@ -5,6 +5,7 @@ pub mod ci;
 pub mod claude_mod;
 pub mod deploy;
 pub mod hooks;
+pub mod instance;
 pub mod lease_updates;
 pub mod local;
 pub mod network;

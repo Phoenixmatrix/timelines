@@ -91,12 +91,17 @@ fn normalize_server(server: &str) -> String {
     server.trim_end_matches('/').to_string()
 }
 
-fn config_path() -> PathBuf {
+/// gm's per-user configuration directory: $XDG_CONFIG_HOME/gitmatrix, else ~/.config/gitmatrix.
+pub fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("gitmatrix").join("gm.json")
+    base.join("gitmatrix")
+}
+
+fn config_path() -> PathBuf {
+    config_dir().join("gm.json")
 }
 
 impl Config {

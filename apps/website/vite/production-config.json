@@ -1,0 +1,294 @@
+{
+  "containers": [
+    {
+      "name": "gitmatrix-ci",
+      "schedulingPolicy": "durable-object",
+      "images": {
+        "default": {
+          "dockerfile": "./ci/Dockerfile"
+        }
+      }
+    }
+  ],
+  "worker": {
+    "name": "gitmatrix",
+    "compatibilityDate": "2026-09-30",
+    "compatibilityFlags": ["nodejs_compat"],
+    "entrypoint": "./worker/index.ts",
+    "domains": ["timelinesapp.fward.dev"],
+    "workersDev": false,
+    "previewUrls": true,
+    "observability": {
+      "enabled": true
+    },
+    "limits": {
+      "cpuMs": 300000,
+      "subrequests": 200000
+    },
+    "assets": {
+      "notFoundHandling": "single-page-application",
+      "runWorkerFirst": [
+        "/api/*",
+        "/*.git/*",
+        "/v2/*",
+        "/npm/*",
+        "/pypi/*",
+        "/maven/*",
+        "/cargo/*",
+        "/go/*",
+        "/helm/*",
+        "/apt/*",
+        "/rpm/*",
+        "/brew/*",
+        "/generic/*",
+        "/releases/*"
+      ]
+    },
+    "env": {
+      "DB": {
+        "type": "d1",
+        "name": "gitmatrix",
+        "id": "3ed3e1ec-bd11-4f8e-bfee-d7c0bcb89e77"
+      },
+      "TRACKER": {
+        "type": "durable-object",
+        "worker": "gitmatrix",
+        "exportName": "Tracker"
+      },
+      "ASSISTANT": {
+        "type": "durable-object",
+        "worker": "gitmatrix",
+        "exportName": "Assistant"
+      },
+      "LOADER": {
+        "type": "worker-loader"
+      },
+      "ARTIFACTS": {
+        "type": "artifacts",
+        "namespace": "gitmatrix",
+        "dev": {
+          "remote": true
+        }
+      },
+      "AI_LOG_BODIES": {
+        "type": "text",
+        "value": "off"
+      },
+      "AI": {
+        "type": "ai",
+        "dev": {
+          "remote": true
+        }
+      },
+      "AI_GATEWAY": {
+        "type": "text",
+        "value": "gitmatrix"
+      },
+      "VECTORS": {
+        "type": "vectorize",
+        "name": "gitmatrix-knowledge-prod",
+        "dev": {
+          "remote": true
+        }
+      },
+      "SEARCH": {
+        "type": "ai-search-namespace",
+        "namespace": "gitmatrix-prod",
+        "dev": {
+          "remote": true
+        }
+      },
+      "KNOWLEDGE_COORDINATOR": {
+        "type": "durable-object",
+        "worker": "gitmatrix",
+        "exportName": "KnowledgeCoordinator"
+      },
+      "STEP_FEED": {
+        "type": "durable-object",
+        "worker": "gitmatrix",
+        "exportName": "StepFeed"
+      },
+      "KNOWLEDGE_BUILD": {
+        "type": "workflow",
+        "name": "knowledge-build",
+        "worker": "gitmatrix",
+        "exportName": "KnowledgeBuild"
+      },
+      "REPO_PURGE": {
+        "type": "workflow",
+        "name": "repo-purge",
+        "worker": "gitmatrix",
+        "exportName": "RepoPurge"
+      },
+      "CI_RUNNER": {
+        "type": "text",
+        "value": "sandbox"
+      },
+      "CI_VERSION": {
+        "type": "version-metadata"
+      },
+      "CI_RUN": {
+        "type": "workflow",
+        "name": "ci-run",
+        "worker": "gitmatrix",
+        "exportName": "CiRun"
+      },
+      "CI_SANDBOX": {
+        "type": "durable-object",
+        "worker": "gitmatrix",
+        "exportName": "CiSandbox"
+      },
+      "REGISTRY_DB": {
+        "type": "d1",
+        "name": "gitmatrix-registry",
+        "id": "caea2f3d-d4d3-43cd-aaf9-f14a3d84621d"
+      },
+      "REGISTRY_BLOBS": {
+        "type": "r2",
+        "name": "gitmatrix-registry-blobs"
+      },
+      "AVATARS": {
+        "type": "r2",
+        "name": "gitmatrix-avatars"
+      },
+      "STEP_ARTIFACTS": {
+        "type": "r2",
+        "name": "gitmatrix-step-artifacts"
+      },
+      "REGISTRY_REPO": {
+        "type": "durable-object",
+        "worker": "gitmatrix",
+        "exportName": "RegistryRepo"
+      },
+      "REGISTRY_UPLOAD": {
+        "type": "durable-object",
+        "worker": "gitmatrix",
+        "exportName": "RegistryUpload"
+      },
+      "REGISTRY_LOGIN": {
+        "type": "durable-object",
+        "worker": "gitmatrix",
+        "exportName": "RegistryLogin"
+      },
+      "REGISTRY_JOBS": {
+        "type": "queue",
+        "name": "gitmatrix-registry-jobs"
+      },
+      "JOBS": {
+        "type": "queue",
+        "name": "gitmatrix-jobs"
+      },
+      "REGISTRY_KEK_SECRET": {
+        "type": "secrets-store-secret",
+        "storeId": "2dcc6c92ee1743548ad303924b4e0f11",
+        "secretName": "gitmatrix_registry_kek"
+      },
+      "BETTER_AUTH_SECRET_SECRET": {
+        "type": "secrets-store-secret",
+        "storeId": "2dcc6c92ee1743548ad303924b4e0f11",
+        "secretName": "gitmatrix_better_auth_secret"
+      },
+      "OWNER_EMAIL": {
+        "type": "text",
+        "value": "hello@fward.me"
+      },
+      "OWNER_ORG": {
+        "type": "text",
+        "value": "matrixorg"
+      },
+      "EMAIL_FROM": {
+        "type": "text",
+        "value": "gitmatrix@mail.fward.dev"
+      },
+      "EMAIL": {
+        "type": "send-email",
+        "allowedSenderAddresses": ["gitmatrix@mail.fward.dev"]
+      },
+      "AUTH_FAILURES": {
+        "type": "rate-limit",
+        "namespace": "4401",
+        "simple": {
+          "limit": 5,
+          "period": 60
+        }
+      },
+      "PUBLIC_URL": {
+        "type": "text",
+        "value": "https://timelinesapp.fward.dev"
+      }
+    },
+    "triggers": [
+      {
+        "type": "queue",
+        "name": "gitmatrix-registry-jobs",
+        "maxBatchSize": 10,
+        "maxRetries": 5
+      },
+      {
+        "type": "queue",
+        "name": "gitmatrix-jobs",
+        "maxBatchSize": 5,
+        "maxRetries": 12
+      },
+      {
+        "type": "scheduled",
+        "schedule": "17 * * * *"
+      }
+    ],
+    "exports": {
+      "Tracker": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      },
+      "Assistant": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      },
+      "KnowledgeCoordinator": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      },
+      "StepFeed": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      },
+      "KnowledgeBuild": {
+        "type": "workflow",
+        "name": "knowledge-build"
+      },
+      "CiRun": {
+        "type": "workflow",
+        "name": "ci-run"
+      },
+      "RepoPurge": {
+        "type": "workflow",
+        "name": "repo-purge"
+      },
+      "RegistryRepo": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      },
+      "RegistryUpload": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      },
+      "RegistryLogin": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      },
+      "CiSandbox": {
+        "type": "durable-object",
+        "storage": "sqlite",
+        "container": {
+          "name": "gitmatrix-ci",
+          "schedulingPolicy": "durable-object",
+          "images": {
+            "default": {
+              "dockerfile": "./ci/Dockerfile"
+            }
+          }
+        }
+      }
+    }
+  }
+}
