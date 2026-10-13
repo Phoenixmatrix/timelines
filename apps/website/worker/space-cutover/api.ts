@@ -183,12 +183,19 @@ spaceCutoverApi.post("/:action", async (c) => {
     );
   return c.json({ ok: true });
 });
-spaceCutoverApi.onError((_error, c) =>
-  c.json(
+spaceCutoverApi.onError((error, c) => {
+  // The operator sees only the generic refusal; the Worker log keeps the reason
+  // (error messages carry no checkpoint bytes or credentials).
+  console.error(
+    "Space cutover: operation rejected",
+    c.req.path,
+    error instanceof Error ? error.message.slice(0, 500) : "",
+  );
+  return c.json(
     {
       error:
         "Cutover operation rejected; inspect the independent journal status. Checkpoint bytes and credentials are never returned in errors.",
     },
     409,
-  ),
-);
+  );
+});
