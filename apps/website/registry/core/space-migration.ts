@@ -202,7 +202,10 @@ const REGISTRY_PRESERVATION: D1CheckpointProjection = {
 
 function fail(): never {
   // Never include checkpoint contents, SQL values, ciphertext or credentials.
-  throw new Error("space_registry_checkpoint_invalid");
+  const error = new Error("space_registry_checkpoint_invalid");
+  // Only code locations: which check refused, for the operator's log.
+  console.error("Space checkpoint check failed", (error.stack ?? "").slice(0, 1500));
+  throw error;
 }
 function parseArchiveJson(text: string): unknown {
   try {

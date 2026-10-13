@@ -190,6 +190,7 @@ spaceCutoverApi.onError((error, c) => {
     "Space cutover: operation rejected",
     c.req.path,
     error instanceof Error ? error.message.slice(0, 500) : "",
+    error instanceof Error ? (error.stack ?? "").slice(0, 1500) : "",
   );
   return c.json(
     {
