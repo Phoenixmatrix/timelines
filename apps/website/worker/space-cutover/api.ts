@@ -134,7 +134,9 @@ spaceCutoverApi.post("/:action", async (c) => {
     await control.fence(body.runId);
     await control.fenceDatabases(body.runId);
   } else if (action === "begin") await control.beginMigration(body.runId);
-  else if (action === "advance") await control.advance(body.runId, actor);
+  // Up to ten seconds of steps per request: one round trip per step made a
+  // production-sized store take hours (CORE-341).
+  else if (action === "advance") await control.advance(body.runId, actor, 10_000);
   else if (action === "drain") return c.json(await inspectCutoverDrain(c.env, body.runId));
   else if (action === "workflow-census")
     // The provider's own instance lists and deployment history, exported by the

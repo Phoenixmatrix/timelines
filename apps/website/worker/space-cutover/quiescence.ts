@@ -34,9 +34,13 @@ type Consumer = (typeof CUTOVER_CONSUMERS)[number];
  * admission, their Artifacts writes are covered by the ref barrier, and a late
  * registry blob without its D1 row is unreferenced and reclaimed by registry GC.
  */
-export const DOCUMENTED_LEGACY_WALL_MS = 15 * 60_000;
+// WAIVED for the CORE-341 production redo only, at the operator's direction: the
+// pre-cutover release stopped serving at 2026-10-13T20:03Z, the first run's census
+// (20:30Z) found no live instance, and only this cutover's own releases have
+// served since. Restore 15 and 5 minutes once the cutover is open.
+export const DOCUMENTED_LEGACY_WALL_MS = 0;
 /** Slack for clock skew and eventually consistent release propagation. */
-export const QUIESCENCE_MARGIN_MS = 5 * 60_000;
+export const QUIESCENCE_MARGIN_MS = 0;
 
 /** Workflows the Worker binds. Their docs give no old-version bound. */
 export const CUTOVER_WORKFLOWS = {

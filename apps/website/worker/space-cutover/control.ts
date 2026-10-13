@@ -1349,12 +1349,25 @@ export class SpaceCutover extends DurableObject<Env> {
       throw new Error("Participant is fenced");
     return mapping;
   }
-  async advance(runId: string, actor: Actor): Promise<void> {
+  /**
+   * One journaled step, or, given a budget, as many as fit in it: each step is
+   * still independently journaled, so stopping anywhere loses nothing. Steps stop
+   * early when the phase changes, so a transition is never run past.
+   */
+  async advance(runId: string, actor: Actor, budgetMs = 0): Promise<void> {
     this.require(runId);
     if (this.running) throw new Error("Another cutover operation is running");
     this.running = true;
     try {
-      await advanceSpaceCutover(this.env, this, actor);
+      const until = Date.now() + budgetMs;
+      const phase = this.require(runId).phase;
+      do {
+        await advanceSpaceCutover(this.env, this, actor);
+      } while (
+        Date.now() < until &&
+        this.require(runId).phase === phase &&
+        !["reconciled", "restored"].includes(phase)
+      );
     } finally {
       this.running = false;
     }

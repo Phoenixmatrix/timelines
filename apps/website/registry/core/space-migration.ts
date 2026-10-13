@@ -9,10 +9,12 @@ import {
   type SpaceReconciliation,
 } from "../../shared/space-cutover.ts";
 
-const ROWS_PER_BLOCK = 4;
-const FRAGMENT_CHARS = 64 * 1024;
+// Four-row blocks in 64 KB fragments took over 120k steps for production's 485k
+// rows (CORE-341); its rows are at most tens of KB, so 64 rows in 256 KB fragments.
+const ROWS_PER_BLOCK = 64;
+const FRAGMENT_CHARS = 256 * 1024;
 const PAGE_BYTES = 512 * 1024;
-// Four D1 rows of at most 2MB, hex encoded, plus their column metadata.
+// A block's hex-encoded rows plus their column metadata; a larger one fails closed.
 const MAX_BLOCK_CHARS = 20_000_000;
 const RECEIPTS = "registry_space_migrations";
 const identifier = (name: string) => `"${name.replaceAll('"', '""')}"`;
@@ -431,7 +433,7 @@ function validSqlValue(value: unknown): value is string {
   return hex !== null && hex.length % 2 === 0 && /^[0-9A-F]*$/.test(hex);
 }
 
-/** Reads at most one bounded four-row block, never scans an entire archive. */
+/** Reads at most one bounded block, never scans an entire archive. */
 export async function readBlock(
   context: SpaceMigrationContext,
   storeId: string,
@@ -813,7 +815,7 @@ async function savedRowMatches(
     .first());
 }
 
-/** One dependency edge or one four-row archive block per invocation. */
+/** One dependency edge or one archive block per invocation. */
 async function expandInsertGroup(
   db: D1Database,
   context: SpaceMigrationContext,
