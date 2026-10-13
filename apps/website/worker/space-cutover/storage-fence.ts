@@ -40,7 +40,14 @@ export async function fenceBusinessDatabase(
     (current.fenced &&
       (current.run_id !== context.runId ||
         current.migration_epoch !== context.migrationEpoch ||
-        current.manifest_digest !== context.manifestDigest))
+        current.manifest_digest !== context.manifestDigest) &&
+      // A newer run may take over a fence whose authority it revoked (it
+      // superseded a restored run that changed no data); nothing else may.
+      !(
+        revokedAuthorityToken !== undefined &&
+        current.authority_token === revokedAuthorityToken &&
+        (current.migration_epoch ?? 0) < context.migrationEpoch
+      ))
   )
     throw new Error("Independent D1 fence context mismatch");
   const tables = (

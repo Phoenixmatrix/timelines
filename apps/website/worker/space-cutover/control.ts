@@ -364,9 +364,18 @@ export class SpaceCutover extends DurableObject<Env> {
     if (this.fresh.status())
       throw new Error("Forward migration of a fresh v4 installation is unsupported");
     const previous = this.status();
+    // A restored run that never exported, migrated or opened anything changed no
+    // business data; a new run may supersede it and take over its storage fences
+    // (CORE-341: a legacy release of the preparation build can't attest contract 3).
+    const supersedable =
+      previous?.phase === "restored" &&
+      !previous.writeAdmissionOpenedAt &&
+      !previous.completedMappings.length &&
+      Object.values(previous.stores).every((store) => !store.exported && !store.migrated);
     if (
       this.running ||
       (previous &&
+        !supersedable &&
         (previous.phase !== "legacy-active" ||
           previous.writeAdmissionOpenedAt ||
           previous.manifest.mapping.some((mapping) => !previous.legacyReleases[mapping.space.id])))
@@ -464,7 +473,8 @@ export class SpaceCutover extends DurableObject<Env> {
       inventories: {},
       storageFenced: false,
       authorityToken: crypto.randomUUID(),
-      revokedAuthorityToken: null,
+      // The superseded run still holds the D1 fences; fencing takes them over.
+      revokedAuthorityToken: supersedable ? previous.authorityToken : null,
       recoveryFencesReady: false,
       legacyReleases: {},
       drainBlockers: ["drain_inspection_required"],
@@ -632,8 +642,9 @@ export class SpaceCutover extends DurableObject<Env> {
     if (run.phase !== "fenced")
       throw new Error("Close independent admission before database fencing");
     const context = migrationContext(run, run.manifest.mapping[0]!);
-    await fenceBusinessDatabase(this.env.DB, context, run.authorityToken);
-    await fenceBusinessDatabase(this.env.REGISTRY_DB, context, run.authorityToken);
+    const superseded = run.revokedAuthorityToken ?? undefined;
+    await fenceBusinessDatabase(this.env.DB, context, run.authorityToken, superseded);
+    await fenceBusinessDatabase(this.env.REGISTRY_DB, context, run.authorityToken, superseded);
     const current = this.require(runId);
     if (current.phase !== "fenced") throw new Error("Fence phase changed");
     current.storageFenced = true;
