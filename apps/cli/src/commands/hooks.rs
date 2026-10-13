@@ -21,6 +21,8 @@
 use super::{Ctx, lease_updates, steps};
 use crate::remote::Config;
 use crate::repo::Workspace;
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::Read;
 use std::path::PathBuf;
@@ -134,53 +136,137 @@ pub fn with_codex_hook(settings: &str) -> String {
 /// Oh My Pi's step extension: `.omp/extensions/gitmatrix-steps.ts`.
 pub const OMP_EXTENSION: &str = include_str!("../../assets/omp-steps-extension.ts");
 
+/// The hooks' event lists, in the order the file has them.
+#[derive(Deserialize)]
+struct OrderedHooks {
+    hooks: IndexMap<String, Value>,
+}
+
+/// A settings key on the way out: `hooks` keeps its events' order.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Field {
+    Hooks(IndexMap<String, Value>),
+    Plain(Value),
+}
+
+/// `settings` with the hook added once. A file that already has it comes back
+/// byte for byte, so setup and `--check` see it as current whatever its key
+/// order or layout (CORE-405); adding one keeps the order of the top-level and
+/// `hooks` keys, other people's included, and appends what is new.
 fn with_hook(settings: &str, event: &str, command: &str) -> String {
-    let mut value: Value = serde_json::from_str(settings).unwrap_or_else(|_| json!({}));
-    if !value.is_object() {
-        value = json!({});
+    // serde_json's own maps sort their keys: read the order from the text.
+    let top: Option<IndexMap<String, Value>> = serde_json::from_str(settings).ok();
+    let mut hooks = serde_json::from_str::<OrderedHooks>(settings)
+        .map(|ordered| ordered.hooks)
+        .unwrap_or_default();
+    let needle = command
+        .split("&& ")
+        .nth(1)
+        .unwrap_or(command)
+        .trim_end_matches(" || true");
+    let present = hooks
+        .get(event)
+        .and_then(Value::as_array)
+        .is_some_and(|list| {
+            list.iter().any(|group| {
+                group["hooks"].as_array().is_some_and(|hs| {
+                    hs.iter()
+                        .any(|h| h["command"].as_str().is_some_and(|c| c.contains(needle)))
+                })
+            })
+        });
+    if present && top.is_some() {
+        return settings.to_string();
     }
-    let hooks = value
-        .as_object_mut()
-        .expect("object")
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-    if !hooks.is_object() {
-        *hooks = json!({});
-    }
-    let list = hooks
-        .as_object_mut()
-        .expect("object")
-        .entry(event)
-        .or_insert_with(|| json!([]));
+    let list = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
     if !list.is_array() {
         *list = json!([]);
     }
-    let present = list.as_array().expect("array").iter().any(|group| {
-        group["hooks"].as_array().is_some_and(|hs| {
-            hs.iter().any(|h| {
-                h["command"].as_str().is_some_and(|c| {
-                    c.contains(
-                        command
-                            .split("&& ")
-                            .nth(1)
-                            .unwrap_or(command)
-                            .trim_end_matches(" || true"),
-                    )
-                })
-            })
-        })
-    });
-    if !present {
-        list.as_array_mut().expect("array").push(json!({
-            "hooks": [{"type": "command", "command": command}]
-        }));
-    }
-    serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
+    list.as_array_mut().expect("array").push(json!({
+        "hooks": [{"type": "command", "command": command}]
+    }));
+    let mut out: IndexMap<String, Field> = top
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| (key, Field::Plain(value)))
+        .collect();
+    out.insert("hooks".to_string(), Field::Hooks(hooks));
+    serde_json::to_string_pretty(&out).unwrap_or_default() + "\n"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checked-in settings file as a formatter leaves it: its own key order,
+    /// short arrays on one line (CORE-405).
+    const FORMATTED: &str = r#"{
+  "model": "opus",
+  "fallbackModel": ["sonnet"],
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "command -v gm >/dev/null 2>&1 && gm hook claude-code || true",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "command -v gm >/dev/null 2>&1 && gm hook claude-code updates || true",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+    #[test]
+    fn settings_that_already_have_the_hooks_stay_byte_for_byte() {
+        assert_eq!(with_claude_hook(FORMATTED), FORMATTED);
+    }
+
+    #[test]
+    fn adding_a_hook_keeps_the_files_key_order() {
+        // Only the prompt hook: setup adds the updates hook and nothing moves.
+        let start = FORMATTED.find(",\n    \"PostToolUse\"").unwrap();
+        let end = FORMATTED.rfind("\n  }\n}").unwrap();
+        let partial = format!("{}{}", &FORMATTED[..start], &FORMATTED[end..]);
+        let added = with_claude_hook(&partial);
+        let top: IndexMap<String, Value> = serde_json::from_str(&added).unwrap();
+        assert_eq!(
+            top.keys().collect::<Vec<_>>(),
+            ["model", "fallbackModel", "env", "hooks"]
+        );
+        let hooks = serde_json::from_str::<OrderedHooks>(&added).unwrap().hooks;
+        assert_eq!(
+            hooks.keys().collect::<Vec<_>>(),
+            ["UserPromptSubmit", "PostToolUse"]
+        );
+        assert_eq!(
+            hooks["PostToolUse"][0]["hooks"][0]["command"],
+            json!(CLAUDE_UPDATES_COMMAND)
+        );
+        // Settings the agent's person added stay where they were too.
+        let theirs =
+            r#"{"permissions": {"allow": ["Bash(ls)"]}, "hooks": {"Stop": []}, "theme": "dark"}"#;
+        let top: IndexMap<String, Value> = serde_json::from_str(&with_claude_hook(theirs)).unwrap();
+        assert_eq!(
+            top.keys().collect::<Vec<_>>(),
+            ["permissions", "hooks", "theme"]
+        );
+    }
 
     #[test]
     fn the_hook_is_added_once_and_other_settings_stay() {
