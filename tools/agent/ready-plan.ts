@@ -13,6 +13,12 @@ export interface ReadyPlan {
   base: string | null;
   changed: string[];
   full: boolean;
+  /**
+   * Explicit `--all`, or no reliable change list: E2E runs every scenario,
+   * main-only ones included. Other full-coverage fallbacks keep the complete
+   * code gates but select E2E journeys from the changed paths.
+   */
+  e2eAll: boolean;
   reasons: string[];
   gates: Array<{ name: string; binary: string; args: string[]; cwd: "root" | "website" }>;
   e2e: boolean;
@@ -142,15 +148,19 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     base: null,
     changed: [],
     full: false,
+    e2eAll: false,
     reasons: [],
     gates: [],
     e2e: false,
   };
-  const full = (reason: string): ReadyPlan => {
+  const full = (reason: string, e2eAll = false): ReadyPlan => {
     plan.full = true;
+    plan.e2eAll = e2eAll;
     plan.reasons.push(
       reason,
-      "Full coverage: all workspace checks, tests, builds and existing non-AI E2E/mirror.",
+      e2eAll
+        ? "Full coverage: all workspace checks, tests, builds and every non-AI E2E scenario/mirror."
+        : "Full coverage: all workspace checks, tests and builds; E2E journeys selected from changed paths.",
     );
     plan.gates = fullGates();
     plan.e2e = true;
@@ -181,9 +191,10 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
   } catch (error) {
     return full(
       `Cannot discover changes against ${options.base}: ${error instanceof Error ? error.message : String(error)}`,
+      true,
     );
   }
-  if (options.all) return full("--all explicitly requested.");
+  if (options.all) return full("--all explicitly requested.", true);
   let stylesheetOnly =
     plan.changed.length > 0 && plan.changed.every((path) => Object.hasOwn(STYLESHEETS, path));
   if (stylesheetOnly) {
@@ -253,6 +264,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
   } catch (error) {
     return full(
       `Cannot load workspace task graph: ${error instanceof Error ? error.message : String(error)}`,
+      true,
     );
   }
 

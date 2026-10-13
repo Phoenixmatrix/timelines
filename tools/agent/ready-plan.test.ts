@@ -374,6 +374,8 @@ await test("unknown/global paths, task manifests and shared harness changes fail
       const plan = await readinessPlan(root, options);
       assert.equal(plan.full, true, path);
       assert.equal(plan.e2e, true, path);
+      // Full code gates, but E2E journeys still come from the changed path.
+      assert.equal(plan.e2eAll, false, path);
       assert.ok(
         plan.reasons.some((reason) => reason.includes(path)),
         path,
@@ -577,21 +579,33 @@ await test("base discovery uses merge-base rather than changes unique to the bas
 });
 
 await test("missing base, invalid Git repository and unreadable graph select full coverage with reasons", async () => {
-  await fixture(async (root, git) => {
+  await fixture(async (root, git, put) => {
     await git(["update-ref", "-d", "refs/remotes/origin/main"]);
     for (const base of ["origin/main", "does-not-exist", "--invalid"]) {
       const plan = await readinessPlan(root, { ...options, base });
       assert.equal(plan.full, true);
       assert.equal(plan.e2e, true);
+      assert.equal(plan.e2eAll, true, "No change list: every scenario runs");
       assert.equal(plan.base, null);
       assert.ok(plan.reasons[0].includes(base));
     }
     await rm(join(root, "packages/utils/package.json"));
     // A missing known manifest is itself a conservative global configuration change.
-    assert.equal((await readinessPlan(root, { ...options, base: "HEAD" })).full, true);
+    const graph = await readinessPlan(root, { ...options, base: "HEAD" });
+    assert.equal(graph.full, true);
+    assert.equal(graph.e2eAll, false);
+    // An unreadable task graph is failed change discovery too: every scenario runs (CORE-406).
+    await put("packages/utils/package.json", "{not json");
+    await git(["add", "."]);
+    await git(["commit", "-m", "break a manifest"]);
+    const broken = await readinessPlan(root, { ...options, base: "HEAD" });
+    assert.equal(broken.full, true);
+    assert.equal(broken.e2eAll, true);
+    assert.ok(broken.reasons[0].includes("Cannot load workspace task graph"));
     await rm(join(root, ".git"), { recursive: true });
     const plan = await readinessPlan(root, options);
     assert.equal(plan.full, true);
+    assert.equal(plan.e2eAll, true);
     assert.ok(plan.reasons[0].includes("Cannot discover changes"));
   });
 });
@@ -603,6 +617,8 @@ await test("--all preserves full gates while dry-run leaves selection and filesy
     const all = await readinessPlan(root, { ...options, all: true, dryRun: true });
     assert.equal(all.full, true);
     assert.equal(all.e2e, true);
+    assert.equal(all.e2eAll, true);
+    assert.equal(selected.e2eAll, false);
     assert.deepEqual(all.changed, []);
     assert.ok(all.reasons[0].includes("--all"));
   });

@@ -1,5 +1,6 @@
 import { cloudflare } from "@cloudflare/vite-plugin";
 import { readFileSync, watchFile, unwatchFile } from "node:fs";
+import { availableParallelism } from "node:os";
 import { resolve } from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import type { Plugin } from "vite-plus";
@@ -8,6 +9,7 @@ import { defineConfig, normalizePath } from "vite-plus";
 import { browserCommands } from "./vite/browser-commands.ts";
 import { ciRunners } from "./vite/ci-runners.ts";
 import { DEV_AI_OPT_IN, developmentEnvironment } from "./vite/environment.ts";
+import { memoryReserve, unitWorkers } from "./vite/workers.ts";
 
 const local = developmentEnvironment(process.env);
 const credentialChannel =
@@ -154,12 +156,15 @@ export default defineConfig({
   // and browser-mode tests that render the app in headless Chromium against
   // mocked and in-memory APIs.
   test: {
-    maxWorkers: process.env.VITEST && availableMemory() < LOW_MEMORY ? 1 : 2,
     projects: [
       {
         extends: true,
         test: {
           name: "unit",
+          // Sized by CPUs and free memory, apart from the browser project (CORE-406).
+          maxWorkers: process.env.VITEST
+            ? unitWorkers(availableParallelism(), availableMemory(), memoryReserve(process.env))
+            : 1,
           include: [
             "worker/**/*.test.ts",
             "registry/**/*.test.ts",
@@ -174,6 +179,9 @@ export default defineConfig({
         server: { strictPort: false },
         test: {
           name: "browser",
+          maxWorkers: process.env.VITEST && availableMemory() < LOW_MEMORY ? 1 : 2,
+          // Projects with different caps must run as separate groups, one after the other.
+          sequence: { groupOrder: 1 },
           // Concurrent source worktrees must not contend for Vitest's default API port.
           api: { host: "127.0.0.1", strictPort: false },
           include: ["src/**/*.browser.test.tsx"],
