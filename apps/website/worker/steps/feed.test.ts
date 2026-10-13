@@ -30,13 +30,14 @@ const record = (n: number): Omit<StepFeedRecord, "seq" | "at"> => ({
   committedAt: new Date().toISOString(),
 });
 
-/** Reads SSE events until `count` step events arrived. */
+/** Reads SSE events until `count` step (and removal) events arrived. */
 async function events(response: Response, count: number) {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let text = "";
   const steps: { id: number; data: StepFeedRecord }[] = [];
-  while (steps.length < count) {
+  const removed: unknown[] = [];
+  while (steps.length + removed.length < count) {
     const { value, done } = await reader.read();
     if (done) break;
     text += decoder.decode(value);
@@ -46,12 +47,29 @@ async function events(response: Response, count: number) {
       text = text.slice(end + 2);
       const id = /^id: (\d+)$/m.exec(block)?.[1];
       const data = /^data: (.*)$/m.exec(block)?.[1];
-      if (id && data) steps.push({ id: Number(id), data: JSON.parse(data) as StepFeedRecord });
+      if (/^event: removed$/m.test(block) && data) {
+        expect(id).toBeUndefined();
+        removed.push(JSON.parse(data));
+      } else if (id && data)
+        steps.push({ id: Number(id), data: JSON.parse(data) as StepFeedRecord });
     }
   }
   await reader.cancel();
-  return steps;
+  return Object.assign(steps, { removed });
 }
+
+const subscribe = (feed: StepFeed, last?: number) =>
+  feed.fetch(
+    new Request("https://step-feed/subscribe", {
+      headers: last === undefined ? {} : { "last-event-id": String(last) },
+    }),
+  );
+
+const removal = (n: number) => ({
+  repo: "orbit/app",
+  changeId: record(n).changeId,
+  commitOid: record(n).commitOid,
+});
 
 describe("the step feed", () => {
   test("a reader gets what's there after its last event, then each new step", async () => {
@@ -111,6 +129,62 @@ describe("the step feed", () => {
     try {
       await feed.alarm();
       expect(await feed.since(0)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("forgets a deleted step: gone from the backlog, readers told, live and on reconnect (CORE-399)", async () => {
+    const { ctx } = fakeDurableState();
+    const feed = new StepFeed(ctx as never, {} as Env);
+    for (let n = 1; n <= 3; n++) await feed.publish(record(n));
+    // Connected since step 3: told live.
+    const reading = events(await subscribe(feed, 3), 1);
+    await vi.waitFor(() => expect(feed.subscribers()).toBe(1));
+    expect(await feed.forget([{ ...removal(2), repo: "orbit/renamed" }])).toBe(1);
+    // The record's own repository, which readers match on.
+    expect((await reading).removed).toEqual([removal(2)]);
+    expect((await feed.since(0)).map((r) => r.seq)).toEqual([1, 3]);
+    // A reader that already had step 2 and missed that is told on reconnect.
+    const back = await events(await subscribe(feed, 3), 1);
+    expect(back.removed).toEqual([removal(2)]);
+    // A new reader never sees it.
+    const fresh = await events(await subscribe(feed), 3);
+    expect(fresh.map((e) => e.id)).toEqual([1, 3]);
+  });
+
+  test("forgetting is idempotent, and a publish in flight can't bring the step back", async () => {
+    const { ctx } = fakeDurableState();
+    const feed = new StepFeed(ctx as never, {} as Env);
+    await feed.publish(record(1));
+    expect(await feed.forget([removal(1)])).toBe(1);
+    const reading = events(await subscribe(feed, 1), 3);
+    await vi.waitFor(() => expect(feed.subscribers()).toBe(1));
+    // Again: nothing new, nobody told twice.
+    expect(await feed.forget([removal(1)])).toBe(0);
+    // Deleted before its publish arrived (it runs after the upload's answer).
+    expect(await feed.forget([removal(2)])).toBe(1);
+    expect(await feed.publish(record(2))).toBeNull();
+    await feed.publish(record(3));
+    const got = await reading;
+    expect(got.removed).toEqual([removal(1), removal(2)]);
+    expect(got.map((e) => e.data.summary)).toEqual(["Step 3"]);
+    expect((await feed.since(0)).map((r) => r.summary)).toEqual(["Step 3"]);
+  });
+
+  test("remembers a forgotten step for a week, then lets go", async () => {
+    const { ctx } = fakeDurableState();
+    const feed = new StepFeed(ctx as never, {} as Env);
+    // No record (evicted, or never here): still remembered, as a reader may hold one.
+    await feed.forget([removal(1)]);
+    expect(await feed.since(0)).toEqual([]);
+    expect(await feed.removals()).toEqual([removal(1)]);
+    expect(await ctx.storage.getAlarm()).not.toBeNull();
+    vi.useFakeTimers({ now: Date.now() + FEED_TTL_MS + 1 });
+    try {
+      expect(await feed.removals()).toEqual([]);
+      await feed.alarm();
+      expect([...(await ctx.storage.list({ prefix: "x:" })).keys()]).toEqual([]);
     } finally {
       vi.useRealTimers();
     }

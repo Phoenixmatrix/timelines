@@ -511,6 +511,74 @@ describe("step context", () => {
     s.as(annsAgent);
     expect((await s.upload(step(1))).status).toBe(410);
   });
+
+  test("deleting a step makes its live feed forget it, before the answer (CORE-399)", async () => {
+    const s = setup();
+    await s.upload(step(1));
+    await s.upload(step(2));
+    // No timeline, no feed.
+    await s.upload(step(3, { timeline: undefined }));
+    const feed = s.feeds.get("repo:search")!;
+    expect((await feed.since(0)).map((r) => r.seq)).toEqual([1, 2]);
+    s.as(ann);
+    expect((await s.call(`/change0001/${oid(1)}`, { method: "DELETE" })).status).toBe(204);
+    expect((await feed.since(0)).map((r) => r.summary)).toEqual(["Step 2"]);
+    expect(await feed.removals()).toEqual([
+      { repo: "ann/app", changeId: "change0001", commitOid: oid(1) },
+    ]);
+    expect((await s.call(`/change0003/${oid(3)}`, { method: "DELETE" })).status).toBe(204);
+    expect([...s.feeds.keys()]).toEqual(["repo:search"]);
+    // Readers are told to drop it, and its summary and why never come again.
+    s.as(ben);
+    const live = await s.call("/live?timeline=search&after=2");
+    const reader = live.body!.getReader();
+    let text = "";
+    while (!text.includes("event: removed"))
+      text += new TextDecoder().decode((await reader.read()).value);
+    await reader.cancel();
+    expect(text).toContain(
+      `event: removed\ndata: {"repo":"ann/app","changeId":"change0001","commitOid":"${oid(1)}"}\n\n`,
+    );
+    expect(text).not.toContain("Step 1");
+    expect(text).not.toContain("Recency matters");
+    // Already deleted: 404, and the feed isn't told twice.
+    s.as(ann);
+    expect((await s.call(`/change0001/${oid(1)}`, { method: "DELETE" })).status).toBe(404);
+    expect(await feed.removals()).toHaveLength(1);
+  });
+
+  test("a feed that fails never fails the deletion; the next reader's connection heals it", async () => {
+    const s = setup();
+    await s.upload(step(1));
+    const feed = s.feeds.get("repo:search")!;
+    const forget = vi.spyOn(feed, "forget").mockRejectedValueOnce(new Error("feed down"));
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    s.as(ann);
+    try {
+      expect((await s.call(`/change0001/${oid(1)}`, { method: "DELETE" })).status).toBe(204);
+      expect(errors).toHaveBeenCalledWith(
+        "Steps: removing a deleted step from the live feed failed",
+        expect.anything(),
+      );
+    } finally {
+      errors.mockRestore();
+    }
+    expect((await feed.since(0)).map((r) => r.summary)).toEqual(["Step 1"]);
+    // The next connection asks D1 which steps were deleted, and the feed forgets them.
+    s.as(ben);
+    const live = await s.call("/live?timeline=search");
+    const reader = live.body!.getReader();
+    let text = "";
+    while (!text.includes("event: removed"))
+      text += new TextDecoder().decode((await reader.read()).value);
+    await reader.cancel();
+    expect(text).not.toContain("Step 1");
+    expect(await feed.since(0)).toEqual([]);
+    expect(forget).toHaveBeenCalledTimes(2);
+    // Once forgotten, a connection doesn't tell anyone again.
+    await (await s.call("/live?timeline=search")).body!.cancel();
+    expect(await feed.removals()).toHaveLength(1);
+  });
 });
 
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);

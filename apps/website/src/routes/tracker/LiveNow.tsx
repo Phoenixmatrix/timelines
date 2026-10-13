@@ -2,20 +2,23 @@
 // in it, from each repository's live feed (GET …/steps/live, Server-Sent
 // Events), within seconds of `gm step`. Read with fetch rather than
 // EventSource so it goes through the app's request layer and can be aborted;
-// a dropped stream reconnects from its last event.
+// a dropped stream reconnects from its last event. A step an admin deleted
+// arrives as a removal (CORE-399), on the stream and on every reconnect, and
+// its record is dropped.
 
 import { RobotIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router";
-import type { StepFeedRecord } from "../../../shared/steps.ts";
+import type { StepFeedRecord, StepFeedRemoval } from "../../../shared/steps.ts";
 import type { Timeline } from "../../../shared/timelines.ts";
 import { link } from "../../components/ui.tsx";
 import { fullDate, timeAgo } from "../../lib/format.ts";
 
-/** Parses Server-Sent Events from a fetch body, calling `onEvent` per step event. */
+/** Parses Server-Sent Events from a fetch body: `onEvent` per step, `onRemoved` per removal. */
 async function readEvents(
   body: ReadableStream<Uint8Array>,
   onEvent: (id: number, record: StepFeedRecord) => void,
+  onRemoved: (removal: StepFeedRemoval) => void,
 ) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -30,23 +33,31 @@ async function readEvents(
       text = text.slice(end + 2);
       const id = /^id: (\d+)$/m.exec(block)?.[1];
       const data = /^data: (.*)$/m.exec(block)?.[1];
-      if (!/^event: step$/m.test(block) || !id || !data) continue;
+      if (!data) continue;
       try {
-        onEvent(Number(id), JSON.parse(data) as StepFeedRecord);
+        if (/^event: removed$/m.test(block)) onRemoved(JSON.parse(data) as StepFeedRemoval);
+        else if (/^event: step$/m.test(block) && id)
+          onEvent(Number(id), JSON.parse(data) as StepFeedRecord);
       } catch {
-        // A record that doesn't parse is skipped.
+        // An event that doesn't parse is skipped.
       }
     }
   }
 }
 
-/** The live feeds of a timeline's repositories: every record seen, newest first. */
+/**
+ * The live feeds of a timeline's repositories: every record seen, newest
+ * first, and the steps they said were deleted (`repo@commitOid`), which other
+ * views drop too, though they got them elsewhere.
+ */
 export function useStepFeed(timeline: Pick<Timeline, "slug" | "repos" | "status">) {
   const [records, setRecords] = useState<StepFeedRecord[]>([]);
+  const [removed, setRemoved] = useState<ReadonlySet<string>>(new Set());
   const live = timeline.status !== "landed" && timeline.status !== "abandoned";
   const repos = timeline.repos.map((r) => `${r.owner}/${r.name}`).join(",");
   useEffect(() => {
     setRecords([]);
+    setRemoved(new Set());
     if (!live || !repos) return;
     const abort = new AbortController();
     const add = (record: StepFeedRecord) =>
@@ -55,6 +66,16 @@ export function useStepFeed(timeline: Pick<Timeline, "slug" | "repos" | "status"
           ? prev
           : [record, ...prev].sort((a, b) => b.at.localeCompare(a.at)).slice(0, 200),
       );
+    const remove = ({ repo, changeId, commitOid }: StepFeedRemoval) => {
+      const key = `${repo}@${commitOid}`;
+      setRemoved((prev) => (prev.has(key) ? prev : new Set([...prev, key])));
+      setRecords((prev) => {
+        const kept = prev.filter(
+          (r) => !(r.repo === repo && r.changeId === changeId && r.commitOid === commitOid),
+        );
+        return kept.length === prev.length ? prev : kept;
+      });
+    };
     for (const repo of repos.split(",")) {
       void (async () => {
         let last = 0;
@@ -74,10 +95,14 @@ export function useStepFeed(timeline: Pick<Timeline, "slug" | "repos" | "status"
               return;
             if (response.ok && response.body) {
               wait = 5_000;
-              await readEvents(response.body, (id, record) => {
-                last = Math.max(last, id);
-                add(record);
-              });
+              await readEvents(
+                response.body,
+                (id, record) => {
+                  last = Math.max(last, id);
+                  add(record);
+                },
+                remove,
+              );
             } else wait = Math.min(wait * 2, 60_000);
           } catch {
             if (abort.signal.aborted) return;
@@ -89,7 +114,7 @@ export function useStepFeed(timeline: Pick<Timeline, "slug" | "repos" | "status"
     }
     return () => abort.abort();
   }, [timeline.slug, repos, live]);
-  return { records, live };
+  return { records, removed, live };
 }
 
 /** The latest step per agent, with when it started working in this feed's window. */

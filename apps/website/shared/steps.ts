@@ -208,3 +208,16 @@ export interface StepFeedRecord {
   /** When the feed received it. */
   at: string;
 }
+
+/**
+ * A step an admin deleted, sent on its live feed as `event: removed` (no `id`;
+ * CORE-399): readers drop the record with this repository, change and commit.
+ * A feed sends every removal it remembers on each connect, so a reader that
+ * missed one while reconnecting still drops what it holds.
+ */
+export interface StepFeedRemoval {
+  /** owner/name, as the record had it */
+  repo: string;
+  changeId: string;
+  commitOid: string;
+}

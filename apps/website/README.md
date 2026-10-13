@@ -475,6 +475,17 @@ reconnect (with `Last-Event-ID`) is checked again, so lost access closes the
 feed within that time. Records come at least once: readers dedupe by
 (repository, commit).
 
+Deleting a step (CORE-399) makes its feed forget it before the `DELETE`
+answers: the record goes, and the feed remembers the step for a week, so a
+publish still in flight is refused. Readers get `event: removed` with
+`data: {"repo","changeId","commitOid"}` and no `id` (it never moves
+`Last-Event-ID`), live and again on every connect, so one that missed it while
+reconnecting still drops what it holds (Live now drops the record; the
+observability view also hides the step's span, even one loaded in full). A
+feed that fails at deletion is only logged; each connection first asks D1 for the timeline's steps deleted in the
+last week (a partial index keeps that to deleted rows) and has the feed forget
+any it doesn't know. Readers that don't know `removed` skip it.
+
 The timeline page's **Live now** (`src/routes/tracker/LiveNow.tsx`) reads each
 repository's feed with `fetch` (not `EventSource`), and shows each agent's
 latest step, its test result, how many steps since when and its why, linked

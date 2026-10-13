@@ -123,10 +123,19 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
       at: minutes(30),
     },
   ];
+  // Steps the feed later says an admin deleted (CORE-399).
+  const removals: StepFeedRecord[] = [];
   server.on("GET", "/api/repos/:owner/:name/steps/live", () => {
-    const body = feed
-      .map((record) => `id: ${record.seq}\nevent: step\ndata: ${JSON.stringify(record)}\n\n`)
-      .join("");
+    const body =
+      feed
+        .map((record) => `id: ${record.seq}\nevent: step\ndata: ${JSON.stringify(record)}\n\n`)
+        .join("") +
+      removals
+        .map(
+          ({ repo, changeId, commitOid }) =>
+            `event: removed\ndata: ${JSON.stringify({ repo, changeId, commitOid })}\n\n`,
+        )
+        .join("");
     return new Response(body, { headers: { "content-type": "text/event-stream" } });
   });
 
@@ -254,6 +263,22 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
   // The removed step never got a mark: the builder's two, then the two that arrived.
   expect(builder.getByRole("button", { name: /Paste the API key/ }).elements()).toHaveLength(0);
   expect(builder.getByRole("button").elements()).toHaveLength(4);
+
+  // An admin deletes a step already loaded in full: the feed says so, and its
+  // span goes, inspector and all, without a reload (CORE-399).
+  removals.push(feed.find((record) => record.changeId === "livechange")!);
+  await expect
+    .poll(
+      () => builder.getByRole("button", { name: /Keep score as tie-breaker/ }).elements().length,
+      {
+        timeout: 20_000,
+      },
+    )
+    .toBe(0);
+  expect(builder.getByRole("button").elements()).toHaveLength(3);
+  await expect
+    .element(observed)
+    .not.toMatchTextContent(/Keep score as tie-breaker|Ties need an order/);
 
   // A phone: nothing scrolls sideways but the lanes themselves.
   await page.viewport(390, 844);

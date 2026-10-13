@@ -38,7 +38,7 @@ import { search } from "../search/api.ts";
 import { aiProvidersApi } from "../ai-providers/api.ts";
 import { aiSettingsApi, siteAiSettingsApi } from "../settings/ai.ts";
 import { steps } from "../steps/api.ts";
-import { StepFeed, sseEvent } from "../steps/feed.ts";
+import { StepFeed } from "../steps/feed.ts";
 import { timelines } from "../timelines/api.ts";
 import { timelineGraph } from "../timelines/graph.ts";
 import { resolveSource } from "../timelines/sources.ts";
@@ -116,16 +116,12 @@ class BrowserStepFeed extends StepFeed {
     const url = new URL(request.url);
     const raw = request.headers.get("last-event-id") ?? url.searchParams.get("after");
     const after = raw && /^\d+$/.test(raw) ? Number(raw) : 0;
-    const backlog = await this.since(after);
-    return new Response(
-      `retry: 5000\n: ${backlog.length} record(s)\n\n${backlog.map(sseEvent).join("")}`,
-      {
-        headers: {
-          "content-type": "text/event-stream; charset=utf-8",
-          "cache-control": "no-store",
-        },
+    return new Response(await this.replay(after), {
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-store",
       },
-    );
+    });
   }
 }
 
