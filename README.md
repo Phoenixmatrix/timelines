@@ -5,6 +5,116 @@ The React app and Worker live in `apps/website`; the Rust `gm` CLI lives in
 `apps/cli`. Timelines hosts its own source. GitHub is a one-way backup, not the
 publication target.
 
+## Run your own instance
+
+You can run your own copy of Timelines in your own Cloudflare account.
+[SELF-HOSTING.md](SELF-HOSTING.md) walks through it from a brand-new
+Cloudflare account, prerequisites included; this section is the summary. The same
+steps add more instances to one account, and each instance stays isolated: it has
+its own Worker, hostname, D1 databases, R2 buckets, queues, Workflows, CI
+container, Artifacts namespace, secrets and (optionally) AI resources. All of
+them are named after the instance (`gitmatrix-<name>`, `gitmatrix-<name>-jobs`,
+`gitmatrix_<name>_…` for secrets and so on), so instances never touch each other
+or the canonical deploy.
+
+You need:
+
+- a Cloudflare account on the **Workers Paid** plan (CI runs in Containers);
+- a domain **in that account** (an active zone), for a hostname such as
+  `timelines.example.com`;
+- [Node.js](https://nodejs.org) 22.18+, [pnpm](https://pnpm.io), a
+  [Rust toolchain](https://rustup.rs) and a running
+  [Docker](https://docs.docker.com/get-docker/), which builds the CI image on deploy.
+
+```sh
+git clone <this repository> timelines && cd timelines
+pnpm install
+cargo build --release --manifest-path apps/cli/Cargo.toml   # builds gm
+apps/cli/target/release/gm instance setup
+```
+
+Put `apps/cli/target/release` on your `PATH` if you like, or use
+`cargo install --path apps/cli --locked`. Run setup from the checkout. It
+deploys that checkout.
+
+`gm instance setup` asks for what it needs: an instance name, the account, the
+hostname, the owner's email, the organization to create for them, the address
+sign-in codes come from, and whether to provision paid AI. AI is off unless you
+choose it; without it the app shows its AI-off states. Setup then shows the plan
+and asks for confirmation. It creates everything with Cloudflare's `cf` CLI
+(installed by `pnpm install`), applies the D1 migrations, deploys the Worker to
+the hostname, and waits for it to answer.
+
+Some steps only you can do. For each one, setup prints what to do in the
+Cloudflare dashboard, then checks again when you press Enter:
+
+| Step                 | What setup does                                                                                                                                                                          |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cloudflare sign-in   | Runs `cf auth login` (browser) when you're signed out. `CLOUDFLARE_API_TOKEN` also works.                                                                                                |
+| Workers Paid         | Checks the account's subscriptions; tells you where to upgrade.                                                                                                                          |
+| R2                   | Checks that R2 is enabled; new accounts start with it off.                                                                                                                               |
+| Domain               | Checks that the hostname is in an active zone and has no DNS records yet. If the domain isn't in the account, it walks you through adding it and changing nameservers.                   |
+| Email Sending        | Uses an Email Sending domain of that zone, or offers to create `mail.<zone>`, then checks its DNS records and offers to add missing ones. Otherwise it guides you through the dashboard. |
+| Secrets Store        | Uses the account's store. `cf` can't create one, so if the account has none it tells you how.                                                                                            |
+| Docker               | Checks that `docker info` works; deploying builds `apps/website/ci/Dockerfile`.                                                                                                          |
+| Every other resource | Creates it, and generates the instance's secrets into the Secrets Store. Secret values never go on a command line.                                                                       |
+
+Setup saves its answers and every resource id as it goes, in
+`~/.config/gitmatrix/instances/<name>.json` (under `$XDG_CONFIG_HOME` when set).
+If setup stops, rerun `gm instance setup <name>`: it resumes from that file and
+creates only what's missing. Agents and scripts can pass every answer as a
+flag, e.g.
+`gm instance setup acme --host timelines.acme.dev --owner-email me@acme.dev --owner-org acme --no-ai --yes`.
+Add `--dry-run` to check the prerequisites and print the plan without creating
+anything or writing the instance file. When it finishes:
+
+1. Open `https://<hostname>` and sign in with the owner's email (a code is emailed).
+   The owner is the site administrator and can invite others.
+2. Point gm at it: `gm auth login --server https://<hostname>`.
+
+Other commands:
+
+- `gm instance list` lists instances set up from this machine.
+- `gm instance show <name>` shows an instance's resources.
+- `gm instance deploy <name>` applies new migrations and redeploys from the
+  current checkout, uncommitted changes included. Use it for your own
+  modifications; `gm instance upgrade` is the way to take new versions.
+
+### Upgrading an instance
+
+Instances don't get the canonical deploy's CI/CD. An instance changes only when
+you upgrade it, and only to the version you choose. Versions are commits on the
+upstream's `main` branch. The upstream is the repository you cloned for setup,
+recorded in the instance file.
+
+```sh
+gm instance upgrade acme --dry-run              # what's new: commits, migrations, CI image
+gm instance upgrade acme                        # upgrade to the upstream's latest main
+gm instance upgrade acme --to 1a2b3c4d5e6f      # or to a version of your choosing
+gm instance upgrade acme --from https://github.com/Phoenixmatrix/timelines.git
+```
+
+Upgrade fetches the upstream into a clone of gm's own, under
+`~/.cache/gitmatrix/instance-sources`, and never touches your checkout. It
+checks out the target there, runs `pnpm install` and builds that version's gm.
+That gm then deploys it: it creates any resources the version needs that setup
+didn't, applies the version's new D1 migrations, deploys the Worker and waits
+for it to answer. The gm built for the version stays in that clone; the upgrade
+prints its path.
+
+Upgrades only move forward. D1 migrations can't be undone, so a target that
+isn't later than the deployed version is refused unless you pass
+`--allow-downgrade`. The dry run lists the migrations that would stay applied.
+Without a terminal, pass `--yes`.
+
+An instance deploys only from your checkout or from upgrade. The canonical repository's
+`.gitmatrix/ci.yml` deploys the canonical instance; previews and gm releases
+(`gm pkg install gm`) are left unconfigured on new instances. Removing an
+instance is manual. Delete its Worker, which also removes its custom domain's
+DNS record. Then delete the resources `gm instance show` lists, in the dashboard
+or with `cf`. If setup created an Email Sending domain, delete it too unless
+something else sends from it.
+
 ## Timeline work and canonical history
 
 Timelines keep full progress history in one owned work repository per timeline

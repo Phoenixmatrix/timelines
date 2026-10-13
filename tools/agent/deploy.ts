@@ -30,9 +30,9 @@ const cf = join(website, "node_modules/.bin/cf");
 const SITE_WORKER = "gitmatrix-site";
 const site = join(root, "apps/site");
 /**
- * Where each Worker answers in production: `PRODUCTION_HOST` in
- * apps/website/cloudflare.config.ts and apps/site/cloudflare.config.ts
- * (deploy.test.ts keeps them in step).
+ * Where each Worker answers in production: `PRODUCTION.host` in
+ * apps/website/vite/instance.ts and `PRODUCTION_HOST` in
+ * apps/site/cloudflare.config.ts (deploy.test.ts keeps them in step).
  */
 export const PRODUCTION_URLS: Record<string, string> = {
   [WORKER]: "https://timelinesapp.fward.dev",

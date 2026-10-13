@@ -211,6 +211,7 @@ fn run(command: Command, ctx: &Ctx) -> Result<(), GmError> {
         Command::Runner(a) => out(f, ci::runner(ctx, &a)),
         Command::Secret(c) => out(f, ci::secret(ctx, &c)),
         Command::Deploy(c) => out(f, commands::deploy::run(ctx, &c)),
+        Command::Instance(c) => out(f, commands::instance::run(ctx, &c)),
         Command::Agent(c) => out(f, agents::agent(ctx, &c)),
         Command::Ask(a) => out(f, commands::ask::ask(ctx, &a)),
         Command::Assistant(c) => out(f, commands::ask::assistant(ctx, &c)),

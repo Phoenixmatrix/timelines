@@ -1,5 +1,6 @@
 import { bindings, defineConfig, defineContainer, exports, triggers } from "cf/config";
 import { developmentEnvironment } from "./vite/environment.ts";
+import { deployedInstance, PRODUCTION } from "./vite/instance.ts";
 import { previewResources } from "./vite/preview.ts";
 
 // Remote services have no local emulator, so dev talks to the real ones
@@ -13,47 +14,18 @@ const remote = { dev: { remote: true } };
 // (needs Docker).
 type Runner = "local" | "sandbox";
 
-/** Where the deployed Worker lives; GITMATRIX_PUBLIC_URL can override it. */
-const PRODUCTION_HOST = "timelinesapp.fward.dev";
-
-/**
- * Remote resources dev also talks to (Artifacts, Vectorize, AI Search) get
- * production-only names, so a deploy never shares repositories or indexes with
- * `vp dev`. Created with `cf` on the "Pile of cats" account.
- */
-const PRODUCTION = {
-  artifacts: "gitmatrix",
-  vectors: "gitmatrix-knowledge-prod",
-  search: "gitmatrix-prod",
-  gateway: "gitmatrix",
-  db: "3ed3e1ec-bd11-4f8e-bfee-d7c0bcb89e77",
-  registryDb: "caea2f3d-d4d3-43cd-aaf9-f14a3d84621d",
-};
-
 /** A fixed, public development key for the registry. Never used once deployed. */
 const DEV_KEK = btoa("gitmatrix-development-key-not-secret!");
 /** Signs development sessions only; deployed, the Secrets Store holds the real one. */
 const DEV_AUTH_SECRET = "gitmatrix-development-auth-secret-not-secret";
 /**
- * The account's Secrets Store, shared with the other ~/dev projects; names are
- * prefixed with the project (gitmatrix_…) so they never collide. readSecret()
- * reads NAME, else the NAME_SECRET binding.
- */
-const SECRETS_STORE = "2dcc6c92ee1743548ad303924b4e0f11";
-
-/** The instance owner: superuser everywhere, owner of OWNER_ORG once deployed. */
-const OWNER_EMAIL = "hello@fward.me";
-/** Sign-in codes come from this address (Email Service, mail.fward.dev). */
-const EMAIL_FROM = "gitmatrix@mail.fward.dev";
-
-/**
  * The CI image. Deploys from CI pass GITMATRIX_CI_IMAGE, the deployed
  * version's image reference: a Sandbox has no Docker to rebuild it, so CI
  * reuses it, and changes to ci/Dockerfile deploy from a machine with Docker.
  */
-function ciSandbox(image: string | undefined) {
+function ciSandbox(name: string, image: string | undefined) {
   return defineContainer({
-    name: "gitmatrix-ci",
+    name,
     schedulingPolicy: "durable-object",
     images: { default: image ? { reference: image } : { dockerfile: "./ci/Dockerfile" } },
   });
@@ -67,6 +39,12 @@ export default defineConfig(({ mode, isPreview }) => {
   const env = runtime.process?.env ?? {};
   const dev = mode === "development";
   const local = developmentEnvironment(env);
+  // What a deploy binds (vite/instance.ts): production's resources, or a
+  // self-hosted instance's when `gm instance deploy` sets
+  // GITMATRIX_INSTANCE_CONFIG. Development and previews keep production's
+  // Worker name and bind resources of their own below.
+  const instance = deployedInstance(dev || isPreview ? {} : env);
+  const worker = instance.worker;
   if (local.agent && !dev) throw new Error("Agent environments must never deploy");
   // A timeline preview (`cf previews deploy`, run by tools/preview; CORE-80).
   // Worker Previews isolate Durable Objects and nothing else, so a preview
@@ -75,9 +53,11 @@ export default defineConfig(({ mode, isPreview }) => {
   // (producers and consumers), cron, email, AI, the domain and the Secrets
   // Store. PREVIEW_MODE turns on worker/preview.ts's guards behind that.
   const preview = isPreview ? previewResources(env) : null;
-  // Deployed Workers always bind AI; development only when opted in
-  // (GITMATRIX_DEV_AI=enabled, or an agent environment set up with --ai).
-  const ai = !preview && (!dev || local.ai);
+  // Deployed Workers bind AI unless their instance has none; development only
+  // when opted in (GITMATRIX_DEV_AI=enabled, or an agent environment set up
+  // with --ai).
+  const ai = !preview && (dev ? local.ai : instance.ai !== null);
+  const deployedAi = instance.ai;
   const runner = (env.GITMATRIX_CI_RUNNER ?? (dev ? "local" : "sandbox")) as Runner;
   const sandboxed = runner === "sandbox";
   // Declaring the container makes `vite build` build its image, which needs
@@ -86,17 +66,17 @@ export default defineConfig(({ mode, isPreview }) => {
   // Previews take no container: they run no CI, and cf can't preview one a
   // Durable Object manages.
   const container = sandboxed && !preview && env.GITMATRIX_CONTAINER_IMAGES !== "skip";
-  const ci = ciSandbox(env.GITMATRIX_CI_IMAGE);
+  const ci = ciSandbox(instance.container, env.GITMATRIX_CI_IMAGE);
   // A preview answers wherever cf put it, so it goes by each request's origin.
   const publicUrl = preview
     ? undefined
     : dev
       ? local.publicUrl
-      : (env.GITMATRIX_PUBLIC_URL ?? `https://${PRODUCTION_HOST}`);
+      : (env.GITMATRIX_PUBLIC_URL ?? `https://${instance.host}`);
   return {
     ...(container ? { containers: [ci] } : {}),
     worker: {
-      name: "gitmatrix",
+      name: worker,
       compatibilityDate: "2026-09-30",
       compatibilityFlags: ["nodejs_compat"],
       entrypoint: "./worker/index.ts",
@@ -105,12 +85,14 @@ export default defineConfig(({ mode, isPreview }) => {
       // (`cf previews deploy`, tools/preview) answer as
       // <preview>-gitmatrix.<subdomain>.workers.dev. Explicit, so a deploy
       // sets the subdomain to exactly that (enabled false, previews_enabled true).
+      // A self-hosted instance runs no previews, so it needs no workers.dev
+      // subdomain, which a new account doesn't have.
       ...(dev || preview
         ? {}
         : {
-            domains: [PRODUCTION_HOST],
+            domains: [instance.host],
             workersDev: false,
-            previewUrls: true,
+            previewUrls: instance === PRODUCTION,
           }),
       observability: { enabled: true },
       // Multi-GB hashing/indexing; up to 20,000 historical frames with base/cache I/O.
@@ -144,18 +126,18 @@ export default defineConfig(({ mode, isPreview }) => {
       env: {
         // Local D1 keeps the zero ids (`vp run db:migrate` targets them).
         DB: bindings.d1({
-          name: "gitmatrix",
-          id: preview?.db ?? (dev ? "00000000000000000000000000000000" : PRODUCTION.db),
+          name: dev || preview ? "gitmatrix" : instance.db.name,
+          id: preview?.db ?? (dev ? "00000000000000000000000000000000" : instance.db.id),
         }),
-        TRACKER: bindings.durableObject({ worker: "gitmatrix", exportName: "Tracker" }),
+        TRACKER: bindings.durableObject({ worker, exportName: "Tracker" }),
         // The assistant (CORE-25): one Durable Object per conversation, and the
         // Worker Loader its Code Mode scripts run in (isolated, no network).
-        ASSISTANT: bindings.durableObject({ worker: "gitmatrix", exportName: "Assistant" }),
+        ASSISTANT: bindings.durableObject({ worker, exportName: "Assistant" }),
         LOADER: bindings.workerLoader(),
         ARTIFACTS: bindings.artifacts({
           namespace:
             preview?.artifacts ??
-            (dev ? (env.GITMATRIX_ARTIFACTS_NAMESPACE ?? "gitmatrix-dev") : PRODUCTION.artifacts),
+            (dev ? (env.GITMATRIX_ARTIFACTS_NAMESPACE ?? "gitmatrix-dev") : instance.artifacts),
           ...remote,
         }),
         // Whether AI Gateway logs keep request and response bodies where the
@@ -167,41 +149,41 @@ export default defineConfig(({ mode, isPreview }) => {
           ? {
               AI: bindings.ai(remote),
               AI_GATEWAY: bindings.text(
-                dev ? (env.GITMATRIX_AI_GATEWAY ?? "gitmatrix-dev") : PRODUCTION.gateway,
+                dev ? (env.GITMATRIX_AI_GATEWAY ?? "gitmatrix-dev") : deployedAi!.gateway,
               ),
               VECTORS: bindings.vectorize({
                 name: dev
                   ? (env.GITMATRIX_VECTORIZE_INDEX ?? "gitmatrix-knowledge")
-                  : PRODUCTION.vectors,
+                  : deployedAi!.vectors,
                 ...remote,
               }),
               SEARCH: bindings.aiSearchNamespace({
                 namespace: dev
                   ? (env.GITMATRIX_SEARCH_NAMESPACE ?? "gitmatrix")
-                  : PRODUCTION.search,
+                  : deployedAi!.search,
                 ...remote,
               }),
             }
           : {}),
         KNOWLEDGE_COORDINATOR: bindings.durableObject({
-          worker: "gitmatrix",
+          worker,
           exportName: "KnowledgeCoordinator",
         }),
         // A timeline's live feed of steps in one repository (CORE-239).
-        STEP_FEED: bindings.durableObject({ worker: "gitmatrix", exportName: "StepFeed" }),
+        STEP_FEED: bindings.durableObject({ worker, exportName: "StepFeed" }),
         // Workflows are the account's, not a Preview's: a preview binds none.
         ...(preview
           ? {}
           : {
               KNOWLEDGE_BUILD: bindings.workflow({
-                name: "knowledge-build",
-                worker: "gitmatrix",
+                name: instance.workflows.knowledgeBuild,
+                worker,
                 exportName: "KnowledgeBuild",
               }),
               // Repository deletion's purge (CORE-199, worker/retention/repo-purge.ts).
               REPO_PURGE: bindings.workflow({
-                name: "repo-purge",
-                worker: "gitmatrix",
+                name: instance.workflows.repoPurge,
+                worker,
                 exportName: "RepoPurge",
               }),
             }),
@@ -266,35 +248,35 @@ export default defineConfig(({ mode, isPreview }) => {
           ? {}
           : {
               CI_RUN: bindings.workflow({
-                name: "ci-run",
-                worker: "gitmatrix",
+                name: instance.workflows.ciRun,
+                worker,
                 exportName: "CiRun",
               }),
             }),
-        CI_SANDBOX: bindings.durableObject({ worker: "gitmatrix", exportName: "CiSandbox" }),
+        CI_SANDBOX: bindings.durableObject({ worker, exportName: "CiSandbox" }),
         // Packages (registry/): its own catalog database and blob bucket, so its
         // tables never meet gitmatrix's. People and permissions stay in DB.
         REGISTRY_DB: bindings.d1({
-          name: "gitmatrix-registry",
+          name: dev || preview ? "gitmatrix-registry" : instance.registryDb.name,
           id:
             preview?.registryDb ??
-            (dev ? "00000000000000000000000000000001" : PRODUCTION.registryDb),
+            (dev ? "00000000000000000000000000000001" : instance.registryDb.id),
         }),
-        REGISTRY_BLOBS: bindings.r2({ name: preview?.bucket ?? "gitmatrix-registry-blobs" }),
+        REGISTRY_BLOBS: bindings.r2({ name: preview?.bucket ?? instance.buckets.registry }),
         // People's profile pictures and their generated options (CORE-116). A
         // preview shares its one bucket: avatar keys (avatars/, avatar-options/)
         // never meet the registry's (b/, c/, d/).
-        AVATARS: bindings.r2({ name: preview?.bucket ?? "gitmatrix-avatars" }),
+        AVATARS: bindings.r2({ name: preview?.bucket ?? instance.buckets.avatars }),
         // Screenshots CI jobs attach to a commit (CORE-383). A preview shares its
         // one bucket: keys (step-artifacts/) never meet the registry's or avatars'.
-        STEP_ARTIFACTS: bindings.r2({ name: preview?.bucket ?? "gitmatrix-step-artifacts" }),
-        REGISTRY_REPO: bindings.durableObject({ worker: "gitmatrix", exportName: "RegistryRepo" }),
+        STEP_ARTIFACTS: bindings.r2({ name: preview?.bucket ?? instance.buckets.stepArtifacts }),
+        REGISTRY_REPO: bindings.durableObject({ worker, exportName: "RegistryRepo" }),
         REGISTRY_UPLOAD: bindings.durableObject({
-          worker: "gitmatrix",
+          worker,
           exportName: "RegistryUpload",
         }),
         REGISTRY_LOGIN: bindings.durableObject({
-          worker: "gitmatrix",
+          worker,
           exportName: "RegistryLogin",
         }),
         // The queues are production's (a preview would feed its consumers), so
@@ -302,9 +284,9 @@ export default defineConfig(({ mode, isPreview }) => {
         ...(preview
           ? {}
           : {
-              REGISTRY_JOBS: bindings.queue({ name: "gitmatrix-registry-jobs" }),
+              REGISTRY_JOBS: bindings.queue({ name: instance.queues.registryJobs }),
               // Repository work off the push path: mirrors to other git hosts.
-              JOBS: bindings.queue({ name: "gitmatrix-jobs" }),
+              JOBS: bindings.queue({ name: instance.queues.jobs }),
             }),
         // Seals signing keys and upstream credentials, and seeds registry tokens.
         // Development uses a fixed public key; deployed, set the REGISTRY_KEK secret.
@@ -319,8 +301,8 @@ export default defineConfig(({ mode, isPreview }) => {
               }
             : {
                 REGISTRY_KEK_SECRET: bindings.secretsStoreSecret({
-                  storeId: SECRETS_STORE,
-                  secretName: "gitmatrix_registry_kek",
+                  storeId: instance.secrets.store,
+                  secretName: instance.secrets.registryKek,
                 }),
               }),
         // Sign-in (worker/better-auth.ts): emailed one-time codes and device
@@ -329,25 +311,27 @@ export default defineConfig(({ mode, isPreview }) => {
           ? { BETTER_AUTH_SECRET: bindings.text(preview?.secret ?? DEV_AUTH_SECRET) }
           : {
               BETTER_AUTH_SECRET_SECRET: bindings.secretsStoreSecret({
-                storeId: SECRETS_STORE,
-                secretName: "gitmatrix_better_auth_secret",
+                storeId: instance.secrets.store,
+                secretName: instance.secrets.betterAuth,
               }),
             }),
-        OWNER_EMAIL: bindings.text(OWNER_EMAIL),
+        OWNER_EMAIL: bindings.text(instance.owner.email),
         // Deployed only: the owner's org, created on their first sign-in. It
         // will hold the gitmatrix repository; development keeps the seed data.
-        ...(dev || preview ? {} : { OWNER_ORG: bindings.text("matrixorg") }),
-        EMAIL_FROM: bindings.text(EMAIL_FROM),
+        ...(dev || preview ? {} : { OWNER_ORG: bindings.text(instance.owner.org) }),
+        EMAIL_FROM: bindings.text(instance.emailFrom),
         // Locally the binding simulates delivery: messages are logged, never sent.
         // A preview sends nothing.
-        ...(preview ? {} : { EMAIL: bindings.sendEmail({ allowedSenderAddresses: [EMAIL_FROM] }) }),
+        ...(preview
+          ? {}
+          : { EMAIL: bindings.sendEmail({ allowedSenderAddresses: [instance.emailFrom] }) }),
         // Failed codes and device approvals, per email and per IP. Crossing the
         // limit locks the key out for 15 minutes (auth_lockouts).
         // Namespace ids are account-wide: ~/dev projects use 1001 and 4x01 per
         // project (4101 trustmatrix … 4301 mailmatrix), so gitmatrix is 4401.
         // Previews count their failures apart from production's, in 4402.
         AUTH_FAILURES: bindings.rateLimit({
-          namespace: preview ? "4402" : "4401",
+          namespace: preview ? "4402" : instance.rateLimitNamespace,
           simple: { limit: 5, period: 60 },
         }),
         // Where package clients and CI sandboxes reach gitmatrix. Generated
@@ -359,9 +343,9 @@ export default defineConfig(({ mode, isPreview }) => {
       triggers: preview
         ? []
         : [
-            triggers.queue({ name: "gitmatrix-registry-jobs", maxBatchSize: 10, maxRetries: 5 }),
+            triggers.queue({ name: instance.queues.registryJobs, maxBatchSize: 10, maxRetries: 5 }),
             // Mirror syncs back off exponentially (worker/mirror/queue.ts), up to ~2 hours.
-            triggers.queue({ name: "gitmatrix-jobs", maxBatchSize: 5, maxRetries: 12 }),
+            triggers.queue({ name: instance.queues.jobs, maxBatchSize: 5, maxRetries: 12 }),
             // Package retention and garbage collection sweeps; previews, landings
             // and Atlas projection retention (worker/index.ts `scheduled`).
             triggers.scheduled({ schedule: "17 * * * *" }),
@@ -376,9 +360,9 @@ export default defineConfig(({ mode, isPreview }) => {
         ...(preview
           ? {}
           : {
-              KnowledgeBuild: exports.workflow({ name: "knowledge-build" }),
-              CiRun: exports.workflow({ name: "ci-run" }),
-              RepoPurge: exports.workflow({ name: "repo-purge" }),
+              KnowledgeBuild: exports.workflow({ name: instance.workflows.knowledgeBuild }),
+              CiRun: exports.workflow({ name: instance.workflows.ciRun }),
+              RepoPurge: exports.workflow({ name: instance.workflows.repoPurge }),
             }),
         RegistryRepo: exports.durableObject({ storage: "sqlite" }),
         RegistryUpload: exports.durableObject({ storage: "sqlite" }),

@@ -28,13 +28,14 @@ export default {
   /**
    * Work queued off the request path: repository mirrors and release notes
    * (gitmatrix-jobs), and registry index rebuilds, retention and GC
-   * (gitmatrix-registry-jobs).
+   * (gitmatrix-registry-jobs). A self-hosted instance names its queues
+   * <prefix>-jobs and <prefix>-registry-jobs (vite/instance.ts).
    */
   async queue(batch, env, ctx) {
     // A preview has no consumers (cloudflare.config.ts); if one were attached,
     // it would be consuming production's messages, so leave them be.
     if (isPreview(env)) return batch.retryAll();
-    if (batch.queue === "gitmatrix-jobs") {
+    if (!batch.queue.endsWith("-registry-jobs")) {
       for (const message of batch.messages as readonly Message<
         MirrorJob | ReleaseNotesJob | ReleaseHighlightsJob | RetentionJob
       >[]) {

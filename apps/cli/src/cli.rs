@@ -157,6 +157,9 @@ pub enum Command {
     /// Deployment records: where commits are deployed (production, timeline previews)
     #[command(subcommand)]
     Deploy(crate::commands::deploy::DeployCommand),
+    /// Self-hosted instances: set up and deploy a Gitmatrix of your own in a Cloudflare account
+    #[command(subcommand)]
+    Instance(crate::commands::instance::InstanceCommand),
     /// Secrets that CI jobs can read as environment variables
     #[command(subcommand)]
     Secret(SecretCommand),
