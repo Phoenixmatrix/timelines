@@ -61,6 +61,7 @@ import {
   type ParsedRef,
 } from "../lib/resolveRefs.ts";
 import { useViewer } from "../lib/session.ts";
+import { scopeOwner } from "../lib/timelineScope.ts";
 import { refContextFromPath } from "../refs/context.ts";
 import {
   COMMAND_SOURCES,
@@ -552,6 +553,8 @@ function Palette({
     trackers: trackers?.trackers ?? null,
     defaultTrackerId: trackers?.defaultOwnerId ?? null,
     query,
+    search: location.search,
+    hash: location.hash,
   };
   // Read on the render that opens it, so a previous opening's list never shows.
   const viewerId = viewer?.id ?? null;
@@ -561,26 +564,45 @@ function Palette({
   );
 
   // The timelines of the tracker in view (else the one /tracker opens), once per opening.
-  const timelineOwner =
-    contextTracker(context)?.slug ??
-    trackers?.trackers.find((tracker) => tracker.id === trackers.defaultOwnerId)?.slug ??
-    null;
+  const defaultTracker =
+    trackers?.trackers.find((tracker) => tracker.id === trackers.defaultOwnerId)?.slug ?? null;
+  const timelineOwner = contextTracker(context)?.slug ?? defaultTracker;
+  // Switching scopes the page in view, so it offers the timelines of the
+  // account the page is about (as the banner reads them), else the default's.
+  const switchOwner =
+    scopeOwner(pathname, location.search) ?? defaultTracker ?? trackers?.trackers[0]?.slug ?? null;
   const [timelines, setTimelines] = useState<JumpContext["timelines"]>([]);
+  const [switchable, setSwitchable] = useState<NonNullable<PaletteContext["timelines"]>>([]);
   useEffect(() => {
     setTimelines([]);
-    if (!open || !viewer || !timelineOwner) return;
+    setSwitchable([]);
+    if (!open || !viewer) return;
     const controller = new AbortController();
-    api<TimelineList>(`/tracker/${encodeURIComponent(timelineOwner)}/timelines`, {
-      signal: controller.signal,
-    }).then(
-      (list) =>
-        setTimelines(
-          list.timelines.map((t) => ({ slug: t.slug, name: t.name, owner: timelineOwner })),
-        ),
-      () => {},
-    );
+    const read = (owner: string) =>
+      api<TimelineList>(`/tracker/${encodeURIComponent(owner)}/timelines`, {
+        signal: controller.signal,
+      });
+    // Open ones first: they're what a person switches to.
+    const ended = (t: { status: string }) => t.status === "landed" || t.status === "abandoned";
+    const offer = (list: TimelineList) =>
+      setSwitchable(
+        [...list.timelines]
+          .sort((a, b) => Number(ended(a)) - Number(ended(b)))
+          .map((t) => ({ slug: t.slug, name: t.name, status: t.status, repos: t.repos })),
+      );
+    if (timelineOwner)
+      read(timelineOwner).then(
+        (list) => {
+          setTimelines(
+            list.timelines.map((t) => ({ slug: t.slug, name: t.name, owner: timelineOwner })),
+          );
+          if (switchOwner === timelineOwner) offer(list);
+        },
+        () => {},
+      );
+    if (switchOwner && switchOwner !== timelineOwner) read(switchOwner).then(offer, () => {});
     return () => controller.abort();
-  }, [open, viewer, timelineOwner]);
+  }, [open, viewer, timelineOwner, switchOwner]);
 
   // Direct jumps: what a reference names, through the one resolver.
   const typed = query.trim().replace(/\s+/g, " ");
@@ -643,7 +665,7 @@ function Palette({
     ? destinations(context)
     : scope
       ? []
-      : COMMAND_SOURCES.flatMap((source) => source(context));
+      : COMMAND_SOURCES.flatMap((source) => source({ ...context, timelines: switchable }));
   const local = matchCommands(
     commands,
     query,

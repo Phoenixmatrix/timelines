@@ -3,8 +3,16 @@
 // app-wide scope (`?tl=`, lib/timelineScope.ts). The layout is in
 // timelineGraph.ts and the drawing in TimelineLanes.tsx.
 
-import { ArrowClockwiseIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { ArrowClockwiseIcon, CaretRightIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
+import {
+  Fragment,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   data as routeData,
   Link,
@@ -21,7 +29,6 @@ import {
   isStalled,
   type CheckpointList,
   type Timeline,
-  type TimelineEvent,
   type TimelineStatus,
 } from "../../../shared/timelines.ts";
 import { refreshTimelines } from "../../components/TimelineScope.tsx";
@@ -43,7 +50,14 @@ import {
   type LineState,
   type Row,
 } from "./timelineGraph.ts";
-import { LaneDrawing, ROW_HEIGHT, RowText, eventRepo, graphWidth } from "./TimelineLanes.tsx";
+import {
+  LaneDrawing,
+  ROW_HEIGHT,
+  eventRepo,
+  graphWidth,
+  type RowGeometry,
+} from "./TimelineLanes.tsx";
+import { RowDetails, summarize } from "./TimelineRows.tsx";
 import { DoneInTimelineIcon, statusLabel } from "./ui.tsx";
 import { PreviewLink, ReviveButton } from "./Checkpoint.tsx";
 import { LandingPanel } from "./Landing.tsx";
@@ -116,6 +130,17 @@ export function TrackerTimelines() {
   const [groupBy, setGroupBy] = useState<GroupBy>("status");
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const [hovered, setHovered] = useState<string | null>(null);
+  // Rows opened to show what's behind them (CORE-402), and where each row sits,
+  // so the lanes run on through an opened one.
+  const [expandedRows, setExpandedRows] = useState<ReadonlySet<string>>(new Set());
+  const toggleRow = (key: string) =>
+    setExpandedRows((open) => {
+      const next = new Set(open);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  const rowsRef = useRef<HTMLOListElement>(null);
+  const [geometry, setGeometry] = useState<RowGeometry | null>(null);
   const owner = data.owner.slug;
   const base = `/tracker/${encodeURIComponent(owner)}/timelines`;
   const slug = params.get("tl");
@@ -184,6 +209,24 @@ export function TrackerTimelines() {
     });
 
   const width = graphWidth(graph);
+  useLayoutEffect(() => {
+    const list = rowsRef.current;
+    if (!list) return;
+    const measure = () => {
+      const rows = [...list.querySelectorAll<HTMLElement>(":scope > li")];
+      const tops = rows.map((row) => row.offsetTop);
+      const last = rows.at(-1);
+      const total = last ? last.offsetTop + last.offsetHeight : 0;
+      setGeometry((prev) =>
+        prev && prev.total === total && prev.tops.join() === tops.join() ? prev : { tops, total },
+      );
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(list);
+    return () => observer.disconnect();
+  }, [graph]);
   const selectedRow = selected
     ? graph.rows.findIndex(
         (r) =>
@@ -334,14 +377,21 @@ export function TrackerTimelines() {
                 aria-label="Timeline graph"
               >
                 <p className="m-0 border-b border-line-soft px-3 py-2 text-body-sm text-ink-muted">
-                  Select a row to view a timeline and use it across the app.
+                  Select a timeline's row to view it and use it across the app. Details opens what a
+                  row has behind it.
                 </p>
                 <ol
+                  ref={rowsRef}
                   className="relative m-0 list-none p-0"
-                  style={{ minWidth: width + 240 }}
+                  style={{ minWidth: width + 360 }}
                   onMouseLeave={() => setHovered(null)}
                 >
-                  <LaneDrawing graph={graph} selected={selected?.id ?? null} hovered={hovered} />
+                  <LaneDrawing
+                    graph={graph}
+                    selected={selected?.id ?? null}
+                    hovered={hovered}
+                    geometry={geometry}
+                  />
                   {graph.rows.map((row, r) => {
                     const t = row.timeline;
                     const isSelected = r === selectedRow && (selected ? true : row.kind === "main");
@@ -351,12 +401,24 @@ export function TrackerTimelines() {
                       row.kind === "abandon" ||
                       row.kind === "landing" ||
                       row.kind === "landed";
+                    const said = summarize(row, {
+                      data,
+                      name: (timeline) =>
+                        selectable && timeline?.id === t?.id ? (
+                          <span className="font-semibold text-ink">{timeline?.name}</span>
+                        ) : (
+                          name(timeline, row.kind === "head")
+                        ),
+                      commit: rowMeta(row),
+                    });
+                    const isOpen = said.expandable && expandedRows.has(row.key);
+                    const detailsId = `row-details-${r}`;
                     return (
                       <li
                         key={row.key}
                         data-kind={row.kind}
-                        className={`relative flex items-center gap-2 border-t border-line-soft pr-3 text-body-sm first:border-t-0 ${isSelected ? "bg-signal-wash" : "hover:bg-raised"}`}
-                        style={{ height: ROW_HEIGHT, paddingLeft: width + 4 }}
+                        className={`relative border-t border-line-soft text-body-sm first:border-t-0 ${isSelected ? "bg-signal-wash" : "hover:bg-raised"}`}
+                        style={{ minHeight: ROW_HEIGHT, paddingLeft: width + 8 }}
                         onMouseEnter={() => setHovered(t?.id ?? null)}
                       >
                         {selectable && (
@@ -368,66 +430,95 @@ export function TrackerTimelines() {
                             title={t ? `${t.name} (${t.slug})` : "main"}
                           />
                         )}
-                        <span
-                          className={`min-w-0 flex-1 truncate ${selectable ? "pointer-events-none" : ""}`}
+                        <div
+                          className="flex items-center gap-2 pr-3"
+                          style={{ minHeight: ROW_HEIGHT }}
                         >
-                          {row.kind === "main" ? (
-                            <>
-                              <span className="font-mono font-semibold text-ink">main</span>
-                              <span className="text-ink-faint"> where every timeline lands</span>
-                            </>
-                          ) : (
-                            <RowText
+                          <div
+                            className={`min-w-0 flex-1 py-1.5 ${selectable ? "pointer-events-none" : ""}`}
+                          >
+                            <div className="flex min-w-0 items-baseline gap-x-2">
+                              <span className="min-w-0 truncate">{said.title}</span>
+                              {said.chips && (
+                                <span className="flex shrink-0 flex-wrap gap-1 max-md:hidden">
+                                  {said.chips}
+                                </span>
+                              )}
+                              {said.detail && (
+                                <span className="min-w-0 flex-1 truncate text-ink-muted">
+                                  {said.detail}
+                                </span>
+                              )}
+                            </div>
+                            {said.by && (
+                              <div className="truncate text-micro text-ink-faint">{said.by}</div>
+                            )}
+                          </div>
+                          {said.expandable && (
+                            <button
+                              type="button"
+                              className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
+                              aria-expanded={isOpen}
+                              aria-controls={isOpen ? detailsId : undefined}
+                              aria-label={`Details: ${row.event?.kind === "checkpoint" ? `checkpoint #${row.event.number}` : row.event?.kind === "landing" ? `landing #${row.event.number}` : row.event?.kind === "approval" ? `approval of #${row.event.number}` : "event"}${t ? ` of ${t.name}` : ""}`}
+                              onClick={() => toggleRow(row.key)}
+                            >
+                              Details
+                              <CaretRightIcon
+                                aria-hidden
+                                className={`size-3.5 transition-transform motion-reduce:transition-none ${isOpen ? "rotate-90" : ""}`}
+                              />
+                            </button>
+                          )}
+                          {selectable && (
+                            <span
+                              className={`pointer-events-none shrink-0 text-micro ${isSelected ? "font-semibold text-signal" : "text-ink-muted"}`}
+                            >
+                              {isSelected ? "Selected" : "Select"}
+                            </span>
+                          )}
+                          {t && row.kind === "landed" && (
+                            <button
+                              type="button"
+                              className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
+                              aria-label={`Draw ${t.name}'s lane`}
+                              onClick={() => toggleExpanded(t.id)}
+                            >
+                              Show lane
+                            </button>
+                          )}
+                          {t && row.kind === "landing" && expanded.has(t.id) && (
+                            <button
+                              type="button"
+                              className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
+                              aria-label={`Fold ${t.name} onto main`}
+                              onClick={() => toggleExpanded(t.id)}
+                            >
+                              Fold
+                            </button>
+                          )}
+                          {row.at && (
+                            <time
+                              className="pointer-events-none shrink-0 text-micro text-ink-faint tabular-nums max-sm:hidden"
+                              dateTime={row.at}
+                              title={fullDate(row.at)}
+                            >
+                              {timeAgo(row.at)}
+                            </time>
+                          )}
+                        </div>
+                        {isOpen && (
+                          <div
+                            id={detailsId}
+                            className="relative z-10 mr-3 mb-3 min-w-0 rounded-md bg-sunken p-3"
+                          >
+                            <RowDetails
                               row={row}
-                              name={(timeline) =>
-                                selectable && timeline?.id === t?.id ? (
-                                  <span className="font-semibold text-ink">{timeline?.name}</span>
-                                ) : (
-                                  name(timeline, row.kind === "head")
-                                )
-                              }
-                              commit={rowMeta(row)}
+                              owner={owner}
+                              name={(id) => data.actors[id]?.name ?? "someone outside the tracker"}
+                              revision={data}
                             />
-                          )}
-                          {t?.experimental && row.kind === "head" && (
-                            <span className="mk-chip mk-chip--tag ml-2">Experimental</span>
-                          )}
-                        </span>
-                        {selectable && (
-                          <span
-                            className={`pointer-events-none shrink-0 text-micro ${isSelected ? "font-semibold text-signal" : "text-ink-muted"}`}
-                          >
-                            {isSelected ? "Selected" : "Select"}
-                          </span>
-                        )}
-                        {t && row.kind === "landed" && (
-                          <button
-                            type="button"
-                            className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
-                            aria-label={`Draw ${t.name}'s lane`}
-                            onClick={() => toggleExpanded(t.id)}
-                          >
-                            Show lane
-                          </button>
-                        )}
-                        {t && row.kind === "landing" && expanded.has(t.id) && (
-                          <button
-                            type="button"
-                            className="mk-btn mk-btn--ghost mk-btn--sm relative z-10 min-h-11 shrink-0"
-                            aria-label={`Fold ${t.name} onto main`}
-                            onClick={() => toggleExpanded(t.id)}
-                          >
-                            Fold
-                          </button>
-                        )}
-                        {row.at && (
-                          <time
-                            className="pointer-events-none shrink-0 text-micro text-ink-faint tabular-nums max-sm:hidden"
-                            dateTime={row.at}
-                            title={fullDate(row.at)}
-                          >
-                            {timeAgo(row.at)}
-                          </time>
+                          </div>
                         )}
                       </li>
                     );
@@ -588,47 +679,6 @@ function Legend({ shape, label }: { shape: ReactNode; label: string }) {
   );
 }
 
-function describe(
-  event: TimelineEvent,
-  self: Timeline,
-  byId: Map<string, Timeline>,
-  actor: (id: string) => string = (id) => id,
-): { verb: string; other: Timeline | null | undefined } {
-  const of = (id: string | null) => (id === null ? null : byId.get(id));
-  switch (event.kind) {
-    case "fork":
-      return event.timelineId === self.id
-        ? { verb: "Forked from", other: of(event.parentId) }
-        : { verb: "Forked into", other: of(event.timelineId) };
-    case "merge":
-      if (event.intoId === self.id) return { verb: "Merged in from", other: of(event.fromId) };
-      return { verb: event.intoId === null ? "Landed on" : "Merged into", other: of(event.intoId) };
-    case "abandon":
-      return { verb: "Abandoned", other: undefined };
-    case "approval": {
-      // Who answered, and whether by hand or by their approve-when-green setting (CORE-378).
-      const by = event.actorId ? actor(event.actorId) : null;
-      const how =
-        event.via === "auto-approve"
-          ? ` automatically by ${by ?? "someone"}\u2019s approve-when-green setting`
-          : event.outcome !== "superseded" && by
-            ? ` by ${by}`
-            : "";
-      return {
-        verb: `Checkpoint #${event.number} ${event.outcome}${how}${event.note && event.outcome !== "approved" ? ` — ${event.note}` : ""}`,
-        other: undefined,
-      };
-    }
-    case "landing":
-      return {
-        verb: `Checkpoint #${event.number}: ${event.outcome === "blocked_dependency" ? "blocked by dependency" : event.outcome.replaceAll("_", " ")}${event.note ? ` — ${event.note}` : ""}`,
-        other: undefined,
-      };
-    default:
-      return { verb: event.kind[0]!.toUpperCase() + event.kind.slice(1), other: undefined };
-  }
-}
-
 /**
  * The issues a timeline worked on or has done (CORE-74), linked into its view,
  * which stays readable after it ends. An abandoned timeline's show the status
@@ -709,43 +759,72 @@ function TimelineDetails({
       actor(id)
     );
   };
+  const own = data.events.filter((e) => e.timelineId === timeline.id);
+  // Numbered from 1, so the newest number counts them even when the oldest
+  // events weren't read (data.truncated).
+  const checkpointCount = own.reduce(
+    (n, e) => (e.kind === "checkpoint" ? Math.max(n, e.number) : n),
+    0,
+  );
+  // Forked from this one: drawn only when their lanes are, so named here.
+  const forks = data.timelines.filter((t) => t.parentId === timeline.id);
+  const lastApproval = own.findLast((e) => e.kind === "approval");
+  const lastLanding = own.findLast((e) => e.kind === "landing");
+  const issues = data.issues?.[timeline.id] ?? [];
+  const ended = timeline.status === "landed" || timeline.status === "abandoned";
+  const latestStep = feed.records[0];
   return (
     <>
-      <div className="flex items-start gap-2">
-        <h2 className="m-0 min-w-0 flex-1 text-title-lg [overflow-wrap:anywhere]">
-          {timeline.name}
-        </h2>
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <h2 className="m-0 min-w-0 text-title-lg [overflow-wrap:anywhere]">{timeline.name}</h2>
+        <span className="inline-flex items-center gap-1.5 text-body-sm text-ink-muted">
+          <StatusDot status={timeline.status} />
+          {STATUS_LABEL[timeline.status]}
+        </span>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-2">
         <Link
-          className="mk-btn mk-btn--ghost mk-btn--sm shrink-0 no-underline"
+          className="mk-btn mk-btn--primary mk-btn--sm no-underline"
           to={`/tracker/${encodeURIComponent(data.owner.slug)}/timelines/${encodeURIComponent(timeline.slug)}/story`}
         >
           Story
         </Link>
-        <Link className="mk-btn mk-btn--ghost mk-btn--sm shrink-0 no-underline" to={clear}>
+        <Link className="mk-btn mk-btn--sm no-underline" to={clear}>
           Back to main
         </Link>
       </div>
-      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-body-sm text-ink-muted">
-        <span className="mk-mono text-ink-faint">{timeline.slug}</span>
-        <span className="inline-flex items-center gap-1.5">
-          <StatusDot status={timeline.status} />
-          {STATUS_LABEL[timeline.status]}
-        </span>
-        <span>{timeline.policy === "auto" ? "Lands automatically" : "Lands after approval"}</span>
-        {timeline.experimental && <span className="mk-chip mk-chip--tag">Experimental</span>}
-      </div>
       <dl className="mt-3 mb-0 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-body-sm">
-        <dt className="text-ink-faint">Forked from</dt>
-        <dd className="m-0 min-w-0 truncate">{name(parent)}</dd>
-        <dt className="text-ink-faint">Started</dt>
-        <dd className="m-0" title={fullDate(timeline.createdAt)}>
-          {timeAgo(timeline.createdAt)} by {actorLink(timeline.startedBy)}
+        <dt className="text-ink-faint">Slug</dt>
+        <dd className="m-0 min-w-0 truncate font-mono text-ink-muted">{timeline.slug}</dd>
+        <dt className="text-ink-faint">Lands</dt>
+        <dd className="m-0">
+          {timeline.policy === "auto" ? "automatically" : "after approval"}
+          {timeline.experimental && <span className="mk-chip mk-chip--tag ml-2">Experimental</span>}
         </dd>
+        <dt className="text-ink-faint">Forked</dt>
+        <dd className="m-0 min-w-0" title={fullDate(timeline.createdAt)}>
+          from {name(parent)}, {timeAgo(timeline.createdAt)} by {actorLink(timeline.startedBy)}
+        </dd>
+        {forks.length > 0 && (
+          <>
+            <dt className="text-ink-faint">Forks</dt>
+            <dd className="m-0 min-w-0">
+              {forks.map((fork, i) => (
+                <Fragment key={fork.id}>
+                  {i > 0 && ", "}
+                  {name(fork)}
+                  {(fork.status === "landed" || fork.status === "abandoned") &&
+                    ` (${STATUS_LABEL[fork.status].toLowerCase()})`}
+                </Fragment>
+              ))}
+            </dd>
+          </>
+        )}
         <dt className="text-ink-faint">Accountable</dt>
         <dd className="m-0">{actorLink(timeline.accountableId)}</dd>
         {timeline.agentIds.length > 0 && (
           <>
-            <dt className="text-ink-faint">Agent participants</dt>
+            <dt className="text-ink-faint">Agents</dt>
             <dd className="m-0">{timeline.agentIds.map(actor).join(", ")}</dd>
           </>
         )}
@@ -758,134 +837,212 @@ function TimelineDetails({
           )}
         </dd>
       </dl>
-      <div className="mt-4">
-        <RecentAgents
-          endpoint={`/tracker/${encodeURIComponent(data.owner.slug)}/timelines/${encodeURIComponent(timeline.slug)}/presence`}
-        />
-      </div>
 
-      {timeline.status !== "landed" && timeline.status !== "abandoned" && (
-        <ExperimentalSwitch owner={data.owner.slug} timeline={timeline} onChange={onChange} />
+      <PanelSection
+        id="landing"
+        title="Landing"
+        hint={
+          lastLanding?.kind === "landing"
+            ? `#${lastLanding.number} · ${timeline.status === "landing" ? "landing now" : lastLanding.outcome.replaceAll("_", " ")}`
+            : timeline.policy === "auto"
+              ? "lands when checks pass"
+              : "lands after approval"
+        }
+        defaultOpen
+      >
+        <LandingPanel owner={data.owner.slug} timeline={timeline} onChange={onChange} />
+      </PanelSection>
+
+      <PanelSection
+        id="checkpoints"
+        title="Checkpoints"
+        hint={
+          checkpointCount
+            ? `${checkpointCount}${lastApproval?.kind === "approval" ? ` · #${lastApproval.number} ${lastApproval.outcome}` : ""}`
+            : data.truncated
+              ? undefined
+              : "none yet"
+        }
+        defaultOpen
+      >
+        <TimelineCheckpoints owner={data.owner.slug} timeline={timeline} actor={actor} />
+      </PanelSection>
+
+      {!ended && (
+        <PanelSection
+          id="live"
+          title="Live now"
+          hint={
+            latestStep ? `${latestStep.author.name} · ${timeAgo(latestStep.at)}` : "no steps yet"
+          }
+          defaultOpen
+        >
+          <LiveNow owner={data.owner.slug} timeline={timeline} feed={feed} />
+        </PanelSection>
       )}
 
-      <h3 className="mt-4 mb-1 text-body-sm font-semibold text-ink-muted">Code</h3>
-      <ul className="m-0 list-none p-0">
-        {timeline.repos.map((repo) => {
-          const gone = timeline.status === "abandoned" || timeline.status === "landed";
-          const last = lastCommits[repo.id];
-          return (
-            <li key={repo.id} className="flex flex-wrap items-baseline gap-x-3 py-0.5 text-body-sm">
-              <span className="min-w-0 truncate text-ink">
-                {repo.owner}/{repo.name}
-              </span>
-              {!repo.source && !gone ? (
-                <span className="text-ink-muted">Source migration required</span>
-              ) : gone ? (
-                last ? (
-                  <Link
-                    className={link}
-                    to={
-                      repo.source && repo.source.sourceId !== "canonical"
-                        ? treeUrl(repo.owner, repo.name, last, "", repo.source.sourceId)
-                        : commitPanelUrl(repo.owner, repo.name, last)
-                    }
-                  >
-                    last commit <span className="mk-mono">{shortOid(last)}</span>
-                  </Link>
-                ) : repo.source?.kind === "timeline-work" ? (
-                  <Link
-                    className={link}
-                    to={commitsUrl(repo.owner, repo.name, repo.bookmark, "", repo.source.sourceId)}
-                  >
-                    Archived progress history
-                  </Link>
-                ) : (
-                  <span className="text-ink-faint">Historical bookmark deleted</span>
-                )
-              ) : (
-                <>
-                  <Link
-                    className={link}
-                    to={treeUrl(repo.owner, repo.name, repo.bookmark, "", repo.source?.sourceId)}
-                  >
-                    <span className="mk-mono">{repo.bookmark}</span>
-                  </Link>
-                  <Link
-                    className={link}
-                    to={commitsUrl(repo.owner, repo.name, repo.bookmark, "", repo.source?.sourceId)}
-                  >
-                    Commits
-                  </Link>
-                </>
-              )}
-            </li>
-          );
-        })}
-      </ul>
+      {data.issues && (
+        <PanelSection
+          id="issues"
+          title="Issues"
+          hint={issues.length ? `${issues.length} · ${issues[0]!.key}` : "none"}
+          defaultOpen={issues.length > 0}
+        >
+          <TimelineIssues timeline={timeline} data={data} />
+        </PanelSection>
+      )}
 
-      <LiveNow owner={data.owner.slug} timeline={timeline} feed={feed} />
-
-      <TimelineCheckpoints owner={data.owner.slug} timeline={timeline} actor={actor} />
-
-      <LandingPanel owner={data.owner.slug} timeline={timeline} onChange={onChange} />
-
-      <TimelineIssues timeline={timeline} data={data} />
-
-      <h3 id="events" className="mt-4 mb-1 text-body-sm font-semibold text-ink-muted">
-        Events
-      </h3>
-      {events.length === 0 ? (
-        <p className="m-0 text-body-sm text-ink-faint">
-          {data.truncated ? "Older than the events drawn here." : "None recorded yet."}
-        </p>
-      ) : (
-        <ol className="m-0 max-h-72 list-none overflow-y-auto p-0">
-          {events.map((event) => {
-            const { verb, other } = describe(event, timeline, byId, actor);
-            const repo = eventRepo(event, [timeline, other]);
+      <PanelSection
+        id="code"
+        title="Code"
+        hint={`${timeline.repos.length} ${timeline.repos.length === 1 ? "repository" : "repositories"}`}
+      >
+        <ul className="m-0 list-none p-0">
+          {timeline.repos.map((repo) => {
+            const gone = timeline.status === "abandoned" || timeline.status === "landed";
+            const last = lastCommits[repo.id];
             return (
               <li
-                key={event.id}
-                className="flex items-baseline gap-2 border-t border-line-soft py-1.5 text-body-sm first:border-t-0"
+                key={repo.id}
+                className="flex flex-wrap items-baseline gap-x-3 py-0.5 text-body-sm"
               >
-                <span className="min-w-0 flex-1 truncate">
-                  <span className="text-ink-muted">{verb}</span>
-                  {other !== undefined && <> {name(other)}</>}
-                  {event.kind === "merge" && repo && (
-                    <>
-                      {" "}
-                      <Link
-                        className="mk-mono text-micro text-ink-faint no-underline hover:underline"
-                        to={
-                          repo.source && repo.source.sourceId !== "canonical"
-                            ? commitsUrl(
-                                repo.owner,
-                                repo.name,
-                                event.commit,
-                                "",
-                                repo.source.sourceId,
-                              )
-                            : commitPanelUrl(repo.owner, repo.name, event.commit)
-                        }
-                      >
-                        {shortOid(event.commit)}
-                      </Link>
-                    </>
-                  )}
+                <span className="min-w-0 truncate text-ink">
+                  {repo.owner}/{repo.name}
                 </span>
-                <time
-                  className="ml-auto shrink-0 text-micro text-ink-faint tabular-nums"
-                  dateTime={event.createdAt}
-                  title={`${fullDate(event.createdAt)}${event.actorId ? ` by ${actor(event.actorId)}` : ""}`}
-                >
-                  {timeAgo(event.createdAt)}
-                </time>
+                {!repo.source && !gone ? (
+                  <span className="text-ink-muted">Source migration required</span>
+                ) : gone ? (
+                  last ? (
+                    <Link
+                      className={link}
+                      to={
+                        repo.source && repo.source.sourceId !== "canonical"
+                          ? treeUrl(repo.owner, repo.name, last, "", repo.source.sourceId)
+                          : commitPanelUrl(repo.owner, repo.name, last)
+                      }
+                    >
+                      last commit <span className="mk-mono">{shortOid(last)}</span>
+                    </Link>
+                  ) : repo.source?.kind === "timeline-work" ? (
+                    <Link
+                      className={link}
+                      to={commitsUrl(
+                        repo.owner,
+                        repo.name,
+                        repo.bookmark,
+                        "",
+                        repo.source.sourceId,
+                      )}
+                    >
+                      Archived progress history
+                    </Link>
+                  ) : (
+                    <span className="text-ink-faint">Historical bookmark deleted</span>
+                  )
+                ) : (
+                  <>
+                    <Link
+                      className={link}
+                      to={treeUrl(repo.owner, repo.name, repo.bookmark, "", repo.source?.sourceId)}
+                    >
+                      <span className="mk-mono">{repo.bookmark}</span>
+                    </Link>
+                    <Link
+                      className={link}
+                      to={commitsUrl(
+                        repo.owner,
+                        repo.name,
+                        repo.bookmark,
+                        "",
+                        repo.source?.sourceId,
+                      )}
+                    >
+                      Commits
+                    </Link>
+                  </>
+                )}
               </li>
             );
           })}
-        </ol>
+        </ul>
+      </PanelSection>
+
+      <PanelSection id="agents" title="Agents seen" hint="in the last 10 minutes">
+        <RecentAgents
+          endpoint={`/tracker/${encodeURIComponent(data.owner.slug)}/timelines/${encodeURIComponent(timeline.slug)}/presence`}
+        />
+      </PanelSection>
+
+      {!ended && (
+        <PanelSection
+          id="settings"
+          title="Settings"
+          hint={timeline.experimental ? "experimental" : "not experimental"}
+        >
+          <ExperimentalSwitch owner={data.owner.slug} timeline={timeline} onChange={onChange} />
+        </PanelSection>
       )}
     </>
+  );
+}
+
+/**
+ * A part of a timeline's panel that opens and closes (CORE-402), with a line
+ * that still says something when closed. Its open state is remembered, per
+ * part, across timelines. Its children's own headings stay for screen readers;
+ * the summary is the visible one.
+ */
+function PanelSection({
+  id,
+  title,
+  hint,
+  defaultOpen = false,
+  children,
+}: {
+  id: string;
+  title: string;
+  hint?: string;
+  defaultOpen?: boolean;
+  children: ReactNode;
+}) {
+  const key = `gitmatrix:timeline-panel:${id}`;
+  const [open, setOpen] = useState(() => {
+    try {
+      const saved = localStorage.getItem(key);
+      return saved === null ? defaultOpen : saved === "1";
+    } catch {
+      return defaultOpen;
+    }
+  });
+  return (
+    <details
+      className="group mt-3 border-t border-line-soft pt-2"
+      open={open}
+      onToggle={(event) => {
+        const next = event.currentTarget.open;
+        if (next === open) return;
+        setOpen(next);
+        try {
+          localStorage.setItem(key, next ? "1" : "0");
+        } catch {
+          // Remembering is a convenience.
+        }
+      }}
+    >
+      <summary className="flex cursor-pointer list-none items-center gap-2 rounded py-1 text-body-sm font-semibold text-ink [&::-webkit-details-marker]:hidden">
+        <CaretRightIcon
+          aria-hidden
+          className="size-3.5 shrink-0 text-ink-faint transition-transform group-open:rotate-90 motion-reduce:transition-none"
+        />
+        {title}
+        {hint && (
+          <span className="ml-auto min-w-0 truncate text-micro font-normal text-ink-faint">
+            {hint}
+          </span>
+        )}
+      </summary>
+      <div className="pt-1 pb-1 pl-5.5 [&_h3]:sr-only [&>*>*:first-child]:mt-0">{children}</div>
+    </details>
   );
 }
 

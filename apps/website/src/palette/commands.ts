@@ -15,6 +15,8 @@ import type { ScopedRepo } from "./knowledge.ts";
 import { packagesPath } from "../lib/packages.ts";
 import { parseRef } from "../lib/resolveRefs.ts";
 import { repoSections } from "../lib/repoSections.ts";
+import { scopeOf, switchScope } from "../lib/timelineScope.ts";
+import type { Timeline } from "../../shared/timelines.ts";
 
 /**
  * A second step the palette narrows to, keeping it open: every place to go,
@@ -39,6 +41,12 @@ export interface PaletteContext {
   defaultTrackerId?: string | null;
   /** What's typed, for actions that take it as input (a proposed title). */
   query: string;
+  /** The page's query string, for switching its timeline in place. */
+  search?: string;
+  /** The page's fragment (a line, a heading), kept when switching. */
+  hash?: string;
+  /** The timelines of the tracker in view, to switch to (CORE-402); none until loaded. */
+  timelines?: Pick<Timeline, "slug" | "name" | "status" | "repos">[];
 }
 
 /** What an action can reach when it runs. */
@@ -349,12 +357,60 @@ const knowledge: CommandSource = ({ viewer, repo }) => {
       ];
 };
 
+/**
+ * Switch this page to a timeline, or back to main, in place (CORE-402): what
+ * the rail's switcher did before the rail opened the graph.
+ */
+const switchTimeline: CommandSource = (context) => {
+  const { viewer, timelines, repo } = context;
+  if (!viewer) return [];
+  const here = { pathname: context.pathname, search: context.search ?? "", hash: context.hash };
+  const current = scopeOf(here.search);
+  // On a code page, the timeline's own source for this repository (as the switcher did).
+  const refs = (slug: string | null) =>
+    repo
+      ? {
+          defaultBranch: repo.defaultBranch,
+          branches: repo.branches.map((branch) => branch.shortName),
+          source: repo.source,
+          targetSource: timelines
+            ?.find((timeline) => timeline.slug === slug)
+            ?.repos.find((r) => r.id === repo.id)?.source,
+        }
+      : null;
+  const commands: Command[] = (timelines ?? [])
+    .filter((timeline) => timeline.slug !== current)
+    .map((timeline) => {
+      const ended = timeline.status === "landed" || timeline.status === "abandoned";
+      return {
+        id: `timeline:${timeline.slug}`,
+        group: "actions",
+        title: `Switch to timeline ${timeline.name}`,
+        hint: `timeline/${timeline.slug}${ended ? ` · ${timeline.status}` : ""}`,
+        keywords: ["timeline", "switch", "scope", timeline.slug],
+        run: { kind: "navigate", to: switchScope(here, timeline.slug, refs(timeline.slug)) },
+      };
+    });
+  if (current)
+    commands.unshift({
+      id: "timeline:main",
+      group: "actions",
+      title: "Switch back to main",
+      hint: `leave timeline/${current}`,
+      keywords: ["timeline", "switch", "main", "scope"],
+      home: true,
+      run: { kind: "navigate", to: switchScope(here, null, refs(null)) },
+    });
+  return commands;
+};
+
 export const COMMAND_SOURCES: readonly CommandSource[] = [
   navigate,
   pages,
   repository,
   knowledge,
   createIssue,
+  switchTimeline,
   actions,
   find,
 ];

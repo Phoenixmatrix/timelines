@@ -38,11 +38,11 @@ import { PaletteProvider, SearchButton } from "../palette/Palette.tsx";
 import { useViewer } from "../lib/session.ts";
 import { packagesPath } from "../lib/packages.ts";
 import { applyTheme, storedTheme, type Theme } from "../lib/theme.ts";
-import { scopeOf } from "../lib/timelineScope.ts";
+import { scopeOf, scopeOwner } from "../lib/timelineScope.ts";
 import { needsYouBadge, needsYouLabel, useNeedsYou } from "../lib/needs-you.ts";
 import { Monogram } from "./Monogram.tsx";
-import { GitmatrixLogo } from "./GitmatrixLogo.tsx";
-import { TimelineBanner, TimelineSwitcher } from "./TimelineScope.tsx";
+import { GitmatrixLogo, TimelinesMark } from "./GitmatrixLogo.tsx";
+import { TimelineBanner } from "./TimelineScope.tsx";
 import { KeyboardShortcuts } from "./KeyboardShortcuts.tsx";
 import { Tip, Toasts } from "./ui.tsx";
 
@@ -232,6 +232,10 @@ export function AppShell() {
   // Timelines and release notes are their own places, though they live under a tracker.
   const trackerPage = tracker?.params["*"]?.split("/")[0];
   const onTimelines = trackerPage === "timelines" || location.pathname === "/timelines";
+  const scoped = scopeOf(location.search);
+  // The graph of the account this page belongs to (a tracker, a repository,
+  // a settings page's); else the default one.
+  const graphOwner = scopeOwner(location.pathname, location.search);
   const onReleaseNotes = trackerPage === "releases" || location.pathname === "/release-notes";
   const onHighlights = trackerPage === "highlights" || location.pathname === "/highlights";
   const owner =
@@ -303,7 +307,27 @@ export function AppShell() {
                 )}
               </Place>
             )}
-            {viewer && <TimelineSwitcher variant="rail" active={onTimelines} />}
+            {viewer && (
+              // The graph is the place (CORE-402); switching is on its rows, the
+              // banner's Switch and the command palette.
+              <Place
+                to={`${graphOwner ? `/tracker/${encodeURIComponent(graphOwner)}/timelines` : "/timelines"}${scoped ? `?tl=${encodeURIComponent(scoped)}` : ""}`}
+                label={scoped ? `Timelines (in ${scoped})` : "Timelines"}
+                active={onTimelines}
+              >
+                {() => (
+                  <span className="relative grid place-items-center">
+                    <TimelinesMark className="size-7" />
+                    {scoped && (
+                      <span
+                        className="absolute -top-1 -right-1 size-2.5 rounded-full bg-signal ring-2 ring-rail"
+                        aria-hidden
+                      />
+                    )}
+                  </span>
+                )}
+              </Place>
+            )}
             {viewer && (
               <Place
                 to={owner ? `/tracker/${encodeURIComponent(owner)}/releases` : "/release-notes"}

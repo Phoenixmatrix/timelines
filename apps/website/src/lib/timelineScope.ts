@@ -117,6 +117,7 @@ export function scopeLinks(router: DataRouter): void {
 /** First path segments that are the app's own places, not accounts. */
 const PLACES = new Set([
   "",
+  "-",
   "agent-work",
   "api",
   "cli-auth",
@@ -125,8 +126,10 @@ const PLACES = new Set([
   "needs-you",
   "new",
   "packages",
+  "release-notes",
   "settings",
   "signin",
+  "timelines",
   "tracker",
 ]);
 
