@@ -566,7 +566,7 @@ export class TrackerSpaceMigration {
         if (typeof object.repoId === "string")
           check(
             this.repositoryIds.includes(object.repoId),
-            "Repository outside approved Space mapping",
+            `Repository outside approved Space mapping (${this.ownerId}: ${object.repoId.slice(0, 64)})`,
           );
         if (Array.isArray(object.repos))
           for (const repo of object.repos) {
