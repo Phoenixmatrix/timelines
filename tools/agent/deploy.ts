@@ -1,5 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 
 // Deploy what changed on main since the deployed Worker versions, from CI.
 //
@@ -11,6 +14,13 @@ import { join, resolve } from "node:path";
 //
 // The public site (apps/site, CORE-115) is a Worker of its own, assets only,
 // on timelines.fward.dev: it deploys the same way, from its own tag.
+//
+// Each Worker that actually deploys is then recorded as a deployment of this
+// repository (CORE-351), as the job, with what ran: the provider version and
+// deployment `cf workers deployments list` reports, only once its `workers/tag`
+// is the deployed commit. Recording starts once both Workers have deployed and
+// has {@link RECORD_BUDGET_MS} in all; the Workers are live by then, so a
+// record that fails or runs out of time only warns.
 
 const WORKER = "gitmatrix";
 const root = resolve(import.meta.dirname, "../..");
@@ -19,6 +29,15 @@ const website = join(root, "apps/website");
 const cf = join(website, "node_modules/.bin/cf");
 const SITE_WORKER = "gitmatrix-site";
 const site = join(root, "apps/site");
+/**
+ * Where each Worker answers in production: `PRODUCTION_HOST` in
+ * apps/website/cloudflare.config.ts and apps/site/cloudflare.config.ts
+ * (deploy.test.ts keeps them in step).
+ */
+export const PRODUCTION_URLS: Record<string, string> = {
+  [WORKER]: "https://timelinesapp.fward.dev",
+  [SITE_WORKER]: "https://timelines.fward.dev",
+};
 
 /** Migration directories (relative to apps/website) and the D1 binding they target. */
 const MIGRATIONS = [
@@ -99,6 +118,8 @@ function stream(command: string, args: string[], cwd = root, env?: NodeJS.Proces
 
 interface Deployed {
   tag: string | null;
+  /** The version serving most traffic. */
+  versionId: string;
   image: string;
   databases: Record<string, string>;
 }
@@ -122,6 +143,7 @@ function deployed(): Deployed {
   const tag = version.annotations?.["workers/tag"] ?? null;
   return {
     tag,
+    versionId: current.version_id,
     image,
     databases: Object.fromEntries(
       version.bindings.filter((b) => b.type === "d1" && b.id).map((b) => [b.name, b.id!]),
@@ -140,7 +162,7 @@ function knownCommit(sha: string | null): sha is string {
 }
 
 /** `--plan` prints what would deploy and changes nothing, from any checkout. */
-function deploy(planOnly: boolean): void {
+async function deploy(planOnly: boolean): Promise<void> {
   if (!planOnly && process.env.GITMATRIX_BRANCH !== "main") {
     console.log(JSON.stringify({ event: "deploy.skipped", reason: "not-main" }));
     return;
@@ -148,12 +170,279 @@ function deploy(planOnly: boolean): void {
   // CI's checkout is shallow (the last 50 commits), and the deployed commit is
   // almost always among them; if it isn't, knownCommit fails and everything deploys.
   const head = run("git", ["rev-parse", "HEAD"]);
-  deployWebsite(head, planOnly);
-  deploySite(head, planOnly);
+  const workers: WorkerDeploy[] = [
+    { worker: WORKER, cwd: website, deploy: () => deployWebsite(head, planOnly) },
+    { worker: SITE_WORKER, cwd: site, deploy: () => deploySite(head, planOnly) },
+  ];
+  if (planOnly) {
+    for (const worker of workers) worker.deploy();
+    return;
+  }
+  let recorder: LiveRecorder | undefined;
+  try {
+    await deployAndRecord(workers, head, (signal) => (recorder = liveRecorder(signal)));
+  } finally {
+    await recorder?.close();
+  }
 }
 
-/** The commit the site's live version was built from; null when it has never deployed. */
-function siteTag(): string | null {
+/** How long recording may take in all, after both deploys, within the job's budget. */
+export const RECORD_BUDGET_MS = 3 * 60_000;
+/** How long one cf read or gm call may take while recording. */
+const RECORD_CALL_MS = 60_000;
+
+/** One Worker's deploy: whether a new version went out, and the one that served before. */
+export interface WorkerDeploy {
+  worker: string;
+  cwd: string;
+  deploy(): { deployed: boolean; previous: string | null };
+}
+
+/** What recording needs: cf's reads, gm, a clock and a log. */
+export interface Recorder {
+  /** `cf workers deployments list` for a Worker, parsed. */
+  deployments(worker: string, cwd: string): WorkerDeployments;
+  /** The version's `workers/tag` annotation: the commit it was built from. */
+  versionTag(worker: string, versionId: string, cwd: string): string | null;
+  /** `gm` with these arguments, as the CI job. */
+  gm(args: string[]): Promise<string>;
+  now(): string;
+  log(event: Record<string, unknown>): void;
+}
+
+export interface WorkerDeployments {
+  deployments: {
+    id?: string;
+    created_on?: string;
+    versions: { version_id: string; percentage: number }[];
+  }[];
+}
+
+/**
+ * Deploy every Worker in turn, then record each one that actually deployed,
+ * so recording can never hold up a deploy. A deploy that fails stops the
+ * rest, as before, after recording what did go out, and is then rethrown.
+ * Recording has `budgetMs` in all: past it, the recorder's signal aborts and
+ * each Worker not yet recorded is logged as skipped. Never fails on its own.
+ */
+export async function deployAndRecord(
+  workers: WorkerDeploy[],
+  head: string,
+  recorderFor: (signal: AbortSignal) => Recorder,
+  budgetMs = RECORD_BUDGET_MS,
+): Promise<void> {
+  const done: (WorkerDeploy & { previous: string | null })[] = [];
+  let failure: unknown;
+  for (const worker of workers) {
+    try {
+      const { deployed, previous } = worker.deploy();
+      if (deployed) done.push({ ...worker, previous });
+    } catch (error) {
+      failure = error;
+      break;
+    }
+  }
+  if (done.length) {
+    const controller = new AbortController();
+    const live = recorderFor(controller.signal);
+    // Past the budget each unrecorded Worker is reported once, here; what the
+    // abandoned attempt logs after that is dropped.
+    const recorder: Recorder = {
+      ...live,
+      log: (event) => {
+        if (!controller.signal.aborted) live.log(event);
+      },
+    };
+    const settled = new Set<string>();
+    let timer: NodeJS.Timeout | undefined;
+    const outOfTime = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), budgetMs);
+    });
+    const recording = (async () => {
+      for (const worker of done) {
+        if (controller.signal.aborted) return;
+        await recordDeployed(recorder, { ...worker, head });
+        settled.add(worker.worker);
+      }
+    })();
+    try {
+      if ((await Promise.race([recording, outOfTime])) === "timeout") {
+        controller.abort(new Error(`recording took longer than ${budgetMs / 1000}s`));
+        for (const worker of done)
+          if (!settled.has(worker.worker))
+            live.log({
+              event: "deploy.record.skipped",
+              worker: worker.worker,
+              head,
+              reason: `recording ran out of its ${budgetMs / 1000}s; the deploy stands`,
+            });
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (failure !== undefined) throw failure;
+}
+
+/**
+ * Record a Worker's new production deployment: its active version (most
+ * traffic) in the newest provider deployment, only when that version's tag is
+ * the deployed commit; the version that served before as `--replaces` when it
+ * differs. Never throws: the Worker is already live.
+ */
+export async function recordDeployed(
+  recorder: Recorder,
+  target: { worker: string; cwd: string; head: string; previous: string | null },
+): Promise<boolean> {
+  const { worker, cwd, head, previous } = target;
+  const warn = (reason: string, extra: Record<string, unknown> = {}) => {
+    recorder.log({ event: "deploy.record.skipped", worker, head, reason, ...extra });
+    return false;
+  };
+  const url = PRODUCTION_URLS[worker];
+  if (!url) return warn("no production URL is known for it");
+  try {
+    const newest = recorder.deployments(worker, cwd).deployments[0];
+    const active = newest?.versions.toSorted((a, b) => b.percentage - a.percentage)[0];
+    if (!newest?.id || !active) return warn("cf lists no deployment with an id and a version");
+    const tag = recorder.versionTag(worker, active.version_id, cwd);
+    if (tag !== head)
+      return warn("the active version wasn't built from the deployed commit", {
+        version: active.version_id,
+        tag,
+      });
+    const created = newest.created_on ? Date.parse(newest.created_on) : Number.NaN;
+    const at = Number.isNaN(created) ? recorder.now() : new Date(created).toISOString();
+    const args = [
+      "deploy",
+      "record",
+      "--url",
+      url,
+      "--environment",
+      "production",
+      "--commit",
+      head,
+      "--service",
+      worker,
+      "--provider-version",
+      active.version_id,
+      "--provider-deployment",
+      newest.id,
+      "--percentage",
+      String(active.percentage),
+      "--deployed-at",
+      at,
+      "--exposed-from",
+      at,
+      ...(previous && previous !== active.version_id ? ["--replaces", previous] : []),
+    ];
+    const output = await recorder.gm(args);
+    const id = /"id"\s*:\s*(\d+)/.exec(output)?.[1];
+    recorder.log({
+      event: "deploy.recorded",
+      worker,
+      version: active.version_id,
+      deployment: id ? Number(id) : null,
+    });
+    return true;
+  } catch (error) {
+    return warn("recording failed; the deploy stands", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/** What {@link liveRecorder} runs; tests replace it. */
+export interface RecorderDeps {
+  env: NodeJS.ProcessEnv;
+  /** cf's stdout, synchronously, within `timeout`. */
+  cf(args: string[], cwd: string, timeout: number): string;
+  /** A directory for gm, made on first use. */
+  tempDir(): Promise<string>;
+  removeDir(path: string): Promise<void>;
+  /** gm's binary, installed into `directory`: loaded only when first needed. */
+  install(env: NodeJS.ProcessEnv, directory: string): Promise<string>;
+  /** A binary's stdout. */
+  exec(
+    file: string,
+    args: string[],
+    options: { env: NodeJS.ProcessEnv; signal: AbortSignal; timeout: number },
+  ): Promise<string>;
+}
+
+export interface LiveRecorder extends Recorder {
+  /** Remove gm's directory, if one was made. */
+  close(): Promise<void>;
+}
+
+const liveDeps: RecorderDeps = {
+  env: process.env,
+  cf: (args, cwd, timeout) =>
+    execFileSync(cf, args, {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "inherit"],
+      timeout,
+    }).trim(),
+  tempDir: () => mkdtemp(join(tmpdir(), "gitmatrix-deploy-")),
+  removeDir: (path) => rm(path, { recursive: true, force: true }),
+  // Loaded lazily, so neither its import nor the install can fail a deploy.
+  install: async (env, directory) =>
+    (await import("../preview/preview.ts")).installGm(env, directory),
+  exec: async (file, args, options) =>
+    (await promisify(execFile)(file, args, { ...options, maxBuffer: 16 * 1024 * 1024 })).stdout,
+};
+
+/**
+ * The job's cf and gm for {@link recordDeployed}. gm is installed once, on
+ * first use (lazily loaded, into a directory made then), and runs as the job
+ * (GITMATRIX_TOKEN) without Cloudflare's credentials. Once `signal` aborts,
+ * nothing more starts and a running gm is stopped.
+ */
+export function liveRecorder(
+  signal: AbortSignal,
+  overrides: Partial<RecorderDeps> = {},
+): LiveRecorder {
+  const deps = { ...liveDeps, ...overrides };
+  const env = { ...deps.env };
+  delete env.CLOUDFLARE_API_TOKEN;
+  let directory: string | undefined;
+  let gm: Promise<string> | undefined;
+  const cfJson = <T>(args: string[], cwd: string): T => {
+    signal.throwIfAborted();
+    return JSON.parse(deps.cf(args, cwd, RECORD_CALL_MS)) as T;
+  };
+  return {
+    deployments: (worker, cwd) =>
+      cfJson(["workers", "deployments", "list", "--worker", worker], cwd),
+    versionTag: (worker, versionId, cwd) =>
+      cfJson<{ annotations?: Record<string, string> }>(
+        ["workers", "versions", "get", versionId, "--worker-id", worker],
+        cwd,
+      ).annotations?.["workers/tag"] ?? null,
+    gm: async (args) => {
+      signal.throwIfAborted();
+      gm ??= (async () => {
+        directory = await deps.tempDir();
+        return deps.install(deps.env, directory);
+      })();
+      const binary = await gm;
+      signal.throwIfAborted();
+      return deps.exec(binary, args, { env, signal, timeout: RECORD_CALL_MS });
+    },
+    now: () => new Date().toISOString(),
+    // A warning in the job's log, never a failure.
+    log: (event) =>
+      (String(event.event).endsWith("skipped") ? console.warn : console.log)(JSON.stringify(event)),
+    close: async () => {
+      if (directory) await deps.removeDir(directory);
+    },
+  };
+}
+
+/** The site's live version and the commit it was built from; null when it has never deployed. */
+function siteCurrent(): { tag: string | null; versionId: string } | null {
   let listed: string;
   try {
     listed = execFileSync(cf, ["workers", "deployments", "list", "--worker", SITE_WORKER], {
@@ -174,22 +463,27 @@ function siteTag(): string | null {
   const version = JSON.parse(
     run(cf, ["workers", "versions", "get", current.version_id, "--worker-id", SITE_WORKER], site),
   ) as { annotations?: Record<string, string> };
-  return version.annotations?.["workers/tag"] ?? null;
+  return { tag: version.annotations?.["workers/tag"] ?? null, versionId: current.version_id };
 }
 
 /** Build the site and deploy its assets-only Worker when anything it's built from changed. */
-function deploySite(head: string, planOnly: boolean): void {
-  const tag = siteTag();
+function deploySite(
+  head: string,
+  planOnly: boolean,
+): { deployed: boolean; previous: string | null } {
+  const current = siteCurrent();
+  const tag = current?.tag ?? null;
+  const previous = current?.versionId ?? null;
   if (tag === head) {
     console.log(JSON.stringify({ event: "deploy.site.skipped", reason: "already-deployed", head }));
-    return;
+    return { deployed: false, previous };
   }
   const base = knownCommit(tag) ? tag : null;
   const todo = base
     ? sitePlan(run("git", ["diff", "--name-only", base, head]).split("\n").filter(Boolean))
     : true;
   console.log(JSON.stringify({ event: "deploy.site.plan", base, head, site: todo }));
-  if (planOnly || !todo) return;
+  if (planOnly || !todo) return { deployed: false, previous };
   stream("vp", ["run", "--no-cache", "site#build"]);
   const subject = run("git", ["log", "-1", "--format=%s", head]);
   stream(
@@ -198,13 +492,18 @@ function deploySite(head: string, planOnly: boolean): void {
     site,
   );
   console.log(JSON.stringify({ event: "deploy.site", head }));
+  return { deployed: true, previous };
 }
 
-function deployWebsite(head: string, planOnly: boolean): void {
+function deployWebsite(
+  head: string,
+  planOnly: boolean,
+): { deployed: boolean; previous: string | null } {
   const current = deployed();
+  const previous = current.versionId;
   if (current.tag === head) {
     console.log(JSON.stringify({ event: "deploy.skipped", reason: "already-deployed", head }));
-    return;
+    return { deployed: false, previous };
   }
   // Without a known base, ship everything but the image, which only a Docker host can build.
   const base = knownCommit(current.tag) ? current.tag : null;
@@ -222,7 +521,7 @@ function deployWebsite(head: string, planOnly: boolean): void {
     }),
   );
 
-  if (planOnly) return;
+  if (planOnly) return { deployed: false, previous };
 
   for (const migration of todo.migrations) {
     const id = current.databases[migration.binding];
@@ -247,11 +546,12 @@ function deployWebsite(head: string, planOnly: boolean): void {
     );
     process.exitCode = 1;
   }
+  return { deployed: todo.worker, previous };
 }
 
 if (import.meta.main) {
   try {
-    deploy(process.argv.includes("--plan"));
+    await deploy(process.argv.includes("--plan"));
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

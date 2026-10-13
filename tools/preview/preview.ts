@@ -1175,6 +1175,9 @@ export async function waitForPreview(
   throw new Error(`The preview at ${origin} never came up (${last}).`);
 }
 
+/** How long downloading gm's binary may take; its lookup takes {@link GITMATRIX_TIMEOUT_MS}. */
+export const GM_DOWNLOAD_TIMEOUT_MS = 120_000;
+
 /**
  * gm for `gm deploy record` and the fixture pushes: GITMATRIX_PREVIEW_GM when
  * given, else the newest gm main published to the job owner's generic
@@ -1194,13 +1197,18 @@ export async function installGm(
     throw new Error("Installing gm needs a CI job's GITMATRIX_URL, GITMATRIX_OWNER and token.");
   const headers = { Authorization: `Bearer ${token}` };
   const owned = encodeURIComponent(owner);
-  const detail = await request(`${server}/api/packages/${owned}/generic/gm`, { headers });
+  const detail = await request(`${server}/api/packages/${owned}/generic/gm`, {
+    headers,
+    signal: AbortSignal.timeout(GITMATRIX_TIMEOUT_MS),
+  });
   if (!detail.ok) throw new Error(`Looking up gm returned HTTP ${detail.status}.`);
   const latest = ((await detail.json()) as { package?: { latest?: string } }).package?.latest;
   if (!latest || !/^[\w.-]+$/.test(latest)) throw new Error("gm has no published version.");
   const platform = `linux-${arch === "arm64" ? "aarch64" : "x86_64"}`;
   const response = await request(`${server}/generic/${owned}/gm/${latest}/${platform}/gm`, {
     headers,
+    // The body too: reading it ends with the same signal.
+    signal: AbortSignal.timeout(GM_DOWNLOAD_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`Downloading gm ${latest} returned HTTP ${response.status}.`);
   const expected = response.headers.get("x-checksum-sha256")?.toLowerCase();
