@@ -627,9 +627,16 @@ describe("forking", () => {
       .call("ben", "POST", "", { slug: "search", repos: ["orbit/app"] })
       .finally(() => (settled = true));
     const attempts = SOURCE_RETRY_DELAYS_MS.length + 1;
-    // Each wait is armed only after real I/O, so advance in steps that let it run.
-    for (let elapsed = 0; !settled && elapsed < 2 * attempts * FORK_TIMEOUT_MS; elapsed += 1_000) {
+    // Each wait is armed only after real I/O, so let that run until a timer is
+    // armed, and only then advance: under load the I/O takes many turns, and
+    // fake time spent with nothing armed would only use up the budget.
+    for (let elapsed = 0; !settled && elapsed < 2 * attempts * FORK_TIMEOUT_MS;) {
+      if (vi.getTimerCount() === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+        continue;
+      }
       await vi.advanceTimersByTimeAsync(1_000);
+      elapsed += 1_000;
       await new Promise((resolve) => setImmediate(resolve));
     }
     expect(settled, "The request answered instead of waiting on the fork").toBe(true);
