@@ -1,7 +1,8 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
 import type { AppEnv } from "../auth.ts";
-import { cutoverControl } from "../durable/cutover-admission.ts";
+import { cachedAdmission, cutoverControl } from "../durable/cutover-admission.ts";
+import type { Timing } from "../timing.ts";
 
 /** JSON content only; native Git/registry and person/credential APIs negotiate independently. */
 export function isContentApiPath(path: string): boolean {
@@ -10,9 +11,14 @@ export function isContentApiPath(path: string): boolean {
   );
 }
 
-/** The cutover fence as this request sees it. The instance gate, the content gate and
- * every Space page a response lists share one read of the singleton control object per
- * contract version instead of a round trip each. Scoped to one request, never cached.
+/**
+ * The cutover fence as this request sees it. The content gate and every Space page a
+ * response lists share one read per contract version, kept in this request's context
+ * only. The current contract comes from the isolate's verified admission, which the
+ * fetch gate primes (cachedAdmission): a positive contract-4 read stays true, since
+ * SpaceCutover.save refuses any write that would close it or move its epoch, and
+ * denials are never cached. Without it (a preview, or an expired entry) this request
+ * reads the control object itself. Other versions always read the control object.
  */
 export function requestAdmission(
   c: Context<AppEnv>,
@@ -22,7 +28,10 @@ export function requestAdmission(
   if (!admissions) c.set("admissions", (admissions = new Map()));
   let admission = admissions.get(contractVersion);
   if (!admission) {
-    admission = Promise.resolve(cutoverControl(c.env).admission(contractVersion));
+    admission =
+      contractVersion === CONTENT_CONTRACT_VERSION
+        ? cachedAdmission(c.env, c.get("timing") as Timing | undefined)
+        : Promise.resolve(cutoverControl(c.env).admission(contractVersion));
     admissions.set(contractVersion, admission);
   }
   return admission;

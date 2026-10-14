@@ -6,7 +6,14 @@ import {
   CUTOVER_TEST_CHECKPOINT,
 } from "../testing/space-cutover.ts";
 import { SpaceCutover } from "./control.ts";
-import { initializeFreshSpaceInstallation } from "./installation.ts";
+import { ensureInstallationAdmitted, initializeFreshSpaceInstallation } from "./installation.ts";
+import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
+import {
+  cachedAdmission,
+  forgetCachedAdmission,
+  peekCachedAdmission,
+} from "../durable/cutover-admission.ts";
+import { Timing } from "../timing.ts";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -278,6 +285,110 @@ describe("independent native v4 installation authority", () => {
     } finally {
       spy.mockRestore();
       f.close();
+    }
+  });
+});
+
+describe("absorbing native admission (CORE-439)", () => {
+  const active = () => createFreshSpaceTestEnvironment();
+  const entries = (timing: Timing) =>
+    timing
+      .header()
+      .split(", ")
+      .map((part) => part.split(";")[0] ?? "");
+
+  test("an active installation refuses every transition out of active", async () => {
+    const f = await active();
+    try {
+      const before = f.control.admission(4);
+      expect(before).toEqual({ allowed: true, epoch: 0 });
+      await expect(
+        f.control.prepare(cutoverTestManifest(), CUTOVER_TEST_CHECKPOINT, "human", "secret"),
+      ).rejects.toThrow("Forward migration");
+      // Advancing an active installation is a no-op that reports it.
+      const status = f.control.freshStatus();
+      expect(await f.control.advanceFreshInstallation(status)).toEqual(status);
+      const installation = Reflect.get(f.control, "fresh") as object;
+      const save = Reflect.get(installation, "save") as (state: unknown) => void;
+      const load = Reflect.get(installation, "load") as () => { phase: string };
+      expect(() =>
+        save.call(installation, { ...load.call(installation), phase: "opening" }),
+      ).toThrow("space_cutover_admission_absorbing");
+      const discard = Reflect.get(installation, "discard") as () => void;
+      expect(() => discard.call(installation)).toThrow("space_cutover_admission_absorbing");
+      expect(f.control.freshStatus()).toEqual(status);
+      expect(f.control.admission(4)).toEqual(before);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("the fetch gate checks once, primes the isolate's admission, then skips the check", async () => {
+    const f = await active();
+    try {
+      forgetCachedAdmission(f.env);
+      const state = vi.spyOn(f.control, "installationState");
+      const first = new Timing();
+      await ensureInstallationAdmitted(f.env, first);
+      expect(entries(first)).toEqual(
+        expect.arrayContaining(["install-status", "install-fresh-verify", "admission-cache-miss"]),
+      );
+      const second = new Timing();
+      await ensureInstallationAdmitted(f.env, second);
+      expect(entries(second).filter((name) => name.startsWith("install-"))).toEqual([]);
+      expect(entries(second)).toContain("admission-cache-hit");
+      expect(state).toHaveBeenCalledTimes(1);
+      expect(peekCachedAdmission(f.env)).toEqual({ allowed: true, epoch: 0 });
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a failed check is not remembered", async () => {
+    const f = await active();
+    try {
+      forgetCachedAdmission(f.env);
+      const verify = vi
+        .spyOn(f.control, "verifyFreshInstallation")
+        .mockRejectedValueOnce(new Error("fresh_install_authority_mismatch"));
+      await expect(ensureInstallationAdmitted(f.env)).rejects.toThrow("authority_mismatch");
+      expect(peekCachedAdmission(f.env)).toBeNull();
+      await ensureInstallationAdmitted(f.env);
+      expect(verify).toHaveBeenCalledTimes(2);
+      expect(peekCachedAdmission(f.env)).toEqual({ allowed: true, epoch: 0 });
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a plain admission read does not let a later gate skip verification", async () => {
+    const f = await active();
+    try {
+      forgetCachedAdmission(f.env);
+      expect(await cachedAdmission(f.env)).toEqual({ allowed: true, epoch: 0 });
+      expect(peekCachedAdmission(f.env)).toBeNull();
+      const verify = vi
+        .spyOn(f.control, "verifyFreshInstallation")
+        .mockRejectedValueOnce(new Error("fresh_install_authority_mismatch"));
+      await expect(ensureInstallationAdmitted(f.env)).rejects.toThrow("authority_mismatch");
+      expect(verify).toHaveBeenCalledTimes(1);
+      expect(peekCachedAdmission(f.env)).toBeNull();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a closed migration is never primed", async () => {
+    const env = {} as Env;
+    const journal = installCutoverTestControl(env);
+    try {
+      await journal.fence();
+      await expect(ensureInstallationAdmitted(env)).rejects.toThrow(
+        "space_cutover_requires_reviewed_migration",
+      );
+      expect(peekCachedAdmission(env)).toBeNull();
+    } finally {
+      journal.close();
     }
   });
 });

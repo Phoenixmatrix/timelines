@@ -197,6 +197,44 @@ export interface CutoverRun {
   >;
 }
 
+/**
+ * Whether content of `contractVersion` is admitted, given the cutover journal
+ * and the native installation. For contract 4 it only ever goes from closed to
+ * open, and its epoch is fixed once open (SpaceCutover.save and
+ * FreshInstallation enforce it): isolates cache a positive answer.
+ */
+export function admissionFor(
+  run: CutoverRun | null,
+  fresh: FreshInstallationStatus | null,
+  contractVersion: number,
+): { allowed: boolean; epoch: number } {
+  if (fresh)
+    return {
+      allowed: !run && fresh.phase === "active" && contractVersion === fresh.contractVersion,
+      epoch: fresh.epoch,
+    };
+  // Approval pins the opening transition, not subsequent compatible releases.
+  const allowed =
+    !run || run.phase === "prepared"
+      ? contractVersion === 3
+      : (run.phase === "active" &&
+          run.releaseApproval?.mode === "space" &&
+          !!run.writeAdmissionOpenedAt &&
+          contractVersion === 4) ||
+        (run.phase === "legacy-active" &&
+          run.releaseApproval?.mode === "legacy" &&
+          contractVersion === 3);
+  return { allowed, epoch: run?.migrationEpoch ?? 0 };
+}
+
+export interface InstallationState {
+  /** Content-contract admission (contract 4). */
+  admission: { allowed: boolean; epoch: number };
+  /** The cutover run's phase, or null when no migration was ever prepared. */
+  runPhase: CutoverPhase | null;
+  fresh: FreshInstallationStatus | null;
+}
+
 /** Independent Instance state: never included in a business-store restore. */
 export class SpaceCutover extends DurableObject<Env> {
   private running = false;
@@ -342,6 +380,23 @@ export class SpaceCutover extends DurableObject<Env> {
     );
   }
   private save(run: CutoverRun) {
+    // Contract-4 admission is absorbing: once open, nothing closes it or moves
+    // its epoch. Isolates admit requests from a cached verified positive read
+    // on that basis (durable/cutover-admission.ts), so a write that
+    // would break it is refused here rather than trusted to every caller.
+    //
+    // A future build that must close contract-4 admission cannot just relax
+    // this check. Isolates may keep admitting for one cache TTL after the
+    // close, and requests already admitted keep running without tickets. It
+    // must first make closing explicit (a stable flag and an admissionClosedAt
+    // journaled when it closes), and every step that relies on "nothing new
+    // is admitted" must wait until max(preparedAt, admissionClosedAt) + the
+    // cache TTL + clock skew before it proceeds.
+    const fresh = this.fresh.status();
+    const was = admissionFor(this.status(), fresh, CONTENT_CONTRACT_VERSION);
+    const next = admissionFor(run, fresh, CONTENT_CONTRACT_VERSION);
+    if (was.allowed && (!next.allowed || next.epoch !== was.epoch))
+      throw new Error("space_cutover_admission_absorbing");
     this.ctx.storage.transactionSync(() => {
       const value = JSON.stringify(run);
       this.ctx.storage.sql.exec(
@@ -505,25 +560,17 @@ export class SpaceCutover extends DurableObject<Env> {
     allowed: boolean;
     epoch: number;
   } {
+    return admissionFor(this.status(), this.fresh.status(), contractVersion);
+  }
+  /** Admission and where the installation stands, in one read; never the manifest. */
+  installationState(): InstallationState {
     const run = this.status();
     const fresh = this.fresh.status();
-    if (fresh)
-      return {
-        allowed: !run && fresh.phase === "active" && contractVersion === fresh.contractVersion,
-        epoch: fresh.epoch,
-      };
-    // Approval pins the opening transition, not subsequent compatible releases.
-    const allowed =
-      !run || run.phase === "prepared"
-        ? contractVersion === 3
-        : (run.phase === "active" &&
-            run.releaseApproval?.mode === "space" &&
-            !!run.writeAdmissionOpenedAt &&
-            contractVersion === 4) ||
-          (run.phase === "legacy-active" &&
-            run.releaseApproval?.mode === "legacy" &&
-            contractVersion === 3);
-    return { allowed, epoch: run?.migrationEpoch ?? 0 };
+    return {
+      admission: admissionFor(run, fresh, CONTENT_CONTRACT_VERSION),
+      runPhase: run?.phase ?? null,
+      fresh,
+    };
   }
   acquire(
     consumer: string,

@@ -25,7 +25,7 @@ import {
   wrapCutoverFetch,
   wrapCutoverBackground,
 } from "./durable/cutover-admission.ts";
-import { initializeFreshSpaceInstallation } from "./space-cutover/installation.ts";
+import { ensureInstallationAdmitted } from "./space-cutover/installation.ts";
 import { startTiming } from "./timing.ts";
 
 export default {
@@ -42,7 +42,7 @@ export default {
       return handler(request, env, ctx);
     if (!isPreview(env)) {
       try {
-        await initializeFreshSpaceInstallation(env, timing);
+        await ensureInstallationAdmitted(env, timing);
       } catch (error) {
         return Response.json(
           {

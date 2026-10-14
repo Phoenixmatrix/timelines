@@ -11,6 +11,8 @@ import { fakeRemotes } from "../testing/remote.ts";
 import { Tracker } from "../tracker/object.ts";
 import { timelines } from "../timelines/api.ts";
 import { gitHttp } from "./http.ts";
+import { invalidateRefs, RepoReader } from "../objects.ts";
+import { Timing } from "../timing.ts";
 import { FLUSH, pkt } from "./pktline.ts";
 
 vi.mock("cloudflare:workers", () => ({
@@ -356,6 +358,37 @@ test.each([
     expect(t.remote.refs.get(`refs/gitmatrix/progress/${next}`)).toBe(
       outcome === "accepted" ? next : undefined,
     );
+  } finally {
+    t.sqlite.close();
+  }
+});
+
+test("an accepted work push forgets cached refs before it answers", async () => {
+  // Push effects (afterPush, mocked here) reach their own invalidation only after
+  // several round trips, long after the client saw the push succeed.
+  const t = await fixture();
+  try {
+    const source = t.sqlite
+      .prepare(
+        "SELECT artifacts_name, artifacts_remote FROM timeline_work_sources WHERE source_id=?",
+      )
+      .get(t.sourceId) as { artifacts_name: string; artifacts_remote: string };
+    const work = async () =>
+      (
+        await new RepoReader(
+          t.env,
+          source.artifacts_name,
+          source.artifacts_remote,
+          new Timing(),
+          () => {},
+        ).refs()
+      ).branches.find((branch) => branch.name === ref)?.oid;
+    // Progress already retained for both tips: the push writes no ref of its own.
+    for (const oid of [old, next]) t.remote.refs.set(`refs/gitmatrix/progress/${oid}`, oid);
+    invalidateRefs(source.artifacts_name);
+    expect(await work()).toBe(old);
+    expect((await t.push(ok, 200, next, "report-status")).status).toBe(200);
+    expect(await work()).toBe(next);
   } finally {
     t.sqlite.close();
   }

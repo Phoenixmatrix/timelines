@@ -10,7 +10,8 @@ import type { TimelineActor, TimelineGraphData } from "../../shared/timeline-gra
 import { previewSettings } from "../deployments/settings.ts";
 import { accessible, authorize } from "../tracker/api.ts";
 import { TrackerError } from "../tracker/store.ts";
-import { trackerObject } from "../tracker/stub.ts";
+import { SUBSCRIBED_PROJECTS_BATCH, trackerObject } from "../tracker/stub.ts";
+import { chunk } from "../knowledge/util.ts";
 import { timedCall, timedEnv } from "../timing.ts";
 
 /** Events drawn at most: the newest, so a long history still loads quickly. */
@@ -45,17 +46,21 @@ timelineGraph.get("/", async (c) => {
 
   const repoIds = [...new Set(timelines.flatMap((timeline) => timeline.repos.map((r) => r.id)))];
   const projects: TimelineGraphData["projects"] = {};
-  await Promise.all(
-    repoIds.map(async (repoId) => {
-      const reply = await timedCall(timing, tracker.subscribedProjects(access, repoId));
-      if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
-      projects[repoId] = reply.value.map((project) => ({
+  // One Tracker call per batch of repositories, each authorized once.
+  const replies = await Promise.all(
+    chunk(repoIds, SUBSCRIBED_PROJECTS_BATCH).map((batch) =>
+      timedCall(timing, tracker.subscribedProjectsFor(access, batch)),
+    ),
+  );
+  for (const reply of replies) {
+    if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
+    for (const [repoId, subscribed] of Object.entries(reply.value))
+      projects[repoId] = subscribed.map((project) => ({
         id: project.projectId,
         slug: project.slug,
         name: project.name,
       }));
-    }),
-  );
+  }
   return c.json<TimelineGraphData>({
     space: access.space,
     trackers,
