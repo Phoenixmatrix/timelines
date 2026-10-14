@@ -69,7 +69,8 @@ function Submenu({
         <CaretRightIcon className="size-3.5 shrink-0 text-ink-faint" aria-hidden />
       </Menu.SubmenuTrigger>
       <Menu.Portal>
-        <Menu.Positioner sideOffset={8} alignOffset={-6} className="z-50">
+        {/* Fixed, like the account menu it opens from. */}
+        <Menu.Positioner sideOffset={8} alignOffset={-6} positionMethod="fixed" className="z-50">
           <Menu.Popup className={`mk-popup max-w-[min(20rem,calc(100vw-1rem))] ${popMotion}`}>
             {children}
           </Menu.Popup>
