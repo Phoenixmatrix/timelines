@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { SpaceMigrationContext, SpaceCheckpointPage } from "../../shared/space-cutover.ts";
 import type { SqlDatabase } from "./sql.ts";
 import type { TrackerScope } from "../../shared/tracker.ts";
-import { cutoverControl, withCutoverAdmission } from "../durable/cutover-admission.ts";
+import { cachedAdmission } from "../durable/cutover-admission.ts";
 
 /** Local scope is evidence, not authorization: callers must also hold current control admission. */
 export function assertTrackerSpaceOpen(sql: SqlDatabase): Readonly<TrackerScope> {
@@ -67,47 +67,50 @@ export function assertTrackerSpaceOpen(sql: SqlDatabase): Readonly<TrackerScope>
   });
 }
 
-/** Requires real controller authority, a real Space, and the exact physical named DO. */
+/**
+ * Requires real controller authority, a real Space, and the exact physical named DO.
+ * Callers hold admission (the Tracker's withSteadyAdmission, which primes the
+ * isolate's verified contract-4 admission); this reads that cache, which only
+ * ever opens, or the control object when it is cold.
+ */
 export async function initializeFreshTrackerSpace(
   env: Env,
   state: { id: DurableObjectId; storage: { sql: SqlDatabase; transactionSync<T>(fn: () => T): T } },
   spaceId: string,
 ): Promise<Readonly<TrackerScope>> {
-  return withCutoverAdmission(env, "tracker", async () => {
-    const admission = await cutoverControl(env).admission(4);
-    check(
-      admission.allowed && Number.isSafeInteger(admission.epoch) && admission.epoch >= 0,
-      "Independent controller denies fresh Tracker admission.",
-    );
-    check(
-      !!spaceId && env.TRACKER.idFromName(spaceId).equals(state.id),
-      "Fresh Tracker physical Space identity mismatch.",
-    );
-    const space = await env.DB.prepare("SELECT id FROM spaces WHERE id=? AND archived_at IS NULL")
-      .bind(spaceId)
-      .first<{ id: string }>();
-    check(space?.id === spaceId, "Fresh Tracker requires an active real Space.");
-    return state.storage.transactionSync(() => {
-      const sql = state.storage.sql;
-      const tables = sql
-        .exec<{ name: string }>(
-          "SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB '_cf_*' AND name NOT GLOB '__cf_*' AND name NOT GLOB '__miniflare_*' AND name <> 'sqlite_sequence'",
-        )
-        .toArray();
-      if (tables.length) {
-        const scope = assertTrackerSpaceOpen(sql);
-        check(
-          scope.spaceId === spaceId && scope.migrationEpoch === admission.epoch,
-          "Tracker Space/epoch differs from current controller admission.",
-        );
-        return scope;
-      }
-      sql.exec(
-        "CREATE TABLE space_migration_scope(singleton INTEGER PRIMARY KEY CHECK(singleton=1),contract_version INTEGER NOT NULL CHECK(contract_version=4),space_id TEXT NOT NULL,migration_epoch INTEGER NOT NULL CHECK(migration_epoch>=0))",
+  const admission = await cachedAdmission(env);
+  check(
+    admission.allowed && Number.isSafeInteger(admission.epoch) && admission.epoch >= 0,
+    "Independent controller denies fresh Tracker admission.",
+  );
+  check(
+    !!spaceId && env.TRACKER.idFromName(spaceId).equals(state.id),
+    "Fresh Tracker physical Space identity mismatch.",
+  );
+  const space = await env.DB.prepare("SELECT id FROM spaces WHERE id=? AND archived_at IS NULL")
+    .bind(spaceId)
+    .first<{ id: string }>();
+  check(space?.id === spaceId, "Fresh Tracker requires an active real Space.");
+  return state.storage.transactionSync(() => {
+    const sql = state.storage.sql;
+    const tables = sql
+      .exec<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB '_cf_*' AND name NOT GLOB '__cf_*' AND name NOT GLOB '__miniflare_*' AND name <> 'sqlite_sequence'",
+      )
+      .toArray();
+    if (tables.length) {
+      const scope = assertTrackerSpaceOpen(sql);
+      check(
+        scope.spaceId === spaceId && scope.migrationEpoch === admission.epoch,
+        "Tracker Space/epoch differs from current controller admission.",
       );
-      sql.exec("INSERT INTO space_migration_scope VALUES(1,4,?,?)", spaceId, admission.epoch);
-      return assertTrackerSpaceOpen(sql);
-    });
+      return scope;
+    }
+    sql.exec(
+      "CREATE TABLE space_migration_scope(singleton INTEGER PRIMARY KEY CHECK(singleton=1),contract_version INTEGER NOT NULL CHECK(contract_version=4),space_id TEXT NOT NULL,migration_epoch INTEGER NOT NULL CHECK(migration_epoch>=0))",
+    );
+    sql.exec("INSERT INTO space_migration_scope VALUES(1,4,?,?)", spaceId, admission.epoch);
+    return assertTrackerSpaceOpen(sql);
   });
 }
 

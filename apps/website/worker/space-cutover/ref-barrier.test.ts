@@ -13,6 +13,11 @@ import {
 } from "../testing/space-cutover.ts";
 import { spaceDigest } from "../../shared/space-cutover.ts";
 import { CUTOVER_CONSUMERS } from "./control.ts";
+import {
+  peekCachedAdmission,
+  verifiedAdmission,
+  wrapCutoverFetch,
+} from "../durable/cutover-admission.ts";
 import { advanceRefReconciliation, REF_SETTLE_MS, replayRefDivergence } from "./ref-barrier.ts";
 
 vi.mock("cloudflare:workers", () => ({
@@ -391,6 +396,67 @@ describe("Artifacts ref barrier instead of a provider drain", () => {
     ]);
     expect(status.pendingReplays).toBe(0);
     expect(afterReplayedPush).not.toHaveBeenCalled();
+  });
+
+  test("under cached open admission a POST in flight still holds its ticket and defers repair, while reads take none", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await fixture();
+    await advanceRefReconciliation(h.env, h.run.runId);
+    await migrateToReconciled(h);
+    approveSpaceRelease(h);
+    await advanceRefReconciliation(h.env, h.run.runId);
+    await h.control.openWriteAdmission(h.run.runId);
+    // The run's open admission, verified as the fetch gate verifies it, primes the isolate.
+    expect(await verifiedAdmission(h.env)).toBe(true);
+    expect(peekCachedAdmission(h.env)).not.toBeNull();
+
+    const pending: Promise<unknown>[] = [];
+    const ctx = { waitUntil: (work: Promise<unknown>) => void pending.push(work) };
+    const accepted = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const push = wrapCutoverFetch(
+      new Request("https://isolated.test/test-person/repo.git/git-receive-pack", {
+        method: "POST",
+      }),
+      h.env,
+      ctx as unknown as ExecutionContext,
+      async () => {
+        // Artifacts accepted the push; logging it is still to come.
+        h.remote.refs.set("refs/heads/main", oid(5));
+        accepted.resolve();
+        await finish.promise;
+        return new Response(null, { status: 200 });
+      },
+    );
+    await accepted.promise;
+    const read = await wrapCutoverFetch(
+      new Request("https://isolated.test/api/repos/test-person/repo"),
+      h.env,
+      ctx as unknown as ExecutionContext,
+      async () => Response.json(h.control.activeTickets().map((entry) => entry.consumer)),
+    );
+    expect(await read.json()).toEqual(["http-git-registry"]);
+    let status = await advanceRefReconciliation(h.env, h.run.runId, { actor: h.operator });
+    expect(status.stages["post-open"].latest).toMatchObject({ divergent: 0, deferred: 1 });
+    vi.setSystemTime(Date.now() + 2 * REF_SETTLE_MS);
+    status = await advanceRefReconciliation(h.env, h.run.runId, { actor: h.operator });
+    expect(status.stages["post-open"].latest).toMatchObject({ divergent: 0, deferred: 1 });
+    expect(h.logged()).toBe(oid(1));
+
+    await recordRefs(
+      h.env.DB,
+      "repo",
+      new Map([["refs/heads/main", oid(5)]]),
+      { id: "test-person" },
+      async () => ({ commits: [], truncated: false }),
+    );
+    finish.resolve();
+    await push;
+    await Promise.all(pending);
+    expect(h.control.activeTickets()).toEqual([]);
+    vi.setSystemTime(Date.now() + REF_SETTLE_MS);
+    status = await advanceRefReconciliation(h.env, h.run.runId, { actor: h.operator });
+    expect(status.stages["post-open"]).toMatchObject({ clean: true });
   });
 
   test("a replay that cannot run is blocked with its reason, never holding up the others or the pass; a Space writer re-triggers it", async () => {

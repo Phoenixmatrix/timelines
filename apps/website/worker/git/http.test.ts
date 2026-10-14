@@ -24,6 +24,8 @@ import { steps } from "../steps/api.ts";
 import { encodeCommit, hashObject, PackWriter } from "@gitmatrix/formats/git";
 import { writeRefs } from "../timelines/bookmarks.ts";
 import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
+import { invalidateRefs, RepoReader } from "../objects.ts";
+import { Timing } from "../timing.ts";
 import { captureWorkAuthority } from "../ci/admission.ts";
 
 vi.mock("cloudflare:workers", () => import("../testing/runtime.ts"));
@@ -749,6 +751,23 @@ test.each(["canonical", "staging"] as const)(
     }
   },
 );
+
+test("a canonical push forgets cached refs before its response ends", async () => {
+  // Push effects (afterPush, mocked here) reach their own invalidation only after
+  // several round trips, long after the client saw the push succeed.
+  const t = await setup();
+  const { secret } = await issueToken(t.env.DB, "orbit", "test", "write");
+  const refs = () =>
+    new RepoReader(t.env, "r-app", "https://artifacts.test/app.git", new Timing(), () => {}).refs();
+  invalidateRefs("r-app");
+  expect((await refs()).branches.map((branch) => branch.shortName)).not.toContain("pushed");
+  const pushed = await t.gitWith(secret, "push", t.proxyUrl, "HEAD:refs/heads/pushed");
+  expect(pushed.status, pushed.stderr).toBe(0);
+  expect(afterPush).toHaveBeenCalled();
+  expect((await refs()).branches).toContainEqual(
+    expect.objectContaining({ shortName: "pushed", oid: t.merge }),
+  );
+});
 
 test("native clones select current work HEAD and hide inherited canonical branches", async () => {
   const t = await setup();

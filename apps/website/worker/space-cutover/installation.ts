@@ -11,7 +11,11 @@ import {
   type CanonicalEmptyStoreState,
 } from "./canonical-schema.ts";
 import { fenceBusinessDatabase, migrationDatabase, type D1FenceContext } from "./storage-fence.ts";
-import { cutoverControl } from "../durable/cutover-admission.ts";
+import {
+  cutoverControl,
+  peekCachedAdmission,
+  primeCachedAdmission,
+} from "../durable/cutover-admission.ts";
 import { readWorkState, writeWorkState } from "./work-state.ts";
 import type { Timing } from "../timing.ts";
 
@@ -115,6 +119,9 @@ export class FreshInstallation {
     }
   }
   private save(state: Installation): void {
+    // An active installation's admission is absorbing (control.ts SpaceCutover.save).
+    if (this.status()?.phase === "active" && state.phase !== "active")
+      throw new Error("space_cutover_admission_absorbing");
     state.revision++;
     const { stores, ...metadata } = state;
     writeWorkState(this.storage, "native-installation", "stores", JSON.stringify(stores), () => {
@@ -123,6 +130,11 @@ export class FreshInstallation {
         JSON.stringify(metadata),
       );
     });
+  }
+  /** Forget an installation that never opened; an active one is never forgotten. */
+  private discard(): void {
+    if (this.status()?.phase === "active") throw new Error("space_cutover_admission_absorbing");
+    this.sql.exec("DELETE FROM fresh_installation WHERE id=1");
   }
   private context(state: Installation): D1FenceContext {
     return { runId: state.id, migrationEpoch: 0, manifestDigest: state.digest };
@@ -275,7 +287,7 @@ export class FreshInstallation {
           await this.open(state, db);
           if (state.store === 0) state.store = 1;
           else if (state.phase === "refusing") {
-            this.sql.exec("DELETE FROM fresh_installation WHERE id=1");
+            this.discard();
             throw new Error(state.refusal);
           } else state.phase = "active";
         }
@@ -286,7 +298,7 @@ export class FreshInstallation {
         if (state.phase !== phase || state.store !== storeIndex || budget === 7) this.save(state);
       }
     } catch (error) {
-      if (state.phase === "preflight") this.sql.exec("DELETE FROM fresh_installation WHERE id=1");
+      if (state.phase === "preflight") this.discard();
       else if (
         (state.phase === "recheck" && String(error).includes("fresh_install_nonempty:")) ||
         (state.phase === "rediscover" && String(error).includes("fresh_install_schema_changed"))
@@ -297,7 +309,7 @@ export class FreshInstallation {
         this.save(state);
         // Only read-only validation has occurred. Undo both owned fences before refusal.
         for (const database of databases) await this.open(state, database);
-        this.sql.exec("DELETE FROM fresh_installation WHERE id=1");
+        this.discard();
       }
       throw error;
     }
@@ -305,20 +317,29 @@ export class FreshInstallation {
   }
 }
 
-/** Called after ordinary migrations and before any fixture/business seed. */
+/**
+ * Called after ordinary migrations and before any fixture/business seed. Once
+ * contract-4 admission is open, primes this isolate's admission cache with the
+ * read that proved it: until that entry expires, requests skip this check.
+ */
 export async function initializeFreshSpaceInstallation(env: Env, timing?: Timing): Promise<void> {
   const control = cutoverControl(env);
   // Server-Timing: each round trip to the singleton, by name, when a request is timed.
   const rpc = <T>(name: string, work: Promise<T>) => (timing ? timing.measure(name, work) : work);
-  if (await rpc("install-status", control.status())) {
-    if (!(await rpc("install-admission", control.admission())).allowed)
-      throw new Error("space_cutover_requires_reviewed_migration");
+  const readAt = Date.now();
+  const state = await rpc("install-status", control.installationState());
+  if (state.runPhase !== null) {
+    if (!state.admission.allowed) throw new Error("space_cutover_requires_reviewed_migration");
+    primeCachedAdmission(env, state.admission, readAt);
     return;
   }
+  let status = state.fresh;
   for (let call = 0; call < 4096; call++) {
-    const status = await rpc("install-fresh-status", control.freshStatus());
+    if (call) status = await rpc("install-fresh-status", control.freshStatus());
     if (status?.phase === "active") {
       await rpc("install-fresh-verify", control.verifyFreshInstallation());
+      // Only a read that saw the installation active proves admission open.
+      if (!call) primeCachedAdmission(env, state.admission, readAt);
       return;
     }
     try {
@@ -328,4 +349,21 @@ export async function initializeFreshSpaceInstallation(env: Env, timing?: Timing
     }
   }
   throw new Error("fresh_install_progress_limit: retry initialization to resume durable progress");
+}
+
+/**
+ * The Worker's fetch gate: an isolate holding an unexpired verified positive
+ * admission skips the installation check (open contract-4 admission never
+ * closes); otherwise it runs, and its success primes that read. Only verified
+ * reads prime it (this check, or durable/cutover-admission.ts
+ * verifiedAdmission): a plain admission read never lets a later request skip
+ * verification. Failures are not kept.
+ */
+export async function ensureInstallationAdmitted(env: Env, timing?: Timing): Promise<void> {
+  if (peekCachedAdmission(env)) {
+    timing?.count("admission-cache-hit");
+    return;
+  }
+  timing?.count("admission-cache-miss");
+  await initializeFreshSpaceInstallation(env, timing);
 }

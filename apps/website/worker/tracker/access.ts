@@ -9,8 +9,8 @@ import { TrackerError } from "./store.ts";
 import { db as gitmatrixDb } from "../schema.ts";
 import type { TrackerAgent, TrackerIdentity } from "../../shared/tracker.ts";
 import type { Access } from "./store.ts";
-import { cutoverControl } from "../durable/cutover-admission.ts";
-import { timedCall, type Timing } from "../timing.ts";
+import { cachedAdmission } from "../durable/cutover-admission.ts";
+import type { Timing } from "../timing.ts";
 
 export async function accessFor(
   env: Env,
@@ -34,7 +34,7 @@ export async function accessFor(
   // no current grant (403), then closed admission (409), then the member reads.
   const [grant, admission, listed] = await Promise.allSettled([
     resolveSpaceAccess(d1, actor, space.id),
-    timedCall(timing, cutoverControl(env).admission(4)),
+    cachedAdmission(env, timing),
     includeMembers ? membersOf(d1, space.id) : Promise.resolve([]),
   ]);
   const current = settledValue(grant);

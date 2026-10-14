@@ -6,6 +6,7 @@ import type { SessionResponse } from "../../shared/api.ts";
 import type { OrganizationPage, SpacePage } from "../../shared/spaces.ts";
 import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
+import { forgetCachedAdmission } from "../durable/cutover-admission.ts";
 import { organizations } from "./organizations.ts";
 import { spaces } from "./spaces.ts";
 import { contentContractGate } from "./content-contract.ts";
@@ -64,6 +65,7 @@ async function setup() {
   );
   const admissions = vi.spyOn(fresh.control, "admission");
   return {
+    env,
     sqlite,
     statements,
     admissions,
@@ -215,6 +217,8 @@ describe("Organization directory and explicit Space grant APIs", () => {
     const read = async (path: string) => {
       t.statements.length = 0;
       t.admissions.mockClear();
+      // A cold isolate: the one admission read this response makes is a real one.
+      forgetCachedAdmission(t.env);
       const response = await t.request(path);
       expect(response.status).toBe(200);
       return {

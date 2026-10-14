@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
-import { cutoverControl } from "../durable/cutover-admission.ts";
+import { cutoverControl, forgetCachedAdmission } from "../durable/cutover-admission.ts";
 import { CONTENT_CONTRACT_HEADER } from "../../shared/spaces.ts";
 import type { Access } from "./store.ts";
 import type { CompletedWorkList } from "../../shared/tracker.ts";
@@ -194,8 +194,8 @@ describe("tracker browser data", () => {
     expect(getByName).not.toHaveBeenCalled();
   });
 
-  test("uses the current control epoch and current grant authorization version on every request", async () => {
-    const { call, snapshot, sqlite, control } = await setup();
+  test("re-resolves the grant on every request and reads the control epoch a cold isolate sees", async () => {
+    const { call, snapshot, sqlite, control, env } = await setup();
     expect((await call("/tracker/orbit/snapshot")).status).toBe(200);
     const first = snapshot.mock.calls[0]![0];
     expect(first).toMatchObject({
@@ -215,16 +215,23 @@ describe("tracker browser data", () => {
       epoch: 8,
       [Symbol.dispose]() {},
     });
+    // Open admission is absorbing: this isolate's positive read stands, the grant does not.
     expect((await call("/tracker/orbit/snapshot")).status).toBe(200);
     const second = snapshot.mock.calls[1]![0];
-    expect(second).toMatchObject({ migrationEpoch: 8, canAdmin: true });
+    expect(second).toMatchObject({ migrationEpoch: 0, canAdmin: true });
     expect(second.authorizationVersion).toBeGreaterThan(first.authorizationVersion);
+    expect(admission).not.toHaveBeenCalled();
+    // An isolate without that read asks the control object.
+    forgetCachedAdmission(env);
+    expect((await call("/tracker/orbit/snapshot")).status).toBe(200);
+    expect(snapshot.mock.calls[2]![0]).toMatchObject({ migrationEpoch: 8, canAdmin: true });
     expect(admission).toHaveBeenCalledWith(4);
     admission.mockResolvedValue({ allowed: false, epoch: 8, [Symbol.dispose]() {} });
+    forgetCachedAdmission(env);
     const denied = await call("/tracker/orbit/snapshot");
     expect(denied.status).toBe(409);
     expect(await denied.json()).toMatchObject({ code: "migration_epoch_mismatch" });
-    expect(snapshot).toHaveBeenCalledTimes(2);
+    expect(snapshot).toHaveBeenCalledTimes(3);
   });
 
   test.each([
@@ -652,6 +659,8 @@ describe("Needs you summary (CORE-301)", () => {
       epoch: 0,
       [Symbol.dispose]() {},
     });
+    // Open admission never closes in protocol; model an isolate that never saw it open.
+    forgetCachedAdmission(closed.env);
     const denied = await closed.call("/requests/summary");
     expect(denied.status).toBe(409);
     expect(await denied.json()).toMatchObject({ code: "migration_epoch_mismatch" });

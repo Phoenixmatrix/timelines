@@ -214,10 +214,13 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     }
     if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok) {
       const finishPush = async () => {
+        // The ref transaction is over, and the client has not seen it end: a
+        // read it makes next must not get this isolate's cached refs. Push
+        // effects invalidate again, but only after their own round trips.
+        invalidateRefs(repo.artifacts_name);
         if (!(await sourceOnly))
           afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
         else {
-          invalidateRefs(repo.artifacts_name);
           // Staging skips CI/AI/preview work, not provenance. Finish this bounded
           // metadata read before the CLI uploads context for the staged commits.
           await recordPush(c.env, repo, actor).catch((error) =>
@@ -390,6 +393,9 @@ async function workPush(
     // Consume the response before checking durable state. A 200 is not a Git acknowledgement.
     const response = respond(upstream);
     const bytes = await protocolBytes(response);
+    // Whatever the outcome, the provider is done: the pusher's next read must
+    // not get this isolate's cached refs (push effects invalidate only later).
+    invalidateRefs(repo.artifacts_name);
     if (!response.ok) throw new Error("Ambiguous source push HTTP outcome.");
     const report = receivePackReport(bytes, request);
     const refs = await lsRefs(c.env, repo.artifacts_name, repo.artifacts_remote, [

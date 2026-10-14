@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vite-plus/test";
 import { FakeD1 } from "@gitmatrix/testing";
-import { SpaceCutover, CUTOVER_CONSUMERS, type CutoverRun } from "./control.ts";
+import { SpaceCutover, CUTOVER_CONSUMERS, admissionFor, type CutoverRun } from "./control.ts";
 import {
   cleanRefPass,
   installCutoverTestControl,
@@ -309,5 +309,79 @@ describe("independent durable cutover control journal", () => {
     expect(() => control.approve(run.runId, run.manifestDigest, run.checkpoint, "human")).toThrow();
     f.close();
     trackerState.db.close();
+  });
+});
+
+describe("absorbing contract-4 admission (CORE-439)", () => {
+  async function journalAtActive(f: ReturnType<typeof fixture>) {
+    const run = await journalAtReconciled(f);
+    const checkpoint = "b".repeat(40);
+    const versionId = "reviewed-v4";
+    f.control.approveRelease(run.runId, checkpoint, versionId, "space", "human");
+    Reflect.set(f.env, "CUTOVER_DEPLOYMENT_CHECKPOINT", checkpoint);
+    Reflect.set(f.env, "CI_VERSION", { id: versionId, tag: checkpoint });
+    for (const consumer of CUTOVER_CONSUMERS)
+      f.control.acknowledgeRuntime(run.runId, consumer, 4, { versionId, checkpoint });
+    await f.control.openWriteAdmission(run.runId);
+    return run;
+  }
+
+  test("an open run refuses every transition that would close admission or move its epoch", async () => {
+    const f = fixture();
+    const run = await journalAtActive(f);
+    const open = f.control.admission(4);
+    expect(open).toEqual({ allowed: true, epoch: run.migrationEpoch });
+    expect(admissionFor(f.control.status(), null, 4)).toEqual(open);
+    const id = run.runId;
+    const stores = Object.keys(f.control.status()!.stores);
+    const human = { id: "human", slug: "human", displayName: "Human", isSiteAdmin: true };
+    const attempts: [string, () => unknown][] = [
+      ["prepare", () => f.control.prepare(cutoverTestManifest(), run.checkpoint, "human", "x")],
+      ["approve", () => f.control.approve(id, run.manifestDigest, run.checkpoint, "human")],
+      ["fence", () => f.control.fence(id)],
+      ["fenceDatabases", () => f.control.fenceDatabases(id)],
+      ["recover", () => f.control.recover(id)],
+      ["establishRecoveryFences", () => f.control.establishRecoveryFences(id)],
+      ["finishRestore", () => f.control.finishRestore(id, stores)],
+      ["beginMigration", () => f.control.beginMigration(id)],
+      ["complete", () => f.control.complete(id, stores)],
+      ["recordStore", () => f.control.recordStore(id, "application", "restored")],
+      ["approveRelease", () => f.control.approveRelease(id, "c".repeat(40), "v", "space", "h")],
+      ["openWriteAdmission", () => f.control.openWriteAdmission(id)],
+      ["advance", () => f.control.advance(id, human)],
+      ["advanceFreshInstallation", () => f.control.advanceFreshInstallation(null)],
+    ];
+    for (const [name, attempt] of attempts) {
+      const outcome = await Promise.resolve()
+        .then(attempt)
+        .then(
+          () => "returned",
+          () => "refused",
+        );
+      expect([name, outcome]).toEqual([name, "refused"]);
+      expect(f.control.admission(4)).toEqual(open);
+    }
+    expect(f.control.status()?.phase).toBe("active");
+    f.close();
+  });
+
+  test("the journal itself refuses a write that closes open admission or moves its epoch", async () => {
+    const f = fixture();
+    const run = await journalAtActive(f);
+    const save = (value: CutoverRun) =>
+      (Reflect.get(f.control, "save") as (run: CutoverRun) => void).call(f.control, value);
+    const current = f.control.status()!;
+    for (const changed of [
+      { ...current, phase: "fenced" as const },
+      { ...current, migrationEpoch: current.migrationEpoch + 1 },
+      { ...current, writeAdmissionOpenedAt: null },
+      { ...current, releaseApproval: { ...current.releaseApproval!, mode: "legacy" as const } },
+    ])
+      expect(() => save(changed)).toThrow("space_cutover_admission_absorbing");
+    // A write that keeps admission open at the same epoch is still journaled.
+    save({ ...current, drainBlockers: [] });
+    expect(f.control.status()?.drainBlockers).toEqual([]);
+    expect(f.control.admission(4)).toEqual({ allowed: true, epoch: run.migrationEpoch });
+    f.close();
   });
 });

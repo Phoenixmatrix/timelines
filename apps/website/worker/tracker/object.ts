@@ -19,9 +19,10 @@ import type {
 } from "../../shared/space-cutover.ts";
 import { DurableObject } from "cloudflare:workers";
 import {
+  cachedAdmission,
   cutoverControl,
-  withCutoverAdmission,
   withCutoverAlarmAdmission,
+  withSteadyAdmission,
 } from "../durable/cutover-admission.ts";
 import { reportCutoverRuntime } from "../durable/cutover-runtime.ts";
 import { forgetUpstreamTokens, isArtifactsError } from "../artifacts.ts";
@@ -37,7 +38,7 @@ import {
   type SourcePush,
   type SourcePushRecovery,
 } from "./timelines.ts";
-import type { MutationRequest } from "../../shared/tracker.ts";
+import type { MutationRequest, TrackerScope } from "../../shared/tracker.ts";
 import type { ChronicleOptions } from "./chronicle.ts";
 import { runChronicleFixture, type ChronicleFixtureOptions } from "./chronicle-fixture.ts";
 import type { QueueFailure } from "../../shared/merge-queue.ts";
@@ -95,6 +96,38 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     return this.#store.timelines;
   }
   private sourceInitializers = new Map<string, Promise<InitializedWorkSource>>();
+  /** The scope this instance last initialized or confirmed, for #initialized. */
+  #scope: Readonly<TrackerScope> | undefined;
+  /**
+   * initializeFreshTrackerSpace for an authorized call (reply with a Space):
+   * once this instance has confirmed its scope under the current admission
+   * epoch, it skips the controller's Space read and the schema scan. Every
+   * such call then re-resolves the caller's grant (#authorize, accessFor),
+   * whose query admits only a Space that isn't archived. Retention and other
+   * unauthorized callers keep the full check.
+   */
+  async #initialized(spaceId: string): Promise<Readonly<TrackerScope>> {
+    const known = this.#scope;
+    if (known?.spaceId === spaceId) {
+      const admission = await cachedAdmission(this.env);
+      try {
+        const scope = assertTrackerSpaceOpen(this.ctx.storage.sql);
+        if (
+          admission.allowed &&
+          known.migrationEpoch === admission.epoch &&
+          scope.spaceId === spaceId &&
+          scope.migrationEpoch === admission.epoch
+        )
+          return scope;
+      } catch {
+        // Purged or never converted: initialize from scratch below.
+      }
+      this.#scope = undefined;
+    }
+    const scope = await initializeFreshTrackerSpace(this.env, this.ctx, spaceId);
+    this.#scope = scope;
+    return scope;
+  }
   private transaction: <T>(fn: () => T) => T;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -328,12 +361,12 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     });
   }
   private reply<T>(fn: () => T | Promise<T>, spaceId?: string): Promise<TrackerReply<T>> {
-    return withCutoverAdmission(this.env, "tracker", async (): Promise<TrackerReply<T>> => {
+    return withSteadyAdmission(this.env, "tracker", async (): Promise<TrackerReply<T>> => {
       try {
         if (spaceId) {
           if (!this.env.TRACKER.idFromName(spaceId).equals(this.ctx.id))
             throw new TrackerError(403, "forbidden", "Tracker physical Space identity mismatch.");
-          await initializeFreshTrackerSpace(this.env, this.ctx, spaceId);
+          await this.#initialized(spaceId);
         }
         assertTrackerSpaceOpen(this.ctx.storage.sql);
         return { ok: true, value: await fn() };
@@ -557,7 +590,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
    * made of real mutations, applied in time order under a controlled clock.
    */
   chronicleFixture(people: Access[], agents: Access[], options: ChronicleFixtureOptions) {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       if (Reflect.get(this.env, "DEV_MODE") !== "true")
         throw new Error("The Chronicle fixture is for development only.");
       if (!people.length)
@@ -801,7 +834,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
         isSiteAdmin: false,
         credential: authority.credential,
       };
-      const admission = await cutoverControl(this.env).admission(4);
+      const admission = await cachedAdmission(this.env);
       let why: string | null = null;
       if (authority.personId !== input.personId || authority.spaceId !== input.spaceId)
         why = "its consent doesn't match this person";
@@ -855,7 +888,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     );
   }
   async cancelReservedCreation(access: Access, slug: string) {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       const claim = await this.#authorized(
         access,
         (current) => this.#timelines.cancelReservedCreation(current, slug),
@@ -930,7 +963,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     repo: RepoRow,
     input: WorkSourceInput,
   ): Promise<TrackerReply<InitializedWorkSource>> {
-    return withCutoverAdmission(
+    return withSteadyAdmission(
       this.env,
       "tracker",
       async (): Promise<TrackerReply<InitializedWorkSource>> => {
@@ -968,7 +1001,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     );
   }
   async reconcileDeletedSource(sourceId: string) {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       let row = this.#timelines.getWorkSource(sourceId);
       const pending = this.sourceInitializers.get(`${row.timeline_id}:${row.repo_id}`);
       if (pending) {
@@ -1053,7 +1086,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     state: WorkSourceRow["state"],
     remote?: string,
   ) {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       const result = await this.reply(() =>
         this.#timelines.transitionWorkSource(sourceId, version, state, remote),
       );
@@ -1085,7 +1118,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
    * returns Tracker content to the pusher.
    */
   async beginSourcePush(input: SourcePush) {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       const authority = input.authority;
       const admitted = await this.reply(async () => {
         if (!authority) throw new TrackerError(403, "forbidden", "Source push authority mismatch.");
@@ -1138,7 +1171,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     outcome: "accepted" | "rejected" | "ambiguous",
   ) {
     const operationId = scope.operationId;
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       await this.#assertRepoScope(scope.spaceId, scope.repoId);
       const stored = this.#timelines.sourcePush(operationId, scope.repoId, scope.sourceId);
       if (
@@ -1253,7 +1286,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     outcome: "accepted" | "rejected",
     head: string,
   ) {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       const settled = await this.reply(() =>
         this.#timelines.settleSourcePushRecovery(operationId, outcome, head),
       );
@@ -1283,7 +1316,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     );
   }
   async rejectUnprojectedSourcePush(operationId: string, repoId: string, sourceId: string) {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       const operation = this.#timelines.sourcePush(operationId, repoId, sourceId);
       if (operation.state !== "projecting") return { ok: true as const, value: false };
       const result = await this.finishSourcePushForSettlement(
@@ -1574,7 +1607,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     cursor: string | null,
     limit: number,
   ): Promise<TrackerSelection> {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       await initializeFreshTrackerSpace(this.env, this.ctx, spaceId);
       assertTrackerSpaceOpen(this.ctx.storage.sql);
       void this.#store;
@@ -1590,7 +1623,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     now: string,
     items: string[],
   ): Promise<TrackerRemoval> {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       await initializeFreshTrackerSpace(this.env, this.ctx, spaceId);
       assertTrackerSpaceOpen(this.ctx.storage.sql);
       void this.#store;
@@ -1614,21 +1647,22 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
     if (nonempty) assertTrackerSpaceOpen(this.ctx.storage.sql);
   }
   async purge(reason: string): Promise<PurgeReport> {
-    const report = await withCutoverAdmission(this.env, "tracker", async () => {
+    const report = await withSteadyAdmission(this.env, "tracker", async () => {
       this.assertLifecycleScope();
+      this.#scope = undefined;
       return clearStorage(this.ctx.storage, reason);
     });
     resetSoon(this.ctx);
     return report;
   }
   retire(reason: string, name: string, delayMs?: number): Promise<void> {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       this.assertLifecycleScope();
       return scheduleRetirement(this.ctx.storage, reason, name, delayMs);
     });
   }
   storageReport() {
-    return withCutoverAdmission(this.env, "tracker", async () => {
+    return withSteadyAdmission(this.env, "tracker", async () => {
       this.assertLifecycleScope();
       return storageReport(this.ctx.storage);
     });
@@ -1644,7 +1678,10 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
         className: "Tracker",
         retirement,
         busy: false,
-        purge: (reason) => clearStorage(this.ctx.storage, reason),
+        purge: (reason) => {
+          this.#scope = undefined;
+          return clearStorage(this.ctx.storage, reason);
+        },
       });
     });
   }
