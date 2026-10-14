@@ -3527,8 +3527,7 @@ always wait ten minutes.
 
 ### Deployments and previews
 
-Timelines deploys nothing (`TIMELINES-RESEARCH.md`, "Previews: primitives, not
-hosting"): a job that deploys records where it went, and the run page and the
+Timelines deploys nothing: a job that deploys records where it went, and the run page and the
 commit list show it. An environment is a name per repository: `production`,
 `timeline/<slug>` for a timeline's previews, `branch/<name>` for any other
 branch a job deploys from, or any name a project uses (`staging`). Records keep the environment, timeline, checkpoint, commit, URL,
@@ -3669,8 +3668,7 @@ the artifact digest when present, are what explicit attribution needs).
 
 #### The preview contract
 
-Projects implement previews in their own CI (CORE-79; `TIMELINES-RESEARCH.md`,
-"Previews: primitives, not hosting"). A repository opts in with `on: preview`
+Projects implement previews in their own CI (CORE-79). A repository opts in with `on: preview`
 (also `on: [push, preview]` or `preview:` under `on:`; pushes start runs either
 way, as before). Timelines then starts **preview runs**: `trigger` is
 `"preview"`, and `action` is `"create"` or `"teardown"` (empty in every other
@@ -3754,9 +3752,7 @@ otherwise.
 
 #### Timelines' own previews
 
-This repository implements the contract for itself (CORE-80;
-`TIMELINES-RESEARCH.md`, "Gitmatrix's own previews: the reference
-implementation"), as a worked example any project could copy. It uses only
+This repository implements the contract for itself (CORE-80), as a worked example any project could copy. It uses only
 what every project has: `on: preview`, the job variables and credential, a
 repository secret, `cf`, and `gm deploy record`.
 
@@ -4114,9 +4110,8 @@ Apply registry migration `0004_artifact_storage.sql` before running the updated
 Worker. Existing raw locators remain readable during backfill. Compaction changes
 storage only: clients and artifact URLs do not change.
 
-The [Git LFS and Xet investigation](../../ARTIFACT-STORAGE-RESEARCH.md) records
-measured comparisons, shared-chunk storage tradeoffs, and the evidence needed
-before revisiting this design.
+Git LFS and Xet were investigated and deferred; revisiting this design needs
+measured comparisons and the shared-chunk storage tradeoffs weighed first.
 
 ## Assistant
 

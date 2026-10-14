@@ -1,5 +1,4 @@
-// The app-wide timeline scope (CORE-82; TIMELINES-RESEARCH.md, "Visualization
-// and switching timelines"). `?tl=<slug>` scopes every surface to main plus
+// The app-wide timeline scope (CORE-82). `?tl=<slug>` scopes every surface to main plus
 // that timeline's work: the tracker shows the timeline's view, the code
 // browser opens its bookmark, CI lists runs on it, the package console filters
 // to versions built from it, knowledge overlays its graph diff and release

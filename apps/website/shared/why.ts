@@ -1,5 +1,4 @@
-// "Why did this change?" (CORE-85, TIMELINES-RESEARCH.md "Knowledge and the
-// 'why'"): one chain that agents and people both walk. From a line, through
+// "Why did this change?" (CORE-85): one chain that agents and people both walk. From a line, through
 // blame, to a commit and its change id; then the timelines the change passed
 // through (the push log and merges), its issues, the checkpoints that pinned
 // it, their approvals, and its landing. Historical change ids join rewritten

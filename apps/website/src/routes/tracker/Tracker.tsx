@@ -1,6 +1,4 @@
 /*
- * DIRECTION (impeccable, locked: throughput-console, seed 49700b21)
- *
  * THESIS       Work as a stream. One query over every issue, opened/closed
  *              activity over time, facet counts, and a one-line log that
  *              reads at 30,000 rows like an event log. Board and Graph are
@@ -16,12 +14,9 @@
  *              switch, saved views, the activity strip, then the log filling
  *              the height; facets in a 17rem column that becomes the
  *              inspector when an issue opens.
- * FORM         throughput-console, rank 4 of 7, seed key 49700b21. Signature:
- *              brushing the strip scopes the query; the canvas graph lights a
- *              selection's whole blocking chain.
- * FINISH       unreviewed and undocumented is unfinished; this build ends with
- *              the finish review, the verdict, DESIGN.md, and every shipping
- *              raster carrying its provenance
+ * FORM         throughput-console. Signature: brushing the strip scopes the
+ *              query; the canvas graph lights a selection's whole blocking
+ *              chain.
  */
 
 import { IssueTagChip } from "../../components/Chips.tsx";

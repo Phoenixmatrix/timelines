@@ -1,5 +1,4 @@
-// Deployments and environments (CORE-78; TIMELINES-RESEARCH.md, "Previews:
-// primitives, not hosting"). Gitmatrix deploys nothing: CI jobs and outside
+// Deployments and environments (CORE-78). Gitmatrix deploys nothing: CI jobs and outside
 // systems record where a commit was deployed, and Gitmatrix shows it next to
 // CI runs, commits, timelines and checkpoints. Records are kept after a
 // preview expires.
@@ -297,7 +296,7 @@ export interface PreviewClock {
 }
 
 /**
- * When a timeline preview is torn down (TIMELINES-RESEARCH.md, Decisions):
+ * When a timeline preview is torn down:
  * `endedDays` after its timeline lands or is abandoned, and `idleDays` after
  * the timeline's last push, whichever comes first. A revived preview counts
  * from its revival too, so reviving last week's checkpoint gives it the same

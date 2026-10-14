@@ -1,4 +1,4 @@
-// The push log: the history git doesn't keep (TIMELINES-RESEARCH.md). After
+// The push log: the history git doesn't keep. After
 // every push through the proxy, recordPush() compares the repository's
 // branches and tags with the ones it last saw (repo_refs) and records each
 // update: the ref, its old and new commit, the person and agent who pushed,

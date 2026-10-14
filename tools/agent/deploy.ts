@@ -91,7 +91,6 @@ export interface Plan {
 function inert(path: string): boolean {
   return (
     /\.(md|test\.tsx?)$/.test(path) ||
-    path.startsWith("apps/website/.impeccable/") ||
     path.startsWith("apps/website/seed/") ||
     path.startsWith("apps/website/scripts/")
   );

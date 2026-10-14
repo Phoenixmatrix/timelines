@@ -1,5 +1,5 @@
 // Wiki pages for timelines (CORE-84): written when a checkpoint is made, or
-// on demand, never on every push (TIMELINES-RESEARCH.md, Decisions). At a
+// on demand, never on every push. At a
 // gate they help review what a timeline adds or changes in components and
 // concepts.
 //

@@ -1,6 +1,4 @@
 /*
- * DIRECTION (impeccable, locked: console-ledger, seed key 270eceb2)
- *
  * THESIS       Signing in reads as a short, honest ledger of steps, the way gm
  *              reports its own work: email, code, signed in. Each finished step
  *              settles into one quiet row as the next opens, so you always see
@@ -15,12 +13,9 @@
  * FIRST VIEW   Wordmark and host across the top; a 30rem column with the
  *              heading, the three-step ledger with the active step open, the
  *              invite-only line; dev personas as a quiet appendix below.
- * FORM         console-ledger, seed key 270eceb2. Signature: steps that settle
- *              into ledger rows with their timestamp; six code cells that
- *              take a paste and submit on the last digit.
- * FINISH       unreviewed and undocumented is unfinished; this build ends with
- *              the finish review, the verdict, DESIGN.md, and every shipping
- *              raster carrying its provenance
+ * FORM         console-ledger. Signature: steps that settle into ledger rows
+ *              with their timestamp; six code cells that take a paste and
+ *              submit on the last digit.
  */
 
 import { CheckIcon } from "@phosphor-icons/react";

@@ -2,7 +2,7 @@
  * Incremental SHA-1 / SHA-256 whose state can be exported and resumed later.
  * WebCrypto and node:crypto hashes are one-shot or cannot be serialized; an OCI
  * blob upload spans many HTTP requests (chunked PATCHes), so its running digest
- * has to survive in a Durable Object between them. Ported from gitflare.
+ * has to survive in a Durable Object between them.
  */
 export type HashAlgo = "sha1" | "sha256";
 

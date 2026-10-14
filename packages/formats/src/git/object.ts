@@ -4,7 +4,7 @@ import { createHasher, fromHex, toHex } from "../hash/index.ts";
 
 /**
  * Git object encoding (SHA-1 object format): loose-object hashing, trees,
- * commits and zlib. Ported from gitflare and trimmed to what a generated,
+ * commits and zlib. Trimmed to what a generated,
  * read-only repository needs.
  */
 export type ObjType = "commit" | "tree" | "blob" | "tag";

@@ -94,8 +94,6 @@ Preserve the incumbent MatrixKit Neo visual identity for Timelines: warm charcoa
 
 This is an extraction of the approved existing system, not a new visual direction. Runtime tokens live in `src/styles/tokens.css`; shared components in `src/styles/matrixkit.css`, `src/styles/app.css` and `src/components/ui.tsx`. The frontmatter records the dark home theme. The existing light-theme overrides remain authoritative; components consume semantic variables rather than copying dark values.
 
-The tracker received a dual-assessor Claude CLI / Impeccable re-review with a **SHIP** verdict and no P0/P1 findings. Remaining P2/P3 findings were corrected and verified in the live browser: semantic conflict comparisons, closed-work recovery, opt-in shortcuts, immutable administration metadata, compact graph overview, and responsive controls. Review captures are local verification evidence, not production assets.
-
 ## Brand identity
 
 The approved **Pounce** identity is a nimble cat formed from flowing paths that separate and rejoin: cats, parallel agents and fast development, without a generic lettermark. The user selected this generated silhouette as “perfect”; preserve it rather than redesigning or replacing the cat. It replaces the former angular G.
@@ -142,7 +140,7 @@ The global navigation is a narrow vertical rail on desktop and one sticky horizo
 
 Focusing a partially clipped rail control reveals its full target within the rail's actual scrollport, not the viewport width (which may include a document scrollbar). This adjustment changes only the rail's horizontal scroll position; it does not scroll the page vertically or capture focus inside portalled menus/dialogs.
 
-The tracker-specific approved composition is recorded in `.impeccable/surfaces/src-routes-tracker-tracker-tsx.md`: capture and scope controls above a 42/58 selection/detail split, independently scrolling above 760px. The board and dependency graph remain in the selection pane. On phones the selected issue replaces the collection; filters and account actions progressively disclose. Tracker controls retain 44px touch targets through 760px, and the return link clears the sticky navigation. This split is a surface decision, not a requirement for unrelated pages.
+The tracker-specific approved composition: capture and scope controls above a 42/58 selection/detail split, independently scrolling above 760px. The board and dependency graph remain in the selection pane. On phones the selected issue replaces the collection; filters and account actions progressively disclose. Tracker controls retain 44px touch targets through 760px, and the return link clears the sticky navigation. This split is a surface decision, not a requirement for unrelated pages.
 
 The assistant reserves a 26rem desktop dock from 1280px upward. Expanding it overlays the page with a wider panel, capped at 72rem, without changing that reserved column or shrinking the underlying page further. Collapse preserves the conversation and draft; Escape collapses the expanded panel first. Below the docking breakpoint it floats, and below 640px it already fills the screen.
 

@@ -1,6 +1,4 @@
 /*
- * DIRECTION (impeccable, locked: query-console, seed 19983661)
- *
  * THESIS       Versions are data. A package that publishes on every commit is
  *              read the way a log explorer reads events: one query over the
  *              whole stream, counts beside it, act on what the query selects.

@@ -7,14 +7,13 @@ with each package's license in its published metadata.
 
 ## Included in this repository
 
-| Work                                                                                                                             | Where                                                              | License                                                  |
-| -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------- |
-| [Figtree](https://github.com/erikdkennedy/figtree) by Erik Kennedy                                                               | `apps/website/src/styles/fonts/`, `apps/site/src/styles/fonts/`    | [SIL Open Font License 1.1](https://openfontlicense.org) |
-| [Geist Mono](https://github.com/vercel/geist-font) by Vercel                                                                     | `apps/website/src/styles/fonts/`, `apps/site/src/styles/fonts/`    | [SIL Open Font License 1.1](https://openfontlicense.org) |
-| MatrixKit Neo, the design system the web app is drawn in, made with Claude Design                                                | `apps/website/src/styles/{tokens,matrixkit}.css`, `Monogram.tsx`   | Part of this project                                     |
-| Git object encoding and hashing, ported from gitflare                                                                            | `packages/formats/src/git/object.ts`, `packages/formats/src/hash/` | See the original project                                 |
-| The `.xz` decoder follows [XZ Embedded](https://tukaani.org/xz/embedded.html) and the [LZMA SDK](https://www.7-zip.org/sdk.html) | `packages/formats/src/xz/`                                         | Public domain (both)                                     |
-| Patches to `@cloudflare/ai-chat`, `cf` and `miniflare`                                                                           | `patches/`                                                         | Each package's own license (MIT, or MIT OR Apache-2.0)   |
+| Work                                                                                                                             | Where                                                            | License                                                  |
+| -------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------- |
+| [Figtree](https://github.com/erikdkennedy/figtree) by Erik Kennedy                                                               | `apps/website/src/styles/fonts/`, `apps/site/src/styles/fonts/`  | [SIL Open Font License 1.1](https://openfontlicense.org) |
+| [Geist Mono](https://github.com/vercel/geist-font) by Vercel                                                                     | `apps/website/src/styles/fonts/`, `apps/site/src/styles/fonts/`  | [SIL Open Font License 1.1](https://openfontlicense.org) |
+| MatrixKit Neo, the design system the web app is drawn in, made with Claude Design                                                | `apps/website/src/styles/{tokens,matrixkit}.css`, `Monogram.tsx` | Part of this project                                     |
+| The `.xz` decoder follows [XZ Embedded](https://tukaani.org/xz/embedded.html) and the [LZMA SDK](https://www.7-zip.org/sdk.html) | `packages/formats/src/xz/`                                       | Public domain (both)                                     |
+| Patches to `@cloudflare/ai-chat`, `cf` and `miniflare`                                                                           | `patches/`                                                       | Each package's own license (MIT, or MIT OR Apache-2.0)   |
 
 The Timelines and Gitmatrix marks in `apps/*/public/brand/` were generated with
 OpenAI's image model through the Codex CLI and traced to SVG; they are part of
