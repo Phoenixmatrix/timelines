@@ -23,6 +23,7 @@ import {
   CUTOVER_WORKFLOWS,
   DEPLOYMENT_EVIDENCE_TTL_MS,
   TERMINAL_WORKFLOW_STATUSES,
+  cutoverWorkflowNames,
   evaluateQuiescence,
   isLegacyInstance,
   legacyBoundElapsed,
@@ -732,7 +733,7 @@ export class SpaceCutover extends DurableObject<Env> {
     const serving = this.observeServingVersion(run);
     this.save(run);
     if (!serving) throw new Error("A workflow census belongs to the preparation deployment");
-    const census = parseCensus(value);
+    const census = parseCensus(value, cutoverWorkflowNames(this.env));
     const sole = preparationSoleSince(census.deployments, run.preparationVersionId);
     if (!sole.ok) throw new Error(sole.message);
     const before = this.boundStart(run);

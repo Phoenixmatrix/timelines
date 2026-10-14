@@ -388,6 +388,10 @@ describe("consumer quiescence from documented execution bounds", () => {
       "every ci-run instance",
     );
     await reject({ ...good, deployments: [] }, "deployment history");
+    // A deployment whose workflow names are unreadable accepts no census at all.
+    Reflect.set(f.env, "CUTOVER_WORKFLOW_NAMES", JSON.stringify({ "ci-run": "ci-run" }));
+    await reject(good, "workflow names are malformed");
+    Reflect.deleteProperty(f.env, "CUTOVER_WORKFLOW_NAMES");
     await reject(
       census([
         { id: "same", status: "running" },
@@ -396,6 +400,42 @@ describe("consumer quiescence from documented execution bounds", () => {
       "twice",
     );
     expect(f.control.status()?.workflowCensus).toBeUndefined();
+    f.close();
+  });
+
+  test("a self-hosted instance's census names its own Workflows", async () => {
+    const f = await fixture();
+    const run = await f.fence();
+    await f.control.fenceDatabases(run.runId);
+    vi.setSystemTime(PREPARED + BOUND);
+    // What cloudflare.config.ts binds for instance demo (vite/instance.ts).
+    Reflect.set(
+      f.env,
+      "CUTOVER_WORKFLOW_NAMES",
+      JSON.stringify({
+        "ci-run": "gitmatrix-demo-ci-run",
+        "knowledge-build": "gitmatrix-demo-knowledge-build",
+        "repo-purge": "gitmatrix-demo-repo-purge",
+      }),
+    );
+    // Production's names are another installation's Workflows.
+    await expect(f.control.recordWorkflowCensus(run.runId, census(), "test-human")).rejects.toThrow(
+      "every ci-run instance (gitmatrix-demo-ci-run)",
+    );
+    const good = census();
+    const demo = {
+      ...good,
+      worker: "gitmatrix-demo",
+      workflows: {
+        "ci-run": { ...good.workflows["ci-run"], name: "gitmatrix-demo-ci-run" },
+        "knowledge-build": { name: "gitmatrix-demo-knowledge-build", instances: [] },
+        "repo-purge": { name: "gitmatrix-demo-repo-purge", instances: [] },
+      },
+    };
+    await f.control.recordWorkflowCensus(run.runId, demo, "test-human");
+    expect(f.control.status()?.workflowCensus?.["ci-run"]?.workflowName).toBe(
+      "gitmatrix-demo-ci-run",
+    );
     f.close();
   });
 

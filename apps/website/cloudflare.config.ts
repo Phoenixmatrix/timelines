@@ -1,6 +1,6 @@
 import { bindings, defineConfig, defineContainer, exports, triggers } from "cf/config";
 import { developmentEnvironment } from "./vite/environment.ts";
-import { deployedInstance, PRODUCTION } from "./vite/instance.ts";
+import { cutoverWorkflowNames, deployedInstance, PRODUCTION } from "./vite/instance.ts";
 import { previewResources } from "./vite/preview.ts";
 
 // Remote services have no local emulator, so dev talks to the real ones
@@ -134,6 +134,8 @@ export default defineConfig(({ mode, isPreview }) => {
         CUTOVER_DEPLOYMENT_CHECKPOINT: bindings.text(
           env.GITMATRIX_CUTOVER_CHECKPOINT ?? "unversioned",
         ),
+        // The Workflow names a cutover's census must list: an instance's are its own.
+        CUTOVER_WORKFLOW_NAMES: bindings.text(JSON.stringify(cutoverWorkflowNames(instance))),
         // The assistant (CORE-25): one Durable Object per conversation, and the
         // Worker Loader its Code Mode scripts run in (isolated, no network).
         ASSISTANT: bindings.durableObject({ worker, exportName: "Assistant" }),

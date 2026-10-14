@@ -491,7 +491,7 @@ fn checkout(ctx: &Ctx, source: &Option<PathBuf>) -> Result<PathBuf> {
         "not_a_checkout",
         "Run this from a Gitmatrix checkout (the repository with apps/website), or pass --source.",
     )
-    .hint("git clone the Gitmatrix repository, run `pnpm install` in it, then `gm instance setup` there."))
+    .hint("git clone the Gitmatrix repository, install its dependencies in it (`pnpm install`, or `vp install` with Vite+), then run `gm instance setup` there."))
 }
 
 struct Cf {
@@ -524,7 +524,11 @@ impl Cf {
                     root.display()
                 ),
             )
-            .hint(format!("Run `pnpm install` in {}, then rerun.", root.display())));
+            .hint(format!(
+                "Run `{}` in {}, then rerun.",
+                installer(root).map_or("pnpm install", |i| i.command()),
+                root.display()
+            )));
         }
         Ok(Cf {
             bin,
@@ -548,6 +552,7 @@ impl Cf {
             "GITMATRIX_PUBLIC_URL",
             "GITMATRIX_AGENT_ID",
             "GITMATRIX_INSTANCE_CONFIG",
+            "GITMATRIX_CUTOVER_CHECKPOINT",
         ] {
             command.env_remove(key);
         }
@@ -1285,7 +1290,7 @@ fn signed_in(cf: &Cf, guide: &Guide) -> Result<Value> {
     if let Some(identity) = check()? {
         return Ok(identity);
     }
-    let login = "pnpm --dir apps/website exec cf auth login";
+    let login = login_command(&cf.bin);
     if !guide.interactive {
         return Err(
             GmError::new("cloudflare_signed_out", "cf isn't signed in to Cloudflare.").hint(
@@ -1305,6 +1310,12 @@ fn signed_in(cf: &Cf, guide: &Guide) -> Result<Value> {
         );
     }
     check()?.ok_or_else(|| GmError::new("cloudflare_signed_out", "cf still isn't signed in."))
+}
+
+/// Signing in runs the checkout's own cf, so the hint names it by path: no
+/// package manager (or its shim) stands between the person and cf.
+fn login_command(cf: &Path) -> String {
+    format!("{} auth login", cf.display())
 }
 
 fn choose_account(
@@ -2061,7 +2072,7 @@ fn deploy(cf: &Cf, guide: &Guide, root: &Path, instance: &mut Instance) -> Resul
     if !message.is_empty() {
         deploy_args.extend(["--message", &message]);
     }
-    cf.stream(&deploy_args, &[("GITMATRIX_INSTANCE_CONFIG", &file_value)])?;
+    cf.stream(&deploy_args, &deploy_env(&file_value, &commit))?;
     let deployed = Deployed {
         commit,
         at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -2073,6 +2084,19 @@ fn deploy(cf: &Cf, guide: &Guide, root: &Path, instance: &mut Instance) -> Resul
     guide.step("Waiting for the instance to answer");
     wait_until_live(guide, instance);
     Ok(deployed)
+}
+
+/// What the Worker deploy adds to cf's environment: the instance file, and the
+/// release the Space cutover names. The cutover's prepare accepts only the
+/// deployed tagged release (CUTOVER_DEPLOYMENT_CHECKPOINT, which
+/// cloudflare.config.ts binds from GITMATRIX_CUTOVER_CHECKPOINT), so it is
+/// the commit `--tag` names, as tools/agent/deploy.ts sets it for the
+/// canonical deploy.
+fn deploy_env<'a>(file: &'a str, commit: &'a str) -> [(&'static str, &'a str); 2] {
+    [
+        ("GITMATRIX_INSTANCE_CONFIG", file),
+        ("GITMATRIX_CUTOVER_CHECKPOINT", commit),
+    ]
 }
 
 /// Wait for the new hostname to answer. Its DNS record appears as the deploy
@@ -2233,6 +2257,87 @@ fn run_tool(dir: &Path, program: &str, args: &[&str], hint: &str) -> Result<()> 
             ),
         ))
     }
+}
+
+/// What installs a checkout's dependencies. gm assumes no Vite+: pnpm, the
+/// repository's package manager, by default. Where `pnpm` on PATH is a shim
+/// that can't run on its own (Vite+'s managed pnpm, invoked directly, says
+/// "the global target of the pnpm shim points back at the shim"), Vite+'s
+/// `vp install` runs pnpm for the same lockfile.
+#[derive(Debug, PartialEq)]
+enum Installer {
+    Pnpm,
+    Vp,
+}
+
+impl Installer {
+    fn program(&self) -> &'static str {
+        match self {
+            Installer::Pnpm => "pnpm",
+            Installer::Vp => "vp",
+        }
+    }
+
+    fn args(&self) -> [&'static str; 2] {
+        ["install", "--frozen-lockfile"]
+    }
+
+    fn command(&self) -> &'static str {
+        match self {
+            Installer::Pnpm => "pnpm install --frozen-lockfile",
+            Installer::Vp => "vp install --frozen-lockfile",
+        }
+    }
+}
+
+/// Whether `program --version` runs in `dir`; if not, what it said.
+fn probe(dir: &Path, program: &str) -> std::result::Result<(), String> {
+    let output = Command::new(program)
+        .arg("--version")
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let said = [&output.stderr, &output.stdout]
+        .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(if said.is_empty() {
+        output.status.to_string()
+    } else {
+        tail(&said, 3)
+    })
+}
+
+/// pnpm when it runs, else vp when it does. Probed before installing: a real
+/// install's failure (a lockfile that doesn't match) is never retried with
+/// the other, which would only hide it.
+fn choose_installer(
+    pnpm: std::result::Result<(), String>,
+    vp: impl FnOnce() -> std::result::Result<(), String>,
+) -> Result<Installer> {
+    let Err(pnpm) = pnpm else {
+        return Ok(Installer::Pnpm);
+    };
+    match vp() {
+        Ok(()) => Ok(Installer::Vp),
+        Err(vp) => Err(GmError::new(
+            "tool_missing",
+            format!(
+                "Couldn't install dependencies: pnpm doesn't run ({pnpm}), and neither does Vite+'s vp ({vp})."
+            ),
+        )
+        .hint("Install pnpm (https://pnpm.io/installation), or fix the pnpm on your PATH, then rerun. With Vite+, `vp` on your PATH also works.")),
+    }
+}
+
+fn installer(dir: &Path) -> Result<Installer> {
+    choose_installer(probe(dir, "pnpm"), || probe(dir, "vp"))
 }
 
 /// The command that deploys what a dry run reported, flags included: a
@@ -2565,10 +2670,11 @@ fn upgrade(ctx: &Ctx, args: &UpgradeArgs) -> Result<Shown> {
         &["checkout", "--quiet", "--force", "--detach", &target],
     )?;
     git(&clone, &["clean", "--quiet", "-fd"])?;
+    let install = installer(&clone)?;
     run_tool(
         &clone,
-        "pnpm",
-        &["install", "--frozen-lockfile"],
+        install.program(),
+        &install.args(),
         "Install pnpm (https://pnpm.io/installation).",
     )?;
     run_tool(
@@ -2878,6 +2984,62 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn deploys_name_their_tagged_commit_as_the_cutover_checkpoint() {
+        let commit = "24e5b7af1a7e72ccd971a83cef74ecefa08afa14";
+        let env = deploy_env("/tmp/demo.json", commit);
+        assert!(env.contains(&("GITMATRIX_CUTOVER_CHECKPOINT", commit)));
+        assert!(env.contains(&("GITMATRIX_INSTANCE_CONFIG", "/tmp/demo.json")));
+        // Nothing from the operator's shell reaches any other cf call.
+        let cf = Cf {
+            bin: PathBuf::from("cf"),
+            website: PathBuf::from("."),
+            account: None,
+        };
+        let command = cf.command(&["deploy"]);
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        assert!(removed.contains(&"GITMATRIX_CUTOVER_CHECKPOINT".to_string()));
+    }
+
+    #[test]
+    fn installs_use_pnpm_unless_only_vp_runs() {
+        let shim = || Err("the global target of the pnpm shim points back at the shim".to_string());
+        let unreachable = || -> std::result::Result<(), String> { panic!("vp probed") };
+        assert_eq!(
+            choose_installer(Ok(()), unreachable).unwrap(),
+            Installer::Pnpm
+        );
+        assert_eq!(choose_installer(shim(), || Ok(())).unwrap(), Installer::Vp);
+        let missing = || Err("No such file or directory (os error 2)".to_string());
+        assert_eq!(
+            choose_installer(missing(), || Ok(())).unwrap(),
+            Installer::Vp
+        );
+        let error = choose_installer(shim(), missing).unwrap_err();
+        assert_eq!(error.code, "tool_missing");
+        assert!(
+            error.message.contains("points back at the shim"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("os error 2"), "{}", error.message);
+        assert_eq!(Installer::Vp.command(), "vp install --frozen-lockfile");
+        assert_eq!(Installer::Pnpm.args(), ["install", "--frozen-lockfile"]);
+    }
+
+    #[test]
+    fn sign_in_runs_the_checkouts_own_cf() {
+        let cf = Path::new("/src/gitmatrix/apps/website/node_modules/.bin/cf");
+        assert_eq!(
+            login_command(cf),
+            "/src/gitmatrix/apps/website/node_modules/.bin/cf auth login"
+        );
     }
 
     #[test]

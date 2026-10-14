@@ -394,7 +394,11 @@ Keep operator state, cookies and inventory exports outside the source checkout.
    After the bound, run `workflow-census --account ACCOUNT_ID --worker NAME`
    (read-only `cf workflows instances list` of every instance and status, every
    page, listed twice; `cf workers deployments list`), refused if `cf` is
-   configured for another account. The census is incomplete, and blocks, if
+   configured for another account. A self-hosted instance names its Workflows
+   after itself (`gitmatrix-<name>-ci-run`): add `--instance-config
+~/.config/gitmatrix/instances/<name>.json`, whose Worker and account must
+   match. The Worker accepts only the names it was deployed with (its
+   `CUTOVER_WORKFLOW_NAMES` binding); production's are the default. The census is incomplete, and blocks, if
    D1's in-flight CI runs, Knowledge builds or repository purges name an
    instance the provider holds but did not list; one the provider doesn't hold
    is recorded as orphaned. The next `drain` terminates every unticketed

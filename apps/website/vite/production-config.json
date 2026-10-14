@@ -64,6 +64,10 @@
         "type": "text",
         "value": "unversioned"
       },
+      "CUTOVER_WORKFLOW_NAMES": {
+        "type": "text",
+        "value": "{\"ci-run\":\"ci-run\",\"knowledge-build\":\"knowledge-build\",\"repo-purge\":\"repo-purge\"}"
+      },
       "ASSISTANT": {
         "type": "durable-object",
         "worker": "gitmatrix",
