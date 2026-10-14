@@ -53,7 +53,13 @@ vi.mock("cloudflare:workers", () => ({
   },
 }));
 // Preview runs (CORE-79) are started through CI's startRun: seen here, not run.
-const startRun = vi.hoisted(() => vi.fn());
+// Unless a test says otherwise it answers as startRun does outside production
+// (CORE-422): an undefined result would throw inside previews and be logged.
+const startRun = vi.hoisted(() =>
+  vi.fn<typeof import("../ci/trigger.ts").startRun>(async () => ({
+    skipped: "Previews don't run CI.",
+  })),
+);
 vi.mock(import("../ci/trigger.ts"), async (original) => {
   const module = await original();
   return {
