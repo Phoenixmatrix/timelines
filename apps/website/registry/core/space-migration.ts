@@ -147,6 +147,8 @@ export interface D1RestoreState {
   digest: string;
   relations: Record<string, ForeignKey[]>;
   group: RowGroup | null;
+  /** Leading rows of the current cyclic block already known to be restored. */
+  presentInBlock?: number;
   deletion: CycleDeletion | null;
   verification: D1InventoryState | null;
   result: SpaceReconciliation | null;
@@ -1292,7 +1294,13 @@ export function createD1SpaceCheckpoint(
         if (block.block.kind !== "rows" || block.block.table !== table.name) fail();
         if (cyclicTables(table, state.ordered).length) {
           if (!state.group) {
-            for (const values of block.block.rows) {
+            // Rows before this offset were found restored by an earlier step; a
+            // group only ever adds rows, so they stay restored (CORE-341: one
+            // query per leading row per group made ci_jobs take days).
+            const skip = Math.min(state.presentInBlock ?? 0, block.block.rows.length);
+            for (const [offset, values] of block.block.rows.entries()) {
+              if (offset < skip) continue;
+              state.presentInBlock = offset;
               const row = { table: table.name, columns: block.block.columns, values };
               const parameters: (string | ArrayBuffer | null)[] = [];
               const where = rowPredicate(table.keys, rowValues(row, table.keys), parameters);
@@ -1362,6 +1370,7 @@ export function createD1SpaceCheckpoint(
           statements.unshift(db.prepare("DELETE FROM sqlite_sequence"));
         if (statements.length) await db.batch(statements).catch(() => fail());
         const nextTable = block.nextCursor === null ? null : cursorFrom(block.nextCursor).table;
+        state.presentInBlock = 0;
         if (nextTable === null || archive.schema.tables[nextTable]?.name !== table.name) {
           if (block.digest !== range.afterDigest) fail();
           state.index++;
