@@ -172,6 +172,10 @@ jobs:
   # deploy what changed since the deployed Worker version (tools/agent/deploy.ts):
   # migrations, then the Worker. A changed CI image fails the job after the
   # rest has shipped; deploy it from a machine with Docker (`vp run deploy`).
+  # The owner's identifiers (account, hosts, D1 and Secrets Store ids, owner
+  # and sender) are this repository's CI secrets, never in the source: the
+  # deploy refuses to start without each, or when the ids aren't the live
+  # Worker's (apps/website/README.md, "Production deploy configuration").
   deploy:
     needs: [check, test, build, cli]
     # A preview run on main (a landed timeline's teardown or revival) must never deploy.
@@ -180,9 +184,17 @@ jobs:
     # burst of pushes deploys once, from the newest commit.
     concurrency: production
     instance: standard-4
-    secrets: [CLOUDFLARE_API_TOKEN]
+    secrets:
+      - CLOUDFLARE_API_TOKEN
+      - CLOUDFLARE_ACCOUNT_ID
+      - GITMATRIX_PRODUCTION_HOST
+      - GITMATRIX_SITE_HOST
+      - GITMATRIX_PRODUCTION_DB_ID
+      - GITMATRIX_PRODUCTION_REGISTRY_DB_ID
+      - GITMATRIX_PRODUCTION_SECRETS_STORE_ID
+      - GITMATRIX_PRODUCTION_OWNER_EMAIL
+      - GITMATRIX_PRODUCTION_EMAIL_FROM
     env:
-      CLOUDFLARE_ACCOUNT_ID: "0e28c6400ae60277d5330899f4db57e4"
       GITMATRIX_CLI_PROVISION_ARM64: "1"
     steps:
       - name: Install
@@ -204,11 +216,14 @@ jobs:
     concurrency: preview
     instance: standard-4
     timeout_minutes: 40
-    secrets: [CLOUDFLARE_API_TOKEN, GITMATRIX_ACCESS_TOKEN]
-    env:
-      CLOUDFLARE_ACCOUNT_ID: "0e28c6400ae60277d5330899f4db57e4"
-      GITMATRIX_PREVIEW_ACCESS_ISSUER: "https://pileofcats.cloudflareaccess.com"
-      GITMATRIX_PREVIEW_ACCESS_AUD: "927abb73ba3900f5dbc9542d57ec887a1d8689894e6c44e8b0e270e23bc5894c"
+    # The Access team origin and the preview application's audience gate every
+    # preview (vite/preview.ts); like the account, they're secrets.
+    secrets:
+      - CLOUDFLARE_API_TOKEN
+      - GITMATRIX_ACCESS_TOKEN
+      - CLOUDFLARE_ACCOUNT_ID
+      - GITMATRIX_PREVIEW_ACCESS_ISSUER
+      - GITMATRIX_PREVIEW_ACCESS_AUD
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -219,9 +234,7 @@ jobs:
   # Artifacts namespace. Gitmatrix has already marked the records expired.
   preview-teardown:
     if: trigger == "preview" && action == "teardown" && runner == "sandbox"
-    secrets: [CLOUDFLARE_API_TOKEN]
-    env:
-      CLOUDFLARE_ACCOUNT_ID: "0e28c6400ae60277d5330899f4db57e4"
+    secrets: [CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID]
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -247,9 +260,7 @@ jobs:
     if: trigger == "preview" && action == "teardown" && runner == "sandbox"
     needs: [preview-teardown]
     timeout_minutes: 15
-    secrets: [CLOUDFLARE_API_TOKEN]
-    env:
-      CLOUDFLARE_ACCOUNT_ID: "0e28c6400ae60277d5330899f4db57e4"
+    secrets: [CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID]
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile

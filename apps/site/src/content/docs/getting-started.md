@@ -9,13 +9,13 @@ This page takes you from nothing to a change on trunk with a green CI run. It us
 
 ## Get access
 
-Timelines is invite-only for now. An Instance administrator invites your email address, and you sign in to the web app at [timelinesapp.fward.dev](https://timelinesapp.fward.dev) with a one-time code sent to that address. Your Account is your person identity. Organizations contain Spaces, and each Space owns its repositories, Tracker, Projects, packages and content settings. Organization membership or ownership alone does not grant private content access: ask for an explicit Space grant. A repository collaborator grant covers only that repository.
+Timelines is invite-only for now. An Instance administrator invites your email address, and you sign in to [the web app](https://timelines.example.com) with a one-time code sent to that address. Your Account is your person identity. Organizations contain Spaces, and each Space owns its repositories, Tracker, Projects, packages and content settings. Organization membership or ownership alone does not grant private content access: ask for an explicit Space grant. A repository collaborator grant covers only that repository.
 
 ## Get gm
 
 `gm` is a single binary, published for Linux on x86-64 and ARM64 (glibc 2.36 or newer).
 
-1. In the web app, create a personal access token under [Settings, Access tokens](https://timelinesapp.fward.dev/settings/tokens).
+1. In the web app, create a personal access token under [Settings, Access tokens](https://timelines.example.com/settings/tokens).
 2. Open the `gm` package under Packages in the `matrixorg` Space. Your inviter must give you package access there. Its page shows the latest version and the `curl` command that downloads it with your token. Verify the downloaded artifact against its published SHA-256 checksum.
 3. Make the downloaded file executable and put it on your `PATH`, for example in `~/.local/bin`:
 
@@ -43,7 +43,7 @@ For an existing checkout, `apps/cli/README.md` has the checksum-verified `instal
 Sign `gm` in. By default it signs in through the browser: it shows a code and a link to the `/device` page, you approve it while signed in on the web, and gm exchanges that approval for a personal access token. Pass `--server` the first time; it also becomes gm's default server.
 
 ```sh
-gm auth login --server https://timelinesapp.fward.dev
+gm auth login --server https://timelines.example.com
 gm auth status
 ```
 

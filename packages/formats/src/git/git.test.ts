@@ -69,7 +69,7 @@ afterAll(() => {
   for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true });
 });
 
-const IDENT = { name: "gitmatrix", email: "noreply@fward.dev", time: 1_700_000_000 };
+const IDENT = { name: "gitmatrix", email: "noreply@example.com", time: 1_700_000_000 };
 
 /** A linear history: each step is the full set of top-level files plus Formula/. */
 function buildHistory(steps: Record<string, string>[]): {
@@ -187,7 +187,7 @@ describe("objects", () => {
     const parsed = parseCommit(data);
     expect(parsed.tree).toBe("4b825dc642cb6eb9a060e54bf8d69288fbee4904");
     expect(parsed.message).toBe("Init\n");
-    expect(parsed.author).toBe("gitmatrix <noreply@fward.dev> 1700000000 +0000");
+    expect(parsed.author).toBe("gitmatrix <noreply@example.com> 1700000000 +0000");
   });
 
   it.skipIf(!GIT)("matches git mktree and commit-tree", () => {
@@ -213,9 +213,9 @@ describe("objects", () => {
       env: {
         ...GIT_ENV,
         GIT_AUTHOR_NAME: "gitmatrix",
-        GIT_AUTHOR_EMAIL: "noreply@fward.dev",
+        GIT_AUTHOR_EMAIL: "noreply@example.com",
         GIT_COMMITTER_NAME: "gitmatrix",
-        GIT_COMMITTER_EMAIL: "noreply@fward.dev",
+        GIT_COMMITTER_EMAIL: "noreply@example.com",
         GIT_AUTHOR_DATE: "@1700000000 +0000",
         GIT_COMMITTER_DATE: "@1700000000 +0000",
       },

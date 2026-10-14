@@ -178,7 +178,28 @@ test("this repository's pipeline is set up to run in Sandbox containers", () => 
   // gm's Rust work is skipped on pushes that leave apps/cli unchanged.
   expect(job("cli").paths).toEqual(["apps/cli"]);
   expect(pipeline.coalesceAfter).toBe(4);
-  expect(deploy.secrets).toEqual(["CLOUDFLARE_API_TOKEN"]);
+  // The owner's identifiers are secrets, never the repository's (tools/agent/deploy.ts).
+  expect(deploy.secrets).toEqual([
+    "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_ACCOUNT_ID",
+    "GITMATRIX_PRODUCTION_HOST",
+    "GITMATRIX_SITE_HOST",
+    "GITMATRIX_PRODUCTION_DB_ID",
+    "GITMATRIX_PRODUCTION_REGISTRY_DB_ID",
+    "GITMATRIX_PRODUCTION_SECRETS_STORE_ID",
+    "GITMATRIX_PRODUCTION_OWNER_EMAIL",
+    "GITMATRIX_PRODUCTION_EMAIL_FROM",
+  ]);
+  for (const name of ["preview", "preview-teardown", "preview-reconcile"])
+    expect(job(name).secrets, name).toContain("CLOUDFLARE_ACCOUNT_ID");
+  expect(job("preview").secrets).toEqual(
+    expect.arrayContaining(["GITMATRIX_PREVIEW_ACCESS_ISSUER", "GITMATRIX_PREVIEW_ACCESS_AUD"]),
+  );
+  for (const { name, env } of pipeline.jobs)
+    expect(
+      Object.keys(env).filter((key) => /ACCOUNT_ID|_HOST|_DB_ID|ACCESS_/.test(key)),
+      name,
+    ).toEqual([]);
   expect(deploy.concurrency).toBe("production");
   const at = (branch: string, runner: "local" | "sandbox") =>
     evaluate(deploy.if!, { branch, trigger: "push", commit: "abc", runner });

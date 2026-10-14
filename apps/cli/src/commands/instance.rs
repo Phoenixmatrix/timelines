@@ -229,11 +229,12 @@ pub struct Deployed {
 }
 
 /// The canonical deploy's account-wide names (apps/website/vite/instance.ts
-/// PRODUCTION) and development's fixed remote ones. An instance must use none.
+/// productionInstance) and development's fixed remote ones. An instance must
+/// use none. Production's host and D1 ids are its deploy's secrets, not the
+/// source's: setup refuses a hostname that already has DNS records, and finds
+/// D1 databases by these names.
 const RESERVED: &[&str] = &[
     "production",
-    "timelinesapp.fward.dev",
-    "timelines.fward.dev",
     "gitmatrix",
     "gitmatrix-site",
     "gitmatrix-registry",
@@ -254,8 +255,6 @@ const RESERVED: &[&str] = &[
     "gitmatrix_better_auth_secret",
     "4401",
     "4402",
-    "3ed3e1ec-bd11-4f8e-bfee-d7c0bcb89e77",
-    "caea2f3d-d4d3-43cd-aaf9-f14a3d84621d",
 ];
 
 /// Names a preview or an agent environment owns (tools/preview, tools/agent).
@@ -553,6 +552,10 @@ impl Cf {
             "GITMATRIX_AGENT_ID",
             "GITMATRIX_INSTANCE_CONFIG",
             "GITMATRIX_CUTOVER_CHECKPOINT",
+            // A production deploy's marker; its exported identifiers stay, so
+            // the instance guards (vite/instance.ts sharedWithProduction) can
+            // still refuse a config that names production's.
+            "GITMATRIX_DEPLOY",
         ] {
             command.env_remove(key);
         }
@@ -1522,9 +1525,6 @@ fn valid_host(host: &str) -> std::result::Result<(), String> {
         return Err(format!(
             "`{host}` isn't a usable hostname: use a lowercase subdomain such as timelines.example.com."
         ));
-    }
-    if RESERVED.contains(&host) {
-        return Err(format!("{host} is the canonical deploy's."));
     }
     Ok(())
 }
@@ -2867,16 +2867,20 @@ mod tests {
         ] {
             assert!(valid_org(bad).is_err(), "{bad}");
         }
-        assert_eq!(user_slug("Fward@hey.com"), "fward");
+        assert_eq!(user_slug("Ada@example.com"), "ada");
         assert_eq!(user_slug("first.last+tag@example.com"), "first-last-tag");
         assert_eq!(user_slug("-x--y-@example.com"), "x-y");
     }
 
     #[test]
-    fn production_ids_are_reserved() {
+    fn production_names_are_reserved() {
         let mut instance = derive("demo");
-        instance.db.id = "3ed3e1ec-bd11-4f8e-bfee-d7c0bcb89e77".into();
-        assert_eq!(instance.reserved_names(), vec![instance.db.id.clone()]);
+        instance.queues.jobs = "gitmatrix-jobs".into();
+        instance.rate_limit_namespace = "4401".into();
+        assert_eq!(
+            instance.reserved_names(),
+            vec!["gitmatrix-jobs".to_string(), "4401".to_string()]
+        );
     }
 
     #[test]
@@ -2884,7 +2888,6 @@ mod tests {
         assert!(valid_host("timelines.example.com").is_ok());
         assert!(valid_host("example.com").is_err());
         assert!(valid_host("Timelines.example.com").is_err());
-        assert!(valid_host("timelinesapp.fward.dev").is_err());
         assert!(valid_host("timelines.example.c0m").is_err());
     }
 
@@ -3005,6 +3008,9 @@ mod tests {
             .map(|(key, _)| key.to_string_lossy().into_owned())
             .collect();
         assert!(removed.contains(&"GITMATRIX_CUTOVER_CHECKPOINT".to_string()));
+        assert!(removed.contains(&"GITMATRIX_DEPLOY".to_string()));
+        // Exported production values stay, so the instance guards can see them.
+        assert!(!removed.contains(&"GITMATRIX_PRODUCTION_HOST".to_string()));
     }
 
     #[test]

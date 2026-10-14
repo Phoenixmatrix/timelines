@@ -88,7 +88,7 @@
 
 - Public application, site, documentation, CLI and assistant presentation use
   Timelines while retaining the pounce logo. The application moves to
-  `timelinesapp.fward.dev`, with `matrixorg/timelines` and its corresponding
+  a new production address, with `matrixorg/timelines` and its corresponding
   GitHub mirror as the public repository names. Internal resource names,
   technical keys, API headers and installation identifiers remain unchanged.
 - New system-authored commits use the Timelines display name; existing Git

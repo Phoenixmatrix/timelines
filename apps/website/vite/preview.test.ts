@@ -82,7 +82,13 @@ describe("cloudflare.config.ts in preview mode", () => {
   });
 
   test("leaves out Workflows, queues, cron, email, AI, the domain and the Secrets Store", async () => {
-    const built = await build(true, previewVariables(resources));
+    // Even where production's identifiers are in the environment.
+    const built = await build(true, {
+      ...previewVariables(resources),
+      GITMATRIX_PRODUCTION_DB_ID: "5a1e0c0d-1111-4aaa-8bbb-0123456789ab",
+      GITMATRIX_PRODUCTION_REGISTRY_DB_ID: "5a1e0c0d-2222-4aaa-8bbb-0123456789ab",
+      GITMATRIX_PRODUCTION_OWNER_EMAIL: "founder@acme.dev",
+    });
     const types = Object.values(built.worker.env).map((binding) => binding.type);
     for (const type of [
       "workflow",
@@ -117,7 +123,7 @@ describe("cloudflare.config.ts in preview mode", () => {
     expect(built.containers).toBeUndefined();
     for (const binding of Object.values(built.worker.env))
       expect(JSON.stringify(binding)).not.toMatch(
-        /3ed3e1ec|caea2f3d|gitmatrix-registry-blobs|"gitmatrix-jobs"|"gitmatrix-prod"/,
+        /5a1e0c0d|acme\.dev|gitmatrix-registry-blobs|"gitmatrix-jobs"|"gitmatrix-prod"/,
       );
   });
 

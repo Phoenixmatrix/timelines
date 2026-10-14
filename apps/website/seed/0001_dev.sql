@@ -3,15 +3,15 @@
 -- database starts empty. Idempotent; never use as legacy migration input.
 --
 -- The personas each exercise a different path through the permission rules.
--- Francois is a real sign-in (hello@fward.me) as well as a persona: his
--- Better Auth user shares his account id, so an emailed code signs into the
--- same superuser account the persona picker does.
+-- Francois is an email sign-in (fward@example.com, development's OWNER_EMAIL)
+-- as well as a persona: his Better Auth user shares his account id, so an
+-- emailed code signs into the same superuser account the persona picker does.
 INSERT OR IGNORE INTO accounts (id, kind, slug, display_name, bio, is_site_admin, email) VALUES
   ('acc_priya', 'user', 'priya', 'Priya Raman', 'Site admin. Can read, push to and manage every repository.', 1, NULL),
   ('acc_marco', 'user', 'marco', 'Marco Bellini', 'Orbit Labs owner with an explicit admin grant in its General Space, not its private Research Space.', 0, NULL),
   ('acc_jun', 'user', 'jun', 'Jun Tanaka', 'Orbit General member. Reads its repositories and can push to orbit/engine as a collaborator.', 0, NULL),
   ('acc_sam', 'user', 'sam', 'Sam Rivera', 'Outside contributor. Has read access to orbit/engine and owns a private repository.', 0, NULL),
-  ('acc_fward', 'user', 'fward', 'Francois Ward', 'The instance owner. Superuser; signs in with an emailed code or as a persona.', 1, 'hello@fward.me');
+  ('acc_fward', 'user', 'fward', 'Francois Ward', 'The instance owner. Superuser; signs in with an emailed code or as a persona.', 1, 'fward@example.com');
 
 -- Apply this seed atomically: Organization/default-Space foreign keys are deferred.
 -- This is fixture data, not migration authority; it never activates the runtime.
@@ -68,4 +68,4 @@ SELECT 'fixture-grant:' || space_id || ':' || account_id, organization_id, space
 FROM space_grants WHERE origin = 'development-fixture';
 
 INSERT OR IGNORE INTO auth_users (id, name, email, emailVerified, createdAt, updatedAt) VALUES
-  ('acc_fward', 'Francois Ward', 'hello@fward.me', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+  ('acc_fward', 'Francois Ward', 'fward@example.com', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));

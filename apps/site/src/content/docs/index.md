@@ -7,7 +7,7 @@ order: 1
 
 Timelines is a git host built for agent-driven development. It runs entirely on Cloudflare: git storage, the git proxy, the database, CI and the AI that keeps track of each repository are all built from Cloudflare's platform, so there are no servers for you to operate.
 
-It hosts git repositories, runs CI, keeps a package registry and an issue tracker, and maintains a knowledge graph and generated wiki for every repository. You reach all of it through the web app at [timelinesapp.fward.dev](https://timelinesapp.fward.dev) and through `gm`, the command-line client.
+It hosts git repositories, runs CI, keeps a package registry and an issue tracker, and maintains a knowledge graph and generated wiki for every repository. You reach all of it through [the web app](https://timelines.example.com) and through `gm`, the command-line client.
 
 ## Who it is for
 
