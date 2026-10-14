@@ -1293,41 +1293,47 @@ export function createD1SpaceCheckpoint(
         );
         if (block.block.kind !== "rows" || block.block.table !== table.name) fail();
         if (cyclicTables(table, state.ordered).length) {
-          if (!state.group) {
-            // Rows before this offset were found restored by an earlier step; a
-            // group only ever adds rows, so they stay restored (CORE-341: one
-            // query per leading row per group made ci_jobs take days).
-            const skip = Math.min(state.presentInBlock ?? 0, block.block.rows.length);
-            for (const [offset, values] of block.block.rows.entries()) {
-              if (offset < skip) continue;
-              state.presentInBlock = offset;
-              const row = { table: table.name, columns: block.block.columns, values };
-              const parameters: (string | ArrayBuffer | null)[] = [];
-              const where = rowPredicate(table.keys, rowValues(row, table.keys), parameters);
-              if (
-                !(await db
-                  .prepare(`SELECT 1 AS present FROM ${identifier(table.name)} WHERE ${where}`)
-                  .bind(...parameters)
-                  .first())
-              ) {
-                state.group = {
-                  rows: [],
-                  index: 0,
-                  relation: 0,
-                  scan: null,
-                  traversalLimit: Object.values(archive.counts).reduce(
-                    (sum, count) => sum + count,
-                    0,
-                  ),
-                };
-                addGroupRow(state.group, row, archive.schema.tables);
-                break;
+          // Expand and insert groups for up to three seconds per journaled step:
+          // one action per step made production's ci_jobs take days (CORE-341).
+          // Each group is its own atomic batch; an interrupted step re-checks
+          // presence, so nothing is lost or inserted twice.
+          const until = Date.now() + 3_000;
+          for (;;) {
+            if (!state.group) {
+              // Rows before this offset were found restored; groups only add rows.
+              const skip = Math.min(state.presentInBlock ?? 0, block.block.rows.length);
+              for (const [offset, values] of block.block.rows.entries()) {
+                if (offset < skip) continue;
+                state.presentInBlock = offset;
+                const row = { table: table.name, columns: block.block.columns, values };
+                const parameters: (string | ArrayBuffer | null)[] = [];
+                const where = rowPredicate(table.keys, rowValues(row, table.keys), parameters);
+                if (
+                  !(await db
+                    .prepare(`SELECT 1 AS present FROM ${identifier(table.name)} WHERE ${where}`)
+                    .bind(...parameters)
+                    .first())
+                ) {
+                  state.group = {
+                    rows: [],
+                    index: 0,
+                    relation: 0,
+                    scan: null,
+                    traversalLimit: Object.values(archive.counts).reduce(
+                      (sum, count) => sum + count,
+                      0,
+                    ),
+                  };
+                  addGroupRow(state.group, row, archive.schema.tables);
+                  break;
+                }
               }
             }
-          }
-          if (state.group) {
-            if (
-              await expandInsertGroup(
+            // Every remaining row of this block is restored: move on below.
+            if (!state.group) break;
+            let complete = false;
+            while (
+              !(complete = await expandInsertGroup(
                 db,
                 context,
                 storeId,
@@ -1335,23 +1341,24 @@ export function createD1SpaceCheckpoint(
                 archive,
                 state.relations,
                 state.group,
-              )
-            ) {
-              await db.batch([
-                db.prepare("PRAGMA defer_foreign_keys=ON"),
-                ...state.group.rows.map((row) =>
-                  restoreStatement(
-                    db,
-                    state.ordered.find((table) => table.name === row.table)!,
-                    row.columns,
-                    row.values,
-                    true,
-                  ),
+              )) &&
+              Date.now() < until
+            );
+            if (!complete) return { state, done: false };
+            await db.batch([
+              db.prepare("PRAGMA defer_foreign_keys=ON"),
+              ...state.group.rows.map((row) =>
+                restoreStatement(
+                  db,
+                  state.ordered.find((table) => table.name === row.table)!,
+                  row.columns,
+                  row.values,
+                  true,
                 ),
-              ]);
-              state.group = null;
-            }
-            return { state, done: false };
+              ),
+            ]);
+            state.group = null;
+            if (Date.now() >= until) return { state, done: false };
           }
         }
         const statements = cyclicTables(table, state.ordered).length
