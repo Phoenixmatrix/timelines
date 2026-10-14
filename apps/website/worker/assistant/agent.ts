@@ -11,11 +11,13 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { DurableObject } from "cloudflare:workers";
 import {
+  cutoverControl,
   trackedContext,
   withCutoverAdmission,
   withCutoverAlarmAdmission,
 } from "../durable/cutover-admission.ts";
 import { reportCutoverRuntime } from "../durable/cutover-runtime.ts";
+import { resolveSpaceAccess } from "../spaces/access.ts";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import { createCodeTool } from "@cloudflare/codemode/ai";
@@ -492,6 +494,22 @@ export class Assistant extends DurableObject<Env> implements Purgeable {
   }
 }
 
+/**
+ * Whether a viewer may read a transcript written before the Organization/Space
+ * cutover: only content of the cutover's Spaces existed then, so a live
+ * repository and package read grant in every one of them covers it.
+ */
+async function readsEveryLegacySpace(env: Env, actor: Actor): Promise<boolean> {
+  const run = await cutoverControl(env).status();
+  if (run?.phase !== "active" || !run.manifest.mapping.length) return false;
+  for (const mapping of run.manifest.mapping) {
+    const access = await resolveSpaceAccess(env.DB, actor, mapping.space.id);
+    if (!access || access.grant.repositoryRole === "none" || access.grant.packageRole === "none")
+      return false;
+  }
+  return true;
+}
+
 type AssistantSession = InstanceType<typeof AssistantSession>;
 // SDK protocol identity derives from constructor.name; keep "Assistant".
 const AssistantSession = class Assistant extends AIChatAgent<Env> implements Purgeable {
@@ -584,9 +602,13 @@ const AssistantSession = class Assistant extends AIChatAgent<Env> implements Pur
     await this.token();
     const receipts = await this.ctx.storage.get<ContentReceipt[]>("content-receipts-v4");
     if (!receipts) {
-      // Legacy content is retained verbatim, but its source rights are unprovable.
-      if (this.messages.some((message) => message.role === "assistant"))
+      // Legacy content is retained verbatim, but its source rights are unprovable,
+      // unless the viewer can read everything it could have come from. Checked
+      // on every read: losing any of those grants hides it again.
+      if (this.messages.some((message) => message.role === "assistant")) {
+        if (await readsEveryLegacySpace(this.env, actor)) return;
         throw new AssistantContentUnavailable();
+      }
       await this.ctx.storage.put("content-receipts-v4", []);
       return;
     }
