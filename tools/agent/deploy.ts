@@ -4,6 +4,12 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { readFileSync, readdirSync } from "node:fs";
 import { promisify } from "node:util";
+import { SITE_HOST_VARIABLE, hosts } from "../../apps/site/src/hosts.ts";
+import {
+  DEPLOY_VARIABLE,
+  PRODUCTION_VARIABLES,
+  productionInstance,
+} from "../../apps/website/vite/instance.ts";
 
 // Deploy what changed on main since the deployed Worker versions, from CI.
 //
@@ -14,7 +20,12 @@ import { promisify } from "node:util";
 // changed ci/Dockerfile fails the job after everything else has shipped.
 //
 // The public site (apps/site, CORE-115) is a Worker of its own, assets only,
-// on timelines.fward.dev: it deploys the same way, from its own tag.
+// on its own host: it deploys the same way, from its own tag.
+//
+// The owner's identifiers (account, hosts, D1 and Secrets Store ids, owner
+// and sender addresses) are never in the repository: the deploy job's CI
+// secrets supply them ({@link DEPLOY_SECRETS}). The deploy refuses to start
+// without every one, or when the ids differ from the live Worker's bindings.
 //
 // Each Worker that actually deploys is then recorded as a deployment of this
 // repository (CORE-351), as the job, with what ran: the provider version and
@@ -31,14 +42,102 @@ const cf = join(website, "node_modules/.bin/cf");
 const SITE_WORKER = "gitmatrix-site";
 const site = join(root, "apps/site");
 /**
- * Where each Worker answers in production: `PRODUCTION.host` in
- * apps/website/vite/instance.ts and `PRODUCTION_HOST` in
- * apps/site/cloudflare.config.ts (deploy.test.ts keeps them in step).
+ * What a production deploy needs from its environment: the deploy job's CI
+ * secrets (.gitmatrix/ci.yml), besides CLOUDFLARE_API_TOKEN.
  */
-export const PRODUCTION_URLS: Record<string, string> = {
-  [WORKER]: "https://timelinesapp.fward.dev",
-  [SITE_WORKER]: "https://timelines.fward.dev",
-};
+export const DEPLOY_SECRETS = [
+  "CLOUDFLARE_ACCOUNT_ID",
+  ...Object.values(PRODUCTION_VARIABLES),
+  SITE_HOST_VARIABLE,
+] as const;
+
+/** Set for every build and deploy below: the configs refuse placeholders (vite/instance.ts). */
+const PRODUCTION_DEPLOY = { [DEPLOY_VARIABLE]: "production" };
+
+/** The deploy secrets `env` lacks. */
+export function missingDeploySecrets(env: NodeJS.ProcessEnv): string[] {
+  return DEPLOY_SECRETS.filter((name) => !env[name]?.trim());
+}
+
+/**
+ * Where each Worker answers in production, from the same variables its
+ * config reads (placeholders where they're unset).
+ */
+export function productionUrls(env: NodeJS.ProcessEnv): Record<string, string> {
+  const app = productionInstance({ ...env, [DEPLOY_VARIABLE]: undefined }).host;
+  return {
+    [WORKER]: `https://${app}`,
+    [SITE_WORKER]: `https://${hosts({ ...env, [DEPLOY_VARIABLE]: undefined }).site}`,
+  };
+}
+
+/**
+ * What a live Worker version binds: D1 databases by binding, its Secrets Store
+ * ids, and its text variables by name.
+ */
+export interface LiveBindings {
+  databases: Record<string, string>;
+  stores: string[];
+  texts: Record<string, string>;
+}
+
+/** Read the D1 and Secrets Store ids and text variables from `cf workers versions get`'s bindings. */
+export function liveBindings(
+  bindings: { type: string; name: string; id?: string; store_id?: string; text?: string }[],
+): LiveBindings {
+  return {
+    texts: Object.fromEntries(
+      bindings
+        .filter((b) => b.type === "plain_text" && b.text !== undefined)
+        .map((b) => [b.name, b.text!]),
+    ),
+    databases: Object.fromEntries(
+      bindings.filter((b) => b.type === "d1" && b.id).map((b) => [b.name, b.id!]),
+    ),
+    stores: [
+      ...new Set(
+        bindings.filter((b) => b.type === "secrets_store_secret").map((b) => b.store_id ?? ""),
+      ),
+    ],
+  };
+}
+
+/**
+ * How the deploy's ids and instance values differ from the live Worker's: a
+ * secret set to another resource's id must never migrate or rebind the wrong
+ * database, nor repoint the public URL or the owner's and sender's addresses.
+ * The site's host isn't compared: cf has no command to list a Worker's domains.
+ */
+export function bindingMismatches(live: LiveBindings, env: NodeJS.ProcessEnv): string[] {
+  const problems: string[] = [];
+  for (const [binding, name] of [
+    ["DB", PRODUCTION_VARIABLES.db],
+    ["REGISTRY_DB", PRODUCTION_VARIABLES.registryDb],
+  ] as const)
+    if (live.databases[binding] !== env[name]?.trim())
+      problems.push(`${name} isn't the live ${binding} binding's database`);
+  const store = env[PRODUCTION_VARIABLES.secretsStore]?.trim();
+  if (!live.stores.length || live.stores.some((id) => id !== store))
+    problems.push(
+      `${PRODUCTION_VARIABLES.secretsStore} isn't the live Secrets Store bindings' store`,
+    );
+  // The Worker's config sets these three on every deploy; a live Worker that
+  // lacks one (a first deploy of the variable) has nothing to disagree with.
+  for (const [binding, name, expected] of [
+    [
+      "PUBLIC_URL",
+      PRODUCTION_VARIABLES.host,
+      env.GITMATRIX_PUBLIC_URL ?? `https://${env[PRODUCTION_VARIABLES.host]?.trim()}`,
+    ],
+    ["OWNER_EMAIL", PRODUCTION_VARIABLES.ownerEmail, env[PRODUCTION_VARIABLES.ownerEmail]?.trim()],
+    ["EMAIL_FROM", PRODUCTION_VARIABLES.emailFrom, env[PRODUCTION_VARIABLES.emailFrom]?.trim()],
+  ] as const) {
+    const liveValue = live.texts[binding];
+    if (liveValue !== undefined && liveValue !== expected)
+      problems.push(`${name} doesn't give the live ${binding} (${liveValue})`);
+  }
+  return problems;
+}
 
 /** Migration directories (relative to apps/website) and the D1 binding they target. */
 const MIGRATIONS = [
@@ -149,15 +248,14 @@ function stream(command: string, args: string[], cwd = root, env?: NodeJS.Proces
   execFileSync(command, args, { cwd, env: { ...process.env, ...env }, stdio: "inherit" });
 }
 
-interface Deployed {
+interface Deployed extends LiveBindings {
   tag: string | null;
   /** The version serving most traffic. */
   versionId: string;
   image: string;
-  databases: Record<string, string>;
 }
 
-/** The version serving traffic: its commit tag, CI image and D1 ids. */
+/** The version serving traffic: its commit tag, CI image, and D1 and Secrets Store ids. */
 function deployed(): Deployed {
   const { deployments } = JSON.parse(
     run(cf, ["workers", "deployments", "list", "--worker", WORKER], website),
@@ -168,7 +266,7 @@ function deployed(): Deployed {
     run(cf, ["workers", "versions", "get", current.version_id, "--worker-id", WORKER], website),
   ) as {
     annotations?: Record<string, string>;
-    bindings: { type: string; name: string; id?: string }[];
+    bindings: { type: string; name: string; id?: string; store_id?: string; text?: string }[];
     containers?: { images: Record<string, string> }[];
   };
   const image = version.containers?.[0]?.images.default;
@@ -178,9 +276,7 @@ function deployed(): Deployed {
     tag,
     versionId: current.version_id,
     image,
-    databases: Object.fromEntries(
-      version.bindings.filter((b) => b.type === "d1" && b.id).map((b) => [b.name, b.id!]),
-    ),
+    ...liveBindings(version.bindings),
   };
 }
 
@@ -199,6 +295,14 @@ async function deploy(planOnly: boolean): Promise<void> {
   if (!planOnly && process.env.GITMATRIX_BRANCH !== "main") {
     console.log(JSON.stringify({ event: "deploy.skipped", reason: "not-main" }));
     return;
+  }
+  if (!planOnly) {
+    const missing = missingDeploySecrets(process.env);
+    if (missing.length)
+      throw new Error(
+        `The production deploy needs ${missing.join(", ")}: set each as a CI secret of this ` +
+          "repository (`gm secret set NAME -R <space>/<repo>`), or export it to deploy by hand.",
+      );
   }
   // CI's checkout is shallow (the last 50 commits), and the deployed commit is
   // almost always among them; if it isn't, knownCommit fails and everything deploys.
@@ -332,7 +436,7 @@ export async function recordDeployed(
     recorder.log({ event: "deploy.record.skipped", worker, head, reason, ...extra });
     return false;
   };
-  const url = PRODUCTION_URLS[worker];
+  const url = productionUrls(process.env)[worker];
   if (!url) return warn("no production URL is known for it");
   try {
     const newest = recorder.deployments(worker, cwd).deployments[0];
@@ -517,12 +621,14 @@ function deploySite(
     : true;
   console.log(JSON.stringify({ event: "deploy.site.plan", base, head, site: todo }));
   if (planOnly || !todo) return { deployed: false, previous };
-  stream("vp", ["run", "--no-cache", "site#build"]);
+  // The build writes the site's domain into its build output, so it too is production's.
+  stream("vp", ["run", "--no-cache", "site#build"], root, PRODUCTION_DEPLOY);
   const subject = run("git", ["log", "-1", "--format=%s", head]);
   stream(
     join(site, "node_modules/.bin/cf"),
     ["deploy", "--prebuilt", "--tag", head, "--message", subject.slice(0, 100)],
     site,
+    PRODUCTION_DEPLOY,
   );
   console.log(JSON.stringify({ event: "deploy.site", head }));
   return { deployed: true, previous };
@@ -534,6 +640,16 @@ function deployWebsite(
 ): { deployed: boolean; previous: string | null } {
   const current = deployed();
   const previous = current.versionId;
+  // Before anything ships, the secrets must name the live resources (the
+  // site deploys after this Worker, so it waits on this check too).
+  if (!planOnly) {
+    const mismatches = bindingMismatches(current, process.env);
+    if (mismatches.length)
+      throw new Error(
+        `Refusing to deploy over ${WORKER} ${current.versionId}: ${mismatches.join("; ")}. ` +
+          "Correct the deploy's secrets; nothing was migrated or deployed.",
+      );
+  }
   if (current.tag === head) {
     console.log(JSON.stringify({ event: "deploy.skipped", reason: "already-deployed", head }));
     return { deployed: false, previous };
@@ -572,7 +688,12 @@ function deployWebsite(
   for (const migration of todo.migrations) {
     const id = current.databases[migration.binding];
     if (!id) throw new Error(`The deployed Worker has no ${migration.binding} binding.`);
-    stream(cf, ["d1", "migrations", "apply", id, "--dir", migration.dir], website);
+    stream(
+      cf,
+      ["d1", "migrations", "apply", id, "--dir", migration.dir],
+      website,
+      PRODUCTION_DEPLOY,
+    );
   }
   if (todo.worker) {
     const subject = run("git", ["log", "-1", "--format=%s", head]);
@@ -580,7 +701,11 @@ function deployWebsite(
       cf,
       ["deploy", "--tag", head, "--message", subject.slice(0, 100), "--containers-rollout", "none"],
       website,
-      { GITMATRIX_CI_IMAGE: current.image, GITMATRIX_CUTOVER_CHECKPOINT: head },
+      {
+        ...PRODUCTION_DEPLOY,
+        GITMATRIX_CI_IMAGE: current.image,
+        GITMATRIX_CUTOVER_CHECKPOINT: head,
+      },
     );
     console.log(JSON.stringify({ event: "deploy.worker", head }));
   }

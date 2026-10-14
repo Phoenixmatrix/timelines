@@ -1,6 +1,6 @@
 import { bindings, defineConfig, defineContainer, exports, triggers } from "cf/config";
 import { developmentEnvironment } from "./vite/environment.ts";
-import { cutoverWorkflowNames, deployedInstance, PRODUCTION } from "./vite/instance.ts";
+import { cutoverWorkflowNames, deployedInstance, isProduction } from "./vite/instance.ts";
 import { previewResources } from "./vite/preview.ts";
 
 // Remote services have no local emulator, so dev talks to the real ones
@@ -18,6 +18,10 @@ type Runner = "local" | "sandbox";
 const DEV_KEK = btoa("gitmatrix-development-key-not-secret!");
 /** Signs development sessions only; deployed, the Secrets Store holds the real one. */
 const DEV_AUTH_SECRET = "gitmatrix-development-auth-secret-not-secret";
+/** Development's and previews' owner: the seeded superuser fward (seed/0001_dev.sql). */
+const DEV_OWNER_EMAIL = "fward@example.com";
+/** Development simulates delivery and a preview sends nothing, so no real domain is needed. */
+const DEV_EMAIL_FROM = "timelines@mail.example.com";
 /**
  * The CI image. Deploys from CI pass GITMATRIX_CI_IMAGE, the deployed
  * version's image reference: a Sandbox has no Docker to rebuild it, so CI
@@ -39,10 +43,11 @@ export default defineConfig(({ mode, isPreview }) => {
   const env = runtime.process?.env ?? {};
   const dev = mode === "development";
   const local = developmentEnvironment(env);
-  // What a deploy binds (vite/instance.ts): production's resources, or a
-  // self-hosted instance's when `gm instance deploy` sets
-  // GITMATRIX_INSTANCE_CONFIG. Development and previews keep production's
-  // Worker name and bind resources of their own below.
+  // What a deploy binds (vite/instance.ts): production's resources, its
+  // identifiers from the GITMATRIX_PRODUCTION_* variables, or a self-hosted
+  // instance's when `gm instance deploy` sets GITMATRIX_INSTANCE_CONFIG.
+  // Development and previews keep production's Worker name and bind resources
+  // of their own below.
   const instance = deployedInstance(dev || isPreview ? {} : env);
   const worker = instance.worker;
   if (local.agent && !dev) throw new Error("Agent environments must never deploy");
@@ -68,6 +73,7 @@ export default defineConfig(({ mode, isPreview }) => {
   const container = sandboxed && !preview && env.GITMATRIX_CONTAINER_IMAGES !== "skip";
   const ci = ciSandbox(instance.container, env.GITMATRIX_CI_IMAGE);
   // A preview answers wherever cf put it, so it goes by each request's origin.
+  const emailFrom = dev || preview ? DEV_EMAIL_FROM : instance.emailFrom;
   const publicUrl = preview
     ? undefined
     : dev
@@ -92,7 +98,7 @@ export default defineConfig(({ mode, isPreview }) => {
         : {
             domains: [instance.host],
             workersDev: false,
-            previewUrls: instance === PRODUCTION,
+            previewUrls: isProduction(instance),
           }),
       observability: { enabled: true },
       // Multi-GB hashing/indexing; up to 20,000 historical frames with base/cache I/O.
@@ -321,16 +327,14 @@ export default defineConfig(({ mode, isPreview }) => {
                 secretName: instance.secrets.betterAuth,
               }),
             }),
-        OWNER_EMAIL: bindings.text(instance.owner.email),
+        OWNER_EMAIL: bindings.text(dev || preview ? DEV_OWNER_EMAIL : instance.owner.email),
         // Deployed only: the owner's org, created on their first sign-in. It
         // will hold the gitmatrix repository; development keeps the seed data.
         ...(dev || preview ? {} : { OWNER_ORG: bindings.text(instance.owner.org) }),
-        EMAIL_FROM: bindings.text(instance.emailFrom),
+        EMAIL_FROM: bindings.text(emailFrom),
         // Locally the binding simulates delivery: messages are logged, never sent.
         // A preview sends nothing.
-        ...(preview
-          ? {}
-          : { EMAIL: bindings.sendEmail({ allowedSenderAddresses: [instance.emailFrom] }) }),
+        ...(preview ? {} : { EMAIL: bindings.sendEmail({ allowedSenderAddresses: [emailFrom] }) }),
         // Failed codes and device approvals, per email and per IP. Crossing the
         // limit locks the key out for 15 minutes (auth_lockouts).
         // Namespace ids are account-wide: ~/dev projects use 1001 and 4x01 per
@@ -341,7 +345,7 @@ export default defineConfig(({ mode, isPreview }) => {
           simple: { limit: 5, period: 60 },
         }),
         // Where package clients and CI sandboxes reach gitmatrix. Generated
-        // indexes (Helm, APT, RPM…) embed it; deployed, https://timelinesapp.fward.dev.
+        // indexes (Helm, APT, RPM…) embed it; deployed, https://<the instance's host>.
         ...(publicUrl ? { PUBLIC_URL: bindings.text(publicUrl) } : {}),
       },
       // No consumers or cron in a preview: Worker Previews don't run them, and

@@ -54,6 +54,18 @@ function availableMemory(): number {
 process.env.CLOUDFLARE_CF_AUTH ??= "1";
 
 export default defineConfig({
+  run: {
+    tasks: {
+      // A hand deploy reads GITMATRIX_PRODUCTION_*, GITMATRIX_SITE_HOST and
+      // CLOUDFLARE_ACCOUNT_ID from the operator's environment. The root config
+      // caches scripts, and a cached run filters the environment, so this is a
+      // task (a package.json script of the same name conflicts) that is never cached.
+      deploy: {
+        command: 'GITMATRIX_DEPLOY=production cf deploy --tag "$(git rev-parse HEAD)"',
+        cache: false,
+      },
+    },
+  },
   // The Cloudflare plugin owns the dev server, which clashes with Vitest's own;
   // the unit tests are plain functions and don't need workerd.
   plugins: [

@@ -68,7 +68,7 @@ describe("in a preview", () => {
 
   test("sign-in sends no email and says why", async () => {
     const { env, email } = previewEnv();
-    await expect(sendCode(env, "hello@fward.me", "123456")).rejects.toThrow(/no email/);
+    await expect(sendCode(env, "owner@example.com", "123456")).rejects.toThrow(/no email/);
     expect(email).not.toHaveBeenCalled();
   });
 

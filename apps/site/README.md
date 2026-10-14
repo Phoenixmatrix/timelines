@@ -1,10 +1,20 @@
 # Public site
 
-The public marketing and documentation site for Timelines, served at
-[timelines.fward.dev](https://timelines.fward.dev) (CORE-115). It is built with
-[Astro](https://astro.build) as static pages and served by a Worker of its own,
-`gitmatrix-site`, that has no code: only its assets. Nobody signs in here; the
-header links to the web app at timelinesapp.fward.dev.
+The public marketing and documentation site for Timelines (CORE-115). It is
+built with [Astro](https://astro.build) as static pages and served by a Worker
+of its own, `gitmatrix-site`, that has no code: only its assets. Nobody signs in
+here; the header links to the web app.
+
+## Hosts
+
+The site's host and the web app's are the production deploy's, not the
+source's: `src/hosts.ts` reads `GITMATRIX_SITE_HOST` and
+`GITMATRIX_PRODUCTION_HOST` (the deploy job's CI secrets), and builds without
+them use `site.example.com` and `timelines.example.com`. The docs link the web
+app as `https://timelines.example.com`; the build swaps in the real address in
+every page (`appUrlIntegration`), and `src/site.ts` `APP_URL` is defined at
+build. With `GITMATRIX_DEPLOY=production` (the deploy sets it), a build without
+both hosts fails.
 
 ## Layout
 

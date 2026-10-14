@@ -17,7 +17,7 @@ afterEach(() => {
 describe("isTransientArtifactsError", () => {
   test("network failures on the way are transient", () => {
     for (const message of [
-      "rust/cxx/kj-rs-io/ffi.rs:186: failed: getaddrinfo(): DNS lookup failed. host = gitmatrix.fward.workers.dev",
+      "rust/cxx/kj-rs-io/ffi.rs:186: failed: getaddrinfo(): DNS lookup failed. host = gitmatrix.example.workers.dev",
       "getaddrinfo EAI_AGAIN example.com: Temporary failure in name resolution",
       "read ECONNRESET",
       "connect ECONNREFUSED 127.0.0.1:443",

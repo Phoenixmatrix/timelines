@@ -46,7 +46,7 @@ export const CUTOVER_WORKFLOWS = {
 } as const;
 export type CutoverWorkflow = keyof typeof CUTOVER_WORKFLOWS;
 export type CutoverWorkflowNames = Record<CutoverWorkflow, string>;
-/** Production's workflow names (vite/instance.ts PRODUCTION), which its census must name exactly. */
+/** Production's workflow names (vite/instance.ts productionInstance), which its census must name exactly. */
 export const PRODUCTION_WORKFLOW_NAMES: CutoverWorkflowNames = {
   "ci-run": "ci-run",
   "knowledge-build": "knowledge-build",

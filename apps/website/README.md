@@ -10,8 +10,8 @@ The public product name is **Timelines**. The app lockup reuses the approved
 Pounce cat with an outlined Figtree Timelines wordmark at the approved weight and spacing; the
 four-colour timeline-scope icon remains a separate navigation symbol.
 Internal `GitmatrixLogo`, `gm`, `.gitmatrix`, protocol identifiers, resource
-names and sender addresses remain unchanged. The production application uses
-`timelinesapp.fward.dev` and its canonical repository is `matrixorg/timelines`.
+names and sender addresses remain unchanged. The canonical repository is
+`matrixorg/timelines`.
 Sign-in email display names and copy use Timelines.
 
 ```
@@ -280,8 +280,8 @@ end. No file contents are read to calculate history.
 
 People sign in with an emailed one-time code ([Better Auth](https://www.better-auth.com),
 `worker/better-auth.ts`, under `/api/identity`). Sign-up is **invite only**: a
-code is only sent to an existing user, the instance owner (`OWNER_EMAIL`,
-hello@fward.me) or an address a site admin invited at `/settings/invites`;
+code is only sent to an existing user, the instance owner (`OWNER_EMAIL`) or
+an address a site admin invited at `/settings/invites`;
 anyone else gets the same "check your email" answer. Failed codes and device
 approvals count against the email and the IP through the `AUTH_FAILURES`
 rate-limit binding; past the limit the key is locked out for 15 minutes.
@@ -304,20 +304,23 @@ admin can set a new password on any account with an email
 `--revoke-tokens` (a checkbox on the page) its access tokens too.
 
 - **Locally**, codes print in the dev server's log (the Email Service binding
-  only simulates delivery), and hello@fward.me is the seeded superuser `fward`,
-  reachable by email code or as a persona.
+  only simulates delivery), and fward@example.com (development's
+  `OWNER_EMAIL`) is the seeded superuser `fward`, reachable by email code or as
+  a persona. Previews use the same owner and send nothing.
 - **Deployed**, the owner's first sign-in makes them a site admin and the owner
   of the `matrixorg` organization (`OWNER_ORG`); the database starts with no
-  other data. Codes are sent from gitmatrix@mail.fward.dev. Mirror pushes are
+  other data. Codes are sent from `EMAIL_FROM`, an address on the account's
+  Email Sending domain. Mirror pushes are
   attributed to the owner account, whoever configured the mirror.
 - **gm** signs in through the browser: `gm auth login` shows a code and a link
   to `/device`, you approve it while signed in, and gm trades that one-time
   session for a personal access token (`POST /api/tokens/device`).
 
 Deploying needs the `BETTER_AUTH_SECRET` and `REGISTRY_KEK` secrets. The Worker
-serves https://timelinesapp.fward.dev (override with `GITMATRIX_PUBLIC_URL` at deploy
-time), with production-only D1, Artifacts, Vectorize and AI Search resources so it
-never shares data with `vp dev`. mail.fward.dev is enabled for Email Sending.
+serves `https://$GITMATRIX_PRODUCTION_HOST` (override with `GITMATRIX_PUBLIC_URL`
+at deploy time), with production-only D1, Artifacts, Vectorize and AI Search
+resources so it never shares data with `vp dev`. The sender's domain must be
+enabled for Email Sending.
 
 **CI deploys main.** Once check, test and build pass on main, the `deploy` job
 (`tools/agent/deploy.ts`) ships only what changed since the deployed version:
@@ -336,6 +339,40 @@ never shares data with `vp dev`. mail.fward.dev is enabled for Email Sending.
   Jobs that start after cf's container rollout run in the new image.
 
 The job's `CLOUDFLARE_API_TOKEN` is a repository CI secret (`gm secret set`).
+
+**Production deploy configuration.** The production instance's identifiers are
+never in the source: `vite/instance.ts` reads them from the environment, and
+the `deploy` job lists them as CI secrets, as it does `CLOUDFLARE_API_TOKEN`.
+Without them, checks, tests and builds resolve the config with placeholders
+(`timelines.example.com`, all-zero ids, `owner@example.com`), as
+`vite/production-config.json` records.
+
+| Secret                                  | What it is                                         | Jobs              |
+| --------------------------------------- | -------------------------------------------------- | ----------------- |
+| `CLOUDFLARE_ACCOUNT_ID`                 | The Cloudflare account                             | deploy, preview\* |
+| `GITMATRIX_PRODUCTION_HOST`             | The web app's hostname (also the site's app links) | deploy            |
+| `GITMATRIX_SITE_HOST`                   | The public site's hostname (`apps/site`)           | deploy            |
+| `GITMATRIX_PRODUCTION_DB_ID`            | The `gitmatrix` D1 database's id                   | deploy            |
+| `GITMATRIX_PRODUCTION_REGISTRY_DB_ID`   | The `gitmatrix-registry` D1 database's id          | deploy            |
+| `GITMATRIX_PRODUCTION_SECRETS_STORE_ID` | The account's Secrets Store id                     | deploy            |
+| `GITMATRIX_PRODUCTION_OWNER_EMAIL`      | `OWNER_EMAIL`, the instance owner                  | deploy            |
+| `GITMATRIX_PRODUCTION_EMAIL_FROM`       | `EMAIL_FROM`, where sign-in codes come from        | deploy            |
+| `GITMATRIX_PREVIEW_ACCESS_ISSUER`       | The previews' Cloudflare Access team origin        | preview           |
+| `GITMATRIX_PREVIEW_ACCESS_AUD`          | The previews' Access application audience          | preview           |
+
+\* `preview`, `preview-teardown` and `preview-reconcile`.
+
+Set each with `gm secret set NAME -R matrixorg/timelines`, which asks for the
+value without echoing it, or reads it from stdin (`printf %s "$VALUE" | gm
+secret set NAME -R …`). CI masks each value in job logs. Every build and deploy
+`tools/agent/deploy.ts` runs sets `GITMATRIX_DEPLOY=production`, and the
+configs then refuse to resolve with any of these missing; before migrating or
+deploying anything, the deploy also checks that the D1 and Secrets Store ids
+are the live Worker's bindings and stops if they aren't. A missing secret is
+silently left out of a job, so it fails there, never with a placeholder.
+Deploying by hand (`vp run deploy`, which sets `GITMATRIX_DEPLOY=production`
+too), export the same variables first, for instance from a file kept outside
+the repository: `set -a; . ~/.config/timelines/production.env; set +a`.
 
 **Adding a migration.** Name it by the current UTC time,
 `YYYYMMDDHHMMSS_snake_case_description.sql` (for example
@@ -797,7 +834,7 @@ for headless bootstrap. Always use a separate browser context for each environme
 | Marco      | Orbit Labs Organization owner with an explicit Orbit Space admin grant           |
 | Jun        | Orbit Space member (repository read), plus write collaborator on `orbit/engine`  |
 | Sam        | Read collaborator on `orbit/engine`; personal Space contains private `sam/notes` |
-| Francois   | hello@fward.me: superuser, also signs in by email code                           |
+| Francois   | fward@example.com: superuser, also signs in by email code                        |
 | Signed out | Public repos, read only                                                          |
 
 Repository roles combine public read, the explicit Space repository baseline,
@@ -3641,8 +3678,8 @@ the artifact digest when present, are what explicit attribution needs).
   `gm deploy list` takes `--provider-version` and `--source`.
 - **Who records it here.** The production deploy job
   (`tools/agent/deploy.ts`) records each Worker it actually deploys
-  (`gitmatrix` on timelinesapp.fward.dev, `gitmatrix-site` on
-  timelines.fward.dev) in `production`, as the job, for the deployed commit.
+  (`gitmatrix` on `GITMATRIX_PRODUCTION_HOST`, `gitmatrix-site` on
+  `GITMATRIX_SITE_HOST`) in `production`, as the job, for the deployed commit.
   It deploys both Workers first, then records them, so recording never holds
   up a deploy. For each it reads `cf workers deployments list`: the newest
   deployment's id, its version with the most traffic and that version's
@@ -3856,9 +3893,9 @@ expiry ─▶ preview run (teardown) ─▶ preview-teardown job ─▶ … prev
 
 **Cloudflare Access, independent of preview lifetime.** The account's
 `Gitmatrix previews` self-hosted Access application protects
-`*-gitmatrix.fward.workers.dev`. This includes named timeline previews,
-deployment URLs, and production-version preview URLs, but not
-`timelinesapp.fward.dev`. The application and its policies are permanent:
+`*-gitmatrix.<subdomain>.workers.dev`. This includes named timeline previews,
+deployment URLs, and production-version preview URLs, but not the production
+host. The application and its policies are permanent:
 **preview teardown must never delete them.** A Preview can disappear from
 Cloudflare's management API while its old route still serves (CORE-216);
 the hostname policy continues to require authentication even then.
@@ -3930,8 +3967,8 @@ not bearer capabilities.
   there. `cloudflare.config.ts` does it: deployed, the Worker sets
   `previewUrls: true` and `workersDev: false`, and each production deploy
   sets the subdomain to `enabled: false`, `previews_enabled: true` (before
-  previews: both false). Production itself still answers only on
-  timelinesapp.fward.dev. Each production version is also reachable at its own
+  previews: both false). Production itself still answers only on its
+  own host. Each production version is also reachable at its own
   version preview URL, `<version>-gitmatrix.<subdomain>.workers.dev`, with
   production's bindings, **behind the same persistent Access application**.
   Sign-in there does not share production cookies, since Better Auth trusts
@@ -3947,19 +3984,19 @@ account's, shared with production. So when cf builds a Preview
 tools/preview made from `GITMATRIX_PREVIEW_*` (`vite/preview.ts`; a missing
 one fails the build rather than falling back to production's) and:
 
-| Production                                          | In a preview                                               |
-| --------------------------------------------------- | ---------------------------------------------------------- |
-| `DB`, `REGISTRY_DB`                                 | The timeline's own D1s                                     |
-| `REGISTRY_BLOBS` (`gitmatrix-registry-blobs`)       | The timeline's own bucket                                  |
-| `ARTIFACTS` (`gitmatrix`)                           | The timeline's own namespace                               |
-| `CI_RUN`, `KNOWLEDGE_BUILD` and their Workflows     | Left out: Workflow names are the account's                 |
-| `JOBS`, `REGISTRY_JOBS`, queue consumers, cron      | Left out: no mirror syncs, release notes or package sweeps |
-| `EMAIL`                                             | Left out: persona sign-in instead                          |
-| `AI`, `VECTORS`, `SEARCH`                           | Left out: no knowledge builds, wiki or assistant           |
-| Secrets Store (auth secret, registry key)           | Text bindings from a secret generated for each create      |
-| `timelinesapp.fward.dev`, `PUBLIC_URL`, `OWNER_ORG` | Left out: a preview answers at its own URL                 |
-| CI Sandbox container                                | Left out: previews run no CI                               |
-| `AUTH_FAILURES` namespace 4401                      | 4402                                                       |
+| Production                                      | In a preview                                               |
+| ----------------------------------------------- | ---------------------------------------------------------- |
+| `DB`, `REGISTRY_DB`                             | The timeline's own D1s                                     |
+| `REGISTRY_BLOBS` (`gitmatrix-registry-blobs`)   | The timeline's own bucket                                  |
+| `ARTIFACTS` (`gitmatrix`)                       | The timeline's own namespace                               |
+| `CI_RUN`, `KNOWLEDGE_BUILD` and their Workflows | Left out: Workflow names are the account's                 |
+| `JOBS`, `REGISTRY_JOBS`, queue consumers, cron  | Left out: no mirror syncs, release notes or package sweeps |
+| `EMAIL`                                         | Left out: persona sign-in instead                          |
+| `AI`, `VECTORS`, `SEARCH`                       | Left out: no knowledge builds, wiki or assistant           |
+| Secrets Store (auth secret, registry key)       | Text bindings from a secret generated for each create      |
+| The production host, `PUBLIC_URL`, `OWNER_ORG`  | Left out: a preview answers at its own URL                 |
+| CI Sandbox container                            | Left out: previews run no CI                               |
+| `AUTH_FAILURES` namespace 4401                  | 4402                                                       |
 
 Behind that, the build binds `PREVIEW_MODE=true`, and `worker/preview.ts`
 guards each effect that would leave the preview, in case a binding ever
@@ -4045,7 +4082,7 @@ commit:4f2a run:42 by:jun tag:latest`, with `-` to exclude);
 - **npm login** works both ways: an access token as the password, or
   `--auth-type=web`, which approves the login at `/cli-auth/npm/:id`.
 
-Deployed, package indexes embed https://timelinesapp.fward.dev (or
+Deployed, package indexes embed `https://$GITMATRIX_PRODUCTION_HOST` (or
 `GITMATRIX_PUBLIC_URL`), and the `REGISTRY_KEK` secret seals keys. Development uses a fixed public key. `pnpm run
 db:migrate` applies both databases' migrations. Space handles exclude every
 reserved application and registry route prefix, including `accounts` and

@@ -15,7 +15,7 @@
     "compatibilityDate": "2026-09-30",
     "compatibilityFlags": ["nodejs_compat"],
     "entrypoint": "./worker/index.ts",
-    "domains": ["timelinesapp.fward.dev"],
+    "domains": ["timelines.example.com"],
     "workersDev": false,
     "previewUrls": true,
     "observability": {
@@ -48,7 +48,7 @@
       "DB": {
         "type": "d1",
         "name": "gitmatrix",
-        "id": "3ed3e1ec-bd11-4f8e-bfee-d7c0bcb89e77"
+        "id": "00000000-0000-4000-8000-000000000000"
       },
       "TRACKER": {
         "type": "durable-object",
@@ -154,7 +154,7 @@
       "REGISTRY_DB": {
         "type": "d1",
         "name": "gitmatrix-registry",
-        "id": "caea2f3d-d4d3-43cd-aaf9-f14a3d84621d"
+        "id": "00000000-0000-4000-8000-000000000001"
       },
       "REGISTRY_BLOBS": {
         "type": "r2",
@@ -193,17 +193,17 @@
       },
       "REGISTRY_KEK_SECRET": {
         "type": "secrets-store-secret",
-        "storeId": "2dcc6c92ee1743548ad303924b4e0f11",
+        "storeId": "00000000000000000000000000000000",
         "secretName": "gitmatrix_registry_kek"
       },
       "BETTER_AUTH_SECRET_SECRET": {
         "type": "secrets-store-secret",
-        "storeId": "2dcc6c92ee1743548ad303924b4e0f11",
+        "storeId": "00000000000000000000000000000000",
         "secretName": "gitmatrix_better_auth_secret"
       },
       "OWNER_EMAIL": {
         "type": "text",
-        "value": "hello@fward.me"
+        "value": "owner@example.com"
       },
       "OWNER_ORG": {
         "type": "text",
@@ -211,11 +211,11 @@
       },
       "EMAIL_FROM": {
         "type": "text",
-        "value": "gitmatrix@mail.fward.dev"
+        "value": "timelines@mail.example.com"
       },
       "EMAIL": {
         "type": "send-email",
-        "allowedSenderAddresses": ["gitmatrix@mail.fward.dev"]
+        "allowedSenderAddresses": ["timelines@mail.example.com"]
       },
       "AUTH_FAILURES": {
         "type": "rate-limit",
@@ -227,7 +227,7 @@
       },
       "PUBLIC_URL": {
         "type": "text",
-        "value": "https://timelinesapp.fward.dev"
+        "value": "https://timelines.example.com"
       }
     },
     "triggers": [

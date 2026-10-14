@@ -1502,7 +1502,7 @@ a running `gm` binary. Symlinks and nonregular destinations are refused.
 `--dry-run` checks remote metadata without creating files or directories.
 Add the bin directory to `PATH` yourself; no shell configuration is edited.
 
-The `matrixorg/timelines` pipeline on timelinesapp.fward.dev publishes Linux x86-64 and ARM64 release
+The `matrixorg/timelines` pipeline on the production instance publishes Linux x86-64 and ARM64 release
 binaries as `gm/<apps/cli tree id>/<os>-<arch>/gm`: the git tree id of the CLI's
 source (`git rev-parse HEAD:apps/cli`, `Cargo.lock` included). The same source
 always has the same version, so unrelated pushes and reruns reuse the existing

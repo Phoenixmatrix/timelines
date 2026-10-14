@@ -1,6 +1,7 @@
 // Self-hosted instances (`gm instance`): a second copy of Gitmatrix in a
 // Cloudflare account binds only its own resources, and the canonical
-// production deploy resolves exactly as it did before instances existed.
+// production deploy resolves exactly as it did before instances existed, its
+// owner's identifiers supplied by the environment (the deploy's CI secrets).
 
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,17 +9,33 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import config from "../cloudflare.config.ts";
 import {
+  DEPLOY_VARIABLE,
   INSTANCE_VARIABLE,
-  PRODUCTION,
+  PRODUCTION_PLACEHOLDERS,
+  PRODUCTION_VARIABLES,
   censusInstance,
   cutoverWorkflowNames,
   parseInstance,
+  productionInstance,
   type Instance,
 } from "./instance.ts";
 import { previewVariables, type PreviewResources } from "./preview.ts";
 
-/** Production's resolved config, as it was before instances existed. */
+/** Production's resolved config, as it was before instances existed, with placeholder identifiers. */
 const PRODUCTION_CONFIG = join(import.meta.dirname, "production-config.json");
+
+/** Real-looking production identifiers, as the deploy job's secrets supply them. */
+const LIVE = {
+  host: "timelines.acme.dev",
+  db: "5a1e0c0d-1111-4aaa-8bbb-0123456789ab",
+  registryDb: "5a1e0c0d-2222-4aaa-8bbb-0123456789ab",
+  secretsStore: "5a1e0c0d33334aaa8bbb0123456789ab",
+  ownerEmail: "founder@acme.dev",
+  emailFrom: "timelines@mail.acme.dev",
+};
+const LIVE_ENV: Record<string, string> = Object.fromEntries(
+  Object.entries(PRODUCTION_VARIABLES).map(([key, name]) => [name, LIVE[key as keyof typeof LIVE]]),
+);
 
 const preview: PreviewResources = {
   name: "timeline-demo",
@@ -63,7 +80,7 @@ const demo = {
     search: "gitmatrix-demo",
   },
   secrets: {
-    store: "2dcc6c92ee1743548ad303924b4e0f11",
+    store: LIVE.secretsStore,
     registryKek: "gitmatrix_demo_registry_kek",
     betterAuth: "gitmatrix_demo_better_auth_secret",
   },
@@ -126,6 +143,51 @@ describe("production", () => {
     if (update) writeFileSync(PRODUCTION_CONFIG, JSON.stringify(built, null, 2) + "\n");
     expect(built).toEqual(JSON.parse(readFileSync(PRODUCTION_CONFIG, "utf8")));
   });
+
+  test("binds the identifiers its deploy supplies, in place of every placeholder", async () => {
+    const built = JSON.stringify(await build({ ...LIVE_ENV, [DEPLOY_VARIABLE]: "production" }));
+    let expected = readFileSync(PRODUCTION_CONFIG, "utf8");
+    for (const [key, placeholder] of Object.entries(PRODUCTION_PLACEHOLDERS))
+      expected = expected.replaceAll(placeholder, LIVE[key as keyof typeof LIVE]);
+    expect(JSON.parse(built)).toEqual(JSON.parse(expected));
+    const { worker } = JSON.parse(built) as Built;
+    expect(worker.domains).toEqual([LIVE.host]);
+    expect(worker.env.DB).toMatchObject({ id: LIVE.db });
+    expect(worker.env.REGISTRY_DB).toMatchObject({ id: LIVE.registryDb });
+    expect(worker.env.REGISTRY_KEK_SECRET).toMatchObject({ storeId: LIVE.secretsStore });
+    expect(worker.env.OWNER_EMAIL).toMatchObject({ value: LIVE.ownerEmail });
+    expect(worker.env.EMAIL_FROM).toMatchObject({ value: LIVE.emailFrom });
+    expect(worker.env.PUBLIC_URL).toMatchObject({ value: `https://${LIVE.host}` });
+    expect(worker).toMatchObject({ workersDev: false, previewUrls: true });
+  });
+
+  test("a production deploy refuses to bind placeholders", async () => {
+    const message = /GITMATRIX_PRODUCTION_HOST, .*GITMATRIX_PRODUCTION_EMAIL_FROM/;
+    await expect(async () => build({ [DEPLOY_VARIABLE]: "production" })).rejects.toThrow(message);
+    const partial: Record<string, string> = { ...LIVE_ENV, [DEPLOY_VARIABLE]: "production" };
+    delete partial.GITMATRIX_PRODUCTION_SECRETS_STORE_ID;
+    await expect(async () => build(partial)).rejects.toThrow(
+      /needs GITMATRIX_PRODUCTION_SECRETS_STORE_ID\./,
+    );
+    expect(() =>
+      productionInstance({ ...LIVE_ENV, GITMATRIX_PRODUCTION_DB_ID: "not-an-id" }),
+    ).toThrow(/GITMATRIX_PRODUCTION_DB_ID/);
+  });
+
+  test("development and previews never take production's owner or sender", async () => {
+    vi.stubEnv(DEPLOY_VARIABLE, "production");
+    for (const [key, value] of Object.entries(LIVE_ENV)) vi.stubEnv(key, value);
+    const factory = config as unknown as (context: {
+      mode: string;
+      isPreview: boolean;
+    }) => Built | Promise<Built>;
+    const development = JSON.stringify(await factory({ mode: "development", isPreview: false }));
+    for (const value of Object.values(LIVE)) expect(development).not.toContain(value);
+    expect(development).toContain("fward@example.com");
+    for (const [key, value] of Object.entries(previewVariables(preview))) vi.stubEnv(key, value);
+    const previewed = JSON.stringify(await factory({ mode: "production", isPreview: true }));
+    for (const value of Object.values(LIVE)) expect(previewed).not.toContain(value);
+  });
 });
 
 describe("an instance", () => {
@@ -174,7 +236,7 @@ describe("an instance", () => {
 
   test("shares nothing with production but the account's Secrets Store", async () => {
     const instance = await build({ [INSTANCE_VARIABLE]: instanceFile(demo) });
-    const production = await build();
+    const production = await build(LIVE_ENV);
     const ours = new Set(strings(instance));
     const shared = strings(production).filter(
       (value) =>
@@ -185,7 +247,7 @@ describe("an instance", () => {
     );
     expect(new Set(shared)).toEqual(
       new Set([
-        "2dcc6c92ee1743548ad303924b4e0f11",
+        LIVE.secretsStore,
         "2026-09-30",
         "nodejs_compat",
         "single-page-application",
@@ -265,7 +327,7 @@ describe("parseInstance", () => {
     expect(() => parseInstance({ ...demo, rateLimitNamespace: "4401" })).toThrow(
       /rateLimitNamespace/,
     );
-    expect(() => parseInstance({ ...demo, host: PRODUCTION.host })).toThrow(/host/);
+    expect(() => parseInstance({ ...demo, host: LIVE.host }, LIVE_ENV)).toThrow(/host/);
     expect(() => parseInstance({ ...demo, ai: { ...demo.ai, search: "gitmatrix-prod" } })).toThrow(
       /ai.search/,
     );
@@ -278,8 +340,17 @@ describe("parseInstance", () => {
     expect(() => parseInstance({})).toThrow(/Invalid instance file/);
     expect(() => parseInstance({ ...demo, name: "preview-x" })).toThrow(/preview-/);
     expect(() => parseInstance({ ...demo, name: "acme-registry" })).toThrow(/-registry/);
-    expect(() => parseInstance({ ...demo, db: { ...demo.db, id: PRODUCTION.db.id } })).toThrow(
+    expect(() => parseInstance({ ...demo, db: { ...demo.db, id: LIVE.db } }, LIVE_ENV)).toThrow(
       /db.id/,
     );
+  });
+
+  test("never mistakes production's placeholders for its resources", () => {
+    const placeholders = {
+      ...demo,
+      host: PRODUCTION_PLACEHOLDERS.host,
+      db: { ...demo.db, id: PRODUCTION_PLACEHOLDERS.db },
+    };
+    expect(parseInstance(placeholders, {}).host).toBe(PRODUCTION_PLACEHOLDERS.host);
   });
 });

@@ -17,10 +17,10 @@ describe("scanRefs", () => {
   test("finds tracker issue URLs of any origin, whole", () => {
     expect(
       refs(
-        "See https://gitmatrix.fward.dev/tracker/matrixorg/issues/CORE-22, and http://x.test:5180/tracker/a/issues/abc-1.",
+        "See https://timelines.example.com/tracker/matrixorg/issues/CORE-22, and http://x.test:5180/tracker/a/issues/abc-1.",
       ),
     ).toEqual([
-      "issue-url:https://gitmatrix.fward.dev/tracker/matrixorg/issues/CORE-22",
+      "issue-url:https://timelines.example.com/tracker/matrixorg/issues/CORE-22",
       "issue-url:http://x.test:5180/tracker/a/issues/abc-1",
     ]);
     // Inside someone else's address, nothing is a ref.

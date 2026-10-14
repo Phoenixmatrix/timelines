@@ -1,19 +1,41 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { test } from "node:test";
 import {
   assertOrdinaryOwnershipMigration,
+  bindingMismatches,
+  DEPLOY_SECRETS,
   deployAndRecord,
+  liveBindings,
   liveRecorder,
+  missingDeploySecrets,
   plan,
-  PRODUCTION_URLS,
+  productionUrls,
   recordDeployed,
   sitePlan,
   type Recorder,
   type WorkerDeployments,
 } from "./deploy.ts";
-import { PRODUCTION } from "../../apps/website/vite/instance.ts";
+import { PRODUCTION_PLACEHOLDERS } from "../../apps/website/vite/instance.ts";
+import { SITE_HOST_PLACEHOLDER } from "../../apps/site/src/hosts.ts";
+
+// recordDeployed reads the production hosts from the environment: these
+// tests use the placeholders, whatever this shell exports.
+for (const name of DEPLOY_SECRETS) delete process.env[name];
+delete process.env.GITMATRIX_DEPLOY;
+const APP_URL = `https://${PRODUCTION_PLACEHOLDERS.host}`;
+const SITE_URL = `https://${SITE_HOST_PLACEHOLDER}`;
+
+/** The deploy job's secrets, as CI sets them. */
+const SECRETS = {
+  CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+  GITMATRIX_PRODUCTION_HOST: "timelines.acme.dev",
+  GITMATRIX_SITE_HOST: "www.acme.dev",
+  GITMATRIX_PRODUCTION_DB_ID: "5a1e0c0d-1111-4aaa-8bbb-0123456789ab",
+  GITMATRIX_PRODUCTION_REGISTRY_DB_ID: "5a1e0c0d-2222-4aaa-8bbb-0123456789ab",
+  GITMATRIX_PRODUCTION_SECRETS_STORE_ID: "5a1e0c0d33334aaa8bbb0123456789ab",
+  GITMATRIX_PRODUCTION_OWNER_EMAIL: "founder@acme.dev",
+  GITMATRIX_PRODUCTION_EMAIL_FROM: "timelines@mail.acme.dev",
+};
 
 const dirs = (paths: string[]) => plan(paths).migrations.map((m) => m.dir);
 
@@ -176,7 +198,7 @@ await test("each Worker that deployed is recorded with what ran; a skipped one i
     "deploy",
     "record",
     "--url",
-    "https://timelinesapp.fward.dev",
+    APP_URL,
     "--environment",
     "production",
     "--commit",
@@ -215,7 +237,7 @@ await test("the site records too, without --replaces when nothing served before"
     }),
     true,
   );
-  assert.equal(flag(calls[0]!, "--url"), "https://timelines.fward.dev");
+  assert.equal(flag(calls[0]!, "--url"), SITE_URL);
   assert.equal(flag(calls[0]!, "--service"), "gitmatrix-site");
   assert.equal(flag(calls[0]!, "--deployed-at"), NOW, "Without cf's time, now");
   assert.equal(calls[0]!.includes("--replaces"), false);
@@ -359,16 +381,94 @@ await test("a deploy that fails stops before recording, as before", async () => 
   assert.deepEqual(calls, []);
 });
 
-await test("production URLs match each Worker's configured host", () => {
-  const host = (path: string) =>
-    /PRODUCTION_HOST = "([^"]+)"/.exec(
-      readFileSync(join(import.meta.dirname, "../..", path), "utf8"),
-    )?.[1];
-  assert.equal(PRODUCTION_URLS.gitmatrix, `https://${PRODUCTION.host}`);
-  assert.equal(
-    PRODUCTION_URLS["gitmatrix-site"],
-    `https://${host("apps/site/cloudflare.config.ts")}`,
+await test("production URLs come from the hosts the deploy's secrets set", () => {
+  assert.deepEqual(productionUrls({}), { gitmatrix: APP_URL, "gitmatrix-site": SITE_URL });
+  assert.deepEqual(productionUrls(SECRETS), {
+    gitmatrix: "https://timelines.acme.dev",
+    "gitmatrix-site": "https://www.acme.dev",
+  });
+});
+
+await test("a deploy needs every one of its secrets", () => {
+  assert.deepEqual(missingDeploySecrets(SECRETS), []);
+  assert.deepEqual(missingDeploySecrets({}), [...DEPLOY_SECRETS]);
+  assert.deepEqual(missingDeploySecrets({ ...SECRETS, GITMATRIX_SITE_HOST: " " }), [
+    "GITMATRIX_SITE_HOST",
+  ]);
+  assert.equal(DEPLOY_SECRETS.length, 8);
+});
+
+await test("a deploy refuses secrets that don't name the live Worker's resources", () => {
+  const live = liveBindings([
+    { type: "d1", name: "DB", id: SECRETS.GITMATRIX_PRODUCTION_DB_ID },
+    { type: "d1", name: "REGISTRY_DB", id: SECRETS.GITMATRIX_PRODUCTION_REGISTRY_DB_ID },
+    {
+      type: "secrets_store_secret",
+      name: "REGISTRY_KEK_SECRET",
+      store_id: SECRETS.GITMATRIX_PRODUCTION_SECRETS_STORE_ID,
+    },
+    {
+      type: "secrets_store_secret",
+      name: "BETTER_AUTH_SECRET_SECRET",
+      store_id: SECRETS.GITMATRIX_PRODUCTION_SECRETS_STORE_ID,
+    },
+    { type: "plain_text", name: "OWNER_ORG", text: "acme" },
+    {
+      type: "plain_text",
+      name: "PUBLIC_URL",
+      text: `https://${SECRETS.GITMATRIX_PRODUCTION_HOST}`,
+    },
+    { type: "plain_text", name: "OWNER_EMAIL", text: SECRETS.GITMATRIX_PRODUCTION_OWNER_EMAIL },
+    { type: "plain_text", name: "EMAIL_FROM", text: SECRETS.GITMATRIX_PRODUCTION_EMAIL_FROM },
+  ]);
+  assert.deepEqual(live.stores, [SECRETS.GITMATRIX_PRODUCTION_SECRETS_STORE_ID]);
+  assert.deepEqual(bindingMismatches(live, SECRETS), []);
+  const swapped = {
+    ...SECRETS,
+    GITMATRIX_PRODUCTION_DB_ID: SECRETS.GITMATRIX_PRODUCTION_REGISTRY_DB_ID,
+    GITMATRIX_PRODUCTION_REGISTRY_DB_ID: SECRETS.GITMATRIX_PRODUCTION_DB_ID,
+  };
+  assert.deepEqual(bindingMismatches(live, swapped), [
+    "GITMATRIX_PRODUCTION_DB_ID isn't the live DB binding's database",
+    "GITMATRIX_PRODUCTION_REGISTRY_DB_ID isn't the live REGISTRY_DB binding's database",
+  ]);
+  assert.match(
+    bindingMismatches(live, {
+      ...SECRETS,
+      GITMATRIX_PRODUCTION_SECRETS_STORE_ID: "f".repeat(32),
+    }).join(),
+    /GITMATRIX_PRODUCTION_SECRETS_STORE_ID/,
   );
+  // A live version without a store binding can't vouch for the secret.
+  assert.equal(bindingMismatches({ ...live, stores: [] }, SECRETS).length, 1);
+  // The live public URL, owner and sender must be the ones the deploy would set.
+  assert.deepEqual(
+    bindingMismatches(live, { ...SECRETS, GITMATRIX_PRODUCTION_HOST: "other.example.com" }),
+    [
+      `GITMATRIX_PRODUCTION_HOST doesn't give the live PUBLIC_URL (https://${SECRETS.GITMATRIX_PRODUCTION_HOST})`,
+    ],
+  );
+  assert.match(
+    bindingMismatches(live, {
+      ...SECRETS,
+      GITMATRIX_PRODUCTION_OWNER_EMAIL: "x@example.com",
+    }).join(),
+    /GITMATRIX_PRODUCTION_OWNER_EMAIL doesn't give the live OWNER_EMAIL/,
+  );
+  assert.match(
+    bindingMismatches(live, {
+      ...SECRETS,
+      GITMATRIX_PRODUCTION_EMAIL_FROM: "x@example.com",
+    }).join(),
+    /GITMATRIX_PRODUCTION_EMAIL_FROM doesn't give the live EMAIL_FROM/,
+  );
+  // GITMATRIX_PUBLIC_URL overrides the URL the config binds.
+  assert.deepEqual(
+    bindingMismatches(live, { ...SECRETS, GITMATRIX_PUBLIC_URL: "https://x.test" }).length,
+    1,
+  );
+  // A text variable the live Worker doesn't bind yet is not a mismatch.
+  assert.deepEqual(bindingMismatches({ ...live, texts: {} }, SECRETS), []);
 });
 
 await test("both Workers deploy before anything is recorded; a later failed deploy still records the first", async () => {

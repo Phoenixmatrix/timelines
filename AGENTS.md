@@ -107,8 +107,8 @@ release. Add a tool name to select part of the graph. For example, run
 This checkout is a `gm` workspace, and Gitmatrix is the source of truth:
 
 - **Commit and push this project with ordinary `gm`**, outside `agent gm`.
-  `origin` is `matrixorg/timelines` on production
-  (`https://timelinesapp.fward.dev`), and plain `gm` defaults to that server:
+  `origin` is `matrixorg/timelines` on the production instance, and plain
+  `gm` defaults to that server:
   `gm commit -m "…"`, then `gm push` (or `gm push --sync` when trunk moved)
   lands it on `main`. Run `gm cli guide` once for the workflow,
   and `gm cli search "<task>"` to find commands. Plain `git commit` still
