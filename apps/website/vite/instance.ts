@@ -169,6 +169,45 @@ export function parseInstance(raw: unknown): Instance {
   return instance;
 }
 
+/**
+ * The provider's names for the Workflows the Space cutover censuses, by the
+ * cutover's own name for each (worker/space-cutover/quiescence.ts
+ * CUTOVER_WORKFLOWS). The Worker reads them from its CUTOVER_WORKFLOW_NAMES
+ * binding; tools/space-cutover.ts lists the same ones.
+ */
+export function cutoverWorkflowNames(
+  instance: Instance,
+): Record<"ci-run" | "knowledge-build" | "repo-purge", string> {
+  return {
+    "ci-run": instance.workflows.ciRun,
+    "knowledge-build": instance.workflows.knowledgeBuild,
+    "repo-purge": instance.workflows.repoPurge,
+  };
+}
+
+/**
+ * The installation a workflow census lists: an instance's file (`gm instance
+ * setup` writes it) when one is given, else production. The census names its
+ * Worker and account explicitly; they must be the instance's, so a census of
+ * one installation never reads another's Workflows.
+ */
+export function censusInstance(file: unknown, worker: string, account: string): Instance {
+  if (file === null) {
+    if (worker !== PRODUCTION.worker)
+      throw new Error(
+        `--worker ${worker} isn't production's; pass its gm instance file with --instance-config`,
+      );
+    return PRODUCTION;
+  }
+  const instance = parseInstance(file);
+  if (worker !== instance.worker)
+    throw new Error(`--worker ${worker} isn't instance ${instance.name}'s (${instance.worker})`);
+  const accountId = (file as { accountId?: unknown }).accountId;
+  if (typeof accountId === "string" && accountId !== account)
+    throw new Error(`--account ${account} isn't instance ${instance.name}'s (${accountId})`);
+  return instance;
+}
+
 /** The account-wide names (and the host) an instance shares with production. */
 export function sharedWithProduction(instance: Instance): string[] {
   if (instance === PRODUCTION) return [];

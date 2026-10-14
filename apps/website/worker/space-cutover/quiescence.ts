@@ -45,8 +45,9 @@ export const CUTOVER_WORKFLOWS = {
   "repo-purge": "REPO_PURGE",
 } as const;
 export type CutoverWorkflow = keyof typeof CUTOVER_WORKFLOWS;
-/** The provider's workflow names (cloudflare.config.ts), which a census must name exactly. */
-export const CUTOVER_WORKFLOW_NAMES: Record<CutoverWorkflow, string> = {
+export type CutoverWorkflowNames = Record<CutoverWorkflow, string>;
+/** Production's workflow names (vite/instance.ts PRODUCTION), which its census must name exactly. */
+export const PRODUCTION_WORKFLOW_NAMES: CutoverWorkflowNames = {
   "ci-run": "ci-run",
   "knowledge-build": "knowledge-build",
   "repo-purge": "repo-purge",
@@ -338,8 +339,36 @@ export interface CensusExport {
 const text = (value: unknown, max = 256): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= max;
 
+/**
+ * The deployed installation's workflow names, which a census must name
+ * exactly: the CUTOVER_WORKFLOW_NAMES text binding (cloudflare.config.ts; a
+ * self-hosted instance names its Workflows after itself), else production's.
+ * A malformed binding fails closed.
+ */
+export function cutoverWorkflowNames(env: object): CutoverWorkflowNames {
+  const raw = Reflect.get(env, "CUTOVER_WORKFLOW_NAMES") as unknown;
+  if (raw === undefined) return PRODUCTION_WORKFLOW_NAMES;
+  let parsed: unknown = null;
+  try {
+    parsed = typeof raw === "string" ? JSON.parse(raw) : null;
+  } catch {
+    // Reported below with every other malformed shape.
+  }
+  const names = {} as CutoverWorkflowNames;
+  for (const workflow of Object.keys(CUTOVER_WORKFLOWS) as CutoverWorkflow[]) {
+    const name =
+      parsed && typeof parsed === "object" ? (Reflect.get(parsed, workflow) as unknown) : null;
+    if (!text(name, 64)) throw new Error("The deployment's workflow names are malformed");
+    names[workflow] = name;
+  }
+  return names;
+}
+
 /** Validates an operator's census export; malformed input is rejected, never trimmed. */
-export function parseCensus(value: unknown): CensusExport {
+export function parseCensus(
+  value: unknown,
+  names: CutoverWorkflowNames = PRODUCTION_WORKFLOW_NAMES,
+): CensusExport {
   if (!value || typeof value !== "object") throw new Error("Workflow census required");
   const account = Reflect.get(value, "account") as unknown;
   const worker = Reflect.get(value, "worker") as unknown;
@@ -357,8 +386,8 @@ export function parseCensus(value: unknown): CensusExport {
       entry && typeof entry === "object" ? (Reflect.get(entry, "name") as unknown) : null;
     const listed =
       entry && typeof entry === "object" ? (Reflect.get(entry, "instances") as unknown) : null;
-    if (name !== CUTOVER_WORKFLOW_NAMES[workflow] || !Array.isArray(listed))
-      throw new Error(`Workflow census must list every ${workflow} instance`);
+    if (name !== names[workflow] || !Array.isArray(listed))
+      throw new Error(`Workflow census must list every ${workflow} instance (${names[workflow]})`);
     if (listed.length > CENSUS_INSTANCE_LIMIT)
       throw new Error(`Workflow census lists too many ${workflow} instances`);
     const ids = new Set<string>();

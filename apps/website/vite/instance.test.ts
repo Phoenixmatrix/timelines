@@ -7,7 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import config from "../cloudflare.config.ts";
-import { INSTANCE_VARIABLE, PRODUCTION, parseInstance, type Instance } from "./instance.ts";
+import {
+  INSTANCE_VARIABLE,
+  PRODUCTION,
+  censusInstance,
+  cutoverWorkflowNames,
+  parseInstance,
+  type Instance,
+} from "./instance.ts";
 import { previewVariables, type PreviewResources } from "./preview.ts";
 
 /** Production's resolved config, as it was before instances existed. */
@@ -134,6 +141,12 @@ describe("an instance", () => {
     expect(worker.env.REGISTRY_DB).toMatchObject({ id: demo.registryDb.id });
     expect(worker.env.JOBS).toMatchObject({ name: "gitmatrix-demo-jobs" });
     expect(worker.env.CI_RUN).toMatchObject({ name: "gitmatrix-demo-ci-run" });
+    // The Space cutover's census must list the instance's Workflows, not production's.
+    expect(JSON.parse(worker.env.CUTOVER_WORKFLOW_NAMES?.value as string)).toEqual({
+      "ci-run": "gitmatrix-demo-ci-run",
+      "knowledge-build": "gitmatrix-demo-knowledge-build",
+      "repo-purge": "gitmatrix-demo-repo-purge",
+    });
     expect(worker.env.AUTH_FAILURES).toMatchObject({ namespace: "52817" });
     expect(worker.env.REGISTRY_KEK_SECRET).toMatchObject({
       secretName: "gitmatrix_demo_registry_kek",
@@ -206,6 +219,33 @@ describe("an instance", () => {
     const previewed = await factory({ mode: "production", isPreview: true });
     expect(previewed.worker.name).toBe("gitmatrix");
     expect(JSON.stringify(previewed)).not.toContain("gitmatrix-demo");
+  });
+});
+
+describe("a workflow census", () => {
+  test("lists production's Workflows by default, and an instance's from its file", () => {
+    expect(cutoverWorkflowNames(censusInstance(null, "gitmatrix", "a".repeat(32)))).toEqual({
+      "ci-run": "ci-run",
+      "knowledge-build": "knowledge-build",
+      "repo-purge": "repo-purge",
+    });
+    expect(cutoverWorkflowNames(censusInstance(demo, "gitmatrix-demo", demo.accountId))).toEqual({
+      "ci-run": "gitmatrix-demo-ci-run",
+      "knowledge-build": "gitmatrix-demo-knowledge-build",
+      "repo-purge": "gitmatrix-demo-repo-purge",
+    });
+  });
+
+  test("refuses a Worker or account that isn't the installation's", () => {
+    // Without the instance file, another Worker would be censused under production's names.
+    expect(() => censusInstance(null, "gitmatrix-demo", demo.accountId)).toThrow(
+      /--instance-config/,
+    );
+    expect(() => censusInstance(demo, "gitmatrix", demo.accountId)).toThrow(/gitmatrix-demo/);
+    expect(() => censusInstance(demo, "gitmatrix-demo", "f".repeat(32))).toThrow(/--account/);
+    expect(() =>
+      censusInstance({ ...demo, workflows: {} }, "gitmatrix-demo", demo.accountId),
+    ).toThrow(/Invalid instance file/);
   });
 });
 

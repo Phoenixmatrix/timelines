@@ -9,6 +9,7 @@ import {
   listWorkflowInstances,
   type ListedInstance,
 } from "../apps/website/shared/space-cutover-census.ts";
+import { censusInstance, cutoverWorkflowNames } from "../apps/website/vite/instance.ts";
 
 /** Application operator protocol, not a Cloudflare resource-management CLI.
  * No origin, production mapping, credentials or approval has a default.
@@ -32,6 +33,9 @@ const { values, positionals } = parseArgs({
     run: { type: "string" },
     account: { type: "string" },
     worker: { type: "string" },
+    // workflow-census of a self-hosted instance: its gm instance file, whose
+    // Workflow names (and Worker and account) the census lists.
+    "instance-config": { type: "string" },
     "version-id": { type: "string" },
     mode: { type: "string" },
     // prepare only: the state file of a restored run the new one supersedes.
@@ -44,7 +48,7 @@ const { values, positionals } = parseArgs({
 const command = positionals[0];
 if (values.help || !command) {
   console.log(
-    "node tools/space-cutover.ts <inventory|prepare|approve|status|fence|reconcile-refs|workflow-census|drain|begin|advance|recover|operator-login|approve-release|open-admission> --origin URL --state PRIVATE_FILE [--cookie-file PRIVATE_FILE] [--manifest FILE --checkpoint SHA] [--digest EXACT_DIGEST] [--version-id PLATFORM_VERSION --mode space|legacy] [--steps 1..500] [--fresh] [--out PRIVATE_FILE] [--account ACCOUNT_ID --worker NAME (workflow-census)]\n" +
+    "node tools/space-cutover.ts <inventory|prepare|approve|status|fence|reconcile-refs|workflow-census|drain|begin|advance|recover|operator-login|approve-release|open-admission> --origin URL --state PRIVATE_FILE [--cookie-file PRIVATE_FILE] [--manifest FILE --checkpoint SHA] [--digest EXACT_DIGEST] [--version-id PLATFORM_VERSION --mode space|legacy] [--steps 1..500] [--fresh] [--out PRIVATE_FILE] [--account ACCOUNT_ID --worker NAME [--instance-config GM_INSTANCE_FILE] (workflow-census)]\n" +
       "node tools/space-cutover.ts replay-refs --origin URL --cookie-file YOUR_SESSION --run RUN_ID --replay PASS:REPO_ID:SOURCE_ID  (a person with write access in the replay's Space)",
   );
 } else {
@@ -355,6 +359,17 @@ if (values.help || !command) {
         throw new Error(
           "workflow-census requires the installation's --account ID and --worker name",
         );
+      // A self-hosted instance names its Workflows after itself (gitmatrix-<name>-ci-run):
+      // its instance file says how. Without one, the installation is production.
+      const names = cutoverWorkflowNames(
+        censusInstance(
+          values["instance-config"]
+            ? (JSON.parse(await readFile(values["instance-config"], "utf8")) as unknown)
+            : null,
+          worker,
+          account,
+        ),
+      );
       const cf = (args: string[]) =>
         execFileSync("cf", args, {
           encoding: "utf8",
@@ -363,12 +378,13 @@ if (values.help || !command) {
         });
       // cf resolves the account from its own configuration: refuse another one.
       const planned = JSON.parse(
-        cf(["workflows", "instances", "list", "--workflow-name", "ci-run", "--dry-run"]),
+        cf(["workflows", "instances", "list", "--workflow-name", names["ci-run"], "--dry-run"]),
       ) as { url?: string };
       if (!planned.url?.includes(`/accounts/${account}/`))
         throw new Error("cf is configured for another account; refusing a census of the wrong one");
       const workflows: Record<string, { name: string; instances: ListedInstance[] }> = {};
-      for (const workflow of ["ci-run", "knowledge-build", "repo-purge"]) {
+      for (const workflow of ["ci-run", "knowledge-build", "repo-purge"] as const) {
+        const name = names[workflow];
         // A census is many read-only listings: one dropped connection retries it.
         const retried = (read: () => string): string => {
           for (let attempt = 1; ; attempt++) {
@@ -385,7 +401,7 @@ if (values.help || !command) {
         const range = { from: Date.parse("2020-01-01T00:00:00Z"), to: Date.now() + 60_000 };
         const list = () =>
           listWorkflowInstances(
-            workflow,
+            name,
             ({ start, end, perPage }) =>
               retried(() =>
                 cf([
@@ -393,7 +409,7 @@ if (values.help || !command) {
                   "instances",
                   "list",
                   "--workflow-name",
-                  workflow,
+                  name,
                   "--per-page",
                   String(perPage),
                   "--date-start",
@@ -406,8 +422,8 @@ if (values.help || !command) {
           );
         const first = list();
         const second = list();
-        confirmListing(workflow, first, second);
-        workflows[workflow] = { name: workflow, instances: second };
+        confirmListing(name, first, second);
+        workflows[workflow] = { name, instances: second };
       }
       const history = JSON.parse(
         cf(["workers", "deployments", "list", "--worker", worker, "--per-page", "100"]),
