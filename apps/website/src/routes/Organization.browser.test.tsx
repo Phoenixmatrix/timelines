@@ -131,6 +131,71 @@ test("scope menus support keyboard dismissal without switching or creating", asy
   await expect.element(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
 });
 
+test("Space switching is offered on every page, marking a Space current only inside it", async () => {
+  const server = await TestServer.start({ world: true });
+  const created = await organization(server, "anywhere-space-browser");
+  const general = created.spaces[0]!.space;
+  const tools = await server.call<SpacePage>("POST", "/api/spaces", {
+    organizationId: created.organization.id,
+    slug: "anywhere-space-browser-tools",
+    displayName: "Tools",
+  });
+  await server.call("PUT", "/api/account/default-scope", {
+    organizationId: created.organization.id,
+    spaceId: tools.space.id,
+  });
+  await server.repo(general.slug, "engine");
+  const choices = () => ({
+    general: page.getByRole("menuitem", { name: `General (${general.slug})`, exact: true }),
+    tools: page.getByRole("menuitem", { name: `Tools (${tools.space.slug})`, exact: true }),
+  });
+  const openSpaces = async () => {
+    await focusOn(accountMenu());
+    await press("Enter");
+    await expect.element(scopeItem("Organization")).toHaveFocus();
+    await expect
+      .element(scopeItem("Organization"))
+      .toHaveAccessibleName("Organization: Navigation Company");
+    await press("ArrowDown");
+    await expect.element(scopeItem("Space")).toHaveFocus();
+    await press("ArrowRight");
+    await expect.element(choices().general).toBeVisible();
+    await expect.element(choices().tools).toBeVisible();
+  };
+  const close = async () => {
+    await press("Escape");
+    await press("Escape");
+    await expect.element(page.getByRole("menu")).not.toBeInTheDocument();
+  };
+
+  // Home has no Space of its own: the person's default Space supplies the Organization.
+  const app = renderApp("/");
+  await openSpaces();
+  expect(scopeItem("Space").element()).toHaveAccessibleName("Space: Choose a Space");
+  for (const choice of Object.values(choices()))
+    expect(choice.element()).not.toHaveAttribute("aria-current");
+  await press("ArrowLeft");
+  await press("ArrowUp");
+  await press("ArrowRight");
+  // Nor is Home in that Organization.
+  await expect
+    .element(page.getByRole("menuitem", { name: "Navigation Company", exact: true }))
+    .not.toHaveAttribute("aria-current");
+  await expect
+    .element(page.getByRole("menuitem", { name: "Organization directory" }))
+    .toHaveAttribute("href", "/organizations");
+  await close();
+
+  // A repository page is in its Space.
+  await app.navigate(`/${general.slug}/engine`);
+  await expect.element(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
+  await openSpaces();
+  expect(scopeItem("Space").element()).toHaveAccessibleName("Space: General");
+  expect(choices().general.element()).toHaveAttribute("aria-current", "true");
+  expect(choices().tools.element()).not.toHaveAttribute("aria-current");
+  await close();
+});
+
 test("Space navigation and browser history retain concrete destinations without creating repositories", async () => {
   const server = await TestServer.start({ world: true });
   const created = await organization(server, "history-space-browser");

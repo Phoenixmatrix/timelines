@@ -21,10 +21,18 @@ function useScope() {
   const organization = viewer?.organizations.find(
     (item) => item.slug === params.organization || item.id === displayedSpace?.organizationId,
   );
+  // A page outside any Organization or Space (Home, say) offers the Spaces of the person's
+  // default Space's Organization, without claiming the page is in it.
+  const fallback =
+    params.organization || slug
+      ? undefined
+      : viewer?.spaces.find((item) => item.id === viewer.defaultSpaceId);
+  const offered =
+    organization ?? viewer?.organizations.find((item) => item.id === fallback?.organizationId);
   const spaces = (viewer?.spaces ?? []).filter(
-    (item) => item.organizationId === organization?.id && !item.archivedAt,
+    (item) => item.organizationId === offered?.id && !item.archivedAt,
   );
-  return { viewer, slug, space, organization, spaces };
+  return { viewer, slug, space, organization, offered, spaces };
 }
 
 const itemClass = "mk-menu-item min-w-0 text-ink no-underline";
@@ -85,14 +93,14 @@ function Submenu({
  * navigation never creates content or infers a grant from an Organization role.
  */
 export function ScopeMenu() {
-  const { viewer, slug, space, organization, spaces } = useScope();
+  const { viewer, slug, space, organization, offered, spaces } = useScope();
   if (!viewer) return null;
   return (
     <>
       <Submenu
         icon={<BuildingsIcon className="size-4 shrink-0" aria-hidden />}
         label="Organization"
-        value={organization?.displayName ?? "Choose an Organization"}
+        value={offered?.displayName ?? "Choose an Organization"}
       >
         {viewer.organizations.map((item) => (
           <Choice
@@ -121,8 +129,8 @@ export function ScopeMenu() {
           Organization directory
         </Menu.LinkItem>
       </Submenu>
-      {/* Spaces only list within the Organization in context; without one, there is nothing to switch between. */}
-      {organization && (
+      {/* Spaces only list within the Organization offered; without one, there is nothing to switch between. */}
+      {offered && (
         <Submenu
           icon={<SquaresFourIcon className="size-4 shrink-0" aria-hidden />}
           label="Space"
