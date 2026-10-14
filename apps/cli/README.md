@@ -1147,8 +1147,8 @@ environments pin that authority; missing configuration/API/authentication fails
 closed, with no implicit selection from scoped credentials or offline fallback.
 For canonical configuration, legacy adoption/drain, failed/expired/orphan capacity
 and cleanup recovery boundaries, read
-[environment limits and quota authority](../../README.md#environment-limits-and-quota-authority)
-and [cleanup and cost bounds](../../README.md#cleanup-and-cost-bounds).
+[environment limits and quota authority](../../CONTRIBUTING.md#environment-limits-and-quota-authority)
+and [cleanup and cost bounds](../../CONTRIBUTING.md#cleanup-and-cost-bounds).
 
 ## Automatic AI settings
 

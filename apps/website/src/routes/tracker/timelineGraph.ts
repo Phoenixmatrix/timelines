@@ -1,5 +1,4 @@
-// The timeline graph's layout (CORE-81; TIMELINES-RESEARCH.md, "Visualization
-// and switching timelines"). Main runs down the middle and each drawn timeline
+// The timeline graph's layout (CORE-81). Main runs down the middle and each drawn timeline
 // is a lane beside it; rows are events, newest first, like `gm log`.
 //
 // It never draws every timeline. With a timeline selected it draws that one,

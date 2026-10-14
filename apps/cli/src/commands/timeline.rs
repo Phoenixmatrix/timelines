@@ -1,4 +1,4 @@
-//! `gm timeline`: parallel lines of work (TIMELINES-RESEARCH.md).
+//! `gm timeline`: parallel lines of work.
 //!
 //! A timeline is a Space-wide tracker record with one owned work repository
 //! per canonical repository. Canonical origin stays unchanged; bound operations

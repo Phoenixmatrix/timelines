@@ -1,5 +1,4 @@
-// The preview contract's runs (CORE-79; TIMELINES-RESEARCH.md, "Previews:
-// primitives, not hosting"). Gitmatrix deploys nothing: it starts CI runs with
+// The preview contract's runs (CORE-79). Gitmatrix deploys nothing: it starts CI runs with
 // trigger "preview" in repositories whose ci.yml opts in with `on: preview`,
 // and their jobs pick an action with `if: trigger == "preview" && action ==
 // "create"` (or "teardown"):

@@ -1,5 +1,5 @@
 /*
- * DIRECTION (impeccable, extension of throughput-console 49700b21; CORE-251)
+ * Chronicle (CORE-251): the tracker as a scrubbable timeline.
  *
  * THESIS       The tracker as footage: scrub a playhead through the issue
  *              stream like DevTools Performance or an editor's timeline, and
@@ -16,9 +16,6 @@
  *              lanes filling the height beside a 22rem summary/inspector.
  * FORM         Extension inside the locked world (no new concept round).
  *              Signature: the playhead and range select on the ruler.
- * FINISH       unreviewed and undocumented is unfinished; this build ends with
- *              the finish review, the verdict, DESIGN.md, and every shipping
- *              raster carrying its provenance
  */
 
 import {

@@ -62,7 +62,7 @@ their standard transports and canonical Space-qualified locators.
 ## Run it
 
 For agent development, start at the repository root and follow the
-[isolated agent workflow](../../README.md#agent-first-development):
+[isolated agent workflow](../../CONTRIBUTING.md#agent-first-development):
 
 ```bash
 vp install
@@ -80,7 +80,7 @@ generation, avatars or Atlas descriptions only. Use `vp run agent inspect` for
 data, `vp run agent test` for non-AI real-service E2E, and `vp run agent test-ai`
 (targeted at the stages your change maps to) when verifying AI capabilities.
 Use `vp run agent destroy` when finished.
-Hourly cleanup and 24-hour expiry bound resource accumulation; see the root README
+Hourly cleanup and 24-hour expiry bound resource accumulation; see CONTRIBUTING.md
 for costs and failure recovery.
 
 The website Vite configuration prebundles the Lezer dependencies used by the
@@ -1274,7 +1274,7 @@ token trees. Rejected grammar forms are reported as `parse_error`.
 
 ### Isolated end-to-end smoke
 
-Use the root [agent-first workflow](../../README.md#agent-first-development):
+Use the [agent-first workflow](../../CONTRIBUTING.md#agent-first-development):
 run `vp run agent setup`, keep `vp run agent up` running in another terminal,
 then run `vp run semantic-smoke` from the repository root.
 
@@ -2505,6 +2505,16 @@ For the generator's local regressions, run
 `vp check`. The suite covers large daily-group convergence, retention when the
 model budget is exhausted, and stale-subject pruning within D1 binding limits.
 
+### Release note evidence
+
+On repository and Space release-note pages, select an item's **last commit**
+time to open its details sidebar. The sidebar lists every linked commit, the
+linked tracker issue when available, and any landing timeline; commit links open
+the exact source revision. These links stay out of the reading view until opened.
+
+Select another item's time to switch details, or use Close or Escape to dismiss
+the sidebar and return focus to the opener. On phones, details fill the screen.
+
 ## Automatic AI settings
 
 `/settings/ai?space=<handle>` controls automatic work across that Space's
@@ -2697,6 +2707,15 @@ original evidence fields, issue status, Tracker Space and source URL. Either
 endpoint can supply that receipt; the model's tool choice is not the contract.
 These are gate requirements, not a claim of a successful run or a five-minute
 full-gate guarantee; use the run's retained outcomes and timings.
+
+### Knowledge Atlas
+
+The Knowledge tab shows the repository as capability territory: groups of files
+that work together, found from imports and shared concepts rather than folders.
+Open a region to see its areas and files, select anything to read why it is
+grouped, what it uses and what uses it, and jump to its source. Labels appear
+as you zoom in; a name is drawn whole or not at all. The Space page's
+Knowledge link opens the same view across the repositories you pick.
 
 ### Live completion evidence (CORE-126)
 
@@ -3516,8 +3535,7 @@ always wait ten minutes.
 
 ### Deployments and previews
 
-Timelines deploys nothing (`TIMELINES-RESEARCH.md`, "Previews: primitives, not
-hosting"): a job that deploys records where it went, and the run page and the
+Timelines deploys nothing: a job that deploys records where it went, and the run page and the
 commit list show it. An environment is a name per repository: `production`,
 `timeline/<slug>` for a timeline's previews, `branch/<name>` for any other
 branch a job deploys from, or any name a project uses (`staging`). Records keep the environment, timeline, checkpoint, commit, URL,
@@ -3658,8 +3676,7 @@ the artifact digest when present, are what explicit attribution needs).
 
 #### The preview contract
 
-Projects implement previews in their own CI (CORE-79; `TIMELINES-RESEARCH.md`,
-"Previews: primitives, not hosting"). A repository opts in with `on: preview`
+Projects implement previews in their own CI (CORE-79). A repository opts in with `on: preview`
 (also `on: [push, preview]` or `preview:` under `on:`; pushes start runs either
 way, as before). Timelines then starts **preview runs**: `trigger` is
 `"preview"`, and `action` is `"create"` or `"teardown"` (empty in every other
@@ -3743,9 +3760,7 @@ otherwise.
 
 #### Timelines' own previews
 
-This repository implements the contract for itself (CORE-80;
-`TIMELINES-RESEARCH.md`, "Gitmatrix's own previews: the reference
-implementation"), as a worked example any project could copy. It uses only
+This repository implements the contract for itself (CORE-80), as a worked example any project could copy. It uses only
 what every project has: `on: preview`, the job variables and credential, a
 repository secret, `cf`, and `gm deploy record`.
 
@@ -4103,9 +4118,8 @@ Apply registry migration `0004_artifact_storage.sql` before running the updated
 Worker. Existing raw locators remain readable during backfill. Compaction changes
 storage only: clients and artifact URLs do not change.
 
-The [Git LFS and Xet investigation](../../ARTIFACT-STORAGE-RESEARCH.md) records
-measured comparisons, shared-chunk storage tradeoffs, and the evidence needed
-before revisiting this design.
+Git LFS and Xet were investigated and deferred; revisiting this design needs
+measured comparisons and the shared-chunk storage tradeoffs weighed first.
 
 ## Assistant
 

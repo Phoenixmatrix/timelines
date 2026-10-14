@@ -5,7 +5,7 @@
 // and snapshot give only to replicas that ask for them: older gm binaries
 // reject entity types they don't know.
 //
-// Permissions (TIMELINES-RESEARCH.md, Decisions): any writer, person or agent,
+// Permissions: any writer, person or agent,
 // creates a timeline, merges into one and sets its experimental flag; only its
 // accountable person and the agent that started it may abandon it. The bookmarks
 // themselves are written by the Worker (timelines/api.ts), which asks here first.
@@ -2029,8 +2029,8 @@ export class TimelineStore {
       : null;
   }
   /**
-   * Queue a landing of the timeline's head checkpoint, or say why not
-   * (TIMELINES-RESEARCH.md, "Landing"): an `approval` timeline needs that
+   * Queue a landing of the timeline's head checkpoint, or say why not:
+   * an `approval` timeline needs that
    * checkpoint approved while it is still the head, an `auto` one needs it
    * green. The experimental flag doesn't matter. A landing already under way
    * is returned as it is (`queued: false`). After a landing of the same

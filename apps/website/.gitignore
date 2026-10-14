@@ -27,5 +27,3 @@ dist-ssr
 .cloudflare
 
 # Local design verification artifacts
-.impeccable/review/
-.impeccable/mocks/

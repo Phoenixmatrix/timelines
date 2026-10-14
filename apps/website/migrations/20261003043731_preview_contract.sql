@@ -1,6 +1,6 @@
--- The preview contract (CORE-79; TIMELINES-RESEARCH.md, "Previews: primitives,
--- not hosting"): a project opts in with `on: preview` in ci.yml, and Gitmatrix
--- starts preview runs whose jobs pick `create` or `teardown` with `if:`.
+-- The preview contract (CORE-79): a project opts in with `on: preview` in
+-- ci.yml, and Gitmatrix starts preview runs whose jobs pick `create` or
+-- `teardown` with `if:`.
 --
 -- A preview run is stored with trigger 'manual' and its action here: widening
 -- ci_runs.trigger's CHECK would mean rebuilding ci_runs, and dropping it

@@ -395,7 +395,6 @@ const rules: readonly (readonly [RegExp, E2ETarget | typeof AGENTS_FULL])[] = [
   // and visuals tooling, agent instructions, this repository's pipeline settings,
   // design notes, and prose at the repository root or an app's root.
   [/^(?:apps\/site|tools\/(?:preview|visuals)|\.claude|\.agents|\.gitmatrix)\//, NONE],
-  [/^apps\/website\/\.impeccable\//, NONE],
   [/^(?:\.gitignore|\.worktreeinclude)$/, NONE],
   [/^(?:apps\/[^/]+\/)?[^/]+\.md$/, NONE],
   // gm's own manifests change only gm: every journey that runs it. Its assets

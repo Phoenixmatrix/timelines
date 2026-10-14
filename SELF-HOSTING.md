@@ -24,13 +24,13 @@ becoming active, which can take a few hours.
 
 **On your machine** (Linux or macOS)
 
-| Tool                                          | Version                            | Why                                                      |
-| --------------------------------------------- | ---------------------------------- | -------------------------------------------------------- |
-| [git](https://git-scm.com)                    | any recent                         | Cloning the source; upgrades fetch new versions with it. |
-| [Node.js](https://nodejs.org)                 | 22.18 or newer                     | Runs the build and Cloudflare's `cf` CLI.                |
-| [pnpm](https://pnpm.io/installation)          | any; it fetches the pinned version | Installs the dependencies.                               |
-| [Rust](https://rustup.rs)                     | 1.85 or newer                      | Builds `gm`, the Timelines CLI.                          |
-| [Docker](https://docs.docker.com/get-docker/) | running, usable without `sudo`     | Builds the image CI jobs run in, on every deploy.        |
+| Tool                                          | Version                                    | Why                                                      |
+| --------------------------------------------- | ------------------------------------------ | -------------------------------------------------------- |
+| [git](https://git-scm.com)                    | any recent                                 | Cloning the source; upgrades fetch new versions with it. |
+| [Node.js](https://nodejs.org)                 | 22.18 or newer                             | Runs the build and Cloudflare's `cf` CLI.                |
+| [pnpm](https://pnpm.io/installation)          | 10 or newer; it fetches the pinned version | Installs the dependencies.                               |
+| [Rust](https://rustup.rs)                     | 1.88 or newer                              | Builds `gm`, the Timelines CLI.                          |
+| [Docker](https://docs.docker.com/get-docker/) | running, usable without `sudo`             | Builds the image CI jobs run in, on every deploy.        |
 
 You don't need to install `cf`: `pnpm install` installs the version the
 repository pins.
@@ -101,7 +101,7 @@ one:
 | Question                | What to answer                                                                                                                                                    |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Instance name           | A short name, such as `acme`. Every resource is named after it (`gitmatrix-acme`, `gitmatrix-acme-jobs`, …), so instances in one account never collide.           |
-| Cloudflare sign-in      | Nothing: when you're signed out, setup opens Cloudflare's sign-in in your browser.                                                                                |
+| Cloudflare sign-in      | Nothing: when you're signed out, setup opens Cloudflare's sign-in in your browser. On a machine without one, set `CLOUDFLARE_API_TOKEN` instead.                  |
 | Account                 | Asked only if your login can use several accounts.                                                                                                                |
 | Hostname                | Where the instance answers, such as `timelines.example.com`. It must be in your active zone and must not have DNS records yet.                                    |
 | Owner's email           | Your address. The owner can always sign in, becomes site administrator and can invite everyone else.                                                              |
@@ -113,7 +113,9 @@ Between questions, setup checks the account: Workers Paid, R2, the zone, the
 Email Sending domain and its DNS records, the Secrets Store and Docker. When
 something is missing, it prints the dashboard steps and checks again when you
 press Enter. You can also stop with Ctrl-C and rerun `gm instance setup <name>`
-later; it keeps your answers.
+later; it keeps your answers. Setup saves them, and every resource id it
+creates, in `~/.config/gitmatrix/instances/<name>.json` (under
+`$XDG_CONFIG_HOME` when that's set).
 
 Then it shows a plan of everything it's about to create and asks you to
 confirm. After that it:
@@ -121,7 +123,8 @@ confirm. After that it:
 1. creates two D1 databases, three R2 buckets, two queues, an Artifacts
    namespace and (with AI) an AI Gateway, a Vectorize index and an AI Search
    namespace;
-2. generates the instance's two secrets into the Secrets Store;
+2. generates the instance's two secrets into the Secrets Store (secret values
+   never go on a command line);
 3. applies the database migrations;
 4. builds the app and the CI image and deploys the Worker, together with its
    Workflows, CI container and custom domain. Cloudflare creates the DNS record
@@ -157,16 +160,27 @@ the version you choose. Versions are commits on the upstream's `main` branch:
 gm instance upgrade acme --dry-run          # what's new: commits, migrations, CI image changes
 gm instance upgrade acme                    # upgrade to the latest main
 gm instance upgrade acme --to 1a2b3c4d5e6f  # or to a specific version
+gm instance upgrade acme --from https://github.com/Phoenixmatrix/timelines.git  # change the upstream
 ```
 
-Upgrade never touches your checkout. It fetches into a clone of its own,
-builds that version (including its gm), and has that version deploy itself,
-creating any new resources it needs. Upgrades only move forward: database
-migrations can't be undone, so going back requires `--allow-downgrade`, and
-the migrations stay applied.
+Upgrade never touches your checkout. It fetches into a clone of its own, under
+`~/.cache/gitmatrix/instance-sources`, builds that version (including its gm,
+whose path it prints), and has that version deploy itself, creating any new
+resources it needs. It installs dependencies with
+`pnpm install --frozen-lockfile`, or with `vp install --frozen-lockfile` where
+the `pnpm` on your `PATH` is a shim that can't run on its own, such as Vite+'s.
+Upgrades only move forward: database migrations can't be undone, so going back
+requires `--allow-downgrade`, and the migrations stay applied. Without a
+terminal, pass `--yes`.
 
 If you change the source yourself, deploy your checkout with
-`gm instance deploy acme`.
+`gm instance deploy acme`. It deploys the checkout as it is, uncommitted
+changes included.
+
+An instance runs only what you deploy to it. The canonical repository's
+`.gitmatrix/ci.yml` deploys the canonical instance, not yours, and previews and
+`gm` releases (`gm pkg install gm`) start unconfigured on a new instance: set
+them up in your own repositories' CI if you want them.
 
 ## Several instances in one account
 

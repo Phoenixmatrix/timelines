@@ -3,7 +3,7 @@
 // (`?tl=<slug>`, see lib/timelineScope.ts) the banner above the page names it,
 // says what the scope means where you are and offers the switcher, and the
 // rail's place carries a dot, so the scope is never out of sight
-// (TIMELINES-RESEARCH.md, "Where it wouldn't work": mode errors).
+// (mode errors).
 
 import { Popover } from "@base-ui/react/popover";
 import { CaretDownIcon, CheckIcon, GitForkIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";

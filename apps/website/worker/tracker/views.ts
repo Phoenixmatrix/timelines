@@ -1,4 +1,4 @@
-// Timeline views of the tracker (TIMELINES-RESEARCH.md, "Tracker"; CORE-73).
+// Timeline views of the tracker (CORE-73).
 //
 // There is one event log. Main's view is the store's tables: main's events,
 // and those of landed timelines, folded in when they land (`landingOverlay`).

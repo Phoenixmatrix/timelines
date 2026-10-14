@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "gm, the Timelines CLI (Rust). Scripts wrap cargo so `vp run -r` covers it.",
+  "license": "MIT",
   "scripts": {
     "build": "cargo build --release",
     "test": "cargo test && node --test assets/claude-code-mod/tests/*.test.ts",

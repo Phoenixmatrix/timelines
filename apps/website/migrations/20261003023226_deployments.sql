@@ -1,5 +1,5 @@
--- Previews as primitives (CORE-78, TIMELINES-RESEARCH.md "Previews: primitives,
--- not hosting"): Gitmatrix deploys nothing; it records where deployments are.
+-- Previews as primitives (CORE-78): Gitmatrix deploys nothing; it records
+-- where deployments are.
 -- Environments are named per repository (`production`, `timeline/<slug>`, or
 -- any name a project uses) and exist through their deployments. A record
 -- outlives its preview: expiring changes the status, never deletes the row.

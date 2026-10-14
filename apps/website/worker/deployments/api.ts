@@ -23,8 +23,7 @@
 // timeline's previews), `branch/<name>` (any other branch a CI job deploys
 // from) or a name of the recorder's own.
 //
-// Gitmatrix deploys nothing (TIMELINES-RESEARCH.md, "Previews: primitives, not
-// hosting"); jobs and outside systems record what they deployed. Records stay
+// Gitmatrix deploys nothing; jobs and outside systems record what they deployed. Records stay
 // when a preview expires: only the status changes.
 //
 // Provenance (CORE-351): a record may name the provider version that ran and

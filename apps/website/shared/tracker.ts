@@ -136,7 +136,7 @@ export function issuePickup(issue: Pick<Issue, "pickup">): IssuePickup {
   return issue.pickup ?? "anyone";
 }
 /**
- * `done_in_timeline` (TIMELINES-RESEARCH.md, "Tracker"; CORE-74): finished
+ * `done_in_timeline` (CORE-74): finished
  * inside a timeline that hasn't landed. It is main's view of that work, and
  * that of timelines that don't have it: it keeps blocking and isn't ready, so
  * nobody does the work twice. The tracker sets and clears it; nobody picks it.
@@ -170,8 +170,7 @@ export const CLOSE_REASONS = {
 } as const;
 export type IssueCloseReason = keyof typeof CLOSE_REASONS;
 /**
- * Whether an agent works this issue in a timeline (TIMELINES-RESEARCH.md,
- * "When an agent uses a timeline"): `required`, `never`, or left to the agent,
+ * Whether an agent works this issue in a timeline: `required`, `never`, or left to the agent,
  * which also reads the description or PRD. Issues from before the field read
  * as `agent_decides`.
  */
@@ -340,8 +339,7 @@ export function completionBy(
 }
 
 /**
- * Issue fields that differ between timelines' views (TIMELINES-RESEARCH.md,
- * "Tracker"): what a timeline changes stays in its view until it lands. The
+ * Issue fields that differ between timelines' views: what a timeline changes stays in its view until it lands. The
  * rest (identity, version, claim, assignee, waiting) is shared by every view:
  * leases stay unique per issue across timelines.
  */

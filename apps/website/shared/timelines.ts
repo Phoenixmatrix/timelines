@@ -1,5 +1,4 @@
-// Timelines (TIMELINES-RESEARCH.md, "A timeline, concretely"): a
-// Space-wide line of work with an owned source in each repository it touches.
+// Timelines: a Space-wide line of work with an owned source in each repository it touches.
 // The records and their events live in the Space's tracker, next to the issues
 // and leases later steps change with them.
 
@@ -198,8 +197,7 @@ export interface CheckpointRepo {
 export const CHECKPOINT_CHANGES = 200;
 
 /**
- * An immutable record of a timeline at one point (TIMELINES-RESEARCH.md,
- * "A timeline, concretely"). Its CI runs, previews and approval are found by
+ * An immutable record of a timeline at one point. Its CI runs, previews and approval are found by
  * its commits and its id, and read live: they change after it's made.
  */
 export interface Checkpoint {
@@ -366,7 +364,7 @@ export interface UpdateTimeline {
 }
 
 /**
- * A landing (CORE-77, TIMELINES-RESEARCH.md "Landing"): the queue merging a
+ * A landing (CORE-77): the queue merging a
  * checkpoint into each repository's current main, running the gates on each
  * merge, and only then advancing each main to its merge with a
  * compare-and-swap. Kept in the tracker with the timeline it lands.
@@ -490,7 +488,7 @@ export function lastPush(timeline: Pick<Timeline, "pushedAt" | "createdAt">): st
  * Whether a timeline has stalled: still being worked (active or idle, not
  * waiting on a person or landing) with no push for the idle period. An
  * experimental timeline never counts: it isn't expected to land, so stalling
- * is expected of it (TIMELINES-RESEARCH.md, Decisions). Views of stalled or
+ * is expected of it. Views of stalled or
  * idle work use this.
  */
 export function isStalled(

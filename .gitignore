@@ -42,9 +42,6 @@ dist-ssr
 .dev.vars*
 !.dev.vars.example
 
-# Impeccable review captures and question logs (local only)
-apps/website/.impeccable/review/
-apps/website/.impeccable/questions/
 
 
 # This checkout's agent (gm agent setup)
