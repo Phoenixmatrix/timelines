@@ -6,7 +6,7 @@ import {
   type SpacePage,
   type SpaceSummary,
 } from "../../shared/spaces.ts";
-import type { AppEnv } from "../auth.ts";
+import { requestTiming, type AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
 import {
   findSpaceById,
@@ -33,9 +33,10 @@ export async function spacePage(
   actor: Actor,
   space: SpaceSummary,
 ): Promise<SpacePage | null> {
+  const timing = requestTiming(c);
   const [access, role, admission] = await Promise.all([
-    resolveSpaceAccess(c.env.DB, actor, space.id),
-    organizationRole(c.env.DB, actor, space.organizationId),
+    timing.measure("space-access", resolveSpaceAccess(c.env.DB, actor, space.id)),
+    timing.measure("organization-role", organizationRole(c.env.DB, actor, space.organizationId)),
     requestAdmission(c),
   ]);
   return spacePageFrom(space, access, role, admission);
@@ -71,7 +72,7 @@ spaces.get("/", async (c) => {
   if (actor instanceof Response) return actor;
   // Only granted Spaces are listed: one grant query, then each Organization's role once.
   const [granted, admission] = await Promise.all([
-    listSpaceAccess(c.env.DB, actor),
+    requestTiming(c).measure("space-access", listSpaceAccess(c.env.DB, actor)),
     requestAdmission(c),
   ]);
   const organizationIds = [...new Set(granted.map((access) => access.space.organizationId))];
@@ -113,7 +114,10 @@ spaces.post("/", async (c) => {
 spaces.get("/:space", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
-  const space = await findSpaceBySlug(c.env.DB, c.req.param("space"));
+  const space = await requestTiming(c).measure(
+    "space",
+    findSpaceBySlug(c.env.DB, c.req.param("space")),
+  );
   const page = space ? await spacePage(c, actor, space) : null;
   return page ? c.json(page) : fail(c, 404, "No such Space.");
 });

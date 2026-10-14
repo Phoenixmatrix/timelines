@@ -26,10 +26,13 @@ import {
   wrapCutoverBackground,
 } from "./durable/cutover-admission.ts";
 import { initializeFreshSpaceInstallation } from "./space-cutover/installation.ts";
+import { startTiming } from "./timing.ts";
 
 export default {
   // A timeline preview answers only through its access gate (worker/preview-gate.ts).
   fetch: async (request, env, ctx) => {
+    // Server-Timing's `total` starts here, before the cutover checks below (app.ts emits it).
+    const timing = startTiming(request);
     const path = new URL(request.url).pathname;
     const handler = async (input: Request, bindings: Env, execution: ExecutionContext) =>
       isPreview(bindings)
@@ -39,7 +42,7 @@ export default {
       return handler(request, env, ctx);
     if (!isPreview(env)) {
       try {
-        await initializeFreshSpaceInstallation(env);
+        await initializeFreshSpaceInstallation(env, timing);
       } catch (error) {
         return Response.json(
           {
@@ -48,11 +51,11 @@ export default {
               "Space initialization is incomplete. Existing legacy data requires the reviewed cutover, not automatic migration.",
             detail: String(error),
           },
-          { status: 503, headers: { "Retry-After": "5" } },
+          { status: 503, headers: { "Retry-After": "5", "Server-Timing": timing.header() } },
         );
       }
     }
-    return wrapCutoverFetch(request, env, ctx, handler);
+    return wrapCutoverFetch(request, env, ctx, handler, timing);
   },
   /**
    * Work queued off the request path: repository mirrors and release notes

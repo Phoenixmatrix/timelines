@@ -5,12 +5,13 @@
 // itself is laid out in the browser.
 
 import { Hono } from "hono";
-import type { AppEnv } from "../auth.ts";
+import { requestTiming, type AppEnv } from "../auth.ts";
 import type { TimelineActor, TimelineGraphData } from "../../shared/timeline-graph.ts";
 import { previewSettings } from "../deployments/settings.ts";
 import { accessible, authorize } from "../tracker/api.ts";
 import { TrackerError } from "../tracker/store.ts";
 import { trackerObject } from "../tracker/stub.ts";
+import { timedCall, timedEnv } from "../timing.ts";
 
 /** Events drawn at most: the newest, so a long history still loads quickly. */
 const EVENT_LIMIT = 5000;
@@ -24,12 +25,14 @@ timelineGraph.onError((error, c) => {
 });
 
 timelineGraph.get("/", async (c) => {
-  const access = await authorize(c);
-  const tracker = trackerObject(c.env, access.space.id);
+  const timing = requestTiming(c);
+  const env = timedEnv(c.env, timing);
+  const access = await authorize(c, true, env, timing);
+  const tracker = trackerObject(env, access.space.id);
   const [graph, trackers, settings] = await Promise.all([
-    tracker.timelineGraph(access, EVENT_LIMIT),
-    accessible(c.env.DB, c.get("actor")!),
-    previewSettings(c.env.DB, access.space.id),
+    timedCall(timing, tracker.timelineGraph(access, EVENT_LIMIT)),
+    accessible(env.DB, c.get("actor")!),
+    previewSettings(env.DB, access.space.id),
   ]);
   if (!graph.ok) throw new TrackerError(graph.status, graph.code, graph.error);
   const { timelines, events, truncated, issues } = graph.value;
@@ -44,7 +47,7 @@ timelineGraph.get("/", async (c) => {
   const projects: TimelineGraphData["projects"] = {};
   await Promise.all(
     repoIds.map(async (repoId) => {
-      const reply = await tracker.subscribedProjects(access, repoId);
+      const reply = await timedCall(timing, tracker.subscribedProjects(access, repoId));
       if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
       projects[repoId] = reply.value.map((project) => ({
         id: project.projectId,

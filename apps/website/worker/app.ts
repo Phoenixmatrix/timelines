@@ -30,7 +30,7 @@ import { atlas } from "./atlas/api.ts";
 import { workspaceAtlas } from "./atlas/workspace.ts";
 import { releaseNotes, trackerReleaseNotes } from "./release-notes/api.ts";
 import { db } from "./schema.ts";
-import { Timing } from "./timing.ts";
+import { Timing, timingFor } from "./timing.ts";
 import { buildRegistry } from "../registry/app.ts";
 import { tracker } from "./tracker/api.ts";
 import { timelines } from "./timelines/api.ts";
@@ -61,20 +61,6 @@ import { spaceCutoverApi } from "./space-cutover/api.ts";
 
 const api = new Hono<AppEnv>();
 
-api.use(async (c, next) => {
-  const timing = new Timing();
-  c.set("timing", timing);
-  await next();
-  // A WebSocket upgrade (the assistant's live chat) can't take headers.
-  if (c.res.status !== 101) {
-    try {
-      c.res.headers.set("server-timing", timing.header());
-    } catch {
-      // A proxied response with immutable headers goes out without timings.
-    }
-  }
-});
-
 // Browsers authenticate with a Better Auth session cookie (or, in development,
 // the persona cookie); scripts and CLIs send a personal access token
 // (`Authorization: Bearer gmx_…`). Read-scoped tokens may only read.
@@ -99,7 +85,7 @@ api.use(async (c, next) => {
     c.set("actor", await sessionActor(c));
     return next();
   }
-  const credential = await tokenCredential(c);
+  const credential = await c.get("timing").measure("token", tokenCredential(c));
   if (credential.kind !== "token") return c.json({ error: "Invalid access token." }, 401);
   if (credential.scope === "read" && c.req.method !== "GET" && c.req.method !== "HEAD") {
     return c.json({ error: "This token is read-only." }, 403);
@@ -183,8 +169,25 @@ api.onError((error, c) => {
 export const app = new Hono<AppEnv>();
 // The operator journal is independent of the business stores it restores.
 app.route("/api/admin/space-cutover", spaceCutoverApi);
+// Server-Timing for /api responses. The Worker's fetch entry (index.ts) started this
+// request's Timing before its cutover checks, so `total` covers everything; an
+// in-process call (the assistant's) starts its own here.
 app.use(async (c, next) => {
-  if (!(await requestAdmission(c, 4)).allowed)
+  const timing = timingFor(c.req.raw) ?? new Timing();
+  c.set("timing", timing);
+  await next();
+  if (c.req.path !== "/api" && !c.req.path.startsWith("/api/")) return;
+  // A WebSocket upgrade (the assistant's live chat) can't take headers.
+  if (c.res.status === 101) return;
+  try {
+    c.res.headers.set("server-timing", timing.header());
+  } catch {
+    // A proxied response with immutable headers goes out without timings.
+  }
+});
+app.use(async (c, next) => {
+  // Later requestAdmission calls in this request reuse this read.
+  if (!(await c.get("timing").measure("admission", requestAdmission(c, 4))).allowed)
     return c.json(
       { error: "Content is fenced for Organization/Space migration", code: "space_cutover_fenced" },
       503,
@@ -194,7 +197,7 @@ app.use(async (c, next) => {
 app.use(contentContractGate);
 // Sign-in: emailed codes and device login (worker/better-auth.ts).
 app.on(["GET", "POST"], "/api/identity/*", async (c) =>
-  (await createAuth(c.env, new URL(c.req.url).origin)).handler(c.req.raw),
+  (await createAuth(c.env, new URL(c.req.url).origin, c.get("timing"))).handler(c.req.raw),
 );
 // Package protocols (/v2, /npm/…, /pypi/…) and their REST extras
 // (/api/registry/…) come first; their middleware is scoped to those paths.

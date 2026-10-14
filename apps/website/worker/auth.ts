@@ -1,7 +1,7 @@
 import type { Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { TokenScope } from "../shared/api.ts";
-import type { Timing } from "./timing.ts";
+import { Timing } from "./timing.ts";
 import { createAuth } from "./better-auth.ts";
 import { actorFromRow, findUserById, sqlNow, type Actor } from "./db.ts";
 import { db } from "./schema.ts";
@@ -16,6 +16,16 @@ export type AppEnv = {
   };
 };
 
+/**
+ * This request's Server-Timing (app.ts starts it). A route reached without that
+ * middleware (the cutover operator API, a sub-app under test) gets its own.
+ */
+export function requestTiming(c: Context<AppEnv>): Timing {
+  let timing = c.get("timing") as Timing | undefined;
+  if (!timing) c.set("timing", (timing = new Timing()));
+  return timing;
+}
+
 // DEVELOPMENT ONLY. Picking a persona issues a real revocable credential.
 // Production sign-in remains Better Auth (worker/better-auth.ts).
 const PERSONA_COOKIE = "gm_persona";
@@ -24,19 +34,23 @@ const PERSONA_COOKIE = "gm_persona";
 const SESSION_COOKIES = ["gm.session_token", "__Secure-gm.session_token"];
 
 export async function sessionActor(c: Context<AppEnv>): Promise<Actor | null> {
+  const timing = requestTiming(c);
   if (SESSION_COOKIES.some((name) => getCookie(c, name))) {
-    const auth = await createAuth(c.env, new URL(c.req.url).origin);
-    const session = await auth.api.getSession({
-      headers: c.req.raw.headers,
-    });
+    const auth = await createAuth(c.env, new URL(c.req.url).origin, timing);
+    const session = await timing.measure(
+      "session",
+      auth.api.getSession({
+        headers: c.req.raw.headers,
+      }),
+    );
     if (session) {
-      const actor = await findUserById(c.env.DB, session.user.id);
+      const actor = await timing.measure("user", findUserById(c.env.DB, session.user.id));
       if (actor) actor.credential = { kind: "session", id: session.session.id };
       return actor;
     }
   }
   const secret = getCookie(c, PERSONA_COOKIE);
-  return secret ? personaActor(c.env, secret) : null;
+  return secret ? timing.measure("persona", personaActor(c.env, secret)) : null;
 }
 
 /** Sign out of Better Auth (if signed in) and drop the persona cookie. */

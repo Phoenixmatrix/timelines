@@ -10,6 +10,7 @@ import { db as gitmatrixDb } from "../schema.ts";
 import type { TrackerAgent, TrackerIdentity } from "../../shared/tracker.ts";
 import type { Access } from "./store.ts";
 import { cutoverControl } from "../durable/cutover-admission.ts";
+import { timedCall, type Timing } from "../timing.ts";
 
 export async function accessFor(
   env: Env,
@@ -18,6 +19,7 @@ export async function accessFor(
   agentId: string | null,
   includeMembers = true,
   credential?: Actor["credential"],
+  timing?: Timing,
 ): Promise<Access> {
   const d1 = env.DB;
   const actor: Actor = {
@@ -35,7 +37,7 @@ export async function accessFor(
       "forbidden",
       "Tracker access requires a current explicit Space grant.",
     );
-  const admission = await cutoverControl(env).admission(4);
+  const admission = await timedCall(timing, cutoverControl(env).admission(4));
   if (!admission.allowed || !Number.isSafeInteger(admission.epoch))
     throw new TrackerError(
       409,
