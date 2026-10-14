@@ -40,6 +40,7 @@ import {
   useNavigate,
   useNavigation,
   useParams,
+  useRevalidator,
   useSearchParams,
   type NavigateOptions,
 } from "react-router";
@@ -437,6 +438,12 @@ function Workbench({ data }: { data: TrackerView }) {
     );
     return () => clearTimeout(timer);
   }, [snapshot, time]);
+  // Navigating within the tracker reuses its view (trackerShouldRevalidate), so
+  // when a refresh is refused (signed out, access revoked, the Space gone) the
+  // route reads the view again and its error or sign-in replaces what's shown.
+  const revalidator = useRevalidator();
+  const latestRevalidator = useRef(revalidator);
+  latestRevalidator.current = revalidator;
   const refresh = useCallback(async () => {
     const sequence = ++refreshSequence.current;
     setRefreshing(true);
@@ -447,6 +454,12 @@ function Workbench({ data }: { data: TrackerView }) {
       if (sequence === refreshSequence.current) accept(next);
       return true;
     } catch (cause) {
+      if (
+        cause instanceof ApiError &&
+        [401, 403, 404].includes(cause.status) &&
+        latestRevalidator.current.state === "idle"
+      )
+        void latestRevalidator.current.revalidate();
       if (sequence === refreshSequence.current)
         setError(
           cause instanceof Error ? cause.message : "Could not refresh the tracker. Try again.",
@@ -456,6 +469,19 @@ function Workbench({ data }: { data: TrackerView }) {
       if (sequence === refreshSequence.current) setRefreshing(false);
     }
   }, [space, scopeQuery, accept]);
+  // The view is reused across issue navigation (trackerShouldRevalidate), so an
+  // issue made since it was read (by someone else, or with gm) isn't in it yet:
+  // read it once more, per issue, before saying the issue doesn't exist.
+  const missingChecked = useRef(new Set<string>());
+  const [checkedIssues, setCheckedIssues] = useState<ReadonlySet<string>>(() => new Set());
+  const missing = route.issue && !selected ? `${space}/${route.issue}` : null;
+  useEffect(() => {
+    if (!missing || missingChecked.current.has(missing)) return;
+    missingChecked.current.add(missing);
+    // No cancellation (StrictMode runs this twice; the ref lets one read through).
+    void refresh().finally(() => setCheckedIssues((checked) => new Set(checked).add(missing)));
+  }, [missing, refresh]);
+  const checkingMissing = !!missing && !checkedIssues.has(missing);
   useEffect(() => {
     const onFocus = () => {
       if (!busyRef.current) void refresh();
@@ -942,6 +968,10 @@ function Workbench({ data }: { data: TrackerView }) {
         initialEditing={editOnCreate === selected.id}
       />
     </fieldset>
+  ) : checkingMissing ? (
+    <p className="m-0 p-4 text-ink-muted" role="status">
+      Loading issue…
+    </p>
   ) : route.issue ? (
     <MissingIssue space={space} issue={route.issue} back={href()} />
   ) : null;

@@ -15,7 +15,7 @@ import { AuthFrame, CodeCells, Ledger, Step } from "../components/AuthFrame.tsx"
 import { Monogram } from "../components/Monogram.tsx";
 import { FormError } from "../components/ui.tsx";
 import { api, ApiError, attempt, field, load } from "../lib/api.ts";
-import { useViewer } from "../lib/session.ts";
+import { announceAccessChange, useViewer } from "../lib/session.ts";
 
 export async function signInLoader({ request }: { request: Request }) {
   // Personas exist only in development; deployed, /personas is a 404.
@@ -56,6 +56,7 @@ export async function signInAction({ request }: { request: Request }) {
 
   if (intent === "signout") {
     await api("/session", { method: "DELETE" });
+    announceAccessChange();
     return redirect("/signin");
   }
   if (intent === "seed") {
@@ -91,6 +92,7 @@ export async function signInAction({ request }: { request: Request }) {
             : "That username or password isn't right. Ask your admin if you've forgotten it.",
       } satisfies SignInResult;
     }
+    announceAccessChange();
     const { viewer } = await api<SessionResponse>("/session");
     return {
       step: "signed-in",
@@ -115,6 +117,7 @@ export async function signInAction({ request }: { request: Request }) {
         error: codeError(error),
       } satisfies SignInResult;
     }
+    announceAccessChange();
     // Settle the last ledger row (who you are now) before moving on.
     const { viewer } = await api<SessionResponse>("/session");
     return {
@@ -130,6 +133,7 @@ export async function signInAction({ request }: { request: Request }) {
     api("/session", { method: "POST", json: { accountId: form.get("accountId") } }),
   );
   if ("error" in (result as object)) return result;
+  announceAccessChange();
   return redirect(safeNext(url.searchParams.get("next")));
 }
 

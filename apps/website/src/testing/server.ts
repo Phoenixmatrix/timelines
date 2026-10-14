@@ -74,6 +74,7 @@ export class TestServer {
   readonly unhandled: string[] = [];
   readonly world: string | null;
   #routes: { method: string; pattern: URLPattern; handler: Canned }[] = [];
+  #pending = 0;
 
   private constructor(world: string | null) {
     this.world = world;
@@ -112,6 +113,14 @@ export class TestServer {
       handler: typeof handler === "function" ? (handler as Canned) : () => handler,
     });
     return this;
+  }
+
+  /**
+   * Requests made and not yet answered or aborted. `requests` records each one
+   * only once answered, so a slow read made before a mark can land after it.
+   */
+  get pending(): number {
+    return this.#pending;
   }
 
   /** The requests since `mark` (a previous `requests.length`), optionally only those under `prefix`. */
@@ -242,10 +251,23 @@ export class TestServer {
     const url = new URL(request.url, location.origin);
     const aborted = () => new DOMException("The request was aborted.", "AbortError");
     if (request.signal.aborted) throw aborted();
-    const response = await this.#answer(request, url);
-    if (request.signal.aborted) throw aborted();
-    this.requests.push({ method: request.method, url, status: response.status });
-    return response;
+    // Pending until answered or aborted, whichever comes first.
+    this.#pending++;
+    let open = true;
+    const close = () => {
+      if (open) this.#pending--;
+      open = false;
+    };
+    request.signal.addEventListener("abort", close, { once: true });
+    try {
+      const response = await this.#answer(request, url);
+      if (request.signal.aborted) throw aborted();
+      this.requests.push({ method: request.method, url, status: response.status });
+      return response;
+    } finally {
+      request.signal.removeEventListener("abort", close);
+      close();
+    }
   }
 
   async #answer(request: Request, url: URL): Promise<Response> {

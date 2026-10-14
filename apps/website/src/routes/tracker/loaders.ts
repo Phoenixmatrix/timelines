@@ -1,16 +1,27 @@
-import { data, redirect, type LoaderFunctionArgs } from "react-router";
+import {
+  data,
+  redirect,
+  type LoaderFunctionArgs,
+  type ShouldRevalidateFunction,
+} from "react-router";
 import type { TrackerList, TrackerView } from "../../../shared/tracker.ts";
 import { api, ApiError } from "../../lib/api.ts";
 import { readLegacyDefaults } from "./preferences.ts";
 import { assertTrackerSnapshot } from "./snapshot.ts";
 import { tokenize } from "./query.ts";
+import { scopeOf } from "../../lib/timelineScope.ts";
 
-export function assertCurrentTrackerFilters(url: URL): void {
-  if (
+/** Obsolete Workspace filters, which the loader refuses rather than broaden. */
+export function hasObsoleteTrackerFilters(url: URL): boolean {
+  return (
     url.searchParams.has("workspace") ||
     url.searchParams.has("ws") ||
     tokenize(url.searchParams.get("q") ?? "").some((term) => /^-?(workspace|ws):/i.test(term))
-  )
+  );
+}
+
+export function assertCurrentTrackerFilters(url: URL): void {
+  if (hasObsoleteTrackerFilters(url))
     throw data(
       {
         message:
@@ -101,3 +112,30 @@ export async function trackerLoader({ request, params, url }: LoaderFunctionArgs
   }
   return view;
 }
+
+/**
+ * A tracker's view is read on entering the Space or a timeline's view (?tl=),
+ * on a submission and on an explicit revalidation, plus whenever the address
+ * carries filters the loader must check (obsolete Workspace filters, older
+ * ?project= and ?team= links) so they are refused, never broadened. Opening an
+ * issue, j/k, Escape, the query, sort and tabs use the view already loaded;
+ * the workbench keeps it fresh by polling and on focus, and a refresh the
+ * server refuses reads the route again (see Tracker.tsx).
+ */
+export const trackerShouldRevalidate: ShouldRevalidateFunction = ({
+  currentParams,
+  nextParams,
+  formMethod,
+  currentUrl,
+  nextUrl,
+  defaultShouldRevalidate,
+}) => {
+  if (formMethod || currentUrl.href === nextUrl.href) return defaultShouldRevalidate;
+  return (
+    currentParams.space !== nextParams.space ||
+    scopeOf(currentUrl.search) !== scopeOf(nextUrl.search) ||
+    nextUrl.searchParams.has("project") ||
+    nextUrl.searchParams.has("team") ||
+    hasObsoleteTrackerFilters(nextUrl)
+  );
+};

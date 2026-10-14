@@ -1,7 +1,6 @@
 import { PlusIcon } from "@phosphor-icons/react";
 import { Link, useLoaderData } from "react-router";
 import type { RepoSummary } from "../../shared/api.ts";
-import type { SpacePage } from "../../shared/spaces.ts";
 import { Page } from "../components/AppShell.tsx";
 import { RepoList } from "../components/RepoList.tsx";
 import { GitmatrixLogo } from "../components/GitmatrixLogo.tsx";
@@ -14,11 +13,11 @@ export async function homeLoader({ request }: { request: Request }) {
     load<{ repos: RepoSummary[] }>("/repos", request),
     loadSession(request),
   ]);
-  const defaultSpace = viewer?.spaces.find((space) => space.id === viewer.defaultSpaceId);
-  const home = defaultSpace
-    ? await load<SpacePage>(`/spaces/${encodeURIComponent(defaultSpace.slug)}`, request)
-    : null;
-  return { repos, creationSpace: home?.capabilities.canCreateRepository ? home.space : null };
+  // The session lists exactly the Spaces the viewer holds a live grant in (the
+  // access /spaces/:space reports as canCreateRepository), and its default is
+  // always one of them; creating still authorizes on the server.
+  const creationSpace = viewer?.spaces.find((space) => space.id === viewer.defaultSpaceId) ?? null;
+  return { repos, creationSpace };
 }
 
 export function Home() {
