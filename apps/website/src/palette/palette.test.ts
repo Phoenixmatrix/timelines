@@ -24,6 +24,7 @@ const viewer: Viewer = {
   spaces: [],
   personalOrganizationId: null,
   defaultSpaceId: null,
+  savedDefault: { organizationId: null, spaceId: null },
   agent: null,
 };
 

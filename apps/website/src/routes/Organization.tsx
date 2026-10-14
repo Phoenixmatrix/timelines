@@ -9,8 +9,6 @@ import {
   type ActionFunctionArgs,
   type LoaderFunctionArgs,
 } from "react-router";
-import { useState } from "react";
-import { ImageSquareIcon } from "@phosphor-icons/react";
 import { Monogram } from "../components/Monogram.tsx";
 import { PictureEditor } from "./AvatarEditor.tsx";
 import type { AccountSummary } from "../../shared/api.ts";
@@ -42,11 +40,14 @@ export async function organizationsAction({ request }: ActionFunctionArgs) {
   return redirect(`/organizations/${encodeURIComponent(result.organization.slug)}?enter=1`);
 }
 export async function organizationLoader({ request, params }: LoaderFunctionArgs) {
-  await requireViewer(request);
-  const page = await load<OrganizationPage>(
+  // Read the Organization while the session resolves; signing in still comes first.
+  const pending = load<OrganizationPage>(
     `/organizations/${encodeURIComponent(params.organization!)}`,
     request,
   );
+  pending.catch(() => undefined);
+  await requireViewer(request);
+  const page = await pending;
   const url = new URL(request.url);
   const defaultSpace = page.spaces.find(
     (item) => item.space.id === page.organization.defaultSpaceId && !item.space.archivedAt,
@@ -76,8 +77,8 @@ export async function organizationLoader({ request, params }: LoaderFunctionArgs
 export async function organizationAction({ request, params }: ActionFunctionArgs) {
   const base = `/organizations/${encodeURIComponent(params.organization!)}`;
   const form = await request.formData();
-  return attempt(async () => {
-    const intent = field(form, "intent");
+  const intent = field(form, "intent");
+  const result = await attempt(async () => {
     if (intent === "rename")
       await api(base, { method: "PATCH", json: { displayName: field(form, "displayName") } });
     else if (intent === "default")
@@ -109,8 +110,10 @@ export async function organizationAction({ request, params }: ActionFunctionArgs
         method: "DELETE",
       });
     else throw data({ message: "Unknown Organization action." }, { status: 400 });
-    return { saved: true };
+    return { saved: true as const };
   });
+  // Each settings card shows its own outcome, next to its own action.
+  return result instanceof Response ? result : { intent, ...result };
 }
 export function Organizations() {
   const { organizations } = useLoaderData<typeof organizationsLoader>();
@@ -188,7 +191,19 @@ export function Organization() {
   const result = useActionData<typeof organizationAction>();
   const busy = useNavigation().state !== "idle";
   const owner = page.viewerRole === "owner";
-  const [editingIcon, setEditingIcon] = useState(false);
+  const outcome = (intent: string) => {
+    const own = result?.intent === intent ? result : undefined;
+    return (
+      <>
+        <FormError message={own && "error" in own ? own.error : undefined} />
+        {own && "saved" in own && !busy && (
+          <p role="status" className="m-0 text-body-sm text-ink-muted">
+            Saved.
+          </p>
+        )}
+      </>
+    );
+  };
   return (
     <Page key={page.organization.id}>
       <header className="flex flex-wrap items-center gap-4">
@@ -209,35 +224,9 @@ export function Organization() {
             · {page.organization.slug}
           </p>
         </div>
-        {owner && (
-          <button
-            type="button"
-            className="mk-btn mk-btn--ghost min-h-11"
-            aria-expanded={editingIcon}
-            onClick={() => setEditingIcon((open) => !open)}
-          >
-            <ImageSquareIcon className="size-4" aria-hidden />
-            {editingIcon ? "Done" : "Change icon"}
-          </button>
-        )}
       </header>
-      {owner && editingIcon && (
-        <Card title="Organization icon" className="mt-6 max-w-xl">
-          <PictureEditor
-            target={{
-              endpoint: `/organizations/${encodeURIComponent(page.organization.slug)}/avatar`,
-              name: page.organization.displayName,
-              avatarUrl: page.organization.avatarUrl,
-              shape: "place",
-              noun: "icon",
-              intro:
-                "Shown wherever this Organization appears. Changing its icon does not grant Space content access.",
-            }}
-          />
-        </Card>
-      )}
-      <FormError message={result && "error" in result ? result.error : undefined} />
-      {result && "saved" in result && <p role="status">Organization updated.</p>}
+      {/* Changing your own role or membership can end ownership, and with it the settings cards. */}
+      {!owner && result && <div className="mt-4">{outcome(result.intent)}</div>}
       <section className="mt-8" aria-labelledby="spaces-heading">
         <h2 id="spaces-heading" className="text-title">
           Spaces
@@ -277,68 +266,30 @@ export function Organization() {
         )}
       </section>
       {owner && (
-        <>
-          <section className="mt-8" aria-labelledby="people-heading">
-            <h2 id="people-heading" className="text-title">
-              People
-            </h2>
-            <p className="text-body-sm text-ink-muted">
-              Membership does not grant Space content access. Removing membership also revokes that
-              person’s Space grants.
-            </p>
-            <ul className="m-0 list-none divide-y divide-line p-0">
-              {page.members.map((member) => (
-                <li
-                  key={member.id}
-                  className="flex flex-wrap items-center justify-between gap-3 py-3"
-                >
-                  <Link to={`/accounts/${encodeURIComponent(member.slug)}`} className={link}>
-                    {member.displayName} · {member.role}
-                  </Link>
-                  <Form method="post">
-                    <input type="hidden" name="intent" value="remove-member" />
-                    <input type="hidden" name="accountId" value={member.id} />
-                    <button
-                      className="mk-btn mk-btn--ghost min-h-11"
-                      disabled={busy}
-                      aria-label={`Remove ${member.displayName} from Organization`}
-                    >
-                      Remove membership
-                    </button>
-                  </Form>
-                </li>
-              ))}
-            </ul>
-            <Form method="post" className="mt-4 flex max-w-xl flex-col gap-3">
-              <input type="hidden" name="intent" value="member" />
-              <TextField
-                name="person"
-                label="Person handle"
-                required
-                hint="Add a person or change their Organization role."
+        // Settings forms share the settings pages' column, cards and left-aligned actions.
+        <section className="mt-10 max-w-3xl" aria-labelledby="organization-settings">
+          <h2 id="organization-settings" className="m-0 text-title">
+            Organization settings
+          </h2>
+          <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
+            Directory and grants administration. Owning the Organization does not grant access to
+            its Spaces&rsquo; content.
+          </p>
+          <div className="mt-6 flex flex-col gap-6">
+            <Card title="Organization icon">
+              <PictureEditor
+                target={{
+                  endpoint: `/organizations/${encodeURIComponent(page.organization.slug)}/avatar`,
+                  name: page.organization.displayName,
+                  avatarUrl: page.organization.avatarUrl,
+                  shape: "place",
+                  noun: "icon",
+                  intro:
+                    "Shown wherever this Organization appears. Changing its icon does not grant Space content access.",
+                }}
               />
-              <label className="mk-field">
-                <span className="mk-label">Organization role</span>
-                <SelectField
-                  name="role"
-                  defaultValue="member"
-                  ariaLabel="Organization role"
-                  options={[
-                    { value: "member", label: "Member" },
-                    { value: "owner", label: "Owner — directory and grants administration" },
-                  ]}
-                />
-              </label>
-              <button className="mk-btn mk-btn--secondary self-start" disabled={busy}>
-                Save membership
-              </button>
-            </Form>
-          </section>
-          <section className="mt-8 flex flex-col gap-6" aria-labelledby="organization-settings">
-            <h2 id="organization-settings" className="m-0 text-title">
-              Organization settings
-            </h2>
-            <Card title="Organization name">
+            </Card>
+            <Card title="Organization name" description="The handle is permanent.">
               <Form method="post" className="mk-card-body">
                 <input type="hidden" name="intent" value="rename" />
                 <TextField
@@ -347,9 +298,12 @@ export function Organization() {
                   defaultValue={page.organization.displayName}
                   required
                 />
-                <button className="mk-btn mk-btn--secondary self-start" disabled={busy}>
-                  Save name
-                </button>
+                {outcome("rename")}
+                <div className="mk-form-actions">
+                  <button className="mk-btn mk-btn--primary" disabled={busy}>
+                    Save name
+                  </button>
+                </div>
               </Form>
             </Card>
             <Card
@@ -358,20 +312,90 @@ export function Organization() {
             >
               <Form method="post" className="mk-card-body">
                 <input type="hidden" name="intent" value="default" />
-                <SelectField
-                  name="spaceId"
-                  defaultValue={page.organization.defaultSpaceId}
-                  ariaLabel="Default Space"
-                  options={page.spaces
-                    .filter((item) => !item.space.archivedAt)
-                    .map(({ space }) => ({
-                      value: space.id,
-                      label: `${space.displayName} (${space.slug})`,
-                    }))}
+                <label className="mk-field">
+                  <span className="mk-label">Space</span>
+                  <SelectField
+                    name="spaceId"
+                    defaultValue={page.organization.defaultSpaceId}
+                    ariaLabel="Default Space"
+                    options={page.spaces
+                      .filter((item) => !item.space.archivedAt)
+                      .map(({ space }) => ({
+                        value: space.id,
+                        label: `${space.displayName} (${space.slug})`,
+                      }))}
+                  />
+                </label>
+                {outcome("default")}
+                <div className="mk-form-actions">
+                  <button className="mk-btn mk-btn--primary" disabled={busy}>
+                    Set default Space
+                  </button>
+                </div>
+              </Form>
+            </Card>
+            <Card
+              title="People"
+              description="Membership does not grant Space content access. Removing membership also revokes that person’s Space grants."
+            >
+              {outcome("remove-member")}
+              <ul className="m-0 mt-4 list-none divide-y divide-line-soft p-0">
+                {page.members.map((member) => (
+                  <li key={member.id} className="flex flex-wrap items-center gap-3 py-3">
+                    <div className="min-w-0 flex-1">
+                      <Link to={`/accounts/${encodeURIComponent(member.slug)}`} className={link}>
+                        <bdi>{member.displayName}</bdi>
+                      </Link>
+                      <div className="text-body-sm text-ink-faint">
+                        @{member.slug} · {member.role === "owner" ? "Owner" : "Member"}
+                      </div>
+                    </div>
+                    <Form method="post">
+                      <input type="hidden" name="intent" value="remove-member" />
+                      <input type="hidden" name="accountId" value={member.id} />
+                      <button
+                        className="mk-btn mk-btn--danger-ghost mk-btn--sm min-h-11"
+                        disabled={busy}
+                        aria-label={`Remove ${member.displayName} from Organization`}
+                      >
+                        Remove membership
+                      </button>
+                    </Form>
+                  </li>
+                ))}
+              </ul>
+            </Card>
+            <Card
+              title="Add or change a member"
+              description="Add a person, or change their Organization role."
+            >
+              <Form method="post" className="mk-card-body">
+                <input type="hidden" name="intent" value="member" />
+                <TextField
+                  name="person"
+                  label="Person handle"
+                  required
+                  autoCapitalize="none"
+                  spellCheck={false}
                 />
-                <button className="mk-btn mk-btn--secondary self-start" disabled={busy}>
-                  Set default Space
-                </button>
+                <label className="mk-field">
+                  <span className="mk-label">Organization role</span>
+                  <SelectField
+                    name="role"
+                    defaultValue="member"
+                    ariaLabel="Organization role"
+                    options={[
+                      { value: "member", label: "Member" },
+                      { value: "owner", label: "Owner — directory and grants administration" },
+                    ]}
+                  />
+                </label>
+                {outcome("member")}
+                <div className="mk-form-actions">
+                  <button className="mk-btn mk-btn--primary" disabled={busy}>
+                    Save membership
+                  </button>
+                </div>
               </Form>
             </Card>
             <Card
@@ -387,13 +411,16 @@ export function Organization() {
                   required
                   hint="Immutable. Choose the repository and tracker address carefully."
                 />
-                <button className="mk-btn mk-btn--primary self-start" disabled={busy}>
-                  Create Space
-                </button>
+                {outcome("space")}
+                <div className="mk-form-actions">
+                  <button className="mk-btn mk-btn--primary" disabled={busy}>
+                    Create Space
+                  </button>
+                </div>
               </Form>
             </Card>
-          </section>
-        </>
+          </div>
+        </section>
       )}
     </Page>
   );

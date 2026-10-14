@@ -2,18 +2,21 @@ import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
 import {
   CONTENT_CONTRACT_VERSION,
+  type SpaceAccess,
   type SpacePage,
   type SpaceSummary,
 } from "../../shared/spaces.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { cutoverControl } from "../durable/cutover-admission.ts";
-import { findSpaceById, findSpaceBySlug, resolveSpaceAccess } from "../spaces/access.ts";
+import {
+  findSpaceById,
+  findSpaceBySlug,
+  listSpaceAccess,
+  resolveSpaceAccess,
+} from "../spaces/access.ts";
 import {
   archiveSpace,
   createSpace,
-  listOrganizations,
-  listSpaceDirectory,
   listSpaceGrants,
   organizationRole,
   restoreSpace,
@@ -22,6 +25,7 @@ import {
   updateSpace,
 } from "../spaces/store.ts";
 import { slugProblem } from "../names.ts";
+import { requestAdmission } from "./content-contract.ts";
 import { fail, readJson, requireActor } from "./http.ts";
 
 export async function spacePage(
@@ -29,12 +33,23 @@ export async function spacePage(
   actor: Actor,
   space: SpaceSummary,
 ): Promise<SpacePage | null> {
-  const [access, role] = await Promise.all([
+  const [access, role, admission] = await Promise.all([
     resolveSpaceAccess(c.env.DB, actor, space.id),
     organizationRole(c.env.DB, actor, space.organizationId),
+    requestAdmission(c),
   ]);
+  return spacePageFrom(space, access, role, admission);
+}
+
+/** A Space page from grant, Organization role and admission already read for this
+ * request, so a listing builds every page from a few queries instead of a few each. */
+export function spacePageFrom(
+  space: SpaceSummary,
+  access: SpaceAccess | null,
+  role: "owner" | "member" | null,
+  admission: { allowed: boolean; epoch: number },
+): SpacePage | null {
   if (!access && role !== "owner") return null;
-  const admission = await cutoverControl(c.env).admission(CONTENT_CONTRACT_VERSION);
   if (!admission.allowed) throw new Error("space_cutover_fenced");
   return {
     space,
@@ -54,16 +69,20 @@ export const spaces = new Hono<AppEnv>();
 spaces.get("/", async (c) => {
   const actor = requireActor(c);
   if (actor instanceof Response) return actor;
-  const pages: SpacePage[] = [];
-  for (const organization of await listOrganizations(c.env.DB, actor)) {
-    for (const entry of await listSpaceDirectory(c.env.DB, actor, organization.id)) {
-      if (entry.archivedAt) continue;
-      const space = await findSpaceById(c.env.DB, entry.id);
-      if (!space) continue;
-      const page = await spacePage(c, actor, space);
-      if (page?.grant) pages.push(page);
-    }
-  }
+  // Only granted Spaces are listed: one grant query, then each Organization's role once.
+  const [granted, admission] = await Promise.all([
+    listSpaceAccess(c.env.DB, actor),
+    requestAdmission(c),
+  ]);
+  const organizationIds = [...new Set(granted.map((access) => access.space.organizationId))];
+  const roles = new Map(
+    await Promise.all(
+      organizationIds.map(async (id) => [id, await organizationRole(c.env.DB, actor, id)] as const),
+    ),
+  );
+  const pages = granted.map((access) =>
+    spacePageFrom(access.space, access, roles.get(access.space.organizationId) ?? null, admission)!,
+  );
   return c.json({ spaces: pages });
 });
 spaces.post("/", async (c) => {

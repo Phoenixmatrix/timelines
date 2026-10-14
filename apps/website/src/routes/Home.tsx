@@ -1,18 +1,18 @@
 import { PlusIcon } from "@phosphor-icons/react";
 import { Link, useLoaderData } from "react-router";
-import type { RepoSummary, SessionResponse } from "../../shared/api.ts";
+import type { RepoSummary } from "../../shared/api.ts";
 import type { SpacePage } from "../../shared/spaces.ts";
 import { Page } from "../components/AppShell.tsx";
 import { RepoList } from "../components/RepoList.tsx";
 import { GitmatrixLogo } from "../components/GitmatrixLogo.tsx";
 import { load } from "../lib/api.ts";
 import { greeting } from "../lib/format.ts";
-import { useViewer } from "../lib/session.ts";
+import { loadSession, useViewer } from "../lib/session.ts";
 
 export async function homeLoader({ request }: { request: Request }) {
   const [{ repos }, { viewer }] = await Promise.all([
     load<{ repos: RepoSummary[] }>("/repos", request),
-    load<SessionResponse>("/session", request),
+    loadSession(request),
   ]);
   const defaultSpace = viewer?.spaces.find((space) => space.id === viewer.defaultSpaceId);
   const home = defaultSpace

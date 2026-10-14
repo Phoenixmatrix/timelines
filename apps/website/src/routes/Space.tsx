@@ -18,11 +18,17 @@ import { useViewer } from "../lib/session.ts";
 
 export async function spaceLoader({ request, params }: LoaderFunctionArgs) {
   const slug = encodeURIComponent(params.space!);
-  const { repos } = await load<{ repos: RepoSummary[] }>(`/repos?space=${slug}`, request);
-  let page: SpacePage | null;
-  try {
-    page = await api<SpacePage>(`/spaces/${slug}`, { signal: request.signal });
-  } catch (error) {
+  // The repositories and the Space page are independent: read them together.
+  const [{ repos }, read] = await Promise.all([
+    load<{ repos: RepoSummary[] }>(`/repos?space=${slug}`, request),
+    api<SpacePage>(`/spaces/${slug}`, { signal: request.signal }).then(
+      (page) => ({ page, error: null }),
+      (error: unknown) => ({ page: null, error }),
+    ),
+  ]);
+  let page: SpacePage | null = read.page;
+  if (read.error) {
+    const { error } = read;
     if (!(error instanceof ApiError)) throw error;
     if (![401, 403, 404].includes(error.status))
       throw data({ message: error.message }, { status: error.status });
@@ -32,28 +38,26 @@ export async function spaceLoader({ request, params }: LoaderFunctionArgs) {
     page = null;
   }
   const space = page?.space ?? repos[0]!.space;
-  let members: AccountSummary[] = [];
-  let grants: SpaceGrant[] = [];
-  let organization: OrganizationPage | null = null;
-  if (page?.capabilities.canManageGrants) {
-    const base = `/organizations/${encodeURIComponent(space.organization.slug)}`;
-    const results = await Promise.all([
-      load<{ members: AccountSummary[] }>(`${base}/members`, request),
-      load<{ grants: SpaceGrant[] }>(`/spaces/${slug}/grants`, request),
-      load<OrganizationPage>(base, request),
-    ]);
-    members = results[0].members;
-    grants = results[1].grants;
-    organization = results[2];
-  }
-  const teams = page?.capabilities.canReadContent
-    ? (
-        await load<{ teams: { id: string; key: string; name: string }[] }>(
+  const base = `/organizations/${encodeURIComponent(space.organization.slug)}`;
+  // Directory administration and the Tracker's teams both follow from the page alone.
+  const [administration, teams] = await Promise.all([
+    page?.capabilities.canManageGrants
+      ? Promise.all([
+          load<{ members: AccountSummary[] }>(`${base}/members`, request),
+          load<{ grants: SpaceGrant[] }>(`/spaces/${slug}/grants`, request),
+          load<OrganizationPage>(base, request),
+        ])
+      : null,
+    page?.capabilities.canReadContent
+      ? load<{ teams: { id: string; key: string; name: string }[] }>(
           `/tracker/${slug}/teams`,
           request,
-        )
-      ).teams
-    : [];
+        ).then((result) => result.teams)
+      : [],
+  ]);
+  const members: AccountSummary[] = administration?.[0].members ?? [];
+  const grants: SpaceGrant[] = administration?.[1].grants ?? [];
+  const organization: OrganizationPage | null = administration?.[2] ?? null;
   return { page, space, repos, members, grants, organization, teams };
 }
 export async function spaceAction({ request, params }: ActionFunctionArgs) {

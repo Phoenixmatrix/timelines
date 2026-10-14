@@ -6,7 +6,15 @@ import { createAuth } from "./better-auth.ts";
 import { actorFromRow, findUserById, sqlNow, type Actor } from "./db.ts";
 import { db } from "./schema.ts";
 
-export type AppEnv = { Bindings: Env; Variables: { actor: Actor | null; timing: Timing } };
+export type AppEnv = {
+  Bindings: Env;
+  Variables: {
+    actor: Actor | null;
+    timing: Timing;
+    /** This request's cutover admission reads, by contract version (requestAdmission). */
+    admissions?: Map<number, Promise<{ allowed: boolean; epoch: number }>>;
+  };
+};
 
 // DEVELOPMENT ONLY. Picking a persona issues a real revocable credential.
 // Production sign-in remains Better Auth (worker/better-auth.ts).

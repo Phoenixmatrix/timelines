@@ -32,6 +32,14 @@ Repositories section creates repositories at `/:space/-/repositories/new`.
 Personal shortcuts use the persisted personal Organization/default Space, never
 an inferred Account slug.
 
+A person may choose their own default Organization and Space in Settings >
+Preferences (CORE-413; `PUT /api/account/default-scope`, people only, not their
+agents). Only a choice that opens a Space is saved; "the Organization's
+default" follows that Organization's default Space. The session's
+`defaultSpaceId` (Home, settings, `gm`) and `/tracker`'s opening tracker use
+it while the person can still open it, and otherwise fall back to the personal
+default (and, for `/tracker`, the tracker last tuned) without forgetting it.
+
 Organization owners administer the directory and explicit grants; they do not
 inherit private content access. A current Space grant joined to current
 Organization membership gives `admin` or `member` access, with independent

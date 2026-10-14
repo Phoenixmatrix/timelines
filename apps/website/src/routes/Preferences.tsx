@@ -1,14 +1,17 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import {
   Link,
   useLoaderData,
   useLocation,
   useNavigate,
+  useRevalidator,
   type LoaderFunctionArgs,
 } from "react-router";
+import type { SessionResponse, Viewer } from "../../shared/api.ts";
+import { preferredSpace, type DefaultScope } from "../../shared/spaces.ts";
 import type { Snapshot, TrackerList, TrackerView } from "../../shared/tracker.ts";
 import { SettingsPage } from "../components/SettingsPage.tsx";
-import { FormError, SelectField, useToast } from "../components/ui.tsx";
+import { Card, FormError, SelectField, useToast } from "../components/ui.tsx";
 import { api, ApiError } from "../lib/api.ts";
 import { requireViewer, useViewer } from "../lib/session.ts";
 import { TrackerDefaultsForm } from "./tracker/Defaults.tsx";
@@ -47,14 +50,21 @@ export function Preferences() {
   };
   const [shortcuts, setShortcuts] = useState(readTrackerShortcuts);
   const [shortcutsError, setShortcutsError] = useState("");
+  const viewer = useViewer();
 
   return (
     <SettingsPage space={data?.snapshot.space.slug}>
       <h1 className="m-0 text-headline">Preferences</h1>
       <p className="mt-1.5 mb-0 max-w-[48ch] text-ink-muted">
-        Choose how the issue tracker opens and how you move through it.
+        Choose where the app opens, how the issue tracker opens and how you move through it.
       </p>
       <div className="mt-8 flex flex-col gap-6">
+        {viewer && (
+          <DefaultScopeCard
+            key={`${viewer.savedDefault.organizationId}/${viewer.savedDefault.spaceId}`}
+            viewer={viewer}
+          />
+        )}
         {data ? (
           <div className="flex flex-col gap-4">
             <div className="flex flex-wrap items-end gap-3">
@@ -143,6 +153,163 @@ export function Preferences() {
         </section>
       </div>
     </SettingsPage>
+  );
+}
+
+/**
+ * The person's own default Organization and Space (CORE-413), on the server:
+ * Home, settings, the tracker and gm open it when nothing more specific names
+ * a Space. Losing access to it falls back to the personal Organization's
+ * default Space without forgetting the choice.
+ */
+function DefaultScopeCard({ viewer }: { viewer: Viewer }) {
+  const toast = useToast();
+  const revalidator = useRevalidator();
+  const saved = viewer.savedDefault;
+  const current = viewer.spaces.find((space) => space.id === viewer.defaultSpaceId);
+  const [organizationId, setOrganizationId] = useState(
+    () =>
+      (viewer.organizations.some((item) => item.id === saved.organizationId)
+        ? saved.organizationId
+        : current?.organizationId) ??
+      viewer.personalOrganizationId ??
+      viewer.organizations[0]?.id ??
+      "",
+  );
+  const [spaceId, setSpaceId] = useState(saved.spaceId ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const agent = !!viewer.agent;
+  const id = useId();
+  const organization = viewer.organizations.find((item) => item.id === organizationId);
+  const spaces = viewer.spaces.filter(
+    (space) => space.organizationId === organizationId && !space.archivedAt,
+  );
+  const organizationDefault = spaces.find((space) => space.id === organization?.defaultSpaceId);
+  // "" stands for the Organization's default Space, offered only while it opens.
+  const selected = spaces.some((space) => space.id === spaceId)
+    ? spaceId
+    : organizationDefault
+      ? ""
+      : (spaces[0]?.id ?? "");
+  const lapsed = !!saved.organizationId && !preferredSpace(saved, viewer.spaces);
+  const save = async (scope: DefaultScope, title: string) => {
+    setBusy(true);
+    setError("");
+    try {
+      await api<SessionResponse>("/account/default-scope", { method: "PUT", json: scope });
+      toast.add({ title });
+      await revalidator.revalidate();
+    } catch (cause) {
+      setError(
+        cause instanceof ApiError ? cause.message : "Couldn't save your default. Try again.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Card
+      title="Default Organization and Space"
+      description="Home, settings, the issue tracker and gm open this Space when nothing more specific names one. If you lose access to it, they open what they did before you chose: your personal default Space, and for the tracker the one you last set defaults for."
+    >
+      <form
+        className="mk-card-body"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void save({ organizationId, spaceId: selected || null }, "Default saved");
+        }}
+      >
+        <label className="mk-field">
+          <span className="mk-label">Organization</span>
+          <SelectField
+            ariaLabel="Default Organization"
+            value={organizationId}
+            options={viewer.organizations.map((item) => ({
+              value: item.id,
+              label: item.displayName,
+            }))}
+            onChange={(value) => {
+              setOrganizationId(value);
+              setSpaceId("");
+            }}
+          />
+        </label>
+        <label className="mk-field">
+          <span className="mk-label">Space</span>
+          <SelectField
+            ariaLabel="Default Space"
+            ariaDescribedBy={spaces.length ? undefined : `${id}-no-space`}
+            value={selected}
+            options={[
+              ...(organizationDefault
+                ? [
+                    {
+                      value: "",
+                      label: `Organization's default (${organizationDefault.displayName})`,
+                    },
+                  ]
+                : []),
+              ...spaces.map((space) => ({
+                value: space.id,
+                label:
+                  space.displayName === space.slug
+                    ? space.slug
+                    : `${space.displayName} (${space.slug})`,
+              })),
+            ]}
+            onChange={setSpaceId}
+          />
+          {!spaces.length && (
+            <span id={`${id}-no-space`} className="text-body-sm text-ink-muted">
+              You have no Space grant in this Organization.
+            </span>
+          )}
+        </label>
+        <p role="status" className="m-0 text-body-sm text-ink-muted">
+          {lapsed
+            ? "You can no longer open your saved default, so your earlier defaults apply. "
+            : ""}
+          {current ? (
+            <>
+              Opens{" "}
+              <bdi>
+                {current.organization.displayName} / {current.displayName}
+              </bdi>{" "}
+              now.
+            </>
+          ) : (
+            "No default Space opens now."
+          )}
+        </p>
+        {agent && (
+          <p id={`${id}-agent`} className="m-0 text-body-sm text-ink-muted">
+            Agents can&rsquo;t do that; sign in as their person.
+          </p>
+        )}
+        <FormError message={error} />
+        <div className="mk-form-actions">
+          <button
+            className="mk-btn mk-btn--primary"
+            disabled={busy || agent || !spaces.length}
+            aria-describedby={agent ? `${id}-agent` : spaces.length ? undefined : `${id}-no-space`}
+          >
+            Save default
+          </button>
+          {saved.organizationId && (
+            <button
+              type="button"
+              className="mk-btn mk-btn--ghost"
+              disabled={busy || agent}
+              aria-describedby={agent ? `${id}-agent` : undefined}
+              onClick={() => void save({ organizationId: null, spaceId: null }, "Default reset")}
+            >
+              Use personal default
+            </button>
+          )}
+        </div>
+      </form>
+    </Card>
   );
 }
 

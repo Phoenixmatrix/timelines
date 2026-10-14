@@ -6,6 +6,7 @@ import { renderApp } from "../testing/render.tsx";
 import { sidewaysOverflow } from "../testing/atlas.ts";
 import { focusOn, focused, press } from "../testing/focus.ts";
 import { TestServer } from "../testing/server.ts";
+import { visual } from "../testing/visual.ts";
 
 // Organization and Space switching lives in the rail's account menu (CORE-414).
 const accountMenu = () => page.getByRole("button", { name: /account menu$/ });
@@ -130,6 +131,71 @@ test("scope menus support keyboard dismissal without switching or creating", asy
   await expect.element(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
 });
 
+test("Space switching is offered on every page, marking a Space current only inside it", async () => {
+  const server = await TestServer.start({ world: true });
+  const created = await organization(server, "anywhere-space-browser");
+  const general = created.spaces[0]!.space;
+  const tools = await server.call<SpacePage>("POST", "/api/spaces", {
+    organizationId: created.organization.id,
+    slug: "anywhere-space-browser-tools",
+    displayName: "Tools",
+  });
+  await server.call("PUT", "/api/account/default-scope", {
+    organizationId: created.organization.id,
+    spaceId: tools.space.id,
+  });
+  await server.repo(general.slug, "engine");
+  const choices = () => ({
+    general: page.getByRole("menuitem", { name: `General (${general.slug})`, exact: true }),
+    tools: page.getByRole("menuitem", { name: `Tools (${tools.space.slug})`, exact: true }),
+  });
+  const openSpaces = async () => {
+    await focusOn(accountMenu());
+    await press("Enter");
+    await expect.element(scopeItem("Organization")).toHaveFocus();
+    await expect
+      .element(scopeItem("Organization"))
+      .toHaveAccessibleName("Organization: Navigation Company");
+    await press("ArrowDown");
+    await expect.element(scopeItem("Space")).toHaveFocus();
+    await press("ArrowRight");
+    await expect.element(choices().general).toBeVisible();
+    await expect.element(choices().tools).toBeVisible();
+  };
+  const close = async () => {
+    await press("Escape");
+    await press("Escape");
+    await expect.element(page.getByRole("menu")).not.toBeInTheDocument();
+  };
+
+  // Home has no Space of its own: the person's default Space supplies the Organization.
+  const app = renderApp("/");
+  await openSpaces();
+  expect(scopeItem("Space").element()).toHaveAccessibleName("Space: Choose a Space");
+  for (const choice of Object.values(choices()))
+    expect(choice.element()).not.toHaveAttribute("aria-current");
+  await press("ArrowLeft");
+  await press("ArrowUp");
+  await press("ArrowRight");
+  // Nor is Home in that Organization.
+  await expect
+    .element(page.getByRole("menuitem", { name: "Navigation Company", exact: true }))
+    .not.toHaveAttribute("aria-current");
+  await expect
+    .element(page.getByRole("menuitem", { name: "Organization directory" }))
+    .toHaveAttribute("href", "/organizations");
+  await close();
+
+  // A repository page is in its Space.
+  await app.navigate(`/${general.slug}/engine`);
+  await expect.element(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
+  await openSpaces();
+  expect(scopeItem("Space").element()).toHaveAccessibleName("Space: General");
+  expect(choices().general.element()).toHaveAttribute("aria-current", "true");
+  expect(choices().tools.element()).not.toHaveAttribute("aria-current");
+  await close();
+});
+
 test("Space navigation and browser history retain concrete destinations without creating repositories", async () => {
   const server = await TestServer.start({ world: true });
   const created = await organization(server, "history-space-browser");
@@ -193,4 +259,75 @@ test("phone scope menus remain reachable and repository creation stays in Reposi
   } finally {
     await page.viewport(1280, 900);
   }
+});
+
+test("entering an Organization reads the session once per navigation and its Space without a waterfall", async () => {
+  const server = await TestServer.start({ world: true });
+  const created = await organization(server, "session-once-browser");
+  const slug = created.spaces[0]!.space.slug;
+  // When each request starts and ends, to see which reads wait on which.
+  const events: string[] = [];
+  const serve = vi.mocked(window.fetch).getMockImplementation()!;
+  vi.mocked(window.fetch).mockImplementation(async (input, init) => {
+    const path = new URL(input instanceof Request ? input.url : input, location.origin).pathname;
+    events.push(`start ${path}`);
+    try {
+      return await serve(input, init);
+    } finally {
+      events.push(`end ${path}`);
+    }
+  });
+  const mark = server.requests.length;
+  // Two navigations: the Organization, then the redirect into its only Space.
+  renderApp(`/organizations/${created.organization.slug}?enter=1`);
+  await expect.element(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
+  const sessions = server.since(mark).filter((request) => request.url.pathname === "/api/session");
+  expect(sessions).toHaveLength(2);
+  const at = (event: string) => {
+    const index = events.indexOf(event);
+    expect(index, event).toBeGreaterThanOrEqual(0);
+    return index;
+  };
+  // The Organization page is read alongside the session, not after it.
+  expect(at(`start /api/organizations/${created.organization.slug}`)).toBeLessThan(
+    at("end /api/session"),
+  );
+  // The Space page doesn't wait for its repositories, nor its teams for directory administration.
+  expect(at(`start /api/spaces/${slug}`)).toBeLessThan(at("end /api/repos"));
+  expect(at(`start /api/tracker/${slug}/teams`)).toBeLessThan(at(`end /api/spaces/${slug}/grants`));
+});
+
+test("Organization settings use the settings pages' column, cards and per-card outcomes (CORE-415)", async () => {
+  const server = await TestServer.start({ world: true });
+  const created = await organization(server, "settings-style-browser");
+  renderApp(`/organizations/${created.organization.slug}`);
+  const settings = page.getByRole("region", { name: "Organization settings" });
+  await expect.element(settings).toBeVisible();
+  await expect.element(settings.getByRole("heading", { name: "Organization icon" })).toBeVisible();
+  // The settings pages' 48rem form column, with each card's own primary action left-aligned.
+  expect(settings.element().getBoundingClientRect().width).toBeLessThanOrEqual(48 * 16);
+  const form = (name: string) => {
+    const button = settings.getByRole("button", { name, exact: true }).element();
+    expect(button.classList).toContain("mk-btn--primary");
+    expect(button.closest(".mk-form-actions")).not.toBeNull();
+    return button.closest("form")!;
+  };
+  for (const name of ["Save name", "Set default Space", "Save membership", "Create Space"])
+    form(name);
+  settings.element().scrollIntoView();
+  await visual("Organization settings");
+
+  await userEvent.fill(settings.getByRole("textbox", { name: "Display name" }), "Renamed Company");
+  await userEvent.click(settings.getByRole("button", { name: "Save name" }));
+  await expect
+    .element(page.getByRole("heading", { name: "Renamed Company", exact: true }))
+    .toBeVisible();
+  await expect.element(settings.getByRole("status")).toHaveTextContent("Saved.");
+  expect(form("Save name").contains(settings.getByRole("status").element())).toBe(true);
+
+  await userEvent.fill(settings.getByRole("textbox", { name: "Person handle" }), "nobody-here");
+  await userEvent.click(settings.getByRole("button", { name: "Save membership" }));
+  await expect.element(settings.getByRole("alert")).toBeVisible();
+  expect(form("Save membership").contains(settings.getByRole("alert").element())).toBe(true);
+  await expect.element(settings.getByRole("status")).not.toBeInTheDocument();
 });

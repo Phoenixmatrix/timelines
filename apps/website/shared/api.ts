@@ -1,6 +1,6 @@
 // Shapes the Worker's JSON API returns, shared with the React app.
 import type { CodeSource, SourceSnapshot } from "./code-source.ts";
-import type { OrganizationSummary, SpaceSummary } from "./spaces.ts";
+import type { DefaultScope, OrganizationSummary, SpaceSummary } from "./spaces.ts";
 
 export type RepoRole = "none" | "read" | "write" | "admin";
 export type Visibility = "public" | "private";
@@ -33,8 +33,14 @@ export interface Viewer extends AccountSummary {
   /** Only live explicit grants contribute to content navigation. */
   spaces: SpaceSummary[];
   personalOrganizationId: string | null;
-  /** Persisted personal default; null when the person cannot access it. */
+  /**
+   * The Space their defaults open: their own choice (`savedDefault`) while they
+   * can open it, else the personal Organization's default; null when neither is
+   * accessible.
+   */
   defaultSpaceId: string | null;
+  /** The default they chose in Preferences (CORE-413), as saved, accessible or not. */
+  savedDefault: DefaultScope;
   /** Set when signed in with an agent's token: the agent acting for this viewer. */
   agent: AgentRef | null;
 }

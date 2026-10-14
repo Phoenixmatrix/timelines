@@ -106,7 +106,14 @@ function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
         </Menu.Trigger>
       </Tip>
       <Menu.Portal>
-        <Menu.Positioner side="right" align="end" sideOffset={12} className="z-50">
+        {/* Fixed, like the rail it opens from: scrolling the page under the menu can't move it. */}
+        <Menu.Positioner
+          side="right"
+          align="end"
+          sideOffset={12}
+          positionMethod="fixed"
+          className="z-50"
+        >
           <Menu.Popup className={`mk-popup ${popMotion}`}>
             <div className="px-2.5 pt-2 pb-1.5">
               <div className="font-semibold">

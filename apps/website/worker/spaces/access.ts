@@ -53,6 +53,17 @@ export async function findSpaceById(d1: D1Database, id: string): Promise<SpaceSu
   const row = await d1.prepare(`${SPACE_SELECT} WHERE s.id = ?`).bind(id).first<SpaceRow>();
   return row ? summary(row) : null;
 }
+/** Every Space of one Organization, archived included. Lookup, not authorization. */
+export async function listOrganizationSpaces(
+  d1: D1Database,
+  organizationId: string,
+): Promise<SpaceSummary[]> {
+  const { results } = await d1
+    .prepare(`${SPACE_SELECT} WHERE s.organization_id = ?`)
+    .bind(organizationId)
+    .all<SpaceRow>();
+  return results.map(summary);
+}
 export async function findSpaceBySlug(d1: D1Database, slug: string): Promise<SpaceSummary | null> {
   const row = await d1
     .prepare(`${SPACE_SELECT} WHERE s.slug = ? COLLATE NOCASE`)
@@ -60,17 +71,20 @@ export async function findSpaceBySlug(d1: D1Database, slug: string): Promise<Spa
     .first<SpaceRow>();
   return row ? summary(row) : null;
 }
-/** Current person/agent, membership and explicit grant in one database snapshot.
- * Credential expiry/scope is the caller's authentication boundary; no cached Actor
- * or Instance privilege can manufacture a Space grant here.
- */
-export async function resolveSpaceAccess(
-  d1: D1Database,
-  actor: Actor | null,
-  spaceId: string,
-): Promise<SpaceAccess | null> {
-  if (!actor) return null;
-  const row = await d1
+type AccessRow = SpaceRow & {
+  role: "admin" | "member";
+  repository_role: "none" | "read" | "write";
+  package_role: "none" | "read" | "write";
+  origin: string;
+  granted_at: string;
+  granted_by: string;
+  granted_by_agent_id: string | null;
+  agent_name: string | null;
+};
+/** Live Space grants: a current Organization member's explicit grant on an active
+ * Space, through an unrevoked agent when one acts. Callers narrow with `filter`. */
+function accessQuery(d1: D1Database, actor: Actor, filter: string, ...values: unknown[]) {
+  return d1
     .prepare(`SELECT s.*, o.slug AS organization_slug,
     o.display_name AS organization_display_name, o.kind AS organization_kind,
     o.personal_account_id, o.default_space_id, o.created_at AS organization_created_at,
@@ -82,31 +96,20 @@ export async function resolveSpaceAccess(
     JOIN organization_members m ON m.organization_id = s.organization_id AND m.account_id = g.account_id
     JOIN accounts p ON p.id = g.account_id AND p.kind = 'user'
     LEFT JOIN agents a ON a.id = ? AND a.accountable_id = p.id AND a.revoked_at IS NULL
-    WHERE s.id = ? AND p.id = ? AND s.archived_at IS NULL
-      AND (? IS NULL OR a.id IS NOT NULL)`)
-    .bind(actor.agent?.id ?? null, spaceId, actor.id, actor.agent?.id ?? null)
-    .first<
-      SpaceRow & {
-        role: "admin" | "member";
-        repository_role: "none" | "read" | "write";
-        package_role: "none" | "read" | "write";
-        origin: string;
-        granted_at: string;
-        granted_by: string;
-        granted_by_agent_id: string | null;
-        agent_name: string | null;
-      }
-    >();
-  if (!row) return null;
+    WHERE p.id = ? AND s.archived_at IS NULL
+      AND (? IS NULL OR a.id IS NOT NULL) ${filter}`)
+    .bind(actor.agent?.id ?? null, actor.id, actor.agent?.id ?? null, ...values);
+}
+function access(actor: Actor, row: AccessRow): SpaceAccess {
   return {
     space: summary(row),
-    spaceId,
+    spaceId: row.id,
     personId: actor.id,
     ...(actor.agent ? { agent: { id: actor.agent.id, name: row.agent_name! } } : {}),
     authorizationVersion: row.authorization_version,
     contractVersion: CONTENT_CONTRACT_VERSION,
     grant: {
-      spaceId,
+      spaceId: row.id,
       accountId: actor.id,
       role: row.role,
       repositoryRole: row.repository_role,
@@ -117,4 +120,31 @@ export async function resolveSpaceAccess(
       grantedByAgentId: row.granted_by_agent_id,
     },
   };
+}
+/** Current person/agent, membership and explicit grant in one database snapshot.
+ * Credential expiry/scope is the caller's authentication boundary; no cached Actor
+ * or Instance privilege can manufacture a Space grant here.
+ */
+export async function resolveSpaceAccess(
+  d1: D1Database,
+  actor: Actor | null,
+  spaceId: string,
+): Promise<SpaceAccess | null> {
+  if (!actor) return null;
+  const row = await accessQuery(d1, actor, "AND s.id = ?", spaceId).first<AccessRow>();
+  return row ? access(actor, row) : null;
+}
+/** Every Space `resolveSpaceAccess` would admit, by Organization then Space handle,
+ * in one query rather than one per Space; optionally within one Organization. */
+export async function listSpaceAccess(
+  d1: D1Database,
+  actor: Actor,
+  organizationId?: string,
+): Promise<SpaceAccess[]> {
+  const { results } = await (
+    organizationId
+      ? accessQuery(d1, actor, "AND s.organization_id = ? ORDER BY o.slug, s.slug", organizationId)
+      : accessQuery(d1, actor, "ORDER BY o.slug, s.slug")
+  ).all<AccessRow>();
+  return results.map((row) => access(actor, row));
 }

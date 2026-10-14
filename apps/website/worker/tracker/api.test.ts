@@ -354,6 +354,21 @@ describe("tracker preferences", () => {
     expect(await (await call("/tracker/orbit/preferences")).json()).toEqual({ preferences: null });
     expect(await (await call("/tracker")).json()).toMatchObject({ defaultSpaceId: "space-ann" });
   });
+  test("the person's own default Space outranks the last tuned tracker while they can open it", async () => {
+    const { call, sqlite } = await setup();
+    await call("/tracker/ann/preferences", put({ teamId: "t-ann", view: "list", query: "" }));
+    const choose = (organization: string | null, space: string | null) =>
+      sqlite
+        .prepare(
+          "UPDATE accounts SET preferred_organization_id=?, preferred_space_id=? WHERE id='ann'",
+        )
+        .run(organization, space);
+    choose("org-orbit", null);
+    expect(await (await call("/tracker")).json()).toMatchObject({ defaultSpaceId: "space-orbit" });
+    // Without a Space grant, the saved choice no longer opens anything: back to the last tuned.
+    choose("org-private", "space-private");
+    expect(await (await call("/tracker")).json()).toMatchObject({ defaultSpaceId: "space-ann" });
+  });
   test("the last save wins at the same clock time, including an existing tracker", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-10-04T12:00:00.000Z"));
