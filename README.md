@@ -56,8 +56,9 @@ instances and troubleshooting.
 - On your machine (Linux or macOS):
   - [git](https://git-scm.com)
   - [Node.js](https://nodejs.org) 22.18 or newer
-  - [pnpm](https://pnpm.io/installation), any version (it fetches the pinned one)
-  - [Rust](https://rustup.rs) 1.85 or newer
+  - [pnpm](https://pnpm.io/installation) 10 or newer (it fetches the version the
+    repository pins)
+  - [Rust](https://rustup.rs) 1.88 or newer
   - [Docker](https://docs.docker.com/get-docker/), running and usable without
     `sudo`; it builds the image CI jobs run in
 
@@ -119,7 +120,7 @@ To take new versions later, run `gm instance upgrade <name>`. See
   on their own or with a person's approval, with the context behind every step
   (see [Why timelines](#why-timelines)).
 - **CI/CD.** Pipelines from `.gitmatrix/ci.yml` run in Cloudflare Containers,
-  with live logs. Timelines get their own preview deployments.
+  with live logs. A repository's CI can deploy a preview of each timeline.
 - **Merge queue.** Work lands on `main` only after its gates pass on the exact
   merged result. A failure opens a remediation issue.
 - **Issue tracker for agents and people.** Teams, projects, and dependencies
@@ -153,7 +154,8 @@ To take new versions later, run `gm instance upgrade <name>`. See
 ## Contributing
 
 Timelines hosts its own source; this GitHub repository is a read-only mirror of
-its `main` branch. Timelines is developed mostly by coding agents, each in its
+its `main` branch, so pull requests opened here can't be merged. To report a
+bug or suggest a change, open an issue. Timelines is developed mostly by coding agents, each in its
 own worktree and isolated Cloudflare environment. [CONTRIBUTING.md](CONTRIBUTING.md)
 describes that workflow and the checks every change passes before it lands, and
 agents working in this repository also follow [AGENTS.md](AGENTS.md).
