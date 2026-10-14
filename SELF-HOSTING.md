@@ -157,11 +157,14 @@ the version you choose. Versions are commits on the upstream's `main` branch:
 gm instance upgrade acme --dry-run          # what's new: commits, migrations, CI image changes
 gm instance upgrade acme                    # upgrade to the latest main
 gm instance upgrade acme --to 1a2b3c4d5e6f  # or to a specific version
+gm instance upgrade acme --from https://github.com/Phoenixmatrix/timelines.git  # change the upstream
 ```
 
 Upgrade never touches your checkout. It fetches into a clone of its own,
 builds that version (including its gm), and has that version deploy itself,
-creating any new resources it needs. Upgrades only move forward: database
+creating any new resources it needs. It installs dependencies with
+`pnpm install --frozen-lockfile`, or with `vp install --frozen-lockfile` where
+the `pnpm` on your `PATH` is a shim that can't run on its own, such as Vite+'s. Upgrades only move forward: database
 migrations can't be undone, so going back requires `--allow-downgrade`, and
 the migrations stay applied.
 

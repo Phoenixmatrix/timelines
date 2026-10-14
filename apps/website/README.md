@@ -54,7 +54,7 @@ their standard transports and canonical Space-qualified locators.
 ## Run it
 
 For agent development, start at the repository root and follow the
-[isolated agent workflow](../../README.md#agent-first-development):
+[isolated agent workflow](../../CONTRIBUTING.md#agent-first-development):
 
 ```bash
 vp install
@@ -72,7 +72,7 @@ generation, avatars or Atlas descriptions only. Use `vp run agent inspect` for
 data, `vp run agent test` for non-AI real-service E2E, and `vp run agent test-ai`
 (targeted at the stages your change maps to) when verifying AI capabilities.
 Use `vp run agent destroy` when finished.
-Hourly cleanup and 24-hour expiry bound resource accumulation; see the root README
+Hourly cleanup and 24-hour expiry bound resource accumulation; see CONTRIBUTING.md
 for costs and failure recovery.
 
 The website Vite configuration prebundles the Lezer dependencies used by the
@@ -1266,7 +1266,7 @@ token trees. Rejected grammar forms are reported as `parse_error`.
 
 ### Isolated end-to-end smoke
 
-Use the root [agent-first workflow](../../README.md#agent-first-development):
+Use the [agent-first workflow](../../CONTRIBUTING.md#agent-first-development):
 run `vp run agent setup`, keep `vp run agent up` running in another terminal,
 then run `vp run semantic-smoke` from the repository root.
 
@@ -2497,6 +2497,16 @@ For the generator's local regressions, run
 `vp check`. The suite covers large daily-group convergence, retention when the
 model budget is exhausted, and stale-subject pruning within D1 binding limits.
 
+### Release note evidence
+
+On repository and Space release-note pages, select an item's **last commit**
+time to open its details sidebar. The sidebar lists every linked commit, the
+linked tracker issue when available, and any landing timeline; commit links open
+the exact source revision. These links stay out of the reading view until opened.
+
+Select another item's time to switch details, or use Close or Escape to dismiss
+the sidebar and return focus to the opener. On phones, details fill the screen.
+
 ## Automatic AI settings
 
 `/settings/ai?space=<handle>` controls automatic work across that Space's
@@ -2689,6 +2699,15 @@ original evidence fields, issue status, Tracker Space and source URL. Either
 endpoint can supply that receipt; the model's tool choice is not the contract.
 These are gate requirements, not a claim of a successful run or a five-minute
 full-gate guarantee; use the run's retained outcomes and timings.
+
+### Knowledge Atlas
+
+The Knowledge tab shows the repository as capability territory: groups of files
+that work together, found from imports and shared concepts rather than folders.
+Open a region to see its areas and files, select anything to read why it is
+grouped, what it uses and what uses it, and jump to its source. Labels appear
+as you zoom in; a name is drawn whole or not at all. The Space page's
+Knowledge link opens the same view across the repositories you pick.
 
 ### Live completion evidence (CORE-126)
 

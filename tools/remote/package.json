@@ -2,6 +2,7 @@
   "name": "@gitmatrix/remote",
   "version": "0.0.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "cf-typegen": "GITMATRIX_REMOTE_TYPEGEN=1 cf workers types",

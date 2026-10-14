@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "description": "In-memory fakes of D1 and R2 that enforce the platform's rules.",
+  "license": "MIT",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
