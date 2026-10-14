@@ -1,11 +1,12 @@
 import { Hono, type Context } from "hono";
 import { requestTiming, type AppEnv } from "../auth.ts";
 import { findRepo, roleFor, savedDefault, visibleRepos, type Actor } from "../db.ts";
-import { findSpaceBySlug, resolveSpaceAccess } from "../spaces/access.ts";
+import { findSpaceBySlug, listSpaceAccess } from "../spaces/access.ts";
 import {
   CONTENT_CONTRACT_HEADER,
   CONTENT_CONTRACT_VERSION,
   preferredSpace,
+  type SpaceAccess,
 } from "../../shared/spaces.ts";
 import { db as gitmatrixDb } from "../schema.ts";
 import type {
@@ -27,7 +28,8 @@ import {
   type OpenRequestItem,
   closedKey,
 } from "./store.ts";
-import { accessFor, agentsAmong } from "./access.ts";
+import { accessFor, accessFromGrant, agentsAmong } from "./access.ts";
+import { requestAdmission } from "../api/content-contract.ts";
 import type { TrackerReply } from "./object.ts";
 import { trackerObject } from "./stub.ts";
 import { CHRONICLE_PAGE, type LinkedWork } from "../../shared/chronicle.ts";
@@ -53,21 +55,20 @@ export const tracker = new Hono<AppEnv>();
 
 /** Explicit current Space grants only; Instance and Organization roles grant no Tracker access. */
 export async function accessible(db: D1Database, actor: Actor): Promise<TrackerSpace[]> {
-  const rows = await db
-    .prepare(`SELECT s.slug FROM spaces s
-    JOIN space_grants g ON g.space_id=s.id AND g.account_id=?
-    JOIN organization_members m ON m.organization_id=s.organization_id AND m.account_id=g.account_id
-    WHERE s.archived_at IS NULL ORDER BY s.slug`)
-    .bind(actor.id)
-    .all<{ slug: string }>();
-  const spaces: TrackerSpace[] = [];
-  for (const row of rows.results) {
-    const space = await findSpaceBySlug(db, row.slug);
-    if (!space) continue;
-    const access = await resolveSpaceAccess(db, actor, space.id);
-    if (access) spaces.push({ ...access.space, canAdmin: access.grant.role === "admin" });
-  }
-  return spaces;
+  return (await accessibleGrants(db, actor)).map((access) => ({
+    ...access.space,
+    canAdmin: access.grant.role === "admin",
+  }));
+}
+/**
+ * The grants behind `accessible`, in one query: exactly the Spaces
+ * resolveSpaceAccess admits, by Space handle. Handles are lowercase ASCII, so
+ * comparing code units keeps SQLite's NOCASE order.
+ */
+async function accessibleGrants(db: D1Database, actor: Actor): Promise<SpaceAccess[]> {
+  return (await listSpaceAccess(db, actor)).sort((a, b) =>
+    a.space.slug < b.space.slug ? -1 : a.space.slug > b.space.slug ? 1 : 0,
+  );
 }
 /** `env` may be this request's timed view of the bindings (timing.ts timedEnv). */
 export async function authorize(
@@ -168,17 +169,20 @@ tracker.get("/requests/summary", async (c) => {
   const timing = requestTiming(c);
   const env = timedEnv(c.env, timing);
   const summary: RequestSummary = { forYou: 0, open: 0 };
-  for (const space of await accessible(env.DB, actor)) {
-    const access = await accessFor(
-      env,
-      space,
-      actor.id,
-      actor.agent?.id ?? null,
-      false,
-      actor.credential,
-      timing,
-    );
-    const result = await timedCall(timing, trackerObject(env, space.id).openRequests(access));
+  const grants = await accessibleGrants(env.DB, actor);
+  if (!grants.length) return c.json(summary);
+  // One admission read for every Space; each Tracker still re-resolves its grant.
+  const admission = await requestAdmission(c);
+  const accesses = grants.map((grant) => accessFromGrant(grant, admission, actor.credential));
+  const results = await Promise.allSettled(
+    accesses.map((access) =>
+      timedCall(timing, trackerObject(env, access.spaceId).openRequests(access)),
+    ),
+  );
+  // The first Space's failure wins, as when they were asked one at a time.
+  for (const settled of results) {
+    if (settled.status === "rejected") throw settled.reason;
+    const result = settled.value;
     if (!result.ok) return response(c, result);
     for (const { request } of result.value) {
       summary.open++;
@@ -448,14 +452,14 @@ tracker.get("/tracker/:space/view", async (c) => {
   const timing = requestTiming(c);
   const env = timedEnv(c.env, timing);
   const [view, trackers] = await Promise.all([
-    authorize(c, true, env, timing).then(async (access) => ({
-      result: await timedCall(
-        timing,
-        trackerObject(env, access.space.id).snapshot(access, timelineParam(c)),
-      ),
-      // An agent sees its person's defaults: they're whose work it does.
-      preferences: await preferencesFor(env.DB, actor.id, access.space.id),
-    })),
+    authorize(c, true, env, timing).then(async (access) => {
+      const [result, preferences] = await Promise.all([
+        timedCall(timing, trackerObject(env, access.space.id).snapshot(access, timelineParam(c))),
+        // An agent sees its person's defaults: they're whose work it does.
+        preferencesFor(env.DB, actor.id, access.space.id),
+      ]);
+      return { result, preferences };
+    }),
     accessible(env.DB, actor),
   ]);
   if (!view.result.ok) return response(c, view.result);

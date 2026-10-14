@@ -27,6 +27,7 @@ import { reportCutoverRuntime } from "../durable/cutover-runtime.ts";
 import { forgetUpstreamTokens, isArtifactsError } from "../artifacts.ts";
 import { UPSTREAM_TIMEOUT_MS, withTimeout } from "../retry.ts";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
+import { SUBSCRIBED_PROJECTS_BATCH } from "./stub.ts";
 import {
   type TimelineStore,
   type LandingRequest,
@@ -79,6 +80,11 @@ export type TrackerReply<T> =
       code: string;
       details: TrackerError["details"];
     };
+function settledValue<T>(result: PromiseSettledResult<T>): T {
+  if (result.status === "rejected") throw result.reason;
+  return result.value;
+}
+
 export class Tracker extends DurableObject<Env> implements Purgeable {
   private activeStore: TrackerStore | undefined;
   get #store(): TrackerStore {
@@ -186,20 +192,29 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
       ...(access.agentId ? { agent: { id: access.agentId, name: "" } } : {}),
       ...(access.credential ? { credential: access.credential } : {}),
     };
-    if (!(await isActorCredentialLive(this.env.DB, actor, write ? "write" : "read")))
+    // Independent reads run together; their failures still decide in this order:
+    // the credential, the current grant and admission (accessFor), the epoch,
+    // the authorization version, then the repository read. Members stay loaded:
+    // approval automation needs every principal in them (store.ts eligibleApproval).
+    const [live, resolved, visible] = await Promise.allSettled([
+      isActorCredentialLive(this.env.DB, actor, write ? "write" : "read"),
+      accessFor(
+        this.env,
+        access.space,
+        access.principalId,
+        access.agentId,
+        true,
+        access.credential,
+      ),
+      visibleRepos(this.env.DB, actor, access.spaceId),
+    ]);
+    if (!settledValue(live))
       throw new TrackerError(
         403,
         "forbidden",
         "Tracker credential is expired, revoked or insufficiently scoped.",
       );
-    const current = await accessFor(
-      this.env,
-      access.space,
-      access.principalId,
-      access.agentId,
-      true,
-      access.credential,
-    );
+    const current = settledValue(resolved);
     if (current.migrationEpoch !== access.migrationEpoch)
       throw new TrackerError(
         409,
@@ -212,7 +227,7 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
         "authorization_changed",
         "Space grants changed; refresh before continuing.",
       );
-    const repos = await visibleRepos(this.env.DB, actor, access.spaceId);
+    const repos = settledValue(visible);
     current.repos = repos
       .filter((repo) => repo.viewerRole === "admin")
       .map((repo) => ({
@@ -600,6 +615,20 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   }
   subscribedProjects(access: Access, repoId: string) {
     return this.#authorized(access, () => this.#store.subscribedProjects(repoId));
+  }
+  /** subscribedProjects for several repositories under one authorization, by repository id. */
+  subscribedProjectsFor(access: Access, repoIds: string[]) {
+    return this.#authorized(access, () => {
+      if (repoIds.length > SUBSCRIBED_PROJECTS_BATCH)
+        throw new TrackerError(
+          400,
+          "invalid_input",
+          `Ask for at most ${SUBSCRIBED_PROJECTS_BATCH} repositories at once.`,
+        );
+      const projects: Record<string, { projectId: string; slug: string; name: string }[]> = {};
+      for (const repoId of repoIds) projects[repoId] = this.#store.subscribedProjects(repoId);
+      return projects;
+    });
   }
   completionEvidence(access: Access, repoId: string, query: SearchQuery, limit = 30) {
     return this.#authorized(access, () => this.#store.completionEvidence(repoId, query, limit));

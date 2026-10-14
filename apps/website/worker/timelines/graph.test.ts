@@ -9,6 +9,7 @@ import { fakeDurableObjectId } from "../testing/durable-state.ts";
 import { accessFor } from "../tracker/access.ts";
 import { findSpaceById } from "../spaces/access.ts";
 import { Tracker } from "../tracker/object.ts";
+import { SUBSCRIBED_PROJECTS_BATCH } from "../tracker/stub.ts";
 import { timelineGraph } from "./graph.ts";
 
 vi.mock("cloudflare:workers", () => ({
@@ -131,6 +132,15 @@ describe("the timeline graph's data", () => {
     const reply = await t.tracker.timelineGraph(t.access, 2);
     expect(reply.ok && reply.value.events.map((e) => e.seq)).toEqual([2, 3]);
     expect(reply.ok && reply.value.truncated).toBe(true);
+  });
+
+  test("one authorized Tracker call answers for a batch of repositories", async () => {
+    const t = await setup();
+    const reply = await t.tracker.subscribedProjectsFor(t.access, ["app", "other"]);
+    expect(reply).toEqual({ ok: true, value: { app: [], other: [] } });
+    const ids = Array.from({ length: SUBSCRIBED_PROJECTS_BATCH + 1 }, (_, n) => `repo-${n}`);
+    const tooMany = await t.tracker.subscribedProjectsFor(t.access, ids);
+    expect(tooMany).toMatchObject({ ok: false, status: 400, code: "invalid_input" });
   });
 
   test("people outside the tracker are refused", async () => {

@@ -5,3 +5,6 @@ import type { Tracker } from "./object.ts";
 export function trackerObject(env: Env, spaceId: string): DurableObjectStub<Tracker> {
   return durableStub(env, "Tracker", spaceId);
 }
+
+/** Repositories one Tracker subscribedProjectsFor call answers for at most. */
+export const SUBSCRIBED_PROJECTS_BATCH = 100;

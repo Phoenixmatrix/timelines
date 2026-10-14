@@ -238,8 +238,13 @@ export async function sendCode(env: Env, email: string, otp: string) {
   });
 }
 
+/** The public URL when configured (deployed), else the request's origin (local). */
+function baseUrl(env: Env, origin?: string): string | undefined {
+  return (Reflect.get(env, "PUBLIC_URL") as string | undefined) ?? origin;
+}
+
 export function authOptions(env: Env, secret: string, origin?: string) {
-  const baseURL = (Reflect.get(env, "PUBLIC_URL") as string | undefined) ?? origin;
+  const baseURL = baseUrl(env, origin);
   return {
     database: env.DB,
     secret,
@@ -363,14 +368,58 @@ export function authOptions(env: Env, secret: string, origin?: string) {
   } satisfies BetterAuthOptions;
 }
 
+const buildAuth = (env: Env, secret: string, origin?: string) =>
+  betterAuth(authOptions(env, secret, origin));
+type Auth = ReturnType<typeof buildAuth>;
+
+/** How long an isolate trusts its read of the signing secret before reading it again. */
+export const AUTH_SECRET_TTL_MS = 5 * 60_000;
+
 /**
- * Better Auth for this request; bindings are request-scoped, so never cached.
- * The signing secret is a plain value locally and a Secrets Store binding
- * (gitmatrix_better_auth_secret) once deployed, read through readSecret.
+ * Per isolate, per `env`: the signing secret, once its read has settled, and
+ * the Better Auth instances built with it, by base URL. Rotating the secret
+ * reaches every instance within the TTL, since they hang off the entry. Only
+ * settled values are shared: a read belongs to the request that started it
+ * (workerd may cancel it with that request), so each request that misses
+ * reads for itself.
  */
-export async function createAuth(env: Env, origin?: string, timing?: Timing) {
-  const read = readSecret(env, "BETTER_AUTH_SECRET");
-  const secret = await (timing ? timing.measure("auth-secret", read) : read);
-  const options = authOptions(env, secret, origin);
-  return timing ? timing.measureSync("auth-init", () => betterAuth(options)) : betterAuth(options);
+const authCache = new WeakMap<
+  Env,
+  { secret: string; until: number; instances: Map<string | undefined, Auth> }
+>();
+
+/**
+ * Better Auth for this request. An isolate's `env` and its bindings outlive a
+ * request, and authOptions captures nothing request-scoped but the base URL,
+ * so the instance is cached per `env` and base URL, and the secret with it for
+ * AUTH_SECRET_TTL_MS from before its read (a failed read is never kept).
+ * Better Auth's own rate limiter, which would hold per-isolate state, stays
+ * off (AUTH_FAILURES counts). The signing secret is a plain value locally and
+ * a Secrets Store binding (gitmatrix_better_auth_secret) once deployed, read
+ * through readSecret.
+ */
+export async function createAuth(env: Env, origin?: string, timing?: Timing): Promise<Auth> {
+  let entry = authCache.get(env);
+  if (!entry || Date.now() >= entry.until) {
+    const readAt = Date.now();
+    const read = readSecret(env, "BETTER_AUTH_SECRET");
+    const secret = await (timing ? timing.measure("auth-secret", read) : read);
+    // A request that read meanwhile may have refreshed the entry already.
+    const current = authCache.get(env);
+    entry =
+      current && Date.now() < current.until && current.secret === secret
+        ? current
+        : { secret, until: readAt + AUTH_SECRET_TTL_MS, instances: new Map() };
+    authCache.set(env, entry);
+  }
+  const secret = entry.secret;
+  const key = baseUrl(env, origin);
+  let auth = entry.instances.get(key);
+  if (!auth) {
+    auth = timing
+      ? timing.measureSync("auth-init", () => buildAuth(env, secret, origin))
+      : buildAuth(env, secret, origin);
+    entry.instances.set(key, auth);
+  }
+  return auth;
 }

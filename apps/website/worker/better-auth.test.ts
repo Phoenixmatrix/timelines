@@ -4,7 +4,13 @@ import {
   issueRegistryToken,
   resetRegistryTokenKeys,
 } from "../registry/core/auth/registry-token.ts";
-import { createAuth, linkAccount, mayJoin, recordFailure } from "./better-auth.ts";
+import {
+  AUTH_SECRET_TTL_MS,
+  createAuth,
+  linkAccount,
+  mayJoin,
+  recordFailure,
+} from "./better-auth.ts";
 import { issueToken } from "./api/tokens.ts";
 import { authHygiene } from "./retention/cleanups/auth-hygiene.ts";
 import { advanceRun, createRun, getRun } from "./retention/runs.ts";
@@ -435,5 +441,87 @@ describe("auth hygiene (CORE-206)", () => {
       cursor = selection.next;
     } while (cursor);
     expect(items).toEqual([]);
+  });
+});
+
+describe("the isolate's Better Auth", () => {
+  /** A Secrets Store binding counting its reads, failing the ones `failures` names. */
+  async function bound(failures = 0) {
+    const { env } = await setup();
+    let reads = 0;
+    const store = {
+      get: vi.fn(async () => {
+        reads++;
+        if (reads <= failures) throw new Error("Secrets Store unavailable");
+        return "store-secret-store-secret-store-secret";
+      }),
+    };
+    const withBinding = {
+      ...env,
+      BETTER_AUTH_SECRET: undefined,
+      BETTER_AUTH_SECRET_SECRET: store,
+    } as unknown as Env;
+    return { env: withBinding, store };
+  }
+
+  test("reads the secret once and reuses the instance across requests", async () => {
+    const { env, store } = await bound();
+    const first = await createAuth(env);
+    expect(await createAuth(env)).toBe(first);
+    expect(await createAuth(env)).toBe(first);
+    expect(store.get).toHaveBeenCalledTimes(1);
+  });
+
+  test("a secret read that never settles blocks only the request that started it", async () => {
+    const { env, store } = await bound();
+    store.get.mockImplementationOnce(() => new Promise<string>(() => {}));
+    let stuck = false;
+    void createAuth(env).then(() => (stuck = true));
+    const auth = await createAuth(env);
+    expect(auth).toBeTruthy();
+    expect(await createAuth(env)).toBe(auth);
+    expect(store.get).toHaveBeenCalledTimes(2);
+    expect(stuck).toBe(false);
+  });
+
+  test("builds one instance per base URL when no public URL is configured", async () => {
+    const { env, store } = await bound();
+    Reflect.set(env, "PUBLIC_URL", undefined);
+    const one = await createAuth(env, "http://one.test");
+    const two = await createAuth(env, "http://two.test");
+    expect(two).not.toBe(one);
+    expect(await createAuth(env, "http://one.test")).toBe(one);
+    expect(store.get).toHaveBeenCalledTimes(1);
+  });
+
+  test("never keeps a failed secret read", async () => {
+    const { env, store } = await bound(1);
+    await expect(createAuth(env)).rejects.toThrow("Secrets Store unavailable");
+    expect(await createAuth(env)).toBeTruthy();
+    expect(store.get).toHaveBeenCalledTimes(2);
+  });
+
+  test("reads the secret again once its TTL passes, with fresh instances", async () => {
+    const { env, store } = await bound();
+    const now = vi.spyOn(Date, "now");
+    try {
+      now.mockReturnValue(1_000_000);
+      const first = await createAuth(env);
+      now.mockReturnValue(1_000_000 + AUTH_SECRET_TTL_MS - 1);
+      expect(await createAuth(env)).toBe(first);
+      now.mockReturnValue(1_000_000 + AUTH_SECRET_TTL_MS);
+      expect(await createAuth(env)).not.toBe(first);
+      expect(store.get).toHaveBeenCalledTimes(2);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  test("different environments share nothing", async () => {
+    const a = await bound();
+    const b = await bound();
+    expect(await createAuth(b.env)).not.toBe(await createAuth(a.env));
+    expect(a.store.get).toHaveBeenCalledTimes(1);
+    expect(b.store.get).toHaveBeenCalledTimes(1);
   });
 });

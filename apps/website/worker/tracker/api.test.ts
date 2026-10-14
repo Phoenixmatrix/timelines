@@ -9,6 +9,8 @@ import type { Access } from "./store.ts";
 import type { CompletedWorkList } from "../../shared/tracker.ts";
 import { defaultSpace, preferencesFor, savePreferences } from "./preferences.ts";
 import { tracker } from "./api.ts";
+import { accessFor } from "./access.ts";
+import { findSpaceById } from "../spaces/access.ts";
 
 const ann: Actor = { id: "ann", slug: "ann", displayName: "Ann", isSiteAdmin: false };
 const cleanups: Array<() => void> = [];
@@ -109,6 +111,7 @@ async function setup(actor: Actor | null = ann) {
   });
   app.route("/api", tracker);
   return {
+    env,
     database,
     sqlite,
     control: cutoverControl(env),
@@ -553,5 +556,105 @@ describe("agent work (CORE-220)", () => {
   test("needs a signed-in person", async () => {
     const t = await world(null);
     expect((await t.call("/agent-work")).status).toBe(401);
+  });
+});
+
+describe("Needs you summary (CORE-301)", () => {
+  type Item = { request: { routeTo: string } };
+  type Reply =
+    | { ok: true; value: Item[] }
+    | { ok: false; status: 409; error: string; code: string };
+  async function world(actor: Actor, replies: Record<string, Reply> = {}) {
+    const t = await setup(actor);
+    // A company whose handle sorts last holds the Space whose handle sorts first,
+    // and a second, archived Space that keeps its grant: it is never asked.
+    await seedSpaceFixture(t.database, {
+      organization: { id: "org-alpha", slug: "zz-company", displayName: "Z", kind: "company" },
+      space: { id: "space-alpha", slug: "alpha", displayName: "alpha" },
+      members: [
+        {
+          accountId: "ann",
+          role: "owner",
+          grant: { role: "member", repositoryRole: "none", packageRole: "none" },
+        },
+      ],
+      actorId: "ann",
+    });
+    t.sqlite.exec(`
+      INSERT INTO spaces (id, organization_id, slug, display_name, archived_at)
+        VALUES ('space-archived', 'org-alpha', 'archived', 'archived', '2026-10-01T00:00:00.000Z');
+      INSERT INTO space_grants
+        (space_id, organization_id, account_id, role, repository_role, package_role, origin, granted_by)
+        VALUES ('space-archived', 'org-alpha', 'ann', 'admin', 'none', 'none', 'test-fixture', 'ann');
+    `);
+    const asked: Access[] = [];
+    const openRequests = vi.fn(async (access: Access) => {
+      asked.push(access);
+      return (
+        replies[access.spaceId] ?? {
+          ok: true,
+          value:
+            access.spaceId === "space-ann"
+              ? [{ request: { routeTo: "ann" } }, { request: { routeTo: "ben" } }]
+              : access.spaceId === "space-orbit"
+                ? [{ request: { routeTo: "ann" } }]
+                : [],
+        }
+      );
+    });
+    Reflect.set(t.env, "TRACKER", { getByName: () => ({ openRequests }) });
+    return { ...t, asked, openRequests };
+  }
+
+  test("asks each open Space with exactly the access accessFor builds, in handle order", async () => {
+    const credential = { kind: "token" as const, id: "tok-ann" };
+    const t = await world({ ...ann, credential });
+    const response = await t.call("/requests/summary");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ forYou: 2, open: 3 });
+    expect(t.asked.map((access) => access.spaceId)).toEqual([
+      "space-alpha",
+      "space-ann",
+      "space-orbit",
+    ]);
+    for (const access of t.asked) {
+      const space = (await findSpaceById(t.env.DB, access.spaceId))!;
+      expect(access).toEqual(await accessFor(t.env, space, "ann", null, false, credential));
+    }
+  });
+
+  test("an agent asks as itself, and asks nothing once revoked", async () => {
+    const t = await world({ ...ann, agent: { id: "agent-1", name: "claude" } });
+    expect(await (await t.call("/requests/summary")).json()).toEqual({ forYou: 2, open: 3 });
+    expect(t.asked.map((access) => [access.actorId, access.agentId])).toEqual([
+      ["agent-1", "agent-1"],
+      ["agent-1", "agent-1"],
+      ["agent-1", "agent-1"],
+    ]);
+    t.sqlite.exec("UPDATE agents SET revoked_at='2026-10-11T00:00:00.000Z' WHERE id='agent-1'");
+    expect(await (await t.call("/requests/summary")).json()).toEqual({ forYou: 0, open: 0 });
+    expect(t.openRequests).toHaveBeenCalledTimes(3);
+  });
+
+  test("the first Space's failure wins, and closed admission asks no Space", async () => {
+    const refused = (code: string) =>
+      ({ ok: false, status: 409, error: code, code }) as const satisfies Reply;
+    const t = await world(ann, {
+      "space-alpha": refused("first"),
+      "space-orbit": refused("last"),
+    });
+    const response = await t.call("/requests/summary");
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: "first" });
+    const closed = await world(ann);
+    vi.spyOn(closed.control, "admission").mockResolvedValue({
+      allowed: false,
+      epoch: 0,
+      [Symbol.dispose]() {},
+    });
+    const denied = await closed.call("/requests/summary");
+    expect(denied.status).toBe(409);
+    expect(await denied.json()).toMatchObject({ code: "migration_epoch_mismatch" });
+    expect(closed.openRequests).not.toHaveBeenCalled();
   });
 });
