@@ -548,6 +548,7 @@ impl Cf {
             "GITMATRIX_PUBLIC_URL",
             "GITMATRIX_AGENT_ID",
             "GITMATRIX_INSTANCE_CONFIG",
+            "GITMATRIX_CUTOVER_CHECKPOINT",
         ] {
             command.env_remove(key);
         }
@@ -2061,7 +2062,7 @@ fn deploy(cf: &Cf, guide: &Guide, root: &Path, instance: &mut Instance) -> Resul
     if !message.is_empty() {
         deploy_args.extend(["--message", &message]);
     }
-    cf.stream(&deploy_args, &[("GITMATRIX_INSTANCE_CONFIG", &file_value)])?;
+    cf.stream(&deploy_args, &deploy_env(&file_value, &commit))?;
     let deployed = Deployed {
         commit,
         at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -2073,6 +2074,19 @@ fn deploy(cf: &Cf, guide: &Guide, root: &Path, instance: &mut Instance) -> Resul
     guide.step("Waiting for the instance to answer");
     wait_until_live(guide, instance);
     Ok(deployed)
+}
+
+/// What the Worker deploy adds to cf's environment: the instance file, and the
+/// release the Space cutover names. The cutover's prepare accepts only the
+/// deployed tagged release (CUTOVER_DEPLOYMENT_CHECKPOINT, which
+/// cloudflare.config.ts binds from GITMATRIX_CUTOVER_CHECKPOINT), so it is
+/// the commit `--tag` names, as tools/agent/deploy.ts sets it for the
+/// canonical deploy.
+fn deploy_env<'a>(file: &'a str, commit: &'a str) -> [(&'static str, &'a str); 2] {
+    [
+        ("GITMATRIX_INSTANCE_CONFIG", file),
+        ("GITMATRIX_CUTOVER_CHECKPOINT", commit),
+    ]
 }
 
 /// Wait for the new hostname to answer. Its DNS record appears as the deploy
@@ -2878,6 +2892,27 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn deploys_name_their_tagged_commit_as_the_cutover_checkpoint() {
+        let commit = "24e5b7af1a7e72ccd971a83cef74ecefa08afa14";
+        let env = deploy_env("/tmp/demo.json", commit);
+        assert!(env.contains(&("GITMATRIX_CUTOVER_CHECKPOINT", commit)));
+        assert!(env.contains(&("GITMATRIX_INSTANCE_CONFIG", "/tmp/demo.json")));
+        // Nothing from the operator's shell reaches any other cf call.
+        let cf = Cf {
+            bin: PathBuf::from("cf"),
+            website: PathBuf::from("."),
+            account: None,
+        };
+        let command = cf.command(&["deploy"]);
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        assert!(removed.contains(&"GITMATRIX_CUTOVER_CHECKPOINT".to_string()));
     }
 
     #[test]
