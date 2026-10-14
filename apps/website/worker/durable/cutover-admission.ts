@@ -1,6 +1,7 @@
 import type { WorkflowStep } from "cloudflare:workers";
 import type { CUTOVER_CONSUMERS, SpaceCutover } from "../space-cutover/control.ts";
 import { CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
+import type { Timing } from "../timing.ts";
 
 export type CutoverConsumer = (typeof CUTOVER_CONSUMERS)[number];
 
@@ -149,11 +150,13 @@ export async function wrapCutoverFetch(
   env: Env,
   ctx: ExecutionContext,
   handler: (request: Request, env: Env, context: ExecutionContext) => Promise<Response>,
+  timing?: Timing,
 ): Promise<Response> {
   const control = cutoverControl(env);
   let ticket: string;
   try {
-    ({ ticket } = await control.acquire("http-git-registry", CONTENT_CONTRACT_VERSION));
+    const acquired = control.acquire("http-git-registry", CONTENT_CONTRACT_VERSION);
+    ({ ticket } = await (timing ? timing.measure("cutover-acquire", acquired) : acquired));
   } catch (error) {
     console.error("Content admission unavailable", error);
     return new Response("Content admission is unavailable. Retry after maintenance completes.", {

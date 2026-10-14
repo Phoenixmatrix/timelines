@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { sql } from "kysely";
 import type { AccountPage, Persona, SessionResponse } from "../../shared/api.ts";
 import { preferredSpace, type DefaultScope } from "../../shared/spaces.ts";
-import { endAllSessions, startPersonaSession, type AppEnv } from "../auth.ts";
+import { endAllSessions, requestTiming, startPersonaSession, type AppEnv } from "../auth.ts";
 import { accountSummary, findAccountBySlug, findUserById, viewerFor } from "../db.ts";
 import { db } from "../schema.ts";
 import { slugProblem } from "../names.ts";
@@ -12,7 +12,9 @@ export const accounts = new Hono<AppEnv>();
 
 accounts.get("/session", async (c) => {
   const actor = c.get("actor");
-  const body: SessionResponse = { viewer: actor ? await viewerFor(c.env.DB, actor) : null };
+  const body: SessionResponse = {
+    viewer: actor ? await requestTiming(c).measure("viewer", viewerFor(c.env.DB, actor)) : null,
+  };
   return c.json(body);
 });
 

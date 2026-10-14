@@ -24,6 +24,7 @@ import { RESERVED_SLUGS } from "./names.ts";
 import { isPreview, productionOnly } from "./preview.ts";
 import { db } from "./schema.ts";
 import { createPerson } from "./spaces/store.ts";
+import type { Timing } from "./timing.ts";
 
 /** The only device client: the gm CLI. */
 export const GM_CLIENT_ID = "gm";
@@ -367,6 +368,9 @@ export function authOptions(env: Env, secret: string, origin?: string) {
  * The signing secret is a plain value locally and a Secrets Store binding
  * (gitmatrix_better_auth_secret) once deployed, read through readSecret.
  */
-export async function createAuth(env: Env, origin?: string) {
-  return betterAuth(authOptions(env, await readSecret(env, "BETTER_AUTH_SECRET"), origin));
+export async function createAuth(env: Env, origin?: string, timing?: Timing) {
+  const read = readSecret(env, "BETTER_AUTH_SECRET");
+  const secret = await (timing ? timing.measure("auth-secret", read) : read);
+  const options = authOptions(env, secret, origin);
+  return timing ? timing.measureSync("auth-init", () => betterAuth(options)) : betterAuth(options);
 }

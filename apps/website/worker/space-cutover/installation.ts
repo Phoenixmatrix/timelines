@@ -13,6 +13,7 @@ import {
 import { fenceBusinessDatabase, migrationDatabase, type D1FenceContext } from "./storage-fence.ts";
 import { cutoverControl } from "../durable/cutover-admission.ts";
 import { readWorkState, writeWorkState } from "./work-state.ts";
+import type { Timing } from "../timing.ts";
 
 type Phase =
   | "preflight"
@@ -305,17 +306,19 @@ export class FreshInstallation {
 }
 
 /** Called after ordinary migrations and before any fixture/business seed. */
-export async function initializeFreshSpaceInstallation(env: Env): Promise<void> {
+export async function initializeFreshSpaceInstallation(env: Env, timing?: Timing): Promise<void> {
   const control = cutoverControl(env);
-  if (await control.status()) {
-    if (!(await control.admission()).allowed)
+  // Server-Timing: each round trip to the singleton, by name, when a request is timed.
+  const rpc = <T>(name: string, work: Promise<T>) => (timing ? timing.measure(name, work) : work);
+  if (await rpc("install-status", control.status())) {
+    if (!(await rpc("install-admission", control.admission())).allowed)
       throw new Error("space_cutover_requires_reviewed_migration");
     return;
   }
   for (let call = 0; call < 4096; call++) {
-    const status = await control.freshStatus();
+    const status = await rpc("install-fresh-status", control.freshStatus());
     if (status?.phase === "active") {
-      await control.verifyFreshInstallation();
+      await rpc("install-fresh-verify", control.verifyFreshInstallation());
       return;
     }
     try {

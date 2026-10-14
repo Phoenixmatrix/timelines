@@ -1,5 +1,5 @@
 import { Hono, type Context } from "hono";
-import type { AppEnv } from "../auth.ts";
+import { requestTiming, type AppEnv } from "../auth.ts";
 import { findRepo, roleFor, savedDefault, visibleRepos, type Actor } from "../db.ts";
 import { findSpaceBySlug, resolveSpaceAccess } from "../spaces/access.ts";
 import {
@@ -47,6 +47,7 @@ import { currentRepositoryNames } from "../timelines/names.ts";
 import type { AutoApproveScope } from "../timelines/auto-approve.ts";
 import type { RepoIssueSummary } from "../../shared/api.ts";
 import { captureWorkAuthority } from "../ci/admission.ts";
+import { timedCall, timedEnv, type Timing } from "../timing.ts";
 
 export const tracker = new Hono<AppEnv>();
 
@@ -68,7 +69,13 @@ export async function accessible(db: D1Database, actor: Actor): Promise<TrackerS
   }
   return spaces;
 }
-export async function authorize(c: Context<AppEnv>, includeMembers = true): Promise<Access> {
+/** `env` may be this request's timed view of the bindings (timing.ts timedEnv). */
+export async function authorize(
+  c: Context<AppEnv>,
+  includeMembers = true,
+  env: Env = c.env,
+  timing?: Timing,
+): Promise<Access> {
   if (c.req.header(CONTENT_CONTRACT_HEADER) !== String(CONTENT_CONTRACT_VERSION))
     throw new TrackerError(
       409,
@@ -77,15 +84,16 @@ export async function authorize(c: Context<AppEnv>, includeMembers = true): Prom
     );
   const actor = c.get("actor");
   if (!actor) throw new TrackerError(401, "unauthenticated", "Sign in to access trackers.");
-  const space = await findSpaceBySlug(c.env.DB, c.req.param("space")!);
+  const space = await findSpaceBySlug(env.DB, c.req.param("space")!);
   if (!space) throw new TrackerError(404, "not_found", "Tracker Space not found.");
   return accessFor(
-    c.env,
+    env,
     space,
     actor.id,
     actor.agent?.id ?? null,
     includeMembers,
     actor.credential,
+    timing,
   );
 }
 /** `?timeline=<slug>`: a timeline's view instead of main's. */
@@ -157,17 +165,20 @@ tracker.get("/tracker", async (c) => {
 tracker.get("/requests/summary", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to see what needs you." }, 401);
+  const timing = requestTiming(c);
+  const env = timedEnv(c.env, timing);
   const summary: RequestSummary = { forYou: 0, open: 0 };
-  for (const space of await accessible(c.env.DB, actor)) {
+  for (const space of await accessible(env.DB, actor)) {
     const access = await accessFor(
-      c.env,
+      env,
       space,
       actor.id,
       actor.agent?.id ?? null,
       false,
       actor.credential,
+      timing,
     );
-    const result = await trackerObject(c.env, space.id).openRequests(access);
+    const result = await timedCall(timing, trackerObject(env, space.id).openRequests(access));
     if (!result.ok) return response(c, result);
     for (const { request } of result.value) {
       summary.open++;
@@ -434,13 +445,18 @@ tracker.get("/agent-work", async (c) => {
 tracker.get("/tracker/:space/view", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
+  const timing = requestTiming(c);
+  const env = timedEnv(c.env, timing);
   const [view, trackers] = await Promise.all([
-    authorize(c).then(async (access) => ({
-      result: await trackerObject(c.env, access.space.id).snapshot(access, timelineParam(c)),
+    authorize(c, true, env, timing).then(async (access) => ({
+      result: await timedCall(
+        timing,
+        trackerObject(env, access.space.id).snapshot(access, timelineParam(c)),
+      ),
       // An agent sees its person's defaults: they're whose work it does.
-      preferences: await preferencesFor(c.env.DB, actor.id, access.space.id),
+      preferences: await preferencesFor(env.DB, actor.id, access.space.id),
     })),
-    accessible(c.env.DB, actor),
+    accessible(env.DB, actor),
   ]);
   if (!view.result.ok) return response(c, view.result);
   return c.json<TrackerView>({
