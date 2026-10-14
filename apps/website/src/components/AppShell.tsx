@@ -4,6 +4,7 @@ import {
   ChatCenteredDotsIcon,
   FingerprintIcon,
   GearSixIcon,
+  GitBranchIcon,
   HandWavingIcon,
   KeyIcon,
   ListChecksIcon,
@@ -40,7 +41,7 @@ import { needsYouBadge, needsYouLabel, useNeedsYou } from "../lib/needs-you.ts";
 import { Monogram } from "./Monogram.tsx";
 import { GitmatrixLogo, TimelinesMark } from "./GitmatrixLogo.tsx";
 import { TimelineBanner } from "./TimelineScope.tsx";
-import { ScopeSelectors } from "./ScopeSelectors.tsx";
+import { ScopeMenu } from "./ScopeMenu.tsx";
 import { KeyboardShortcuts } from "./KeyboardShortcuts.tsx";
 import { Tip, Toasts } from "./ui.tsx";
 
@@ -116,6 +117,8 @@ function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
                 {viewer.isSiteAdmin && " · Instance operator"}
               </div>
             </div>
+            <div className="mk-menu-sep" />
+            <ScopeMenu />
             <div className="mk-menu-sep" />
             <Menu.LinkItem
               closeOnClick
@@ -228,6 +231,11 @@ export function AppShell() {
   const graphSpace = scopeSpace(location.pathname, location.search);
   const onReleaseNotes = trackerPage === "releases" || location.pathname === "/release-notes";
   const onHighlights = trackerPage === "highlights" || location.pathname === "/highlights";
+  // Home lists every readable repository (CORE-416); a repository's pages are in that place too.
+  const onRepositories =
+    location.pathname === "/" ||
+    Boolean(matches.at(-1)?.params.repo) ||
+    /^\/[^/]+\/-\/repositories\/new$/.test(location.pathname);
   const requestedSpace =
     tracker?.params.space ??
     routeSpace ??
@@ -278,11 +286,17 @@ export function AppShell() {
               else if (target.right > right) rail.scrollLeft += target.right - right;
             }}
           >
-            <Place to="/" label="Home" end>
+            {/* Repositories owns the current-page state for "/", so the logo never claims it. */}
+            <Place to="/" label="Home" active={false}>
               {() => <GitmatrixLogo markOnly className="size-8" />}
             </Place>
             <SearchButton />
             <KeyboardShortcuts />
+            <Place to="/" label="Repositories" active={onRepositories}>
+              {(active) => (
+                <GitBranchIcon size={22} weight={active ? "fill" : "regular"} aria-hidden />
+              )}
+            </Place>
             {viewer && (
               <Place
                 to={owner ? `/tracker/${encodeURIComponent(owner)}` : "/tracker"}
@@ -394,14 +408,10 @@ export function AppShell() {
           >
             {trackerWorkbench ? (
               <div className="contents lg:block lg:shrink-0">
-                <ScopeSelectors />
                 <TimelineBanner />
               </div>
             ) : (
-              <>
-                <ScopeSelectors />
-                <TimelineBanner />
-              </>
+              <TimelineBanner />
             )}
             <Outlet />
           </main>
