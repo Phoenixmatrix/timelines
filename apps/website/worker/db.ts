@@ -11,8 +11,8 @@ import { avatarUrl } from "./avatars/api.ts";
 import { repoRole } from "./permissions.ts";
 import { db } from "./schema.ts";
 import type { SpaceSummary } from "../shared/spaces.ts";
-import { findSpaceById, resolveSpaceAccess } from "./spaces/access.ts";
-import { listOrganizations, listSpaceDirectory } from "./spaces/store.ts";
+import { findSpaceById, listSpaceAccess, resolveSpaceAccess } from "./spaces/access.ts";
+import { listOrganizations } from "./spaces/store.ts";
 
 /** A signed-in person, as the Worker sees them. */
 export interface Actor {
@@ -272,22 +272,23 @@ export async function visibleRepos(
 }
 
 export async function viewerFor(d1: D1Database, actor: Actor): Promise<Viewer> {
-  const organizations = await listOrganizations(d1, actor);
-  const spaces: SpaceSummary[] = [];
-  for (const organization of organizations) {
-    for (const entry of await listSpaceDirectory(d1, actor, organization.id)) {
-      const access = await resolveSpaceAccess(d1, actor, entry.id);
-      if (access) spaces.push(access.space);
-    }
-  }
+  // Every navigation reads the viewer: one query for all granted Spaces, not one per
+  // Space. Without an Organization there is nothing to grant, and a not-yet-cutover
+  // schema (no Organization avatars) must still answer the session.
+  const [organizations, account] = await Promise.all([
+    listOrganizations(d1, actor),
+    db(d1)
+      .selectFrom("accounts")
+      .select(["email", "avatar_key"])
+      .where("id", "=", actor.id)
+      .executeTakeFirst(),
+  ]);
+  const granted = organizations.length ? await listSpaceAccess(d1, actor) : [];
+  const spaces = granted.map((access) => access.space);
   const personal = organizations.find(
     (organization) => organization.personalAccountId === actor.id,
   );
-  const { email, avatar_key } = (await db(d1)
-    .selectFrom("accounts")
-    .select(["email", "avatar_key"])
-    .where("id", "=", actor.id)
-    .executeTakeFirst()) ?? { email: null, avatar_key: null };
+  const { email, avatar_key } = account ?? { email: null, avatar_key: null };
   const self: AccountSummary = {
     id: actor.id,
     kind: "user",

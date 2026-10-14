@@ -43,8 +43,29 @@ async function setup() {
   app.route("/api/spaces/:space/settings/ai", aiSettingsApi);
   app.route("/api/spaces/:space/usage", spaceUsageApi);
   app.route("/api", accounts);
+  // Count what each request asks of D1 and of the singleton cutover control.
+  const statements: string[] = [];
+  const database = env.DB;
+  Reflect.set(
+    env,
+    "DB",
+    new Proxy(database, {
+      get(target, property) {
+        if (property === "prepare")
+          return (query: string) => {
+            statements.push(query);
+            return target.prepare(query);
+          };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  );
+  const admissions = vi.spyOn(fresh.control, "admission");
   return {
     sqlite,
+    statements,
+    admissions,
     as(id: string) {
       actor = { id, slug: id, displayName: id, isSiteAdmin: id === "outsider" };
     },
@@ -177,6 +198,55 @@ describe("Organization directory and explicit Space grant APIs", () => {
     ).toEqual({ default_space_id: "beta" });
     expect((await t.request("/organizations/company/members/owner", "DELETE")).status).toBe(409);
     expect((await t.request("/spaces/alpha/restore", "POST")).status).toBe(204);
+  });
+  test("listings read each Space's grant and role in a fixed number of queries", async () => {
+    const t = await setup();
+    t.sqlite.exec(`INSERT INTO spaces(id,organization_id,slug,display_name) VALUES
+      ('gamma','company','gamma','Gamma'),('delta','company','delta','Delta'),
+      ('epsilon','company','epsilon','Epsilon');
+      UPDATE spaces SET archived_at='2026-01-01T00:00:00Z' WHERE id='epsilon';
+      INSERT INTO space_grants(space_id,organization_id,account_id,role,repository_role,package_role,origin,granted_by)
+        VALUES ('gamma','company','owner','admin','write','write','explicit','owner'),
+               ('delta','company','member','member','read','none','explicit','owner');`);
+    const read = async (path: string) => {
+      t.statements.length = 0;
+      t.admissions.mockClear();
+      const response = await t.request(path);
+      expect(response.status).toBe(200);
+      return {
+        body: await response.json<Record<string, unknown>>(),
+        queries: t.statements.length,
+        admissions: t.admissions.mock.calls.length,
+      };
+    };
+    const owner = await read("/organizations/company");
+    const directory = owner.body as unknown as OrganizationPage;
+    expect(directory.spaces.map((page) => [page.space.slug, page.capabilities])).toEqual([
+      ["alpha", expect.objectContaining({ canReadContent: false, canManageGrants: true })],
+      ["beta", expect.objectContaining({ canReadContent: false, canManageGrants: true })],
+      ["delta", expect.objectContaining({ canReadContent: false, canManageGrants: true })],
+      ["epsilon", expect.objectContaining({ canReadContent: false, canManageGrants: true })],
+      ["gamma", expect.objectContaining({ canReadContent: true, canAdministerContent: true })],
+    ]);
+    expect(directory.activeSpaceCount).toBe(4);
+    // Organization lookup (gate and handler), role, directory, grants and Spaces;
+    // one cutover read for the whole response, not one per Space.
+    expect(owner.queries).toBeLessThanOrEqual(6);
+    expect(owner.admissions).toBe(1);
+    t.as("member");
+    const member = await read("/organizations/company");
+    expect(
+      (member.body as unknown as OrganizationPage).spaces.map((page) => page.space.slug),
+    ).toEqual(["alpha", "delta"]);
+    expect(member.queries).toBeLessThanOrEqual(6);
+    expect(member.admissions).toBe(1);
+    const listed = await read("/spaces");
+    expect((listed.body.spaces as SpacePage[]).map((page) => page.space.slug)).toEqual([
+      "alpha",
+      "delta",
+    ]);
+    expect(listed.queries).toBeLessThanOrEqual(2);
+    expect(listed.admissions).toBe(1);
   });
   test("old JSON clients and fenced epochs fail closed", async () => {
     const t = await setup();

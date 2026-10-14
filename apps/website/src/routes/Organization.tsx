@@ -42,11 +42,14 @@ export async function organizationsAction({ request }: ActionFunctionArgs) {
   return redirect(`/organizations/${encodeURIComponent(result.organization.slug)}?enter=1`);
 }
 export async function organizationLoader({ request, params }: LoaderFunctionArgs) {
-  await requireViewer(request);
-  const page = await load<OrganizationPage>(
+  // Read the Organization while the session resolves; signing in still comes first.
+  const pending = load<OrganizationPage>(
     `/organizations/${encodeURIComponent(params.organization!)}`,
     request,
   );
+  pending.catch(() => undefined);
+  await requireViewer(request);
+  const page = await pending;
   const url = new URL(request.url);
   const defaultSpace = page.spaces.find(
     (item) => item.space.id === page.organization.defaultSpaceId && !item.space.archivedAt,

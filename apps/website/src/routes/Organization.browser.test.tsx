@@ -194,3 +194,39 @@ test("phone scope menus remain reachable and repository creation stays in Reposi
     await page.viewport(1280, 900);
   }
 });
+
+test("entering an Organization reads the session once per navigation and its Space without a waterfall", async () => {
+  const server = await TestServer.start({ world: true });
+  const created = await organization(server, "session-once-browser");
+  const slug = created.spaces[0]!.space.slug;
+  // When each request starts and ends, to see which reads wait on which.
+  const events: string[] = [];
+  const serve = vi.mocked(window.fetch).getMockImplementation()!;
+  vi.mocked(window.fetch).mockImplementation(async (input, init) => {
+    const path = new URL(input instanceof Request ? input.url : input, location.origin).pathname;
+    events.push(`start ${path}`);
+    try {
+      return await serve(input, init);
+    } finally {
+      events.push(`end ${path}`);
+    }
+  });
+  const mark = server.requests.length;
+  // Two navigations: the Organization, then the redirect into its only Space.
+  renderApp(`/organizations/${created.organization.slug}?enter=1`);
+  await expect.element(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
+  const sessions = server.since(mark).filter((request) => request.url.pathname === "/api/session");
+  expect(sessions).toHaveLength(2);
+  const at = (event: string) => {
+    const index = events.indexOf(event);
+    expect(index, event).toBeGreaterThanOrEqual(0);
+    return index;
+  };
+  // The Organization page is read alongside the session, not after it.
+  expect(at(`start /api/organizations/${created.organization.slug}`)).toBeLessThan(
+    at("end /api/session"),
+  );
+  // The Space page doesn't wait for its repositories, nor its teams for directory administration.
+  expect(at(`start /api/spaces/${slug}`)).toBeLessThan(at("end /api/repos"));
+  expect(at(`start /api/tracker/${slug}/teams`)).toBeLessThan(at(`end /api/spaces/${slug}/grants`));
+});

@@ -2,7 +2,12 @@ import { Hono } from "hono";
 import type { OrganizationPage } from "../../shared/spaces.ts";
 import type { AppEnv } from "../auth.ts";
 import { findUserById } from "../db.ts";
-import { findSpaceById, findSpaceBySlug } from "../spaces/access.ts";
+import {
+  findSpaceById,
+  findSpaceBySlug,
+  listOrganizationSpaces,
+  listSpaceAccess,
+} from "../spaces/access.ts";
 import {
   createOrganization,
   listOrganizations,
@@ -15,8 +20,9 @@ import {
   updateOrganization,
 } from "../spaces/store.ts";
 import { slugProblem } from "../names.ts";
+import { requestAdmission } from "./content-contract.ts";
 import { fail, readJson, requireActor } from "./http.ts";
-import { spacePage } from "./spaces.ts";
+import { spacePage, spacePageFrom } from "./spaces.ts";
 
 export const organizations = new Hono<AppEnv>();
 organizations.get("/", async (c) => {
@@ -99,24 +105,31 @@ organizations.get("/:organization", async (c) => {
     (entry) => entry.slug.toLowerCase() === c.req.param("organization").toLowerCase(),
   );
   if (!organization) return fail(c, 404, "No such Organization.");
-  const viewerRole = await organizationRole(c.env.DB, actor, organization.id);
+  // Switching Organization lands here: read role, directory, grants and Spaces
+  // together rather than a lookup, grant and role query per Space in turn.
+  const [viewerRole, directory, granted, spaces, admission] = await Promise.all([
+    organizationRole(c.env.DB, actor, organization.id),
+    listSpaceDirectory(c.env.DB, actor, organization.id),
+    listSpaceAccess(c.env.DB, actor, organization.id),
+    listOrganizationSpaces(c.env.DB, organization.id),
+    requestAdmission(c),
+  ]);
   if (!viewerRole) return fail(c, 404, "No such Organization.");
+  const accessById = new Map(granted.map((access) => [access.spaceId, access]));
+  const spaceById = new Map(spaces.map((space) => [space.id, space]));
   const pages: OrganizationPage["spaces"] = [];
-  for (const entry of await listSpaceDirectory(c.env.DB, actor, organization.id)) {
-    const space = await findSpaceById(c.env.DB, entry.id);
-    const page = space ? await spacePage(c, actor, space) : null;
+  for (const entry of directory) {
+    const space = spaceById.get(entry.id);
+    const page = space
+      ? spacePageFrom(space, accessById.get(entry.id) ?? null, viewerRole, admission)
+      : null;
     if (page) pages.push(page);
   }
-  const count = await c.env.DB.prepare(
-    "SELECT count(*) AS count FROM spaces WHERE organization_id = ? AND archived_at IS NULL",
-  )
-    .bind(organization.id)
-    .first<{ count: number }>();
   const page: OrganizationPage = {
     organization,
     viewerRole,
     spaces: pages,
-    activeSpaceCount: count!.count,
+    activeSpaceCount: spaces.filter((space) => !space.archivedAt).length,
   };
   return c.json(page);
 });

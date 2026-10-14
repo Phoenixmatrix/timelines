@@ -6,7 +6,7 @@ import { Hono } from "hono";
 import { accounts } from "./api/accounts.ts";
 import { organizations } from "./api/organizations.ts";
 import { spaces } from "./api/spaces.ts";
-import { contentContractGate } from "./api/content-contract.ts";
+import { contentContractGate, requestAdmission } from "./api/content-contract.ts";
 import { dev } from "./api/dev.ts";
 import { repos } from "./api/repos.ts";
 import { environments, environmentSettings } from "./api/environments.ts";
@@ -58,7 +58,6 @@ import { queueApi } from "./merge-queue/index.ts";
 import { spaceUsageApi, personUsageApi, instanceUsageApi } from "./usage/report-api.ts";
 import { TrackerError } from "./tracker/store.ts";
 import { spaceCutoverApi } from "./space-cutover/api.ts";
-import { cutoverControl } from "./durable/cutover-admission.ts";
 
 const api = new Hono<AppEnv>();
 
@@ -185,7 +184,7 @@ export const app = new Hono<AppEnv>();
 // The operator journal is independent of the business stores it restores.
 app.route("/api/admin/space-cutover", spaceCutoverApi);
 app.use(async (c, next) => {
-  if (!(await cutoverControl(c.env).admission(4)).allowed)
+  if (!(await requestAdmission(c, 4)).allowed)
     return c.json(
       { error: "Content is fenced for Organization/Space migration", code: "space_cutover_fenced" },
       503,
