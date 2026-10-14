@@ -877,9 +877,15 @@ async function expandInsertGroup(
     archive.schema,
   );
   if (block.block.kind !== "rows" || block.block.table !== relation.table) fail();
+  const wanted = rowValues(row, relation.from);
   for (const values of block.block.rows) {
     const candidate = { table: relation.table, columns: block.block.columns, values };
-    if (await savedRowMatches(db, candidate, relation.to, rowValues(row, relation.from))) {
+    // Archive cells are canonical literals: only an identical key literal can be
+    // the referenced row, so SQL (affinity, collation) confirms just those. One
+    // query per candidate made production's install crawl (CORE-341); a key that
+    // matched only by affinity would end the scan unmatched and fail closed.
+    if (rowValues(candidate, relation.to).some((value, index) => value !== wanted[index])) continue;
+    if (await savedRowMatches(db, candidate, relation.to, wanted)) {
       if (addGroupRow(group, candidate, archive.schema.tables)) return false;
       group.scan = null;
       group.relation++;
