@@ -30,6 +30,7 @@ import { FLUSH, pkt } from "../git/pktline.ts";
 import { mintJobToken } from "../ci/registry.ts";
 import { deliverRecoveredSourcePush } from "../git/source-push-delivery.ts";
 import { drainDeletedRepoSources } from "../retention/work-sources.ts";
+import { FORK_TIMEOUT_MS, SOURCE_RETRY_DELAYS_MS } from "./sources.ts";
 import { onPush } from "../ci/trigger.ts";
 import {
   afterRun,
@@ -53,7 +54,13 @@ vi.mock("cloudflare:workers", () => ({
   },
 }));
 // Preview runs (CORE-79) are started through CI's startRun: seen here, not run.
-const startRun = vi.hoisted(() => vi.fn());
+// Unless a test says otherwise it answers as startRun does outside production
+// (CORE-422): an undefined result would throw inside previews and be logged.
+const startRun = vi.hoisted(() =>
+  vi.fn<typeof import("../ci/trigger.ts").startRun>(async () => ({
+    skipped: "Previews don't run CI.",
+  })),
+);
 vi.mock(import("../ci/trigger.ts"), async (original) => {
   const module = await original();
   return {
@@ -596,6 +603,51 @@ describe("forking", () => {
       "https://side",
     ]);
     expect((await t.call("ben", "GET", "")).body.timelines).toEqual([]);
+  });
+
+  test("a fork the provider never answers is a retryable 503, not a request held forever (CORE-409)", async () => {
+    const t = await setup();
+    const original = t.git.artifacts.get;
+    let forks = 0;
+    vi.spyOn(t.git.artifacts, "get").mockImplementation(async (name) => {
+      const resource = await original(name);
+      if (name !== "r-app") return resource;
+      return {
+        ...resource,
+        fork: () => {
+          forks++;
+          return new Promise<never>(() => {});
+        },
+      };
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    onTestFinished(() => void vi.useRealTimers());
+    let settled = false;
+    const creating = t
+      .call("ben", "POST", "", { slug: "search", repos: ["orbit/app"] })
+      .finally(() => (settled = true));
+    const attempts = SOURCE_RETRY_DELAYS_MS.length + 1;
+    // Each wait is armed only after real I/O, so let that run until a timer is
+    // armed, and only then advance: under load the I/O takes many turns, and
+    // fake time spent with nothing armed would only use up the budget.
+    for (let elapsed = 0; !settled && elapsed < 2 * attempts * FORK_TIMEOUT_MS;) {
+      if (vi.getTimerCount() === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+        continue;
+      }
+      await vi.advanceTimersByTimeAsync(1_000);
+      elapsed += 1_000;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(settled, "The request answered instead of waiting on the fork").toBe(true);
+    const created = await creating;
+    expect(created.status).toBe(503);
+    expect(created.body.code).toBe("source_unavailable");
+    expect(forks).toBe(attempts);
+    // The outcome is unknown: the reservation stays fenced for reconciliation.
+    expect(t.sqlite.prepare("SELECT state FROM timeline_work_sources").all()).toEqual([
+      { state: "creating" },
+    ]);
   });
 
   test("a fork from a timeline starts at its bookmarks, in its repositories by default", async () => {
