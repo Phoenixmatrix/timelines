@@ -1,11 +1,12 @@
 import { Hono } from "hono";
 import { sql } from "kysely";
 import type { AccountPage, Persona, SessionResponse } from "../../shared/api.ts";
+import { preferredSpace, type DefaultScope } from "../../shared/spaces.ts";
 import { endAllSessions, startPersonaSession, type AppEnv } from "../auth.ts";
 import { accountSummary, findAccountBySlug, findUserById, viewerFor } from "../db.ts";
 import { db } from "../schema.ts";
 import { slugProblem } from "../names.ts";
-import { fail, readJson, requireActor } from "./http.ts";
+import { fail, readJson, requireActor, requirePerson } from "./http.ts";
 
 export const accounts = new Hono<AppEnv>();
 
@@ -83,6 +84,42 @@ accounts.patch("/account", async (c) => {
   }
   const updated = await findUserById(c.env.DB, actor.id);
   const response: SessionResponse = { viewer: updated ? await viewerFor(c.env.DB, updated) : null };
+  return c.json(response);
+});
+
+/**
+ * A person's own default Organization and Space (CORE-413). Only a choice that
+ * opens a Space now is saved; `{organizationId: null, spaceId: null}` clears it.
+ * Agents can't change where their person's app and gm open.
+ */
+accounts.put("/account/default-scope", async (c) => {
+  const actor = requirePerson(c);
+  if (actor instanceof Response) return actor;
+  const body: unknown = await readJson(c);
+  if (typeof body !== "object" || body === null || !("organizationId" in body))
+    return fail(c, 400, "Send {organizationId, spaceId}.");
+  const { organizationId, spaceId = null, ...rest } = body as Record<string, unknown>;
+  if (Object.keys(rest).length)
+    return fail(c, 400, `Unknown fields: ${Object.keys(rest).join(", ")}.`);
+  if (organizationId !== null && (typeof organizationId !== "string" || !organizationId))
+    return fail(c, 400, "organizationId is an Organization ID, or null to clear.");
+  if (spaceId !== null && (typeof spaceId !== "string" || !spaceId || organizationId === null))
+    return fail(c, 400, "spaceId is a Space ID in the Organization, or null for its default.");
+  const scope: DefaultScope = { organizationId, spaceId };
+  if (scope.organizationId && !preferredSpace(scope, (await viewerFor(c.env.DB, actor)).spaces))
+    return fail(
+      c,
+      400,
+      scope.spaceId
+        ? "Choose a Space you can open in that Organization."
+        : "You can't open that Organization's default Space. Choose one of its Spaces.",
+    );
+  await db(c.env.DB)
+    .updateTable("accounts")
+    .set({ preferred_organization_id: scope.organizationId, preferred_space_id: scope.spaceId })
+    .where("id", "=", actor.id)
+    .execute();
+  const response: SessionResponse = { viewer: await viewerFor(c.env.DB, actor) };
   return c.json(response);
 });
 

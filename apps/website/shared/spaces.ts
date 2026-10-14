@@ -24,6 +24,29 @@ export interface SpaceSummary {
   authorizationVersion: number;
   createdAt: string;
 }
+/**
+ * A person's own default Organization and Space (CORE-413). Both null: unset.
+ * An Organization with a null Space means that Organization's default Space.
+ */
+export interface DefaultScope {
+  organizationId: string | null;
+  spaceId: string | null;
+}
+/**
+ * The Space a saved default opens among the Spaces the person can open now;
+ * null when it's unset or no longer accessible, so callers fall back.
+ */
+export function preferredSpace<T extends SpaceSummary>(saved: DefaultScope, spaces: T[]): T | null {
+  if (!saved.organizationId) return null;
+  return (
+    spaces.find(
+      (space) =>
+        !space.archivedAt &&
+        space.organizationId === saved.organizationId &&
+        space.id === (saved.spaceId ?? space.organization.defaultSpaceId),
+    ) ?? null
+  );
+}
 export interface SpaceGrant {
   spaceId: string;
   accountId: string;

@@ -205,6 +205,10 @@ export interface Database {
     created_at: Generated<string>;
     /** People's profile picture in the AVATARS bucket; null shows initials. */
     avatar_key: string | null;
+    /** Their own default Organization (CORE-413); null uses the personal one. */
+    preferred_organization_id: Generated<string | null>;
+    /** Their default Space in it; null uses that Organization's default Space. */
+    preferred_space_id: Generated<string | null>;
   };
   // Better Auth's tables (worker/better-auth.ts): only what Gitmatrix reads.
   auth_users: {

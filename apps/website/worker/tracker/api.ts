@@ -1,8 +1,12 @@
 import { Hono, type Context } from "hono";
 import type { AppEnv } from "../auth.ts";
-import { findRepo, roleFor, visibleRepos, type Actor } from "../db.ts";
+import { findRepo, roleFor, savedDefault, visibleRepos, type Actor } from "../db.ts";
 import { findSpaceBySlug, resolveSpaceAccess } from "../spaces/access.ts";
-import { CONTENT_CONTRACT_HEADER, CONTENT_CONTRACT_VERSION } from "../../shared/spaces.ts";
+import {
+  CONTENT_CONTRACT_HEADER,
+  CONTENT_CONTRACT_VERSION,
+  preferredSpace,
+} from "../../shared/spaces.ts";
 import { db as gitmatrixDb } from "../schema.ts";
 import type {
   ApprovalAutomation,
@@ -137,10 +141,13 @@ tracker.onError((error, c) => {
 tracker.get("/tracker", async (c) => {
   const actor = c.get("actor");
   if (!actor) return c.json({ error: "Sign in to access trackers." }, 401);
-  const [trackers, defaultSpaceId] = await Promise.all([
+  const [trackers, saved, lastSaved] = await Promise.all([
     accessible(c.env.DB, actor),
+    savedDefault(c.env.DB, actor.id),
     defaultSpace(c.env.DB, actor.id),
   ]);
+  // The person's own default (CORE-413) outranks the tracker they last tuned.
+  const defaultSpaceId = preferredSpace(saved, trackers)?.id ?? lastSaved;
   return c.json<TrackerList>({ viewerId: actor.id, trackers, defaultSpaceId });
 });
 /**

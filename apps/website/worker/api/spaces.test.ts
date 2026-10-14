@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
+import type { SessionResponse } from "../../shared/api.ts";
 import type { OrganizationPage, SpacePage } from "../../shared/spaces.ts";
 import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
@@ -68,6 +69,9 @@ async function setup() {
     admissions,
     as(id: string) {
       actor = { id, slug: id, displayName: id, isSiteAdmin: id === "outsider" };
+    },
+    agent() {
+      actor = { ...actor, agent: { id: "agent", name: "agent" } };
     },
     epoch,
     async fence() {
@@ -310,5 +314,80 @@ describe("Organization directory and explicit Space grant APIs", () => {
     for (const removed of ["repos", "teams", "members", "viewerCanManage"])
       expect(profile).not.toHaveProperty(removed);
     expect((await t.request("/accounts/company", "GET", undefined, null)).status).toBe(404);
+  });
+});
+
+describe("a person's own default Organization and Space (CORE-413)", () => {
+  const session = async (t: Awaited<ReturnType<typeof setup>>) =>
+    ((await (await t.request("/session", "GET", undefined, null)).json()) as SessionResponse)
+      .viewer!;
+  const choose = (t: Awaited<ReturnType<typeof setup>>, body: unknown) =>
+    t.request("/account/default-scope", "PUT", body, null);
+
+  test("saves only a choice that opens a Space, and falls back when access lapses", async () => {
+    const t = await setup();
+    t.sqlite.exec(`BEGIN;
+      INSERT INTO organizations(id,slug,display_name,kind,personal_account_id,default_space_id) VALUES ('member-personal','member-personal','Member','personal','member','mine');
+      INSERT INTO spaces(id,organization_id,slug,display_name) VALUES ('mine','member-personal','mine','Mine');
+      INSERT INTO organization_members(organization_id,account_id,role,origin,granted_by) VALUES ('member-personal','member','owner','bootstrap','member');
+      INSERT INTO space_grants(space_id,organization_id,account_id,role,repository_role,package_role,origin,granted_by) VALUES ('mine','member-personal','member','admin','write','write','bootstrap','member');
+      COMMIT;`);
+    t.as("member");
+    expect(await session(t)).toMatchObject({
+      defaultSpaceId: "mine",
+      savedDefault: { organizationId: null, spaceId: null },
+    });
+
+    // No grant in Beta, and no membership in someone else's Organization.
+    expect((await choose(t, { organizationId: "company", spaceId: "beta" })).status).toBe(400);
+    expect((await choose(t, { organizationId: "nowhere", spaceId: null })).status).toBe(400);
+    const company = await choose(t, { organizationId: "company", spaceId: null });
+    expect(company.status).toBe(200);
+    expect(((await company.json()) as SessionResponse).viewer).toMatchObject({
+      defaultSpaceId: "alpha",
+      savedDefault: { organizationId: "company", spaceId: null },
+    });
+
+    t.sqlite.exec(
+      `INSERT INTO space_grants(space_id,organization_id,account_id,role,repository_role,package_role,origin,granted_by) VALUES ('beta','company','member','member','none','read','explicit','owner');`,
+    );
+    expect((await choose(t, { organizationId: "company", spaceId: "beta" })).status).toBe(200);
+    expect((await session(t)).defaultSpaceId).toBe("beta");
+
+    // Losing the grant keeps the saved choice but opens the personal default again.
+    t.sqlite.exec("DELETE FROM space_grants WHERE space_id='beta' AND account_id='member'");
+    expect(await session(t)).toMatchObject({
+      defaultSpaceId: "mine",
+      savedDefault: { organizationId: "company", spaceId: "beta" },
+    });
+
+    expect((await choose(t, { organizationId: null, spaceId: null })).status).toBe(200);
+    expect((await session(t)).savedDefault).toEqual({ organizationId: null, spaceId: null });
+  });
+
+  test("rejects malformed bodies, Spaces from another Organization and agents", async () => {
+    const t = await setup();
+    t.as("member");
+    for (const body of [
+      null,
+      {},
+      { organizationId: 5 },
+      { organizationId: "", spaceId: null },
+      { organizationId: "company", spaceId: "" },
+      { organizationId: null, spaceId: "alpha" },
+      { organizationId: "company", spaceId: 5 },
+      { organizationId: "company", spaceId: "alpha", extra: true },
+    ])
+      expect((await choose(t, body)).status).toBe(400);
+    t.sqlite.exec(`BEGIN;
+      INSERT INTO organizations(id,slug,display_name,kind,default_space_id) VALUES ('other','other','Other','company','gamma');
+      INSERT INTO spaces(id,organization_id,slug,display_name) VALUES ('gamma','other','gamma','Gamma');
+      INSERT INTO organization_members(organization_id,account_id,role,origin,granted_by) VALUES ('other','member','member','explicit','owner');
+      INSERT INTO space_grants(space_id,organization_id,account_id,role,repository_role,package_role,origin,granted_by) VALUES ('gamma','other','member','member','none','read','explicit','owner');
+      COMMIT;`);
+    expect((await choose(t, { organizationId: "company", spaceId: "gamma" })).status).toBe(400);
+    t.as("member");
+    t.agent();
+    expect((await choose(t, { organizationId: "other", spaceId: null })).status).toBe(403);
   });
 });

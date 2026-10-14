@@ -10,7 +10,7 @@ import { sql } from "kysely";
 import { avatarUrl } from "./avatars/api.ts";
 import { repoRole } from "./permissions.ts";
 import { db } from "./schema.ts";
-import type { SpaceSummary } from "../shared/spaces.ts";
+import { preferredSpace, type DefaultScope, type SpaceSummary } from "../shared/spaces.ts";
 import { findSpaceById, listSpaceAccess, resolveSpaceAccess } from "./spaces/access.ts";
 import { listOrganizations } from "./spaces/store.ts";
 
@@ -271,6 +271,19 @@ export async function visibleRepos(
     .sort((a, b) => (b.pushedAt ?? b.createdAt).localeCompare(a.pushedAt ?? a.createdAt));
 }
 
+/** The default Organization and Space a person saved (CORE-413), as saved. */
+export async function savedDefault(d1: D1Database, accountId: string): Promise<DefaultScope> {
+  const row = await db(d1)
+    .selectFrom("accounts")
+    .select(["preferred_organization_id", "preferred_space_id"])
+    .where("id", "=", accountId)
+    .executeTakeFirst();
+  return {
+    organizationId: row?.preferred_organization_id ?? null,
+    spaceId: row?.preferred_organization_id ? (row.preferred_space_id ?? null) : null,
+  };
+}
+
 export async function viewerFor(d1: D1Database, actor: Actor): Promise<Viewer> {
   // Every navigation reads the viewer: one query for all granted Spaces, not one per
   // Space. Without an Organization there is nothing to grant, and a not-yet-cutover
@@ -279,7 +292,7 @@ export async function viewerFor(d1: D1Database, actor: Actor): Promise<Viewer> {
     listOrganizations(d1, actor),
     db(d1)
       .selectFrom("accounts")
-      .select(["email", "avatar_key"])
+      .select(["email", "avatar_key", "preferred_organization_id", "preferred_space_id"])
       .where("id", "=", actor.id)
       .executeTakeFirst(),
   ]);
@@ -289,6 +302,11 @@ export async function viewerFor(d1: D1Database, actor: Actor): Promise<Viewer> {
     (organization) => organization.personalAccountId === actor.id,
   );
   const { email, avatar_key } = account ?? { email: null, avatar_key: null };
+  // The saved default (CORE-413) comes with the same account read.
+  const saved: DefaultScope = {
+    organizationId: account?.preferred_organization_id ?? null,
+    spaceId: account?.preferred_organization_id ? (account.preferred_space_id ?? null) : null,
+  };
   const self: AccountSummary = {
     id: actor.id,
     kind: "user",
@@ -306,9 +324,11 @@ export async function viewerFor(d1: D1Database, actor: Actor): Promise<Viewer> {
     spaces,
     personalOrganizationId: personal?.id ?? null,
     defaultSpaceId:
-      personal && spaces.some((space) => space.id === personal.defaultSpaceId)
+      preferredSpace(saved, spaces)?.id ??
+      (personal && spaces.some((space) => space.id === personal.defaultSpaceId)
         ? personal.defaultSpaceId
-        : null,
+        : null),
+    savedDefault: saved,
   };
 }
 

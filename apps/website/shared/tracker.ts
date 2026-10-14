@@ -540,7 +540,10 @@ export interface TrackerView {
 export interface TrackerList {
   viewerId: string;
   trackers: TrackerSpace[];
-  /** The tracker whose defaults the viewer saved most recently: where /tracker opens. */
+  /**
+   * Where /tracker opens: the viewer's own default Space (CORE-413) while they
+   * can open it, else the tracker whose defaults they saved most recently.
+   */
   defaultSpaceId: string | null;
 }
 export const TRACKER_LAYOUTS = ["list", "board", "graph", "chronicle"] as const;

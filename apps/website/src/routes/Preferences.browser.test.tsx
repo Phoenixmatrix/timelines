@@ -130,6 +130,12 @@ test("signed in with an agent's token, the setting is shown but can't be changed
   renderApp("/settings/preferences?tracker=orbit");
   await expect.element(toggle()).toBeDisabled();
   await expect
-    .element(page.getByText("Agents can’t do that; sign in as their person."))
+    .element(
+      page
+        .getByRole("region", { name: "Approve when green" })
+        .getByText("Agents can’t do that; sign in as their person."),
+    )
     .toBeVisible();
+  // Nor can it move where its person's app and gm open (CORE-413).
+  await expect.element(page.getByRole("button", { name: "Save default" })).toBeDisabled();
 });
