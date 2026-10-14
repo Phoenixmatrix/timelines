@@ -30,6 +30,7 @@ import { FLUSH, pkt } from "../git/pktline.ts";
 import { mintJobToken } from "../ci/registry.ts";
 import { deliverRecoveredSourcePush } from "../git/source-push-delivery.ts";
 import { drainDeletedRepoSources } from "../retention/work-sources.ts";
+import { FORK_TIMEOUT_MS, SOURCE_RETRY_DELAYS_MS } from "./sources.ts";
 import { onPush } from "../ci/trigger.ts";
 import {
   afterRun,
@@ -602,6 +603,44 @@ describe("forking", () => {
       "https://side",
     ]);
     expect((await t.call("ben", "GET", "")).body.timelines).toEqual([]);
+  });
+
+  test("a fork the provider never answers is a retryable 503, not a request held forever (CORE-409)", async () => {
+    const t = await setup();
+    const original = t.git.artifacts.get;
+    let forks = 0;
+    vi.spyOn(t.git.artifacts, "get").mockImplementation(async (name) => {
+      const resource = await original(name);
+      if (name !== "r-app") return resource;
+      return {
+        ...resource,
+        fork: () => {
+          forks++;
+          return new Promise<never>(() => {});
+        },
+      };
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    onTestFinished(() => void vi.useRealTimers());
+    let settled = false;
+    const creating = t
+      .call("ben", "POST", "", { slug: "search", repos: ["orbit/app"] })
+      .finally(() => (settled = true));
+    const attempts = SOURCE_RETRY_DELAYS_MS.length + 1;
+    // Each wait is armed only after real I/O, so advance in steps that let it run.
+    for (let elapsed = 0; !settled && elapsed < 2 * attempts * FORK_TIMEOUT_MS; elapsed += 1_000) {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(settled, "The request answered instead of waiting on the fork").toBe(true);
+    const created = await creating;
+    expect(created.status).toBe(503);
+    expect(created.body.code).toBe("source_unavailable");
+    expect(forks).toBe(attempts);
+    // The outcome is unknown: the reservation stays fenced for reconciliation.
+    expect(t.sqlite.prepare("SELECT state FROM timeline_work_sources").all()).toEqual([
+      { state: "creating" },
+    ]);
   });
 
   test("a fork from a timeline starts at its bookmarks, in its repositories by default", async () => {

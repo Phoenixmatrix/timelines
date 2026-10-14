@@ -150,9 +150,9 @@ const TRANSIENT_CODES: readonly ArtifactsErrorCode[] = [
 // internal error, a fork still in progress (CORE-315), the dropped connection
 // of local development's remote binding (CORE-302), or a network failure on
 // the way: a name lookup that failed once, a reset or refused connection
-// (CORE-331).
+// (CORE-331), or a binding call withTimeout gave up on (CORE-409).
 const TRANSIENT_REMOTE =
-  /^ArtifactsError: An internal error occurred|^ArtifactsError: Repository "[^"]+" is currently being forked|Peer closed WebSocket|Network connection lost|DNS lookup failed|Temporary failure in name resolution|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|^fetch failed$/;
+  /^ArtifactsError: An internal error occurred|^ArtifactsError: Repository "[^"]+" is currently being forked|Peer closed WebSocket|Network connection lost|DNS lookup failed|Temporary failure in name resolution|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|^fetch failed$|Timed out after \d+ ms/;
 /** Node-style network error codes, as some runtimes' fetch reports them. */
 const TRANSIENT_NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN"]);
 

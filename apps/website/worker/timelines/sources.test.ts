@@ -169,6 +169,11 @@ test("transient Artifacts errors: provider failures and dropped remote connectio
     true,
   );
   expect(isTransientArtifactsError(forking)).toBe(true);
+  // A bounded binding call that got no answer, with or without its name across RPC (CORE-409).
+  expect(
+    isTransientArtifactsError(new DOMException("Timed out after 60000 ms", "TimeoutError")),
+  ).toBe(true);
+  expect(isTransientArtifactsError(new Error("Timed out after 60000 ms"))).toBe(true);
   expect(isTransientArtifactsError({ code: "NOT_FOUND" })).toBe(false);
   expect(isTransientArtifactsError({ code: "INVALID_INPUT" })).toBe(false);
   expect(isTransientArtifactsError(new Error("Repository was deleted."))).toBe(false);

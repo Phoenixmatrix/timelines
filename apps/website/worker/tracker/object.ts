@@ -25,6 +25,7 @@ import {
 } from "../durable/cutover-admission.ts";
 import { reportCutoverRuntime } from "../durable/cutover-runtime.ts";
 import { forgetUpstreamTokens, isArtifactsError } from "../artifacts.ts";
+import { UPSTREAM_TIMEOUT_MS, withTimeout } from "../retry.ts";
 import { TrackerError, TrackerStore, type Access } from "./store.ts";
 import {
   type TimelineStore,
@@ -843,8 +844,11 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
           // A restarted initializer may still have an outstanding remote fork.
           // Missing by name is not proof that its delayed creation cannot arrive.
           try {
-            using provider = await this.env.ARTIFACTS.get(row.artifacts_name);
-            await provider.info();
+            using provider = await withTimeout(
+              this.env.ARTIFACTS.get(row.artifacts_name),
+              UPSTREAM_TIMEOUT_MS,
+            );
+            await withTimeout(provider.info(), UPSTREAM_TIMEOUT_MS);
           } catch (error) {
             if (!isArtifactsError(error, "NOT_FOUND")) throw error;
             return this.reply(() => {
@@ -962,8 +966,11 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
       if (row.state === "creating") {
         // A ready capability proves the named provider fork finished. NOT_FOUND
         // cannot prove an ambiguous provider request will never create it.
-        using provider = await this.env.ARTIFACTS.get(row.artifacts_name);
-        await provider.info();
+        using provider = await withTimeout(
+          this.env.ARTIFACTS.get(row.artifacts_name),
+          UPSTREAM_TIMEOUT_MS,
+        );
+        await withTimeout(provider.info(), UPSTREAM_TIMEOUT_MS);
         row = this.#timelines.transitionWorkSource(sourceId, row.version, "failed");
         await this.env.DB.prepare(
           "UPDATE timeline_work_sources SET state=?,version=?,updated_at=? WHERE source_id=? AND state='creating'",

@@ -15,6 +15,7 @@ import {
   forgetUpstreamTokens,
 } from "../artifacts.ts";
 import { trackerObject } from "../tracker/stub.ts";
+import { UPSTREAM_TIMEOUT_MS, withTimeout } from "../retry.ts";
 import { TrackerError } from "../tracker/store.ts";
 import type { TrackerReply } from "../tracker/object.ts";
 import { writeRefs } from "./bookmarks.ts";
@@ -134,6 +135,12 @@ export async function resolveTimelineSource(env: Env, repo: RepoRow, entry: Time
 export const SOURCE_RETRY_DELAYS_MS = [500, 2000, 5000] as const;
 
 /**
+ * How long a fork may take before it counts as failed. It copies a whole
+ * repository, so it gets longer than one git call's UPSTREAM_TIMEOUT_MS.
+ */
+export const FORK_TIMEOUT_MS = 60_000;
+
+/**
  * Native fork allocation: the Tracker reserves the name before any provider side effect.
  * Initialization resumes from the reservation, so a transient Artifacts failure (the
  * fork may even have succeeded) is retried here; if it persists, the caller gets a
@@ -177,7 +184,13 @@ export async function ensureWorkSource(
   }
 }
 
-/** Runs inside the Space Tracker's single-flight initializer. */
+/**
+ * Runs inside the Space Tracker's single-flight initializer. Binding calls take
+ * no AbortSignal, so each is bounded by racing a timer: one the provider never
+ * answers fails as transient (retried, then a 503) instead of holding the
+ * initializer, and the cancellation or repository deletion draining it,
+ * forever (CORE-409).
+ */
 export async function initializeWorkSource(
   env: Env,
   access: Access,
@@ -291,8 +304,8 @@ export async function initializeWorkSource(
     fail("source_not_ready", "Source allocation cannot be initialized.", 409);
   const parent = await resolveSource(env, repo, row.initial_source_id);
   try {
-    using existing = await env.ARTIFACTS.get(row.artifacts_name);
-    row.artifacts_remote = (await existing.info()).remote;
+    using existing = await withTimeout(env.ARTIFACTS.get(row.artifacts_name), UPSTREAM_TIMEOUT_MS);
+    row.artifacts_remote = (await withTimeout(existing.info(), UPSTREAM_TIMEOUT_MS)).remote;
   } catch (error) {
     if (!isArtifactsError(error, "NOT_FOUND")) throw error;
     const live = await db(env.DB)
@@ -309,8 +322,14 @@ export async function initializeWorkSource(
     let forked: ArtifactsCreateRepoResult;
     try {
       await authorize();
-      using origin = await env.ARTIFACTS.get(parent.repo.artifacts_name);
-      forked = await origin.fork(row.artifacts_name, { readOnly: false });
+      using origin = await withTimeout(
+        env.ARTIFACTS.get(parent.repo.artifacts_name),
+        UPSTREAM_TIMEOUT_MS,
+      );
+      forked = await withTimeout(
+        origin.fork(row.artifacts_name, { readOnly: false }),
+        FORK_TIMEOUT_MS,
+      );
     } catch (error) {
       // A fork whose connection dropped can stay "in progress" for good (an
       // Artifacts fault seen in development): rather than wait on it, fork
@@ -319,18 +338,25 @@ export async function initializeWorkSource(
       row = unwrap(await tracker.renameWorkSource(row.source_id, row.version));
       await project();
       await authorize();
-      using origin = await env.ARTIFACTS.get(parent.repo.artifacts_name);
-      forked = await origin.fork(row.artifacts_name, { readOnly: false });
+      using origin = await withTimeout(
+        env.ARTIFACTS.get(parent.repo.artifacts_name),
+        UPSTREAM_TIMEOUT_MS,
+      );
+      forked = await withTimeout(
+        origin.fork(row.artifacts_name, { readOnly: false }),
+        FORK_TIMEOUT_MS,
+      );
     }
     row.artifacts_remote = forked.remote;
   }
-  using owned = await env.ARTIFACTS.get(row.artifacts_name);
+  using owned = await withTimeout(env.ARTIFACTS.get(row.artifacts_name), UPSTREAM_TIMEOUT_MS);
   // Includes recovery after a crash before the initial token could be saved.
   // No caller receives the repo until all pre-readiness credentials are revoked.
-  const tokens = await owned.listTokens();
-  for (const token of tokens.tokens) await owned.revokeToken(token.id);
+  const tokens = await withTimeout(owned.listTokens(), UPSTREAM_TIMEOUT_MS);
+  for (const token of tokens.tokens)
+    await withTimeout(owned.revokeToken(token.id), UPSTREAM_TIMEOUT_MS);
   forgetUpstreamTokens(row.artifacts_name);
-  const pinned = await owned.readCommit(row.initial_commit);
+  const pinned = await withTimeout(owned.readCommit(row.initial_commit), UPSTREAM_TIMEOUT_MS);
   if (!pinned || pinned.treeHash !== row.initial_tree)
     fail("source_not_ready", "Fork does not contain the exact requested source snapshot.", 409);
   const refs = await lsRefs(env, row.artifacts_name, row.artifacts_remote!);
@@ -352,7 +378,7 @@ export async function initializeWorkSource(
   while (basePending.length) {
     const oid = basePending.pop()!;
     if (baseline.has(oid)) continue;
-    const commit = await owned.readCommit(oid);
+    const commit = await withTimeout(owned.readCommit(oid), UPSTREAM_TIMEOUT_MS);
     if (!commit) fail("source_not_ready", "The logical base graph is incomplete.", 409);
     baseline.add(oid);
     basePending.push(...commit.parents);
@@ -366,7 +392,7 @@ export async function initializeWorkSource(
   while (pending.length) {
     const oid = pending.pop()!;
     if (members.has(oid)) continue;
-    const commit = await owned.readCommit(oid);
+    const commit = await withTimeout(owned.readCommit(oid), UPSTREAM_TIMEOUT_MS);
     if (!commit) fail("source_not_ready", "The initial source graph is incomplete.", 409);
     members.add(oid);
     pending.push(...commit.parents);
