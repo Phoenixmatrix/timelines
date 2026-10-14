@@ -141,3 +141,24 @@ for (const width of [390, 320]) {
     });
   }
 }
+
+test("the rail's Repositories place opens the repository list and owns its current state", async () => {
+  const server = await TestServer.start({ world: true });
+  await server.repo("orbit", "engine");
+  const app = renderApp("/tracker/orbit");
+  const repositories = rail().getByRole("link", { name: "Repositories", exact: true });
+  const home = rail().getByRole("link", { name: "Home", exact: true });
+  await expect.element(repositories).toHaveAttribute("href", "/");
+  await expect.element(repositories).not.toHaveAttribute("aria-current");
+  await userEvent.click(repositories);
+  await app.waitForUrl((url) => url.pathname === "/");
+  await expect.element(repositories).toHaveAttribute("aria-current", "page");
+  // Both lead home; only one announces the current page.
+  await expect.element(home).toHaveAttribute("href", "/");
+  await expect.element(home).not.toHaveAttribute("aria-current");
+  await app.navigate("/orbit/engine");
+  await expect.element(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
+  await expect.element(repositories).toHaveAttribute("aria-current", "page");
+  await app.navigate("/needs-you");
+  await expect.element(repositories).not.toHaveAttribute("aria-current");
+});
