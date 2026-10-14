@@ -6,6 +6,7 @@ import { renderApp } from "../testing/render.tsx";
 import { sidewaysOverflow } from "../testing/atlas.ts";
 import { focusOn, focused, press } from "../testing/focus.ts";
 import { TestServer } from "../testing/server.ts";
+import { visual } from "../testing/visual.ts";
 
 // Organization and Space switching lives in the rail's account menu (CORE-414).
 const accountMenu = () => page.getByRole("button", { name: /account menu$/ });
@@ -229,4 +230,39 @@ test("entering an Organization reads the session once per navigation and its Spa
   // The Space page doesn't wait for its repositories, nor its teams for directory administration.
   expect(at(`start /api/spaces/${slug}`)).toBeLessThan(at("end /api/repos"));
   expect(at(`start /api/tracker/${slug}/teams`)).toBeLessThan(at(`end /api/spaces/${slug}/grants`));
+});
+
+test("Organization settings use the settings pages' column, cards and per-card outcomes (CORE-415)", async () => {
+  const server = await TestServer.start({ world: true });
+  const created = await organization(server, "settings-style-browser");
+  renderApp(`/organizations/${created.organization.slug}`);
+  const settings = page.getByRole("region", { name: "Organization settings" });
+  await expect.element(settings).toBeVisible();
+  await expect.element(settings.getByRole("heading", { name: "Organization icon" })).toBeVisible();
+  // The settings pages' 48rem form column, with each card's own primary action left-aligned.
+  expect(settings.element().getBoundingClientRect().width).toBeLessThanOrEqual(48 * 16);
+  const form = (name: string) => {
+    const button = settings.getByRole("button", { name, exact: true }).element();
+    expect(button.classList).toContain("mk-btn--primary");
+    expect(button.closest(".mk-form-actions")).not.toBeNull();
+    return button.closest("form")!;
+  };
+  for (const name of ["Save name", "Set default Space", "Save membership", "Create Space"])
+    form(name);
+  settings.element().scrollIntoView();
+  await visual("Organization settings");
+
+  await userEvent.fill(settings.getByRole("textbox", { name: "Display name" }), "Renamed Company");
+  await userEvent.click(settings.getByRole("button", { name: "Save name" }));
+  await expect
+    .element(page.getByRole("heading", { name: "Renamed Company", exact: true }))
+    .toBeVisible();
+  await expect.element(settings.getByRole("status")).toHaveTextContent("Saved.");
+  expect(form("Save name").contains(settings.getByRole("status").element())).toBe(true);
+
+  await userEvent.fill(settings.getByRole("textbox", { name: "Person handle" }), "nobody-here");
+  await userEvent.click(settings.getByRole("button", { name: "Save membership" }));
+  await expect.element(settings.getByRole("alert")).toBeVisible();
+  expect(form("Save membership").contains(settings.getByRole("alert").element())).toBe(true);
+  await expect.element(settings.getByRole("status")).not.toBeInTheDocument();
 });
