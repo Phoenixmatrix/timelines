@@ -100,6 +100,18 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     if (lease?.sealed) throw new Error("Sandbox execution was sealed by cutover");
     if (lease && !this.ctx.container)
       throw new Error("Sandbox container binding unavailable for execution reconciliation");
+    if (lease && !this.ctx.container?.running) {
+      // A replayed run can race the cleanup of the call it replaces: that call
+      // released its ticket while this lease survived (CORE-341: every later
+      // run failed with space_cutover_ticket_mismatch). With no container
+      // running nothing executes under it, so the stale lease is dropped.
+      try {
+        await control.assertTicket(lease.ticket, lease.epoch, CONTENT_CONTRACT_VERSION);
+      } catch {
+        await this.ctx.storage.delete(CUTOVER_EXECUTION);
+        lease = undefined;
+      }
+    }
     if (!lease) {
       // A process predating preparation has no trustworthy execution identity.
       // Do not destroy it or let a new run hide it from the drain inventory.
