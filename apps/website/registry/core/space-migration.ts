@@ -1304,7 +1304,9 @@ export function createD1SpaceCheckpoint(
           // Each group is its own atomic batch; an interrupted step re-checks
           // presence, so nothing is lost or inserted twice.
           const until = Date.now() + 3_000;
-          for (;;) {
+          let blockRestored = false;
+          // And at most eight groups, keeping one invocation's queries bounded.
+          for (let groups = 0; groups < 8; groups++) {
             if (!state.group) {
               // Rows before this offset were found restored; groups only add rows.
               const skip = Math.min(state.presentInBlock ?? 0, block.block.rows.length);
@@ -1336,7 +1338,10 @@ export function createD1SpaceCheckpoint(
               }
             }
             // Every remaining row of this block is restored: move on below.
-            if (!state.group) break;
+            if (!state.group) {
+              blockRestored = true;
+              break;
+            }
             let complete = false;
             while (
               !(complete = await expandInsertGroup(
@@ -1366,6 +1371,8 @@ export function createD1SpaceCheckpoint(
             state.group = null;
             if (Date.now() >= until) return { state, done: false };
           }
+          // Out of groups for this step: the block may still be missing rows.
+          if (!blockRestored) return { state, done: false };
         }
         const statements = cyclicTables(table, state.ordered).length
           ? []

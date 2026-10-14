@@ -104,11 +104,13 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
       throw new Error("space_migration_fenced: Tracker DO identity mismatch");
     // Records may still name this owner's own repositories deleted since: those
     // references move with the owner's Space too (CORE-341: a smoke-test repo).
+    // An unreadable deletion log allows none: stricter, never looser.
     const deleted = await this.env.DB.prepare(
       "SELECT repo_id FROM repo_deletions WHERE owner_id=? AND phase='done'",
     )
       .bind(context.legacyOwnerId)
-      .all<{ repo_id: string }>();
+      .all<{ repo_id: string }>()
+      .catch(() => ({ results: [] as { repo_id: string }[] }));
     return new TrackerSpaceMigration(
       this.ctx.storage.sql,
       this.transaction,
