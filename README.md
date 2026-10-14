@@ -96,7 +96,9 @@ gm instance upgrade acme --from https://github.com/Phoenixmatrix/timelines.git
 
 Upgrade fetches the upstream into a clone of gm's own, under
 `~/.cache/gitmatrix/instance-sources`, and never touches your checkout. It
-checks out the target there, runs `pnpm install` and builds that version's gm.
+checks out the target there, runs `pnpm install --frozen-lockfile` (or
+`vp install --frozen-lockfile` where the `pnpm` on your PATH is a shim that
+can't run on its own, such as Vite+'s) and builds that version's gm.
 That gm then deploys it: it creates any resources the version needs that setup
 didn't, applies the version's new D1 migrations, deploys the Worker and waits
 for it to answer. The gm built for the version stays in that clone; the upgrade
