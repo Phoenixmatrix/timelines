@@ -22,6 +22,7 @@ import { emailOTP } from "better-auth/plugins/email-otp";
 import { readSecret } from "../registry/core/secrets.ts";
 import { RESERVED_SLUGS } from "./names.ts";
 import { isPreview, productionOnly } from "./preview.ts";
+import { markSessionsRevoked } from "./db.ts";
 import { db } from "./schema.ts";
 import { createPerson } from "./spaces/store.ts";
 import type { Timing } from "./timing.ts";
@@ -204,11 +205,16 @@ async function requestIdentity(
 const identities = new WeakMap<Request, SignInIdentity>();
 
 /**
- * Better Auth routes nobody here uses, all ways to set a password or change or
- * prove an email outside an admin: passwords are set by site admins
+ * Better Auth routes nobody here uses. Most are ways to set a password or
+ * change or prove an email outside an admin: passwords are set by site admins
  * (worker/api/admin-accounts.ts) and changed with /change-password.
+ * /list-sessions returns every live session of the person with its raw token,
+ * which /api/tokens/device would once have traded for a token; /update-session
+ * could only change the session fields Better Auth keeps for us.
  */
 const DISABLED_PATHS = [
+  "/list-sessions",
+  "/update-session",
   "/email-otp/request-password-reset",
   "/email-otp/reset-password",
   "/forget-password/email-otp",
@@ -220,6 +226,33 @@ const DISABLED_PATHS = [
   "/send-verification-email",
   "/verify-email",
 ];
+
+/**
+ * Lockouts and username sign-in for the guarded paths: throws for a locked-out
+ * key or a code no address could have been sent, and returns the body a
+ * password sign-in by username goes on with (its email in place of the name).
+ */
+async function guardSignIn(
+  env: Env,
+  ctx: { path: string; body?: Record<string, unknown>; request?: Request },
+): Promise<Record<string, unknown> | undefined> {
+  if (!GUARDED.has(ctx.path)) return undefined;
+  const identity = await requestIdentity(env, ctx.path, ctx.body);
+  if (identity && ctx.request) identities.set(ctx.request, identity);
+  if (await lockedOut(env, failureKeys(ctx.request, identity?.key)))
+    throw new APIError("TOO_MANY_REQUESTS", {
+      message: "Too many failed attempts. Try again in 15 minutes.",
+    });
+  // No code was sent to an address that may not join (see mayJoin):
+  // refuse a guessed one like any wrong code.
+  if (ctx.path === "/sign-in/email-otp" && identity && !(await mayJoin(env, identity.email))) {
+    await recordFailure(env, failureKeys(ctx.request, identity.key));
+    throw APIError.from("BAD_REQUEST", { code: "INVALID_OTP", message: "Invalid OTP" });
+  }
+  // A password sign-in may name a username; Better Auth wants the email.
+  if (ctx.path === "/sign-in/email" && identity) return { ...ctx.body, email: identity.email };
+  return undefined;
+}
 
 /** Email a sign-in code. A preview sends none: its people are the seeded personas. */
 export async function sendCode(env: Env, email: string, otp: string) {
@@ -243,6 +276,54 @@ function baseUrl(env: Env, origin?: string): string | undefined {
   return (Reflect.get(env, "PUBLIC_URL") as string | undefined) ?? origin;
 }
 
+/**
+ * How long a browser's signed session cache (gm.session_data) answers for its
+ * session without a D1 read, and only for auth.ts sessionActor's reads (GET,
+ * HEAD, OPTIONS). For this long after a person's sessions are revoked
+ * (accounts.sessions_revoked_at, stamped by the session delete hook below and
+ * by worker/api/admin-accounts.ts), those reads read D1 too, so a revoked
+ * session never identifies its holder. POST, PUT, PATCH and DELETE, every
+ * Better Auth endpoint over HTTP (withoutSessionCache), isActorCredentialLive
+ * and the registry always read D1.
+ */
+export const SESSION_CACHE_SECONDS = 5 * 60;
+
+/**
+ * The one Better Auth endpoint that may answer from the signed session cache,
+ * and only when called in-process (auth.ts sessionActor's auth.api.getSession,
+ * which checks accounts.sessions_revoked_at), never over HTTP.
+ */
+const CACHED_SESSION_PATH = "/get-session";
+
+/**
+ * The request's headers without the signed session cache (its __Secure-
+ * variant and any chunks), for every Better Auth endpoint over HTTP (and
+ * in-process for all but /get-session): its session middlewares then read the
+ * session from D1, so a revoked session reaches none of them (updating the
+ * person, revoking, device approval, /get-session itself…). Nothing when there
+ * is nothing to remove. Better Auth sends a fresh cache back after the D1 read.
+ */
+function withoutSessionCache(ctx: {
+  path: string;
+  headers?: Headers;
+  request?: Request;
+  context: { authCookies: { sessionData: { name: string } } };
+}): Headers | undefined {
+  if (ctx.path === CACHED_SESSION_PATH && !ctx.request) return undefined;
+  const cookie = ctx.headers?.get("cookie");
+  if (!cookie) return undefined;
+  const name = ctx.context.authCookies.sessionData.name.replace(/^__Secure-/, "");
+  const cache = (key: string) =>
+    [name, `__Secure-${name}`].some((base) => key === base || key.startsWith(`${base}.`));
+  const pairs = cookie.split(";");
+  const kept = pairs.filter((pair) => !cache(pair.split("=", 1)[0]!.trim()));
+  if (kept.length === pairs.length) return undefined;
+  return new Headers({ cookie: kept.map((pair) => pair.trim()).join("; ") });
+}
+
+/** What auth_sessions.kind says of a session gm's device login created. */
+export const DEVICE_SESSION = "device";
+
 export function authOptions(env: Env, secret: string, origin?: string) {
   const baseURL = baseUrl(env, origin);
   return {
@@ -258,6 +339,14 @@ export function authOptions(env: Env, secret: string, origin?: string) {
       modelName: "auth_sessions",
       expiresIn: 60 * 60 * 24 * 30,
       updateAge: 60 * 60 * 24,
+      // "device" for the session gm's device login gets (/device/token), the
+      // only one /api/tokens/device trades for a token; null for a browser's.
+      // Never set from a request.
+      additionalFields: {
+        kind: { type: "string", required: false, input: false },
+      },
+      // Signed with the auth secret (HMAC-SHA256, "compact"), never unsigned.
+      cookieCache: { enabled: true, maxAge: SESSION_CACHE_SECONDS, strategy: "compact" },
     },
     account: { modelName: "auth_accounts" },
     verification: { modelName: "auth_verifications" },
@@ -275,6 +364,13 @@ export function authOptions(env: Env, secret: string, origin?: string) {
     advanced: {
       cookiePrefix: "gm",
       database: {
+        // The schema is the repository's migrations (migrations.test.ts and
+        // the canonical-schema tests check it). Better Auth's own check would
+        // introspect every table once per instance, and share that read
+        // between requests.
+        validateSchema: false,
+        // A session and its user in one query (the Kysely adapter's native join).
+        joins: true,
         generateId: ({ model }) =>
           model === "user" || model === "auth_users"
             ? `acc_${crypto.randomUUID()}`
@@ -314,7 +410,7 @@ export function authOptions(env: Env, secret: string, origin?: string) {
       },
       session: {
         create: {
-          async before(session) {
+          async before(session, ctx) {
             // A failed user.create.after can leave only the authentication row.
             // Retry its atomic person bootstrap before issuing any session.
             const user = await db(env.DB)
@@ -324,7 +420,18 @@ export function authOptions(env: Env, secret: string, origin?: string) {
               .executeTakeFirst();
             if (!user) return false;
             await linkAccount(env, user);
-            return { data: session };
+            return {
+              data: { ...session, kind: ctx?.path === "/device/token" ? DEVICE_SESSION : null },
+            };
+          },
+        },
+        // Every session Better Auth ends (sign-out, /revoke-session(s),
+        // /revoke-other-sessions, /change-password, an expired one): stamp the
+        // person before the row goes, so from then on their reads stop
+        // trusting a signed session cache (auth.ts sessionActor).
+        delete: {
+          async before(session) {
+            await markSessionsRevoked(env.DB, session.userId);
           },
         },
       },
@@ -334,26 +441,10 @@ export function authOptions(env: Env, secret: string, origin?: string) {
         // Codes only sign in: none reset a password or verify an address.
         if (ctx.path === "/email-otp/send-verification-otp" && ctx.body?.type !== "sign-in")
           throw new APIError("BAD_REQUEST", { message: "Only sign-in codes are sent." });
-        if (!GUARDED.has(ctx.path)) return;
-        const identity = await requestIdentity(env, ctx.path, ctx.body);
-        if (identity && ctx.request) identities.set(ctx.request, identity);
-        if (await lockedOut(env, failureKeys(ctx.request, identity?.key)))
-          throw new APIError("TOO_MANY_REQUESTS", {
-            message: "Too many failed attempts. Try again in 15 minutes.",
-          });
-        // No code was sent to an address that may not join (see mayJoin):
-        // refuse a guessed one like any wrong code.
-        if (
-          ctx.path === "/sign-in/email-otp" &&
-          identity &&
-          !(await mayJoin(env, identity.email))
-        ) {
-          await recordFailure(env, failureKeys(ctx.request, identity.key));
-          throw APIError.from("BAD_REQUEST", { code: "INVALID_OTP", message: "Invalid OTP" });
-        }
-        // A password sign-in may name a username; Better Auth wants the email.
-        if (ctx.path === "/sign-in/email" && identity)
-          return { context: { body: { ...ctx.body, email: identity.email } } };
+        const headers = withoutSessionCache(ctx);
+        const body = await guardSignIn(env, ctx);
+        if (headers || body)
+          return { context: { ...(headers && { headers }), ...(body && { body }) } };
       }),
       after: createAuthMiddleware(async (ctx) => {
         if (!GUARDED.has(ctx.path)) return;

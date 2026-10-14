@@ -214,6 +214,12 @@ adminAccounts.put("/:username/password", async (c) => {
        VALUES (?1, ?2, 'credential', ?2, ?3, ?4, ?4)`,
     ).bind(crypto.randomUUID(), account.id, hash, now),
     DB.prepare(`DELETE FROM auth_sessions WHERE userId = ?`).bind(account.id),
+    // Their browsers' signed session caches stop counting at once
+    // (auth.ts sessionActor reads D1 for a while after this).
+    DB.prepare(`UPDATE accounts SET sessions_revoked_at = ? WHERE id = ?`).bind(
+      Date.now(),
+      account.id,
+    ),
     // Tokens (gm, agents, any minted from a session) outlive sessions: a
     // leaked password's access ends only if the admin revokes them too.
     ...(revokeTokens === true
@@ -222,6 +228,6 @@ adminAccounts.put("/:username/password", async (c) => {
   ]);
   return c.json({
     sessionsRevoked: results[3]?.meta.changes ?? 0,
-    tokensRevoked: results[4]?.meta.changes ?? 0,
+    tokensRevoked: results[5]?.meta.changes ?? 0,
   });
 });

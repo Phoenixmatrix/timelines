@@ -2,8 +2,8 @@ import type { Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { TokenScope } from "../shared/api.ts";
 import { Timing } from "./timing.ts";
-import { createAuth } from "./better-auth.ts";
-import { actorFromRow, findUserById, sqlNow, type Actor } from "./db.ts";
+import { createAuth, SESSION_CACHE_SECONDS } from "./better-auth.ts";
+import { actorFromRow, findSignedInUser, findUserById, sqlNow, type Actor } from "./db.ts";
 import { db } from "./schema.ts";
 
 export type AppEnv = {
@@ -30,21 +30,78 @@ export function requestTiming(c: Context<AppEnv>): Timing {
 // Production sign-in remains Better Auth (worker/better-auth.ts).
 const PERSONA_COOKIE = "gm_persona";
 
-/** Better Auth's session cookie (with its __Secure- variant over HTTPS). */
+/**
+ * Better Auth's session cookie (with its __Secure- variant over HTTPS). Its
+ * signed session cache (gm.session_data) means nothing without it, so only
+ * this one says a request may be signed in.
+ */
 const SESSION_COOKIES = ["gm.session_token", "__Secure-gm.session_token"];
 
+/** Requests that read: they may trust the signed session cache. */
+const CACHED_SESSION_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/**
+ * How long after a person's sessions were revoked (accounts.sessions_revoked_at)
+ * their reads skip the signed session cache: its age, and a margin for the
+ * clocks of the isolates that stamped the revocation and signed a cache.
+ */
+export const SESSION_REVOCATION_WINDOW_MS = SESSION_CACHE_SECONDS * 1000 + 30_000;
+
+function revokedRecently(at: number | null, now = Date.now()): boolean {
+  return at !== null && now - at < SESSION_REVOCATION_WINDOW_MS;
+}
+
+/**
+ * The signed-in person, if any. A read trusts Better Auth's signed session
+ * cookie cache (better-auth.ts SESSION_CACHE_SECONDS) instead of reading the
+ * session from D1, unless the person's sessions were revoked within the
+ * cache's age (accounts.sessions_revoked_at: any session of theirs deleted
+ * through Better Auth, which covers sign-out, /revoke-session(s),
+ * /revoke-other-sessions and /change-password, or an administrator's
+ * `gm auth account password`). Then a cache signed before the revocation may
+ * still be within its age, so the session is read from D1 as well, and a
+ * revoked one is signed out at once. The person is read from D1 on every
+ * request anyway (one query, with the stamp), so the common read costs no
+ * more, and a removed account ends at once. Every other method reads the
+ * session from D1, so no POST, PUT, PATCH or DELETE (minting a token, adding a
+ * key) runs on a revoked session. Better Auth's own endpoints read D1
+ * (better-auth.ts withoutSessionCache), the assistant, Tracker and delayed
+ * work revalidate with isActorCredentialLive, and the registry re-reads the
+ * session row. No endpoint returns another session's token (/list-sessions is
+ * disabled; /get-session returns only the caller's own), and
+ * /api/tokens/device trades only the device flow's session, never a
+ * browser's.
+ * Cookies Better Auth refreshes (the cache, an extended session) go out with
+ * the response; after a D1 read for a revoked session, the ones expiring it.
+ */
 export async function sessionActor(c: Context<AppEnv>): Promise<Actor | null> {
   const timing = requestTiming(c);
   if (SESSION_COOKIES.some((name) => getCookie(c, name))) {
     const auth = await createAuth(c.env, new URL(c.req.url).origin, timing);
-    const session = await timing.measure(
-      "session",
-      auth.api.getSession({
-        headers: c.req.raw.headers,
-      }),
-    );
+    const getSession = (cache: boolean) =>
+      timing.measure(
+        cache ? "session" : "session-db",
+        auth.api.getSession({
+          headers: c.req.raw.headers,
+          query: cache ? {} : { disableCookieCache: true },
+          returnHeaders: true,
+        }),
+      );
+    const cache = CACHED_SESSION_METHODS.has(c.req.method);
+    let { headers, response: session } = await getSession(cache);
+    let person = session
+      ? await timing.measure("user", findSignedInUser(c.env.DB, session.user.id))
+      : null;
+    // A cache signed before the revocation may still be within its age.
+    if (person && cache && revokedRecently(person.sessionsRevokedAt)) {
+      ({ headers, response: session } = await getSession(false));
+      if (session?.user.id !== person.actor.id) person = null;
+    }
+    // Only the last read's cookies, so a revoked session's expire the cache.
+    for (const cookie of headers?.getSetCookie() ?? [])
+      c.header("set-cookie", cookie, { append: true });
     if (session) {
-      const actor = await timing.measure("user", findUserById(c.env.DB, session.user.id));
+      const actor = person?.actor ?? null;
       if (actor) actor.credential = { kind: "session", id: session.session.id };
       return actor;
     }
@@ -53,7 +110,11 @@ export async function sessionActor(c: Context<AppEnv>): Promise<Actor | null> {
   return secret ? timing.measure("persona", personaActor(c.env, secret)) : null;
 }
 
-/** Sign out of Better Auth (if signed in) and drop the persona cookie. */
+/**
+ * Sign out of Better Auth (if signed in) and drop the persona cookie. Better
+ * Auth's sign-out deletes the session and expires both its cookie and the
+ * signed session cache.
+ */
 export async function endAllSessions(c: Context<AppEnv>) {
   if (SESSION_COOKIES.some((name) => getCookie(c, name))) {
     const auth = await createAuth(c.env, new URL(c.req.url).origin);
