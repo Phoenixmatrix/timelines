@@ -41,7 +41,7 @@ import { needsYouBadge, needsYouLabel, useNeedsYou } from "../lib/needs-you.ts";
 import { Monogram } from "./Monogram.tsx";
 import { GitmatrixLogo, TimelinesMark } from "./GitmatrixLogo.tsx";
 import { TimelineBanner } from "./TimelineScope.tsx";
-import { ScopeSelectors } from "./ScopeSelectors.tsx";
+import { ScopeMenu } from "./ScopeMenu.tsx";
 import { KeyboardShortcuts } from "./KeyboardShortcuts.tsx";
 import { Tip, Toasts } from "./ui.tsx";
 
@@ -117,6 +117,8 @@ function AccountMenu({ preferencesPath }: { preferencesPath: string }) {
                 {viewer.isSiteAdmin && " · Instance operator"}
               </div>
             </div>
+            <div className="mk-menu-sep" />
+            <ScopeMenu />
             <div className="mk-menu-sep" />
             <Menu.LinkItem
               closeOnClick
@@ -406,14 +408,10 @@ export function AppShell() {
           >
             {trackerWorkbench ? (
               <div className="contents lg:block lg:shrink-0">
-                <ScopeSelectors />
                 <TimelineBanner />
               </div>
             ) : (
-              <>
-                <ScopeSelectors />
-                <TimelineBanner />
-              </>
+              <TimelineBanner />
             )}
             <Outlet />
           </main>

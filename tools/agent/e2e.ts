@@ -4680,16 +4680,12 @@ export async function runE2E(
           for (const width of [1280, 390]) {
             await page.setViewportSize({ width, height: 850 });
             await page.goto(`/${activeSpace}`);
-            const scope = page.getByRole("navigation", {
-              name: "Organization and Space",
-              exact: true,
-            });
-            await expect(
-              scope.getByRole("combobox", { name: "Switch Organization", exact: true }),
-            ).toBeVisible();
-            await expect(
-              scope.getByRole("combobox", { name: "Switch Space", exact: true }),
-            ).toBeVisible();
+            // Organization and Space switching lives in the account menu (CORE-414).
+            await page.getByRole("button", { name: /account menu$/ }).click();
+            await expect(page.getByRole("menuitem", { name: /^Organization: / })).toBeVisible();
+            await expect(page.getByRole("menuitem", { name: /^Space: / })).toBeVisible();
+            await page.keyboard.press("Escape");
+            await expect(page.getByRole("menu")).toHaveCount(0);
             await expect(
               page.getByRole("region", { name: "Repositories", exact: true }),
             ).toBeVisible();
