@@ -206,6 +206,7 @@ await test("AI-only code, the docs site and prose select nothing; nothing provis
     "apps/site/cloudflare.config.ts",
     "DESIGN.md",
     "PRODUCT.md",
+    "LICENSE",
     "TIMELINES-RESEARCH.md",
     "apps/website/DESIGN.md",
     ".claude/agents/runner.md",

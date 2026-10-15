@@ -112,6 +112,27 @@ export async function ciTestPlan(
   };
 }
 
+/** The website-tests.ts calls a non-full plan makes, in order, as their arguments. */
+export function websiteRuns(plan: CiTestPlan): string[][] {
+  // website-tests.ts retries a crashed browser run only for a lone `--project browser`
+  // (or no filters at all), so the projects run apart unless the whole suite is wanted.
+  if (plan.websiteUnit === "all" && plan.websiteBrowser) return [[]];
+  const runs: string[][] = [];
+  if (plan.websiteUnit !== "none")
+    runs.push([
+      "--project",
+      "unit",
+      "--passWithNoTests",
+      ...(plan.websiteUnit === "changed" ? [`--changed=${plan.baseline!.commit}`] : []),
+    ]);
+  // Vitest ANDs positional filters with `--changed`, so files chosen by name run apart,
+  // without `--passWithNoTests`.
+  if (plan.websiteUnit !== "all" && plan.websiteFiles.length)
+    runs.push(["--project", "unit", ...plan.websiteFiles]);
+  if (plan.websiteBrowser) runs.push(["--project", "browser"]);
+  return runs;
+}
+
 function manifestName(root: string, label: string): string {
   const workspace = Object.entries(labels).find(([, value]) => value === label)![0];
   return JSON.parse(readFileSync(join(root, workspace, "package.json"), "utf8")).name;
@@ -129,26 +150,8 @@ if (import.meta.main) {
     } else {
       for (const label of plan.workspaces)
         run("vp", ["run", "--no-cache", `${manifestName(root, label)}#test`]);
-      const website = join(root, "apps/website");
-      const tests = (args: string[]) =>
-        run("node", ["../../tools/agent/website-tests.ts", ...args], website);
-      // website-tests.ts retries a crashed browser run only for a lone `--project browser`
-      // (or no filters at all), so the projects run apart unless the whole suite is wanted.
-      if (plan.websiteUnit === "all" && plan.websiteBrowser) tests([]);
-      else {
-        if (plan.websiteUnit !== "none")
-          tests([
-            "--project",
-            "unit",
-            "--passWithNoTests",
-            ...(plan.websiteUnit === "changed" ? [`--changed=${plan.baseline!.commit}`] : []),
-          ]);
-        // Vitest ANDs positional filters with `--changed`, so files chosen by name run apart,
-        // without `--passWithNoTests`: a missing file fails.
-        if (plan.websiteUnit !== "all" && plan.websiteFiles.length)
-          tests(["--project", "unit", ...plan.websiteFiles]);
-        if (plan.websiteBrowser) tests(["--project", "browser"]);
-      }
+      for (const args of websiteRuns(plan))
+        run("node", ["../../tools/agent/website-tests.ts", ...args], join(root, "apps/website"));
     }
   }
 }

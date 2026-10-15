@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { ciTestPlan, websiteRunnerFiles } from "./ci-test.ts";
+import { ciTestPlan, websiteRunnerFiles, websiteRuns, type CiTestPlan } from "./ci-test.ts";
 import { websiteTestSelection } from "./ready-plan.ts";
 
 const exec = promisify(execFile);
@@ -256,4 +256,41 @@ await test("the website README, which a unit test reads, runs the changed unit t
     assert.deepEqual(selected.websiteFiles, ["worker/ci/fake.test.ts"]);
     assert.equal(selected.websiteBrowser, false);
   });
+});
+
+await test("the runner turns a website selection into website-tests.ts calls", () => {
+  const plan = (over: Partial<CiTestPlan>): CiTestPlan => ({
+    full: false,
+    baseline: { commit: "b".repeat(40), runNumber: 1, jobId: "job" },
+    changed: [],
+    reasons: [],
+    workspaces: [],
+    websiteUnit: "none",
+    websiteFiles: [],
+    websiteBrowser: false,
+    ...over,
+  });
+  assert.deepEqual(websiteRuns(plan({})), []);
+  assert.deepEqual(websiteRuns(plan({ websiteUnit: "all", websiteBrowser: true })), [[]]);
+  assert.deepEqual(websiteRuns(plan({ websiteUnit: "changed", websiteBrowser: true })), [
+    ["--project", "unit", "--passWithNoTests", `--changed=${"b".repeat(40)}`],
+    ["--project", "browser"],
+  ]);
+  // A README change: its readers run by name, apart from (and not narrowed by) --changed.
+  assert.deepEqual(
+    websiteRuns(plan({ websiteUnit: "changed", websiteFiles: ["worker/ci/config.test.ts"] })),
+    [
+      ["--project", "unit", "--passWithNoTests", `--changed=${"b".repeat(40)}`],
+      ["--project", "unit", "worker/ci/config.test.ts"],
+    ],
+  );
+  assert.deepEqual(
+    websiteRuns(plan({ websiteUnit: "none", websiteFiles: ["worker/ci/config.test.ts"] })),
+    [["--project", "unit", "worker/ci/config.test.ts"]],
+  );
+  // The whole unit project already includes them.
+  assert.deepEqual(
+    websiteRuns(plan({ websiteUnit: "all", websiteFiles: ["worker/ci/config.test.ts"] })),
+    [["--project", "unit", "--passWithNoTests"]],
+  );
 });

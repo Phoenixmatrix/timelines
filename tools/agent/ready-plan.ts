@@ -425,7 +425,8 @@ function websiteConfig(path: string): boolean {
  */
 export function readmeTests(root: string): string[] {
   const found: string[] = [];
-  for (const dir of ["worker", "registry", "src", "shared"]) {
+  // The unit project's roots (vite.config.ts `include`); it runs `*.test.ts` only.
+  for (const dir of ["worker", "registry", "src", "shared", "vite"]) {
     let entries: string[];
     try {
       entries = readdirSync(join(root, WEBSITE, dir), { recursive: true, encoding: "utf8" });
@@ -433,7 +434,7 @@ export function readmeTests(root: string): string[] {
       continue;
     }
     for (const entry of entries) {
-      if (!/\.test\.tsx?$/.test(entry) || entry.endsWith(".browser.test.tsx")) continue;
+      if (!entry.endsWith(".test.ts")) continue;
       if (entry.split("/").includes("node_modules")) continue;
       const path = `${dir}/${entry}`;
       try {
