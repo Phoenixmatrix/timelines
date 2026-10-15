@@ -266,16 +266,20 @@ commit trailers, not verified account identities.
 `GET /api/repos/:space/:name/history` accepts `at=<ref>/<path>` or `ref` and
 `path`, plus `entries=true` for immediate-child metadata. Each request scans at
 most 100 commits, except with `cover=1` (with `entries=true`): then it scans on,
-within 1000 commits and 1.5 s, until every entry and the path itself have their
-latest change, and stops at that commit (from a cursor, after at least 100).
+up to 1000 commits of its own, until every entry and the path itself have their
+latest change, and stops at that commit (from a cursor, after at least 100). The
+budget is a commit count, so a request always stops at the same commit; only a
+5 s safety stop, or a missing parent commit or tree, ends one early, and such an
+answer is neither cached nor kept.
 `next` is the next commit to scan; pass it as `cursor` and pin `ref` to the
 returned `head` for subsequent pages. The file list loads this separately from
 files with `cover=1`, and follows pages until every displayed file and folder has
 its latest change, then stops: usually after the first. One scan serves the whole
-directory, not a request per row. Each commit's changes at a path and a complete
-cover answer from a commit are cached by commit (memory, then the Cache API), so a
-newer head scans back only to the newest commit with a cached answer; immutable
-history pages and commit/tree objects are reused. Older pages never replace a
+directory, not a request per row. Each commit's changes at a path, each cover
+answer from a head (complete or ended by the budget) and each cover page from a
+cursor are kept (memory, then the Cache API), so a newer head scans back only to
+the newest commit with a kept answer, takes its range and scans on from its
+`next` if needed; immutable history pages and commit/tree objects are reused. Older pages never replace a
 newer last-change message. Pending rows say **Finding last change…**; a failed
 page preserves resolved rows and offers **Retry history**. Leaving the directory
 stops further pagination. Until history is complete, the folder's **History** link

@@ -3,6 +3,8 @@ import { describe, expect, test } from "vite-plus/test";
 import type { HistoryPage } from "../../shared/api.ts";
 import {
   CHANGES,
+  CHUNK,
+  COVER_PAGES,
   commitSummary,
   derivedId,
   HISTORY_PAGE_SIZE,
@@ -274,7 +276,7 @@ function reference(
 
 /** What the client receives: JSON, with the server-only flag aside. */
 const plain = (page: Omit<HistoryPage, "ref"> | HistoryRead) => {
-  const { cut: _cut, ...rest } = page as HistoryRead;
+  const { stopped: _stopped, ...rest } = page as HistoryRead;
   return JSON.parse(JSON.stringify(rest)) as Omit<HistoryPage, "ref">;
 };
 
@@ -389,7 +391,7 @@ describe("a directory's last changes in one request (CORE-451)", () => {
           cover: true,
         });
         expect(plain(cover), `path "${path}"`).toEqual(expected(head));
-        expect(cover.cut).toBeUndefined();
+        expect(cover.stopped).toBeUndefined();
         expect(f.derived.has(`${LAST_CHANGES}/${derivedId(`c${head}`, path)}`)).toBe(true);
         // A stored answer reads back the same.
         f.stores.length = 0;
@@ -411,7 +413,8 @@ describe("a directory's last changes in one request (CORE-451)", () => {
           ),
         ).toEqual(paged);
 
-        for (const distance of [1, 2, 7, 31, 40, 150]) {
+        // 101: the first commit of the walk's second chunk.
+        for (const distance of [1, 2, 7, 31, 40, 101, 150]) {
           const g = fixture(trees, roots);
           const base = head - distance;
           await readHistory(g.reader, `c${base}`, path, true, `c${base}`, { cover: true });
@@ -434,9 +437,97 @@ describe("a directory's last changes in one request (CORE-451)", () => {
             plain(await readHistory(g.reader, `c${head}`, path, true, `c${head}`, { cover: true })),
           ).toEqual(expected(head));
         }
+
+        // A base its budget cut short: the head takes its range, then walks on from its `next`.
+        for (const distance of [1, 7, 40, 101]) {
+          const g = fixture(trees, roots);
+          const base = head - distance;
+          const partial = await readHistory(g.reader, `c${base}`, path, true, `c${base}`, {
+            cover: true,
+            budget: 15,
+          });
+          expect(partial.stopped).toBeUndefined();
+          expect(g.derived.has(`${LAST_CHANGES}/${derivedId(`c${base}`, path)}`)).toBe(true);
+          const merged = await readHistory(g.reader, `c${head}`, path, true, `c${head}`, {
+            cover: true,
+          });
+          expect(plain(merged), `path "${path}", cut base ${distance} back`).toEqual(
+            expected(head),
+          );
+        }
       }
     });
   }
+
+  test("keys keep paths apart, dot segments included", () => {
+    const key = (path: string) =>
+      new URL(`https://objects.test/repo/${CHANGES}/${derivedId("c1", path)}`).pathname;
+    expect(new Set(["", ".", "..", "a/..", "a%2F"].map(key)).size).toBe(5);
+    expect(key("..")).toBe(`/repo/${CHANGES}/v2/c1/p=..`);
+  });
+
+  test("a long walk holds only one chunk's trees at a time", async () => {
+    const { trees, roots } = history(
+      Array.from(
+        { length: 1000 },
+        (_, n) =>
+          new Map([
+            ["LICENSE", { mode: "100644", content: "mit" }],
+            ["counter", { mode: "100644", content: String(n) }],
+          ]),
+      ),
+    );
+    const g = fixture(trees, roots);
+    const held: number[] = [];
+    const answer = await readHistory(g.reader, "c999", "", true, "c999", {
+      cover: true,
+      trace: (size) => held.push(size),
+    });
+    expect(answer).toMatchObject({ scanned: 1000, next: null });
+    expect(held.length).toBeGreaterThanOrEqual(5);
+    expect(Math.max(...held)).toBeLessThanOrEqual(CHUNK + 2);
+  });
+
+  test("a missing tree ends a cover answer above it, unkept; plain pages fail", async () => {
+    const { trees, roots } = history(
+      Array.from(
+        { length: 20 },
+        (_, n) =>
+          new Map([
+            ["LICENSE", { mode: "100644", content: "mit" }],
+            ["counter", { mode: "100644", content: String(n) }],
+          ]),
+      ),
+    );
+    delete trees[roots[10]!];
+    const g = fixture(trees, roots);
+    // c11 can't be compared with c10, whose tree is gone.
+    const first = await readHistory(g.reader, "c19", "", true, "c19", { cover: true });
+    expect(first).toMatchObject({ stopped: true, scanned: 8, next: "c11" });
+    expect([...g.derived.keys()].filter((key) => key.startsWith(`${LAST_CHANGES}/`))).toEqual([]);
+    await expect(readHistory(g.reader, "c19", "", true)).rejects.toThrow("a tree is unavailable");
+
+    // A tree missing on the way to a nested path.
+    const nested = history(
+      Array.from(
+        { length: 20 },
+        (_, n) =>
+          new Map([
+            ["src/lib/stale", { mode: "100644", content: "0" }],
+            ["src/lib/counter", { mode: "100644", content: String(n) }],
+          ]),
+      ),
+    );
+    const src = nested.trees[nested.roots[10]!]!.find((entry) => entry.name === "src")!.hash;
+    delete nested.trees[src];
+    const h = fixture(nested.trees, nested.roots);
+    expect(
+      await readHistory(h.reader, "c19", "src/lib", true, "c19", { cover: true, budget: 20 }),
+    ).toMatchObject({ stopped: true, scanned: 8, next: "c11" });
+    await expect(readHistory(h.reader, "c19", "src/lib", false)).rejects.toThrow(
+      "a tree is unavailable",
+    );
+  });
 
   test("a name missing at the base keeps its older changes; special names survive storage", async () => {
     const f = (content: string, mode = "100644") => ({ mode, content });
@@ -473,9 +564,9 @@ describe("a directory's last changes in one request (CORE-451)", () => {
     g.commits[10]!.parents = ["missing"];
     const first = await readHistory(g.reader, "c19", "", true, "c19", { cover: true });
     // c10 can't be compared with its parent: the answer ends above it.
-    expect(first).toMatchObject({ cut: true, scanned: 9, next: "c10" });
+    expect(first).toMatchObject({ stopped: true, scanned: 9, next: "c10" });
     const intact = fixture(trees, roots);
-    const sameRange = { cover: true, budget: { commits: 9, ms: 1e9 } };
+    const sameRange = { cover: true, budget: 9 };
     expect(plain(first)).toEqual(
       plain(await readHistory(intact.reader, "c19", "", true, "c19", sameRange)),
     );
@@ -501,33 +592,53 @@ describe("a directory's last changes in one request (CORE-451)", () => {
     }
   });
 
-  test("a walk its budget cuts short says so, stores nothing, and pages on exactly", async () => {
+  test("a budget-cut answer is exact, kept and reused; pages on from it are kept too", async () => {
     const { trees, roots } = history(randomStates(5, 150));
-    for (const options of [
-      { cover: true, budget: { commits: 10, ms: 1e9 } },
-      {
-        cover: true,
-        budget: { commits: 1e9, ms: 500 },
-        now: (
-          (t) => () =>
-            (t += 1000)
-        )(0),
-      },
-    ]) {
-      const g = fixture(trees, roots);
-      const first = await readHistory(g.reader, "c149", "", true, "c149", options);
-      expect(first.cut).toBe(true);
-      expect(first.next).not.toBeNull();
-      expect(first.scanned).toBe(options.budget.commits === 10 ? 10 : HISTORY_PAGE_SIZE + 1);
-      expect([...g.derived.keys()].filter((key) => key.startsWith(`${LAST_CHANGES}/`))).toEqual([]);
-      // The client pages on with cover from the cursor.
-      let merged = plain(first);
-      for (let next = first.next; next;) {
-        const page = await readHistory(g.reader, "c149", "", true, next, { cover: true });
+    const g = fixture(trees, roots);
+    const options = { cover: true, budget: 10 };
+    const first = await readHistory(g.reader, "c149", "", true, "c149", options);
+    expect(first).toMatchObject({ scanned: 10, next: "c139" });
+    expect(first.stopped).toBeUndefined();
+    expect(g.derived.has(`${LAST_CHANGES}/${derivedId("c149", "")}`)).toBe(true);
+    const pageOn = async () => {
+      let merged = plain(await readHistory(g.reader, "c149", "", true, "c149", options));
+      for (let next = merged.next; next;) {
+        const page = await readHistory(g.reader, "c149", "", true, next, options);
+        expect(page.stopped).toBeUndefined();
         merged = merge(merged, page);
         next = page.next;
       }
-      expect(merged).toEqual(reference(trees, g.commits, "")(149));
+      return merged;
+    };
+    expect(await pageOn()).toEqual(reference(trees, g.commits, "")(149));
+    expect([...g.derived.keys()].some((key) => key.startsWith(`${COVER_PAGES}/`))).toBe(true);
+    // The same requests again: every answer comes back kept, nothing is worked out.
+    g.stores.length = 0;
+    expect(await pageOn()).toEqual(reference(trees, g.commits, "")(149));
+    expect(g.stores).toEqual([]);
+  });
+
+  test("a safety stop answers what it has, unkept, and paging on still adds up", async () => {
+    const { trees, roots } = history(randomStates(5, 150));
+    const g = fixture(trees, roots);
+    let clock = 0;
+    const first = await readHistory(g.reader, "c149", "", true, "c149", {
+      cover: true,
+      safetyMs: 500,
+      now: () => (clock += 1000),
+    });
+    expect(first).toMatchObject({ stopped: true, scanned: HISTORY_PAGE_SIZE + 1 });
+    expect(
+      [...g.derived.keys()].filter(
+        (key) => key.startsWith(`${LAST_CHANGES}/`) || key.startsWith(`${COVER_PAGES}/`),
+      ),
+    ).toEqual([]);
+    let merged = plain(first);
+    for (let next = first.next; next;) {
+      const page = await readHistory(g.reader, "c149", "", true, next, { cover: true });
+      merged = merge(merged, page);
+      next = page.next;
     }
+    expect(merged).toEqual(reference(trees, g.commits, "")(149));
   });
 });
