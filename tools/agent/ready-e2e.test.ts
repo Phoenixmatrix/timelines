@@ -560,6 +560,20 @@ await test("every scenario declares the shared resources it reads or writes", ()
       "source-retention-expiry-orphan-and-canonical-purge",
     ],
   );
+  // The long CI slot holders found in e2e.ts and its helpers: one at a time, so
+  // the other runner slots (one at two workers, two from three) stay free.
+  assert.deepEqual(
+    e2eScenarioNames.filter((name) => scenarioResources[name]["ci-runner-hold"]),
+    [
+      "ci-cancellation-and-job-token-lifetime",
+      "queue-concurrency-failure-fencing-and-push-recovery",
+      "repository-deletion-purges-everything-and-resumes",
+      "source-retention-expiry-orphan-and-canonical-purge",
+    ],
+  );
+  for (const name of e2eScenarioNames)
+    if (scenarioResources[name]["ci-runner-hold"])
+      assert.equal(scenarioResources[name]["ci-runner-hold"], "write", name);
   assert.equal(browserScenarios.length, 12);
 });
 
@@ -679,7 +693,7 @@ await test("four workers more than halve the suite over its historical scenario 
     const serial = selected.reduce((sum, name) => sum + seconds[name], 0);
     assert.equal(makespan(selected, 1, seconds), serial, "One worker is the serial suite");
     const parallel = makespan(selected, 4, seconds);
-    // Measured with these declarations: 1249 → 595 s (full), 405 → 222 s (agents').
+    // Measured with these declarations: 1249 → 591 s (full), 405 → 222 s (agents').
     assert(parallel < serial * 0.6, `${parallel} s of ${serial} s`);
   }
   // Nothing shared: the longest scenario bounds the run.

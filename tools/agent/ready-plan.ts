@@ -131,7 +131,7 @@ function fullGates(): ReadyPlan["gates"] {
   ];
 }
 
-function documentation(path: string): boolean {
+export function documentation(path: string): boolean {
   // Only human-facing documents at known names (nothing builds from or reads them); an unknown
   // root file, assets and nested Markdown can be runtime inputs.
   return (
@@ -145,7 +145,7 @@ function documentation(path: string): boolean {
   );
 }
 
-function agentConfig(path: string): boolean {
+export function agentConfig(path: string): boolean {
   // Coding agents' instructions, subagents, skills and harness settings: nothing builds from or
   // tests them, and the mandatory root check still formats and lints them. Scripts and hooks
   // beside them are not covered.

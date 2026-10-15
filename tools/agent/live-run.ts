@@ -2,6 +2,8 @@
 // setup overlaps the gates, what a failure of either means, how cleanup runs, and when the
 // seed's idempotency check is worth its time. main.ts supplies the real steps; tests fake them.
 
+import { agentConfig, documentation } from "./ready-plan.ts";
+
 /** Either environment limit (installation quota or machine maximum), as main-e2e.ts detects them. */
 export function isEnvironmentLimitRefusal(error: unknown): boolean {
   const text =
@@ -19,13 +21,19 @@ export function isEnvironmentLimitRefusal(error: unknown): boolean {
 export interface OverlapSteps<S> {
   /** Runs every selected gate in order; rejects with the first gate failure. */
   runGates(): Promise<void>;
-  /** Prepare through seed. Resolves to its state even when a step failed (see `setupFailure`). */
-  startLive(): Promise<S>;
+  /**
+   * Prepare through seed. Resolves to its state even when a step failed (see `setupFailure`).
+   * Aborting `signal` kills the step in flight, so the setup settles soon after.
+   */
+  startLive(signal?: AbortSignal): Promise<S>;
   /** The error a started setup ended with, if any. */
   setupFailure(setup: S): unknown;
   /** Scenarios, shutdown, cleanup and completion. `overlapped` is false for a sequential run. */
   finishLive(setup: S, overlapped: boolean): Promise<void>;
-  /** Stops and destroys what a started setup created, without running scenarios. */
+  /**
+   * Stops what an aborted setup started and hands its environment to cleanup (the detached
+   * one unless cleanup runs in the foreground), without running scenarios.
+   */
   abortLive(setup: S): Promise<void>;
 }
 
@@ -37,29 +45,44 @@ export interface OverlapOutcome {
 }
 
 /**
- * Starts the live setup before the gates and joins the two. A gate failure tears the setup
- * down and throws the gate error (with the setup's own error beside it); a setup failure
- * with passing gates is the live run's failure; a quota refusal is not a failure, because
- * the gates were the extra load: the setup is simply repeated after them.
+ * Starts the live setup before the gates and joins the two. A gate failure aborts the setup,
+ * hands whatever it provisioned to cleanup and throws the gate error at once (with the setup's
+ * own error beside it if the setup had already failed); a setup failure with passing gates is
+ * the live run's failure; a quota refusal is not a failure, because the gates were the extra
+ * load: the setup is simply repeated after them.
  */
 export async function overlapSetup<S>(steps: OverlapSteps<S>): Promise<OverlapOutcome> {
+  const controller = new AbortController();
+  // Whether the setup ended on its own; an error after the abort is the abort's doing.
+  let settledBeforeAbort = false;
+  const settle = () => {
+    settledBeforeAbort = !controller.signal.aborted;
+  };
   // Attached before anything awaits, so a setup that fails during the gates never goes unhandled.
-  const setup = steps.startLive().then(
-    (state) => ({ state }) as { state: S; error?: undefined },
-    (error: unknown) => ({ state: undefined, error }) as { state: undefined; error: unknown },
+  const setup = steps.startLive(controller.signal).then(
+    (state): { state: S; error?: undefined } => {
+      settle();
+      return { state };
+    },
+    (error: unknown): { state: undefined; error: unknown } => {
+      settle();
+      return { state: undefined, error };
+    },
   );
   let gateFailure: { error: unknown } | undefined;
   try {
     await steps.runGates();
   } catch (error) {
     gateFailure = { error };
+    // Fail fast: kill the setup's step in flight rather than wait for the rest of the setup.
+    controller.abort(new Error("A gate failed; the live E2E setup was aborted."));
   }
   const settled = await setup;
   const state = settled.state;
   const error = state === undefined ? settled.error : steps.setupFailure(state);
   if (gateFailure) {
     const errors: unknown[] = [gateFailure.error];
-    if (error !== undefined) errors.push(error);
+    if (error !== undefined && settledBeforeAbort) errors.push(error);
     if (state !== undefined) {
       try {
         await steps.abortLive(state);
@@ -94,16 +117,21 @@ export function gatesWriteBindingTypes(gates: readonly { name: string }[]): bool
 }
 
 /**
- * Seed-related paths: the second seed run exists to prove the bootstrap repeatable
- * against real data, which only a change to the bootstrap or its fixtures can break.
+ * Whether the seed's second run is worth its time. It proves the bootstrap repeatable against
+ * real data, through /dev/seed, /dev/tokens, the tracker's operationId dedup and gm clone,
+ * commit and push, so most changes can break it. It is skipped only when every changed path
+ * cannot reach it: the website's frontend (apps/website/src/, but not its testing helpers),
+ * a test file, or documentation or coding-agent configuration as ready-plan defines them.
  */
-export function seedPathsChanged(changed: readonly string[]): boolean {
+export function seedMayBeAffected(changed: readonly string[]): boolean {
   return changed.some(
     (path) =>
-      path === "tools/agent/seed.ts" ||
-      path === "tools/agent/content-fixtures.ts" ||
-      path.startsWith("tools/agent/fixtures/") ||
-      path.startsWith("apps/website/seed/"),
+      !(
+        (path.startsWith("apps/website/src/") && !path.startsWith("apps/website/src/testing/")) ||
+        /\.test\.tsx?$/.test(path) ||
+        documentation(path) ||
+        agentConfig(path)
+      ),
   );
 }
 

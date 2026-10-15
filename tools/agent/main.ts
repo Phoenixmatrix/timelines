@@ -15,6 +15,7 @@ import {
   destroyExclusively,
   listEnvironments,
   loadEnvironment,
+  markDeleting,
   markServer,
   privateJson,
   redact,
@@ -37,7 +38,7 @@ import {
   cleanupMode,
   gatesWriteBindingTypes,
   overlapSetup,
-  seedPathsChanged,
+  seedMayBeAffected,
   type CleanupMode,
 } from "./live-run.ts";
 import { runE2E } from "./e2e.ts";
@@ -139,7 +140,8 @@ Canonical source publication uses ordinary gm outside 'agent gm'. Never point te
 async function prepare({
   skipTypes = false,
   overlapped = false,
-}: { skipTypes?: boolean; overlapped?: boolean } = {}): Promise<void> {
+  signal,
+}: { skipTypes?: boolean; overlapped?: boolean; signal?: AbortSignal } = {}): Promise<void> {
   await installMaintenance();
   console.log(JSON.stringify({ event: "prepare", step: "gm-build" }));
   const target = process.env.CARGO_TARGET_DIR
@@ -153,6 +155,7 @@ async function prepare({
       // Beside the gates, cli-check (clippy) contends for the target-dir lock: wait as long as a gate may.
       timeout: overlapped ? 1_800_000 : 900_000,
       log: join(root, ".gitmatrix-agent", "artifacts", "cargo-build.log"),
+      signal,
     },
   );
   const scopedTarget = join(root, "apps/cli/target");
@@ -167,13 +170,15 @@ async function prepare({
     }
   }
   // A gate of the same run (website-types, bindings) regenerates .cloudflare/types; two writers race.
-  if (!skipTypes) await command("cf", ["workers", "types"], { cwd: website });
+  if (!skipTypes) await command("cf", ["workers", "types"], { cwd: website, signal });
   // Every scenario launches headless, which Playwright serves from the headless
   // shell; full Chromium (~400 MB a revision) is only for headed or channel launches.
   await command("vp", ["exec", "playwright", "install", "--only-shell", "chromium"], {
     cwd: join(root, "tools/agent"),
     timeout: 300_000,
+    signal,
   });
+  signal?.throwIfAborted();
   // Fail before provisioning if the shell or its system dependencies are unavailable,
   // exercising the emulation the browser scenarios rely on.
   const browser = await chromium.launch({ headless: true });
@@ -197,7 +202,7 @@ async function prepare({
   }
 }
 
-async function migrate(env: Environment): Promise<void> {
+async function migrate(env: Environment, signal?: AbortSignal): Promise<void> {
   for (const [id, directory] of [
     ["00000000000000000000000000000000", "migrations"],
     ["00000000000000000000000000000001", "registry/migrations"],
@@ -215,11 +220,11 @@ async function migrate(env: Environment): Promise<void> {
         "--dir",
         directory!,
       ],
-      { cwd: website },
+      { cwd: website, signal },
     );
 }
 
-async function seedDatabase(env: Environment): Promise<void> {
+async function seedDatabase(env: Environment, signal?: AbortSignal): Promise<void> {
   // The authenticated readiness request completes real canonical-v4 bootstrap.
   // Never apply persona SQL to a legacy or not-yet-initialized installation.
   if (!(await identity(env)))
@@ -241,7 +246,7 @@ async function seedDatabase(env: Environment): Promise<void> {
       "--dir",
       "seed",
     ],
-    { cwd: website },
+    { cwd: website, signal },
   );
 }
 
@@ -341,9 +346,11 @@ interface EnvironmentSupervisor {
   close(): Promise<void>;
 }
 
+/** Stops the owned server on SIGINT, SIGTERM, expiry or an abort of `signal`. */
 function superviseEnvironment(
   env: Environment,
   stopOwned: () => Promise<void> = () => stopEnvironment(env),
+  signal?: AbortSignal,
 ): EnvironmentSupervisor {
   let interrupted = false;
   let stopping: Promise<void> | undefined;
@@ -356,6 +363,8 @@ function superviseEnvironment(
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
+  if (signal?.aborted) stop();
+  else signal?.addEventListener("abort", stop, { once: true });
   const expiry = setTimeout(stop, Math.max(1, env.expires - Date.now()));
   return {
     assertRunning() {
@@ -366,6 +375,7 @@ function superviseEnvironment(
       await stopping;
       process.off("SIGINT", stop);
       process.off("SIGTERM", stop);
+      signal?.removeEventListener("abort", stop);
       if (stopFailure) throw stopFailure;
     },
   };
@@ -489,11 +499,13 @@ interface LiveOptions {
   skipTypes?: boolean;
   /** Setup runs beside the gates, so the cargo build may wait on a target-dir lock. */
   overlapped?: boolean;
-  /** Run the seed's idempotency check (always, except when only unrelated paths changed). */
+  /** Run the seed's idempotency check (always, unless every changed path cannot reach the seed). */
   repeatSeed: boolean;
   cleanup: CleanupMode;
   /** The setup is a repeat after the environment quota refused the overlapped one. */
   quotaFallback?: boolean;
+  /** Aborted when a gate fails during an overlapped setup: kills the step in flight. */
+  signal?: AbortSignal;
 }
 
 interface LiveState extends LiveOptions {
@@ -537,9 +549,12 @@ async function liveTest(
   );
 }
 
-/** Prepare, provision, migrate, start and seed. Never rejects: a failure is kept for finishLive. */
+/**
+ * Prepare, provision, migrate, start and seed. Never rejects: a failure is kept for finishLive.
+ * An abort of `options.signal` kills the step in flight and ends the setup with its reason.
+ */
 async function startLive(options: LiveOptions): Promise<LiveState> {
-  const { ai } = options;
+  const { ai, signal } = options;
   const started = Date.now();
   const timings: LiveState["timings"] = [];
   const state: LiveState = {
@@ -569,29 +584,42 @@ async function startLive(options: LiveOptions): Promise<LiveState> {
   const { timed } = state;
   try {
     await timed("prepare", () =>
-      prepare({ skipTypes: options.skipTypes, overlapped: options.overlapped }),
+      prepare({ skipTypes: options.skipTypes, overlapped: options.overlapped, signal }),
     );
+    signal?.throwIfAborted();
+    // Not interruptible: a failed provisioning destroys what it made in the foreground, and the
+    // remote calls take seconds. Whatever it made is torn down with the rest after an abort.
     const env = (state.env = await timed("provision", () => createEnvironment(root, true, ai)));
+    signal?.throwIfAborted();
     const ctx = (state.ctx = await context(env));
     // Atlas settings per owning account: the degraded providers test-ai verifies.
     if (ai) ctx.env.GITMATRIX_ATLAS_CONFIG = JSON.stringify(ATLAS_PROVIDER_CONFIG);
     state.artifacts = ctx.artifacts;
-    const supervisor = (state.supervisor = superviseEnvironment(env));
-    await timed("migrate", () => migrate(env));
-    await timed("start", () => start(env, ctx));
+    // An abort stops the server too, so the readiness wait and the seed's requests end at once.
+    const supervisor = (state.supervisor = superviseEnvironment(env, undefined, signal));
+    await timed("migrate", () => migrate(env, signal));
+    supervisor.assertRunning();
+    await timed("start", () =>
+      start(env, ctx, { assertRunning: () => supervisor.assertRunning(), spawned: () => {} }),
+    );
     supervisor.assertRunning();
     state.fixtures = await timed("seed", async () => {
-      await seedDatabase(env);
+      await seedDatabase(env, signal);
       supervisor.assertRunning();
       const fixtures = await seed(ctx);
       // Bootstrap remains repeatable against real data. The second run only guards the
-      // seed's own idempotency, so ready skips it unless seed-related paths changed.
-      if (!ai && options.repeatSeed) await seed(ctx);
+      // seed's own idempotency, so ready skips it when no changed path can reach the seed.
+      if (!ai && options.repeatSeed) {
+        supervisor.assertRunning();
+        await seed(ctx);
+      }
       return fixtures;
     });
   } catch (error) {
-    state.setupFailure = error;
-    state.failures.push(error);
+    // After an abort, whatever failed did so because of it: report the abort.
+    const failure = signal?.aborted ? signal.reason : error;
+    state.setupFailure = failure;
+    state.failures.push(failure);
   }
   return state;
 }
@@ -623,8 +651,9 @@ async function teardownLive(state: LiveState, mode: CleanupMode): Promise<void> 
 
 /**
  * Destroys the environment in a detached child so the result is not held for the 11-48 s of
- * remote deletions. The journal keeps the environment owned until the child finishes, and the
- * hourly janitor retries a child that died.
+ * remote deletions. The server is already stopped; the journal is marked "deleting" before the
+ * spawn, so a child that dies at any point leaves it to the next sweep (the hourly janitor's,
+ * or any setup's on this machine), which finishes the destroy.
  */
 async function startBackgroundCleanup(state: LiveState, env: Environment): Promise<boolean> {
   const log = join(state.artifacts, "cleanup.log");
@@ -635,6 +664,7 @@ async function startBackgroundCleanup(state: LiveState, env: Environment): Promi
       script: fileURLToPath(import.meta.url),
       id: env.id,
     });
+    await markDeleting(env);
     await mkdir(state.artifacts, { recursive: true, mode: 0o700 });
     const descriptor = openSync(log, "a", 0o600);
     try {
@@ -663,9 +693,12 @@ async function startBackgroundCleanup(state: LiveState, env: Environment): Promi
   }
 }
 
-/** A gate failed while the setup was running: leave nothing behind and write no verdict. */
+/**
+ * A gate failed while the setup was running: stop it and hand the environment to cleanup (the
+ * detached one, unless this run cleans up in the foreground), writing no verdict.
+ */
 async function abortLive(state: LiveState): Promise<void> {
-  await teardownLive(state, "foreground");
+  await teardownLive(state, state.cleanup);
   const teardown = state.failures.slice(state.setupFailure === undefined ? 0 : 1);
   if (teardown.length) throw new AggregateError(teardown, "Live E2E teardown failed");
 }
@@ -971,7 +1004,7 @@ async function gates(options: ReadyOptions, foregroundCleanup = false): Promise<
       let attempt = 0;
       overlap = await overlapSetup<LiveState>({
         runGates,
-        startLive: async () =>
+        startLive: async (signal) =>
           (live = await startLive({
             ai: false,
             readyE2E: liveE2E,
@@ -979,13 +1012,15 @@ async function gates(options: ReadyOptions, foregroundCleanup = false): Promise<
             skipTypes: ++attempt === 1 && gatesWriteBindingTypes(gatesToRun),
             overlapped: attempt === 1,
             quotaFallback: attempt > 1,
-            // The repeat seed guards the bootstrap itself: an unreliable change list keeps it.
-            repeatSeed: plan.e2eAll || plan.full || seedPathsChanged(plan.changed),
+            // The repeat seed guards the bootstrap, which most paths reach; an unreliable
+            // change list keeps it.
+            repeatSeed: plan.e2eAll || plan.full || seedMayBeAffected(plan.changed),
             cleanup: cleanupMode({
               ready: true,
               foregroundFlag: foregroundCleanup,
               hosted: process.env.GITMATRIX_REMOTE_HOSTED === "1",
             }),
+            ...(signal ? { signal } : {}),
           })),
         setupFailure: (state) => state.setupFailure,
         finishLive: (state, overlapped) => finishLive(state, overlapped),

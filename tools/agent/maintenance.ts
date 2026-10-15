@@ -8,6 +8,19 @@ const unitName = "gitmatrix-agent-cleanup";
 const unitDirectory = join(homedir(), ".config", "systemd", "user");
 
 /** Install outside the worktree: cleanup still runs after a worktree is removed. */
+/**
+ * What the hourly janitor runs, copied out of the worktree that installs it. Every
+ * `setup` reinstalls it, so these files' runtime imports must stay within this list
+ * (maintenance.test.ts checks).
+ */
+export const JANITOR_FILES = [
+  "quota.ts",
+  "reservations.ts",
+  "heavy.ts",
+  "cloudflare-delete.ts",
+  "environment.ts",
+] as const;
+
 export async function installMaintenance(): Promise<void> {
   // The hosted container's absolute lifetime is enforced by its owning DO alarm.
   if (process.env.GITMATRIX_REMOTE_HOSTED === "1") return;
@@ -41,13 +54,7 @@ export async function installMaintenance(): Promise<void> {
     if ((await realpath(executable)).startsWith(`${checkout}/`))
       throw new Error("Scheduled cleanup requires Node, cf and gm installed outside the worktree.");
   }
-  for (const name of [
-    "quota.ts",
-    "reservations.ts",
-    "heavy.ts",
-    "cloudflare-delete.ts",
-    "environment.ts",
-  ]) {
+  for (const name of JANITOR_FILES) {
     const temporary = join(registry, `${name}.${process.pid}.tmp`);
     await copyFile(join(source, name), temporary);
     await rename(temporary, join(registry, name));

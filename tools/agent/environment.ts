@@ -17,7 +17,6 @@ import {
 } from "./quota.ts";
 import type { QuotaReservation } from "./quota.ts";
 import { prunable, sweepReservations } from "./reservations.ts";
-import { e2eWorkers } from "./ready-e2e.ts";
 
 const TTL = 24 * 60 * 60 * 1000;
 const ID = /^gma-[a-z0-9]{8,10}-[a-f0-9]{12}$/;
@@ -164,8 +163,11 @@ export async function command(
     env?: NodeJS.ProcessEnv;
     timeout?: number;
     log?: string;
+    /** Aborting kills the command as an interrupt does. */
+    signal?: AbortSignal;
   } = {},
 ): Promise<string> {
+  options.signal?.throwIfAborted();
   const childEnv: NodeJS.ProcessEnv = { ...(options.env ?? process.env), NO_COLOR: "1" };
   if (childEnv.GITMATRIX_REMOTE_HOSTED === "1") {
     const channel = childEnv.GITMATRIX_REMOTE_CREDENTIALS_FILE;
@@ -234,6 +236,7 @@ export async function command(
       };
       process.once("SIGINT", interrupt);
       process.once("SIGTERM", interrupt);
+      options.signal?.addEventListener("abort", interrupt, { once: true });
       const timer = setTimeout(interrupt, options.timeout ?? 120_000);
       const collect = (chunk: Buffer, standard: boolean) => {
         if (output.length + chunk.length > 16 * 1024 * 1024) {
@@ -251,6 +254,7 @@ export async function command(
         clearTimeout(killTimer);
         process.off("SIGINT", interrupt);
         process.off("SIGTERM", interrupt);
+        options.signal?.removeEventListener("abort", interrupt);
         reject(error);
       });
       child.once("close", (code) => {
@@ -258,6 +262,7 @@ export async function command(
         clearTimeout(killTimer);
         process.off("SIGINT", interrupt);
         process.off("SIGTERM", interrupt);
+        options.signal?.removeEventListener("abort", interrupt);
         accept({ code: overflow || timedOut ? -1 : code, output, stdout });
       });
     },
@@ -515,8 +520,7 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
   validateEnvironment(env);
   if (env.status === "deleted") return;
   await stopEnvironment(env);
-  if (!retired(env)) env.status = "deleting";
-  else if (env.resources.artifacts === "orphaned") env.status = "orphaned";
+  beginDeleting(env);
   await persist(env);
   const failures: string[] = [];
   // Continue independent deletions even if one provider is unavailable.
@@ -624,38 +628,72 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
   console.log(JSON.stringify({ event: `environment.${env.status}`, id: env.id }));
 }
 
+/** The first step of a destroy: once persisted, any sweep (the janitor's included) finishes it. */
+function beginDeleting(env: Environment): void {
+  if (!retired(env)) env.status = "deleting";
+  else if (env.resources.artifacts === "orphaned") env.status = "orphaned";
+}
+
+/**
+ * Marks the journal "deleting" under the registry lock, as destroyEnvironment's first write
+ * does, before ready hands the destroy to a detached child: a child that dies before its own
+ * first write still leaves a journal every sweep, the hourly janitor's included, destroys.
+ */
+export async function markDeleting(env: Environment): Promise<void> {
+  validateEnvironment(env);
+  if (env.status === "deleted") return;
+  await registryLock(async () => {
+    beginDeleting(env);
+    await persist(env);
+  });
+}
+
 /** The lock one environment's destroy holds, apart from the registry lock. */
 function destroyLockPath(id: string): string {
   return join(registry, "environments", `${id}.destroy.lock`);
 }
 
 class DestroyInProgress extends Error {}
+const DESTROYING = Symbol("destroy in progress");
 
 /**
- * Destroy under the environment's own lock, without the registry lock: ready's background
- * cleanup deletes for up to a minute, and must not stall the next setup on this machine.
+ * Runs `action` holding the environment's destroy lock, or returns DESTROYING at once when
+ * another process (ready's background cleanup) holds it. `action` gets the journal re-read
+ * under the lock (null once removed): a copy read before the lock may predate a destroy that
+ * finished meanwhile, and writing it back would un-delete its status or re-reserve its
+ * released quota (CORE-368).
  */
-export async function destroyExclusively(env: Environment): Promise<void> {
-  await mkdir(join(registry, "environments"), { recursive: true, mode: 0o700 });
-  await withFileLock(destroyLockPath(env.id), 300, () => destroyEnvironment(env));
-}
-
-/** Destroy unless another process (a background cleanup) is already destroying it. */
-async function destroyUnlessBusy(env: Environment): Promise<boolean> {
+async function unlessDestroying<T>(
+  id: string,
+  action: (current: Environment | null) => Promise<T>,
+): Promise<T | typeof DESTROYING> {
   try {
-    await withFileLock(
-      destroyLockPath(env.id),
+    return await withFileLock(
+      destroyLockPath(id),
       0,
-      () => destroyEnvironment(env),
+      async () => action(await recordAt(join(registry, "environments", `${id}.json`))),
       () => {
         throw new DestroyInProgress();
       },
     );
-    return true;
   } catch (error) {
-    if (error instanceof DestroyInProgress) return false;
+    if (error instanceof DestroyInProgress) return DESTROYING;
     throw error;
   }
+}
+
+/**
+ * Destroy under the environment's own lock, without the registry lock: ready's background
+ * cleanup deletes for up to a minute, and must not stall the next setup on this machine.
+ * Registry-locked work on this journal (sweeps, adoption) skips it while the lock is held.
+ */
+export async function destroyExclusively(env: Environment): Promise<void> {
+  await mkdir(join(registry, "environments"), { recursive: true, mode: 0o700 });
+  await withFileLock(destroyLockPath(env.id), 300, async () => {
+    // A sweep may have destroyed it while this waited: act on the journal as it is now.
+    const current = await recordAt(join(registry, "environments", `${env.id}.json`));
+    if (current) await destroyEnvironment(current);
+  });
 }
 
 /**
@@ -683,8 +721,10 @@ export async function cleanupExpired({ orphans = true } = {}): Promise<void> {
       if (env.status === "deleted" && Date.now() - env.expires > 7 * TTL) {
         // A journal whose row may still be reserved stays: it is the only
         // record that can release that row.
-        if (prunable(env.quota, env.id, listing))
+        if (prunable(env.quota, env.id, listing)) {
           await rm(join(registry, "environments", `${env.id}.json`));
+          await rm(destroyLockPath(env.id), { force: true });
+        }
         continue;
       }
       // An orphaned namespace is retried on every janitor sweep, expired or not.
@@ -695,7 +735,10 @@ export async function cleanupExpired({ orphans = true } = {}): Promise<void> {
       )
         continue;
       try {
-        if (!(await destroyUnlessBusy(env)))
+        const outcome = await unlessDestroying(env.id, async (current) => {
+          if (current && current.status !== "deleted") await destroyEnvironment(current);
+        });
+        if (outcome === DESTROYING)
           console.error(JSON.stringify({ event: "cleanup.in-progress", id: env.id }));
       } catch (error) {
         failures.push(String(error));
@@ -751,7 +794,7 @@ export async function createEnvironment(
   root = await realpath(root);
   await sweepBeforeCreate();
   return registryLock(async () => {
-    const existing = await inventory();
+    const journals = await inventory();
     const limits = await readEnvironmentLimits();
     if (!limits.authority)
       throw new Error(
@@ -759,8 +802,24 @@ export async function createEnvironment(
       );
     // Adopt legacy journals before admitting anything new. Other hosts must do
     // the same during rollout; a local journal cannot discover offline hosts.
-    for (const current of existing)
-      if (!retired(current)) await reserveQuota(current, "local", persist);
+    // Never one a background cleanup is destroying: its release may land
+    // mid-adoption, and a reserve after it would resurrect the row (CORE-368).
+    const existing: Environment[] = [];
+    for (const journal of journals) {
+      if (retired(journal)) {
+        existing.push(journal);
+        continue;
+      }
+      const current = await unlessDestroying(journal.id, async (current) => {
+        if (current && !retired(current)) await reserveQuota(current, "local", persist);
+        return current;
+      });
+      if (current === DESTROYING) {
+        console.error(JSON.stringify({ event: "environment.adoption-skipped", id: journal.id }));
+        // Still holds its slot until that destroy finishes.
+        existing.push(journal);
+      } else if (current) existing.push(current);
+    }
     if (!ephemeral) {
       const current = existing.find(
         (e) => e.root === root && e.dir === join(root, ".gitmatrix-agent") && !retired(e),
@@ -928,6 +987,29 @@ export async function createEnvironment(
   });
 }
 
+let workersWarned = false;
+
+/**
+ * GITMATRIX_E2E_WORKERS as context() reads it. Every agent command builds a context, so an
+ * invalid value only warns (once) and counts as 1 here; the E2E run refuses it (e2eWorkers in
+ * ready-e2e.ts, which this file must not import: the hourly janitor copies only the files
+ * maintenance.ts lists).
+ */
+export function contextWorkers(env: NodeJS.ProcessEnv = process.env): number {
+  const value = env.GITMATRIX_E2E_WORKERS?.trim() || "1";
+  if (/^[1-9]\d*$/.test(value)) return Number(value);
+  if (!workersWarned) {
+    workersWarned = true;
+    console.warn(
+      JSON.stringify({
+        event: "environment.e2e-workers-ignored",
+        message: `GITMATRIX_E2E_WORKERS must be a positive integer, not ${value}; using 1. The E2E run refuses it.`,
+      }),
+    );
+  }
+  return 1;
+}
+
 export async function context(env: Environment): Promise<HarnessContext> {
   validateEnvironment(env);
   requireGateway(env);
@@ -973,7 +1055,7 @@ export async function context(env: Environment): Promise<HarnessContext> {
     { mode: 0o600 },
   );
   const gm = join(env.root, "apps", "cli", "target", "debug", "gm");
-  const workers = e2eWorkers();
+  const workers = contextWorkers();
   const hosted = process.env.GITMATRIX_REMOTE_HOSTED === "1";
   const preview = hosted && env.dir === join(env.root, ".gitmatrix-agent");
   if (hosted) {

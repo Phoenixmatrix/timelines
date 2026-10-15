@@ -6,7 +6,7 @@ import {
   gatesWriteBindingTypes,
   isEnvironmentLimitRefusal,
   overlapSetup,
-  seedPathsChanged,
+  seedMayBeAffected,
   type OverlapSteps,
 } from "./live-run.ts";
 
@@ -25,6 +25,7 @@ function harness(
   } = {},
 ) {
   const calls: string[] = [];
+  const signals: (AbortSignal | undefined)[] = [];
   const setups = [...(options.setups ?? [{ id: 1 }])];
   const steps: OverlapSteps<Fake> = {
     async runGates() {
@@ -32,7 +33,8 @@ function harness(
       await options.gate?.();
       calls.push("gates:end");
     },
-    async startLive() {
+    async startLive(signal) {
+      signals.push(signal);
       calls.push("setup:start");
       const next = await setups.shift()!;
       calls.push(`setup:end:${next.id}`);
@@ -48,15 +50,16 @@ function harness(
       await options.abort?.();
     },
   };
-  return { calls, steps };
+  return { calls, signals, steps };
 }
 
 const quota = new Error("Machine environment limit reached (4). Destroy unused environments.");
 
 await test("setup starts before the gates and the scenarios run once both pass", async () => {
-  const { calls, steps } = harness();
+  const { calls, signals, steps } = harness();
   const outcome = await overlapSetup(steps);
   assert.deepEqual(outcome, { overlapped: true, quotaFallback: false });
+  assert.equal(signals[0]?.aborted, false, "passing gates never abort the setup");
   assert.equal(calls[0], "setup:start");
   assert.deepEqual(calls.slice(-1), ["finish:1:true"]);
   assert.ok(calls.indexOf("gates:end") < calls.indexOf("finish:1:true"));
@@ -75,22 +78,41 @@ await test("a failing gate tears the setup down and throws the gate error", asyn
   assert.ok(!calls.some((call) => call.startsWith("finish")));
 });
 
-await test("a gate failure waits for a slow setup before destroying it", async () => {
-  let release!: (fake: Fake) => void;
-  const slow = new Promise<Fake>((accept) => (release = accept));
+await test("a gate failure aborts the setup instead of waiting for it to complete", async () => {
   const gateError = new Error("gate");
   const { calls, steps } = harness({
-    setups: [slow],
     gate: async () => {
       throw gateError;
     },
   });
-  const result = overlapSetup(steps);
-  await new Promise((accept) => setImmediate(accept));
-  assert.ok(!calls.includes("abort:7"));
-  release({ id: 7 });
-  await assert.rejects(result, (error) => error === gateError);
-  assert.deepEqual(calls.slice(-2), ["setup:end:7", "abort:7"]);
+  // A setup that never finishes on its own: it settles only when aborted, with the abort's error.
+  steps.startLive = (signal) => {
+    calls.push("setup:start");
+    return new Promise<Fake>((accept) =>
+      signal!.addEventListener("abort", () => {
+        calls.push("setup:aborted");
+        accept({ id: 7, error: signal!.reason });
+      }),
+    );
+  };
+  // The abort's own error is not reported: only the gate's.
+  await assert.rejects(overlapSetup(steps), (error) => error === gateError);
+  assert.deepEqual(calls.slice(-2), ["setup:aborted", "abort:7"]);
+  assert.ok(!calls.some((call) => call.startsWith("finish")));
+});
+
+await test("a setup aborted outright still reports only the gate failure", async () => {
+  const gateError = new Error("gate");
+  const { steps } = harness({
+    gate: async () => {
+      throw gateError;
+    },
+  });
+  steps.startLive = (signal) =>
+    new Promise<Fake>((_, reject) =>
+      signal!.addEventListener("abort", () => reject(signal!.reason)),
+    );
+  await assert.rejects(overlapSetup(steps), (error) => error === gateError);
 });
 
 await test("a setup failure with passing gates is the live run's failure", async () => {
@@ -185,13 +207,30 @@ await test("the setup skips binding types only when a gate regenerates them", ()
   assert.ok(!gatesWriteBindingTypes([{ name: "check" }, { name: "cli-check" }]));
 });
 
-await test("the seed repeats only for seed-related paths", () => {
-  assert.ok(seedPathsChanged(["tools/agent/seed.ts"]));
-  assert.ok(seedPathsChanged(["README.md", "apps/website/seed/0001_dev.sql"]));
-  assert.ok(seedPathsChanged(["tools/agent/fixtures/a.json"]));
-  assert.ok(seedPathsChanged(["tools/agent/content-fixtures.ts"]));
-  assert.ok(!seedPathsChanged(["tools/agent/e2e.ts", "apps/website/src/app.tsx"]));
-  assert.ok(!seedPathsChanged([]));
+await test("the seed repeats unless no changed path can reach it", () => {
+  // The bootstrap, the endpoints and gm it drives, and anything not known to be inert.
+  assert.ok(seedMayBeAffected(["tools/agent/seed.ts"]));
+  assert.ok(seedMayBeAffected(["README.md", "apps/website/seed/0001_dev.sql"]));
+  assert.ok(seedMayBeAffected(["apps/website/worker/routes/dev.ts"]));
+  assert.ok(seedMayBeAffected(["apps/website/shared/tracker.ts"]));
+  assert.ok(seedMayBeAffected(["apps/cli/src/main.rs"]));
+  assert.ok(seedMayBeAffected(["tools/agent/e2e.ts"]));
+  assert.ok(seedMayBeAffected(["apps/website/src/testing/fixtures.ts"]));
+  assert.ok(seedMayBeAffected(["docs/guide.md"]));
+  assert.ok(seedMayBeAffected(["apps/website/src/app.tsx", "apps/website/worker/index.ts"]));
+  // Frontend, tests, documentation and coding-agent configuration only.
+  assert.ok(
+    !seedMayBeAffected([
+      "apps/website/src/app.tsx",
+      "apps/website/src/routes/home.browser.test.tsx",
+      "tools/agent/seed.test.ts",
+      "README.md",
+      "apps/website/README.md",
+      ".claude/agents/runner.md",
+      ".agents/skills/gitmatrix-graph-work/SKILL.md",
+    ]),
+  );
+  assert.ok(!seedMayBeAffected([]));
 });
 
 await test("only a local ready run cleans up in the background", () => {

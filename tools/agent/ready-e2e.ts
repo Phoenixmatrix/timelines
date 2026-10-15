@@ -158,7 +158,9 @@ export const prerequisites: Readonly<Record<ScenarioName, readonly ScenarioName[
  * `person:jun` jun's account (avatar, chats, personal retention); `gm-state` the
  * one gm configuration, tracker replicas and lease store every gm shares
  * (XDG_DATA_HOME), and with it the seed's tracker issues and marco's agents;
- * `instance` everything (a write means the scenario needs the environment alone).
+ * `ci-runner-hold` a CI runner slot held for a minute or more (written by the
+ * scenarios that park a job on a barrier or a long sleep); `instance` everything
+ * (a write means the scenario needs the environment alone).
  */
 export const resources = [
   "engine",
@@ -167,6 +169,7 @@ export const resources = [
   "space:jun",
   "person:jun",
   "gm-state",
+  "ci-runner-hold",
   "instance",
 ] as const;
 
@@ -182,8 +185,11 @@ const engineWrite = { engine: "write", "space:orbit": "read" } as const;
  * What each scenario touches, audited against e2e.ts and its helpers. Fresh
  * fixtures of its own (a timeline, a tracker team, an `orbit/queue-*` or Atlas
  * repository) count as reading their Space. When unsure, write: over-serializing
- * is safe. Not modelled: the CI runner slots (GITMATRIX_CI_RUNNERS) every
- * repository shares, which the environment widens when scenarios overlap.
+ * is safe. Every repository shares the environment's CI runner slots
+ * (GITMATRIX_CI_RUNNERS: two, three from three workers). Short jobs just queue
+ * for them; a scenario that holds one for a minute or more writes
+ * `ci-runner-hold`, so at most one such hold runs at a time and the other slots
+ * stay free for everyone else's pipelines.
  */
 export const scenarioResources: Readonly<
   Record<ScenarioName, Readonly<Partial<Record<Resource, Access>>>>
@@ -220,7 +226,8 @@ export const scenarioResources: Readonly<
   "ci-push-triggered-local-dag-and-provenance": engineWrite,
   "ci-failing-prerequisite-skips-dependent": engineWrite,
   "ci-job-records-and-updates-a-deployment": engineWrite,
-  "ci-cancellation-and-job-token-lifetime": engineWrite,
+  // Parks a job on its collector for up to 60 s while the run is cancelled.
+  "ci-cancellation-and-job-token-lifetime": { ...engineWrite, "ci-runner-hold": "write" },
   // Retention runs over orbit's CI logs and runs.
   "ci-retention-removes-logs-and-runs": { engine: "write", "space:orbit": "write" },
   // Tracker-activity retention on orbit, 179 days ahead.
@@ -232,10 +239,12 @@ export const scenarioResources: Readonly<
   "steps-context-hook-live-run-landing-and-access": { ...engineWrite, "gm-state": "write" },
   "timeline-landing-conflict-asks-for-a-sync": engineWrite,
   "timeline-nested-admission-and-canonical-revert": engineWrite,
-  // Its own orbit repositories; claims a remediation issue.
+  // Its own orbit repositories; claims a remediation issue. Its deletion phase
+  // holds a landing gate in a 60 s sleep.
   "queue-concurrency-failure-fencing-and-push-recovery": {
     "space:orbit": "read",
     "gm-state": "write",
+    "ci-runner-hold": "write",
   },
   // Counts marco's agents exactly; its own HOME and XDG_CONFIG_HOME, but the shared XDG_DATA_HOME.
   "agent-setup-memorable-persistent-identities": { "space:orbit": "read", "gm-state": "write" },
@@ -265,8 +274,12 @@ export const scenarioResources: Readonly<
   },
   // Instance registry retention and garbage collection, 400 days ahead.
   "registry-retention-keeps-installs-working": { instance: "write" },
-  // Its own orbit repository, preview and grant.
-  "repository-deletion-purges-everything-and-resumes": { "space:orbit": "read" },
+  // Its own orbit repository, preview and grant; its teardown job waits on a
+  // barrier for up to ~170 s.
+  "repository-deletion-purges-everything-and-resumes": {
+    "space:orbit": "read",
+    "ci-runner-hold": "write",
+  },
   // jun's chats and personal retention, 100 days ahead.
   "assistant-chats-expire": { "person:jun": "write" },
   // Instance-wide auth hygiene; asserts nothing is left after its run.
@@ -291,8 +304,12 @@ export const scenarioResources: Readonly<
   "source-push-recovery-fences-late-writes": { "space:orbit": "read" },
   "source-late-sync-lineage-conflicts-guard-and-expiry": { "space:orbit": "read" },
   "source-finite-legacy-migration-and-partial-revert": { "space:orbit": "read" },
-  // Source retention on sam's Space and the Instance-wide orphan sweep.
-  "source-retention-expiry-orphan-and-canonical-purge": { instance: "write" },
+  // Source retention on sam's Space and the Instance-wide orphan sweep. Also
+  // holds a preview job on a barrier, which running alone already covers.
+  "source-retention-expiry-orphan-and-canonical-purge": {
+    instance: "write",
+    "ci-runner-hold": "write",
+  },
   // Tracker-activity retention on sam's Space, 181 days ahead.
   "browser-expired-source-without-timeline-history": { "space:sam": "write" },
   // Links a month of seeded orbit history to an engine CI run.
