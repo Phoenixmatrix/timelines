@@ -154,7 +154,7 @@ async function fixture() {
     await Promise.all(pending.splice(0));
     return response;
   };
-  return { sqlite, env, app, ctx, tracker, remote, sourceId, push, access };
+  return { sqlite, env, app, ctx, tracker, remote, sourceId, push, access, headers };
 }
 
 test.each([
@@ -385,10 +385,60 @@ test("an accepted work push forgets cached refs before it answers", async () => 
       ).branches.find((branch) => branch.name === ref)?.oid;
     // Progress already retained for both tips: the push writes no ref of its own.
     for (const oid of [old, next]) t.remote.refs.set(`refs/gitmatrix/progress/${oid}`, oid);
-    invalidateRefs(source.artifacts_name);
+    await invalidateRefs(t.env.DB, source.artifacts_name);
     expect(await work()).toBe(old);
     expect((await t.push(ok, 200, next, "report-status")).status).toBe(200);
     expect(await work()).toBe(next);
+  } finally {
+    t.sqlite.close();
+  }
+});
+
+test("a work push bumps its own source's refs generation, never the canonical one", async () => {
+  const t = await fixture();
+  try {
+    const generations = () => ({
+      work: (
+        t.sqlite
+          .prepare("SELECT refs_generation AS g FROM timeline_work_sources WHERE source_id=?")
+          .get(t.sourceId) as { g: number }
+      ).g,
+      canonical: (
+        t.sqlite.prepare("SELECT refs_generation AS g FROM repos WHERE id='app'").get() as {
+          g: number;
+        }
+      ).g,
+    });
+    const before = generations();
+    expect((await t.push(ok, 200, next, "report-status")).status).toBe(200);
+    const accepted = generations();
+    expect(accepted.work).toBeGreaterThan(before.work);
+    expect(accepted.canonical).toBe(before.canonical);
+
+    // Artifacts' connection drops once the push is forwarded: its outcome is
+    // unknown, so the generation moves all the same.
+    const reads = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/git-receive-pack")) throw new Error("Network connection lost.");
+      return reads(input, init);
+    });
+    const dropped = await Promise.resolve(
+      t.app.request(
+        "/ann/app@work.git/git-receive-pack",
+        {
+          method: "POST",
+          headers: { ...t.headers, "content-type": "application/x-git-receive-pack-request" },
+          body: pkt(`${next} ${old} ${ref}\0report-status\n`) + FLUSH,
+        },
+        t.env,
+        t.ctx,
+      ),
+    ).catch(() => null);
+    expect(dropped?.status ?? 500).not.toBe(200);
+    const after = generations();
+    expect(after.work).toBeGreaterThan(accepted.work);
+    expect(after.canonical).toBe(before.canonical);
   } finally {
     t.sqlite.close();
   }

@@ -134,8 +134,8 @@ async function setup(publicUrl?: string) {
   const git = fakeRemotes();
   git.add("https://remote.test/engine", { "refs/heads/main": HEAD, "refs/heads/other": OTHER });
   git.add("https://remote.test/secret", { "refs/heads/main": "9".repeat(40) });
-  invalidateRefs("a-engine");
-  invalidateRefs("a-secret");
+  await invalidateRefs(fresh.env.DB, "a-engine");
+  await invalidateRefs(fresh.env.DB, "a-secret");
   vi.stubGlobal("fetch", git.fetch);
   vi.stubGlobal("caches", {
     default: { match: async () => undefined, put: async () => {}, delete: async () => false },

@@ -78,21 +78,26 @@ export async function writeRefs(
     body.set(commands);
     body.set(pack, commands.length);
   }
-  const response = await fetch(`${repo.artifacts_remote}/git-receive-pack`, {
-    method: "POST",
-    headers: {
-      authorization,
-      "content-type": "application/x-git-receive-pack-request",
-      accept: "application/x-git-receive-pack-result",
-    },
-    body,
-  });
-  invalidateRefs(repo.artifacts_name);
+  let response: Response;
+  let bytes: Uint8Array;
+  try {
+    response = await fetch(`${repo.artifacts_remote}/git-receive-pack`, {
+      method: "POST",
+      headers: {
+        authorization,
+        "content-type": "application/x-git-receive-pack-request",
+        accept: "application/x-git-receive-pack-result",
+      },
+      body,
+    });
+    bytes = new Uint8Array(await response.arrayBuffer());
+  } finally {
+    // The ref transaction is over, or its outcome unknown: before the caller
+    // reads on, no reader may be served refs listed before it (CORE-444).
+    await invalidateRefs(env.DB, repo.artifacts_name);
+  }
   if (!response.ok) throw new Error(`Artifacts refused the ref update (HTTP ${response.status}).`);
-  const report = parsePushReport(
-    new Uint8Array(await response.arrayBuffer()),
-    capabilities.has("side-band-64k"),
-  );
+  const report = parsePushReport(bytes, capabilities.has("side-band-64k"));
   if (report.errors.length) throw new Error(`Artifacts: ${report.errors.join("; ")}`);
   if (report.unpack && report.unpack !== "ok")
     throw new Error(`Artifacts couldn't apply the ref update: ${report.unpack}`);

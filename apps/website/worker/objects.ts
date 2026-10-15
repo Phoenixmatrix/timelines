@@ -5,8 +5,32 @@
 // isolate's memory, then in the Workers Cache API (shared by every isolate in
 // the colo). Only branch and tag names are mutable; they resolve through a
 // short-lived ref cache that pushes through the proxy invalidate.
+//
+// Refs consistency (CORE-444). Listing them costs ~2 s on a cold isolate, and
+// production deploys often enough that isolates usually are cold, so the
+// interactive read API (readers given the repository's refs generation, from
+// api/repos.ts; never git smart-HTTP, CI triggers, release notes, knowledge or
+// landing) also keeps them in the colo's Cache API, keyed by that generation
+// (D1: repos.refs_generation, or timeline_work_sources' for a work source):
+// - Every ref write the Worker makes or proxies bumps the generation once the
+//   write is over, or its outcome unknown, and before its client sees it end
+//   (invalidateRefs). A read that loads the row afterwards asks for the new
+//   generation, under which no listing begun before the write is ever stored,
+//   in memory or in any colo's Cache API: it reads that write. This relies on
+//   that read reaching D1's primary, as every read here does (no D1 Sessions
+//   or read replicas); a lagging replica could still return the old generation.
+// - Within a generation, refs up to REFS_FRESH_MS old (counted from when their
+//   listing started) are served as they are, and older ones, up to
+//   REFS_STALE_MS, once while a background listing replaces them. That bounds
+//   only ref changes no bump follows: ones Artifacts makes on its own (an import
+//   finishing), writes made straight to Artifacts rather than through the
+//   Worker, and a bump that failed (D1 unreachable or stalled; logged).
+// - Other readers keep refs in isolate memory only, as before: a push through
+//   this isolate forgets them, and a listing begun before that is not kept.
+// - Tokens are never cached outside isolate memory.
 
 import { listRefs, type RepoRefs } from "./artifacts.ts";
+import { UPSTREAM_TIMEOUT_MS, withTimeout } from "./retry.ts";
 import type { Timing } from "./timing.ts";
 
 const MEMORY_BUDGET = 64 * 1024 * 1024;
@@ -49,16 +73,71 @@ export function forgetObjectMemory() {
 }
 
 // Only completed data may cross request boundaries. Pending I/O belongs to a reader.
-const refsCache = new Map<string, { at: number; refs: RepoRefs }>();
+interface RefsEntry {
+  /** Freshness clock: when these refs were listed, or last handed out while a refresh runs. */
+  at: number;
+  refs: RepoRefs;
+  /** The refs generation they were listed under; undefined from a reader without one. */
+  generation: number | undefined;
+  /** Read from the Cache API (another isolate's listing), not listed here. */
+  shared: boolean;
+}
+const refsCache = new Map<string, RefsEntry>();
+/** How often each repository's refs were invalidated in this isolate. */
+const invalidations = new Map<string, number>();
+const invalidationsOf = (artifactsName: string) => invalidations.get(artifactsName) ?? 0;
+const refsKey = (artifactsName: string, generation: number) =>
+  `${CACHE_ORIGIN}/${artifactsName}/refs/v2/${generation}`;
+/** The Cache API, where this runtime has one. */
+const cacheApi = () => (typeof caches === "undefined" ? undefined : caches.default);
 /** Heads already warmed in this isolate. */
 const warmed = new Set<string>();
 const WARM_MAX_BLOBS = 400;
 const WARM_MAX_BYTES = 8 * 1024 * 1024;
 const WARM_CONCURRENCY = 16;
 
-/** Forget cached refs for a repo, e.g. after a push went through the proxy. */
-export function invalidateRefs(artifactsName: string) {
+/**
+ * Forget this isolate's refs for the repo, and keep any listing already under
+ * way here from being remembered: for a reader that wants refs listed from now
+ * on, where no ref write happened (one that did calls invalidateRefs).
+ */
+export function forgetRefs(artifactsName: string): void {
   refsCache.delete(artifactsName);
+  invalidations.set(artifactsName, invalidationsOf(artifactsName) + 1);
+}
+
+/**
+ * After a ref write (or one whose outcome is unknown) is over: forget this
+ * isolate's refs for the repo, and bump the refs generation of whichever row
+ * owns that Artifacts repository, so no read that loads it later is served refs
+ * listed before. Await it before the writer's client sees the write end. Never
+ * rejects, and gives up on D1 after UPSTREAM_TIMEOUT_MS so a stalled D1 can't
+ * hold a push's answer: a failed bump is logged, leaving the age bounds above.
+ */
+export async function invalidateRefs(d1: D1Database, artifactsName: string): Promise<void> {
+  forgetRefs(artifactsName);
+  try {
+    await withTimeout(
+      d1.batch(
+        ["repos", "timeline_work_sources"].map((table) =>
+          d1
+            .prepare(
+              `UPDATE ${table} SET refs_generation = refs_generation + 1 WHERE artifacts_name = ?`,
+            )
+            .bind(artifactsName),
+        ),
+      ),
+      UPSTREAM_TIMEOUT_MS,
+    );
+  } catch (error) {
+    console.error("refs generation bump failed", artifactsName, error);
+  }
+}
+
+/** Drop this isolate's refs memory, as a fresh isolate starts (tests). */
+export function forgetRefsMemory() {
+  refsCache.clear();
+  invalidations.clear();
 }
 
 export interface BlobData {
@@ -78,16 +157,29 @@ const jsonEncode = (value: unknown) => {
 };
 const jsonDecode = <T>(response: Response) => response.json() as Promise<T>;
 
+export interface RepoReaderOptions {
+  /**
+   * Also keep refs in the Cache API, across isolates and deploys, under the
+   * repository's refs generation as loaded for this request (CORE-444). Only
+   * for interactive reads that tolerate the bounds described at the top of this
+   * file; anything that acts on refs lists them itself.
+   */
+  sharedRefs?: { generation: number };
+}
+
 export class RepoReader {
   #stub: Promise<ArtifactsRepo> | undefined;
   #inflight: Map<string, Promise<unknown>> | undefined;
   #refs: Promise<RepoRefs> | undefined;
+  #refsInvalidations: number | undefined;
   private env: Env;
   private artifactsName: string;
   private remote: string;
   private timing: Timing;
   private waitUntil: (work: Promise<unknown>) => void;
   private sourceRef: string | undefined;
+  /** The refs generation to share refs under, when this reader opted in. */
+  private generation: number | undefined;
 
   constructor(
     env: Env,
@@ -96,6 +188,7 @@ export class RepoReader {
     timing: Timing,
     waitUntil: (work: Promise<unknown>) => void,
     sourceRef?: string,
+    options: RepoReaderOptions = {},
   ) {
     this.env = env;
     this.artifactsName = artifactsName;
@@ -103,6 +196,7 @@ export class RepoReader {
     this.timing = timing;
     this.waitUntil = waitUntil;
     this.sourceRef = sourceRef;
+    this.generation = options.sharedRefs?.generation;
   }
 
   /** The binding stub, fetched only when something misses the cache. */
@@ -290,27 +384,112 @@ export class RepoReader {
   }
 
   /** Branch and tag tips: cached, and refreshed in the background once stale. */
-  async refs(): Promise<RepoRefs> {
+  refs(): Promise<RepoRefs> {
+    // One lookup per reader (split() then resolve() must not ask twice), until
+    // an invalidation in this isolate says its refs may have moved.
+    const invalidations = invalidationsOf(this.artifactsName);
+    if (!this.#refs || this.#refsInvalidations !== invalidations) {
+      this.#refs = this.#lookupRefs();
+      this.#refsInvalidations = invalidations;
+    }
+    return this.#refs.then((refs) => this.#sourceRefs(refs));
+  }
+
+  /** Memory, then (for shared readers) the Cache API, then a listing; physical refs. */
+  async #lookupRefs(): Promise<RepoRefs> {
+    const remembered = this.#memoryRefs();
+    if (remembered) return remembered;
+    if (this.generation !== undefined) {
+      const stored = await this.#cachedRefs(this.generation);
+      if (stored) return stored;
+    }
+    return this.timing.measure("ls-refs", this.#listRefs());
+  }
+
+  /** This isolate's refs, if this reader may have them; past REFS_FRESH_MS they start a refresh. */
+  #memoryRefs(): RepoRefs | undefined {
     const cached = refsCache.get(this.artifactsName);
-    const age = cached ? Date.now() - cached.at : Infinity;
-    if (cached && age < REFS_FRESH_MS) {
+    if (!cached) return undefined;
+    // A shared reader takes only its own generation; others never take another isolate's refs.
+    if (this.generation === undefined ? cached.shared : cached.generation !== this.generation)
+      return undefined;
+    const age = Date.now() - cached.at;
+    if (age < REFS_FRESH_MS) {
       this.timing.count("refs-memory");
-      return this.#sourceRefs(cached.refs);
+      return cached.refs;
     }
-    const refresh = async () => {
-      const refs = await listRefs(this.env, this.artifactsName, this.remote, this.timing);
-      refsCache.set(this.artifactsName, { at: Date.now(), refs });
-      return refs;
-    };
-    if (cached && age < REFS_STALE_MS) {
-      this.timing.count("refs-stale");
-      // Mark it fresh now so concurrent requests don't all refresh at once.
-      refsCache.set(this.artifactsName, { at: Date.now(), refs: cached.refs });
-      this.waitUntil(refresh().catch(() => refsCache.delete(this.artifactsName)));
-      return this.#sourceRefs(cached.refs);
+    if (age >= REFS_STALE_MS) return undefined;
+    this.timing.count("refs-stale");
+    this.#refreshInBackground(cached);
+    return cached.refs;
+  }
+
+  /** The colo's copy for `generation`, if younger than REFS_STALE_MS; fills memory. */
+  async #cachedRefs(generation: number): Promise<RepoRefs | undefined> {
+    const cache = cacheApi();
+    if (!cache) return undefined;
+    let stored: { startedAt: number; refs: RepoRefs } | undefined;
+    try {
+      const response = await cache.match(refsKey(this.artifactsName, generation));
+      stored = response ? await response.json() : undefined;
+    } catch {
+      return undefined;
     }
-    this.#refs ??= this.timing.measure("ls-refs", refresh());
-    return this.#sourceRefs(await this.#refs);
+    if (typeof stored?.startedAt !== "number" || !stored.refs) return undefined;
+    const age = Date.now() - stored.startedAt;
+    if (age >= REFS_STALE_MS) return undefined;
+    // Another request here may have listed or read them meanwhile.
+    const remembered = this.#memoryRefs();
+    if (remembered) return remembered;
+    const entry: RefsEntry = { at: stored.startedAt, refs: stored.refs, generation, shared: true };
+    refsCache.set(this.artifactsName, entry);
+    if (age < REFS_FRESH_MS) this.timing.count("refs-cache");
+    else {
+      this.timing.count("refs-cache-stale");
+      this.#refreshInBackground(entry);
+    }
+    return stored.refs;
+  }
+
+  /** Serve `entry` while a listing replaces it. */
+  #refreshInBackground(entry: RefsEntry) {
+    // Mark it fresh now so concurrent requests don't all refresh at once.
+    const marked = { ...entry, at: Date.now() };
+    refsCache.set(this.artifactsName, marked);
+    this.waitUntil(
+      this.#listRefs().catch(() => {
+        if (refsCache.get(this.artifactsName) === marked) refsCache.delete(this.artifactsName);
+      }),
+    );
+  }
+
+  /**
+   * List refs from Artifacts and keep them, under the generation this reader
+   * loaded, unless this isolate invalidated them meanwhile.
+   */
+  async #listRefs(): Promise<RepoRefs> {
+    const name = this.artifactsName;
+    const generation = this.generation;
+    const invalidations = invalidationsOf(name);
+    const startedAt = Date.now();
+    const refs = await listRefs(this.env, name, this.remote, this.timing);
+    if (invalidationsOf(name) !== invalidations) return refs;
+    refsCache.set(name, { at: Date.now(), refs, generation, shared: false });
+    const cache = cacheApi();
+    if (cache && generation !== undefined) {
+      const response = new Response(JSON.stringify({ startedAt, refs }), {
+        headers: {
+          "content-type": "application/json",
+          "cache-control": `public, max-age=${REFS_STALE_MS / 1000}`,
+        },
+      });
+      this.waitUntil(
+        cache
+          .put(refsKey(name, generation), response)
+          .catch((error: unknown) => console.warn("refs cache put failed", name, error)),
+      );
+    }
+    return refs;
   }
 
   /** A branch, tag or commit id, as a commit id. */

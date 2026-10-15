@@ -200,31 +200,60 @@ async function setup(queue = false, changeId?: string) {
   const receivePack = async (
     secret: string,
     commands: string[],
-    options: { gzip?: boolean; repo?: string } = {},
+    options: {
+      gzip?: boolean;
+      repo?: string;
+      /** Pack data after the commands (none by default). */
+      pack?: Uint8Array;
+      /** Called once the client has the whole answer (or its failure), before
+       * the proxy's background work is awaited. */
+      onEnd?: () => void;
+    } = {},
   ) => {
     let text = "";
     commands.forEach((command, i) => {
       text += pkt(i === 0 ? `${command}\0report-status\n` : `${command}\n`);
     });
-    let body: Uint8Array = new TextEncoder().encode(text + FLUSH);
+    let body: Uint8Array = Buffer.concat([
+      new TextEncoder().encode(text + FLUSH),
+      options.pack ?? new Uint8Array(),
+    ]);
     if (options.gzip) body = new Uint8Array(gzipSync(body));
     const before = backend.requests.length;
-    const response = await app.request(
-      `/orbit/${options.repo ?? "app"}.git/git-receive-pack`,
-      {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${secret}`,
-          "content-type": "application/x-git-receive-pack-request",
-          ...(options.gzip ? { "content-encoding": "gzip" } : {}),
+    const pending: Promise<unknown>[] = [];
+    let response: Response;
+    let answer: string;
+    try {
+      response = await app.request(
+        `/orbit/${options.repo ?? "app"}.git/git-receive-pack`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${secret}`,
+            "content-type": "application/x-git-receive-pack-request",
+            ...(options.gzip ? { "content-encoding": "gzip" } : {}),
+          },
+          body,
         },
-        body,
-      },
-      env,
-    );
+        env,
+        // The proxy finishes a push's answer in the background.
+        {
+          waitUntil: (work: Promise<unknown>) => {
+            pending.push(work);
+          },
+          passThroughOnException() {},
+          props: {},
+        } as ExecutionContext,
+      );
+      // Read like a client: the proxy holds the body's end until its refs are forgotten.
+      answer = await response.text();
+    } finally {
+      options.onEnd?.();
+    }
+    await Promise.all(pending);
     return {
       status: response.status,
-      text: await response.text(),
+      text: answer,
       forwarded: backend.requests.slice(before),
     };
   };
@@ -759,7 +788,7 @@ test("a canonical push forgets cached refs before its response ends", async () =
   const { secret } = await issueToken(t.env.DB, "orbit", "test", "write");
   const refs = () =>
     new RepoReader(t.env, "r-app", "https://artifacts.test/app.git", new Timing(), () => {}).refs();
-  invalidateRefs("r-app");
+  await invalidateRefs(t.env.DB, "r-app");
   expect((await refs()).branches.map((branch) => branch.shortName)).not.toContain("pushed");
   const pushed = await t.gitWith(secret, "push", t.proxyUrl, "HEAD:refs/heads/pushed");
   expect(pushed.status, pushed.stderr).toBe(0);
@@ -767,6 +796,132 @@ test("a canonical push forgets cached refs before its response ends", async () =
   expect((await refs()).branches).toContainEqual(
     expect.objectContaining({ shortName: "pushed", oid: t.merge }),
   );
+});
+
+describe("refs generation (CORE-444)", () => {
+  const generation = (t: Awaited<ReturnType<typeof setup>>) =>
+    (
+      t.sqlite
+        .prepare("SELECT refs_generation AS g FROM repos WHERE artifacts_name = 'r-app'")
+        .get() as {
+        g: number;
+      }
+    ).g;
+  /** Artifacts' receive-pack fails: it may or may not have moved refs. */
+  const failingPushes = (t: Awaited<ReturnType<typeof setup>>, failure: "throw" | "500") =>
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/git-receive-pack")) {
+        if (failure === "throw") throw new Error("Network connection lost.");
+        return new Response("", { status: 500 });
+      }
+      return t.backend.fetch(input, init);
+    });
+
+  /** Each bump takes a while, so one that isn't awaited lands after its push ends. */
+  const slowBumps = (t: Awaited<ReturnType<typeof setup>>) => {
+    const batch = t.env.DB.batch.bind(t.env.DB);
+    vi.spyOn(t.env.DB, "batch").mockImplementation(async (statements) => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return batch(statements);
+    });
+  };
+  /** The generation when the client saw its push end, and after the push. */
+  const observed = (t: Awaited<ReturnType<typeof setup>>) => {
+    const seen: { atEnd?: number } = {};
+    return { seen, onEnd: () => (seen.atEnd = generation(t)) };
+  };
+
+  test("a canonical push bumps it before the client sees the push end", async () => {
+    const t = await setup();
+    const { secret } = await issueToken(t.env.DB, "orbit", "test", "write");
+    const before = generation(t);
+    const pushed = await t.gitWith(secret, "push", t.proxyUrl, "HEAD:refs/heads/pushed");
+    expect(pushed.status, pushed.stderr).toBe(0);
+    expect(generation(t)).toBe(before + 1);
+  });
+
+  for (const failure of ["throw", "500"] as const) {
+    test(`a canonical push whose outcome is unknown still bumps it (${failure})`, async () => {
+      const t = await setup();
+      const { secret } = await issueToken(t.env.DB, "orbit", "test", "write");
+      const before = generation(t);
+      failingPushes(t, failure);
+      slowBumps(t);
+      const { seen, onEnd } = observed(t);
+      const result = await t
+        .receivePack(secret, [`${t.main} ${t.merge} refs/heads/lost`], { onEnd })
+        .catch(() => null);
+      expect(result?.status ?? 500).not.toBe(200);
+      expect(seen.atEnd).toBe(before + 1);
+      expect(generation(t)).toBe(before + 1);
+    });
+
+    test(`a landing job's push whose outcome is unknown still bumps it (${failure})`, async () => {
+      const t = await setup();
+      const secret = await t.token();
+      const before = generation(t);
+      failingPushes(t, failure);
+      slowBumps(t);
+      const { seen, onEnd } = observed(t);
+      const result = await t
+        .receivePack(secret, [`${t.main} ${t.merge} ${LANDING}`], { onEnd })
+        .catch(() => null);
+      expect(result?.status ?? 500).not.toBe(200);
+      expect(seen.atEnd).toBe(before + 1);
+      expect(generation(t)).toBe(before + 1);
+    });
+
+    test(`writeRefs bumps it when Artifacts' answer is not ok (${failure})`, async () => {
+      const t = await setup();
+      const before = generation(t);
+      failingPushes(t, failure);
+      slowBumps(t);
+      await expect(
+        writeRefs(t.env, repo, [{ ref: "refs/heads/work", old: null, new: t.main }]),
+      ).rejects.toThrow();
+      expect(generation(t)).toBe(before + 1);
+    });
+  }
+
+  test("a landing job's push bumps it before its answer ends", async () => {
+    const t = await setup();
+    const secret = await t.token();
+    const before = generation(t);
+    const pack = execFileSync("git", ["pack-objects", "--stdout", "--revs", "-q"], {
+      cwd: t.work,
+      input: `${t.merge}\n^${t.main}\n`,
+      env: { ...process.env, ...GIT_ENV },
+    });
+    slowBumps(t);
+    const { seen, onEnd } = observed(t);
+    const result = await t.receivePack(secret, [`${t.main} ${t.merge} ${LANDING}`], {
+      pack: new Uint8Array(pack),
+      onEnd,
+    });
+    expect(result.status).toBe(200);
+    expect(result.text).toContain(`ok ${LANDING}`);
+    expect(t.ref(LANDING)).toBe(t.merge);
+    expect(seen.atEnd).toBe(before + 1);
+    expect(generation(t)).toBe(before + 1);
+  });
+
+  const repo = { artifacts_name: "r-app", artifacts_remote: "https://artifacts.test/app.git" };
+
+  test("writeRefs bumps it before it returns, whatever the report says", async () => {
+    const t = await setup();
+    const before = generation(t);
+    slowBumps(t);
+    expect(
+      await writeRefs(t.env, repo, [{ ref: "refs/heads/work", old: null, new: t.main }]),
+    ).toMatchObject([{ ok: true }]);
+    expect(generation(t)).toBe(before + 1);
+    // The ref no longer holds `old`: the report refuses it, and the bump still comes.
+    expect(
+      await writeRefs(t.env, repo, [{ ref: "refs/heads/work", old: t.merge, new: t.main }]),
+    ).toMatchObject([{ ok: false }]);
+    expect(generation(t)).toBe(before + 2);
+  });
 });
 
 test("native clones select current work HEAD and hide inherited canonical branches", async () => {

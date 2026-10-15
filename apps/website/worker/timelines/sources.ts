@@ -21,10 +21,11 @@ import type { TrackerReply } from "../tracker/object.ts";
 import { writeRefs } from "./bookmarks.ts";
 import { pinSourceRoot } from "../retention/work-sources.ts";
 
-// The expiry admission fence belongs to D1, not the Tracker's lifecycle projection.
+// The expiry admission fence and the refs generation (CORE-444) belong to D1,
+// not the Tracker's lifecycle projection.
 export type WorkSourceRow = Omit<
   Selectable<Database["timeline_work_sources"]>,
-  "expiry_requested_at"
+  "expiry_requested_at" | "refs_generation"
 >;
 export interface InitializedWorkSource {
   repo: RepoRow & { source_id: string };
@@ -57,7 +58,7 @@ export async function getWorkSource(
   env: Env,
   repoId: string,
   sourceId: string,
-): Promise<WorkSourceRow | undefined> {
+): Promise<(WorkSourceRow & { refs_generation: number }) | undefined> {
   return db(env.DB)
     .selectFrom("timeline_work_sources")
     .selectAll()
@@ -99,6 +100,7 @@ export async function resolveSource(
       artifacts_name: owned.artifacts_name,
       artifacts_remote: owned.artifacts_remote,
       default_branch: owned.work_ref.replace(/^refs\/heads\//, ""),
+      refs_generation: owned.refs_generation,
     },
     source: {
       sourceId: owned.source_id,

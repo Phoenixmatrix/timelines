@@ -127,6 +127,8 @@ export interface Database {
     archive_disposition: Generated<"landed" | "abandoned" | null>;
     expiry_requested_at: Generated<string | null>;
     error: string | null;
+    /** Bumped after every ref write (CORE-444, worker/objects.ts invalidateRefs). */
+    refs_generation: Generated<number>;
   };
   source_operations: {
     space_id: string;
@@ -267,6 +269,8 @@ export interface Database {
     pushed_bytes: Generated<number>;
     /** Set when deletion starts (CORE-199): missing to readers until the purge removes the row. */
     deleted_at: Generated<string | null>;
+    /** Bumped after every ref write (CORE-444, worker/objects.ts invalidateRefs). */
+    refs_generation: Generated<number>;
   };
   /** Repository deletions and what their purge did (CORE-199, worker/retention/repo-purge.ts). */
   repo_deletions: {

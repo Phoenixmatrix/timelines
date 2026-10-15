@@ -65,7 +65,7 @@ export async function deliverRecoveredSourcePush(
   // This audit always observes the live source, never rewinds it to the
   // historical obligation. The durable plan already exists if observation
   // succeeds but the process disappears before run creation.
-  invalidateRefs(repo.artifacts_name);
+  await invalidateRefs(env.DB, repo.artifacts_name);
   await recordPush(env, repo, actor);
   const previous = await kdb
     .selectFrom("ci_refs")
