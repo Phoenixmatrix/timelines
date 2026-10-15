@@ -623,7 +623,12 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
   console.log(JSON.stringify({ event: `environment.${env.status}`, id: env.id }));
 }
 
-export async function cleanupExpired(): Promise<void> {
+/**
+ * Destroy expired environments and retry incomplete deletions. `orphans: false`
+ * leaves orphaned namespaces to the hourly janitor: retrying each one costs a
+ * few seconds of Cloudflare calls under the registry lock, in every setup.
+ */
+export async function cleanupExpired({ orphans = true } = {}): Promise<void> {
   // Best effort, and before taking the registry lock: its network calls must not
   // stall every setup on this machine. Pruning after it stays safe because ids
   // are random and a released reservation is never re-reserved, so a row the
@@ -647,9 +652,10 @@ export async function cleanupExpired(): Promise<void> {
           await rm(join(registry, "environments", `${env.id}.json`));
         continue;
       }
-      // An orphaned namespace is retried on every sweep, expired or not.
+      // An orphaned namespace is retried on every janitor sweep, expired or not.
       if (
         env.status === "deleted" ||
+        (env.status === "orphaned" && !orphans) ||
         (env.status !== "deleting" && env.status !== "orphaned" && env.expires > Date.now())
       )
         continue;
@@ -689,7 +695,7 @@ async function allocatePort(): Promise<number> {
  */
 export async function sweepBeforeCreate(): Promise<void> {
   try {
-    await cleanupExpired();
+    await cleanupExpired({ orphans: false });
   } catch (error) {
     console.error(
       JSON.stringify({

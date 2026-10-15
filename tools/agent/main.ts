@@ -33,7 +33,7 @@ import { seed } from "./seed.ts";
 import { runE2E } from "./e2e.ts";
 import { runProviderE2E, type AiRun } from "./provider-e2e.ts";
 import { ATLAS_PROVIDER_CONFIG } from "./atlas-provider-e2e.ts";
-import { parseReadyOptions, readinessPlan, type ReadyOptions } from "./ready-plan.ts";
+import { localGates, parseReadyOptions, readinessPlan, type ReadyOptions } from "./ready-plan.ts";
 import { selectReadyE2E, selectsE2E, type ReadyE2ESelection } from "./ready-e2e.ts";
 import {
   AI_STAGES,
@@ -651,6 +651,14 @@ async function retainReports(artifacts: string): Promise<void> {
 
 async function gates(options: ReadyOptions): Promise<void> {
   const plan = await readinessPlan(root, options);
+  if (!options.all) {
+    plan.gates = await localGates(root, plan);
+    // Failed change discovery keeps the full gates (localGates returns them unchanged).
+    if (plan.base !== null)
+      plan.reasons.push(
+        "Local ready skips builds and unrelated tests: remote CI's check, test, build and cli jobs run them.",
+      );
+  }
   // Only explicit --all (or no change list) runs main-only journeys; other full
   // fallbacks still select journeys by path.
   const e2e = plan.e2e ? selectReadyE2E(plan.changed, plan.e2eAll) : null;

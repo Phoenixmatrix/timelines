@@ -22,6 +22,8 @@ export interface ReadyPlan {
   reasons: string[];
   gates: Array<{ name: string; binary: string; args: string[]; cwd: "root" | "website" }>;
   e2e: boolean;
+  /** Workspaces containing a changed path directly, not only through dependency propagation. */
+  direct: string[];
 }
 
 export function parseReadyOptions(args: readonly string[]): ReadyOptions {
@@ -68,6 +70,18 @@ interface Manifest {
   peerDependencies?: Record<string, string>;
   optionalDependencies?: Record<string, string>;
 }
+
+const labels: Record<Workspace, string> = {
+  "apps/cli": "cli",
+  "tools/agent": "agent",
+  "tools/preview": "preview",
+  "tools/remote": "remote",
+  "apps/website": "website",
+  "apps/site": "site",
+  "packages/formats": "formats",
+  "packages/testing": "testing",
+  "packages/utils": "utils",
+};
 
 const exec = promisify(execFile);
 const gate = (name: string, args: string[]): ReadyPlan["gates"][number] => ({
@@ -152,6 +166,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     reasons: [],
     gates: [],
     e2e: false,
+    direct: [],
   };
   const full = (reason: string, e2eAll = false): ReadyPlan => {
     plan.full = true;
@@ -188,6 +203,11 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
       git(["ls-files", "--others", "--exclude-standard", "-z"]),
     ]);
     plan.changed = [...new Set(lists.flatMap((list) => list.split("\0").filter(Boolean)))].sort();
+    plan.direct = WORKSPACES.filter((workspace) =>
+      plan.changed.some(
+        (path) => path.startsWith(`${workspace}/`) && !documentation(path) && !agentConfig(path),
+      ),
+    );
   } catch (error) {
     return full(
       `Cannot discover changes against ${options.base}: ${error instanceof Error ? error.message : String(error)}`,
@@ -337,17 +357,6 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
       "Content-only audited stylesheets: retain whole website tests/build/types and frontend E2E; omit unrelated implicit agent/preview consumers.",
     );
   plan.gates.push(gate("check", ["check"]));
-  const labels: Record<Workspace, string> = {
-    "apps/cli": "cli",
-    "tools/agent": "agent",
-    "tools/preview": "preview",
-    "tools/remote": "remote",
-    "apps/website": "website",
-    "apps/site": "site",
-    "packages/formats": "formats",
-    "packages/testing": "testing",
-    "packages/utils": "utils",
-  };
   for (const workspace of WORKSPACES) {
     if (!affected.has(workspace)) continue;
     const manifest = manifests.get(workspace)!;
@@ -378,4 +387,80 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     `Unaffected workspaces skipped: ${WORKSPACES.filter((workspace) => !affected.has(workspace)).join(", ") || "none"}.`,
   );
   return plan;
+}
+
+/**
+ * What local `ready` runs instead of the plan's gates: remote CI runs the full tests and builds,
+ * so keep the cheap checks and typechecks, plus the tests related to the change. Website unit
+ * tests follow Vitest's changed-file graph, its browser tests are picked by colocated path, and
+ * other directly changed workspaces keep their own tests. Workspaces only reached through
+ * dependency propagation get no tests. `--all` is not slimmed by the caller.
+ */
+export async function localGates(root: string, plan: ReadyPlan): Promise<ReadyPlan["gates"]> {
+  if (plan.base === null) return plan.gates;
+  const kept = plan.gates.filter(
+    ({ name }) => name !== "tests" && name !== "build" && !/-(?:tests|build)$/.test(name),
+  );
+  const tests: ReadyPlan["gates"] = [];
+  for (const workspace of WORKSPACES) {
+    if (!plan.direct.includes(workspace)) continue;
+    const label = labels[workspace];
+    if (workspace === "apps/website") {
+      // `vp run website#test` does not forward extra Vitest arguments, so run its script directly.
+      const runner = (name: string, args: string[]): ReadyPlan["gates"][number] => ({
+        name,
+        binary: "node",
+        args: ["../../tools/agent/website-tests.ts", ...args],
+        cwd: "website",
+      });
+      tests.push(
+        runner("website-tests", [
+          "--project",
+          "unit",
+          `--changed=${plan.base}`,
+          "--passWithNoTests",
+        ]),
+      );
+      const browser = new Set<string>();
+      for (const path of plan.changed) {
+        if (!path.startsWith("apps/website/src/")) continue;
+        const relative = path.slice("apps/website/".length);
+        if (relative.endsWith(".browser.test.tsx")) {
+          if (await exists(join(root, path))) browser.add(relative);
+        } else if (/\.(?:ts|tsx|css)$/.test(relative) && !testOnly(relative)) {
+          const candidate = relative.replace(/\.[^./]+$/, ".browser.test.tsx");
+          if (await exists(join(root, "apps/website", candidate))) browser.add(candidate);
+        }
+      }
+      if (browser.size)
+        tests.push(
+          runner("website-browser-tests", ["--project", "browser", ...[...browser].sort()]),
+        );
+      continue;
+    }
+    const existing = plan.gates.find(({ name }) => name === `${label}-tests`);
+    if (existing) {
+      tests.push(existing);
+      continue;
+    }
+    if (!plan.gates.some(({ name }) => name === "tests")) continue;
+    try {
+      const manifest: Manifest = JSON.parse(
+        await readFile(join(root, workspace, "package.json"), "utf8"),
+      );
+      if (manifest.scripts?.test) tests.push(task(`${label}-tests`, `${manifest.name}#test`));
+    } catch {
+      // An unreadable manifest already forced the full plan; its tests run remotely.
+    }
+  }
+  return [...kept, ...tests];
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }

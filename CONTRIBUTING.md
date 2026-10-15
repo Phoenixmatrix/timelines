@@ -549,10 +549,17 @@ retention matrix: it expires and purges real source data, removes timeline histo
 and checks the explicit expired-source browser state. Full profiles keep both
 journeys.
 
+Local `ready` does not repeat what remote CI runs. It keeps the checks and typechecks
+above, the tests related to the change (website unit tests through Vitest's
+changed-file graph, the colocated `*.browser.test.tsx` of changed website sources, and
+the tests of directly changed workspaces) and the selected E2E journeys. It skips
+builds and the tests of workspaces reached only through dependencies: remote CI's
+check, test, build and cli jobs run the full suite and builds.
+
 Unchanged workspaces are skipped, not reported as tested. The selection and its
 reasons print before execution and are saved as `selection.json` beside the gate
 logs under `.gitmatrix-agent/artifacts/gates-<timestamp>/`. `--all` restores complete
-workspace checks, tests/builds and all non-AI CLI/API/browser/mirror E2E, main-only
+workspace checks, full tests/builds and all non-AI CLI/API/browser/mirror E2E, main-only
 journeys included.
 Gate `completion.json` records per-gate `elapsedMs`, `wallMs` and `outcome`, plus
 total elapsed time and completion status, including failed cases. These describe

@@ -51,8 +51,10 @@ release. Add a tool name to select part of the graph. For example, run
   with `agent inspect` or scoped tracker/issue commands.
 - Before completion, inspect **`vp run ready --dry-run`**, then run
   **`vp run ready`**. Plain `ready` is the required, automatically selective
-  gate: it runs uncached checks and workspace tests/builds selected from changed
-  paths and dependencies, plus only the non-AI E2E journeys of the areas those
+  gate: it runs uncached checks and typechecks selected from changed paths and
+  dependencies, the tests related to the change (website unit tests via Vitest's
+  changed-file graph, colocated browser tests, and the tests of directly changed
+  workspaces; remote CI runs the full test suite and builds), plus only the non-AI E2E journeys of the areas those
   paths touch (with their prerequisite scenarios). Do not routinely prepend or append
   blanket `vp check`, `vp test`, recursive builds or `vp run agent test`;
   targeted checks for development/debugging are still appropriate.
