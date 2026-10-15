@@ -2,6 +2,8 @@
 // setup overlaps the gates, what a failure of either means, how cleanup runs, and when the
 // seed's idempotency check is worth its time. main.ts supplies the real steps; tests fake them.
 
+import type { EventEmitter } from "node:events";
+import { closeSync, writeSync } from "node:fs";
 import { agentConfig, documentation } from "./ready-plan.ts";
 
 /** Either environment limit (installation quota or machine maximum), as main-e2e.ts detects them. */
@@ -26,7 +28,10 @@ export interface OverlapSteps<S> {
    * Aborting `signal` kills the step in flight, so the setup settles soon after.
    */
   startLive(signal?: AbortSignal): Promise<S>;
-  /** The error a started setup ended with, if any. */
+  /**
+   * The error a started setup ended with, if any, leaving out one the abort caused (a step it
+   * interrupted). A step the abort cannot interrupt fails for real even after it.
+   */
   setupFailure(setup: S): unknown;
   /** Scenarios, shutdown, cleanup and completion. `overlapped` is false for a sequential run. */
   finishLive(setup: S, overlapped: boolean): Promise<void>;
@@ -53,21 +58,10 @@ export interface OverlapOutcome {
  */
 export async function overlapSetup<S>(steps: OverlapSteps<S>): Promise<OverlapOutcome> {
   const controller = new AbortController();
-  // Whether the setup ended on its own; an error after the abort is the abort's doing.
-  let settledBeforeAbort = false;
-  const settle = () => {
-    settledBeforeAbort = !controller.signal.aborted;
-  };
   // Attached before anything awaits, so a setup that fails during the gates never goes unhandled.
   const setup = steps.startLive(controller.signal).then(
-    (state): { state: S; error?: undefined } => {
-      settle();
-      return { state };
-    },
-    (error: unknown): { state: undefined; error: unknown } => {
-      settle();
-      return { state: undefined, error };
-    },
+    (state): { state: S; error?: undefined } => ({ state }),
+    (error: unknown): { state: undefined; error: unknown } => ({ state: undefined, error }),
   );
   let gateFailure: { error: unknown } | undefined;
   try {
@@ -82,7 +76,10 @@ export async function overlapSetup<S>(steps: OverlapSteps<S>): Promise<OverlapOu
   const error = state === undefined ? settled.error : steps.setupFailure(state);
   if (gateFailure) {
     const errors: unknown[] = [gateFailure.error];
-    if (error !== undefined && settledBeforeAbort) errors.push(error);
+    // The abort's own reason is not a setup failure; setupFailure has already left out the
+    // other errors the abort caused, so whatever remains failed for real (a provisioning that
+    // left "cleanup remains pending", say), however late it settled.
+    if (error !== undefined && error !== controller.signal.reason) errors.push(error);
     if (state !== undefined) {
       try {
         await steps.abortLive(state);
@@ -159,4 +156,80 @@ export function backgroundCleanupSpawn(input: {
     command: input.execPath,
     args: [...input.execArgv, input.script, "destroy-environment", input.id],
   };
+}
+
+/**
+ * The detached cleanup's handoff (see destroyExclusively): it writes this line on fd 3 once it
+ * holds the environment's destroy lock and the journal says "deleting", then closes fd 3.
+ */
+export const HANDOFF_LINE = "locked";
+const HANDOFF_FD = 3;
+/**
+ * Set only in the detached cleanup's environment. A destroy-environment started any other way
+ * has no pipe there, and fd 3 may then be one of Node's own descriptors: never write to it.
+ */
+export const HANDOFF_ENV = "GITMATRIX_CLEANUP_HANDOFF";
+
+/** The child's side: announce the handoff when the parent asked for it. Never throws. */
+export function announceHandoff(
+  env: NodeJS.ProcessEnv = process.env,
+  io: { write(fd: number, text: string): void; close(fd: number): void } = {
+    write: (fd, text) => writeSync(fd, text),
+    close: closeSync,
+  },
+): void {
+  if (env[HANDOFF_ENV] !== "1") return;
+  try {
+    io.write(HANDOFF_FD, `${HANDOFF_LINE}\n`);
+  } catch {
+    // A parent that is gone falls back or leaves "deleting" to the sweeps: destroy anyway.
+  }
+  try {
+    io.close(HANDOFF_FD);
+  } catch {
+    /* already closed */
+  }
+}
+
+/** Whether the parent waited for its detached cleanup in vain. */
+export type HandoffOutcome = "locked" | "exited" | "timeout";
+
+/**
+ * The parent's side: resolves "locked" once the child announces it, "exited" when the pipe
+ * closes first (the child died, or exited without the lock: the pipe closes after any line it
+ * wrote, so a late exit event never hides an announcement), "timeout" after `timeoutMs`.
+ * Rejects when the child cannot be started. Only "locked" lets the parent leave the destroy
+ * to the child; otherwise the parent kills it and destroys in the foreground.
+ */
+export function awaitHandoff(input: {
+  channel: EventEmitter;
+  child: EventEmitter;
+  timeoutMs: number;
+}): Promise<HandoffOutcome> {
+  const { channel, child, timeoutMs } = input;
+  return new Promise<HandoffOutcome>((accept, reject) => {
+    let received = "";
+    const settle = (finish: () => void) => {
+      clearTimeout(timer);
+      channel.off("data", data);
+      channel.off("end", closed);
+      channel.off("close", closed);
+      channel.off("error", closed);
+      child.off("error", failed);
+      finish();
+    };
+    const data = (chunk: Buffer | string) => {
+      // One short line is expected; anything longer is not the protocol.
+      received = (received + String(chunk)).slice(-1024);
+      if (received.split("\n").slice(0, -1).includes(HANDOFF_LINE)) settle(() => accept("locked"));
+    };
+    const closed = () => settle(() => accept("exited"));
+    const failed = (error: unknown) => settle(() => reject(error));
+    const timer = setTimeout(() => settle(() => accept("timeout")), timeoutMs);
+    channel.on("data", data);
+    channel.once("end", closed);
+    channel.once("close", closed);
+    channel.once("error", closed);
+    child.once("error", failed);
+  });
 }

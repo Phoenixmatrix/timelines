@@ -15,7 +15,6 @@ import {
   destroyExclusively,
   listEnvironments,
   loadEnvironment,
-  markDeleting,
   markServer,
   privateJson,
   redact,
@@ -34,6 +33,9 @@ import { parseReservationArgs, reconcileReservations } from "./reservations.ts";
 import { pruneBrowsers } from "./browsers.ts";
 import { seed } from "./seed.ts";
 import {
+  HANDOFF_ENV,
+  announceHandoff,
+  awaitHandoff,
   backgroundCleanupSpawn,
   cleanupMode,
   gatesWriteBindingTypes,
@@ -53,6 +55,7 @@ import {
 } from "./ready-plan.ts";
 import {
   e2eScenarioNames,
+  e2eWorkers,
   selectReadyE2E,
   selectsE2E,
   type ReadyE2ESelection,
@@ -522,6 +525,8 @@ interface LiveState extends LiveOptions {
   failures: unknown[];
   /** The error that ended setup (prepare through seed), if any; also the first of `failures`. */
   setupFailure?: unknown;
+  /** `setupFailure` came from a step the abort interrupted, not from the setup itself. */
+  setupAbortCaused?: boolean;
   /** Set once a detached cleanup process owns the environment's deletion. */
   cleanupLog?: string;
 }
@@ -531,6 +536,8 @@ async function liveTest(
   options?: TestAiOptions,
   readyE2E?: ReadyE2ESelection,
 ): Promise<void> {
+  // Refuse a malformed worker count before anything is provisioned.
+  e2eWorkers();
   let run: AiRun | undefined;
   if (ai) {
     const selection = await selectAiStages(options ?? parseTestAiOptions([]));
@@ -582,6 +589,8 @@ async function startLive(options: LiveOptions): Promise<LiveState> {
     failures: [],
   };
   const { timed } = state;
+  // Whether the step in flight is one an abort interrupts (and so fails because of it).
+  let interruptible = true;
   try {
     await timed("prepare", () =>
       prepare({ skipTypes: options.skipTypes, overlapped: options.overlapped, signal }),
@@ -589,9 +598,13 @@ async function startLive(options: LiveOptions): Promise<LiveState> {
     signal?.throwIfAborted();
     // Not interruptible: a failed provisioning destroys what it made in the foreground, and the
     // remote calls take seconds. Whatever it made is torn down with the rest after an abort.
+    interruptible = false;
     const env = (state.env = await timed("provision", () => createEnvironment(root, true, ai)));
+    interruptible = true;
     signal?.throwIfAborted();
+    interruptible = false;
     const ctx = (state.ctx = await context(env));
+    interruptible = true;
     // Atlas settings per owning account: the degraded providers test-ai verifies.
     if (ai) ctx.env.GITMATRIX_ATLAS_CONFIG = JSON.stringify(ATLAS_PROVIDER_CONFIG);
     state.artifacts = ctx.artifacts;
@@ -616,10 +629,11 @@ async function startLive(options: LiveOptions): Promise<LiveState> {
       return fixtures;
     });
   } catch (error) {
-    // After an abort, whatever failed did so because of it: report the abort.
-    const failure = signal?.aborted ? signal.reason : error;
-    state.setupFailure = failure;
-    state.failures.push(failure);
+    // Kept as it is: a real failure must not be replaced by the abort. It is the abort's doing
+    // only when the abort was signalled before this rejection and could reach the step.
+    state.setupFailure = error;
+    state.setupAbortCaused = interruptible && signal?.aborted === true;
+    state.failures.push(error);
   }
   return state;
 }
@@ -641,8 +655,12 @@ async function teardownLive(state: LiveState, mode: CleanupMode): Promise<void> 
   try {
     await timed("cleanup", async () => {
       if (!env) return;
-      if (mode === "background" && (await startBackgroundCleanup(state, env))) return;
-      await registryLock(() => destroyEnvironment(env));
+      if (mode === "foreground") return await registryLock(() => destroyEnvironment(env));
+      if (await startBackgroundCleanup(state, env)) return;
+      // The child never held the destroy lock: destroy here under that lock, never the
+      // registry lock, which a contended machine may hold for minutes.
+      const destroyed = await destroyExclusively(env);
+      if (destroyed) Object.assign(env, destroyed);
     });
   } catch (error) {
     failures.push(error);
@@ -651,12 +669,18 @@ async function teardownLive(state: LiveState, mode: CleanupMode): Promise<void> 
 
 /**
  * Destroys the environment in a detached child so the result is not held for the 11-48 s of
- * remote deletions. The server is already stopped; the journal is marked "deleting" before the
- * spawn, so a child that dies at any point leaves it to the next sweep (the hourly janitor's,
- * or any setup's on this machine), which finishes the destroy.
+ * remote deletions. The child owns the destroy: holding the environment's destroy lock, it
+ * marks the journal "deleting" and only then announces "locked" on fd 3, so a child that dies
+ * afterwards leaves the journal to the next sweep (the hourly janitor's, or any setup's on this
+ * machine). Resolves false when no announcement came (the child died first, or did not take
+ * the lock within a minute): the child is killed and the caller destroys in the foreground.
+ * A parent killed before it spawns the child leaves the journal "ready" until it expires, and
+ * the next sweep after that destroys it (as before ready cleaned up in the background); once
+ * spawned, the detached child carries on without its parent.
  */
 async function startBackgroundCleanup(state: LiveState, env: Environment): Promise<boolean> {
   const log = join(state.artifacts, "cleanup.log");
+  let child: ChildProcess | undefined;
   try {
     const { command: binary, args: spawnArgs } = backgroundCleanupSpawn({
       execPath: process.execPath,
@@ -664,33 +688,45 @@ async function startBackgroundCleanup(state: LiveState, env: Environment): Promi
       script: fileURLToPath(import.meta.url),
       id: env.id,
     });
-    await markDeleting(env);
     await mkdir(state.artifacts, { recursive: true, mode: 0o700 });
     const descriptor = openSync(log, "a", 0o600);
     try {
-      const child = spawn(binary, spawnArgs, {
+      child = spawn(binary, spawnArgs, {
         cwd: root,
-        env: process.env,
+        env: { ...process.env, [HANDOFF_ENV]: "1" },
         detached: true,
-        stdio: ["ignore", descriptor, descriptor],
+        stdio: ["ignore", descriptor, descriptor, "pipe"],
       });
-      await new Promise<void>((accept, reject) => {
-        child.once("error", reject);
-        child.once("spawn", accept);
-      });
-      child.unref();
-      state.cleanupLog = log;
-      console.log(JSON.stringify({ event: "cleanup.background", id: env.id, pid: child.pid, log }));
     } finally {
       closeSync(descriptor);
     }
-    return true;
+    const outcome = await awaitHandoff({
+      channel: child.stdio[3]!,
+      child,
+      timeoutMs: 60_000,
+    });
+    if (outcome === "locked") {
+      state.cleanupLog = log;
+      console.log(JSON.stringify({ event: "cleanup.background", id: env.id, pid: child.pid, log }));
+      return true;
+    }
+    console.error(JSON.stringify({ event: "cleanup.background-failed", id: env.id, outcome, log }));
   } catch (error) {
     console.error(
       redact(`Background cleanup could not start (${String(error)}); cleaning up now.`),
     );
-    return false;
+  } finally {
+    child?.stdio[3]?.destroy();
+    child?.unref();
   }
+  // Never two destroys at once: the child (and its lock helper) goes before the foreground one.
+  if (child?.pid !== undefined && child.exitCode === null && child.signalCode === null)
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      /* exited */
+    }
+  return false;
 }
 
 /**
@@ -999,6 +1035,8 @@ async function gates(options: ReadyOptions, foregroundCleanup = false): Promise<
   try {
     // An empty selection, or one --resume reused entirely, provisions no environment.
     if (liveE2E && selectsE2E(liveE2E)) {
+      // Refuse a malformed worker count before any gate runs or anything is provisioned.
+      e2eWorkers();
       // The environment's setup (about a minute, several when the machine is loaded) needs
       // nothing from the gates, so it starts first and the scenarios start when both are done.
       let attempt = 0;
@@ -1022,7 +1060,7 @@ async function gates(options: ReadyOptions, foregroundCleanup = false): Promise<
             }),
             ...(signal ? { signal } : {}),
           })),
-        setupFailure: (state) => state.setupFailure,
+        setupFailure: (state) => (state.setupAbortCaused ? undefined : state.setupFailure),
         finishLive: (state, overlapped) => finishLive(state, overlapped),
         abortLive,
       });
@@ -1154,7 +1192,8 @@ async function destroyCurrent(): Promise<void> {
  * The detached cleanup that `ready` starts after it has its result (see startBackgroundCleanup).
  * It takes no registry lock: destroyEnvironment is idempotent per resource and its journal
  * writes merge deleted resources, and holding the lock for the 11-48 s of remote deletions
- * would stall the next setup on this machine.
+ * would stall the next setup on this machine. It announces the handoff on fd 3 once it holds
+ * the environment's destroy lock and has marked the journal "deleting".
  */
 async function destroyById(id: string | undefined): Promise<void> {
   if (!id || !/^gma-[a-z0-9]{8,10}-[a-f0-9]{12}$/.test(id))
@@ -1164,7 +1203,7 @@ async function destroyById(id: string | undefined): Promise<void> {
   ) as Environment;
   validateEnvironment(env);
   if (env.id !== id) throw new Error("Mismatched ownership journal.");
-  await destroyExclusively(env);
+  await destroyExclusively(env, () => announceHandoff());
 }
 
 try {

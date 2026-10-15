@@ -20,6 +20,7 @@ import {
 } from "./environment.ts";
 import type { Environment } from "./environment.ts";
 import { parseEnvironmentLimits } from "./quota.ts";
+import { HANDOFF_ENV, awaitHandoff } from "./live-run.ts";
 import { developmentEnvironment } from "../../apps/website/vite/environment.ts";
 
 function owned(root = "/tmp/agent-worktree"): Environment {
@@ -1866,32 +1867,82 @@ console.log(args[0] === 'auth'
   }
 });
 
-await test("a journal marked deleting before the detached cleanup is left to every sweep", async () => {
-  const { home, environment, run, rows } = await quotaHome("gitmatrix-mark-deleting-");
+await test("the detached cleanup marks the journal deleting under its lock, then announces", async () => {
+  const { home, env, environment, run, rows } = await quotaHome("gitmatrix-cleanup-handoff-");
   try {
     const root = join(home, "worktree");
     await mkdir(root);
     await run(
       `import {createEnvironment} from ${JSON.stringify(environment)}; await createEnvironment(${JSON.stringify(root)});`,
     );
-    const local = join(root, ".gitmatrix-agent/environment.json");
-    const env = JSON.parse(await readFile(local, "utf8")) as Environment;
-    const journal = join(home, ".local/state/gitmatrix-agent/environments", `${env.id}.json`);
-    const sweep = `import {cleanupExpired} from ${JSON.stringify(environment)}; await cleanupExpired();`;
-    // Ready and unexpired: a sweep leaves it alone.
-    await run(sweep);
-    assert.equal((JSON.parse(await readFile(journal, "utf8")) as Environment).status, "ready");
-    // ready marks it before spawning the child; the child then dies before doing anything.
-    await run(
-      `import {markDeleting} from ${JSON.stringify(environment)}; await markDeleting(${JSON.stringify(env)});`,
+    const created = JSON.parse(
+      await readFile(join(root, ".gitmatrix-agent/environment.json"), "utf8"),
+    ) as Environment;
+    const directory = join(home, ".local/state/gitmatrix-agent/environments");
+    const journal = join(directory, `${created.id}.json`);
+    // Remote deletions wait for this file, so the destroy is observed in flight.
+    const release = join(home, "release");
+    await writeFile(
+      join(home, "bin/cf"),
+      `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] !== 'auth') while (!fs.existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+console.log(args[0] === 'auth'
+  ? JSON.stringify({ authenticated: true, tokenValid: true, accounts: [{ id: '${"a".repeat(32)}' }] })
+  : args.includes('list') ? '[]' : '{}');
+`,
+      { mode: 0o700 },
     );
-    const marked = JSON.parse(await readFile(journal, "utf8")) as Environment;
-    assert.equal(marked.status, "deleting");
-    assert.equal(marked.quota?.state, "reserved");
-    await run(sweep);
-    const swept = JSON.parse(await readFile(journal, "utf8")) as Environment;
-    assert.equal(swept.status, "deleted");
-    assert.equal(swept.resources.artifacts, "deleted");
+    const liveRun = fileURLToPath(new URL("./live-run.ts", import.meta.url));
+    const announced = join(home, "journal-at-announcement.json");
+    // As main.ts's destroy-environment does it, with the pipe and variable ready sets.
+    const child = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        // Records the journal as it stands when the child announces, before destroyEnvironment's
+        // own writes, in a file written before the announcement (two pipes have no common order).
+        `import {copyFileSync} from "node:fs"; import {destroyExclusively} from ${JSON.stringify(environment)}; import {announceHandoff} from ${JSON.stringify(liveRun)}; await destroyExclusively(${JSON.stringify(created)}, () => { copyFileSync(${JSON.stringify(journal)}, ${JSON.stringify(announced)}); announceHandoff(); });`,
+      ],
+      { env: { ...env, [HANDOFF_ENV]: "1" }, stdio: ["ignore", "pipe", "pipe", "pipe"] },
+    );
+    let output = "";
+    child.stdout!.on("data", (chunk: Buffer) => (output += chunk.toString()));
+    child.stderr!.on("data", (chunk: Buffer) => (output += chunk.toString()));
+    const exited = once(child, "exit");
+    try {
+      assert.equal(
+        await awaitHandoff({ channel: child.stdio[3]!, child, timeoutMs: 60_000 }),
+        "locked",
+        output,
+      );
+      const marked = JSON.parse(await readFile(announced, "utf8")) as Environment;
+      assert.equal(marked.status, "deleting");
+      assert.equal(marked.quota?.state, "reserved");
+      // The child still holds the destroy lock: a sweep would skip this journal.
+      let busy = false;
+      await assert.rejects(
+        withFileLock(
+          join(directory, `${created.id}.destroy.lock`),
+          0,
+          async () => {},
+          () => {
+            busy = true;
+            throw new Error("busy");
+          },
+        ),
+        /busy/,
+      );
+      assert.ok(busy);
+    } finally {
+      await writeFile(release, "");
+    }
+    const [code] = await exited;
+    assert.equal(code, 0, output);
+    const finished = JSON.parse(await readFile(journal, "utf8")) as Environment;
+    assert.equal(finished.status, "deleted");
     assert.deepEqual(await rows(), {});
   } finally {
     await rm(home, { recursive: true, force: true });

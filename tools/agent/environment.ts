@@ -237,6 +237,8 @@ export async function command(
       process.once("SIGINT", interrupt);
       process.once("SIGTERM", interrupt);
       options.signal?.addEventListener("abort", interrupt, { once: true });
+      // The hosted branch awaits its credentials after the first check: an abort meanwhile.
+      if (options.signal?.aborted) interrupt();
       const timer = setTimeout(interrupt, options.timeout ?? 120_000);
       const collect = (chunk: Buffer, standard: boolean) => {
         if (output.length + chunk.length > 16 * 1024 * 1024) {
@@ -634,20 +636,6 @@ function beginDeleting(env: Environment): void {
   else if (env.resources.artifacts === "orphaned") env.status = "orphaned";
 }
 
-/**
- * Marks the journal "deleting" under the registry lock, as destroyEnvironment's first write
- * does, before ready hands the destroy to a detached child: a child that dies before its own
- * first write still leaves a journal every sweep, the hourly janitor's included, destroys.
- */
-export async function markDeleting(env: Environment): Promise<void> {
-  validateEnvironment(env);
-  if (env.status === "deleted") return;
-  await registryLock(async () => {
-    beginDeleting(env);
-    await persist(env);
-  });
-}
-
 /** The lock one environment's destroy holds, apart from the registry lock. */
 function destroyLockPath(id: string): string {
   return join(registry, "environments", `${id}.destroy.lock`);
@@ -686,13 +674,26 @@ async function unlessDestroying<T>(
  * Destroy under the environment's own lock, without the registry lock: ready's background
  * cleanup deletes for up to a minute, and must not stall the next setup on this machine.
  * Registry-locked work on this journal (sweeps, adoption) skips it while the lock is held.
+ * Holding the lock, it marks the journal "deleting" (destroyEnvironment's first write) and
+ * then calls `onLocked`, where ready's detached cleanup announces the handoff: from then on a
+ * process that dies leaves a journal every sweep, the hourly janitor's included, finishes.
+ * Resolves to the journal as the destroy left it (null if it was already removed).
  */
-export async function destroyExclusively(env: Environment): Promise<void> {
+export async function destroyExclusively(
+  env: Environment,
+  onLocked?: () => void,
+): Promise<Environment | null> {
   await mkdir(join(registry, "environments"), { recursive: true, mode: 0o700 });
-  await withFileLock(destroyLockPath(env.id), 300, async () => {
+  return withFileLock(destroyLockPath(env.id), 300, async () => {
     // A sweep may have destroyed it while this waited: act on the journal as it is now.
     const current = await recordAt(join(registry, "environments", `${env.id}.json`));
+    if (current && current.status !== "deleted") {
+      beginDeleting(current);
+      await persist(current);
+    }
+    onLocked?.();
     if (current) await destroyEnvironment(current);
+    return current;
   });
 }
 

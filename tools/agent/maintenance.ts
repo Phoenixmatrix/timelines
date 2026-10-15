@@ -7,11 +7,10 @@ import { command, registry, listEnvironments } from "./environment.ts";
 const unitName = "gitmatrix-agent-cleanup";
 const unitDirectory = join(homedir(), ".config", "systemd", "user");
 
-/** Install outside the worktree: cleanup still runs after a worktree is removed. */
 /**
  * What the hourly janitor runs, copied out of the worktree that installs it. Every
- * `setup` reinstalls it, so these files' runtime imports must stay within this list
- * (maintenance.test.ts checks).
+ * `setup` reinstalls it, so the runtime imports reachable from environment.ts (which
+ * janitor.ts imports) must stay within this list (maintenance.test.ts checks).
  */
 export const JANITOR_FILES = [
   "quota.ts",
@@ -21,6 +20,24 @@ export const JANITOR_FILES = [
   "environment.ts",
 ] as const;
 
+/**
+ * What the remote janitor copies besides JANITOR_FILES, relative to tools/agent. Its
+ * entry.ts imports only Node builtins before dispatch; the runtime imports reachable from
+ * it on the cleanup path must stay within both lists (maintenance.test.ts checks).
+ */
+export const REMOTE_JANITOR_ONLY = [
+  "entry.ts",
+  "remote.ts",
+  "remote-build.ts",
+  "remote-environment.ts",
+  "remote-sync.ts",
+  "remote-protocol.ts",
+  "maintenance.ts",
+  "types.ts",
+  "../remote/cloudflare.config.ts",
+] as const;
+
+/** Install outside the worktree: cleanup still runs after a worktree is removed. */
 export async function installMaintenance(): Promise<void> {
   // The hosted container's absolute lifetime is enforced by its owning DO alarm.
   if (process.env.GITMATRIX_REMOTE_HOSTED === "1") return;
@@ -121,22 +138,7 @@ export async function installRemoteMaintenance(root: string): Promise<void> {
   await mkdir(destination, { recursive: true, mode: 0o700 });
   // This entry imports only Node builtins before dispatch. Keep its complete
   // dependency closure outside the worktree, including maintenance's imports.
-  for (const name of [
-    "entry.ts",
-    "remote.ts",
-    "remote-build.ts",
-    "remote-environment.ts",
-    "remote-sync.ts",
-    "remote-protocol.ts",
-    "maintenance.ts",
-    "environment.ts",
-    "quota.ts",
-    "reservations.ts",
-    "heavy.ts",
-    "cloudflare-delete.ts",
-    "types.ts",
-    "../remote/cloudflare.config.ts",
-  ]) {
+  for (const name of [...JANITOR_FILES, ...REMOTE_JANITOR_ONLY]) {
     const target = join(destination, name);
     await mkdir(dirname(target), { recursive: true, mode: 0o700 });
     const temporary = `${target}.${process.pid}.tmp`;

@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import {
+  HANDOFF_ENV,
+  announceHandoff,
+  awaitHandoff,
   backgroundCleanupSpawn,
   cleanupMode,
   gatesWriteBindingTypes,
@@ -150,6 +156,29 @@ await test("both failing reports the gate failure with the setup error", async (
   assert.ok(calls.includes("abort:3"));
 });
 
+await test("a setup error after the abort is still reported when the abort did not cause it", async () => {
+  const gateError = new Error("gate");
+  const provisionError = new AggregateError([], "Provisioning failed and cleanup remains pending");
+  const { calls, steps } = harness({
+    gate: async () => {
+      throw gateError;
+    },
+  });
+  // Provisioning takes no signal: it fails on its own, after the abort was signalled.
+  steps.startLive = (signal) =>
+    new Promise<Fake>((accept) =>
+      signal!.addEventListener("abort", () =>
+        setImmediate(() => accept({ id: 8, error: provisionError })),
+      ),
+    );
+  await assert.rejects(overlapSetup(steps), (error) => {
+    assert.ok(error instanceof AggregateError);
+    assert.deepEqual(error.errors, [gateError, provisionError]);
+    return true;
+  });
+  assert.ok(calls.includes("abort:8"));
+});
+
 await test("a failing abort is reported beside the gate error", async () => {
   const gateError = new Error("gate");
   const abortError = new Error("destroy failed");
@@ -258,5 +287,84 @@ await test("the detached cleanup runs the same script on one validated environme
   });
   assert.throws(() =>
     backgroundCleanupSpawn({ execPath: "node", execArgv: [], script: "m.ts", id: "../x" }),
+  );
+});
+
+/** A fake detached child: its fd 3 pipe and its process events. */
+function handoffFake() {
+  return { channel: new PassThrough(), child: new EventEmitter() };
+}
+
+await test("the handoff is the announced line, even split across chunks", async () => {
+  const { channel, child } = handoffFake();
+  const outcome = awaitHandoff({ channel, child, timeoutMs: 5_000 });
+  channel.write("lo");
+  channel.write("cked\n");
+  assert.equal(await outcome, "locked");
+});
+
+await test("a child whose pipe closes without the line has not taken over", async () => {
+  const { channel, child } = handoffFake();
+  const outcome = awaitHandoff({ channel, child, timeoutMs: 5_000 });
+  // Garbage, and the line without its end, are not the announcement.
+  channel.write("unlocked\nlocked");
+  channel.end();
+  assert.equal(await outcome, "exited");
+});
+
+await test("a child that never announces times out", async () => {
+  const { channel, child } = handoffFake();
+  assert.equal(await awaitHandoff({ channel, child, timeoutMs: 20 }), "timeout");
+});
+
+await test("a child that cannot start rejects the handoff", async () => {
+  const { channel, child } = handoffFake();
+  const outcome = awaitHandoff({ channel, child, timeoutMs: 5_000 });
+  const error = new Error("spawn ENOENT");
+  child.emit("error", error);
+  await assert.rejects(outcome, (thrown) => thrown === error);
+});
+
+await test("a real child that exits before announcing is seen as exited", async () => {
+  const child = spawn(process.execPath, ["-e", "process.exit(3)"], {
+    stdio: ["ignore", "ignore", "ignore", "pipe"],
+  });
+  assert.equal(
+    await awaitHandoff({ channel: child.stdio[3]!, child, timeoutMs: 30_000 }),
+    "exited",
+  );
+});
+
+await test("a real child announces only when the parent asked", async () => {
+  const script = `import {announceHandoff} from ${JSON.stringify(new URL("./live-run.ts", import.meta.url).pathname)}; announceHandoff(); setTimeout(() => {}, 200);`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, [HANDOFF_ENV]: "1" },
+    stdio: ["ignore", "ignore", "inherit", "pipe"],
+  });
+  assert.equal(
+    await awaitHandoff({ channel: child.stdio[3]!, child, timeoutMs: 30_000 }),
+    "locked",
+  );
+});
+
+await test("a destroy-environment started by hand never writes to fd 3", () => {
+  const writes: number[] = [];
+  const io = {
+    write: (fd: number) => void writes.push(fd),
+    close: (fd: number) => void writes.push(-fd),
+  };
+  announceHandoff({}, io);
+  assert.deepEqual(writes, []);
+  announceHandoff({ [HANDOFF_ENV]: "1" }, io);
+  assert.deepEqual(writes, [3, -3]);
+  // A parent that is gone does not stop the destroy.
+  announceHandoff(
+    { [HANDOFF_ENV]: "1" },
+    {
+      write: () => {
+        throw new Error("EPIPE");
+      },
+      close: () => {},
+    },
   );
 });
