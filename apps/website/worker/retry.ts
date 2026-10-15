@@ -22,7 +22,10 @@ export interface RetryOptions {
   delays?: readonly number[];
   /** No retry starts later than this after the first attempt (READ_DEADLINE_MS). */
   deadlineMs?: number;
-  /** Named in the warning each retry logs, with `context`. */
+  /**
+   * Named in the warning each retry logs, with `context`: Gitmatrix ids, never the
+   * provider's names, remotes or tokens (server logs are public output).
+   */
   label: string;
   context?: Record<string, unknown>;
   wait?: (ms: number) => Promise<unknown>;
@@ -47,13 +50,34 @@ export async function retrying<T>(work: () => Promise<T>, options: RetryOptions)
       if (delay === undefined || !options.retryable(error) || now() - started + delay > deadline)
         throw error;
       console.warn(`${options.label}: retrying after a transient failure`, {
-        ...options.context,
+        ...withoutProviderMetadata(options.context),
         attempt: attempt + 1,
-        error: String(error),
+        error: redactProvider(String(error)),
       });
       await wait(delay);
     }
   }
+}
+
+/** Context fields naming the storage provider's own handles. */
+const PROVIDER_KEY = /^(?:artifacts_?(?:name|remote)|upstream_?token|remote|token)$/i;
+/** A provider repository name or remote URL inside free text. */
+const PROVIDER_TEXT = [
+  /\bw-[a-f0-9]{32,}\b/g,
+  /https?:\/\/[^\s"<>]*(?:artifacts|cloudflare)[^\s"<>]*/gi,
+];
+
+function redactProvider(text: string): string {
+  return PROVIDER_TEXT.reduce((out, pattern) => out.replace(pattern, "[provider]"), text);
+}
+
+/** The context without provider handles, so no caller can log them by accident. */
+function withoutProviderMetadata(context: Record<string, unknown> = {}): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(context)
+      .filter(([key]) => !PROVIDER_KEY.test(key))
+      .map(([key, value]) => [key, typeof value === "string" ? redactProvider(value) : value]),
+  );
 }
 
 const jitter = (ms: number) => Math.round(ms * (0.75 + Math.random() * 0.5));
