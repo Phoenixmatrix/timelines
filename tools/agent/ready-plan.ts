@@ -1,12 +1,19 @@
 import { execFile } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 
 export interface ReadyOptions {
   all: boolean;
   dryRun: boolean;
   base: string;
+  /**
+   * `ci-tests`: remote CI's test selection. Changes under tools/agent and tools/remote are
+   * classified like any other workspace's instead of forcing full coverage; the full suite
+   * runs on the main watcher.
+   */
+  scope?: "ci-tests";
 }
 
 export interface ReadyPlan {
@@ -22,6 +29,8 @@ export interface ReadyPlan {
   reasons: string[];
   gates: Array<{ name: string; binary: string; args: string[]; cwd: "root" | "website" }>;
   e2e: boolean;
+  /** Workspaces containing a changed path directly, not only through dependency propagation. */
+  direct: string[];
 }
 
 export function parseReadyOptions(args: readonly string[]): ReadyOptions {
@@ -69,6 +78,18 @@ interface Manifest {
   optionalDependencies?: Record<string, string>;
 }
 
+export const labels: Record<Workspace, string> = {
+  "apps/cli": "cli",
+  "tools/agent": "agent",
+  "tools/preview": "preview",
+  "tools/remote": "remote",
+  "apps/website": "website",
+  "apps/site": "site",
+  "packages/formats": "formats",
+  "packages/testing": "testing",
+  "packages/utils": "utils",
+};
+
 const exec = promisify(execFile);
 const gate = (name: string, args: string[]): ReadyPlan["gates"][number] => ({
   name,
@@ -101,9 +122,13 @@ function fullGates(): ReadyPlan["gates"] {
 }
 
 function documentation(path: string): boolean {
-  // Only human-facing documents at known roots; assets and nested Markdown can be runtime inputs.
+  // Only human-facing documents at known names (nothing builds from or reads them); an unknown
+  // root file, assets and nested Markdown can be runtime inputs.
   return (
-    /^(?:README|AGENTS|CONTRIBUTING|CHANGELOG)\.md$/.test(path) ||
+    /^(?:README|AGENTS|CONTRIBUTING|CHANGELOG|CLAUDE|DESIGN|PRODUCT|SELF-HOSTING|ATTRIBUTIONS)\.md$/.test(
+      path,
+    ) ||
+    path === "LICENSE" ||
     WORKSPACES.some((workspace) =>
       new RegExp(`^${workspace}/(?:README|AGENTS|CONTRIBUTING|CHANGELOG)\\.md$`).test(path),
     )
@@ -152,6 +177,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     reasons: [],
     gates: [],
     e2e: false,
+    direct: [],
   };
   const full = (reason: string, e2eAll = false): ReadyPlan => {
     plan.full = true;
@@ -188,6 +214,11 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
       git(["ls-files", "--others", "--exclude-standard", "-z"]),
     ]);
     plan.changed = [...new Set(lists.flatMap((list) => list.split("\0").filter(Boolean)))].sort();
+    plan.direct = WORKSPACES.filter((workspace) =>
+      plan.changed.some(
+        (path) => path.startsWith(`${workspace}/`) && !documentation(path) && !agentConfig(path),
+      ),
+    );
   } catch (error) {
     return full(
       `Cannot discover changes against ${options.base}: ${error instanceof Error ? error.message : String(error)}`,
@@ -239,9 +270,9 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     if (!workspace) return full(`Unclassified or global path: ${path}`);
     if (path === `${workspace}/package.json`)
       return full(`Workspace task/dependency configuration changed: ${path}`);
-    if (workspace === "tools/agent" && !testOnly(path))
+    if (workspace === "tools/agent" && !testOnly(path) && options.scope !== "ci-tests")
       return full(`Shared harness lifecycle or readiness implementation changed: ${path}`);
-    if (workspace === "tools/remote" && !testOnly(path))
+    if (workspace === "tools/remote" && !testOnly(path) && options.scope !== "ci-tests")
       return full(`Shared remote execution backend changed: ${path}`);
     affected.add(workspace);
     if (!testOnly(path) && workspace !== "packages/testing") production.add(workspace);
@@ -292,6 +323,9 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
   }
   dependencies.get("tools/preview")!.add("tools/agent");
   dependencies.get("tools/remote")!.add("tools/agent");
+  // The agent tests import the remote runtime and copy its Worker configuration, and remote CI
+  // runs a tools/remote change by test selection alone; ready's full fallback covers it locally.
+  if (options.scope === "ci-tests") dependencies.get("tools/agent")!.add("tools/remote");
   // The site's gm reference is checked against gm's manifest (apps/cli/src/meta.rs).
   dependencies.get("apps/site")!.add("apps/cli");
   const propagate = (selected: Set<Workspace>) => {
@@ -337,17 +371,6 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
       "Content-only audited stylesheets: retain whole website tests/build/types and frontend E2E; omit unrelated implicit agent/preview consumers.",
     );
   plan.gates.push(gate("check", ["check"]));
-  const labels: Record<Workspace, string> = {
-    "apps/cli": "cli",
-    "tools/agent": "agent",
-    "tools/preview": "preview",
-    "tools/remote": "remote",
-    "apps/website": "website",
-    "apps/site": "site",
-    "packages/formats": "formats",
-    "packages/testing": "testing",
-    "packages/utils": "utils",
-  };
   for (const workspace of WORKSPACES) {
     if (!affected.has(workspace)) continue;
     const manifest = manifests.get(workspace)!;
@@ -378,4 +401,202 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     `Unaffected workspaces skipped: ${WORKSPACES.filter((workspace) => !affected.has(workspace)).join(", ") || "none"}.`,
   );
   return plan;
+}
+
+const WEBSITE = "apps/website/";
+
+/** The one README the website's tests read (worker/ci/config.test.ts). */
+export const WEBSITE_README = `${WEBSITE}README.md`;
+
+/** Configuration or setup that Vitest's changed-file graph cannot be trusted to follow. */
+function websiteConfig(path: string): boolean {
+  const relative = path.slice(WEBSITE.length);
+  return (
+    relative === "vite.config.ts" ||
+    relative.startsWith("vite/") ||
+    /^tsconfig[^/]*\.json$/.test(basename(relative)) ||
+    relative === "worker/testing/runtime.ts"
+  );
+}
+
+/**
+ * The website unit test files whose source names the README (they read it). Vitest's changed
+ * graph does not trace a README read, so these are selected by name.
+ */
+export function readmeTests(root: string): string[] {
+  const found: string[] = [];
+  // The unit project's roots (vite.config.ts `include`); it runs `*.test.ts` only.
+  for (const dir of ["worker", "registry", "src", "shared", "vite"]) {
+    let entries: string[];
+    try {
+      entries = readdirSync(join(root, WEBSITE, dir), { recursive: true, encoding: "utf8" });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".test.ts")) continue;
+      if (entry.split("/").includes("node_modules")) continue;
+      const path = `${dir}/${entry}`;
+      try {
+        if (readFileSync(join(root, WEBSITE, path), "utf8").includes("README.md")) found.push(path);
+      } catch {}
+    }
+  }
+  return found.sort();
+}
+
+/**
+ * Which website tests a change needs when `website-tests` is selected: whether Vitest's
+ * `--changed` graph can be trusted for the unit project, and whether browser tests can be
+ * affected. Shared by remote CI (ci-test.ts) and local `ready`.
+ */
+export function websiteTestSelection(
+  changed: string[],
+  root: string,
+): {
+  unit: "all" | "changed";
+  /** Unit test files, relative to apps/website, to run by name: Vitest does not trace the README read. */
+  files: string[];
+  browser: boolean;
+  reasons: string[];
+} {
+  const web = changed.filter((path) => path.startsWith(WEBSITE));
+  const code = web.filter((path) => path !== WEBSITE_README);
+  const packages = changed.some((path) => path.startsWith("packages/"));
+  // Workspace sources may not be in Vitest's module graph, and fixtures, migrations, seeds,
+  // CSS and configuration cannot be traced through imports.
+  const traceable =
+    web.length > 0 &&
+    !packages &&
+    web.every((path) => path === WEBSITE_README || /\.tsx?$/.test(path)) &&
+    !web.some(websiteConfig);
+  // Browser tests run against worker/testing/browser-api.ts, which imports the real Worker
+  // routes, so any website source change can affect them. Only a unit test file or the README
+  // (read by a unit test) cannot.
+  const browser =
+    packages ||
+    web.length === 0 ||
+    (code.length > 0 &&
+      !code.every((path) => path.endsWith(".test.ts") && !path.endsWith(".browser.test.tsx")));
+  return {
+    unit: traceable ? "changed" : "all",
+    files: changed.includes(WEBSITE_README) ? readmeTests(root) : [],
+    browser,
+    reasons: traceable
+      ? []
+      : [
+          "Website unit tests run in full: a changed path cannot be traced through imports (workspace package, non-TypeScript file, configuration, or no website path).",
+        ],
+  };
+}
+
+/**
+ * What local `ready` runs instead of the plan's gates: remote CI runs the tests and builds, so
+ * keep the cheap checks and typechecks, plus the tests related to the change. Website unit
+ * tests follow Vitest's changed-file graph when every changed path is traceable (else the whole
+ * unit project runs), its browser tests are picked by colocated path, and other directly changed
+ * workspaces keep their own tests, as do a changed package's consumers. A global or unclassified
+ * path, or failed change discovery, keeps the plan's gates unchanged (the same array).
+ * `--all` is not slimmed by the caller.
+ */
+export async function localGates(root: string, plan: ReadyPlan): Promise<ReadyPlan["gates"]> {
+  if (plan.base === null) return plan.gates;
+  if (
+    plan.changed.some(
+      (path) =>
+        !documentation(path) &&
+        !agentConfig(path) &&
+        !WORKSPACES.some((workspace) => path.startsWith(`${workspace}/`)),
+    )
+  )
+    return plan.gates;
+  const kept = plan.gates.filter(
+    ({ name }) => name !== "tests" && name !== "build" && !/-(?:tests|build)$/.test(name),
+  );
+  const tests: ReadyPlan["gates"] = [];
+  const packages = plan.changed.some((path) => path.startsWith("packages/"));
+  for (const workspace of WORKSPACES) {
+    const label = labels[workspace];
+    const direct = plan.direct.includes(workspace);
+    if (workspace === "apps/website") {
+      if (
+        !direct &&
+        !plan.changed.includes(WEBSITE_README) &&
+        !plan.gates.some(({ name }) => name === "website-tests")
+      )
+        continue;
+      // `vp run website#test` does not forward extra Vitest arguments, so run its script directly.
+      const runner = (name: string, args: string[]): ReadyPlan["gates"][number] => ({
+        name,
+        binary: "node",
+        args: ["../../tools/agent/website-tests.ts", ...args],
+        cwd: "website",
+      });
+      const selection = websiteTestSelection(plan.changed, root);
+      tests.push(
+        runner(
+          "website-tests",
+          selection.unit === "changed"
+            ? ["--project", "unit", `--changed=${plan.base}`, "--passWithNoTests"]
+            : ["--project", "unit"],
+        ),
+      );
+      // Vitest ANDs positional filters with `--changed`, so the README's readers get their own run.
+      if (selection.unit === "changed" && selection.files.length)
+        tests.push(runner("website-readme-tests", ["--project", "unit", ...selection.files]));
+      const browser = new Set<string>();
+      for (const path of plan.changed) {
+        if (!path.startsWith("apps/website/src/")) continue;
+        const relative = path.slice("apps/website/".length);
+        if (relative.endsWith(".browser.test.tsx")) {
+          if (await exists(join(root, path))) browser.add(relative);
+        } else if (/\.(?:ts|tsx|css)$/.test(relative) && !testOnly(relative)) {
+          const candidate = relative.replace(/\.[^./]+$/, ".browser.test.tsx");
+          if (await exists(join(root, "apps/website", candidate))) browser.add(candidate);
+        }
+      }
+      if (browser.size)
+        tests.push(
+          runner("website-browser-tests", ["--project", "browser", ...[...browser].sort()]),
+        );
+      continue;
+    }
+    const existing = plan.gates.find(({ name }) => name === `${label}-tests`);
+    if (existing) {
+      if (direct || (packages && workspace !== "apps/cli")) tests.push(existing);
+      continue;
+    }
+    if (!direct || !plan.gates.some(({ name }) => name === "tests")) continue;
+    try {
+      const manifest: Manifest = JSON.parse(
+        await readFile(join(root, workspace, "package.json"), "utf8"),
+      );
+      if (manifest.scripts?.test) tests.push(task(`${label}-tests`, `${manifest.name}#test`));
+    } catch {
+      // An unreadable manifest already forced the full plan; its tests run remotely.
+    }
+  }
+  return [...kept, ...tests];
+}
+
+/** The plan's reasons once `localGates` has slimmed its gates: coverage lines would be false. */
+export function localReasons(reasons: string[]): string[] {
+  return [
+    ...reasons.filter(
+      (reason) =>
+        !reason.startsWith("Full coverage:") &&
+        !reason.startsWith("Build affected production workspaces") &&
+        !reason.startsWith("Skip builds:"),
+    ),
+    "Local ready runs checks, typechecks, related tests and E2E; remote CI's check, test, build and cli jobs run the rest.",
+  ];
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }

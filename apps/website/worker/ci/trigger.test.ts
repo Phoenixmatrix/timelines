@@ -2,8 +2,8 @@
 // serves one ci.yml at every commit, and the variables their jobs get.
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
-import { seedSpaceFixture } from "../testing/spaces.ts";
+import { d1 } from "../testing/d1.ts";
+import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import type { DatabaseSync } from "node:sqlite";
@@ -61,8 +61,8 @@ afterEach(() => {
 const initiatingActor = { id: "ann", credential: { kind: "token" as const, id: "ann-token" } };
 
 async function setup() {
-  const sqlite = migratedDatabase();
-  const registry = migratedRegistryDatabase();
+  const fresh = await freshInstallationDatabases();
+  const { sqlite, registry } = fresh;
   closeControls.push(() => registry.close());
   const created: string[] = [];
   const env = {
@@ -71,7 +71,7 @@ async function setup() {
     CI_RUNNER: "sandbox",
     CI_RUN: { create: async ({ id }: { id: string }) => void created.push(id) },
   } as unknown as Env;
-  closeControls.push(installCutoverTestControl(env).close);
+  closeControls.push(installCutoverTestControl(env, fresh.control).close);
   await initializeFreshSpaceInstallation(env);
   sqlite.exec(`INSERT INTO accounts (id,kind,slug,display_name) VALUES ('ann','user','ann','Ann')`);
   await seedSpaceFixture(env.DB, {

@@ -98,7 +98,16 @@ jobs:
   test:
     verification: context-invariant-v1
     instance: standard-4
-    # The unit half alone takes about 29 minutes (main run #745 timed out at 30).
+    # Run #745 timed out at 30 minutes before tests restored a snapshot of the
+    # fresh installation instead of building one per test. This job now runs only
+    # the tests a change affects (tools/agent/ci-test.ts), measured against the
+    # last verified successful test job, as the build job does; no baseline, a
+    # global or unclassified path, a workspace package.json, the lockfile or this
+    # file select the full suite. The complete unit and browser suites run on
+    # every new main commit in the main-E2E watcher, which files a P0 issue when
+    # they fail.
+    # Full mode (the first run after a spec change, no ancestor baseline, global
+    # paths) must still fit, so keep 60 until its new duration is measured.
     timeout_minutes: 60
     # The browser tests save a picture of the app at their key states here
     # (src/testing/visual.ts); the last step attaches them to the commit's step
@@ -127,7 +136,7 @@ jobs:
       - name: Tests (everything but gm, which the cli job tests)
         run: |
           rm -rf "$GITMATRIX_VISUALS_DIR"
-          vp run --filter '!cli' --concurrency-limit 1 --no-cache test
+          node tools/agent/ci-test.ts
       - name: Upload screenshots for the step view
         run: node tools/visuals/upload.ts
 
@@ -168,10 +177,12 @@ jobs:
       - name: Live isolated CLI, API, browser, CI and mirror journeys (no AI)
         run: vp run agent test
 
-  # On main, once the gates pass: publish gm when its source changed, then
-  # deploy what changed since the deployed Worker version (tools/agent/deploy.ts):
-  # migrations, then the Worker. A changed CI image fails the job after the
-  # rest has shipped; deploy it from a machine with Docker (`vp run deploy`).
+  # On main, once the gates pass: deploy what changed since the deployed Worker
+  # version (tools/agent/deploy.ts): migrations, then the Worker. Then publish gm
+  # when its source changed: its two release builds take about four minutes,
+  # and nothing in the Worker waits for them. A changed CI image fails the job
+  # after the Worker has shipped; deploy it from a machine with Docker (`vp run
+  # deploy`). gm then publishes on the next deploy, which finds it missing.
   # The owner's identifiers (account, hosts, D1 and Secrets Store ids, owner
   # and sender) are this repository's CI secrets, never in the source: the
   # deploy refuses to start without each, or when the ids aren't the live
@@ -199,10 +210,10 @@ jobs:
     steps:
       - name: Install
         run: pnpm install --frozen-lockfile
-      - name: Publish gm if it changed
-        run: node tools/agent/publish-cli.ts
       - name: Deploy what changed
         run: node tools/agent/deploy.ts
+      - name: Publish gm if it changed
+        run: node tools/agent/publish-cli.ts
 
   # A timeline's preview, at each checkpoint and on revival: one Worker Preview
   # per timeline (timeline-<slug>), rebuilt from the checkpoint's commit on

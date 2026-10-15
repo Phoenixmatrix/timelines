@@ -4,10 +4,10 @@ import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { AI_LOG_COMPONENTS, aiLogComponentScope, type AiLogComponent } from "../shared/ai.ts";
 import { aiGatewayOptions, componentOf, type GatewayComponent } from "./ai-gateway.ts";
 import { decide } from "./knowledge/models.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "./testing/d1.ts";
+import { d1 } from "./testing/d1.ts";
 import { installCutoverTestControl } from "./testing/space-cutover.ts";
 import { initializeFreshSpaceInstallation } from "./space-cutover/installation.ts";
-import { seedSpaceFixture } from "./testing/spaces.ts";
+import { freshInstallationDatabases, seedSpaceFixture } from "./testing/spaces.ts";
 import { aiWork } from "./usage/ai.ts";
 import { issueToken } from "./api/tokens.ts";
 import type { Actor } from "./db.ts";
@@ -33,8 +33,8 @@ const COMPONENTS: [GatewayComponent, AiLogComponent][] = [
 ];
 
 async function setup(environment?: "on" | "off") {
-  const sqlite = migratedDatabase();
-  const registry = migratedRegistryDatabase();
+  const fresh = await freshInstallationDatabases();
+  const { sqlite, registry } = fresh;
   databases.push(sqlite, registry);
   const env = {
     DB: d1(sqlite),
@@ -42,7 +42,7 @@ async function setup(environment?: "on" | "off") {
     AI_GATEWAY: "gw",
     ...(environment ? { AI_LOG_BODIES: environment } : {}),
   } as unknown as Env;
-  controls.push(installCutoverTestControl(env).close);
+  controls.push(installCutoverTestControl(env, fresh.control).close);
   await initializeFreshSpaceInstallation(env);
   sqlite.exec(`INSERT INTO accounts (id, kind, slug, display_name) VALUES
     ('same', 'user', 'ann', 'Ann'), ('other', 'user', 'bob', 'Bob');`);

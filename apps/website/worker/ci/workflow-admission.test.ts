@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { withWorkflowCutoverAdmission } from "../durable/cutover-admission.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
+import { freshInstallationDatabases } from "../testing/spaces.ts";
 import { CiRun } from "./workflow.ts";
 import { KnowledgeBuild, type BuildParams } from "../knowledge/build.ts";
 import { RepoPurge, type RepoPurgeParams } from "../retention/repo-purge.ts";
@@ -12,7 +13,7 @@ import type * as Jobs from "./jobs.ts";
 import { settleStoppedJob } from "./jobs.ts";
 import { DatabaseSync } from "node:sqlite";
 import { sandbox } from "./sandbox.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 
 vi.mock("./admission.ts", async (importOriginal) => ({
@@ -74,10 +75,10 @@ function durableSteps() {
 const event = { instanceId: "provider-workflow-id" };
 
 async function nativeAdmission() {
-  const application = migratedDatabase();
-  const registry = migratedRegistryDatabase();
+  const fresh = await freshInstallationDatabases();
+  const { sqlite: application, registry } = fresh;
   const env = { DB: d1(application), REGISTRY_DB: d1(registry) } as Env;
-  const admission = installCutoverTestControl(env);
+  const admission = installCutoverTestControl(env, fresh.control);
   dispose.push(
     () => application.close(),
     () => registry.close(),
@@ -310,14 +311,14 @@ describe("CI current Space authority", () => {
     const prepare = vi.fn(() => {
       throw new Error("Unauthorized business access");
     });
-    const application = migratedDatabase();
-    const registry = migratedRegistryDatabase();
+    const fresh = await freshInstallationDatabases();
+    const { sqlite: application, registry } = fresh;
     dispose.push(
       () => application.close(),
       () => registry.close(),
     );
     const env = { DB: d1(application), REGISTRY_DB: d1(registry) } as Env;
-    const admission = installCutoverTestControl(env);
+    const admission = installCutoverTestControl(env, fresh.control);
     dispose.push(admission.close);
     await initializeFreshSpaceInstallation(env);
     Reflect.set(env, "DB", { prepare });

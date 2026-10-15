@@ -495,7 +495,9 @@ The root formatting/lint/type-aware `vp check` and remote Worker contract
 typecheck always run. The latter generates the credential-free remote bindings
 required by root lint. Website bindings are generated once before consumer checks.
 Other uncached gates follow workspace dependencies, including the harness and
-preview tools' relative imports of website contracts:
+preview tools' relative imports of website contracts. The table is the plan's
+coverage, which `--all` and remote CI draw on; local `ready` runs the slimmed subset
+described after it:
 
 | Change                                                                                                 | Selected coverage                                                                                                                             |
 | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -507,13 +509,14 @@ preview tools' relative imports of website contracts:
 | Tests only                                                                                             | Their workspace's checks/tests; no builds or live E2E                                                                                         |
 | Known root/workspace README, AGENTS, CONTRIBUTING or CHANGELOG                                         | Mandatory checks only; Markdown runtime assets are not exempt                                                                                 |
 | Coding-agent Markdown instructions/skills and `.claude/settings.json`                                  | Mandatory checks only; executable hooks and scripts are not exempt                                                                            |
-| Global/task/dependency configuration, shared harness or unknown paths                                  | Full code gates and every E2E journey except the main-only and the four area-only ones                                                        |
+| Global/task/dependency configuration, shared harness or unknown paths                                  | Full code gates (local `ready` too, for global and unknown paths) and every E2E journey except the main-only and the four area-only ones      |
 | Harness-only files no local run executes (AI stages, deploys, the main E2E watcher, remote helpers, …) | Full code gates; no E2E                                                                                                                       |
 | `--all`, or failed change discovery (no base, unreadable changes, unreadable task graph)               | Full suite, main-only and area-only journeys included                                                                                         |
 
 Content-only edits to the three audited stylesheets
-`apps/website/src/styles/{app,tokens,matrixkit}.css` preserve all website unit and
-browser tests, the website build and selected live E2E. They omit only the implicit
+`apps/website/src/styles/{app,tokens,matrixkit}.css` keep the website tests and build
+in the plan (local `ready` runs the whole website unit project and the colocated browser
+tests) and the selected live E2E. They omit only the implicit
 agent/preview TypeScript consumer checks. Changed imports, URLs or at-rules,
 renames, and mixed or unknown changes widen coverage instead of taking that shortcut.
 
@@ -549,10 +552,22 @@ retention matrix: it expires and purges real source data, removes timeline histo
 and checks the explicit expired-source browser state. Full profiles keep both
 journeys.
 
+Local `ready` does not repeat what remote CI runs. It keeps the checks and typechecks
+above, the tests related to the change and the selected E2E journeys. Website unit
+tests go through Vitest's changed-file graph when every changed path is a traceable
+website TypeScript file, and run the whole unit project otherwise (a change to a
+workspace package, migration, seed, fixture, stylesheet or configuration); the
+colocated `*.browser.test.tsx` of changed website sources run too. Directly changed
+workspaces keep their tests, and so do a changed package's consumers. Local `ready` skips builds
+and the tests of other workspaces reached only through dependencies. A global or
+unknown path, or failed change discovery, keeps the full local gates. Remote CI runs
+only the affected tests (`tools/agent/ci-test.ts`) and its builds; the main watcher
+runs the full suite on each new main commit.
+
 Unchanged workspaces are skipped, not reported as tested. The selection and its
 reasons print before execution and are saved as `selection.json` beside the gate
 logs under `.gitmatrix-agent/artifacts/gates-<timestamp>/`. `--all` restores complete
-workspace checks, tests/builds and all non-AI CLI/API/browser/mirror E2E, main-only
+workspace checks, full tests/builds and all non-AI CLI/API/browser/mirror E2E, main-only
 journeys included.
 Gate `completion.json` records per-gate `elapsedMs`, `wallMs` and `outcome`, plus
 total elapsed time and completion status, including failed cases. These describe
@@ -702,8 +717,12 @@ vp run agent main-e2e install    # also: status, uninstall
 
 It keeps its own checkout and state in `~/.local/state/gitmatrix-agent/main-e2e/`
 (`gm worktree add` on `origin/main`, never a feature worktree) and every five minutes
-runs `gm sync`; when main moved it runs `vp install` and the same full suite as
-`vp run agent test`, logging to `runs/<sha>.log`. Runs never overlap, and several
+runs `gm sync`; when main moved it runs `vp install`, then the full unit and browser
+suites (`vp run --filter '!cli' --concurrency-limit 1 --no-cache test`, in their own
+process group, logging to `runs/<sha>.tests.log`: remote CI tests only what a push
+affects), then the same full suite as `vp run agent test`, logging to `runs/<sha>.log`.
+The suites run once per commit: a tick whose E2E is deferred by the environment limit
+reuses their outcome, and a failure is filed at once. Runs never overlap, and several
 commits that land during a run are tested together as the newest one.
 
 Failures become P0 bug issues tagged `testing` and `main-e2e` on main (never a
@@ -711,8 +730,10 @@ timeline), titled `Main E2E failing: <scenarios>`, with the commit, failed stage
 scenarios, evidence path, log and reproduction. While an open issue names the same
 failing set, later commits add a comment instead. When main passes again each open
 `main-e2e` issue gets a "Passing again" comment; closing stays a person's decision.
-A run refused for the installation or the machine environment limit files nothing
-and is retried on the next tick. A run stops at its first failing scenario, so the
+A tests failure files the same P0 issue (stage `tests`, with the tests log and its
+reproduction) even when scenarios fail too, in which case the title names only the
+scenarios and the body lists both. A run refused for the installation or the machine
+environment limit files nothing for E2E and is retried on the next tick. A run stops at its first failing scenario, so the
 issue title names that first failure: a second regression can hide behind it until the
 first is fixed. A run that outlasts its budget (85 minutes) is stopped with SIGTERM so
 it can destroy its environment, then SIGKILL after three minutes, and is reported as
@@ -723,6 +744,10 @@ and, failing that, files a P0 `Main E2E watcher stuck: <reason>` issue once and 
 on it when the checkout recovers. A running suite holds one environment slot for its duration (about
 as long as `vp run agent test`). `uninstall` removes the units and keeps the checkout
 and state.
+
+The unit's 150-minute `TimeoutStartSec` (room for the suites and E2E) reaches only a
+fresh install: after updating, run `vp run agent main-e2e install` again. `status` and
+the start of each tick warn when the installed unit's timeout differs.
 
 ### AI capability verification
 

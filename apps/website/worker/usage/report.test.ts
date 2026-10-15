@@ -9,7 +9,8 @@ import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { UsageLine, UsageReport } from "../../shared/usage.ts";
 import { issueToken } from "../api/tokens.ts";
 import { tokenCredential, type AppEnv } from "../auth.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { d1, migratedDatabase } from "../testing/d1.ts";
+import { freshInstallationDatabases } from "../testing/spaces.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import { priceTimeline } from "./prices.ts";
@@ -431,14 +432,14 @@ afterEach(() => {
 });
 
 async function setup() {
-  const sqlite = migratedDatabase();
-  const registry = migratedRegistryDatabase();
+  const fresh = await freshInstallationDatabases();
+  const { sqlite, registry } = fresh;
   const env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as Env;
   fixtureCleanup.push(
     () => sqlite.close(),
     () => registry.close(),
   );
-  const control = installCutoverTestControl(env);
+  const control = installCutoverTestControl(env, fresh.control);
   fixtureCleanup.push(control.close);
   await initializeFreshSpaceInstallation(env);
   sqlite.exec(`

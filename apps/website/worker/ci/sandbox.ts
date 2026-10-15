@@ -8,7 +8,14 @@ import { DurableObject } from "cloudflare:workers";
 import type { CiClaimedJob, CiJobReport } from "../../shared/api.ts";
 import { upstreamToken } from "../artifacts.ts";
 import { batch, db, nowIso } from "../schema.ts";
-import { jobPayload, loadJob, report, settleStoppedJob, type StoredJob } from "./jobs.ts";
+import {
+  JobCredentialsRevoked,
+  jobPayload,
+  loadJob,
+  report,
+  settleStoppedJob,
+  type StoredJob,
+} from "./jobs.ts";
 import { mintJobToken, revokeJobTokens, withConfigDir } from "./registry.ts";
 import {
   clearStorage,
@@ -46,6 +53,9 @@ const BASE_ENV = {
 };
 const FLUSH_MS = 1000;
 const FLUSH_BYTES = 16 * 1024;
+// How long log writes may keep failing (D1 "Network connection lost") before the
+// job is stopped; a revoked authority stops it at once.
+const FLUSH_FAILURE_MS = 30_000;
 const READY_TIMEOUT_MS = 180_000;
 /** A container that still isn't running after this long is asked to start again. */
 const RESTART_AFTER_MS = 10_000;
@@ -484,25 +494,56 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     let cancelled = false;
     let timedOut = false;
     let flushing: Promise<void> = Promise.resolve();
+    // The flush waiting behind the one in flight. It takes the buffer when it
+    // starts, so every caller meanwhile shares it instead of queueing another.
+    let queued: Promise<void> | null = null;
+    let failingSince: number | null = null;
     const flush = () => {
-      // Even a silent process must observe revocation on the next poll.
-      const text = buffer;
-      buffer = "";
-      flushing = flushing.then(async () => {
+      if (queued) return queued;
+      // One write at a time, taking the buffer when it starts, so text kept for a
+      // retry stays ahead of what arrived since. Even a silent process must
+      // observe revocation on the next poll.
+      const run = (flushing = flushing.then(async () => {
+        queued = null;
+        const text = buffer;
+        buffer = "";
         let result: { cancelled: boolean };
         try {
           await resolveJobAuthority(this.env, jobId);
-          result = await report(this.env, jobId, { logs: [{ step, text }] });
+          result = await report(this.env, jobId, {
+            logs: [{ step, text }],
+          });
         } catch (error) {
+          // A transient write failure keeps the text for the next flush instead
+          // of throwing away a nearly finished job. A write that committed before
+          // failing is stored twice. Revoked authority or credentials end the job.
+          failingSince ??= Date.now();
+          if (
+            !(error instanceof WorkAuthorizationError) &&
+            !(error instanceof JobCredentialsRevoked) &&
+            Date.now() - failingSince < FLUSH_FAILURE_MS
+          ) {
+            buffer = text + buffer;
+            return;
+          }
           process.kill();
           throw error;
         }
+        failingSince = null;
         if (result.cancelled && !cancelled) {
           cancelled = true;
           process.kill();
         }
-      });
-      return flushing;
+      }));
+      return (queued = run);
+    };
+    // Flush until the text is written; flush throws once failures outlast FLUSH_FAILURE_MS.
+    const drain = async () => {
+      await flush();
+      while (buffer) {
+        await new Promise((resolve) => setTimeout(resolve, FLUSH_MS));
+        await flush();
+      }
     };
     const timer = setInterval(() => {
       void flush().catch(() => {});
@@ -524,7 +565,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
       }
       buffer += decoder.decode();
       const code = await process.exitCode;
-      await flush();
+      await drain();
       if (cancelled) throw new Cancelled();
       outcome = { code: timedOut ? 124 : code };
     } catch (error) {
@@ -536,7 +577,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     // Drain writes after stopping timers. A flush failure takes precedence over
     // the stream result, but cannot bypass timer cleanup or process shutdown.
     try {
-      await flush();
+      await drain();
     } catch (error) {
       process.kill();
       await process.exitCode;

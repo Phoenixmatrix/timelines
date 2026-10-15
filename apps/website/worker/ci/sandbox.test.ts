@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type * as Artifacts from "../artifacts.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
 import { TrackerStore } from "../tracker/store.ts";
 import { drainDeletedRepoSources } from "../retention/work-sources.ts";
 import { cancelRun } from "./cancel.ts";
 import { CiSandbox } from "./sandbox.ts";
+import { MAX_CHUNK } from "./jobs.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
-import { seedSpaceFixture } from "../testing/spaces.ts";
+import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 import { issueToken } from "../api/tokens.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import { initializeFreshTrackerSpace } from "../tracker/space-migration.ts";
@@ -32,8 +33,8 @@ describe("Sandbox infrastructure retry cancellation", () => {
   test.each(["stopped", "stop-failed", "stop-unacknowledged"])(
     "%s preserves evidence and releases source purge only after confirmed shutdown",
     async (shutdown) => {
-      const sqlite = migratedDatabase();
-      const registry = migratedRegistryDatabase();
+      const fresh = await freshInstallationDatabases();
+      const { sqlite, registry } = fresh;
       const durable = fakeDurableState({ name: "org" });
       const stopping = Promise.withResolvers<void>();
       const stopped = Promise.withResolvers<void>();
@@ -84,7 +85,7 @@ describe("Sandbox infrastructure retry cancellation", () => {
           },
         },
       } as unknown as Env;
-      const admission = installCutoverTestControl(env);
+      const admission = installCutoverTestControl(env, fresh.control);
       await initializeFreshSpaceInstallation(env);
       sqlite.exec(
         "INSERT INTO accounts(id,kind,slug,display_name) VALUES ('person','user','person','Person')",
@@ -316,6 +317,312 @@ describe("Sandbox infrastructure retry cancellation", () => {
       }
     },
   );
+});
+
+describe("Sandbox log flushing", () => {
+  const MARKER = "flush marker output\n";
+
+  /**
+   * A real job on the canonical source whose `build` step runs `script`, by
+   * default printing MARKER. A log write carrying MARKER fails when `failLogWrite`
+   * returns true, or, when it returns a promise, once that settles.
+   * `failAuthority` fails the job's authority reads.
+   */
+  async function flushFixture(
+    failLogWrite: () => boolean | Promise<void>,
+    options: {
+      script?: (emit: (text: string) => void) => Promise<void> | void;
+      failAuthority?: () => boolean;
+      /** Holds every log write until it settles. */
+      delayLogWrite?: () => Promise<void>;
+    } = {},
+  ) {
+    const script = options.script ?? ((emit) => emit(MARKER));
+    const fresh = await freshInstallationDatabases();
+    const { sqlite, registry } = fresh;
+    const kill = vi.fn();
+    let running = false;
+    const container = {
+      get running() {
+        return running;
+      },
+      images: { default: "fixture-image" },
+      start() {
+        running = true;
+      },
+      async exec(command: string[]) {
+        const build = command[4] === "build";
+        return {
+          stdout: new ReadableStream({
+            async start(controller) {
+              if (build) await script((text) => controller.enqueue(new TextEncoder().encode(text)));
+              controller.close();
+            },
+          }),
+          exitCode: Promise.resolve(0),
+          kill,
+        };
+      },
+      async destroy() {
+        running = false;
+      },
+    } as unknown as Container;
+    // Fail only the log insert carrying MARKER, so setup messages still land.
+    const real = d1(sqlite);
+    const slow = new WeakMap<object, Promise<void>>();
+    const logWrites = new WeakSet<object>();
+    const failing = (statement: D1PreparedStatement) =>
+      new Proxy(statement, {
+        get(target, key) {
+          if (key !== "bind") return Reflect.get(target, key, target);
+          return (...params: unknown[]) => {
+            const failure = params.some((p) => typeof p === "string" && p.includes(MARKER.trim()))
+              ? failLogWrite()
+              : false;
+            if (failure === true) throw new Error("D1_ERROR: Network connection lost");
+            const bound = target.bind(...params);
+            logWrites.add(bound);
+            if (failure) slow.set(bound, failure);
+            return bound;
+          };
+        },
+      });
+    const DB = new Proxy(real, {
+      get(target, key) {
+        if (key === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            if (statements.some((s) => logWrites.has(s))) await options.delayLogWrite?.();
+            const pending = statements.map((s) => slow.get(s)).find(Boolean);
+            if (pending) {
+              await pending;
+              throw new Error("D1_ERROR: Network connection lost");
+            }
+            return target.batch(statements);
+          };
+        if (key !== "prepare") return Reflect.get(target, key, target);
+        return (sql: string) => {
+          if (/run_repo_id/.test(sql) && options.failAuthority?.())
+            throw new Error("D1_ERROR: Network connection lost");
+          const statement = target.prepare(sql);
+          return sql.includes('into "ci_logs"') ? failing(statement) : statement;
+        };
+      },
+    });
+    const env = {
+      DB,
+      REGISTRY_DB: d1(registry),
+      PUBLIC_URL: "https://gitmatrix.example",
+    } as unknown as Env;
+    const admission = installCutoverTestControl(env, fresh.control);
+    await initializeFreshSpaceInstallation(env);
+    sqlite.exec(
+      "INSERT INTO accounts(id,kind,slug,display_name) VALUES ('person','user','person','Person')",
+    );
+    await seedSpaceFixture(env.DB, {
+      organization: {
+        id: "organization",
+        slug: "orbit-company",
+        displayName: "Orbit",
+        kind: "company",
+      },
+      space: { id: "org", slug: "orbit", displayName: "General" },
+      members: [
+        {
+          accountId: "person",
+          role: "owner",
+          grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+        },
+      ],
+      actorId: "person",
+    });
+    const credential = await issueToken(env.DB, "person", "ci", "write");
+    sqlite.exec(`
+      INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+        VALUES ('repo','org','app','private','app','https://app');
+      INSERT INTO ci_runs(id,repo_id,source_id,number,commit_oid,ref,trigger,status,title)
+        VALUES ('run','repo','canonical',1,'head','main','manual','running','Flush');
+      INSERT INTO ci_jobs(id,run_id,repo_id,source_id,name,spec,status,runner)
+        VALUES ('job','run','repo','canonical','job','{}','queued','sandbox');
+      INSERT INTO ci_steps(job_id,position,name,status) VALUES ('job',0,'build','pending');
+    `);
+    sqlite
+      .prepare(
+        "UPDATE ci_runs SET actor_id=?,space_id=?,migration_epoch=?,authority=? WHERE id='run'",
+      )
+      .run(
+        "person",
+        "org",
+        0,
+        JSON.stringify({
+          spaceId: "org",
+          migrationEpoch: 0,
+          personId: "person",
+          agentId: null,
+          credential: { kind: "token", id: credential.id },
+        }),
+      );
+    sqlite.prepare("UPDATE ci_jobs SET spec=? WHERE id='job'").run(
+      JSON.stringify({
+        secrets: [],
+        env: {},
+        timeoutMinutes: 5,
+        instance: "lite",
+        image: "default",
+        steps: [{ name: "build", run: "build" }],
+      }),
+    );
+    const state = fakeDurableState({ name: "job" });
+    Reflect.set(state.ctx, "container", container);
+    dispose.push(() => {
+      sqlite.close();
+      registry.close();
+      admission.close();
+      state.db.close();
+    });
+    return {
+      kill,
+      tokens: () =>
+        (sqlite.prepare("SELECT count(*) AS n FROM ci_job_tokens").get() as { n: number }).n,
+      run: () => new CiSandbox(state.ctx, env).run("job"),
+      status: () =>
+        (sqlite.prepare("SELECT status FROM ci_jobs WHERE id='job'").get() as { status: string })
+          .status,
+      logs: () =>
+        (sqlite.prepare("SELECT text FROM ci_logs ORDER BY seq").all() as { text: string }[])
+          .map((row) => row.text)
+          .join(""),
+    };
+  }
+
+  test("a transient log write failure does not fail the job", async () => {
+    let failures = 1;
+    const fixture = await flushFixture(() => failures-- > 0);
+    await fixture.run();
+    expect(failures).toBeLessThan(0); // the failure was injected and consumed
+    expect(fixture.status()).toBe("succeeded");
+    expect(fixture.logs()).toContain(MARKER);
+    expect(fixture.kill).not.toHaveBeenCalled();
+  });
+
+  /** A write that fails only after `release`, and a promise for when it began. */
+  function slowFailure() {
+    const gate = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    let first = true;
+    return {
+      started: started.promise,
+      release: gate.resolve,
+      failLogWrite: () => {
+        if (!first) return false;
+        first = false;
+        started.resolve();
+        return gate.promise;
+      },
+    };
+  }
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  test("retried text keeps its order behind a slow failing write", async () => {
+    const A = `${MARKER.trim()} A ${"a".repeat(20 * 1024)}\n`;
+    const B = `B ${"b".repeat(20 * 1024)}\n`;
+    const write = slowFailure();
+    const fixture = await flushFixture(write.failLogWrite, {
+      async script(emit) {
+        emit(A); // large enough to flush at once; that write is still failing...
+        await write.started;
+        emit(B); // ...when its successor is queued
+        await settle();
+        write.release();
+      },
+    });
+    await fixture.run();
+    expect(fixture.status()).toBe("succeeded");
+    expect(fixture.logs()).toContain(A + B);
+  });
+
+  test("retried text longer than a log chunk is stored whole", async () => {
+    const lines = ["a", "b", "c"].map(
+      (c, i) => `${i === 0 ? MARKER.trim() : "line"} ${c.repeat(40 * 1024)}\n`,
+    );
+    const write = slowFailure();
+    const fixture = await flushFixture(write.failLogWrite, {
+      async script(emit) {
+        emit(lines[0]!);
+        await write.started;
+        emit(lines[1]!);
+        emit(lines[2]!);
+        await settle();
+        write.release();
+      },
+    });
+    await fixture.run();
+    expect(fixture.status()).toBe("succeeded");
+    expect(lines.join("").length).toBeGreaterThan(MAX_CHUNK);
+    expect(fixture.logs()).toContain(lines.join(""));
+  });
+
+  test("fast output behind a slow write queues one flush, not one per chunk", async () => {
+    // Every flush confirms authority twice (the sandbox, then report()), each
+    // costing D1 reads, so count those.
+    let reads = 0;
+    const fixture = await flushFixture(() => false, {
+      async script(emit) {
+        for (let i = 0; i < 200; i++) {
+          emit(`${MARKER.trim()} ${i} ${"x".repeat(17 * 1024)}\n`);
+          await Promise.resolve();
+        }
+      },
+      failAuthority: () => {
+        reads++;
+        return false;
+      },
+      delayLogWrite: () => new Promise((resolve) => setTimeout(resolve, 20)),
+    });
+    await fixture.run();
+    expect(fixture.status()).toBe("succeeded");
+    expect(fixture.logs()).toContain(`${MARKER.trim()} 199 `);
+    expect(reads).toBeLessThan(40);
+  });
+
+  test("a transient failure confirming authority revokes the credentials and stops the job", async () => {
+    let armed = false;
+    let reads = 0;
+    let tokensWhenFailing = 0;
+    let fixture!: Awaited<ReturnType<typeof flushFixture>>;
+    fixture = await flushFixture(() => false, {
+      script(emit) {
+        armed = true;
+        emit(MARKER);
+      },
+      // The first read is the sandbox's own; the second is report()'s.
+      failAuthority: () => {
+        if (!armed || ++reads !== 2) return false;
+        tokensWhenFailing = fixture.tokens();
+        return true;
+      },
+    });
+    await expect(fixture.run()).rejects.toThrow("Network connection lost");
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(tokensWhenFailing).toBeGreaterThan(0);
+    expect(fixture.kill).toHaveBeenCalled();
+    expect(fixture.tokens()).toBe(0);
+    expect(fixture.logs()).not.toContain(MARKER);
+  });
+
+  test("log writes that keep failing stop the job", async () => {
+    // Each failed write moves the clock 20 s, so the third crosses FLUSH_FAILURE_MS.
+    let skew = 0;
+    const now = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now() + skew);
+    dispose.push(() => clock.mockRestore());
+    const fixture = await flushFixture(() => {
+      skew += 20_000;
+      return true;
+    });
+    await expect(fixture.run()).rejects.toThrow("Network connection lost");
+    expect(fixture.kill).toHaveBeenCalled();
+    expect(fixture.logs()).not.toContain(MARKER);
+  });
 });
 
 describe("Sandbox cutover admission", () => {

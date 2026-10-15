@@ -62,8 +62,12 @@ const workspaces = [
   "packages/testing",
   "packages/utils",
 ];
+// As ready-plan.ts's documentation().
 const documentation = (path: string) =>
-  /^(?:README|AGENTS|CONTRIBUTING|CHANGELOG)\.md$/.test(path) ||
+  /^(?:README|AGENTS|CONTRIBUTING|CHANGELOG|CLAUDE|DESIGN|PRODUCT|SELF-HOSTING|ATTRIBUTIONS)\.md$/.test(
+    path,
+  ) ||
+  path === "LICENSE" ||
   workspaces.some((w) =>
     new RegExp(`^${w}/(?:README|AGENTS|CONTRIBUTING|CHANGELOG)\\.md$`).test(path),
   );

@@ -16,7 +16,8 @@ export type StoredJob = Omit<JobSpec, "name">;
 
 type JobContext = NonNullable<Awaited<ReturnType<typeof loadJob>>>;
 
-const MAX_CHUNK = 64 * 1024;
+/** The most text one stored log chunk keeps; a runner sends longer text as several. */
+export const MAX_CHUNK = 64 * 1024;
 const MAX_CHUNKS_PER_JOB = 4000;
 
 /** The Workflow event a job's end is announced with. */
@@ -92,7 +93,7 @@ export async function jobPayload(
   // source (whose ref is just `work`, CORE-296), names the timeline.
   const timeline = job.timeline_slug ?? timelineSlug ?? timelineSlugOf(`refs/heads/${job.ref}`);
   const gitUrl = `${registry.origin}/${job.full_name}${timelineSlug ? `@${encodeURIComponent(timelineSlug)}` : ""}.git`;
-  const verifiedBase = JSON.stringify(await previousVerification(d1, job.id));
+  const verifiedBases = await previousVerification(d1, job.id);
   await resolveJobAuthority(env, job.id);
   return {
     id: job.id,
@@ -131,11 +132,24 @@ export async function jobPayload(
       ...spec.env,
       ...secrets,
       // Reserved: repository env and secrets cannot manufacture verification provenance.
-      GITMATRIX_VERIFIED_BASE: verifiedBase,
+      GITMATRIX_VERIFIED_BASE: JSON.stringify(verifiedBases[0] ?? null),
+      GITMATRIX_VERIFIED_BASES: JSON.stringify(verifiedBases),
     },
     files: setup.files,
     steps: spec.steps.map((s, i) => ({ position: i, name: s.name, run: s.run })),
   };
+}
+
+/** Text as pieces a log chunk stores whole, cut after a newline where one fits. */
+export function chunks(text: string, size = MAX_CHUNK): string[] {
+  const out: string[] = [];
+  while (text.length > size) {
+    const cut = text.lastIndexOf("\n", size - 1) + 1 || size;
+    out.push(text.slice(0, cut));
+    text = text.slice(cut);
+  }
+  if (text) out.push(text);
+  return out;
 }
 
 /** Hide secret values (and any CI job credential) in output. */
@@ -145,6 +159,14 @@ export function mask(text: string, secrets: string[]): string {
     if (secret.length >= 4) out = out.split(secret).join("***");
   }
   return out;
+}
+
+/** report() could not confirm the job's authority and revoked its credentials: the job cannot go on. */
+export class JobCredentialsRevoked extends Error {
+  override name = "JobCredentialsRevoked";
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+  }
 }
 
 /** Apply a runner's report. Returns whether the job was cancelled meanwhile. */
@@ -163,7 +185,7 @@ export async function report(
       return true;
     } catch (error) {
       await revokeJobTokens(d1, jobId);
-      if (!(error instanceof WorkAuthorizationError)) throw error;
+      if (!(error instanceof WorkAuthorizationError)) throw new JobCredentialsRevoked(error);
       // Ask the runner to stop without accepting logs, steps or success.
       // Only its later terminal acknowledgment releases the source claim.
       if (update.done) await settleStoppedJob(env, jobId, "Job authority is no longer current.");
@@ -177,23 +199,25 @@ export async function report(
 
   for (const log of update.logs ?? []) {
     if (!log.text) continue;
-    statements.push(
-      kdb
-        .insertInto("ci_logs")
-        .columns(["job_id", "seq", "step", "text"])
-        .expression((eb) =>
-          eb
-            .selectFrom("ci_logs")
-            .select([
-              eb.val(jobId).as("job_id"),
-              eb(eb.fn.coalesce(eb.fn.max("seq"), eb.lit(0)), "+", eb.lit(1)).as("seq"),
-              eb.val(log.step).as("step"),
-              eb.val(mask(log.text, secrets).slice(0, MAX_CHUNK)).as("text"),
-            ])
-            .where("job_id", "=", jobId)
-            .having(eb.fn.countAll(), "<", MAX_CHUNKS_PER_JOB),
-        ),
-    );
+    // Mask the whole text before cutting it, so a secret can't straddle a cut.
+    for (const text of chunks(mask(log.text, secrets)))
+      statements.push(
+        kdb
+          .insertInto("ci_logs")
+          .columns(["job_id", "seq", "step", "text"])
+          .expression((eb) =>
+            eb
+              .selectFrom("ci_logs")
+              .select([
+                eb.val(jobId).as("job_id"),
+                eb(eb.fn.coalesce(eb.fn.max("seq"), eb.lit(0)), "+", eb.lit(1)).as("seq"),
+                eb.val(log.step).as("step"),
+                eb.val(text).as("text"),
+              ])
+              .where("job_id", "=", jobId)
+              .having(eb.fn.countAll(), "<", MAX_CHUNKS_PER_JOB),
+          ),
+      );
   }
   for (const step of update.steps ?? []) {
     const terminal = step.status !== "running" && step.status !== "pending";

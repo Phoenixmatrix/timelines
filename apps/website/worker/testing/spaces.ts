@@ -39,16 +39,30 @@ function restored(bytes: Uint8Array): DatabaseSync {
   return db;
 }
 
-/** Empty real schemas and control journal, initialized before callers seed content. */
-export async function createFreshSpaceTestEnvironment() {
+/**
+ * Copies of this worker's freshly initialized installation: the migrated DB and
+ * REGISTRY_DB, and the control journal to pass to installCutoverTestControl.
+ * Restoring takes milliseconds; migrating and initializing per test took most
+ * of the unit suite's time.
+ */
+export async function freshInstallationDatabases() {
   const fresh = await (snapshot ??= initializedSnapshot().catch((error: unknown) => {
     snapshot = null;
     throw error;
   }));
-  const sqlite = restored(fresh.db);
-  const registry = restored(fresh.registry);
+  return {
+    sqlite: restored(fresh.db),
+    registry: restored(fresh.registry),
+    control: restored(fresh.control),
+  };
+}
+
+/** Empty real schemas and control journal, initialized before callers seed content. */
+export async function createFreshSpaceTestEnvironment() {
+  const fresh = await freshInstallationDatabases();
+  const { sqlite, registry } = fresh;
   const env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as Env;
-  const cutover = installCutoverTestControl(env, restored(fresh.control));
+  const cutover = installCutoverTestControl(env, fresh.control);
   let closed = false;
   const close = () => {
     if (closed) return;

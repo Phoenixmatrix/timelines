@@ -11,8 +11,14 @@ describe("unitWorkers (CORE-406)", () => {
 
   test("typical hosts get several workers", () => {
     expect(unitWorkers(24, 3.7 * GiB)).toBe(6);
-    expect(unitWorkers(8, 10 * GiB)).toBe(2);
+    expect(unitWorkers(8, 10 * GiB)).toBe(3);
     expect(unitWorkers(24, 2 * GiB)).toBe(3);
+  });
+
+  test("a small CI container gets all but one CPU, not a single worker", () => {
+    expect(unitWorkers(4, 11 * GiB)).toBe(3);
+    expect(unitWorkers(4, 11 * GiB, 3 * GiB)).toBe(3);
+    expect(unitWorkers(3, 11 * GiB)).toBe(2);
   });
 
   test("never exceeds six, nor drops below one", () => {

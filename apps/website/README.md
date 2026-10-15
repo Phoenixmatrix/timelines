@@ -3389,10 +3389,13 @@ OID. Leave it off context-sensitive jobs, especially deployment.
 Reuse requires successful **actual sandbox execution** for the exact current
 canonical repository, candidate commit, queue attempt and job specification. The
 producer must also match the current known resolved container image digest and
-Worker `CI_VERSION` metadata. A tag or configuration fingerprint is not an image
-identity. Local runners, custom images, jobs with secrets and jobs with concurrency
-controls are ineligible. Missing or unknown identity, failed verification or a
-changed candidate, attempt, specification, image or Worker version falls back to
+`SANDBOX_CONTRACT`, which only a deployed Worker version produces; a deploy that
+leaves the contract alone keeps earlier proofs valid. A guard test hashes the
+sandbox execution sources and fails until a change to them is recorded, bumping
+`SANDBOX_CONTRACT` when it alters how a job runs or what its success proves. A
+tag or configuration fingerprint is not an image identity. Local runners, custom
+images, jobs with secrets and jobs with concurrency controls are ineligible. Missing or unknown identity, failed verification or a
+changed candidate, attempt, specification, image or sandbox contract falls back to
 normal execution.
 
 The persisted queue owns main CI for its exact canonical candidate from the
@@ -3497,6 +3500,8 @@ of those reuse properties.
   `context-invariant-v1` sandbox jobs without secrets can receive evidence.
   It is a candidate comparison baseline, not authorization to skip a required
   job; consumers must prove ancestry and complete input independence.
+  `GITMATRIX_VERIFIED_BASES` is reserved the same way: a JSON array of up to 20
+  such objects, newest first, or `[]`.
 
 API: `/api/repos/:o/:n/ci` (runs, `?ref=<branch>` for one branch's, run detail,
 logs with `?after=`, cancel, re-run, commit statuses, secrets) and

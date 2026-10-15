@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { d1 } from "../testing/d1.ts";
 import { onPush, startRun, startWorkflow } from "./trigger.ts";
 import {
   candidateProofs,
   executionIdentity,
+  SANDBOX_CONTRACT,
   prerequisitesSatisfied,
   previousVerification,
 } from "./verification.ts";
@@ -19,7 +24,7 @@ import { tokenCredential, type AppEnv } from "../auth.ts";
 import { claim, jobPayload, loadJob } from "./jobs.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
-import { seedSpaceFixture } from "../testing/spaces.ts";
+import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 
 const fixture = vi.hoisted(() => ({
   yaml: "",
@@ -126,8 +131,8 @@ async function setup(config = yaml) {
   fixture.landing = async () => {};
   fixture.queue = async () => {};
   fixture.refs = [{ shortName: "main", oid: commit }];
-  const sqlite = migratedDatabase();
-  const registry = migratedRegistryDatabase();
+  const fresh = await freshInstallationDatabases();
+  const { sqlite, registry } = fresh;
   databases.push(sqlite, registry);
   const workflows = new Set<string>();
   const env = {
@@ -145,7 +150,7 @@ async function setup(config = yaml) {
       },
     },
   } as unknown as Env;
-  const admission = installCutoverTestControl(env);
+  const admission = installCutoverTestControl(env, fresh.control);
   databases.push(admission.state.db);
   await initializeFreshSpaceInstallation(env);
   sqlite.exec(
@@ -402,7 +407,7 @@ describe("landed candidate verification", () => {
     ).toEqual([{ status: "pending", verified_by: null }]);
   });
 
-  test.each(["sandbox-v1:new-version:image", "sandbox-v1:version:new-image", null])(
+  test.each(["sandbox-v1:new-contract:image", "sandbox-v1:version:new-image", null])(
     "recovery rechecks runtime identity after D1 creation: %s",
     async (identity) => {
       const t = await setup(gatePipeline);
@@ -423,7 +428,7 @@ describe("landed candidate verification", () => {
     },
   );
 
-  test.each(["sandbox-v1:new-version:image", "sandbox-v1:version:new-image", null])(
+  test.each(["sandbox-v1:new-contract:image", "sandbox-v1:version:new-image", null])(
     "a cached plan cannot admit a delayed gate with changed identity: %s",
     async (identity) => {
       const t = await setup(gatePipeline);
@@ -744,10 +749,14 @@ describe("landed candidate verification", () => {
     ).toEqual({ n: 5 });
   });
 
-  test("only platform digest plus immutable Worker version identifies execution", () => {
+  test("platform digest plus sandbox contract identifies execution, from a deployed Worker only", () => {
     const version = { id: "12345678-1234-1234-1234-123456789abc" };
     const image = `registry/image@sha256:${"a".repeat(64)}`;
-    expect(executionIdentity(image, version)).toBe(`sandbox-v1:${version.id}:${image}`);
+    expect(executionIdentity(image, version)).toBe(`sandbox-v2:${SANDBOX_CONTRACT}:${image}`);
+    // Another deploy of the same sandbox contract keeps earlier proofs valid.
+    expect(executionIdentity(image, { id: "87654321-4321-4321-4321-cba987654321" })).toBe(
+      executionIdentity(image, version),
+    );
     expect(executionIdentity("default", version)).toBeNull();
     expect(executionIdentity("registry/image:latest", version)).toBeNull();
     expect(executionIdentity(image, undefined)).toBeNull();
@@ -766,24 +775,59 @@ describe("verified change-selection baselines", () => {
 
   test("only executed equivalent success supplies a baseline; repository env cannot forge it", async () => {
     const t = await baseline();
-    expect(await previousVerification(t.env.DB, "production-check")).toEqual({
-      commit,
-      runNumber: 1,
-      jobId: "gates-check",
-    });
-    t.sqlite.exec(`UPDATE ci_jobs SET spec=json_set(spec,'$.env.GITMATRIX_VERIFIED_BASE','forged')
-      WHERE name='check'`);
+    expect(await previousVerification(t.env.DB, "production-check")).toEqual([
+      { commit, runNumber: 1, jobId: "gates-check" },
+    ]);
+    t.sqlite.exec(`UPDATE ci_jobs SET spec=json_set(spec,'$.env.GITMATRIX_VERIFIED_BASE','forged',
+      '$.env.GITMATRIX_VERIFIED_BASES','forged') WHERE name='check'`);
     const payload = await jobPayload(t.env, (await loadJob(t.env.DB, "production-check"))!, {
       origin: "https://gm.test",
       token: "test-token",
     });
-    expect(JSON.parse(payload.env.GITMATRIX_VERIFIED_BASE ?? "null")).toEqual({
+    // The published single-object contract, and the newest-first list beside it.
+    expect(JSON.parse(payload.env.GITMATRIX_VERIFIED_BASE ?? "")).toEqual({
       commit,
       runNumber: 1,
       jobId: "gates-check",
     });
+    expect(JSON.parse(payload.env.GITMATRIX_VERIFIED_BASES ?? "")).toEqual([
+      { commit, runNumber: 1, jobId: "gates-check" },
+    ]);
     t.sqlite.exec("UPDATE ci_jobs SET status='skipped', verified_by='{}' WHERE id='gates-check'");
-    expect(await previousVerification(t.env.DB, "production-check")).toBeNull();
+    expect(await previousVerification(t.env.DB, "production-check")).toEqual([]);
+    const none = await jobPayload(t.env, (await loadJob(t.env.DB, "production-check"))!, {
+      origin: "https://gm.test",
+      token: "test-token",
+    });
+    expect(none.env.GITMATRIX_VERIFIED_BASE).toBe("null");
+    expect(none.env.GITMATRIX_VERIFIED_BASES).toBe("[]");
+  });
+
+  test("returns every qualifying candidate newest first and still applies the filters", async () => {
+    const t = await baseline();
+    // Copy the verified run, job and steps as runs 10 and 11.
+    const copy = (table: string, where: string, set: Record<string, string>) => {
+      const columns = (
+        t.sqlite.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+      ).map((c) => c.name);
+      const select = columns.map((c) => (c in set ? set[c] : c)).join(",");
+      t.sqlite.exec(
+        `INSERT INTO ${table}(${columns.join(",")}) SELECT ${select} FROM ${table} WHERE ${where}`,
+      );
+    };
+    for (const n of [10, 11]) {
+      copy("ci_runs", "id='gates'", { id: `'gates-${n}'`, number: String(n) });
+      copy("ci_jobs", "id='gates-check'", { id: `'gates-check-${n}'`, run_id: `'gates-${n}'` });
+      copy("ci_steps", "job_id='gates-check'", { job_id: `'gates-check-${n}'` });
+    }
+    expect(
+      (await previousVerification(t.env.DB, "production-check")).map((b) => b.runNumber),
+    ).toEqual([11, 10, 1]);
+    t.sqlite.exec("UPDATE ci_jobs SET exit_code=1, status='failed' WHERE id='gates-check-11'");
+    t.sqlite.exec("DELETE FROM ci_steps WHERE job_id='gates-check-10'");
+    expect(await previousVerification(t.env.DB, "production-check")).toEqual([
+      { commit, runNumber: 1, jobId: "gates-check" },
+    ]);
   });
 
   test.each([
@@ -805,7 +849,7 @@ describe("verified change-selection baselines", () => {
   ])("falls back without complete equivalent evidence: %s", async (change) => {
     const t = await baseline();
     t.sqlite.exec(change);
-    expect(await previousVerification(t.env.DB, "production-check")).toBeNull();
+    expect(await previousVerification(t.env.DB, "production-check")).toEqual([]);
   });
 });
 
@@ -845,3 +889,27 @@ test.each(["landing", "queue"] as const)(
     });
   },
 );
+
+// The sources that define how a sandbox job runs and what its success proves.
+// A change here may leave earlier proofs wrong, so it must be a decision.
+const SANDBOX_SOURCES = ["sandbox.ts", "jobs.ts", "registry.ts"];
+const RECORDED_SANDBOX_SOURCES = {
+  contract: 1,
+  sha256: "b42aef0a9326b6489542497d504a4afe2e3f58cd4bb1b65f6284ecc2b735ec64",
+};
+
+test("a change to the sandbox execution sources is a deliberate contract decision", () => {
+  const hash = createHash("sha256");
+  for (const file of SANDBOX_SOURCES)
+    hash
+      .update(`${file}\0`)
+      .update(readFileSync(join(dirname(fileURLToPath(import.meta.url)), file)));
+  expect(
+    hash.digest("hex"),
+    "Sandbox execution sources changed. If the change alters how a job runs or what its success proves, bump SANDBOX_CONTRACT in verification.ts. Either way, record the new hash here.",
+  ).toBe(RECORDED_SANDBOX_SOURCES.sha256);
+  expect(
+    RECORDED_SANDBOX_SOURCES.contract,
+    "SANDBOX_CONTRACT was bumped: record the sources' hash again next to it.",
+  ).toBe(SANDBOX_CONTRACT);
+});

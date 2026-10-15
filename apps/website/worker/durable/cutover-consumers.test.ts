@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { FakeD1, FakeR2Bucket } from "@gitmatrix/testing";
 import { fakeDurableState } from "../testing/durable-state.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { d1, migratedDatabase } from "../testing/d1.ts";
+import { freshInstallationDatabases } from "../testing/spaces.ts";
 import { cleanRefPass, installCutoverTestControl } from "../testing/space-cutover.ts";
 import { KnowledgeCoordinator } from "../knowledge/coordinator.ts";
 import { StepFeed } from "../steps/feed.ts";
@@ -36,11 +37,11 @@ afterEach(() => {
   forgetRecorded();
 });
 
-function fixture() {
-  const database = migratedDatabase();
+function fixture(fresh?: Awaited<ReturnType<typeof freshInstallationDatabases>>) {
+  const database = fresh?.sqlite ?? migratedDatabase();
   resources.push(database);
   const env = { DB: d1(database), REGISTRY_BLOBS: new FakeR2Bucket() } as unknown as Env;
-  const journal = installCutoverTestControl(env);
+  const journal = installCutoverTestControl(env, fresh?.control);
   resources.push(journal);
   const state = fakeDurableState({ name: "business-instance" });
   resources.push(state.db);
@@ -48,8 +49,9 @@ function fixture() {
 }
 
 async function nativeFixture() {
-  const fixtureState = fixture();
-  const registry = migratedRegistryDatabase();
+  const fresh = await freshInstallationDatabases();
+  const fixtureState = fixture(fresh);
+  const { registry } = fresh;
   resources.push(registry);
   Reflect.set(fixtureState.env, "REGISTRY_DB", d1(registry));
   await initializeFreshSpaceInstallation(fixtureState.env);

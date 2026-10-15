@@ -547,6 +547,51 @@ await test("a stuck expired environment doesn't block creating another (CORE-292
   }
 });
 
+await test("the sweep before a create leaves orphaned namespaces to the janitor", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-orphan-sweep-"));
+  try {
+    const root = join(home, "worktree");
+    const directory = join(home, ".local/state/gitmatrix-agent/environments");
+    const bin = join(home, "bin");
+    await mkdir(directory, { recursive: true });
+    await mkdir(root, { recursive: true });
+    await mkdir(bin);
+    const env = owned(root);
+    env.created -= 172_800_000;
+    env.expires -= 172_800_000;
+    env.status = "orphaned";
+    env.resources = { artifacts: "orphaned", vectors: "deleted", search: "deleted" };
+    await writeFile(join(directory, `${env.id}.json`), JSON.stringify(env));
+    // Every cf call is recorded; Cloudflare still refuses the namespace.
+    const calls = join(home, "cf-calls");
+    await writeFile(
+      join(bin, "cf"),
+      `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(' ') + '\\n'); console.error('409 [10202] Namespace is not empty'); process.exit(1);\n`,
+      { mode: 0o700 },
+    );
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const run = (code: string) =>
+      command(process.execPath, ["--input-type=module", "-e", code], {
+        env: {
+          ...unitTestEnvironment(process.env),
+          HOME: home,
+          PATH: `${bin}:${process.env.PATH}`,
+        },
+      });
+    await run(
+      `import {sweepBeforeCreate} from ${JSON.stringify(module)}; await sweepBeforeCreate();`,
+    );
+    assert.equal(await readFile(calls, "utf8").catch(() => ""), "");
+    // The hourly janitor still retries it.
+    await run(
+      `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired().catch(() => {});`,
+    );
+    assert.match(await readFile(calls, "utf8"), /artifacts/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 for (const gateway of [undefined, "pending", "created"] as const)
   await test(`cleanup retries incomplete ${gateway ? `${gateway} Gateway` : "legacy vector"} deletions without repeating completed providers`, async () => {
     const home = await mkdtemp(join(tmpdir(), "gitmatrix-cleanup-"));

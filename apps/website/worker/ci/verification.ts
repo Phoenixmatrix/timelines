@@ -4,13 +4,24 @@ import { db } from "../schema.ts";
 import { jobRuns } from "./config.ts";
 import type { StoredJob } from "./jobs.ts";
 
-/** The platform-resolved image, not the repository's mutable `default` alias. */
+/**
+ * How the sandbox runs a job's steps (checkout, environment, step wrapper).
+ * Bump it with any change to that, so proofs from before the change stop counting.
+ */
+export const SANDBOX_CONTRACT = 1;
+
+/**
+ * The platform-resolved image, not the repository's mutable `default` alias,
+ * and the sandbox contract. Only a deployed Worker version identifies anything,
+ * but the version itself isn't part of the identity: every landing deploys, and
+ * a gate whose proof another deploy invalidated ran again on main.
+ */
 export function executionIdentity(image: string | undefined, version: unknown): string | null {
   if (!image || !/(?:^|@)sha256:[0-9a-f]{64}$/.test(image)) return null;
   if (typeof version !== "object" || version === null) return null;
   const id: unknown = Reflect.get(version, "id");
   if (typeof id !== "string" || !/^[0-9a-f-]{36}$/i.test(id)) return null;
-  return `sandbox-v1:${id}:${image}`;
+  return `sandbox-v2:${SANDBOX_CONTRACT}:${image}`;
 }
 
 export interface CandidateVerification {
@@ -168,9 +179,13 @@ export async function candidateProofs(
   return proofs;
 }
 
+/** Candidates the consumer may pick from: the newest one need not be an ancestor of its checkout. */
+const MAX_BASELINE_CANDIDATES = 20;
+
 /** A build planner may compare inputs against an executed, runtime-equivalent job.
  * This is a baseline, not permission to skip a gate: the consumer must prove ancestry
  * and classify the complete diff, falling back to execution when either is unknown.
+ * Returns up to 20 candidates, newest first.
  */
 export async function previousVerification(d1: D1Database, jobId: string) {
   const k = db(d1);
@@ -187,8 +202,8 @@ export async function previousVerification(d1: D1Database, jobId: string) {
     !target.execution_identity ||
     !eligibleVerification(JSON.parse(target.spec))
   )
-    return null;
-  const previous = await k
+    return [];
+  const candidates = await k
     .selectFrom("ci_jobs as j")
     .innerJoin("ci_runs as r", "r.id", "j.run_id")
     .select(["j.id", "r.number", "r.commit_oid"])
@@ -215,27 +230,39 @@ export async function previousVerification(d1: D1Database, jobId: string) {
     .where("r.started_at", "is not", null)
     .where("r.finished_at", "is not", null)
     .orderBy("r.number", "desc")
-    .executeTakeFirst();
-  if (!previous) return null;
+    .limit(MAX_BASELINE_CANDIDATES)
+    .execute();
+  if (!candidates.length) return [];
   const spec = JSON.parse(target.spec) as StoredJob;
-  const steps = await k
+  const allSteps = await k
     .selectFrom("ci_steps")
     .selectAll()
-    .where("job_id", "=", previous.id)
+    .where(
+      "job_id",
+      "in",
+      candidates.map((c) => c.id),
+    )
     .orderBy("position")
     .execute();
-  if (
-    steps.length !== spec.steps.length ||
-    steps.some(
-      (step, position) =>
-        step.position !== position ||
-        step.name !== spec.steps[position]?.name ||
-        step.status !== "succeeded" ||
-        step.exit_code !== 0 ||
-        !step.started_at ||
-        !step.finished_at,
-    )
-  )
-    return null;
-  return { commit: previous.commit_oid, runNumber: previous.number, jobId: previous.id };
+  return candidates
+    .filter((previous) => {
+      const steps = allSteps.filter((step) => step.job_id === previous.id);
+      return (
+        steps.length === spec.steps.length &&
+        steps.every(
+          (step, position) =>
+            step.position === position &&
+            step.name === spec.steps[position]?.name &&
+            step.status === "succeeded" &&
+            step.exit_code === 0 &&
+            step.started_at &&
+            step.finished_at,
+        )
+      );
+    })
+    .map((previous) => ({
+      commit: previous.commit_oid,
+      runNumber: previous.number,
+      jobId: previous.id,
+    }));
 }

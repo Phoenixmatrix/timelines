@@ -6,10 +6,13 @@ import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import {
+  localGates,
+  localReasons,
   parseReadyOptions,
   readinessPlan,
   type ReadyOptions,
   type ReadyPlan,
+  websiteTestSelection,
 } from "./ready-plan.ts";
 import { ciBuildPlan } from "./ci-build.ts";
 
@@ -111,6 +114,9 @@ await test("docs and coding-agent configuration retain mandatory checks", async 
   await fixture(async (root, _git, put) => {
     assert.deepEqual(names(await readinessPlan(root, options)), ["remote-types", "check"]);
     await put("README.md");
+    await put("DESIGN.md");
+    await put("SELF-HOSTING.md");
+    await put("LICENSE");
     await put("apps/website/README.md");
     await put(".claude/settings.json", "{}\n");
     await put(".claude/agents/runner.md");
@@ -130,6 +136,15 @@ await test("docs and coding-agent configuration retain mandatory checks", async 
       args: ["workers", "types"],
       cwd: "website",
     });
+  });
+});
+
+await test("Markdown below the root and outside known workspace names is not documentation", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("docs/guide.md");
+    const plan = await readinessPlan(root, options);
+    assert.equal(plan.full, true);
+    assert.match(plan.reasons[0]!, /Unclassified or global path: docs\/guide\.md/);
   });
 });
 
@@ -645,6 +660,62 @@ await test("CI build selection covers all changes since proven success, not only
   });
 });
 
+await test("CI build selection takes the newest candidate that is an ancestor", async () => {
+  await fixture(async (root, git, put) => {
+    const base = (await git(["rev-parse", "HEAD"])).trim();
+    await put("README.md");
+    await git(["add", "."]);
+    await git(["commit", "-m", "other branch"]);
+    const other = (await git(["rev-parse", "HEAD"])).trim();
+    await git(["checkout", "--detach", base]);
+    const entry = (commit: string, runNumber: number) => ({
+      commit,
+      runNumber,
+      jobId: `build-${runNumber}`,
+    });
+    const env = {
+      GITMATRIX_COMMIT: base,
+      GITMATRIX_VERIFIED_BASES: JSON.stringify([
+        entry("f".repeat(40), 3),
+        entry(other, 2),
+        entry(base, 1),
+      ]),
+    };
+    assert.equal((await ciBuildPlan(root, env)).build, false);
+    // Without an ancestor, or with only malformed entries, everything builds.
+    for (const list of [[entry(other, 2)], [entry(other, 2), { commit: base }]]) {
+      assert.equal(
+        (await ciBuildPlan(root, { ...env, GITMATRIX_VERIFIED_BASES: JSON.stringify(list) })).build,
+        true,
+      );
+    }
+    // A usable list wins over the single object; an unusable one falls back to it.
+    const single = JSON.stringify(entry(base, 1));
+    const stale = JSON.stringify([entry(other, 2)]);
+    assert.equal(
+      (
+        await ciBuildPlan(root, {
+          ...env,
+          GITMATRIX_VERIFIED_BASES: stale,
+          GITMATRIX_VERIFIED_BASE: single,
+        })
+      ).build,
+      true,
+    );
+    for (const bases of [undefined, "not-json", "null"])
+      assert.equal(
+        (
+          await ciBuildPlan(root, {
+            GITMATRIX_COMMIT: base,
+            GITMATRIX_VERIFIED_BASES: bases,
+            GITMATRIX_VERIFIED_BASE: single,
+          })
+        ).build,
+        false,
+      );
+  });
+});
+
 await test("CI build selection cannot use absent, shallow, unrelated or mismatched evidence", async () => {
   await fixture(async (root, git, put) => {
     const base = (await git(["rev-parse", "HEAD"])).trim();
@@ -683,5 +754,159 @@ await test("CI build selection cannot use absent, shallow, unrelated or mismatch
       ).build,
       true,
     );
+  });
+});
+
+const local = async (root: string, opts = options) => {
+  const plan = await readinessPlan(root, opts);
+  return { plan, gates: await localGates(root, plan) };
+};
+const localNames = (gates: ReadyPlan["gates"]) => gates.map((gate) => gate.name);
+
+await test("local ready runs only website unit tests related to a worker change", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("apps/website/worker/ci/trigger.ts");
+    const { plan, gates } = await local(root);
+    assert.deepEqual(plan.direct, ["apps/website"]);
+    const found = localNames(gates);
+    assert.equal(
+      found.some((name) => name === "build" || name.endsWith("-build")),
+      false,
+    );
+    assert.equal(found.includes("tests"), false);
+    assert.ok(found.includes("website-types") && found.includes("check"));
+    const tests = gates.find((gate) => gate.name === "website-tests")!;
+    assert.equal(tests.cwd, "website");
+    assert.ok(tests.args.includes(`--changed=${plan.base}`));
+    assert.deepEqual(tests.args.slice(1, 3), ["--project", "unit"]);
+    assert.equal(found.includes("website-browser-tests"), false);
+  });
+});
+
+await test("local ready selects colocated and changed browser tests by path", async () => {
+  await fixture(async (root, git, put) => {
+    await put("apps/website/src/components/X.browser.test.tsx");
+    await put("apps/website/src/components/Y.browser.test.tsx");
+    await git(["add", "."]);
+    await git(["commit", "-m", "browser tests"]);
+    await git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    await put("apps/website/src/components/X.tsx");
+    await put("apps/website/src/components/Z.tsx");
+    const { gates } = await local(root);
+    const browser = gates.find((gate) => gate.name === "website-browser-tests")!;
+    assert.deepEqual(browser.args.slice(1), [
+      "--project",
+      "browser",
+      "src/components/X.browser.test.tsx",
+    ]);
+    await put("apps/website/src/components/Y.browser.test.tsx", "edited\n");
+    const both = (await local(root)).gates.find((gate) => gate.name === "website-browser-tests")!;
+    assert.deepEqual(both.args.slice(3), [
+      "src/components/X.browser.test.tsx",
+      "src/components/Y.browser.test.tsx",
+    ]);
+  });
+});
+
+await test("local ready keeps tests of directly changed workspaces and a package's consumers", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("packages/formats/src/index.ts");
+    const { plan, gates } = await local(root);
+    assert.deepEqual(plan.direct, ["packages/formats"]);
+    const found = localNames(gates);
+    assert.ok(found.includes("formats-tests"));
+    assert.ok(found.includes("website-types"));
+    assert.ok(found.includes("website-tests"));
+    assert.equal(
+      found.some((name) => name.endsWith("-build")),
+      false,
+    );
+  });
+});
+
+await test("local ready runs the full website unit project for untraceable changes", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("apps/website/migrations/20990101000000_throwaway.sql", "select 1;\n");
+    const { gates } = await local(root);
+    const tests = gates.find((gate) => gate.name === "website-tests")!;
+    assert.deepEqual(tests.args.slice(1), ["--project", "unit"]);
+  });
+  await fixture(async (root, _git, put) => {
+    await put("packages/testing/src/index.ts");
+    const { plan, gates } = await local(root);
+    assert.deepEqual(plan.direct, ["packages/testing"]);
+    const tests = gates.find((gate) => gate.name === "website-tests")!;
+    assert.deepEqual(tests.args.slice(1), ["--project", "unit"]);
+  });
+});
+
+await test("local ready keeps the full gates for a global path", async () => {
+  await fixture(async (root, _git, put) => {
+    await put(".gitmatrix/ci.yml");
+    const { plan, gates } = await local(root);
+    assert.equal(plan.full, true);
+    assert.equal(gates, plan.gates);
+    assert.ok(names(plan).includes("tests") && names(plan).includes("build"));
+  });
+});
+
+await test("local ready slims the full fallback to checks and direct tests", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("tools/agent/environment.ts");
+    const { plan, gates } = await local(root);
+    assert.equal(plan.full, true);
+    assert.deepEqual(plan.direct, ["tools/agent"]);
+    const found = localNames(gates);
+    assert.equal(found.includes("tests"), false);
+    assert.equal(found.includes("build"), false);
+    assert.ok(found.includes("agent-tests"));
+    for (const name of ["website-types", "remote-types", "check", "cli-check", "types"])
+      assert.ok(found.includes(name), name);
+    assert.equal(found.includes("website-tests"), false);
+    assert.equal(
+      localReasons(plan.reasons).some((reason) => reason.startsWith("Full coverage")),
+      false,
+    );
+  });
+});
+
+await test("the README's readers are found by name in the real website", () => {
+  const files = websiteTestSelection(["apps/website/README.md"], repository).files;
+  assert.ok(files.includes("worker/ci/config.test.ts"), files.join(","));
+  assert.equal(
+    files.some((file) => file.endsWith(".browser.test.tsx")),
+    false,
+  );
+  assert.deepEqual(websiteTestSelection(["apps/website/worker/ci/jobs.ts"], repository).files, []);
+});
+
+await test("local ready runs the website unit tests a README change reaches", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("apps/website/worker/ci/fake.test.ts", "// reads ../../README.md\n");
+    await put("apps/website/README.md");
+    const { gates } = await local(root);
+    const website = gates.find((gate) => gate.name === "website-tests");
+    assert.ok(website);
+    assert.ok(website.args.some((arg) => arg.startsWith("--changed=")));
+    // Vitest ANDs filters with --changed, so the README's readers run by name in their own gate.
+    const readme = gates.find((gate) => gate.name === "website-readme-tests");
+    assert.ok(readme);
+    assert.deepEqual(readme.args.slice(1, 4), ["--project", "unit", "worker/ci/fake.test.ts"]);
+    assert.equal(
+      readme.args.some((arg) => arg.startsWith("--changed")),
+      false,
+    );
+    assert.equal(localNames(gates).includes("website-browser-tests"), false);
+  });
+});
+
+await test("--all keeps the full gates and failed discovery is not slimmed", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("apps/website/worker/ci/trigger.ts");
+    const all = await readinessPlan(root, { ...options, all: true });
+    assert.ok(names(all).includes("tests") && names(all).includes("build"));
+    const lost = await readinessPlan(root, { ...options, base: "no-such-ref" });
+    assert.equal(lost.base, null);
+    assert.deepEqual(await localGates(root, lost), lost.gates);
   });
 });
