@@ -229,30 +229,47 @@ test("a repository's composer writes from the selected release", async () => {
     .toBeVisible();
 });
 
-test("Copy puts the Markdown and the rendered HTML on the clipboard", async () => {
-  await world();
+test("Copy and Download Markdown give the notes as written; the result is plain: no images, no autolinked references", async () => {
+  // The notes, then what a plain result must not render: an image, and
+  // references that elsewhere would be links.
+  const markdown = `${MARKDOWN}\n\n![pixel](https://example.com/pixel.png)\n\nFixed ENG-1 in commit 1a2b3c4d, see [the guide](https://example.com/g).`;
+  await world(markdown);
   const items: ClipboardItem[] = [];
   vi.spyOn(navigator.clipboard, "write").mockImplementation(async (data) => {
     items.push(...data);
   });
-  renderApp("/tracker/orbit/releases");
-  await expect.element(page.getByText("Parcel verification", { exact: true })).toBeVisible();
-  await openAndWrite();
-  await page.getByRole("button", { name: "Copy", exact: true }).click();
-  await expect.poll(() => items.length).toBe(1);
-  expect(await (await items[0]!.getType("text/plain")).text()).toBe(MARKDOWN);
-  expect(await (await items[0]!.getType("text/html")).text()).toContain("<h1>Spring release</h1>");
-});
-
-test("Download Markdown saves the text as a .md file", async () => {
-  await world();
   const downloads = captureDownloads();
   renderApp("/tracker/orbit/releases");
   await expect.element(page.getByText("Parcel verification", { exact: true })).toBeVisible();
   await openAndWrite();
+  await expect.element(page.getByText(/Fixed ENG-1 in commit 1a2b3c4d/)).toBeVisible();
+  const result = document.querySelector<HTMLElement>(
+    "section[aria-label='Custom release notes'] .gm-prose",
+  )!;
+  expect(result.querySelector("img")).toBeNull();
+  // The reference stays text; only the links the model wrote are links.
+  expect([...result.querySelectorAll("a")].map((a) => a.textContent)).toEqual([
+    "guide",
+    "the guide",
+  ]);
+  expect(
+    performance.getEntriesByType("resource").some((entry) => entry.name.includes("pixel.png")),
+  ).toBe(false);
+
+  // Copy puts the Markdown and the rendered HTML on the clipboard, as plain.
+  await page.getByRole("button", { name: "Copy", exact: true }).click();
+  await expect.poll(() => items.length).toBe(1);
+  expect(await (await items[0]!.getType("text/plain")).text()).toBe(markdown);
+  const html = await (await items[0]!.getType("text/html")).text();
+  expect(html).toContain("<h1>Spring release</h1>");
+  expect(html).toContain("Fixed ENG-1 in commit 1a2b3c4d");
+  expect(html).not.toContain("<img");
+  expect(html.match(/<a /g)).toHaveLength(2);
+
+  // Download Markdown saves the text as a .md file.
   await page.getByRole("button", { name: "Download Markdown", exact: true }).click();
   await expect.poll(() => downloads.blobs.length).toBe(1);
-  expect(await downloads.blobs[0]!.text()).toBe(MARKDOWN);
+  expect(await downloads.blobs[0]!.text()).toBe(markdown);
   expect(downloads.names).toEqual(["orbit-release-notes.md"]);
 });
 
@@ -317,37 +334,6 @@ test("Print opens the print dialog on the notes alone", async () => {
   const frame = document.querySelector("iframe")!;
   (real.get!.call(frame) as Window).dispatchEvent(new Event("afterprint"));
   expect(document.querySelector("iframe")).toBeNull();
-});
-
-test("the result is plain: no images, no autolinked references, the same in what is copied", async () => {
-  await world(
-    "![pixel](https://example.com/pixel.png)\n\nFixed ENG-1 in commit 1a2b3c4d, see [the guide](https://example.com/g).",
-  );
-  const items: ClipboardItem[] = [];
-  vi.spyOn(navigator.clipboard, "write").mockImplementation(async (data) => {
-    items.push(...data);
-  });
-  renderApp("/tracker/orbit/releases");
-  await expect.element(page.getByText("Parcel verification", { exact: true })).toBeVisible();
-  await toggle().click();
-  await prompt().fill("Announcement");
-  await write().click();
-  await expect.element(page.getByText(/Fixed ENG-1 in commit 1a2b3c4d/)).toBeVisible();
-  const result = document.querySelector<HTMLElement>(
-    "section[aria-label='Custom release notes'] .gm-prose",
-  )!;
-  expect(result.querySelector("img")).toBeNull();
-  // The reference stays text; only the link the model wrote is a link.
-  expect([...result.querySelectorAll("a")].map((a) => a.textContent)).toEqual(["the guide"]);
-  expect(
-    performance.getEntriesByType("resource").some((entry) => entry.name.includes("pixel.png")),
-  ).toBe(false);
-  await page.getByRole("button", { name: "Copy", exact: true }).click();
-  await expect.poll(() => items.length).toBe(1);
-  const html = await (await items[0]!.getType("text/html")).text();
-  expect(html).toContain("Fixed ENG-1 in commit 1a2b3c4d");
-  expect(html).not.toContain("<img");
-  expect(html.match(/<a /g)).toHaveLength(1);
 });
 
 test("an environment without AI explains itself instead of offering a dead button", async () => {

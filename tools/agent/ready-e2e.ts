@@ -55,7 +55,6 @@ export const e2eScenarioNames = [
   "source-authorization-native-and-canonical-separation",
   "source-multi-repository-landing-and-durable-recovery",
   "source-push-recovery-fences-late-writes",
-  "source-late-sync-lineage-conflicts-guard-and-expiry",
   "source-finite-legacy-migration-and-partial-revert",
   "source-retention-expiry-orphan-and-canonical-purge",
   "browser-expired-source-without-timeline-history",
@@ -141,7 +140,6 @@ export const prerequisites: Readonly<Record<ScenarioName, readonly ScenarioName[
   "source-authorization-native-and-canonical-separation": [],
   "source-multi-repository-landing-and-durable-recovery": [],
   "source-push-recovery-fences-late-writes": [],
-  "source-late-sync-lineage-conflicts-guard-and-expiry": [],
   "source-finite-legacy-migration-and-partial-revert": [],
   "source-retention-expiry-orphan-and-canonical-purge": [],
   "browser-expired-source-without-timeline-history": [],
@@ -239,12 +237,10 @@ export const scenarioResources: Readonly<
   "steps-context-hook-live-run-landing-and-access": { ...engineWrite, "gm-state": "write" },
   "timeline-landing-conflict-asks-for-a-sync": engineWrite,
   "timeline-nested-admission-and-canonical-revert": engineWrite,
-  // Its own orbit repositories; claims a remediation issue. Its deletion phase
-  // holds a landing gate in a 60 s sleep.
+  // Its own orbit repository; claims a remediation issue.
   "queue-concurrency-failure-fencing-and-push-recovery": {
     "space:orbit": "read",
     "gm-state": "write",
-    "ci-runner-hold": "write",
   },
   // Counts marco's agents exactly; its own HOME and XDG_CONFIG_HOME, but the shared XDG_DATA_HOME.
   "agent-setup-memorable-persistent-identities": { "space:orbit": "read", "gm-state": "write" },
@@ -302,14 +298,9 @@ export const scenarioResources: Readonly<
   "source-authorization-native-and-canonical-separation": { "space:sam": "read" },
   "source-multi-repository-landing-and-durable-recovery": { "space:orbit": "read" },
   "source-push-recovery-fences-late-writes": { "space:orbit": "read" },
-  "source-late-sync-lineage-conflicts-guard-and-expiry": { "space:orbit": "read" },
   "source-finite-legacy-migration-and-partial-revert": { "space:orbit": "read" },
-  // Source retention on sam's Space and the Instance-wide orphan sweep. Also
-  // holds a preview job on a barrier, which running alone already covers.
-  "source-retention-expiry-orphan-and-canonical-purge": {
-    instance: "write",
-    "ci-runner-hold": "write",
-  },
+  // Source retention on sam's Space and the Instance-wide orphan sweep.
+  "source-retention-expiry-orphan-and-canonical-purge": { instance: "write" },
   // Tracker-activity retention on sam's Space, 181 days ahead.
   "browser-expired-source-without-timeline-history": { "space:sam": "write" },
   // Links a month of seeded orbit history to an engine CI run.
@@ -475,13 +466,7 @@ export const scenarioAreas: Readonly<Record<ScenarioName, readonly E2EArea[]>> =
     "git-transport",
     "why",
   ],
-  "steps-context-hook-live-run-landing-and-access": [
-    "gm",
-    "steps",
-    "timelines-landing",
-    "ci",
-    "why",
-  ],
+  "steps-context-hook-live-run-landing-and-access": ["gm", "steps", "ci"],
   "timeline-landing-conflict-asks-for-a-sync": ["gm", "timelines-landing", "sources", "ci"],
   "timeline-nested-admission-and-canonical-revert": [
     "gm",
@@ -530,12 +515,7 @@ export const scenarioAreas: Readonly<Record<ScenarioName, readonly E2EArea[]>> =
     "ci",
     "assistant",
   ],
-  "source-authorization-native-and-canonical-separation": [
-    "gm",
-    "sources",
-    "auth",
-    "git-transport",
-  ],
+  "source-authorization-native-and-canonical-separation": ["gm", "sources", "git-transport"],
   "source-multi-repository-landing-and-durable-recovery": [
     "gm",
     "sources",
@@ -543,7 +523,6 @@ export const scenarioAreas: Readonly<Record<ScenarioName, readonly E2EArea[]>> =
     "ci",
   ],
   "source-push-recovery-fences-late-writes": ["gm", "sources", "git-transport"],
-  "source-late-sync-lineage-conflicts-guard-and-expiry": ["gm", "sources", "timelines-landing"],
   "source-finite-legacy-migration-and-partial-revert": ["gm", "sources", "timelines-landing"],
   "source-retention-expiry-orphan-and-canonical-purge": ["gm", "sources", "retention"],
   "browser-expired-source-without-timeline-history": ["gm", "sources", "retention"],
@@ -690,10 +669,6 @@ const rules: readonly (readonly [RegExp, E2ETarget | typeof AGENTS_FULL])[] = [
   [worker("api/bytes\\.ts$"), { areas: ["accounts", "steps"] }],
   // Fixture endpoints of particular journeys (landing and legacy sources are main-only).
   [
-    worker("api/dev-source-auth\\.ts$"),
-    { scenarios: ["source-authorization-native-and-canonical-separation"] },
-  ],
-  [
     worker("api/dev-source-retention\\.ts$"),
     {
       scenarios: [
@@ -784,7 +759,6 @@ const rules: readonly (readonly [RegExp, E2ETarget | typeof AGENTS_FULL])[] = [
         "queue-concurrency-failure-fencing-and-push-recovery",
         "source-multi-repository-landing-and-durable-recovery",
         "source-push-recovery-fences-late-writes",
-        "source-late-sync-lineage-conflicts-guard-and-expiry",
         "source-finite-legacy-migration-and-partial-revert",
       ],
     },
@@ -795,7 +769,6 @@ const rules: readonly (readonly [RegExp, E2ETarget | typeof AGENTS_FULL])[] = [
     { scenarios: ["source-multi-repository-landing-and-durable-recovery"] },
   ],
   [helper("source-push-recovery"), { scenarios: ["source-push-recovery-fences-late-writes"] }],
-  [helper("source-sync"), { scenarios: ["source-late-sync-lineage-conflicts-guard-and-expiry"] }],
   [
     helper("source-migration"),
     { scenarios: ["source-finite-legacy-migration-and-partial-revert"] },
@@ -832,10 +805,10 @@ const rules: readonly (readonly [RegExp, E2ETarget | typeof AGENTS_FULL])[] = [
 
 function exempt(path: string): boolean {
   return (
-    /^(?:(?:apps\/(?:cli|website)|tools\/(?:agent|preview)|packages\/(?:formats|testing|utils))\/)?(?:README|CHANGELOG|CONTRIBUTING|AGENTS)\.md$/.test(
+    /^(?:(?:apps\/(?:cli|website)|tools\/(?:agent|preview)|packages\/(?:formats|testing))\/)?(?:README|CHANGELOG|CONTRIBUTING|AGENTS)\.md$/.test(
       path,
     ) ||
-    /^(?:apps\/(?:cli|website|site)|tools\/(?:agent|preview|remote)|packages\/(?:formats|testing|utils))\/.*\.(test|spec)\.[cm]?[jt]sx?$/.test(
+    /^(?:apps\/(?:cli|website|site)|tools\/(?:agent|preview|remote)|packages\/(?:formats|testing))\/.*\.(test|spec)\.[cm]?[jt]sx?$/.test(
       path,
     ) ||
     /^apps\/cli\/tests\/.*\.rs$/.test(path)

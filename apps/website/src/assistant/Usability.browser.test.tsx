@@ -226,9 +226,9 @@ test("a fresh conversation retains its first sent message while chat access hist
   }
 });
 
+// A short desktop and a narrower one; a tall window adds no layout case.
 for (const [width, height] of [
   [1440, 540],
-  [1440, 1000],
   [1024, 540],
 ]) {
   test(`expanding overlays rather than moving the page and preserves the draft at ${width}×${height}`, async () => {
@@ -292,80 +292,76 @@ test("keyboard removal and re-inclusion change only the next message's context",
     .toBeVisible();
 });
 
-for (const [width, height] of [
-  [1440, 360],
-  [390, 360],
-  [1440, 1000],
-]) {
-  for (const approved of [true, false]) {
-    test(`a long draft leaves the entire approval and ${approved ? "Approve" : "Decline"} reachable at ${width}×${height}`, async () => {
-      await setup(width!, height!, true);
-      await userEvent.fill(composer(), longDraft);
-      const field = composer().element() as HTMLTextAreaElement;
-      expect(field.scrollHeight).toBeGreaterThan(field.clientHeight);
-      expect(reachable(field)).toBe(true);
-      if (width! < 640) {
-        expect(box(dock().element()).width).toBe(innerWidth);
-        await expect
-          .element(dock().getByRole("button", { name: "Expand the assistant" }))
-          .not.toBeInTheDocument();
-      }
-      const showAll = dock().getByRole("button", { name: "Show all", exact: true });
-      await userEvent.click(showAll);
-      const marker = dock().getByText(finalMarker, { exact: true });
-      (marker.element() as HTMLElement).scrollIntoView({ block: "center" });
-      await expect.poll(() => reachable(marker.element())).toBe(true);
-      for (const name of ["Approve", "Decline"]) {
-        const action = dock().getByRole("button", { name, exact: true });
-        await focusOn(action);
-        await expect.poll(() => reachable(action.element())).toBe(true);
-      }
-      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(innerWidth);
-      await expect.element(composer()).toHaveValue(longDraft);
-      await focusOn(
-        dock().getByRole("button", { name: approved ? "Approve" : "Decline", exact: true }),
-      );
-      await press("Enter");
-      await expect.poll(() => transport.decisions).toEqual([{ id: "review-fixture", approved }]);
+// A short desktop and a short phone; which decision is sent only changes the
+// button pressed, so each window presses one.
+for (const [width, height, approved] of [
+  [390, 360, true],
+  [1440, 360, false],
+] as const) {
+  test(`a long draft leaves the entire approval and ${approved ? "Approve" : "Decline"} reachable at ${width}×${height}`, async () => {
+    await setup(width, height, true);
+    await userEvent.fill(composer(), longDraft);
+    const field = composer().element() as HTMLTextAreaElement;
+    expect(field.scrollHeight).toBeGreaterThan(field.clientHeight);
+    expect(reachable(field)).toBe(true);
+    if (width < 640) {
+      expect(box(dock().element()).width).toBe(innerWidth);
       await expect
-        .element(dock().getByRole("button", { name: "Approve", exact: true }))
+        .element(dock().getByRole("button", { name: "Expand the assistant" }))
         .not.toBeInTheDocument();
-      await expect.element(composer()).toHaveValue(longDraft);
-      expect(transport.sent).toEqual([]);
-    });
-  }
-}
-
-for (const theme of ["light", "dark"]) {
-  test(`slash completion lists and filters names and descriptions in ${theme} at narrow width`, async () => {
-    await setup(390, 640);
-    const previous = document.documentElement.getAttribute("data-theme");
-    document.documentElement.setAttribute("data-theme", theme);
-    onTestFinished(() => {
-      if (previous === null) document.documentElement.removeAttribute("data-theme");
-      else document.documentElement.setAttribute("data-theme", previous);
-    });
-    await userEvent.fill(composer(), "/");
-    const list = dock().getByRole("listbox", { name: "Assistant skills" });
-    await expect.element(list).toBeVisible();
-    await expect
-      .element(list.getByRole("option", { name: "/review Inspect a change for defects" }))
-      .toBeVisible();
-    await expect.element(list.getByRole("option", { name: "/quiet No description" })).toBeVisible();
-    await userEvent.fill(composer(), "/actionable");
-    await expect
-      .element(list.getByRole("option", { name: "/plan Break work into actionable steps" }))
-      .toBeVisible();
-    await expect.element(list.getByRole("option", { name: /^\/review/ })).not.toBeInTheDocument();
+    }
+    const showAll = dock().getByRole("button", { name: "Show all", exact: true });
+    await userEvent.click(showAll);
+    const marker = dock().getByText(finalMarker, { exact: true });
+    (marker.element() as HTMLElement).scrollIntoView({ block: "center" });
+    await expect.poll(() => reachable(marker.element())).toBe(true);
+    for (const name of ["Approve", "Decline"]) {
+      const action = dock().getByRole("button", { name, exact: true });
+      await focusOn(action);
+      await expect.poll(() => reachable(action.element())).toBe(true);
+    }
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(innerWidth);
+    await expect.element(composer()).toHaveValue(longDraft);
+    await focusOn(
+      dock().getByRole("button", { name: approved ? "Approve" : "Decline", exact: true }),
+    );
     await press("Enter");
-    await expect.element(composer()).toHaveValue("/plan ");
-    await expect.element(composer()).toHaveFocus();
+    await expect.poll(() => transport.decisions).toEqual([{ id: "review-fixture", approved }]);
     await expect
-      .element(dock().getByRole("list", { name: "Conversation" }))
+      .element(dock().getByRole("button", { name: "Approve", exact: true }))
       .not.toBeInTheDocument();
+    await expect.element(composer()).toHaveValue(longDraft);
+    expect(transport.sent).toEqual([]);
   });
 }
+
+// In the light theme, not the default dark one; no step depends on the theme.
+test("slash completion lists and filters names and descriptions in light at narrow width", async () => {
+  await setup(390, 640);
+  const previous = document.documentElement.getAttribute("data-theme");
+  document.documentElement.setAttribute("data-theme", "light");
+  onTestFinished(() => {
+    if (previous === null) document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", previous);
+  });
+  await userEvent.fill(composer(), "/");
+  const list = dock().getByRole("listbox", { name: "Assistant skills" });
+  await expect.element(list).toBeVisible();
+  await expect
+    .element(list.getByRole("option", { name: "/review Inspect a change for defects" }))
+    .toBeVisible();
+  await expect.element(list.getByRole("option", { name: "/quiet No description" })).toBeVisible();
+  await userEvent.fill(composer(), "/actionable");
+  await expect
+    .element(list.getByRole("option", { name: "/plan Break work into actionable steps" }))
+    .toBeVisible();
+  await expect.element(list.getByRole("option", { name: /^\/review/ })).not.toBeInTheDocument();
+  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(innerWidth);
+  await press("Enter");
+  await expect.element(composer()).toHaveValue("/plan ");
+  await expect.element(composer()).toHaveFocus();
+  await expect.element(dock().getByRole("list", { name: "Conversation" })).not.toBeInTheDocument();
+});
 
 test("arrows wrap, Tab completes without sending, and the chosen prefix survives collapse", async () => {
   await setup(1440, 900);
@@ -458,19 +454,6 @@ test("a persisted skill receipt retains its name and accessible source when the 
   renderApp("/tracker/orbit");
   await expect.element(conversation().getByText("Used /plan", { exact: true })).toBeVisible();
   await expect.element(conversation().getByText("Personal skill", { exact: true })).toBeVisible();
-});
-
-test("a skill with no description can be selected and sent as ordinary visible text", async () => {
-  await setup(1440, 900);
-  await userEvent.fill(composer(), "/quiet");
-  await expect.element(dock().getByRole("option", { name: "/quiet No description" })).toBeVisible();
-  await press("Enter");
-  await expect.element(composer()).toHaveValue("/quiet ");
-  await press("Enter");
-  await expect
-    .element(dock().getByRole("list", { name: "Conversation" }))
-    .toHaveTextContent("/quiet");
-  await expect.element(composer()).toHaveValue("");
 });
 
 test("refocusing the composer refreshes changed personal skill configuration", async () => {

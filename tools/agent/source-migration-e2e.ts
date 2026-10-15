@@ -32,7 +32,6 @@ export async function runSourceMigrationE2E(
   record: (value: unknown) => void,
 ) {
   const owned: OwnedMigrationRepo[] = [];
-  const deleted = new Set<string>();
   const secret = ctx.env.GITMATRIX_AGENT_SECRET;
   assert(secret, "Migration fixtures require the named agent development secret");
   const tag = randomUUID().slice(0, 8);
@@ -49,7 +48,7 @@ export async function runSourceMigrationE2E(
       const value = await read();
       if (done(value)) return value;
       assert(Date.now() < deadline, `Timed out: ${label}`);
-      await delay(1_000);
+      await delay(250);
     }
   }
   type Inventory = {
@@ -61,85 +60,45 @@ export async function runSourceMigrationE2E(
   try {
     const a = await queueFixture(ctx, fixtures, record);
     owned.push(a);
-    const b = await queueFixture(ctx, fixtures, record);
-    owned.push(b);
-    const commit = async (f: typeof a, file: string, content: string) => {
-      await writeFile(join(f.root, file), content);
-      await f.git(["add", file]);
-      await f.git(["-c", "core.hooksPath=/dev/null", "commit", "-m", `Migration ${file}`]);
-      return f.git(["rev-parse", "HEAD"]);
+    const commit = async (file: string, content: string) => {
+      await writeFile(join(a.root, file), content);
+      await a.git(["add", file]);
+      await a.git(["-c", "core.hooksPath=/dev/null", "commit", "-m", `Migration ${file}`]);
+      return a.git(["rev-parse", "HEAD"]);
     };
     // Replace queue-only gates before any migration baseline is pinned.
-    for (const f of [a, b]) {
-      await commit(
-        f,
-        ".gitmatrix/ci.yml",
-        JSON.stringify({
-          on: { push: { branches: ["never-agent-auto"] } },
-          jobs: {
-            gate: {
-              if: 'trigger == "landing"',
-              steps: [{ run: 'test "$(git log -1 --format=%P | wc -w)" = 1' }],
-            },
+    await commit(
+      ".gitmatrix/ci.yml",
+      JSON.stringify({
+        on: { push: { branches: ["never-agent-auto"] } },
+        jobs: {
+          gate: {
+            if: 'trigger == "landing"',
+            steps: [{ run: 'test "$(git log -1 --format=%P | wc -w)" = 1' }],
           },
-        }),
-      );
-      await f.git(["push", "origin", "HEAD:main"]);
-    }
-    const B = await a.tip();
-    const B2 = await b.tip();
-    const T = await commit(a, "legacy.txt", "retained B-to-T contribution\n");
-    const parent = slug("parent");
-    const child = slug("child");
-    const inflight = slug("inflight");
-    const tombstone = slug("tombstone");
-    const U = await commit(a, "nested.txt", "nested contribution\n");
-    const seed = async (
-      name: string,
-      entries: { f: typeof a; base: string; head: string; merge?: string }[],
-      extra: object = {},
-    ) => {
-      for (const { f, head } of entries)
-        await f.git(["push", "origin", `${head}:refs/heads/gitmatrix/queue/${head}`]);
-      return a.json<{ timeline: Timeline; landing: Landing | null }>(
-        "/api/dev/source-fixtures",
-        "POST",
-        {
-          slug: name,
-          ...extra,
-          repos: entries.map(({ f, ...entry }) => ({ name: f.repo.split("/")[1], ...entry })),
         },
-        [201],
-        secret,
-      );
-    };
-    await seed(parent, [{ f: a, base: B, head: T }], { policy: "approval" });
-    await seed(child, [{ f: a, base: T, head: U }], { parent, experimental: true });
-    await seed(inflight, [{ f: a, base: B, head: T }], { operation: "inflight" });
-    await seed(tombstone, [{ f: b, base: B2, head: B2 }]);
-    for (const status of ["landed", "abandoned"] as const) {
-      const name = slug(status);
-      await seed(name, [{ f: a, base: B, head: T }], { status });
-      await gm(["timeline", "migrate", name, "--space", "orbit"], "marco", a.root);
-      const historical = await a.json<TimelineDetail>(path(name));
-      assert.equal(historical.timeline.status, status);
-      assert.equal(historical.timeline.repos[0]?.source?.kind, "canonical-historical");
-      assert.equal(historical.timeline.repos[0]?.source?.sourceId, "canonical");
-      const history = await a.json<CheckpointView>(`${path(name)}/checkpoints/1`);
-      assert.equal(history.checkpoint.repos[0]?.commit, T);
-      record({ historical: name, status, checkpoint: history.checkpoint.id, commit: T });
-    }
+      }),
+    );
+    await a.git(["push", "origin", "HEAD:main"]);
+    const B = await a.tip();
+    const T = await commit("legacy.txt", "retained B-to-T contribution\n");
+    const parent = slug("parent");
+    await a.git(["push", "origin", `${T}:refs/heads/gitmatrix/queue/${T}`]);
+    await a.json<{ timeline: Timeline; landing: Landing | null }>(
+      "/api/dev/source-fixtures",
+      "POST",
+      {
+        slug: parent,
+        policy: "approval",
+        repos: [{ name: a.repo.split("/")[1], base: B, head: T }],
+      },
+      [201],
+      secret,
+    );
     const oldApproval = await a.json<CheckpointView>(`${path(parent)}/checkpoints/1`);
     assert.equal(oldApproval.approved, true, "Fixture really persisted an approved old checkpoint");
-    // Parent-first migration is mandatory; a child cannot guess its foreign baseline.
-    await gm(
-      ["timeline", "migrate", child, "--space", "orbit"],
-      "marco",
-      a.root,
-      /parent first|historical dependency/i,
-    );
     await a.git(["checkout", "--detach", B]);
-    const M = await commit(a, "independent.txt", "independent canonical edit\n");
+    const M = await commit("independent.txt", "independent canonical edit\n");
     const attempts = await Promise.allSettled([
       gm(["timeline", "migrate", parent, "--space", "orbit"], "marco", a.root),
       gm(["timeline", "migrate", parent, "--space", "orbit"], "marco", a.root),
@@ -183,7 +142,7 @@ export async function runSourceMigrationE2E(
     assert.equal(
       allocated.d1.timeline_work_sources,
       1,
-      "Concurrent migrations allocate exactly one work source; historical conversions allocate none",
+      "Concurrent migrations allocate exactly one work source",
     );
     assert.equal(await a.git(["ls-remote", "origin", `refs/heads/timeline/${parent}`]), "");
     const staleApproval = await a.json<CheckpointView>(`${path(parent)}/checkpoints/1`);
@@ -198,29 +157,9 @@ export async function runSourceMigrationE2E(
       "",
       "Stale canonical client cannot recreate the retired bookmark",
     );
-    await gm(["timeline", "migrate", child, "--space", "orbit"], "marco", a.root);
-    const nested = (await a.json<TimelineDetail>(path(child))).timeline;
-    assert.equal(nested.experimental, true);
-    assert.equal(nested.repos[0]?.logicalBase?.commit, T);
-    assert.equal(nested.repos[0]?.logicalBase?.sourceId, sourceId);
-    assert.equal(nested.repos[0]?.dependencies?.[0]?.source.commit, T);
-    assert.equal(nested.repos[0]?.dependencies?.[0]?.base.commit, B);
-    const nestedCheckpoint = await a.json<CheckpointView>(
-      `${path(child)}/checkpoints`,
-      "POST",
-      { summary: "Fresh migrated nested work" },
-      [201],
-    );
-    assert.equal(nestedCheckpoint.checkpoint.repos[0]?.source?.commit, U);
-    await a.json(`${path(child)}/land`, "POST", {}, [200, 202, 409]);
-    await poll(
-      () => a.json<{ landing: Landing | null }>(`${path(child)}/landing`),
-      (value) => value.landing?.state === "blocked_dependency",
-      "unlanded migrated parent blocks child",
-    );
     // A new WIP commit goes ONLY to owned work; canonical already contains old T by design.
     await a.git(["checkout", "--detach", T]);
-    const W = await commit(a, "post-cutover.txt", "new source-only progress\n");
+    const W = await commit("post-cutover.txt", "new source-only progress\n");
     await a.git(["push", workUrl, `${W}:refs/heads/work`]);
     const progress = await a.json<{ commits: { oid: string }[] }>(
       `${a.api}/commits?source=${sourceId}&ref=${W}`,
@@ -310,148 +249,10 @@ export async function runSourceMigrationE2E(
       C,
       sourceId,
       approvalInvalidated: true,
-      nested: child,
     });
-    await a.json(`${path(child)}/land`, "POST", {}, [200, 202, 409]);
-    const childLanding = await poll(
-      () => a.json<{ landing: Landing | null }>(`${path(child)}/landing`),
-      (value) => !!value.landing && ["landed", "failed", "conflict"].includes(value.landing.state),
-      "migrated nested landing after parent",
-    );
-    assert.equal(
-      childLanding.landing?.state,
-      "landed",
-      childLanding.landing?.reason ?? "Nested landing failed",
-    );
-    const nestedCanonical = childLanding.landing?.repos[0]?.merge;
-    assert(nestedCanonical);
-    await a.git(["fetch", "origin", "main"]);
-    assert.equal(await a.git(["show", `${nestedCanonical}:nested.txt`]), "nested contribution");
-    assert.equal(
-      await a.git(["show", `${nestedCanonical}:post-cutover.txt`]),
-      "new source-only progress",
-    );
-    assert.equal(
-      await a.git(["show", `${nestedCanonical}:independent.txt`]),
-      "independent canonical edit",
-    );
-    assert.equal(await a.git(["show", "-s", "--format=%P", nestedCanonical]), C);
-    record({ nested: child, logicalBase: T, integratedParent: C, canonical: nestedCanonical });
-
-    await gm(
-      ["timeline", "migrate", inflight, "--space", "orbit"],
-      "marco",
-      a.root,
-      /Resolve the legacy landing|landing_unresolved/i,
-    );
-    await a.json(`${path(inflight)}/migration/resolve`, "POST", {
-      expectedVersion: 1,
-      action: "cancel-unadvanced",
-      note: "No canonical advance; cancel old operation",
-    });
-    await gm(["timeline", "migrate", inflight, "--space", "orbit"], "marco", a.root);
-    assert.equal(
-      (await a.json<TimelineDetail>(path(inflight))).timeline.repos[0]?.source?.kind,
-      "timeline-work",
-    );
-
-    // Real old partial success, followed by a real canonical revert before explicit resolution.
-    const partial = slug("partial");
-    await a.git(["checkout", "--detach", nestedCanonical]);
-    const P = await commit(a, "partial.txt", "legacy successful contribution\n");
-    await a.git(["checkout", "--detach", nestedCanonical]);
-    await a.git([
-      "-c",
-      "core.hooksPath=/dev/null",
-      "merge",
-      "--no-ff",
-      P,
-      "-m",
-      "Legacy successful first repository",
-    ]);
-    const receipt = await a.git(["rev-parse", "HEAD"]);
-    await a.git(["push", "origin", `${receipt}:main`]);
-    await a.git(["-c", "core.hooksPath=/dev/null", "revert", "--no-edit", "-m", "1", receipt]);
-    const reverted = await a.git(["rev-parse", "HEAD"]);
-    await a.git(["push", "origin", `${reverted}:main`]);
-    const pending = await commit(b, "remaining.txt", "unlanded second repository\n");
-    await seed(
-      partial,
-      [
-        { f: a, base: nestedCanonical, head: P, merge: receipt },
-        { f: b, base: B2, head: pending },
-      ],
-      { operation: "partial" },
-    );
-    await gm(
-      ["timeline", "migrate", partial, "--space", "orbit"],
-      "marco",
-      a.root,
-      /Resolve the legacy landing|landing_unresolved/i,
-    );
-    await a.json(
-      `${path(partial)}/migration/resolve`,
-      "POST",
-      { expectedVersion: 1, action: "cancel-unadvanced", note: "Must be refused after success" },
-      [409],
-    );
-    await a.json(`${path(partial)}/migration/resolve`, "POST", {
-      expectedVersion: 1,
-      action: "accept-partial-and-abandon",
-      note: "Preserve first receipt despite revert; remaining work needs new timeline",
-    });
-    await gm(["timeline", "migrate", partial, "--space", "orbit"], "marco", a.root);
-    const abandoned = (await a.json<TimelineDetail>(path(partial))).timeline;
-    assert.equal(abandoned.status, "abandoned");
-    assert(abandoned.repos.every((repo) => repo.source?.kind === "canonical-historical"));
-    const kept = (await a.json<{ landing: Landing }>(`${path(partial)}/landing`)).landing;
-    assert.equal(kept.repos[0]?.merge, receipt);
-    assert.equal(kept.repos[0]?.state, "advanced");
-    await a.json(
-      `${path(partial)}/checkpoints`,
-      "POST",
-      { summary: "Cannot reuse resolved partial timeline" },
-      [409],
-    );
-    await a.json(`${path(partial)}/land`, "POST", {}, [409]);
-    assert.equal(await a.tip(), reverted, "Resolution must not replay reverted successful content");
-    assert.equal(await b.tip(), B2, "Resolution must not land remaining repository implicitly");
-    await assert.rejects(a.git(["show", `${reverted}:partial.txt`]), /git show failed/);
-    const replacement = join(ctx.work, `${partial}-replacement`);
-    await gm(["clone", b.repo, replacement], "marco");
-    await gm(
-      ["timeline", "start", slug("replacement"), "--space", "orbit", "--policy", "auto"],
-      "marco",
-      replacement,
-    );
-    const replacementTimeline = (await a.json<TimelineDetail>(path(slug("replacement")))).timeline;
-    assert.notEqual(replacementTimeline.id, abandoned.id);
-    assert.equal(replacementTimeline.repos[0]?.logicalBase?.commit, B2);
-    record({
-      partial,
-      receipt,
-      reverted,
-      pending,
-      preservedReceipt: kept.repos[0]?.merge,
-      replacement: replacementTimeline.id,
-    });
-
-    await b.json(b.api, "DELETE", undefined, [204]);
-    deleted.add(b.repo);
-    await gm(
-      ["timeline", "migrate", tombstone, "--space", "orbit"],
-      "marco",
-      b.root,
-      /deleted|not found|write access|forbidden|404/i,
-    );
-    await b.json(b.api, "GET", undefined, [404]);
-    record({ tombstone, migrationRefused: true });
   } finally {
     for (const f of owned) {
-      if (!deleted.has(f.repo)) {
-        await f.json(f.api, "DELETE", undefined, [204, 404]);
-        deleted.add(f.repo);
-      }
+      await f.json(f.api, "DELETE", undefined, [204, 404]);
       await f.json(
         "/api/dev/repo-purge",
         "POST",

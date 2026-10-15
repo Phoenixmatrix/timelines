@@ -47,9 +47,8 @@ test("personal skills persist across remounts, edit every field, toggle catalog 
     body: "# Release\nCheck the deployment plan.",
     enabled: true,
   });
-  expect((await catalog(server)).skills).toContainEqual(
-    expect.objectContaining({ id: created.id, name: "release-check", source: "personal" }),
-  );
+  // Which skills the assistant's catalog then offers is
+  // worker/api/personal-skills.test.ts's.
 
   app.unmount();
   app = renderApp("/settings/skills");
@@ -87,15 +86,11 @@ test("personal skills persist across remounts, edit every field, toggle catalog 
       enabled: false,
     }),
   ]);
-  expect((await catalog(server)).skills.some((skill) => skill.id === created.id)).toBe(false);
 
   await row("ship-check").getByRole("checkbox", { name: "Enable /ship-check" }).click();
   await expect
     .element(row("ship-check").getByRole("checkbox", { name: "Enable /ship-check" }))
     .toBeChecked();
-  expect((await catalog(server)).skills).toContainEqual(
-    expect.objectContaining({ id: created.id, name: "ship-check" }),
-  );
   await row("ship-check").getByRole("button", { name: "Remove /ship-check" }).click();
   let dialog = page.getByRole("dialog", { name: "Remove /ship-check?" });
   await dialog.getByRole("button", { name: "Keep it" }).click();
@@ -224,39 +219,36 @@ test("loading failure can be retried and a failed remove remains recoverable in 
   await expect.element(page.getByText(/No personal skills yet/)).toBeVisible();
 });
 
-for (const theme of ["light", "dark"]) {
-  test(`personal skills are reachable from Profile and mobile settings in ${theme} theme`, async () => {
-    const oldTheme = localStorage.getItem("gitmatrix.theme");
-    const size = { width: window.innerWidth, height: window.innerHeight };
-    onTestFinished(async () => {
-      if (oldTheme === null) localStorage.removeItem("gitmatrix.theme");
-      else localStorage.setItem("gitmatrix.theme", oldTheme);
-      await page.viewport(size.width, size.height);
-    });
-    localStorage.setItem("gitmatrix.theme", theme);
-    await page.viewport(320, 720);
-    await TestServer.start({ world: true });
-    const app = renderApp("/settings/profile");
-    await page.getByRole("link", { name: "Manage assistant skills" }).click();
-    await app.waitForUrl((url) => url.pathname === "/settings/skills");
-    await expect
-      .element(page.getByRole("heading", { name: "Assistant skills", exact: true, level: 1 }))
-      .toBeVisible();
-    await page.getByText("Settings /", { exact: true }).click();
-    await expect
-      .element(page.getByRole("link", { name: "Assistant skills", exact: true }))
-      .toHaveAttribute("aria-current", "page");
-    await page.getByRole("link", { name: "Profile", exact: true }).click();
-    await app.waitForUrl((url) => url.pathname === "/settings/profile");
-    await page.getByRole("link", { name: "Manage assistant skills" }).click();
-    await expect
-      .element(addForm().getByRole("textbox", { name: "Name", exact: true }))
-      .toBeVisible();
-    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
-    await focusOn(addForm().getByRole("textbox", { name: "Name", exact: true }));
-    await press("Tab");
-    await expect
-      .element(addForm().getByRole("textbox", { name: "Description (optional)" }))
-      .toHaveFocus();
+// In the light theme: dark is the default, and no step depends on it.
+test("personal skills are reachable from Profile and mobile settings in light theme", async () => {
+  const oldTheme = localStorage.getItem("gitmatrix.theme");
+  const size = { width: window.innerWidth, height: window.innerHeight };
+  onTestFinished(async () => {
+    if (oldTheme === null) localStorage.removeItem("gitmatrix.theme");
+    else localStorage.setItem("gitmatrix.theme", oldTheme);
+    await page.viewport(size.width, size.height);
   });
-}
+  localStorage.setItem("gitmatrix.theme", "light");
+  await page.viewport(320, 720);
+  await TestServer.start({ world: true });
+  const app = renderApp("/settings/profile");
+  await page.getByRole("link", { name: "Manage assistant skills" }).click();
+  await app.waitForUrl((url) => url.pathname === "/settings/skills");
+  await expect
+    .element(page.getByRole("heading", { name: "Assistant skills", exact: true, level: 1 }))
+    .toBeVisible();
+  await page.getByText("Settings /", { exact: true }).click();
+  await expect
+    .element(page.getByRole("link", { name: "Assistant skills", exact: true }))
+    .toHaveAttribute("aria-current", "page");
+  await page.getByRole("link", { name: "Profile", exact: true }).click();
+  await app.waitForUrl((url) => url.pathname === "/settings/profile");
+  await page.getByRole("link", { name: "Manage assistant skills" }).click();
+  await expect.element(addForm().getByRole("textbox", { name: "Name", exact: true })).toBeVisible();
+  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+  await focusOn(addForm().getByRole("textbox", { name: "Name", exact: true }));
+  await press("Tab");
+  await expect
+    .element(addForm().getByRole("textbox", { name: "Description (optional)" }))
+    .toHaveFocus();
+});

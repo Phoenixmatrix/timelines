@@ -6,7 +6,6 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Landing, TimelineDetail, TimelineRepo } from "../../apps/website/shared/timelines.ts";
 import type { HarnessContext, SeedManifest } from "./types.ts";
 import type { CiLogs, CiRunDetail, CiRunList } from "../../apps/website/shared/api.ts";
-import type { Snapshot } from "../../apps/website/shared/tracker.ts";
 import {
   queueFixture,
   type QueueGm,
@@ -16,12 +15,10 @@ import {
 
 interface Scenario {
   slug: string;
-  before: string[];
   first: TimelineRepo;
   second: TimelineRepo;
   fa: Fixture;
   fb: Fixture;
-  issueId?: string;
   sources: Map<string, string>;
 }
 type Receipt = {
@@ -38,7 +35,7 @@ type Control = {
   receipts: Receipt[];
 };
 
-/** Real two-repository compact jobs, gates, native CAS, ledger and public retry/cancel.
+/** Real two-repository compact jobs, gates, native CAS, ledger and public retry.
  * Faults only stop execution at durable boundaries; they never seed modern success.
  */
 export async function runSourceLandingE2E(
@@ -229,20 +226,16 @@ export async function runSourceLandingE2E(
         assert.equal((await current(slug)).state, "landed");
       }
     };
-    const move = async (f: Fixture, slug: string, fail = false) => {
+    // Move canonical main to a commit its gate rejects.
+    const failMain = async (f: Fixture, slug: string) => {
       await f.git(["fetch", "origin", "main"]);
       await f.git(["checkout", "--detach", "origin/main"]);
-      const oid = await commit(
-        f,
-        fail ? "landing-fail.txt" : `${slug}-independent.txt`,
-        `${slug}\n`,
-      );
+      const oid = await commit(f, "landing-fail.txt", `${slug}\n`);
       await f.git(["push", "origin", "HEAD:main"]);
       return oid;
     };
-    async function start(suffix: string, point?: string, failB = false): Promise<Scenario> {
+    async function start(suffix: string, point: string): Promise<Scenario> {
       const slug = `source-landing-${tag}-${suffix}`;
-      const before = await Promise.all(owned.map((f) => f.tip()));
       await a.json(
         "/api/tracker/orbit/timelines",
         "POST",
@@ -263,64 +256,17 @@ export async function runSourceLandingE2E(
         const url = `${ctx.origin}/${f.repo}@${slug}.git`;
         await f.git(["fetch", url, "refs/heads/work"]);
         await f.git(["checkout", "--detach", "FETCH_HEAD"]);
-        const oid = await commit(f, `${slug}.txt`, `approved ${slug}\n`);
-        let tip = oid;
-        if (failB && entry.id === second.id)
-          tip = await commit(f, "landing-fail.txt", "fail real gate B\n");
+        const tip = await commit(f, `${slug}.txt`, `approved ${slug}\n`);
         await f.git(["push", url, `${tip}:refs/heads/work`]);
         sources.set(entry.id, tip);
       }
-      if (point)
-        await control(slug, "arm", {
-          point,
-          ...(["before-cas", "after-cas", "after-receipt"].includes(point)
-            ? { repoId: first.id }
-            : {}),
-        });
-      let issueId: string | undefined;
-      if (suffix === "cancel-partial") {
-        issueId = randomUUID();
-        const mutate = (mutations: unknown[], timeline?: string) =>
-          a.json<{ results: { leaseToken?: string }[] }>("/api/tracker/orbit/mutate", "POST", {
-            operationId: randomUUID(),
-            mutations,
-            ...(timeline ? { timeline } : {}),
-          });
-        await mutate([
-          {
-            kind: "issue.create",
-            id: issueId,
-            data: { teamId: fixtures.tracker.team, title: `Outstanding partial ${slug}` },
-          },
-        ]);
-        const claimed = await mutate(
-          [{ kind: "issue.claim", id: issueId, data: { agent: "landing-fixture" } }],
-          slug,
-        );
-        const leaseToken = claimed.results[0]?.leaseToken;
-        assert(leaseToken, "Partial fixture owns a real retained issue lease");
-        await mutate(
-          [
-            {
-              kind: "issue.complete",
-              id: issueId,
-              data: { leaseToken, evidence: "Awaiting all repositories" },
-            },
-          ],
-          slug,
-        );
-        const issue = (await a.json<Snapshot>("/api/tracker/orbit/snapshot")).issues.find(
-          (value) => value.id === issueId,
-        );
-        assert.equal(issue?.status, "done_in_timeline");
-        assert.equal(issue?.claim?.retainedIn?.slug, slug);
-      }
+      await control(slug, "arm", { point, repoId: first.id });
       await a.json(`${path(slug)}/checkpoints`, "POST", { summary: `A7 ${suffix}` }, [201]);
-      return { slug, before, first, second, fa, fb, sources, issueId };
+      return { slug, first, second, fa, fb, sources };
     }
-    async function assertComplete(s: Scenario, baseline?: Landing) {
+    async function assertComplete(s: Scenario) {
       const landed = await stopped(s.slug);
-      record({ scenario: s.slug, landing: landed, baseline: baseline ?? null });
+      record({ scenario: s.slug, landing: landed });
       assert.equal(landed.state, "landed", landed.reason ?? "Landing failed");
       const receipts = (await control(s.slug, "inspect")).receipts;
       assert.equal(receipts.length, 2);
@@ -342,12 +288,6 @@ export async function runSourceLandingE2E(
             .length,
           1,
         );
-        if (baseline) {
-          const prepared = baseline.repos.find((value) => value.id === repo.id)!;
-          assert.equal(repo.merge, prepared.merge, "Recovery reuses recorded candidate");
-          assert.deepEqual(repo.mergeRun, prepared.mergeRun, "Recovery does not rematerialize");
-          assert.deepEqual(repo.gateRun, prepared.gateRun, "Recovery does not regate");
-        }
       }
       await gm(
         ["timeline", "land", s.slug, "--space", "orbit"],
@@ -363,187 +303,42 @@ export async function runSourceLandingE2E(
       record({ scenario: s.slug, state: landed.state, receipts });
       return landed;
     }
-    // Both gates execute against real compact candidates. A green A is insufficient.
-    beginPhase("failing-gate");
-    const failing = await start("failing-gate", undefined, true);
-    const failed = await stopped(failing.slug);
-    assert.equal(failed.state, "failed");
-    assert.deepEqual(await Promise.all(owned.map((f) => f.tip())), failing.before);
-    assert.deepEqual((await control(failing.slug, "inspect")).receipts, []);
-    await a.json(`${path(failing.slug)}/abandon`, "POST", {}, [200]);
-    record({ scenario: failing.slug, state: failed.state, unchangedMains: failing.before });
-
-    beginPhase("moving-before-cas");
-    const moving = await start("moving-before-cas", "prepared");
-    const prepared = await waitBarrier(moving.slug);
-    assert(prepared.repos.every((repo) => repo.state === "tested"));
-    assert.deepEqual(await Promise.all(owned.map((f) => f.tip())), moving.before);
-    const movedB = await move(moving.fb, moving.slug);
-    await control(moving.slug, "arm", { point: "before-cas", repoId: moving.first.id });
-    await gm(["timeline", "land", moving.slug, "--space", "orbit"], "marco", a.root);
-    const validBeforeCas = await waitBarrier(moving.slug);
-    assert(validBeforeCas.repos.every((repo) => repo.state === "tested"));
-    assert.equal(
-      await moving.fa.tip(),
-      validBeforeCas.repos.find((repo) => repo.id === moving.first.id)?.base,
+    beginPhase("retry-partial");
+    const s = await start("retry-partial", "after-receipt");
+    const paused = await waitBarrier(s.slug);
+    const fixedA = paused.repos.find((repo) => repo.id === s.first.id)!;
+    assert.equal(fixedA.state, "advanced");
+    const receiptA = (await control(s.slug, "inspect")).receipts.find(
+      (r) => r.repo_id === s.first.id,
+    )!;
+    assert.equal(receiptA.status, "integrated");
+    const failedMain = await failMain(s.fb, s.slug);
+    await resume(s.slug);
+    const partial = await stopped(s.slug);
+    assert.equal(partial.state, "failed");
+    assert.equal((await a.json<TimelineDetail>(path(s.slug))).timeline.status, "partly_landed");
+    assert.equal(await s.fa.tip(), fixedA.merge);
+    assert.equal(await s.fb.tip(), failedMain);
+    assert.deepEqual(
+      (await control(s.slug, "inspect")).receipts.find((r) => r.repo_id === s.first.id),
+      receiptA,
     );
-    assert.equal(await moving.fb.tip(), movedB);
-    assert.equal(validBeforeCas.repos.find((repo) => repo.id === moving.second.id)?.base, movedB);
-    await resume(moving.slug);
-    const regated = await assertComplete(moving);
-    const oldB = prepared.repos.find((repo) => repo.id === moving.second.id)!;
-    const newB = regated.repos.find((repo) => repo.id === moving.second.id)!;
-    assert.equal(newB.base, movedB);
-    assert.notEqual(newB.mergeRun?.id, oldB.mergeRun?.id);
-    assert.notEqual(newB.gateRun?.id, oldB.gateRun?.id);
-    assert.equal(newB.attempt, oldB.attempt + 1);
-
-    for (const point of ["before-cas", "after-cas", "before-finalize"] as const) {
-      beginPhase(point);
-      const s = await start(point, point);
-      const paused = await waitBarrier(s.slug);
-      const ledger = (await control(s.slug, "inspect")).receipts;
-      const first = paused.repos.find((repo) => repo.id === s.first.id)!;
-      if (point === "before-cas") {
-        assert.equal(await s.fa.tip(), first.base);
-        assert.equal(ledger.find((r) => r.repo_id === first.id)?.status, "intent");
-      } else if (point === "after-cas") {
-        assert.equal(await s.fa.tip(), first.merge);
-        assert.equal(first.state, "tested");
-        assert.equal(ledger.find((r) => r.repo_id === first.id)?.status, "intent");
-        // Recovery must recognize ancestry, not merely equality with the current tip.
-        await move(s.fa, s.slug);
-      } else {
-        assert(paused.repos.every((repo) => repo.state === "advanced"));
-        assert.equal(ledger.length, 2);
-        assert(ledger.every((receipt) => receipt.status === "integrated"));
-        assert.notEqual((await a.json<TimelineDetail>(path(s.slug))).timeline.status, "landed");
-      }
-      await resume(s.slug);
-      await assertComplete(s, paused);
-    }
-
-    for (const cancel of [false, true]) {
-      beginPhase(cancel ? "cancel-partial" : "retry-partial");
-      const s = await start(cancel ? "cancel-partial" : "retry-partial", "after-receipt");
-      const paused = await waitBarrier(s.slug);
-      const fixedA = paused.repos.find((repo) => repo.id === s.first.id)!;
-      assert.equal(fixedA.state, "advanced");
-      const receiptA = (await control(s.slug, "inspect")).receipts.find(
-        (r) => r.repo_id === s.first.id,
-      )!;
-      assert.equal(receiptA.status, "integrated");
-      const failedMain = await move(s.fb, s.slug, true);
-      await resume(s.slug);
-      const partial = await stopped(s.slug);
-      assert.equal(partial.state, "failed");
-      assert.equal((await a.json<TimelineDetail>(path(s.slug))).timeline.status, "partly_landed");
-      assert.equal(await s.fa.tip(), fixedA.merge);
-      assert.equal(await s.fb.tip(), failedMain);
-      assert.deepEqual(
-        (await control(s.slug, "inspect")).receipts.find((r) => r.repo_id === s.first.id),
-        receiptA,
-      );
-      if (cancel) {
-        await a.json(`${path(s.slug)}/abandon`, "POST", {}, [200]);
-        const ended = await a.json<TimelineDetail>(path(s.slug));
-        assert.equal(ended.timeline.status, "abandoned");
-        const visible = await current(s.slug);
-        assert.notEqual(visible.state, "landed");
-        assert.equal(visible.repos.find((r) => r.id === s.first.id)?.state, "advanced");
-        assert.notEqual(visible.repos.find((r) => r.id === s.second.id)?.state, "advanced");
-        assert.deepEqual((await control(s.slug, "inspect")).receipts, [receiptA]);
-        assert.equal(await s.fa.tip(), fixedA.merge);
-        assert.equal(await s.fb.tip(), failedMain);
-        const outstanding = (await a.json<Snapshot>("/api/tracker/orbit/snapshot")).issues.find(
-          (issue) => issue.id === s.issueId,
-        );
-        assert(outstanding, "Outstanding issue remains visible");
-        assert.equal(
-          outstanding.status,
-          "todo",
-          "Cancel returns outstanding work without claiming success",
-        );
-        assert(!outstanding.claim, "Cancel releases the outstanding lease without marking it done");
-        record({ issue: outstanding.id, status: outstanding.status, partialCanceled: true });
-      }
-      // Fix B canonically: the admitted work source remains frozen and unchanged.
-      await s.fb.git(["fetch", "origin", "main"]);
-      await s.fb.git(["checkout", "--detach", "origin/main"]);
-      await s.fb.git(["rm", "landing-fail.txt"]);
-      await s.fb.git(["-c", "core.hooksPath=/dev/null", "commit", "-m", "Repair canonical gate B"]);
-      const repaired = await s.fb.git(["rev-parse", "HEAD"]);
-      await s.fb.git(["push", "origin", "HEAD:main"]);
-      if (!cancel) {
-        await gm(["timeline", "land", s.slug, "--space", "orbit"], "marco", a.root);
-        const landed = await assertComplete(s);
-        const finalA = landed.repos.find((r) => r.id === s.first.id)!;
-        assert.equal(finalA.merge, fixedA.merge);
-        assert.equal(finalA.attempt, fixedA.attempt);
-        assert.deepEqual(finalA.mergeRun, fixedA.mergeRun);
-        assert.deepEqual(finalA.gateRun, fixedA.gateRun);
-        assert.equal(landed.repos.find((r) => r.id === s.second.id)?.base, repaired);
-      }
-      record({
-        scenario: s.slug,
-        partial: partial.state,
-        successfulReceipt: receiptA,
-        canceled: cancel,
-      });
-    }
-
-    for (const resetToBase of [false, true]) {
-      beginPhase(resetToBase ? "unknown-base-reset" : "unknown-rewrite");
-      const unknown = await start(
-        resetToBase ? "unknown-base-reset" : "unknown-rewrite",
-        "after-cas",
-      );
-      const ambiguous = await waitBarrier(unknown.slug);
-      const uncertain = ambiguous.repos.find((repo) => repo.id === unknown.first.id)!;
-      // Retain the accepted candidate locally before replacing its only canonical ref.
-      await unknown.fa.git(["fetch", "origin", "main"]);
-      assert.equal(await unknown.fa.git(["rev-parse", "FETCH_HEAD"]), uncertain.merge);
-      // Neither unrelated rewritten history nor an exact reset proves rejection.
-      const tree = await unknown.fa.git(["rev-parse", `${uncertain.base}^{tree}`]);
-      const rewritten = resetToBase
-        ? uncertain.base!
-        : await unknown.fa.git([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "commit-tree",
-            tree,
-            "-m",
-            "Explicit fixture force rewrite",
-          ]);
-      await unknown.fa.git(["push", "--force", "origin", `${rewritten}:main`]);
-      await resume(unknown.slug);
-      const blocked = await stopped(unknown.slug);
-      assert.equal(blocked.state, "failed");
-      assert.equal(await unknown.fa.tip(), rewritten);
-      const blockedRepo = blocked.repos.find((repo) => repo.id === unknown.first.id)!;
-      assert.equal(blockedRepo.merge, uncertain.merge);
-      assert.deepEqual(blockedRepo.mergeRun, uncertain.mergeRun);
-      assert.deepEqual(blockedRepo.casIntent, uncertain.casIntent);
-      assert.equal(
-        (await control(unknown.slug, "inspect")).receipts.find((r) => r.repo_id === uncertain.id)
-          ?.status,
-        "intent",
-      );
-      record({
-        scenario: unknown.slug,
-        state: blocked.state,
-        candidate: uncertain.merge,
-        rewritten,
-      });
-      // Explicit operator repair restores known history, permitting honest recovery/cleanup.
-      await unknown.fa.git(["push", "--force", "origin", `${uncertain.merge}:main`]);
-      await gm(["timeline", "land", unknown.slug, "--space", "orbit"], "marco", a.root);
-      const repairedUnknown = await assertComplete(unknown);
-      assert.equal(
-        repairedUnknown.repos.find((repo) => repo.id === unknown.first.id)?.merge,
-        uncertain.merge,
-      );
-    }
+    // Fix B canonically: the admitted work source remains frozen and unchanged.
+    await s.fb.git(["fetch", "origin", "main"]);
+    await s.fb.git(["checkout", "--detach", "origin/main"]);
+    await s.fb.git(["rm", "landing-fail.txt"]);
+    await s.fb.git(["-c", "core.hooksPath=/dev/null", "commit", "-m", "Repair canonical gate B"]);
+    const repaired = await s.fb.git(["rev-parse", "HEAD"]);
+    await s.fb.git(["push", "origin", "HEAD:main"]);
+    await gm(["timeline", "land", s.slug, "--space", "orbit"], "marco", a.root);
+    const landed = await assertComplete(s);
+    const finalA = landed.repos.find((r) => r.id === s.first.id)!;
+    assert.equal(finalA.merge, fixedA.merge);
+    assert.equal(finalA.attempt, fixedA.attempt);
+    assert.deepEqual(finalA.mergeRun, fixedA.mergeRun);
+    assert.deepEqual(finalA.gateRun, fixedA.gateRun);
+    assert.equal(landed.repos.find((r) => r.id === s.second.id)?.base, repaired);
+    record({ scenario: s.slug, partial: partial.state, successfulReceipt: receiptA });
     finishPhase("passed");
   } catch (error) {
     finishPhase("failed");

@@ -40,7 +40,6 @@ import { fail, readJson, requirePerson } from "./http.ts";
 import { issueToken } from "./tokens.ts";
 import { sourceFixtures } from "./dev-source-fixtures.ts";
 import { sourceRetentionFixture } from "./dev-source-retention.ts";
-import { sourceAuthFixture } from "./dev-source-auth.ts";
 import { landingFixtures } from "./dev-landing-fixtures.ts";
 import { knowledgeFixtures } from "./dev-knowledge-fixtures.ts";
 import { sourcePushFixtures } from "./dev-source-push-fixtures.ts";
@@ -122,7 +121,6 @@ dev.use("*", async (c, next) => {
       "/assistant-chat",
       "/source-fixtures",
       "/source-retention",
-      "/source-auth",
       "/landing-fixtures",
       "/source-push-fixtures",
       "/knowledge-fixtures",
@@ -143,7 +141,6 @@ dev.use("*", async (c, next) => {
 
 dev.post("/source-fixtures", sourceFixtures);
 dev.post("/source-retention", sourceRetentionFixture);
-dev.post("/source-auth", sourceAuthFixture);
 dev.post("/landing-fixtures", landingFixtures);
 dev.post("/source-push-fixtures", sourcePushFixtures);
 dev.post("/knowledge-fixtures", knowledgeFixtures);

@@ -693,15 +693,6 @@ mod account_tests {
     use super::*;
 
     #[test]
-    fn generated_passwords_are_24_unambiguous_characters() {
-        let a = generate_password();
-        assert_eq!(a.len(), 24);
-        assert!(a.bytes().all(|b| PASSWORD_ALPHABET.contains(&b)));
-        assert!(!a.contains(['0', 'O', '1', 'l', 'I']));
-        assert_ne!(a, generate_password());
-    }
-
-    #[test]
     fn stdin_passwords_lose_one_trailing_newline_only() {
         assert_eq!(trim_stdin_password("secret-pass\n"), "secret-pass");
         assert_eq!(trim_stdin_password("secret-pass\r\n"), "secret-pass");

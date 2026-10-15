@@ -7,13 +7,6 @@ import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import { renderApp } from "../testing/render.tsx";
 import { TestServer } from "../testing/server.ts";
-import { generatePassword } from "./Accounts.tsx";
-
-test("generated passwords are long, unambiguous and different each time", () => {
-  const passwords = new Set(Array.from({ length: 50 }, () => generatePassword()));
-  expect(passwords.size).toBe(50);
-  for (const password of passwords) expect(password).toMatch(/^[a-km-zA-HJ-NP-Z2-9]{24}$/);
-});
 
 test("a site admin creates an account and sets a new password; others can't", async () => {
   const server = await TestServer.start({ world: true, persona: "priya" });
@@ -53,18 +46,11 @@ test("a site admin creates an account and sets a new password; others can't", as
     .toBeVisible();
   app.unmount();
 
-  // Not a site admin: the page sends them home, and the API refuses.
+  // Not a site admin: the page sends them home (the API's refusal is
+  // worker/api/admin-accounts.test.ts's).
   await server.as("marco");
-  const other = renderApp("/settings/accounts");
+  renderApp("/settings/accounts");
   await expect.element(page.getByRole("heading", { name: "Accounts" })).not.toBeInTheDocument();
-  other.unmount();
-  await expect(
-    server.call("POST", "/api/admin/accounts", {
-      username: "sneaky",
-      email: "sneaky@example.com",
-      password: "a long enough password",
-    }),
-  ).rejects.toThrow(/403/);
 });
 
 test("the sign-in page takes a username and password", async () => {
@@ -102,9 +88,5 @@ test("the sign-in page takes a username and password", async () => {
   await expect.element(page.getByRole("alert")).not.toBeInTheDocument();
   // In memory the world still acts as nobody, so the ledger names the username.
   await expect.element(page.getByText("as demo", { exact: true })).toBeVisible();
-  const signedIn = server.requests.filter(
-    (r) => r.method === "POST" && r.url.pathname === "/api/identity/sign-in/email",
-  );
-  expect(signedIn).toHaveLength(2);
   app.unmount();
 });

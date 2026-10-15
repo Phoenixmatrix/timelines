@@ -296,6 +296,7 @@ impl Sandbox {
             .current_dir(self.work())
             .args(args)
             .env("GM_AGENT", "1")
+            .env("GM_POLL_MS", "20")
             .env_remove("GM_TIMELINE")
             .env("GM_SERVER", format!("http://{}", self.api.address))
             .env("GM_TOKEN", "test-token")

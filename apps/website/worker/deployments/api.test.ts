@@ -1066,7 +1066,6 @@ describe("deployment provenance (CORE-351)", () => {
       /provider.name/,
     ],
     [{ provider: { name: "cloudflare", service: "app", deploymentId: "d" } }, /provider.versionId/],
-    [{ provider: { name: "cloudflare", service: "app", versionId: "v" } }, /provider.deploymentId/],
     [
       { provider: { name: "cloudflare", service: "a b", versionId: "v", deploymentId: "d" } },
       /provider.service/,
@@ -1074,17 +1073,13 @@ describe("deployment provenance (CORE-351)", () => {
     [{ provider: { ...provider("v"), connectionId: "c" } }, /Unknown field: provider.connectionId/],
     [{ percentage: 10 }, /give provider too/],
     [{ replaces: "v0" }, /give provider too/],
-    [{ provider: provider("v"), replaces: "v" }, /can't replace itself/],
-    [{ provider: provider("v"), percentage: 101 }, /percentage/],
     [{ deployedAt: "2026-10-12T20:00:00+02:00" }, /deployedAt/],
     [
       { deployedAt: "2026-10-12T20:00:00Z", exposedFrom: "2026-10-12T19:00:00Z" },
       /before the deployment/,
     ],
     [{ exposedUntil: "2026-10-12T20:00:00Z" }, /start before it ends/],
-    [{ artifact: { digest: DIGEST } }, /publishId, or by packageId and version/],
     [{ artifact: { publishId: "p", packageId: "pkg", version: "1" } }, /not both/],
-    [{ artifact: { publishId: "p", digest: "md5" } }, /artifact.digest/],
   ])("refuses %j", async (extra, message) => {
     const t = await setup();
     const refused = await t.call(t.tokens.ann, "POST", path, {

@@ -53,36 +53,6 @@ test("capture menu preserves the draft and scope without submitting; Enter still
   ]);
 });
 
-test("quick capture applies catalog tags and the selected issue type, not title prefixes", async () => {
-  const server = await TestServer.start({ world: true });
-  await mutate(server, [
-    {
-      kind: "team.create",
-      id: "capture-team",
-      data: { key: "ENG", name: "Engineering", memberIds: ["acc_marco"] },
-    },
-    {
-      kind: "issue.create",
-      id: "seed-tag",
-      data: { teamId: "capture-team", title: "Known tag", labels: ["Frontend"] },
-    },
-  ]);
-  renderApp("/tracker/orbit?captureTeam=capture-team");
-  await page.getByRole("combobox", { name: "Type for the new issue" }).click();
-  await page.getByRole("option", { name: "Bug", exact: true }).click();
-  const title = page.getByRole("textbox", { name: "New issue title", exact: true });
-  await title.fill("(frontend) (FRONTEND) Fix save (on mobile)");
-  await press("Enter");
-  await expect.element(title).toHaveValue("");
-  const snapshot = await server.call<Snapshot>("GET", "/api/tracker/orbit/snapshot");
-  expect(snapshot.issues.find((issue) => issue.title === "Fix save (on mobile)")).toMatchObject({
-    type: "bug",
-    labels: ["Frontend"],
-    teamId: "capture-team",
-  });
-  expect(snapshot.labels).toEqual(["Frontend"]);
-});
-
 test("unknown capture tags require definition and survive expansion into a research issue", async () => {
   const server = await TestServer.start({ world: true });
   await mutate(server, [
@@ -130,7 +100,7 @@ test("unknown capture tags require definition and survive expansion into a resea
   expect(snapshot.labels).toEqual(["latency", "profiling"]);
 });
 
-test("editor-defined tags persist, survive final removal, and can be reused with catalog casing", async () => {
+test("editor-defined tags persist and survive final removal", async () => {
   const server = await TestServer.start({ world: true });
   await mutate(server, [
     {
@@ -144,7 +114,7 @@ test("editor-defined tags persist, survive final removal, and can be reused with
       data: { teamId: "capture-team", title: "Tag editing" },
     },
   ]);
-  const app = renderApp("/tracker/orbit/issues/tag-edit");
+  renderApp("/tracker/orbit/issues/tag-edit");
   await page.getByRole("button", { name: "Edit issue", exact: true }).click();
   const tags = page.getByRole("combobox", { name: "Tags", exact: true });
   await tags.fill("Performance");
@@ -164,17 +134,8 @@ test("editor-defined tags persist, survive final removal, and can be reused with
         (await server.call<Snapshot>("GET", "/api/tracker/orbit/snapshot")).issues[0]?.labels,
     )
     .toEqual([]);
-  app.unmount();
-  renderApp("/tracker/orbit/issues/tag-edit");
-  await page.getByRole("button", { name: "Edit issue", exact: true }).click();
-  await tags.fill("performance");
-  await page.getByRole("option", { name: "Performance", exact: true }).click();
-  await expect
-    .poll(
-      async () =>
-        (await server.call<Snapshot>("GET", "/api/tracker/orbit/snapshot")).issues[0]?.labels,
-    )
-    .toEqual(["Performance"]);
+  // The catalog keeps it; reusing it in its catalog casing is the server's
+  // rule (E2E tags-one-vocabulary-and-old-spellings).
   expect((await server.call<Snapshot>("GET", "/api/tracker/orbit/snapshot")).labels).toEqual([
     "Performance",
   ]);

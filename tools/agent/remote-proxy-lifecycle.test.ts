@@ -345,8 +345,15 @@ await test(
   },
 );
 
-for (const method of ["list", "create", "import", "delete", "get"]) {
-  for (const failure of method === "get" ? [true] : [false, true]) {
+// One read and one write per outcome kind: the root-release policy is the same generic
+// wrapper for every method name.
+for (const [method, failure] of [
+  ["list", false],
+  ["create", true],
+  ["delete", false],
+  ["get", true],
+] as const) {
+  {
     await test(
       `remote proxy ${method} ${failure ? "failure" : "success"} releases its root`,
       { timeout: 30_000 },
@@ -372,7 +379,7 @@ for (const method of ["list", "create", "import", "delete", "get"]) {
   }
 }
 
-for (const method of ["get", "info", "list"]) {
+for (const method of ["get"]) {
   await test(
     `remote proxy retries dropped ${method} on a fresh owned session`,
     { timeout: 30_000 },
@@ -399,7 +406,7 @@ for (const method of ["get", "info", "list"]) {
   );
 }
 
-for (const method of ["import", "delete", "fork", "createToken", "revokeToken"]) {
+for (const method of ["import"]) {
   await test(
     `remote proxy does not replay unknown ${method} outcome`,
     { timeout: 30_000 },

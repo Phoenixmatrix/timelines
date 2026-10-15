@@ -161,11 +161,9 @@ test("older navigation acknowledgements cannot erase a newer playhead gesture", 
   await expect.element(scrubber).toHaveFocus();
 });
 
-test.each([
-  { committed: false, direction: "ArrowRight", offset: 2 },
-  { committed: true, direction: "ArrowRight", offset: 2 },
-  { committed: true, direction: "ArrowLeft", offset: 0 },
-])(
+// A key held down while an older address arrives is the test above's; this
+// is a committed press. Direction only changes the arithmetic.
+test.each([{ committed: true, direction: "ArrowRight", offset: 2 }])(
   "an older URL acknowledgement preserves $direction (committed: $committed)",
   async ({ committed, direction, offset }) => {
     await TestServer.start({ world: true });
@@ -257,7 +255,8 @@ test.each([
   },
 );
 
-test.each(["chart", "list", "phone"] as const)(
+// The list layout differs from the phone's only by its width.
+test.each(["chart", "phone"] as const)(
   "%s checkpoints disclose readable summaries and navigate time without losing the range",
   async (layout) => {
     await page.viewport(layout === "phone" ? 390 : 1280, 900);
@@ -309,7 +308,6 @@ test.each(["chart", "list", "phone"] as const)(
         at: new Date(time - 1_800_000).toISOString(),
         rs: new Date(time - 600_000).toISOString(),
         re: new Date(time + 600_000).toISOString(),
-        ...(layout === "list" ? { layout: "list" } : {}),
       });
       const app = renderApp(`/tracker/orbit?${params}`);
       const entry = page.getByRole("link", { name: "Read 2 checkpoints for CP-1" });

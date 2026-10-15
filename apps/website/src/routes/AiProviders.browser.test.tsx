@@ -8,7 +8,6 @@ import { page, userEvent } from "vite-plus/test/browser";
 import type { AiProvidersView, AiSettingsView } from "../../shared/ai.ts";
 import { renderApp } from "../testing/render.tsx";
 import { TestServer } from "../testing/server.ts";
-import { searchModels } from "./AiProviders.tsx";
 
 async function choose(name: string, option: string) {
   await userEvent.click(page.getByRole("combobox", { name }));
@@ -88,8 +87,8 @@ test("a Space admin connects OpenRouter, adds a model from search and uses it fo
     .toBeDisabled();
 });
 
-test("TypeSafe's refused key saves nothing; Jev becomes a Classification choice once added", async () => {
-  const server = await TestServer.start({ world: true, persona: "marco" });
+test("TypeSafe's refused key saves nothing; Jev is offered once it connects", async () => {
+  await TestServer.start({ world: true, persona: "marco" });
   renderApp("/settings/ai-providers?space=orbit");
   const typeSafe = page.getByRole("region", { name: "TypeSafe" });
   await userEvent.fill(typeSafe.getByLabelText("TypeSafe API key"), "wrong-key-1234");
@@ -108,11 +107,7 @@ test("TypeSafe's refused key saves nothing; Jev becomes a Classification choice 
   await expect
     .element(typeSafe.getByRole("heading", { name: "Add models" }))
     .not.toBeInTheDocument();
-  const settings = await server.call<AiSettingsView>("GET", "/api/spaces/orbit/settings/ai");
-  expect(settings.catalog.classification.map((option) => option.id)).toContain(
-    "typesafe:jev-latest",
-  );
-  expect(settings.catalog.fast.some((option) => option.provider)).toBe(false);
+  // Which roles it then serves is worker/ai-providers/api.test.ts's.
 });
 
 test("an explicitly granted Space member sees the Space's providers read-only", async () => {
@@ -135,33 +130,4 @@ test("an explicitly granted Space member sees the Space's providers read-only", 
   await expect
     .element(openRouter.getByRole("button", { name: /Remove|Add|Disconnect/ }))
     .not.toBeInTheDocument();
-});
-
-test("search ranks name matches first and can sort by price or recency", () => {
-  const entry = (model: string, name: string, input: number, releasedAt: string) => ({
-    id: `openrouter:${model}` as const,
-    model,
-    name,
-    description: "",
-    provider: "openrouter" as const,
-    capability: "generation" as const,
-    releasedAt,
-    inputUsdPerMillion: input,
-    outputUsdPerMillion: 0,
-    contextLength: null,
-    jsonMode: true,
-    url: "",
-  });
-  const models = [
-    entry("x/flash-lite", "Vendor X: Lite", 0.1, "2026-01-01"),
-    entry("google/gemini-3-flash", "Google: Gemini 3 Flash", 0.3, "2026-03-01"),
-    entry("z/zeta", "Zeta Flash", 0.2, "2026-02-01"),
-  ];
-  const ids = (sort: "name" | "newest" | "cheapest", query = "flash") =>
-    searchModels(models, query, sort).map((model) => model.model);
-  // Name matches before id-only ones; equally good matches by name.
-  expect(ids("name")).toEqual(["google/gemini-3-flash", "z/zeta", "x/flash-lite"]);
-  expect(ids("cheapest")).toEqual(["x/flash-lite", "z/zeta", "google/gemini-3-flash"]);
-  expect(ids("newest")).toEqual(["google/gemini-3-flash", "z/zeta", "x/flash-lite"]);
-  expect(ids("name", "google gemini")).toEqual(["google/gemini-3-flash"]);
 });

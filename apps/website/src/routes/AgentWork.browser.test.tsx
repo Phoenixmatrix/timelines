@@ -129,18 +129,13 @@ test("lists what my agents finished, filters it, and loads an issue's work only 
     "/api/tracker/orbit/issues/orb-1/work",
   ]);
 
-  // Slice by agent, then by type: the URL keeps the filters.
+  // Slice by agent (the other filters work the same way): the URL keeps it.
   await page.getByRole("combobox", { name: "Agent" }).click();
   await page.getByRole("option", { name: "helper" }).click();
   await app.waitForUrl((url) => url.searchParams.get("agent") === "helper");
   await expect.element(item("PRI-2")).toBeVisible();
   await expect.element(page.getByText("1 issue in the last 14 days.")).toBeVisible();
   expect(item("ORB-1").elements()).toHaveLength(0);
-  await page.getByRole("combobox", { name: "Type" }).click();
-  await page.getByRole("option", { name: "Task" }).click();
-  await expect
-    .element(page.getByText("Nothing finished in the last 14 days that matches."))
-    .toBeVisible();
   const loads = server.requests.filter((r) => r.url.pathname === "/api/agent-work").length;
   // Slicing doesn't ask the server again.
   expect(loads).toBe(1);
@@ -148,8 +143,6 @@ test("lists what my agents finished, filters it, and loads an issue's work only 
   // A wider window does.
   await page.getByRole("combobox", { name: "Agent" }).click();
   await page.getByRole("option", { name: "All my agents" }).click();
-  await page.getByRole("combobox", { name: "Type" }).click();
-  await page.getByRole("option", { name: "All types" }).click();
   await page.getByRole("radio", { name: "30 days" }).click();
   await app.waitForUrl((url) => url.searchParams.get("since") === "30d");
   await expect.element(item("ORB-9")).toBeVisible();

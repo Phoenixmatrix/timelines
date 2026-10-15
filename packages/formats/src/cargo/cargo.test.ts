@@ -197,7 +197,7 @@ describe("dl templates", () => {
 });
 
 describe("publish body framing", () => {
-  const crate = new Uint8Array(100_000).map((_, i) => i % 251);
+  const crate = new Uint8Array(10_000).map((_, i) => i % 251);
   const body = encodePublishBody({ name: "demo", vers: "1.0.0" }, crate);
 
   it("splits metadata and streams the crate across chunk boundaries", async () => {

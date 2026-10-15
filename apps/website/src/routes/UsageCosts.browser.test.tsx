@@ -11,7 +11,7 @@ import { renderApp } from "../testing/render.tsx";
 import { TestServer } from "../testing/server.ts";
 
 test("personal usage stays separate from the person's granted Spaces", async () => {
-  const server = await TestServer.start({ world: true, persona: "marco" });
+  await TestServer.start({ world: true, persona: "marco" });
   const app = renderApp("/settings/usage?person=marco");
   await expect
     .element(page.getByRole("heading", { name: "Usage & costs", level: 1 }))
@@ -19,11 +19,8 @@ test("personal usage stays separate from the person's granted Spaces", async () 
   await expect
     .element(page.getByRole("link", { name: "Personal usage & costs", exact: true }).first())
     .toHaveAttribute("aria-current", "page");
-  const report = await server.call<UsageReport>("GET", "/api/accounts/marco/usage");
-  expect(report.scope).toBe("person");
-  expect(report.subject?.slug).toBe("marco");
-  expect(report.subjects).toBeNull();
-  expect(report.knowledgeUpdates).toBeNull();
+  // What each scope's report holds, and who may read it, are
+  // worker/usage/report.test.ts's.
   await userEvent.click(page.getByRole("combobox", { name: "Scope for usage and costs" }));
   await userEvent.click(
     page.getByRole("option", { name: "Orbit Labs / General (@orbit)", exact: true }),
@@ -34,31 +31,6 @@ test("personal usage stays separate from the person's granted Spaces", async () 
   await expect
     .element(page.getByRole("link", { name: "Space usage & costs", exact: true }).first())
     .toHaveAttribute("aria-current", "page");
-  const spaceReport = await server.call<UsageReport>("GET", "/api/spaces/orbit/usage");
-  expect(spaceReport.scope).toBe("space");
-  expect(spaceReport.subject?.slug).toBe("orbit");
-  expect(spaceReport.subjects).toBeNull();
-});
-
-test("Instance operator authority alone does not grant a Space usage report", async () => {
-  const server = await TestServer.start({ world: true, persona: "priya" });
-  const report = await server.call<UsageReport>("GET", "/api/admin/usage");
-  expect(report.scope).toBe("instance");
-  expect(report.subject).toBeNull();
-  renderApp("/settings/usage?space=orbit");
-  await expect.element(page.getByRole("alert")).toBeVisible();
-  await expect(server.call("GET", "/api/spaces/orbit/usage")).rejects.toThrow(
-    /GET \/api\/spaces\/orbit\/usage: 404/,
-  );
-});
-
-test("a Space member cannot administer Space usage", async () => {
-  const server = await TestServer.start({ world: true, persona: "jun" });
-  renderApp("/settings/usage?space=orbit");
-  await expect.element(page.getByRole("alert")).toBeVisible();
-  await expect(server.call("GET", "/api/spaces/orbit/usage")).rejects.toThrow(
-    /GET \/api\/spaces\/orbit\/usage: 403/,
-  );
 });
 
 const spend = (over: Partial<AttributedSpend> & Pick<AttributedSpend, "id" | "name">) => ({

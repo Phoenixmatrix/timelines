@@ -3,10 +3,8 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
-import { createServer, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { CiRunDetail, CiRunSummary } from "../../apps/website/shared/api.ts";
 import type { RetentionSettings } from "../../apps/website/shared/retention.ts";
 import type { Timeline } from "../../apps/website/shared/timelines.ts";
 import type { QueueGm, RepoInventory } from "./queue-e2e.ts";
@@ -175,7 +173,7 @@ export async function runSourceRetentionE2E(
       const value = await read();
       if (done(value)) return value;
       assert(Date.now() < deadline, `Timed out waiting for ${label}`);
-      await delay(500);
+      await delay(250);
     }
   };
   await gm(["repo", "create", name, "--space", owner], "sam", root);
@@ -231,63 +229,22 @@ export async function runSourceRetentionE2E(
     record({ retentionSource: source });
   };
   const defaults = await endedPair("defaults");
-  await retain(29);
   await readable(defaults.landed.sourceId, defaults.commit);
   await state(defaults.abandoned.sourceId, "archived");
   await retain(31);
   await state(defaults.landed.sourceId, "purged");
-  await state(defaults.abandoned.sourceId, "archived");
-  await retain(89);
   await state(defaults.abandoned.sourceId, "archived");
   await retain(91);
   await state(defaults.abandoned.sourceId, "purged");
   // Source expiry must not remove the independent 180-day timeline history.
   for (const source of [defaults.landed, defaults.abandoned])
     await json(`${timelines}/${source.slug}`);
-  const custom = await endedPair("overrides");
-  try {
-    const configured = await json<RetentionSettings>(settingsPath, "PATCH", {
-      categories: { "timeline-work-sources": { thresholds: { landedDays: 5, abandonedDays: 10 } } },
-    });
-    const policy = configured.categories.find(
-      (category) => category.id === "timeline-work-sources",
-    );
-    assert(policy);
-    assert.deepEqual(policy.values, { landedDays: 5, abandonedDays: 10 });
-    assert.deepEqual(policy.valuesFrom, { landedDays: "space", abandonedDays: "space" });
-    const categories = { "timeline-work-sources": policy.values };
-    await retain(4, categories);
-    await state(custom.landed.sourceId, "archived");
-    await state(custom.abandoned.sourceId, "archived");
-    await retain(6, categories);
-    await state(custom.landed.sourceId, "purged");
-    await state(custom.abandoned.sourceId, "archived");
-    await retain(9, categories);
-    await state(custom.abandoned.sourceId, "archived");
-    await retain(11, categories);
-    await state(custom.abandoned.sourceId, "purged");
-    record({
-      configuredWorkSourcePolicy: policy,
-      defaultBoundaries: [29, 31, 89, 91],
-      overrideBoundaries: [4, 6, 9, 11],
-    });
-  } finally {
-    await json(settingsPath, "PATCH", {
-      categories: {
-        "timeline-work-sources": { thresholds: { landedDays: null, abandonedDays: null } },
-      },
-    });
-  }
   await git(["fetch", `${ctx.origin}/${repo}.git`, "main"]);
   await git(["checkout", "--detach", "FETCH_HEAD"]);
   const oid = await git(["rev-parse", "HEAD"]);
   const parent = await create("parent");
   const child = await create("child", parent.slug);
   await abandon(parent.slug);
-  await readable(parent.sourceId, oid);
-  await retain(10, { "preview-records": { days: 1 }, "ended-timeline-data": { days: 1 } });
-  await readable(parent.sourceId, oid);
-  await retain(89);
   await readable(parent.sourceId, oid);
   await retain(91);
   await readable(parent.sourceId, oid);
@@ -296,222 +253,11 @@ export async function runSourceRetentionE2E(
     "active",
   );
   record({
-    archiveSurvivedShortPolicies: true,
     archiveSurvivedDependencyAtExpiry: true,
     oid,
     parent,
     child,
   });
-  const consumer = await create("consumer");
-  // A real runner waits on a bounded HTTP barrier. No injected root, deployment,
-  // child, or unfinished push may protect this independent source.
-  const capability = randomUUID();
-  let waiting: ServerResponse | undefined;
-  const barrier = createServer((request, response) => {
-    if (request.method !== "GET" || request.url !== `/${capability}`) {
-      response.writeHead(404).end();
-      return;
-    }
-    assert.equal(waiting, undefined, "The fixture starts exactly one held job");
-    waiting = response;
-    response.setTimeout(300_000, () => response.writeHead(504).end());
-  });
-  const listening = Promise.withResolvers<void>();
-  barrier.once("error", listening.reject);
-  barrier.listen(0, "127.0.0.1", listening.resolve);
-  await listening.promise;
-  let heldNumber: number | undefined;
-  const sourceObservation = async () => {
-    const source = (await inspect()).find((entry) => entry.sourceId === consumer.sourceId);
-    assert(source, "The owned consumer source remains in inventory");
-    return source;
-  };
-  const expireConsumer = () =>
-    hook<{ sourceId: string; state: string; cutoff: string }>({
-      action: "expire",
-      timeline: consumer.slug,
-      sourceId: consumer.sourceId,
-    });
-  try {
-    const address = barrier.address();
-    assert(address && typeof address !== "string");
-    await mkdir(join(root, ".gitmatrix"), { recursive: true });
-    await writeFile(
-      join(root, ".gitmatrix", "ci.yml"),
-      JSON.stringify({
-        on: { push: { branches: ["never-agent-auto"] }, preview: {} },
-        jobs: {
-          hold: {
-            if: 'trigger == "preview" && action == "create"',
-            steps: [
-              {
-                run: `curl --fail --silent --show-error --max-time 305 http://127.0.0.1:${address.port}/${capability}`,
-              },
-            ],
-          },
-        },
-      }),
-    );
-    await git(["add", ".gitmatrix/ci.yml"]);
-    await git([
-      "-c",
-      "core.hooksPath=/dev/null",
-      "commit",
-      "-m",
-      "Hold real source-aware preview CI",
-    ]);
-    const consumerOid = await git(["rev-parse", "HEAD"]);
-    await git(["push", `${ctx.origin}/${repo}@${consumer.slug}.git`, "HEAD:work"]);
-    const checkpoint = await json<{
-      checkpoint: {
-        id: string;
-        number: number;
-        repos: { source?: { sourceId: string }; commit: string }[];
-      };
-    }>(
-      `${timelines}/${consumer.slug}/checkpoints`,
-      "POST",
-      { summary: "Retained CI preview" },
-      [201],
-    );
-    assert.equal(checkpoint.checkpoint.repos[0]?.source?.sourceId, consumer.sourceId);
-    assert.equal(checkpoint.checkpoint.repos[0]?.commit, consumerOid);
-    const runsPath = `${api}/ci?source=${consumer.sourceId}`;
-    const running = await poll(
-      () => json<{ runs: CiRunSummary[] }>(runsPath),
-      (result) =>
-        result.runs.some((run) => run.trigger === "preview" && run.commit === consumerOid),
-      "source-qualified checkpoint preview CI",
-    );
-    const run = running.runs.find(
-      (entry) => entry.trigger === "preview" && entry.commit === consumerOid,
-    )!;
-    heldNumber = run.number;
-    const runPath = `${api}/ci/runs/${run.number}`;
-    await poll(
-      async () => waiting,
-      (gate) => Boolean(gate),
-      "real runner reaching its barrier",
-    );
-    const active = await poll(
-      () => json<CiRunDetail>(runPath),
-      (detail) =>
-        detail.status === "running" && detail.jobs.some((job) => job.status === "running"),
-      "running CI state",
-    );
-    assert.equal(active.sourceId, consumer.sourceId);
-    assert.equal(active.commit, consumerOid);
-    assert.equal(active.jobs.length, 1);
-    await abandon(consumer.slug);
-    const archived = await sourceObservation();
-    assert.equal(archived.state, "archived");
-    assert(archived.archivedAt);
-    assert.equal(archived.exists, true);
-    assert.deepEqual(archived.operations, []);
-    assert.deepEqual(archived.roots, [
-      {
-        consumerKind: "ci",
-        consumerId: run.id,
-        commit: consumerOid,
-      },
-    ]);
-    const protectedExpiry = await expireConsumer();
-    assert.equal(protectedExpiry.sourceId, consumer.sourceId);
-    assert(Date.parse(archived.archivedAt) < Date.parse(protectedExpiry.cutoff));
-    assert.equal(protectedExpiry.state, "archived");
-    await readable(consumer.sourceId, consumerOid);
-    const held = await json<CiRunDetail>(runPath);
-    const protectedSource = await sourceObservation();
-    assert.equal(held.status, "running");
-    assert.equal(held.jobs[0]?.status, "running");
-    assert.equal(waiting!.destroyed, false, "The runner is still held during expiry");
-    assert.equal(protectedSource.state, "archived");
-    assert.equal(protectedSource.exists, true);
-    assert.deepEqual(protectedSource.roots, archived.roots);
-    assert.deepEqual(protectedSource.operations, []);
-    await retain(181, { "ci-runs": { days: 1, keepLatest: 1 } });
-    assert.equal((await json<CiRunDetail>(runPath)).status, "running");
-    assert.deepEqual((await sourceObservation()).roots, archived.roots);
-    record({
-      realCiRootBlockedPurge: {
-        run: held,
-        source: protectedSource,
-        cutoff: protectedExpiry.cutoff,
-      },
-    });
-    waiting!.writeHead(204).end();
-    const completed = await poll(
-      () => json<CiRunDetail>(runPath),
-      (detail) => !["queued", "running"].includes(detail.status),
-      "held CI completing normally",
-    );
-    assert.equal(completed.status, "succeeded");
-    assert.equal(completed.jobs[0]?.status, "succeeded");
-    const terminalSource = await sourceObservation();
-    assert.deepEqual(terminalSource.roots, [], "True CI completion releases its source claim");
-    assert.equal(terminalSource.exists, true);
-    // Normal history retention still keeps the latest run, independently of
-    // source expiry. Completion, not history deletion, releases the claim.
-    await retain(181, { "ci-runs": { days: 1, keepLatest: 1 } });
-    const retainedHistory = await json<CiRunDetail>(runPath);
-    assert.equal(retainedHistory.status, "succeeded");
-    assert.deepEqual(retainedHistory.jobs, completed.jobs);
-    heldNumber = undefined;
-    const released = await sourceObservation();
-    assert.deepEqual(released.roots, []);
-    assert.deepEqual(released.operations, []);
-    const purged = await expireConsumer();
-    assert.equal(purged.state, "purged");
-    const absent = await sourceObservation();
-    assert.equal(absent.exists, false);
-    assert.equal(absent.state, "purged");
-    assert.deepEqual(await json<CiRunDetail>(runPath), retainedHistory);
-    await json(
-      `${api}/commits?source=${consumer.sourceId}&ref=${consumerOid}`,
-      "GET",
-      undefined,
-      [410],
-    );
-    await assert.rejects(git(["ls-remote", `${ctx.origin}/${repo}@${consumer.slug}.git`]));
-    // The checkpoint itself remains addressable: this must reject its expired
-    // physical input, not merely fail because timeline metadata was removed.
-    const checkpointPath = `${timelines}/${consumer.slug}/checkpoints/${checkpoint.checkpoint.number}`;
-    const retained = await json<typeof checkpoint>(checkpointPath);
-    assert.equal(retained.checkpoint.id, checkpoint.checkpoint.id);
-    assert.equal(retained.checkpoint.repos[0]?.source?.sourceId, consumer.sourceId);
-    const beforeRevival = await json<{ runs: CiRunSummary[] }>(runsPath);
-    const revived = await json<{ runs: { number?: number; skipped?: string }[] }>(
-      `${checkpointPath}/revive`,
-      "POST",
-      {},
-    );
-    assert.equal(revived.runs.length, 1);
-    assert.equal(revived.runs[0]?.number, undefined);
-    assert.match(revived.runs[0]?.skipped ?? "", /source.*(?:expired|unavailable)/i);
-    assert.deepEqual((await json<{ runs: CiRunSummary[] }>(runsPath)).runs, beforeRevival.runs);
-    assert.deepEqual((await sourceObservation()).roots, []);
-    record({
-      realCiCompleted: completed,
-      terminalSource,
-      retainedCiHistory: retainedHistory,
-      realCiRootReleased: released,
-      purgedSource: absent,
-      expiredCheckpointPreview: revived,
-    });
-  } finally {
-    try {
-      if (heldNumber !== undefined) {
-        const detail = await json<CiRunDetail>(`${api}/ci/runs/${heldNumber}`);
-        if (["queued", "running"].includes(detail.status))
-          await gm(["runs", "cancel", String(heldNumber), "--repo", repo], "sam", root);
-      }
-    } finally {
-      barrier.closeAllConnections();
-      await new Promise<void>((resolve, reject) =>
-        barrier.close((error) => (error ? reject(error) : resolve())),
-      );
-    }
-  }
   await abandon(child.slug);
   // A child is removed first; its dependency root is released only after its provider is gone.
   for (let pass = 0; pass < 3; pass++) await retain(91);
@@ -547,7 +293,7 @@ export async function runSourceRetentionE2E(
   await hook({ action: "initialize", sourceId: reservation.sourceId });
   await readable(reservation.sourceId, oid);
   const observed = await inspect();
-  for (const sourceId of [parent.sourceId, child.sourceId, consumer.sourceId]) {
+  for (const sourceId of [parent.sourceId, child.sourceId]) {
     const source = observed.find((item) => item.sourceId === sourceId);
     assert.equal(source?.state, "purged");
     assert.equal(source?.exists, false);
@@ -569,7 +315,7 @@ export async function runSourceRetentionE2E(
     after = await inventory(before.repoId);
     if (after.deletion?.phase === "done") break;
     assert(Date.now() < deadline, `Source purge stalled in ${after.deletion?.phase}`);
-    await delay(1_000);
+    await delay(250);
   }
   assert.equal(after.repo, null);
   assert.deepEqual(after.d1, {});

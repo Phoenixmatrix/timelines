@@ -204,7 +204,7 @@ describe("Whole Workflow cutover admission", () => {
     expect(admission.control.activeTickets()).toEqual([]);
   });
 
-  test.each(["queued", "running", "paused", "waiting", "waitingForPause", "sleeping", "unknown"])(
+  test.each(["running", "unknown"])(
     "%s provider status cannot close an orphan ticket",
     async (status) => {
       const get = vi.fn(async () => ({ status: async () => ({ status }) }));

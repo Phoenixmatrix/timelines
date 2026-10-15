@@ -133,26 +133,6 @@ test("landed rows keep main, commit and lane controls separate from selection", 
   );
 });
 
-test("phone timeline rows are touch targets without widening the page", async () => {
-  await page.viewport(390, 844);
-  try {
-    const server = await TestServer.start({ world: true });
-    await timelineWorld(server);
-    const app = renderApp("/tracker/orbit/timelines");
-    await expect.element(select("Search")).toBeVisible();
-    expect(select("Search").element().getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
-    expect(sidewaysOverflow()).toBeLessThanOrEqual(0);
-    await tap(select("Search"));
-    await app.waitForUrl((url) => url.searchParams.get("tl") === "search");
-    await expect.element(select("Search")).toHaveAttribute("aria-current", "true");
-    await tap(select("main"));
-    await app.waitForUrl((url) => url.searchParams.get("tl") === "main");
-    await expect.element(select("main")).toHaveAttribute("aria-current", "true");
-  } finally {
-    await page.viewport(1280, 900);
-  }
-});
-
 const panel = () => page.getByRole("region", { name: "Selected timeline" });
 
 /** A compare answer: two files, +5 −1. */
@@ -259,7 +239,7 @@ test("the selected timeline's panel leads with its review, then checkpoints, in 
   forgetPanel();
 });
 
-test("on a phone, choosing a timeline brings its panel into view and reads its name", async () => {
+test("on a phone, timeline rows are touch targets, and choosing one brings its panel into view and reads its name", async () => {
   await page.viewport(390, 844);
   try {
     const server = await TestServer.start({ world: true });
@@ -267,8 +247,11 @@ test("on a phone, choosing a timeline brings its panel into view and reads its n
     canned(server);
     const app = renderApp("/tracker/orbit/timelines");
     await expect.element(select("Search")).toBeVisible();
+    expect(select("Search").element().getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
+    expect(sidewaysOverflow()).toBeLessThanOrEqual(0);
     await tap(select("Search"));
     await app.waitForUrl((url) => url.searchParams.get("tl") === "search");
+    await expect.element(select("Search")).toHaveAttribute("aria-current", "true");
     const heading = panel().getByRole("heading", { level: 2, name: "Search" });
     await expect.element(heading).toHaveFocus();
     expect(heading.element().getBoundingClientRect().top).toBeLessThan(window.innerHeight);
@@ -276,6 +259,9 @@ test("on a phone, choosing a timeline brings its panel into view and reads its n
     expect(changes.element().getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
     expect(sidewaysOverflow()).toBeLessThanOrEqual(0);
     await visual("Timelines - phone panel");
+    await tap(select("main"));
+    await app.waitForUrl((url) => url.searchParams.get("tl") === "main");
+    await expect.element(select("main")).toHaveAttribute("aria-current", "true");
   } finally {
     await page.viewport(1280, 900);
   }

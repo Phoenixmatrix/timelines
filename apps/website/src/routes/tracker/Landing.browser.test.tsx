@@ -4,8 +4,9 @@
 // not green, stale). An approved checkpoint queues itself and merges; a
 // conflict stops it and asks for a sync; Land again queues it afresh; a
 // failed merge stops it too. Those runs end as rows a CI run leaves; the
-// later states (testing, advancing, partly landed, landed), which need git
-// objects and runners the world doesn't have, are canned.
+// later states (testing, landed), which need git objects and runners the
+// world doesn't have, are canned; advancing and partly landed are the same
+// rows with other words.
 
 import { describe, expect, test } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
@@ -326,39 +327,6 @@ describe("the later states, with the runs that merged and tested them", () => {
     await expect
       .element(repoRow("web").getByRole("link", { name: "Gates #6" }))
       .toHaveAttribute("href", "/orbit/web/ci/6?tl=search");
-    expect(landButton().elements()).toHaveLength(0);
-  });
-
-  test("advancing: every merge passed; mains move one at a time", async () => {
-    await landed("advancing", "landing", {
-      engine: { state: "advanced", merge: merge.engine, mergeRun: run(3), gateRun: run(4) },
-      // Not started yet: a run without its number isn't a link.
-      web: { state: "tested", merge: merge.web, mergeRun: run(5), gateRun: { id: "g", number: 0 } },
-    });
-    await expect.element(panel()).toMatchTextContent("Checkpoint #1: Advancing main");
-    await expect.element(repoRow("engine")).toMatchTextContent("orbit/enginemain advanced");
-    await expect.element(repoRow("web")).toMatchTextContent("orbit/webpassed");
-    await expect
-      .element(repoRow("web").getByRole("link", { name: "Preparation #5" }))
-      .toBeVisible();
-    expect(repoRow("web").getByRole("link", { name: /Gates/ }).elements()).toHaveLength(0);
-    expect(landButton().elements()).toHaveLength(0);
-  });
-
-  test("partly landed: one main advanced, the other merges again", async () => {
-    await landed("merging", "partly_landed", {
-      engine: { state: "advanced", merge: merge.engine, mergeRun: run(3), gateRun: run(4) },
-      web: { state: "merging", attempt: 2, mergeRun: run(7) },
-    });
-    await expect
-      .element(inspector())
-      .toMatchTextContent(/Search\s*Partly landed[\s\S]*Lands\s*after approval/);
-    await expect.element(panel()).toMatchTextContent("Checkpoint #1: Preparing the result on main");
-    await expect.element(repoRow("engine")).toMatchTextContent("orbit/enginemain advanced");
-    await expect.element(repoRow("web")).toMatchTextContent("orbit/webmerging");
-    await expect
-      .element(repoRow("web").getByRole("link", { name: "Preparation #7" }))
-      .toHaveAttribute("href", "/orbit/web/ci/7?tl=search");
     expect(landButton().elements()).toHaveLength(0);
   });
 

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "./d1.ts";
+import { d1, migratedDatabase, migratedRegistryDatabase, restoredDatabase } from "./d1.ts";
+import { providedDatabase } from "./provided.ts";
 import { installCutoverTestControl } from "./space-cutover.ts";
 
 /** A freshly initialized installation's three databases, serialized. */
@@ -11,10 +11,13 @@ interface FreshSnapshot {
   control: Uint8Array;
 }
 
-/** Initializing an installation takes about two seconds; each test file's worker does it once. */
+/**
+ * Initializing an installation takes about a second. The unit run does it once
+ * (worker/testing/provided.ts); other runs, once per module.
+ */
 let snapshot: Promise<FreshSnapshot> | null = null;
 
-async function initializedSnapshot(): Promise<FreshSnapshot> {
+export async function initializedSnapshot(): Promise<FreshSnapshot> {
   const sqlite = migratedDatabase();
   const registry = migratedRegistryDatabase();
   const env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as Env;
@@ -33,27 +36,30 @@ async function initializedSnapshot(): Promise<FreshSnapshot> {
   }
 }
 
-function restored(bytes: Uint8Array): DatabaseSync {
-  const db = new DatabaseSync(":memory:");
-  db.deserialize(bytes);
-  return db;
+function providedSnapshot(): FreshSnapshot | null {
+  const db = providedDatabase("installed");
+  const registry = providedDatabase("installedRegistry");
+  const control = providedDatabase("installedControl");
+  return db && registry && control ? { db, registry, control } : null;
 }
 
 /**
- * Copies of this worker's freshly initialized installation: the migrated DB and
+ * Copies of a freshly initialized installation: the migrated DB and
  * REGISTRY_DB, and the control journal to pass to installCutoverTestControl.
  * Restoring takes milliseconds; migrating and initializing per test took most
  * of the unit suite's time.
  */
 export async function freshInstallationDatabases() {
-  const fresh = await (snapshot ??= initializedSnapshot().catch((error: unknown) => {
-    snapshot = null;
-    throw error;
-  }));
+  const fresh = await (snapshot ??= Promise.resolve()
+    .then(() => providedSnapshot() ?? initializedSnapshot())
+    .catch((error: unknown) => {
+      snapshot = null;
+      throw error;
+    }));
   return {
-    sqlite: restored(fresh.db),
-    registry: restored(fresh.registry),
-    control: restored(fresh.control),
+    sqlite: restoredDatabase(fresh.db),
+    registry: restoredDatabase(fresh.registry),
+    control: restoredDatabase(fresh.control),
   };
 }
 

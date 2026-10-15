@@ -134,6 +134,8 @@ interface Guard {
   /** No further cf call starts after this time (by `clock`). */
   deadline?: number;
   clock?: () => number;
+  /** Pauses between repeat deletes of a namespace's repositories (tests inject a no-op). */
+  wait?: (ms: number) => Promise<unknown>;
   /** Whether the bucket is still the one listed (not a create's new one). */
   unchanged?: () => Promise<boolean>;
 }
@@ -191,7 +193,7 @@ async function deleteBucket(
 async function deleteNamespace(
   cloudflare: Cloudflare,
   name: string,
-  guard: Pick<Guard, "deadline" | "clock"> = {},
+  guard: Pick<Guard, "deadline" | "clock" | "wait"> = {},
 ): Promise<"deleted" | "absent" | "orphaned"> {
   return await deleteArtifactsNamespace((args) => cloudflare.cf(args), name, {
     ...guard,
@@ -370,7 +372,7 @@ export async function deletePreview(
 export async function deleteData(
   cloudflare: Cloudflare,
   names: Names,
-  guard: Pick<Guard, "deadline" | "clock"> = {},
+  guard: Pick<Guard, "deadline" | "clock" | "wait"> = {},
 ): Promise<void> {
   const failures: string[] = [];
   // Independent: one failing doesn't keep the others.
@@ -394,7 +396,7 @@ export async function teardown(
   cloudflare: Cloudflare,
   account: string,
   slug: string,
-  guard: Pick<Guard, "deadline" | "clock"> = {},
+  guard: Pick<Guard, "deadline" | "clock" | "wait"> = {},
 ) {
   const all = names(slug);
   await deletePreview(cloudflare, account, all.preview);
@@ -1245,6 +1247,8 @@ export interface CreateDeps {
   recorded(url: string): Promise<boolean | null>;
   /** The rollback's clock (tests). */
   clock?: () => number;
+  /** Pauses between repeat repository deletes during teardown (tests). */
+  pause?: (ms: number) => Promise<unknown>;
   wait(origin: string, resources: PreviewResources, headers: Record<string, string>): Promise<void>;
   secret?: string;
 }
@@ -1265,7 +1269,7 @@ export async function create(deps: CreateDeps, job: Job): Promise<string> {
   try {
     const access = previewAccess(job.env);
     const headers = accessHeaders(job.env);
-    const all = await teardown(deps.cloudflare, job.account, job.slug);
+    const all = await teardown(deps.cloudflare, job.account, job.slug, { wait: deps.pause });
     const secret = deps.secret ?? randomBytes(32).toString("hex");
     hide(secret);
     made = true;
@@ -1289,7 +1293,7 @@ export async function create(deps: CreateDeps, job: Job): Promise<string> {
     // The checkpoint shows a failed preview rather than none; the job still fails.
     if (live !== true)
       await deps.record(["deploy", "record", "--status", "failed"]).catch(() => {});
-    if (made && live === false) await rollBack(deps.cloudflare, job, deps.clock);
+    if (made && live === false) await rollBack(deps.cloudflare, job, deps.clock, deps.pause);
     else if (made)
       console.error(
         JSON.stringify({
@@ -1315,6 +1319,7 @@ async function rollBack(
   cloudflare: Cloudflare,
   job: Job,
   clock: () => number = Date.now,
+  wait?: (ms: number) => Promise<unknown>,
 ): Promise<void> {
   try {
     // Bounded: a bucket or namespace that won't empty mustn't hold the
@@ -1322,6 +1327,7 @@ async function rollBack(
     const all = await teardown(cloudflare, job.account, job.slug, {
       deadline: clock() + ROLLBACK_MS,
       clock,
+      wait,
     });
     console.error(JSON.stringify({ event: "preview.create.rolled-back", ...all }));
   } catch (error) {

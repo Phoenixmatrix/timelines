@@ -313,7 +313,7 @@ fn wait(
             return Err(timeout_error(requested, repo, timeout, deploy));
         }
         std::thread::sleep(
-            Duration::from_secs(2)
+            remote::poll_interval(Duration::from_secs(2))
                 .min(Duration::from_secs(timeout).saturating_sub(started.elapsed())),
         );
     }

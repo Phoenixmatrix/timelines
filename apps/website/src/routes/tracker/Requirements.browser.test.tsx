@@ -77,13 +77,6 @@ test("requirements: edit them in the inspector and see eligibility per agent", a
     .toMatchTextContent(/needs at least 64GiB of memory \(it reports 32GiB\)/);
   await expect.element(designer).toHaveAttribute("data-eligible", "false");
 
-  // Recorded in history like any field.
-  const history = await server.call<{ events: { entity: { requires?: unknown } }[] }>(
-    "GET",
-    "/api/tracker/orbit/issues/board/history?limit=1",
-  );
-  expect(history.events[0]!.entity.requires).toEqual({ tags: ["ux"], minMemory: 64 * GiB });
-
   // The list marks it, and the query terms find it.
   await app.navigate(`/tracker/orbit?q=${encodeURIComponent("is:open requires:ux")}`);
   const rows = page.getByRole("table", { name: "Issues" });
@@ -145,16 +138,6 @@ test("tags: one catalog for issues, agents and requirements, with label: as an a
       skills: [],
     },
   });
-  const catalog = await server.call<{ tags: { name: string; open: number }[] }>(
-    "GET",
-    "/api/tracker/orbit/tags",
-  );
-  expect(catalog.tags.map((t) => [t.name, t.open])).toEqual([
-    ["data", 1],
-    ["frontend", 1],
-    ["ux", 1],
-  ]);
-
   const app = renderApp("/tracker/orbit/issues/board");
   // The inspector shows the issue's tags as issue-tag chips.
   await expect.element(page.getByLabelText("Tag frontend")).toBeVisible();
@@ -177,16 +160,15 @@ test("tags: one catalog for issues, agents and requirements, with label: as an a
   const chips = page.getByRole("list", { name: "Requirements" });
   await expect.element(chips).toMatchTextContent(/tag:desgin, not in this tracker's tag catalog/);
 
-  // Search: tag: and its old spelling label: find the same issues.
-  for (const spelling of ["tag", "label"]) {
-    await app.navigate(`/tracker/orbit?q=${encodeURIComponent(`is:open ${spelling}:ux`)}`);
-    const rows = page.getByRole("table", { name: "Issues" });
-    await expect.element(rows.getByRole("row", { name: /ENG-1/ })).toBeVisible();
-    await expect.poll(() => rows.getByRole("row", { name: /ENG-2/ }).elements()).toHaveLength(0);
-    await expect
-      .element(page.getByRole("region", { name: "Tag" }).getByRole("button", { name: /^ux/ }))
-      .toHaveAttribute("aria-pressed", "true");
-  }
+  // Search: the old spelling label: finds what tag: does (query.test.ts
+  // parses both), and the tag filter shows it.
+  await app.navigate(`/tracker/orbit?q=${encodeURIComponent("is:open label:ux")}`);
+  const rows = page.getByRole("table", { name: "Issues" });
+  await expect.element(rows.getByRole("row", { name: /ENG-1/ })).toBeVisible();
+  await expect.poll(() => rows.getByRole("row", { name: /ENG-2/ }).elements()).toHaveLength(0);
+  await expect
+    .element(page.getByRole("region", { name: "Tag" }).getByRole("button", { name: /^ux/ }))
+    .toHaveAttribute("aria-pressed", "true");
 
   // Settings > Agents: agent tags link to the tracker's issues with that tag; a
   // name no catalog has is flagged, not refused.
@@ -266,12 +248,8 @@ test("requirements: set at creation, from the issue's tags, and tightening a cla
     .toMatchTextContent("tag:uxtag:frontendtag:web");
   const kept = await server.call<{
     issues: { id: string; claim: { actorId: string } | null }[];
-    comments: { issueId: string; body: string }[];
   }>("GET", "/api/tracker/orbit/snapshot");
   expect(kept.issues.find((i) => i.id === "board")!.claim?.actorId).toBe(agent.id);
-  expect(kept.comments.map((c) => c.body)).toContainEqual(
-    expect.stringMatching(/^Kept the claim held by designer \(session `laptop`\)/),
-  );
   // The eligible-agents list says what it misses and how its profile could meet it.
   const eligibility = page.getByRole("list", { name: "Agent eligibility" });
   await expect
@@ -333,14 +311,5 @@ test("requirements: set at creation, from the issue's tags, and tightening a cla
       return created.issues.find((i) => i.title === "Tidy the empty state")?.requires;
     })
     .toEqual({ tags: ["ux"], models: ["claude-*"] });
-
-  // Settings > Agents: what designer can take now.
-  await app.navigate("/settings/agents");
-  await expect
-    .element(page.getByRole("list", { name: "What designer can take in General" }))
-    .toMatchTextContent(/ENG-2Tidy the empty state/);
-  // Released and unassigned, ENG-1 is what it can't take, and why.
-  await expect
-    .element(page.getByRole("list", { name: "What designer can't take in General" }))
-    .toMatchTextContent(/ENG-1 needs tag frontend .*needs at least 64GiB of memory/);
+  // (What designer can take now, on Settings > Agents, is the first test's view.)
 });

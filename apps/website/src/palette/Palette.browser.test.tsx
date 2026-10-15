@@ -4,7 +4,8 @@
 // Ctrl+K open it with focus in the query and Escape gives focus back; an
 // exact identifier comes first and Enter opens it; what the viewer can't read
 // never appears; before anything's typed one Go to leads, and Go to and Find
-// are second steps; issues and packages open their pages; Create issue hands a
+// are second steps, and an issue found opens its page (what search finds is
+// worker/search's, packages by name included); Create issue hands a
 // proposed title to the tracker's own creator once, never in the address;
 // signed out it only navigates, and never searches.
 
@@ -127,60 +128,12 @@ test("before anything's typed, one Go to leads; Go to and Find are second steps"
   expect(search.url.searchParams.get("categories")).toBe("issues");
   expect(search.url.searchParams.get("limit")).toBe("20");
   expect(page.getByRole("group", { name: "Repositories" }).elements()).toHaveLength(0);
-});
-
-test("issues and packages open their own pages", async () => {
-  const server = await setup();
-  await server.call("POST", "/api/tracker/orbit/mutate", {
-    ...(await server.trackerContract("orbit")),
-    operationId: "palette-fixtures",
-    mutations: [
-      {
-        kind: "team.create",
-        id: "palette-team",
-        data: { key: "PAL", name: "Palette", memberIds: ["acc_marco"] },
-      },
-      {
-        kind: "issue.create",
-        id: "palette-ready",
-        data: { teamId: "palette-team", title: "Agent ready fixture", status: "todo" },
-      },
-    ],
-  });
-  // A package orbit publishes, in its npm feed.
-  const head = commitId();
-  await server.push("orbit/engine", "main", head);
-  await server.call("POST", "/api/dev/atlas", {
-    repo: "orbit/engine",
-    action: "publish",
-    commit: head,
-    publishes: "orbit-kit",
-  });
-
-  const app = renderApp("/orbit/website");
-  await expect.element(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
-
-  // Issues from the trackers marco belongs to open their page.
-  await press("Control+k");
-  await userEvent.keyboard("Agent ready fixture");
-  const issues = page.getByRole("group", { name: "Issues" });
-  await expect
-    .element(issues.getByRole("option").first())
-    .toMatchTextContent("Agent ready fixture");
-  await expect.element(issues.getByRole("option").first()).toMatchTextContent("orbit");
+  // An issue opens its page.
   await press("Enter");
   await app.waitForUrl((url) => url.pathname === "/tracker/orbit/issues/palette-ready");
   await expect
     .element(page.getByText("Agent ready fixture", { exact: true }).first())
     .toBeVisible();
-
-  // A package, by name, opens its console page.
-  await press("Control+k");
-  await userEvent.keyboard("orbit-kit");
-  const packages = page.getByRole("group", { name: "Packages" });
-  await expect.element(packages.getByRole("option").first()).toMatchTextContent("orbit-kit");
-  await press("Enter");
-  await app.waitForUrl((url) => /^\/orbit\/-\/packages\/npm\/orbit-kit$/.test(url.pathname));
 });
 
 test("Create issue hands the proposed title to the tracker's creator, once", async () => {

@@ -545,14 +545,15 @@ quick core API journeys. The Worker entry, schema, auth and development API,
 migrations and seed, build/runtime configuration, dependencies, shared packages, the
 E2E harness, repository authorization (`worker/permissions.ts`) and unknown paths
 select every journey except the main-only ones: the
-multi-repository landing recovery matrix and the legacy-source migration (about
-eight minutes together). That widened set is added to whatever the other changed
-paths select, so a merge-queue change beside a migration still runs the queue journey.
+multi-repository landing recovery and the legacy-source migration (an estimated
+three to four minutes together). That widened set is added to whatever the other
+changed paths select, so a merge-queue change beside a migration still runs the
+queue journey.
 `gm`'s agent, profile and server modules run for every command, so they select every
 gm journey. Agents' `ready` never runs those; `--all`, `agent test` and
 the [main E2E watcher](#full-e2e-on-main) do. Four more heavy journeys (the merge
-queue, source retention, nested timeline admission and source push recovery, about
-seven minutes) run only when a change reaches their own area, never in that
+queue, source retention, nested timeline admission and source push recovery, an
+estimated five minutes) run only when a change reaches their own area, never in that
 widened set. To see what the policy costs,
 `node tools/agent/ready-e2e-replay.ts --timings <run>/artifacts/e2e.json` replays
 recent main commits through it with a complete run's measured scenario times.
@@ -560,8 +561,8 @@ recent main commits through it with a complete run's measured scenario times.
 Route-only changes to `UsageCosts.tsx` select both the usage and retention browser
 journeys; `DataRetention.tsx` selects retention. Global styles and shared UI,
 navigation, API/session and routing changes keep broad browser coverage. Frontend
-profiles use the focused real expired-source journey instead of the full backend
-retention matrix: it expires and purges real source data, removes timeline history,
+profiles use the focused real expired-source journey instead of the broader backend
+retention journey: it expires and purges real source data, removes timeline history,
 and checks the explicit expired-source browser state. Full profiles keep both
 journeys.
 
@@ -608,9 +609,24 @@ Measured decisions from 2026-10-09 (single local runs, not portable benchmarks):
   browser invocations took 178.4 s and did not demonstrate an improvement.
 - Keep all nine recovery fault cases: the shared two-repository fixture took
   4.7 s of the 467.4 s recovery matrix, so setup was not its dominant cost.
+  Superseded on 2026-10-15, below.
 - Use the focused expiry/history-removed browser fixture in frontend selection
   (12.9 s), while retaining the broad backend retention scenario (76.4 s) in full
   readiness. These are different coverage scopes, not interchangeable tests.
+
+Decided on 2026-10-15, when the live suite was pruned to the journeys that are
+each a boundary's one real-stack representative:
+
+- The multi-repository landing recovery journey keeps only its fixture, the
+  partial retry and cleanup (it was 542 s of a 1862 s serial suite on the main
+  watcher). The recovery state machine stays unit-tested on real D1 against
+  stubbed refs in `apps/website/worker/timelines/landing.test.ts` ("compact
+  landing state") and `apps/website/worker/tracker/leases.test.ts`: the
+  after-receipt and after-CAS barriers, a prepared intent without admission,
+  partial abandonment and fenced CAS. The before-CAS case is covered only as
+  state, not as a barrier, and the before-finalize barrier is no longer
+  exercised anywhere: an accepted gap. The partial retry stays live as the one
+  end-to-end proof of a real provider CAS and durable recovery.
 
 Selected test commands always execute; Cargo may reuse compiled outputs, not test
 results. Missing credentials, required provider outages or an unavailable browser
@@ -632,16 +648,16 @@ The E2E command creates a **separate ephemeral environment**, seeds it twice,
 exercises it and destroys it on success or failure. It does not reset the interactive
 environment. Its checks include:
 
-| Boundary                       | Observable behavior                                                                                                                                                                                                                 |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Authentication and permissions | Anonymous/public access, invalid and revoked tokens, read/write roles, private-repo concealment                                                                                                                                     |
-| CLI and Git transport          | Real clone/commit/push; denied push leaves remote refs unchanged                                                                                                                                                                    |
-| Tracker                        | Blocked and contested claims, fencing, completion evidence and local replica synchronization                                                                                                                                        |
-| Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance                                                                                  |
-| CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                                                                                                                |
-| Steps                          | `gm step` with a hook-captured instruction and steering, local `gm test` results, the live feed within 5 s, the step run's summary, a no-context warning, anonymous readers refused, and `gm why` on a landed line showing its step |
-| Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries; a scoped timeline round trip; an Atlas smoke down to the cited source                                                   |
-| Mirror                         | Authenticated Git mirror update/tag/prune, default branch and tags only, rejected credentials and recovery against a real local HTTP target                                                                                         |
+| Boundary                       | Observable behavior                                                                                                                                                                    |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Authentication and permissions | Anonymous/public access, invalid and revoked tokens, read/write roles, private-repo concealment                                                                                        |
+| CLI and Git transport          | Real clone/commit/push; denied push leaves remote refs unchanged                                                                                                                       |
+| Tracker                        | Blocked and contested claims, fencing, completion evidence and local replica synchronization                                                                                           |
+| Registry                       | Real upload/download, executable install/run/update in disposable directories, failed-update preservation, denied writes, grants and CI provenance                                     |
+| CI                             | Push-triggered DAG, dependency ordering, failed prerequisite, skipped dependent, cancellation and job-token lifetime                                                                   |
+| Steps                          | `gm step` with a hook-captured instruction and steering, local `gm test` results, the live feed within 5 s, the step run's summary, a no-context warning and anonymous readers refused |
+| Browser                        | Independent persona sessions, persisted repository/CI/tracker/package views, reloads and access boundaries; a scoped timeline round trip; an Atlas smoke down to the cited source      |
+| Mirror                         | Authenticated Git mirror update/tag/prune, default branch and tags only, rejected credentials and recovery against a real local HTTP target                                            |
 
 Local runners keep deadline and cancellation supervision after stdout/stderr EOF.
 Silent running steps use a five-second cancellation heartbeat. The live cancellation
@@ -650,7 +666,7 @@ scenario requires the held process to disconnect without the test releasing it.
 The source-landing fault fixture stops at `after-receipt` only once Tracker has
 durably saved the repository as `advanced`, before any subsequent repository moves.
 Setting that barrier before an optimistic save can deadlock recovery after a
-version conflict or interrupted RPC. The real partial-retry/cancel assertions
+version conflict or interrupted RPC. The real partial-retry assertions
 remain unchanged; unit regressions exercise both failed-save paths.
 Its secret-scoped `tick` action drives the existing recovery state machine while
 waiting, since local development does not run the hourly cron after an interrupted
@@ -680,8 +696,8 @@ Local CI runners set `GITMATRIX_CI_ARTIFACTS_DIR` to a private job-specific dire
 outside the disposable checkout and print its path in setup logs. The harness
 retains only allowlisted sanitized JSON reports there, including failures; it strips
 scenario observations and never copies credentials, raw logs or browser storage.
-Structured phase timings are extracted from observations: up to 11 allowlisted
-source-landing entries (fixture, nine fault cases and cleanup) retain only the
+Structured phase timings are extracted from observations: up to 3 allowlisted
+source-landing entries (fixture, retry-partial and cleanup) retain only the
 `e2e.phase` event, sanitized name, `elapsedMs` and `outcome` fields, never the
 surrounding observations.
 E2E `timings.json` separates preparation, provisioning, migrations, startup, seeding,

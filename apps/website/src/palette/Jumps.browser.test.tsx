@@ -1,9 +1,10 @@
 // Direct jumps and recent places in the palette (CORE-22), in a real
-// browser against the Worker's search, tracker and timelines in memory: an
+// browser against the Worker's search and tracker in memory: an
 // issue key, `#<run>` (and a bare number) in the current repository, a SHA
 // (which opens the commit panel over the page and is never proposed as an
-// issue title), `pkg@version` and a timeline's slug each jump straight
-// there with Enter; with nothing typed, the last places visited come first.
+// issue title) and `pkg@version` each jump straight there with Enter; with
+// nothing typed, the last places visited come first. A timeline's slug, and a
+// SHA outside a repository, are the resolver's (src/lib/resolveRefs.test.ts).
 // References resolve through the real resolver in memory; CI runs and
 // commit contents aren't in the world, so those are canned, and the package
 // console's API isn't either, so its page isn't checked as a recent.
@@ -83,11 +84,6 @@ async function setup() {
   const key =
     group.status === "ok" && group.results[0]?.category === "issues" ? group.results[0].key : "";
   expect(key).toMatch(/^JMP-\d+$/);
-  await server.call("POST", "/api/tracker/orbit/timelines", {
-    slug: "fast-search",
-    name: "Fast search",
-    repos: ["orbit/engine"],
-  });
   await server.call("POST", "/api/dev/atlas", {
     repo: "orbit/engine",
     action: "publish",
@@ -151,7 +147,7 @@ async function jump(text: string) {
   return jumps;
 }
 
-test("Cmd-K jumps straight to an issue key, a run, a SHA, pkg@version and a timeline", async () => {
+test("Cmd-K jumps straight to an issue key, a run, a SHA and pkg@version", async () => {
   const { head, key } = await setup();
   const app = renderApp("/orbit/engine");
   await expect.element(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
@@ -205,20 +201,10 @@ test("Cmd-K jumps straight to an issue key, a run, a SHA, pkg@version and a time
       url.searchParams.get("version") === "1.2.0",
   );
 
-  // A timeline's slug, from a page of the tracker it's in.
-  await app.navigate("/orbit/engine");
-  await expect.element(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
-  await jump("fast-search");
-  await expect.element(selected()).toMatchTextContent("Fast search");
-  await press("Enter");
-  await app.waitForUrl(
-    (url) =>
-      url.pathname === "/tracker/orbit/timelines" && url.searchParams.get("tl") === "fast-search",
-  );
-
+  // (A timeline's slug resolves without a resolver: resolveRefs.test.ts.)
   await expect
     .poll(() => localStorage.getItem("gitmatrix:recent-places:v4:acc_marco") ?? "")
-    .toContain("Fast search");
+    .toContain(head.slice(0, 7));
 
   // With nothing typed, the places just visited come first, newest first.
   // (The page it's opened on isn't offered: wait to be on Home first.)
@@ -226,61 +212,19 @@ test("Cmd-K jumps straight to an issue key, a run, a SHA, pkg@version and a time
   await app.waitForUrl((url) => url.pathname === "/");
   await press("Control+k");
   const recent = page.getByRole("group", { name: "Recent" });
-  await expect.element(recent.getByRole("option", { name: /Fast search/ })).toBeVisible();
+  await expect.element(recent.getByRole("option", { name: /#7 Nightly checks/ })).toBeVisible();
   const titles = recent
     .getByRole("option")
     .elements()
     .map((option) => option.textContent ?? "");
   const at = (text: string) => titles.findIndex((title) => title.includes(text));
-  // Newest first: the timeline before the run, the run before the issue.
-  expect(at("Fast search")).toBeGreaterThanOrEqual(0);
-  expect(at("Fast search")).toBeLessThan(at("#7 Nightly checks"));
-  expect(at("#7 Nightly checks")).toBeLessThan(at(key));
+  // Newest first: the commit before the run, the run before the issue.
   expect(at(head.slice(0, 7))).toBeGreaterThanOrEqual(0);
+  expect(at(head.slice(0, 7))).toBeLessThan(at("#7 Nightly checks"));
+  expect(at("#7 Nightly checks")).toBeLessThan(at(key));
   expect(at("orbit/engine")).toBeGreaterThanOrEqual(0);
   expect(titles.length).toBeLessThanOrEqual(8);
   // Choosing one goes back there.
   await userEvent.click(recent.getByRole("option", { name: /#7 Nightly checks/ }));
   await app.waitForUrl((url) => url.pathname === "/orbit/engine/ci/7");
-});
-
-test("SHA-like input never leads with Create issue, in a repository or outside one", async () => {
-  const { head } = await setup();
-  const app = renderApp("/orbit/engine");
-  await expect.element(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
-  // The real resolver answers from the branch tips here (the world has no git objects).
-  await jump(head.slice(0, 12));
-  await expect.element(selected()).toMatchTextContent(`Commit ${head.slice(0, 7)}`);
-  expect(
-    dialog()
-      .getByRole("option", { name: /Create issue/ })
-      .elements(),
-  ).toHaveLength(0);
-  await press("Escape");
-
-  // Outside a repository, it's offered in the repository visited recently.
-  await app.navigate("/tracker/orbit");
-  await press("Control+k");
-  await userEvent.keyboard(head.slice(0, 10));
-  await expect.element(selected()).toMatchTextContent("in orbit/engine");
-  expect(
-    dialog()
-      .getByRole("option", { name: /Create issue/ })
-      .elements(),
-  ).toHaveLength(0);
-  await press("Enter");
-  await app.waitForUrl(
-    (url) => url.pathname === "/orbit/engine" && url.searchParams.get("commit") === head,
-  );
-  await expect
-    .element(page.getByRole("dialog", { name: `Commit ${head.slice(0, 7)}` }))
-    .toBeVisible();
-
-  // Ordinary words still propose a title.
-  await press("Escape");
-  await press("Control+k");
-  await userEvent.keyboard("Tidy the release script");
-  await expect
-    .element(dialog().getByRole("option", { name: /Create issue “Tidy the release script”/ }))
-    .toBeVisible();
 });

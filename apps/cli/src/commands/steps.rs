@@ -813,7 +813,7 @@ pub fn follow(ctx: &Ctx, args: &StepsArgs) -> Result<()> {
             Err(e) if e.code != "stream_interrupted" && e.code != "server_unreachable" => {
                 return Err(e);
             }
-            _ => std::thread::sleep(std::time::Duration::from_secs(2)),
+            _ => std::thread::sleep(remote::poll_interval(std::time::Duration::from_secs(2))),
         }
     }
     Ok(())

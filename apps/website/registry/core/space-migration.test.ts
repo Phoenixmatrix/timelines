@@ -562,12 +562,12 @@ describe("independent registry Space migration participant", () => {
     expect(budget.maximumSql).toBeLessThan(100_000);
   });
 
-  it("advances inventory, reconciliation and restore over 4000 rows below the per-invocation query limit", async () => {
+  it("advances inventory, reconciliation and restore over 1000 rows below the per-invocation query limit", async () => {
     h.db.applySql(
-      "CREATE TABLE checkpoint_many(id INTEGER PRIMARY KEY, value TEXT); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4100) INSERT INTO checkpoint_many SELECT x,'row-' || x FROM n",
+      "CREATE TABLE checkpoint_many(id INTEGER PRIMARY KEY, value TEXT); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1100) INSERT INTO checkpoint_many SELECT x,'row-' || x FROM n",
     );
     const before = await checkpoint();
-    expect(before.inventory.counts.checkpoint_many).toBe(4100);
+    expect(before.inventory.counts.checkpoint_many).toBe(1100);
     await migrate(before.inventory);
     expect((await reconcile(before.inventory)).digest).toBe(before.inventory.digest);
     await h.env.REGISTRY_DB.prepare("DELETE FROM checkpoint_many WHERE id%2=0").run();

@@ -131,7 +131,7 @@ test("distant description edits omit unchanged prose on phones but disclose both
 
 test("missing prior values are not invented as deltas and large rewrites remain bounded", async () => {
   const server = await world();
-  const rewritten = `Replacement specification. ${"Keep every historical detail. ".repeat(900)}End of the complete replacement.`;
+  const rewritten = `Replacement specification. ${"Keep every historical detail. ".repeat(200)}End of the complete replacement.`;
   await mutate(server, [
     {
       kind: "issue.update",

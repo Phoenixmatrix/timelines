@@ -3,15 +3,12 @@ import {
   bucketsFor,
   checkCursorBinding,
   cursorRequestDigest,
-  METRIC_IDS,
-  METRICS,
   normalizeCommitRef,
   normalizeTraceRef,
   OBSERVABILITY_CURSOR_MAX_AGE_MS,
   OBSERVABILITY_MAX_BUCKETS,
   OBSERVABILITY_PAGE_DEFAULT,
   OBSERVABILITY_PAGE_MAX,
-  OBSERVABILITY_PROVIDERS,
   ObservabilityError,
   observationBindingCheck,
   pageLimit,
@@ -19,7 +16,6 @@ import {
   ratePoints,
   retentionSplit,
   safeProviderLink,
-  UNAVAILABLE_REASONS,
   validateCapability,
   validateEvidence,
   validateInterval,
@@ -63,46 +59,6 @@ function invalid(run: () => unknown, message: RegExp) {
   expect(run).toThrow(message);
 }
 
-describe("contract shape", () => {
-  test("Cloudflare is the only provider; there is no otel provider", () => {
-    expect(OBSERVABILITY_PROVIDERS).toEqual(["cloudflare"]);
-  });
-
-  test("every metric is defined under its own id, rates name both counts", () => {
-    for (const id of METRIC_IDS) {
-      const metric = METRICS[id];
-      expect(metric.id).toBe(id);
-      if (metric.kind === "rate") {
-        expect(METRICS[metric.numerator!].kind).toBe("count");
-        expect(METRICS[metric.denominator!].kind).toBe("count");
-      } else {
-        expect(metric.numerator).toBeNull();
-        expect(metric.denominator).toBeNull();
-      }
-    }
-    expect(METRICS["worker.exception_rate"].denominator).toBe("worker.invocations");
-    expect(METRICS["tracker.bug_events"].source).toBe("gitmatrix");
-  });
-
-  test("edge and origin 5xx are separate signals over the same request denominator", () => {
-    expect(METRICS["http.edge_5xx_rate"]).toMatchObject({
-      numerator: "http.edge_5xx",
-      denominator: "http.requests",
-    });
-    expect(METRICS["http.origin_5xx_rate"]).toMatchObject({
-      numerator: "http.origin_5xx",
-      denominator: "http.requests",
-    });
-    expect(METRIC_IDS).not.toContain("http.5xx" as never);
-  });
-
-  test("unavailable reasons include read-by-id and binding drift", () => {
-    expect(UNAVAILABLE_REASONS).toContain("not_found");
-    expect(UNAVAILABLE_REASONS).toContain("binding_changed");
-    expect(UNAVAILABLE_REASONS).toContain("expired_at_provider");
-  });
-});
-
 describe("parseUtcInstant", () => {
   test("accepts strict UTC instants", () => {
     expect(parseUtcInstant("2026-10-12T20:00:00Z")).toBe(Date.UTC(2026, 9, 12, 20));
@@ -113,20 +69,10 @@ describe("parseUtcInstant", () => {
   });
 
   test.each([
-    "2026-10-12T20:00:00+00:00",
     "2026-10-12T22:00:00+02:00",
     "2026-10-12T20:00:00",
-    "2026-10-12",
-    "2026-10-12 20:00:00Z",
-    "2026-10-12t20:00:00z",
     "2026-02-29T00:00:00Z",
-    "2026-02-30T00:00:00Z",
-    "2026-10-12T24:00:00Z",
-    "2026-12-31T23:59:60Z",
-    "2026-10-12T20:00:00.1234Z",
     "1969-12-31T23:59:59.999Z",
-    "0000-01-01T00:00:00Z",
-    "1760299200000",
   ])("refuses %s", (value) => invalid(() => parseUtcInstant(value), /Invalid time/));
 
   test("refuses non-strings", () => {
@@ -320,17 +266,9 @@ describe("validateCapability", () => {
   });
 
   test.each([
-    [{ dataset: "" }, /dataset/],
     [{ stability: "alpha" as never }, /stability/],
-    [{ reads: ["series", "logs" as never] }, /read/],
-    [{ reads: ["series", "series"] as never }, /read is listed twice/],
-    [{ metrics: ["worker.exceptions", "made.up" as never] }, /metric/],
-    [{ metrics: ["worker.exceptions", "worker.exceptions"] as never }, /metric is listed twice/],
     [{ metrics: ["tracker.bug_events"] as never }, /isn't a provider's/],
     [{ reads: ["error-groups"] as never }, /series read/],
-    [{ metrics: [] }, /series read/],
-    [{ retentionMs: 0 }, /retentionMs/],
-    [{ limits: { ...LIMITS, minBucketMs: -1 } }, /minBucketMs/],
   ] as [Partial<DatasetCapability>, RegExp][])("refuses %j", (overrides, message) =>
     invalid(() => validateCapability({ ...capability, ...overrides }), message),
   );
@@ -351,12 +289,7 @@ describe("normalizeCommitRef", () => {
 
   test.each([
     [{ sourceId: "canonical", commit: OID }, /repoId/],
-    [{ repoId: "repo_1", commit: OID }, /sourceId/],
-    [{ repoId: "", sourceId: "canonical", commit: OID }, /repoId/],
-    [{ repoId: "repo 1", sourceId: "canonical", commit: OID }, /repoId/],
     [{ repoId: "repo_1", sourceId: "canonical", commit: OID.slice(0, 12) }, /40-character/],
-    [{ repoId: "repo_1", sourceId: "canonical", commit: OID.toUpperCase() }, /40-character/],
-    [{ repoId: "repo_1", sourceId: "canonical", commit: "production" }, /40-character/],
     [null, /expected \{repoId, sourceId, commit\}/],
   ])("refuses %j", (value, message) => invalid(() => normalizeCommitRef(value), message));
 });

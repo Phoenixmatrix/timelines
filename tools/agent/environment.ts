@@ -398,6 +398,12 @@ function cfEnv(env: Pick<Environment, "account">): NodeJS.ProcessEnv {
 }
 /** Pauses before retrying a cleanup call that Cloudflare refused for authentication (CORE-316). */
 const AUTH_RETRY_MS = [1_000, 3_000];
+/** Test-only: `GITMATRIX_TEST_AUTH_RETRY_MS=0,0` replaces the pauses so tests need not wait them out. */
+function authRetryMs(): number[] {
+  const override = process.env.GITMATRIX_TEST_AUTH_RETRY_MS;
+  if (!override || !/^\d{1,4}(,\d{1,4})*$/.test(override)) return AUTH_RETRY_MS;
+  return override.split(",").map(Number);
+}
 function authRefused(error: unknown): boolean {
   return /\b401\b|Authentication error/i.test(String(error));
 }
@@ -427,7 +433,7 @@ async function cf(env: Environment, args: string[], retryAuth = false): Promise<
         timeout: 180_000,
       });
     } catch (error) {
-      const wait = AUTH_RETRY_MS[attempt];
+      const wait = authRetryMs()[attempt];
       if (!retryAuth || wait === undefined || !authRefused(error) || !(await loginValid(env)))
         throw error;
       console.warn(
@@ -453,7 +459,12 @@ async function deleteIfPresent(env: Environment, args: string[]): Promise<void> 
 }
 
 /** Stop a fenced session, not just its launcher: vp may exit before Vite/workerd. */
-export async function terminateProcessGroup(pid: number, start?: string): Promise<void> {
+export async function terminateProcessGroup(
+  pid: number,
+  start?: string,
+  /** Test-only shortcuts; production keeps the defaults. */
+  { termGraceMs = 20_000, killWaitMs = 5_000 }: { termGraceMs?: number; killWaitMs?: number } = {},
+): Promise<void> {
   const initial = await processStart(pid);
   if (start !== undefined && initial !== start) return;
   if (initial === null) return;
@@ -489,11 +500,11 @@ export async function terminateProcessGroup(pid: number, start?: string): Promis
   };
   if (!(await running())) return;
   signal("SIGTERM");
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + termGraceMs;
   while (await running()) {
     if (Date.now() >= deadline) {
       signal("SIGKILL");
-      const killedDeadline = Date.now() + 5_000;
+      const killedDeadline = Date.now() + killWaitMs;
       while (await running()) {
         if (Date.now() >= killedDeadline)
           throw new Error("Owned process group did not stop after SIGKILL; retaining its journal.");

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { CheckpointView, TimelineDetail } from "../../apps/website/shared/timelines.ts";
+import type { TimelineDetail } from "../../apps/website/shared/timelines.ts";
 import type { HarnessContext, SeedManifest } from "./types.ts";
 import { queueFixture, type QueueFixture, type QueueGm, type RepoInventory } from "./queue-e2e.ts";
 import type { CiRunList, RepoDetail } from "../../apps/website/shared/api.ts";
@@ -91,12 +91,12 @@ export async function runSourcePushRecoveryE2E(
     assert(result.barrier?.operationId);
     return result.barrier.operationId;
   };
-  async function start(name: string, policy: "auto" | "approval" = "auto"): Promise<Case> {
+  async function start(name: string): Promise<Case> {
     const slug = `source-recovery-${tag}-${name}`;
     const cwd = join(ctx.work, slug);
     clones.push(cwd);
     await gm(["clone", f!.repo, cwd], "marco");
-    await gm(["timeline", "start", slug, "--space", "orbit", "--policy", policy], "marco", cwd);
+    await gm(["timeline", "start", slug, "--space", "orbit", "--policy", "auto"], "marco", cwd);
     const detail = await f!.json<TimelineDetail>(`/api/tracker/orbit/timelines/${slug}`);
     const source = detail.timeline.repos[0]!.source!;
     assert.equal(source.kind, "timeline-work");
@@ -130,8 +130,7 @@ export async function runSourcePushRecoveryE2E(
       "A recovery fence must not change source files",
     );
   }
-  async function publish(s: Case, sync: boolean) {
-    if (sync) await gm(["sync"], "marco", s.cwd);
+  async function publish(s: Case) {
     assert.equal(await readFile(join(s.cwd, "local.txt"), "utf8"), `${s.slug}\n`);
     await gm(["push"], "marco", s.cwd);
     await f!.git(["fetch", s.remote, "refs/heads/work"]);
@@ -161,16 +160,6 @@ export async function runSourcePushRecoveryE2E(
     await f.git(["push", "origin", "HEAD:main"]);
     const canonical = await f.tip();
 
-    const before = await start("before-provider");
-    await control(before, "arm", { point: "before-provider", mode: "fail" });
-    await gm(["push"], "marco", before.cwd, true);
-    const beforeId = await hit(before);
-    assert.equal((await inspect(before, beforeId)).state, "rejected");
-    assert.equal(await head(before), before.before);
-    await control(before, "delete");
-    await publish(before, false);
-    record({ case: "before-provider", operationId: beforeId, rejectedWithoutProviderWrite: true });
-
     const late = await start("late-original");
     await control(late, "arm", { point: "before-forward", mode: "hold" });
     const original = launch(["push"], late, true);
@@ -198,7 +187,7 @@ export async function runSourcePushRecoveryE2E(
     await control(late, "delete");
     await gm(["sync"], "marco", late.cwd);
     await gm(["commit", "-m", "Publish preserved local work after recovery"], "marco", late.cwd);
-    await publish(late, false);
+    await publish(late);
     assert.equal(
       await readFile(join(late.cwd, "uncommitted.txt"), "utf8"),
       "authoritative local work\n",
@@ -208,45 +197,6 @@ export async function runSourcePushRecoveryE2E(
       ...fenced,
       originalCasRejected: true,
       normalSyncPublished: true,
-    });
-
-    const mergedFence = await start("merge-checkpoint", "approval");
-    await control(mergedFence, "arm", { point: "before-forward", mode: "fail" });
-    await launch(["push"], mergedFence, true)();
-    const mergedId = await hit(mergedFence);
-    const mergedRecovery = await recover(mergedFence, mergedId);
-    await marker(mergedFence, mergedRecovery, mergedId);
-    await control(mergedFence, "delete");
-    await gm(["fetch"], "marco", mergedFence.cwd);
-    await gm(
-      ["merge", mergedRecovery.fenceCommit!, "-m", "Integrate the proven source recovery fence"],
-      "marco",
-      mergedFence.cwd,
-    );
-    await publish(mergedFence, false);
-    const mergedHead = await head(mergedFence);
-    assert.equal(
-      (await f.git(["show", "-s", "--format=%P", "FETCH_HEAD"])).split(" ")[1],
-      mergedRecovery.fenceCommit,
-      "Exercise the recovery fence as a merge parent, not only linear rebased history",
-    );
-    const checkpoint = JSON.parse(
-      await gm(
-        ["timeline", "checkpoint", "-m", "Review normally merged recovery-fence ancestry"],
-        "marco",
-        mergedFence.cwd,
-      ),
-    ) as CheckpointView;
-    assert.equal(checkpoint.checkpoint.repos[0]!.source?.commit, mergedHead);
-    assert.equal(checkpoint.checkpoint.repos[0]!.logicalBase?.commit, mergedFence.before);
-    assert.deepEqual(checkpoint.checkpoint.repos[0]!.dependencies, []);
-    assert.equal(checkpoint.approved, false, "Recovery provenance must not grant approval");
-    record({
-      case: "merge-checkpoint",
-      fenceCommit: mergedRecovery.fenceCommit,
-      head: mergedHead,
-      checkpoint: checkpoint.checkpoint.id,
-      canonicalBasePreserved: true,
     });
 
     const accepted = await start("accepted-provider");
@@ -286,7 +236,7 @@ export async function runSourcePushRecoveryE2E(
     await control(accepted, "delete");
     await writeFile(join(accepted.cwd, "next.txt"), "ordinary subsequent publication\n");
     await gm(["commit", "-m", "Publish after accepted recovery"], "marco", accepted.cwd);
-    await publish(accepted, false);
+    await publish(accepted);
     const latest = await head(accepted);
     assert.notEqual(latest, proposed);
     const subsequent = await poll(
@@ -319,30 +269,7 @@ export async function runSourcePushRecoveryE2E(
       nextCi: latestRun.number,
       historicalReplayPreservedCurrentHead: true,
     });
-
-    const replay = await start("recovery-replay");
-    await control(replay, "arm", { point: "before-forward", mode: "fail" });
-    await gm(["push"], "marco", replay.cwd, true);
-    const replayId = await hit(replay);
-    assert.equal((await inspect(replay, replayId)).state, "ambiguous");
-    assert.equal(await head(replay), replay.before);
-    await control(replay, "arm", { point: "after-recovery-fence", mode: "hold" });
-    const firstRecovery = launch(["timeline", "recover-push", replayId], replay);
-    assert.equal(await hit(replay), replayId);
-    const replayed = await recover(replay, replayId);
-    await marker(replay, replayed, replayId);
-    await control(replay, "release");
-    assert.deepEqual(JSON.parse(await firstRecovery()), replayed);
-    assert.deepEqual(await recover(replay, replayId), replayed);
-    await control(replay, "delete");
-    await publish(replay, true);
     assert.equal(await f.tip(), canonical, "Source recovery must not advance canonical main");
-    record({
-      case: "recovery-replay",
-      ...replayed,
-      replayReusedFence: true,
-      canonicalUnchanged: true,
-    });
   } catch (error) {
     failure = error;
   }

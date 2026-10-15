@@ -237,7 +237,6 @@ describe("Knowledge updates", { timeout: 120_000 }, () => {
         "a crowded neighbourhood",
         (r) => setConcepts(r, "src/webhooks/f2.ts", ["Token Revocation", "Token Rotation"]),
       ],
-      ["a file in a sibling directory", (r) => editCode(r, "src/webhooks/f0.ts")],
     ];
     for (const [what, change] of pushes) {
       const result = await t.push(change);
@@ -264,6 +263,11 @@ describe("Knowledge updates", { timeout: 120_000 }, () => {
     // One file's card, its role, and whether the edit means anything.
     expect(edit.inc.calls).toMatchObject({ card: 1, role: 1, cosmetic: 1 });
     expect(edit.inc.calls.total!).toBeLessThan(cold / 5);
+    // It reads only the trees that changed: the root, src and src/billing
+    // (twice: before and after), not every directory.
+    expect(edit.inc.treeReads).toBeLessThan(first.inc.treeReads);
+    expect(edit.inc.stats.treesRead).toBe(edit.inc.treeReads);
+    expect(edit.inc.stats).toMatchObject({ changedFiles: 1, removedFiles: 0, toAnalyze: 1 });
 
     // A new concept in one file: only its pairs and the definitions (and
     // reviews) of the groups it changed.
@@ -281,16 +285,6 @@ describe("Knowledge updates", { timeout: 120_000 }, () => {
       "@cf/qwen/qwen3-embedding-0.6b",
       "@cf/zai-org/glm-5.3-flash",
     ]);
-  });
-
-  test("an update reads only the trees that changed", async () => {
-    const t = await twins();
-    const first = await t.push(() => {});
-    const edit = await t.push((r) => editCode(r, "src/billing/f0.ts"));
-    // The root, src and src/billing (twice: before and after), not every directory.
-    expect(edit.inc.treeReads).toBeLessThan(first.inc.treeReads);
-    expect(edit.inc.stats.treesRead).toBe(edit.inc.treeReads);
-    expect(edit.inc.stats).toMatchObject({ changedFiles: 1, removedFiles: 0, toAnalyze: 1 });
   });
 
   test("a new pipeline version rebuilds in full", async () => {

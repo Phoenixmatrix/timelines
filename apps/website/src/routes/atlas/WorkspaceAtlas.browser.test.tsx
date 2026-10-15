@@ -104,42 +104,35 @@ test("a capability across repositories, read, drilled into and cited at each com
   // Why it's one: the importing file in shop, at shop's indexed commit.
   await expect.poll(() => sourceLink(shop.name, shop.head)).not.toBeNull();
 
-  // Drill through each member to a file, and cite it at its own commit.
-  const citations: string[] = [];
-  for (const [m, repo] of [
-    [shopMember, shop],
-    [ledgerMember, ledger],
-  ] as const) {
-    await userEvent.click(
-      members.getByRole("button", { name: new RegExp(`^${escape(m.name)}.*${escape(repo.name)}`) }),
-    );
-    await app.waitForUrl((url) => url.searchParams.get("select") === m.id);
-    await expect.element(heading(m.name)).toBeVisible();
-    // Areas open a level further; files are the first thing a source lives in.
-    let entry = page
-      .getByRole("list", { name: `Inside ${m.name}` })
+  // Drill through the other repository's member to a file, and cite it at
+  // its own commit (each member's drill is the API's:
+  // worker/atlas/workspace-navigation.test.ts).
+  const [m, repo] = [ledgerMember, ledger];
+  await userEvent.click(
+    members.getByRole("button", { name: new RegExp(`^${escape(m.name)}.*${escape(repo.name)}`) }),
+  );
+  await app.waitForUrl((url) => url.searchParams.get("select") === m.id);
+  await expect.element(heading(m.name)).toBeVisible();
+  // Areas open a level further; files are the first thing a source lives in.
+  let entry = page
+    .getByRole("list", { name: `Inside ${m.name}` })
+    .getByRole("button")
+    .first();
+  for (let depth = 0; depth < 3; depth++) {
+    await expect.element(entry).toBeVisible();
+    const label = entry.element().querySelector("span")?.textContent?.trim() ?? "";
+    await userEvent.click(entry);
+    await expect.element(heading(label)).toBeVisible();
+    if (label.endsWith(".ts")) break;
+    entry = page
+      .getByRole("list", { name: `Inside ${label}` })
       .getByRole("button")
       .first();
-    for (let depth = 0; depth < 3; depth++) {
-      await expect.element(entry).toBeVisible();
-      const label = entry.element().querySelector("span")?.textContent?.trim() ?? "";
-      await userEvent.click(entry);
-      await expect.element(heading(label)).toBeVisible();
-      if (label.endsWith(".ts")) break;
-      entry = page
-        .getByRole("list", { name: `Inside ${label}` })
-        .getByRole("button")
-        .first();
-    }
-    await expect.poll(() => sourceLink(repo.name, repo.head)).not.toBeNull();
-    citations.push(sourceLink(repo.name, repo.head)!.getAttribute("href") ?? "");
-    if (m === shopMember) {
-      await app.navigate(`${base}?repos=${repos}&select=${encodeURIComponent(composite.id)}`);
-      await expect.element(heading(composite.name)).toBeVisible();
-    }
   }
-  expect(citations[0]).toContain(`/${shop.name}/blob/${shop.head}/`);
-  expect(citations[1]).toContain(`/${ledger.name}/blob/${ledger.head}/`);
+  await expect.poll(() => sourceLink(repo.name, repo.head)).not.toBeNull();
+  expect(sourceLink(repo.name, repo.head)!.getAttribute("href")).toContain(
+    `/${ledger.name}/blob/${ledger.head}/`,
+  );
 
   // The lookup reads the workspace catalogue, labelled by repository.
   await userEvent.fill(

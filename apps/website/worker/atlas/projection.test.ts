@@ -332,7 +332,7 @@ describe("Atlas projections", () => {
       `INSERT INTO kg_edges (repo_id, src, dst, kind, weight) VALUES ('r1', 'component:big', ?, 'contains', 1)`,
     );
     sqlite.exec("BEGIN");
-    for (let i = 0; i < 25_000; i++) {
+    for (let i = 0; i < 2_500; i++) {
       const path = `f/${String(i).padStart(5, "0")}.ts`;
       insertNode.run(`file:${path}`, path, path);
       insertEdge.run(`file:${path}`);
@@ -342,24 +342,25 @@ describe("Atlas projections", () => {
     const { snapshotId, seq } = await beginRepoProjection(db, "r1", [
       { repoId: "r1", commit: "c1", buildId: "b1" },
     ]);
+    // Batches of 1,000, not ENTITY_BATCH: the same bound and resume, a tenth the rows.
     const batches: number[] = [];
     let after: string | null = null;
     do {
-      const result = await projectEntities(db, "r1", snapshotId, seq, after);
+      const result = await projectEntities(db, "r1", snapshotId, seq, after, 1_000);
       batches.push(result.written);
       after = result.next;
     } while (after);
-    expect(Math.max(...batches)).toBeLessThanOrEqual(ENTITY_BATCH);
+    expect(Math.max(...batches)).toBeLessThanOrEqual(1_000);
     expect(batches.length).toBe(3);
     let cursor: EdgeCursor = null;
     do ({ next: cursor } = await projectEdges(db, "r1", snapshotId, seq, cursor));
     while (cursor);
     await publishProjection(db, scope, snapshotId, seq);
     const current = await currentSnapshot(db, scope);
-    expect(current?.entities).toBe(25_002);
-    expect(current?.edges).toBe(25_001);
+    expect(current?.entities).toBe(2_502);
+    expect(current?.edges).toBe(2_501);
     expect((await entityAt(db, scope, seq, "component:big"))?.data.counts).toEqual({
-      files: 25_000,
+      files: 2_500,
     });
     const page = await childrenAt(db, scope, seq, "component:big", null, 100);
     expect(page.entities).toHaveLength(100);

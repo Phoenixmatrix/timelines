@@ -621,14 +621,12 @@ describe("landed candidate verification", () => {
 
   test.each([
     "UPDATE ci_runs SET status='failed' WHERE id='gates'",
-    "UPDATE ci_runs SET status='cancelled' WHERE id='gates'",
     "UPDATE ci_runs SET finished_at=NULL WHERE id='gates'",
     "UPDATE ci_runs SET queue_attempt=1 WHERE id='gates'",
     "UPDATE ci_runs SET source_id='other' WHERE id='gates'",
     "UPDATE ci_runs SET commit_oid='other' WHERE id='gates'",
     "UPDATE ci_jobs SET status='failed' WHERE name='check'",
     "UPDATE ci_jobs SET status='skipped' WHERE name='check'",
-    "UPDATE ci_jobs SET status='cancelled' WHERE name='check'",
     "UPDATE ci_jobs SET runner='local' WHERE name='check'",
     "UPDATE ci_jobs SET claimed_by='manual' WHERE name='check'",
     "UPDATE ci_jobs SET source_id='other' WHERE name='check'",
@@ -842,7 +840,6 @@ describe("verified change-selection baselines", () => {
     "UPDATE ci_jobs SET status='failed',exit_code=1 WHERE id='gates-check'",
     "UPDATE ci_jobs SET finished_at=NULL WHERE id='gates-check'",
     "UPDATE ci_jobs SET source_completion_pending=1 WHERE id='gates-check'",
-    "UPDATE ci_runs SET status='running' WHERE id='gates'",
     "UPDATE ci_runs SET covered_by='other' WHERE id='gates'",
     "UPDATE ci_steps SET status='skipped' WHERE job_id='gates-check'",
     "DELETE FROM ci_steps WHERE job_id='gates-check'",

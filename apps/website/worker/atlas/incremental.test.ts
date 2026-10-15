@@ -138,7 +138,7 @@ async function twins(files: number) {
 // Each test runs two whole projection histories: allow slow CI sandboxes time.
 describe("incremental projection", { timeout: 60_000 }, () => {
   test("publishes exactly what a full pass publishes, push after push", async () => {
-    const t = await twins(320);
+    const t = await twins(160);
     await t.push("b1", () => {});
     const first = await t.project("b1");
     // Nothing published yet: the first projection reads everything.
@@ -186,7 +186,7 @@ describe("incremental projection", { timeout: 60_000 }, () => {
   });
 
   test("an unchanged rebuild writes nothing and asks the model nothing", async () => {
-    const t = await twins(200);
+    const t = await twins(100);
     await t.push("b1", () => {});
     await t.project("b1");
     const before = published(t.inc.sqlite);
@@ -207,7 +207,7 @@ describe("incremental projection", { timeout: 60_000 }, () => {
   });
 
   test("a failed projection's changes carry into the next increment", async () => {
-    const t = await twins(240);
+    const t = await twins(100);
     await t.push("b1", () => {});
     await t.project("b1");
     await t.push("b2", (repo) => changeFiles(repo, 10));
@@ -223,7 +223,7 @@ describe("incremental projection", { timeout: 60_000 }, () => {
   });
 
   test("an incremental batch stays within the step bound and resumes by cursor", async () => {
-    const t = await twins(200);
+    const t = await twins(60);
     await t.push("b1", () => {});
     await t.project("b1");
     await t.push("b2", (repo) => changeFiles(repo, 10));

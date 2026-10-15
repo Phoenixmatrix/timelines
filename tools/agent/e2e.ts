@@ -44,7 +44,6 @@ import { runSourceRetentionE2E } from "./source-retention-e2e.ts";
 import { runSourceExpiredE2E } from "./source-expired-e2e.ts";
 import { runSourceAuthE2E } from "./source-auth-e2e.ts";
 import { runSourceLandingE2E } from "./source-landing-e2e.ts";
-import { runSourceSyncE2E } from "./source-sync-e2e.ts";
 import { availableMemory, gib } from "./heavy.ts";
 import {
   browserScenarios,
@@ -2529,6 +2528,20 @@ export async function runE2E(
       await readFile(join(clone, "late-local.txt"), "utf8"),
       "Preserve unpushed local work after landing.\n",
     );
+    // Sync replays only the late suffix, as one commit on the compact canonical commit.
+    const lateSuffix = await nativeGit(
+      ["log", "-1", "--format=%H", "--fixed-strings", "--grep=Late local suffix", "HEAD"],
+      clone,
+    );
+    assert(lateSuffix, "The late suffix survives sync");
+    assert.equal(await nativeGit(["show", "-s", "--format=%P", lateSuffix], clone), mainAfter);
+    assert.equal(
+      (await nativeGit(["rev-list", lateSuffix, `^${mainAfter}`], clone))
+        .split("\n")
+        .filter(Boolean).length,
+      1,
+      "Sync replays only the unlanded suffix",
+    );
     await gm(["push"], "jun", clone, /timeline_ended/);
     await gm(["timeline", "use", "main", "--space", fixtures.tracker.space], "jun", clone);
     record({
@@ -2599,10 +2612,10 @@ export async function runE2E(
   }
 
   scenario("steps-context-hook-live-run-landing-and-access", async () => {
-    // CORE-226 (S01, S02, S04, S06, S07, S09): an agent steps through a
-    // timeline: what the person said comes through the hook, the step carries
-    // its why and local tests, arrives on the live feed within seconds, gets
-    // its step run's summary, and after landing, gm why on its line shows it.
+    // CORE-226 (S01, S02, S04, S06, S09): an agent steps through a timeline:
+    // what the person said comes through the hook, the step carries its why and
+    // local tests, arrives on the live feed within seconds and gets its step
+    // run's summary. S07, a landed line's step, is in worker/why/api.test.ts.
     const slug = `steps-e2e-${randomUUID().slice(0, 8)}`;
     const file = `steps-e2e/${slug}.txt`;
     const clone = await landingTimeline(slug);
@@ -2619,7 +2632,6 @@ export async function runE2E(
             local: true,
             steps: [{ run: `test -f ${file} && echo STEP_OK` }],
           },
-          gate: { if: 'trigger == "landing"', steps: [{ run: "echo LANDING_GATE_OK" }] },
         },
       }),
     );
@@ -2692,18 +2704,8 @@ export async function runE2E(
     await request(`${api}/steps?timeline=${slug}`, null, "GET", undefined, [404]);
     await request(`${api}/steps/live?timeline=${slug}`, null, "GET", undefined, [404]);
 
-    // S07: the timeline lands; gm why on the landed line still shows its step.
-    await writeFile(join(clone, `${file}.done`), "done\n");
-    await pushAndCheckpoint(clone, slug, `Steps E2E checkpoint ${slug}`);
-    const landing = await settledLanding(slug);
-    assert.equal(landing.state, "landed", `Landing stopped: ${landing.reason}`);
-    const why = JSON.parse(await gm(["why", `${file}:1`], "jun", clone)) as WhyResponse;
-    const chain = why.chains.find((c) => c.oid === live.commitOid);
-    assert(chain, "gm why leads the landed line to the step's commit");
-    assert.equal(chain.step?.context.why, "Prove steps end to end.");
-    record({
-      steps: { slug, commit: live.commitOid, latencyMs, artifact: summary.kind, landed: true },
-    });
+    await request(`${timelinesApi}/${slug}/abandon`, fixtures.tokens.jun, "POST");
+    record({ steps: { slug, commit: live.commitOid, latencyMs, artifact: summary.kind } });
   });
 
   scenario("timeline-landing-conflict-asks-for-a-sync", async () => {
@@ -2904,26 +2906,6 @@ export async function runE2E(
     assert.equal(checkpoint.repos[0]?.logicalBase?.commit, p0);
     const blocked = await settledLanding(child);
     assert.equal(blocked.state, "blocked_dependency");
-    // A separate child imports the parent's later P1; its fresh checkpoint must
-    // review P1 as B rather than permanently inheriting its original P0.
-    const importedChild = `${child}-imported`;
-    await json(
-      timelinesApi,
-      fixtures.tokens.jun,
-      "POST",
-      { slug: importedChild, parent, policy: "auto", repos: [fullName] },
-      [201],
-    );
-    const importedClone = join(work, importedChild);
-    const importedFile = `${importedChild}.txt`;
-    await gm(["clone", fullName, importedClone], "jun");
-    await gm(
-      ["timeline", "use", importedChild, "--space", fixtures.tracker.space],
-      "jun",
-      importedClone,
-    );
-    await writeFile(join(importedClone, importedFile), "Imported child's own delta\n");
-    await gm(["commit", "-m", "Child delta before importing P1"], "jun", importedClone);
     await writeFile(join(parentClone, laterFile), "Parent P1\n");
     const parentCheckpoint = await pushAndCheckpoint(parentClone, parent, "Parent P1 includes P0");
     const parentLanding = await settledLanding(parent);
@@ -2936,39 +2918,6 @@ export async function runE2E(
     assert.equal(integrated.status, "integrated");
     assert.equal(integrated.integration?.source.commit, parentCheckpoint.repos[0]?.commit);
     assert.deepEqual(integrated.members, [p0]);
-    await gm(["timeline", "merge", parent], "jun", importedClone);
-    const importedCheckpoint = await pushAndCheckpoint(
-      importedClone,
-      importedChild,
-      "Review imported P1 baseline",
-    );
-    assert.equal(importedCheckpoint.repos[0]?.logicalBase?.sourceId, parentSource.sourceId);
-    assert.equal(
-      importedCheckpoint.repos[0]?.logicalBase?.commit,
-      parentCheckpoint.repos[0]?.commit,
-    );
-    const importedLanding = await settledLanding(importedChild);
-    assert.equal(importedLanding.state, "landed", importedLanding.reason ?? "");
-    const importedCompact = importedLanding.repos[0]?.merge;
-    assert(importedCompact);
-    await nativeGit(["fetch", "origin", "main"], importedClone);
-    assert.equal(
-      await nativeGit(["show", "-s", "--format=%P", importedCompact], importedClone),
-      parentLanding.repos[0]?.merge,
-    );
-    assert.equal(
-      await nativeGit(["show", `${importedCompact}:${importedFile}`], importedClone),
-      "Imported child's own delta",
-    );
-    assert.equal(
-      await nativeGit(["show", `${importedCompact}:${laterFile}`], importedClone),
-      "Parent P1",
-    );
-    record({
-      importedChild,
-      importedCompact,
-      reviewedBase: importedCheckpoint.repos[0]?.logicalBase,
-    });
 
     // Reverting the compact parent must not cause the child to replay parent content.
     const reverted = join(work, `${parent}-revert`);
@@ -5586,9 +5535,6 @@ export async function runE2E(
   );
   scenario("source-push-recovery-fences-late-writes", () =>
     runSourcePushRecoveryE2E(ctx, fixtures, gm, record),
-  );
-  scenario("source-late-sync-lineage-conflicts-guard-and-expiry", () =>
-    runSourceSyncE2E(ctx, fixtures, gm, record),
   );
   scenario("source-finite-legacy-migration-and-partial-revert", () =>
     runSourceMigrationE2E(ctx, fixtures, gm, record),

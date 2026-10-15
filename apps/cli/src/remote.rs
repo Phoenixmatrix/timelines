@@ -1591,3 +1591,17 @@ mod retry_tests {
         assert_eq!(*accepted.lock().unwrap(), 1);
     }
 }
+
+/// The pause between polls of a long-running server operation. Debug builds only
+/// (so `cargo test`, never a release gm) honour `GM_POLL_MS`, a test-only knob that
+/// replaces `default` so integration tests need not wait out real poll intervals.
+pub fn poll_interval(default: std::time::Duration) -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("GM_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    default
+}

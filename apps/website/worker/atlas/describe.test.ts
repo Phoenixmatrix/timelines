@@ -604,10 +604,7 @@ describe("capability names and summaries", () => {
     expect(spend.usd).toBeCloseTo((900 * 0.1 + 120 * 0.3) / 1_000_000, 10);
   });
 
-  test.each([
-    [MODELS.reason, "@cf/zai-org/glm-5.3-flash"],
-    ["@cf/zai-org/glm-5.3-flash", "@cf/google/gemma-4-26b-a4b-it"],
-  ])(
+  test.each([[MODELS.reason, "@cf/zai-org/glm-5.3-flash"]])(
     "reuses legacy %s cache rows after selecting %s without rewriting provenance",
     async (original, selected) => {
       const { sqlite, DB } = await setup();

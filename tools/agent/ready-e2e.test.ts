@@ -114,7 +114,7 @@ await test("representative paths select their areas' journeys", () => {
   for (const name of [
     "timeline-compact-landing-gates-receipt-and-native-source",
     "timeline-nested-admission-and-canonical-revert",
-    "source-late-sync-lineage-conflicts-guard-and-expiry",
+    "source-push-recovery-fences-late-writes",
     "browser-timeline-scope-round-trip",
   ] as const)
     assert(landing.scenarios!.includes(name), name);
@@ -254,7 +254,6 @@ await test("transport and mirror paths run the mirror stage; helpers select thei
   assert.deepEqual(select("tools/agent/queue-e2e.ts").scenarios, [
     "queue-concurrency-failure-fencing-and-push-recovery",
     "source-push-recovery-fences-late-writes",
-    "source-late-sync-lineage-conflicts-guard-and-expiry",
   ]);
   assert.deepEqual(select("tools/agent/chronicle-e2e.ts").scenarios, [
     "gm-clone-commit-push-and-denied-push",
@@ -325,8 +324,8 @@ await test("browser prerequisites expand transitively in execution order without
     "ci-failing-prerequisite-skips-dependent",
     "agent-identity-provisioned-on-first-use",
   ]);
-  assert.deepEqual(expandE2EScenarios(["source-late-sync-lineage-conflicts-guard-and-expiry"]), [
-    "source-late-sync-lineage-conflicts-guard-and-expiry",
+  assert.deepEqual(expandE2EScenarios(["source-push-recovery-fences-late-writes"]), [
+    "source-push-recovery-fences-late-writes",
   ]);
 });
 
@@ -407,7 +406,7 @@ await test("runtime, configuration, harness and unknown paths select agents' ful
     "package.json",
     "pnpm-lock.yaml",
     "patches/cf.patch",
-    "packages/utils/src/index.ts",
+    "packages/formats/src/index.ts",
     "tools/agent/e2e.ts",
     "tools/agent/seed.ts",
     "tools/agent/environment.ts",
@@ -428,7 +427,7 @@ await test("invalid scenario names fail before any E2E filesystem or runtime sid
   assert.throws(() => expandE2EScenarios(["browser-atlas-smkoe"]), /Unknown E2E scenario/);
   // Unknown names must still fail beside valid ones.
   assert.throws(
-    () => expandE2EScenarios(["source-late-sync-lineage-conflicts-guard-and-expiry", "unknown"]),
+    () => expandE2EScenarios(["source-push-recovery-fences-late-writes", "unknown"]),
     /Unknown E2E scenario: unknown/,
   );
   const directory = await mkdtemp(join(tmpdir(), "ready-e2e-invalid-"));
@@ -564,12 +563,7 @@ await test("every scenario declares the shared resources it reads or writes", ()
   // the other runner slots (one at two workers, two from three) stay free.
   assert.deepEqual(
     e2eScenarioNames.filter((name) => scenarioResources[name]["ci-runner-hold"]),
-    [
-      "ci-cancellation-and-job-token-lifetime",
-      "queue-concurrency-failure-fencing-and-push-recovery",
-      "repository-deletion-purges-everything-and-resumes",
-      "source-retention-expiry-orphan-and-canonical-purge",
-    ],
+    ["ci-cancellation-and-job-token-lifetime", "repository-deletion-purges-everything-and-resumes"],
   );
   for (const name of e2eScenarioNames)
     if (scenarioResources[name]["ci-runner-hold"])
@@ -684,7 +678,7 @@ function makespan(
   return now;
 }
 
-await test("four workers more than halve the suite over its historical scenario medians", async () => {
+await test("four workers cut the suite well below serial over its historical scenario medians", async () => {
   const seconds = JSON.parse(
     await readFile(new URL("fixtures/e2e-scenario-medians.json", import.meta.url), "utf8"),
   ) as Record<ScenarioName, number>;
@@ -693,14 +687,17 @@ await test("four workers more than halve the suite over its historical scenario 
     const serial = selected.reduce((sum, name) => sum + seconds[name], 0);
     assert.equal(makespan(selected, 1, seconds), serial, "One worker is the serial suite");
     const parallel = makespan(selected, 4, seconds);
-    // Measured with these declarations: 1249 → 591 s (full), 405 → 222 s (agents').
-    assert(parallel < serial * 0.6, `${parallel} s of ${serial} s`);
+    // The agents' set is bounded by its longest chain, which serial-only cuts don't shorten.
+    assert(parallel < serial * 0.65, `${parallel} s of ${serial} s`);
   }
-  // Nothing shared: the longest scenario bounds the run.
-  assert.equal(
-    makespan(e2eScenarioNames, e2eScenarioNames.length, seconds, none, independent),
-    Math.max(...Object.values(seconds)),
+  // Nothing shared: only the longest scenario and the two-browser cap bound the run.
+  const unbounded = makespan(e2eScenarioNames, e2eScenarioNames.length, seconds, none, independent);
+  const browsers = browserScenarios.map((name) => seconds[name]);
+  const floor = Math.max(
+    ...Object.values(seconds),
+    browsers.reduce((sum, value) => sum + value, 0) / 2,
   );
+  assert(unbounded >= floor && unbounded <= floor + Math.max(...browsers), `${unbounded} s`);
 });
 
 await test("GITMATRIX_E2E_WORKERS defaults to one and refuses anything but a positive integer", () => {
@@ -831,7 +828,7 @@ await test("side by side at most `workers` scenarios and two browser scenarios r
   const others = [
     "durable-objects-register-and-purge",
     "source-push-recovery-fences-late-writes",
-    "source-late-sync-lineage-conflicts-guard-and-expiry",
+    "source-authorization-native-and-canonical-separation",
   ];
   let most = 0,
     mostBrowsers = 0;

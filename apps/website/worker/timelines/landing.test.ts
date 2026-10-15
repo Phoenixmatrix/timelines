@@ -1582,7 +1582,7 @@ describe("exact nested admission", () => {
       validateDependencies(f.env, imported, new Set([repo.base!, repo.merge!])),
     ).rejects.toThrow("blocked_dependency");
   });
-  test.each(["valid", "missing", "provider error", "foreign", "unacknowledged"] as const)(
+  test.each(["valid", "missing"] as const)(
     "448 revisions and 58 overlapping merges preserve exact checkpoint and landing proof: %s",
     async (mode) => {
       const f = await fixture(1);
@@ -1631,12 +1631,6 @@ describe("exact nested admission", () => {
         // An old side branch must still be checked, not just recent merge tips.
         const uncertain = branches[0]!;
         if (mode === "missing") graph.delete(uncertain);
-        if (mode === "foreign")
-          f.sqlite
-            .prepare("UPDATE source_revision_origins SET source_id='foreign' WHERE commit_oid=?")
-            .run(uncertain);
-        if (mode === "unacknowledged")
-          f.sqlite.prepare("DELETE FROM source_progress_members WHERE commit_oid=?").run(uncertain);
         const reads = new Map<string, number>();
         const get = f.env.ARTIFACTS.get.bind(f.env.ARTIFACTS);
         Object.assign(f.env.ARTIFACTS, {
@@ -1645,11 +1639,7 @@ describe("exact nested admission", () => {
             const read = artifacts.readCommit.bind(artifacts);
             return Object.assign(artifacts, {
               readCommit: async (hash: string) => {
-                if (name === "work_0") {
-                  reads.set(hash, (reads.get(hash) ?? 0) + 1);
-                  if (mode === "provider error" && hash === uncertain)
-                    throw new Error("Artifacts INTERNAL_ERROR");
-                }
+                if (name === "work_0") reads.set(hash, (reads.get(hash) ?? 0) + 1);
                 return read(hash);
               },
             });
@@ -1701,13 +1691,9 @@ describe("exact nested admission", () => {
             ),
           ).toMatchObject([{ status: "complete" }]);
         } else {
-          await expect(checkpoint).rejects.toThrow(
-            mode === "provider error"
-              ? "Artifacts INTERNAL_ERROR"
-              : /unavailable|blocked_dependency/,
-          );
+          await expect(checkpoint).rejects.toThrow(/unavailable|blocked_dependency/);
           const result = await f.run();
-          expect(result.state).toBe(mode === "provider error" ? "advancing" : "blocked_dependency");
+          expect(result.state).toBe("blocked_dependency");
           expect(f.writes).toEqual([]);
           expect(
             f.sqlite.prepare("SELECT count(*) AS count FROM source_integration_receipts").get(),

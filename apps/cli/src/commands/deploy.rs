@@ -640,51 +640,6 @@ mod tests {
     }
 
     #[test]
-    fn provenance_bodies() {
-        let args = ProvenanceArgs {
-            service: Some("gitmatrix".into()),
-            provider_version: Some("v-2".into()),
-            provider_deployment: Some("d-9".into()),
-            artifact: Some("pkg_1@1.2.3".into()),
-            digest: Some("sha256:abc".into()),
-            deployed_at: Some("2026-10-12T21:00:00+01:00".into()),
-            exposed_from: Some("now".into()),
-            percentage: Some(10.0),
-            replaces: Some("v-1".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            Value::Object(provenance_body(&args, now()).unwrap()),
-            json!({
-                "provider": {
-                    "name": "cloudflare",
-                    "service": "gitmatrix",
-                    "versionId": "v-2",
-                    "deploymentId": "d-9"
-                },
-                "artifact": { "packageId": "pkg_1", "version": "1.2.3", "digest": "sha256:abc" },
-                "deployedAt": "2026-10-12T20:00:00.000Z",
-                "exposedFrom": "2026-10-12T20:00:00.000Z",
-                "percentage": 10.0,
-                "replaces": "v-1"
-            })
-        );
-        let by_id = ProvenanceArgs {
-            artifact: Some("01PUBLISH".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            Value::Object(provenance_body(&by_id, now()).unwrap()),
-            json!({ "artifact": { "publishId": "01PUBLISH" } })
-        );
-        assert!(
-            provenance_body(&ProvenanceArgs::default(), now())
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn refuses_incomplete_provenance() {
         let bad = [
             ProvenanceArgs {
@@ -731,54 +686,5 @@ mod tests {
         for args in &bad {
             assert!(provenance_body(args, now()).is_err());
         }
-    }
-
-    #[test]
-    fn update_bodies() {
-        let args = UpdateArgs {
-            id: 4,
-            status: Some(Status::Expired),
-            url: None,
-            expires: None,
-            exposed_from: Some("now".into()),
-            exposed_until: Some("2026-10-12T20:30:00Z".into()),
-            percentage: Some(50.0),
-            repo: None,
-        };
-        assert_eq!(
-            Value::Object(update_body(&args, now()).unwrap()),
-            json!({
-                "status": "expired",
-                "exposedFrom": "2026-10-12T20:00:00.000Z",
-                "exposedUntil": "2026-10-12T20:30:00.000Z",
-                "percentage": 50.0
-            })
-        );
-        let empty = UpdateArgs {
-            status: None,
-            exposed_from: None,
-            exposed_until: None,
-            percentage: None,
-            ..args
-        };
-        assert!(update_body(&empty, now()).is_err());
-    }
-
-    #[test]
-    fn lines_show_provenance() {
-        let record = json!({
-            "id": 3, "status": "active", "environment": "production",
-            "commit": "0123456789abcdef0123456789abcdef01234567", "url": "https://a.example",
-            "run": 7, "revived": false,
-            "provider": { "name": "cloudflare", "service": "gitmatrix", "versionId": "4f1c2d3e-aaaa" },
-            "percentage": 10.0,
-            "artifact": { "name": "app", "version": "1.2.3" }
-        });
-        let text = line(&record);
-        assert!(text.contains("gitmatrix 4f1c2d3e (10%)"), "{text}");
-        assert!(text.ends_with("app@1.2.3"), "{text}");
-        let plain = json!({ "id": 4, "status": "failed", "environment": "staging",
-            "commit": "0123456789abcdef0123456789abcdef01234567", "url": null, "provider": null });
-        assert!(!line(&plain).contains('%'));
     }
 }

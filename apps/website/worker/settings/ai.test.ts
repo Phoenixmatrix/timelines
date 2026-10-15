@@ -228,8 +228,9 @@ describe("account AI settings", () => {
     },
   );
 
-  test.each(
-    [
+  test("rejects malformed or non-curated configuration without writing", async () => {
+    const t = await setup();
+    for (const body of [
       null,
       [],
       "on",
@@ -248,15 +249,16 @@ describe("account AI settings", () => {
       { models: { task: null } },
       { models: { task: "gemma-3" } },
       { features: { __proto__: null, constructor: true } },
-    ].map((body) => ({ body })),
-  )("rejects malformed or non-curated configuration %# without writing", async ({ body }) => {
-    const t = await setup();
-    const response = await t.call(t.tokens.owner, "PATCH", body);
-    expect(response.status).toBe(400);
-    expect(await response.json()).toHaveProperty("error");
-    expect(t.sqlite.prepare("SELECT count(*) AS count FROM space_settings").get()).toMatchObject({
-      count: 0,
-    });
+    ]) {
+      const label = JSON.stringify(body);
+      const response = await t.call(t.tokens.owner, "PATCH", body);
+      expect(response.status, label).toBe(400);
+      expect(await response.json(), label).toHaveProperty("error");
+      expect(
+        t.sqlite.prepare("SELECT count(*) AS count FROM space_settings").get(),
+        label,
+      ).toMatchObject({ count: 0 });
+    }
   });
 
   test("rejects malformed JSON and treats empty partial updates as no-ops", async () => {
@@ -406,8 +408,9 @@ describe("account AI settings", () => {
     await expect(spaceAiSnapshot(t.env.DB, "missing")).rejects.toThrow(/no such active Space/);
   });
 
-  test.each(
-    [
+  test("rejects malformed highlights cadence without writing", async () => {
+    const t = await setup();
+    for (const releaseHighlights of [
       null,
       [],
       false,
@@ -421,15 +424,16 @@ describe("account AI settings", () => {
       { intervalHours: true },
       { hours: 24 },
       { constructor: 24 },
-    ].map((releaseHighlights) => ({ releaseHighlights })),
-  )("rejects malformed highlights cadence %# without writing", async ({ releaseHighlights }) => {
-    const t = await setup();
-    const response = await t.call(t.tokens.owner, "PATCH", { releaseHighlights });
-    expect(response.status).toBe(400);
-    expect(await response.json()).toHaveProperty("error");
-    expect(t.sqlite.prepare("SELECT count(*) AS count FROM space_settings").get()).toMatchObject({
-      count: 0,
-    });
+    ]) {
+      const label = JSON.stringify(releaseHighlights);
+      const response = await t.call(t.tokens.owner, "PATCH", { releaseHighlights });
+      expect(response.status, label).toBe(400);
+      expect(await response.json(), label).toHaveProperty("error");
+      expect(
+        t.sqlite.prepare("SELECT count(*) AS count FROM space_settings").get(),
+        label,
+      ).toMatchObject({ count: 0 });
+    }
   });
 
   test("stored account cadence and viewer-scoped highlight keys obey migration constraints", async () => {
@@ -569,8 +573,9 @@ describe("gateway body logging settings (CORE-290)", () => {
     ).toEqual({ "cf-aig-collect-log-payload": "false" });
   });
 
-  test.each(
-    [
+  test("rejects malformed log body settings without writing", async () => {
+    const t = await setup();
+    for (const body of [
       null,
       [],
       { logBodies: true },
@@ -579,22 +584,23 @@ describe("gateway body logging settings (CORE-290)", () => {
       { logBodies: { atlas: true } },
       { logBodies: { "assistant-title": true } },
       { other: {} },
-    ].map((body) => ({ body })),
-  )("rejects malformed log body settings %# without writing", async ({ body }) => {
-    const t = await setup();
-    for (const response of [
-      await t.site(t.tokens.admin, "PATCH", body),
-      await t.call(t.tokens.owner, "PATCH", body),
     ]) {
-      expect(response.status).toBe(400);
-      expect(await response.json()).toHaveProperty("error");
+      const label = JSON.stringify(body);
+      for (const response of [
+        await t.site(t.tokens.admin, "PATCH", body),
+        await t.call(t.tokens.owner, "PATCH", body),
+      ]) {
+        expect(response.status, label).toBe(400);
+        expect(await response.json(), label).toHaveProperty("error");
+      }
+      expect(t.sqlite.prepare("SELECT count(*) AS n FROM site_ai_log_bodies").get(), label).toEqual(
+        { n: 0 },
+      );
+      expect(
+        t.sqlite.prepare("SELECT count(*) AS n FROM space_ai_log_bodies").get(),
+        label,
+      ).toEqual({ n: 0 });
     }
-    expect(t.sqlite.prepare("SELECT count(*) AS n FROM site_ai_log_bodies").get()).toEqual({
-      n: 0,
-    });
-    expect(t.sqlite.prepare("SELECT count(*) AS n FROM space_ai_log_bodies").get()).toEqual({
-      n: 0,
-    });
   });
 
   test("Space logging overrides only control content components", async () => {

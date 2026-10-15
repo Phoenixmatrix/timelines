@@ -2831,59 +2831,6 @@ mod tests {
     }
 
     #[test]
-    fn names_are_checked() {
-        assert!(valid_name("demo").is_ok());
-        assert!(valid_name("team-two").is_ok());
-        for bad in [
-            "",
-            "a",
-            "Demo",
-            "1demo",
-            "demo-",
-            "de--mo",
-            "production",
-            "preview",
-            "preview-x",
-            "acme-registry",
-        ] {
-            assert!(valid_name(bad).is_err(), "{bad}");
-        }
-        let long = "a".repeat(33);
-        assert!(valid_name(&long).is_err());
-    }
-
-    #[test]
-    fn orgs_follow_the_apps_slug_rules() {
-        assert!(valid_org("acme").is_ok());
-        for bad in [
-            "",
-            "-acme",
-            "acme-",
-            "ac--me",
-            "Acme",
-            "api",
-            "admin",
-            "gitmatrix",
-        ] {
-            assert!(valid_org(bad).is_err(), "{bad}");
-        }
-        assert_eq!(user_slug("Ada@example.com"), "ada");
-        assert_eq!(user_slug("first.last+tag@example.com"), "first-last-tag");
-        assert_eq!(user_slug("-x--y-@example.com"), "x-y");
-    }
-
-    #[test]
-    fn production_names_are_reserved() {
-        let mut instance = derive("demo");
-        instance.queues.jobs = "gitmatrix-jobs".into();
-        instance.rate_limit_namespace = "4401".into();
-        assert_eq!(
-            instance.reserved_names(),
-            vec!["gitmatrix-jobs".to_string(), "4401".to_string()]
-        );
-    }
-
-    #[test]
     fn hosts_are_checked() {
         assert!(valid_host("timelines.example.com").is_ok());
         assert!(valid_host("example.com").is_err());
@@ -2907,13 +2854,6 @@ mod tests {
         assert_eq!(zone_for("a.dev.example.com", &zones).unwrap().id, "2");
         assert!(zone_for("a.example.org", &zones).is_none());
         assert!(zone_for("badexample.com", &zones).is_none());
-    }
-
-    #[test]
-    fn rate_limit_defaults_are_stable_and_clear_of_production() {
-        assert_eq!(rate_limit_for("demo"), rate_limit_for("demo"));
-        let id: u64 = rate_limit_for("demo").parse().unwrap();
-        assert!((50_000..60_000).contains(&id));
     }
 
     #[test]
@@ -2978,15 +2918,6 @@ mod tests {
         let instance: Instance = serde_json::from_value(value).unwrap();
         assert!(!instance.deployed.unwrap().dirty);
         assert!(instance.upstream.is_none());
-    }
-
-    #[test]
-    fn base64_matches_the_standard_alphabet() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]

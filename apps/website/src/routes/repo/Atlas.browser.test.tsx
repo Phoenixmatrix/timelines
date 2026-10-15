@@ -4,20 +4,14 @@
 // browser-atlas-deep-links-lookup-and-expiry and the browser half of
 // browser-atlas-revocation-clears-the-open-view): cold deep links, the
 // catalogue lookup, Back/Forward, copied links, the explicit search handoff,
-// a retired capability's lineage, snapshot comparison and expiry, the phone
-// layout, and a revoked reader's open view. Every request the page makes is
+// a retired capability's lineage, snapshot comparison and expiry, and a
+// revoked reader's open view (the phone layout is AtlasAccess's). Every request the page makes is
 // recorded, to prove what browsing reads and what it never does.
 
 import { describe, expect, test, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { AtlasAncestors } from "../../../shared/atlas.ts";
-import {
-  atlasCalls,
-  atlasFixtureRepo,
-  expectNoPaidFanOut,
-  settled,
-  sidewaysOverflow,
-} from "../../testing/atlas.ts";
+import { atlasCalls, atlasFixtureRepo, expectNoPaidFanOut, settled } from "../../testing/atlas.ts";
 import { cannedFiles } from "../../testing/git.ts";
 import { focusOn } from "../../testing/focus.ts";
 import { renderApp } from "../../testing/render.tsx";
@@ -244,27 +238,14 @@ describe("snapshots", () => {
       .getByRole("listitem")
       .filter({ hasText: `Merged into “${successorName}”` });
     await expect.element(retired.getByText(capability.name, { exact: true })).toBeVisible();
-    await expect.element(retired).toMatchTextContent("Capability · gone");
-    await expect.element(comparison).toMatchTextContent("Source: 3 edited files");
+    // (What each kind of change holds, and the other filters, are
+    // worker/atlas/compare.test.ts's and atlasCompare.test.ts's.)
     await userEvent.click(comparison.getByRole("button", { name: /^Regrouping \d+$/ }));
     await app.waitForUrl((url) => url.searchParams.get("changes") === "regrouping");
     const deploy = changes.getByRole("listitem").filter({ hasText: "ops/deploy.ts" });
     await expect
       .element(deploy)
       .toMatchTextContent(`Moved from ${capability.name} to ${successorName}`);
-    await expect.element(deploy).toMatchTextContent("Its source changed");
-    await userEvent.click(comparison.getByRole("button", { name: /^Summary only 0$/ }));
-    await expect.element(comparison.getByText("No summary only changes.")).toBeVisible();
-    await userEvent.click(comparison.getByRole("button", { name: /^Regrouping \d+$/ }));
-    await userEvent.click(changes.getByRole("button", { name: successorName, exact: true }));
-    await expect.element(heading(successorName)).toBeVisible();
-    await userEvent.click(
-      comparison.getByRole("button", { name: `Only changes in ${successorName}` }),
-    );
-    await app.waitForUrl((url) => url.searchParams.has("within"));
-    await expect.element(comparison).toMatchTextContent(`Only in ${successorName}`);
-    await expect.element(deploy).toBeVisible();
-    await expect.element(changes).not.toMatchTextContent("billing/");
     const compared = app.url();
     await userEvent.click(deploy.getByRole("link", { name: "History", exact: true }));
     await app.waitForUrl((url) => url.pathname.startsWith(`/orbit/fixture/commits/${repo.head}/`));
@@ -300,17 +281,6 @@ describe("snapshots", () => {
     await settled(server);
     expectNoPaidFanOut(server, mark, repo.api);
   });
-});
-
-test("the phone layout never scrolls sideways", async () => {
-  const { server, repo } = await setup();
-  await page.viewport(390, 844);
-  renderApp(`${repo.base}?select=${encodeURIComponent(LEDGER)}&q=ledger`);
-  await expect.element(heading("ledger.ts")).toBeVisible();
-  await expect.element(page.getByRole("status").filter({ hasText: /match/ })).toBeVisible();
-  await settled(server);
-  expect(sidewaysOverflow()).toBeLessThanOrEqual(0);
-  await page.viewport(1280, 900);
 });
 
 /**

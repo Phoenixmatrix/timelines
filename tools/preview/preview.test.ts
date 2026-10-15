@@ -721,7 +721,10 @@ await test("create refuses a leftover namespace that lists repositories again", 
   };
   const stderr = captureStderr();
   try {
-    await assert.rejects(create(deps(fake.cloudflare), job), /still lists repositories/);
+    await assert.rejects(
+      create({ ...deps(fake.cloudflare), pause: async () => {} }, job),
+      /still lists repositories/,
+    );
   } finally {
     stderr.restore();
   }
