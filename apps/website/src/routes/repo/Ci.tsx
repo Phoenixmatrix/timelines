@@ -55,7 +55,7 @@ export async function ciLoader({ request, params }: LoaderFunctionArgs) {
   const scope = scopeOf(new URL(request.url).search);
   const ref = scope
     ? (bookmarkIn(
-        await routeData(repoData.detail(params.space ?? "", params.repo ?? "", source)),
+        await routeData(repoData.detail(params.space ?? "", params.repo ?? "", source, true)),
         scope,
       ) ?? (source ? scopeBookmark(scope) : null))
     : null;

@@ -170,6 +170,11 @@ const base = (space: string, name: string) =>
   `/repos/${encodeURIComponent(space)}/${encodeURIComponent(name)}`;
 
 export const repoData = {
+  /**
+   * Repository pages ask with `metadataOnly` (?metadata=1), as the layout does,
+   * so a page load shares one request (CORE-444). It answers an expired work
+   * source with its identity instead of failing: see requireLiveSource.
+   */
   detail: (space: string, name: string, source?: string | null, metadataOnly = false) =>
     cached<RepoDetail>(
       sourceUrl(`${base(space, name)}${metadataOnly ? "?metadata=1" : ""}`, source),
@@ -230,7 +235,7 @@ export async function requestSource(
   let entry = detail.timeline.repos.find((repo) => repo.space === space && repo.name === name);
   if (!entry) {
     // Timeline labels are historical; canonical identity survives a rename.
-    const canonical = await routeData(repoData.detail(space, name, "canonical"));
+    const canonical = await routeData(repoData.detail(space, name, "canonical", true));
     entry = detail.timeline.repos.find((repo) => repo.id === canonical.id);
   }
   if (!entry) return null;
@@ -287,6 +292,16 @@ export function setRepoDataByteLimit(bytes = 32 * 2 ** 20) {
 onAccessChange(forgetAllRepoData);
 
 /** In loaders: turn API failures into route errors for the error boundary. */
+/**
+ * A metadata detail for a page that reads the source's Git data: an expired
+ * work source fails the page as those reads would, not as an empty repository.
+ */
+export function requireLiveSource(detail: RepoDetail): RepoDetail {
+  if (detail.sourceState === "expired")
+    throw data({ message: "This code source has expired." }, { status: 410 });
+  return detail;
+}
+
 export async function routeData<T>(promise: Promise<T>): Promise<T> {
   try {
     return await promise;
@@ -325,7 +340,7 @@ export function prefetchRoute(to: string) {
   const tail = rest.join("/");
   const ignore = () => {};
   const source = url.searchParams.get("source");
-  repoData.detail(space, name, source).catch(ignore);
+  repoData.detail(space, name, source, true).catch(ignore);
   if (view === undefined) repoData.tree(space, name, "", source).catch(ignore);
   else if (view === "tree") repoData.tree(space, name, tail, source).catch(ignore);
   else if (view === "blob") repoData.blob(space, name, tail, source).catch(ignore);

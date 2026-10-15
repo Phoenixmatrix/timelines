@@ -5,7 +5,7 @@ import { CiStatusIcon, ciLabel } from "../../components/CiStatus.tsx";
 import { CommitLink } from "../../components/CommitLink.tsx";
 import { DeploymentMark, useCommitDeployments } from "../../components/Deployments.tsx";
 import { Monogram } from "../../components/Monogram.tsx";
-import { repoData, requestSource, routeData } from "../../lib/repoData.ts";
+import { repoData, requestSource, requireLiveSource, routeData } from "../../lib/repoData.ts";
 import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { shortOid } from "../../lib/format.ts";
@@ -23,7 +23,8 @@ export async function commitsLoader({ request, params }: LoaderFunctionArgs) {
   // In a timeline's scope, history without a named branch is the bookmark's.
   const scope = at ? null : scopeOf(new URL(request.url).search);
   if (scope) {
-    const bookmark = bookmarkIn(await routeData(repoData.detail(space, name, source)), scope);
+    const detail = requireLiveSource(await routeData(repoData.detail(space, name, source, true)));
+    const bookmark = bookmarkIn(detail, scope);
     if (!bookmark && source)
       throw data(
         {
