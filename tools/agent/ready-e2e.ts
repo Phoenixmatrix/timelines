@@ -825,6 +825,11 @@ function exempt(path: string): boolean {
   );
 }
 
+/** Whether a changed path's target selects the mirror stage: git transport or agents' full set. */
+export function selectsMirror(target: E2ETarget | typeof AGENTS_FULL): boolean {
+  return target === AGENTS_FULL || !!target.mirror || !!target.areas?.includes("git-transport");
+}
+
 /** A changed path's E2E consumers, or AGENTS_FULL when it can affect any journey. */
 export function e2eTarget(path: string): E2ETarget | typeof AGENTS_FULL {
   if (exempt(path)) return NONE;
@@ -868,6 +873,7 @@ export function selectReadyE2E(changed: readonly string[], full: boolean): Ready
   let agentsFull = false;
   for (const path of changed) {
     const target = e2eTarget(path);
+    if (selectsMirror(target)) mirror = true;
     if (target === AGENTS_FULL) {
       agentsFull = true;
       continue;
@@ -875,13 +881,9 @@ export function selectReadyE2E(changed: readonly string[], full: boolean): Ready
     for (const area of target.areas ?? [])
       for (const name of areaScenarios(area)) selected.add(name);
     for (const name of target.scenarios ?? []) selected.add(name);
-    if (target.mirror || target.areas?.includes("git-transport")) mirror = true;
   }
   // A path that can affect any journey adds the agents' full set to what the others select.
-  if (agentsFull) {
-    for (const name of agentScenarioNames) selected.add(name);
-    mirror = true;
-  }
+  if (agentsFull) for (const name of agentScenarioNames) selected.add(name);
   return {
     scenarios: expandE2EScenarios([...selected]).filter((name) => !mainOnlyScenarios.has(name)),
     mirror,

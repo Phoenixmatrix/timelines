@@ -8,6 +8,8 @@ export interface ReadyOptions {
   all: boolean;
   dryRun: boolean;
   base: string;
+  /** Reuse passed verdicts whose inputs are unchanged since an earlier run (ready-history.ts). */
+  resume?: boolean;
   /**
    * `ci-tests`: remote CI's test selection. Changes under tools/agent and tools/remote are
    * classified like any other workspace's instead of forcing full coverage; the full suite
@@ -31,6 +33,11 @@ export interface ReadyPlan {
   e2e: boolean;
   /** Workspaces containing a changed path directly, not only through dependency propagation. */
   direct: string[];
+  /**
+   * Each workspace's transitive dependencies, relative imports included, for `--resume`
+   * fingerprints. Absent on a full-coverage fallback: every gate then reads every change.
+   */
+  dependencies?: Record<string, string[]>;
 }
 
 export function parseReadyOptions(args: readonly string[]): ReadyOptions {
@@ -39,12 +46,13 @@ export function parseReadyOptions(args: readonly string[]): ReadyOptions {
   for (let i = 0; i < args.length; i++) {
     const argument = args[i];
     const flag = argument.startsWith("--base=") ? "--base" : argument;
-    if (!["--all", "--dry-run", "--base"].includes(flag))
+    if (!["--all", "--dry-run", "--base", "--resume"].includes(flag))
       throw new Error(`Unknown ready option: ${argument}`);
     if (seen.has(flag)) throw new Error(`Duplicate ready option: ${flag}`);
     seen.add(flag);
     if (flag === "--all") options.all = true;
     else if (flag === "--dry-run") options.dryRun = true;
+    else if (flag === "--resume") options.resume = true;
     else {
       const value = argument === "--base" ? args[++i] : argument.slice("--base=".length);
       if (!value || value.startsWith("-") || value.includes("\0") || value.trim() !== value)
@@ -52,6 +60,8 @@ export function parseReadyOptions(args: readonly string[]): ReadyOptions {
       options.base = value;
     }
   }
+  if (options.all && options.resume)
+    throw new Error("--all is deliberate comprehensive verification; it cannot --resume.");
   return options;
 }
 
@@ -328,6 +338,24 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
   if (options.scope === "ci-tests") dependencies.get("tools/agent")!.add("tools/remote");
   // The site's gm reference is checked against gm's manifest (apps/cli/src/meta.rs).
   dependencies.get("apps/site")!.add("apps/cli");
+  // What each workspace's gates read, for --resume: the stylesheet shortcut's omitted
+  // relative-import edges stay in, so a fingerprint is never narrower than the code.
+  const reads = (workspace: Workspace, seen = new Set<Workspace>()): Set<Workspace> => {
+    const extra: Workspace[] =
+      workspace === "tools/agent" || workspace === "tools/preview" ? ["apps/website"] : [];
+    for (const dependency of [...dependencies.get(workspace)!, ...extra])
+      if (!seen.has(dependency)) {
+        seen.add(dependency);
+        reads(dependency, seen);
+      }
+    return seen;
+  };
+  plan.dependencies = Object.fromEntries(
+    WORKSPACES.map((workspace) => [
+      workspace,
+      [...reads(workspace)].filter((dependency) => dependency !== workspace).sort(),
+    ]),
+  );
   const propagate = (selected: Set<Workspace>) => {
     let added = true;
     while (added) {

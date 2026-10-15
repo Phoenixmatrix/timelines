@@ -609,8 +609,8 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
     const local = await recordAt(join(env.dir, "environment.json"));
     if (local?.id === env.id) {
       for (const name of await readdir(env.dir)) {
-        // test-ai's run history outlives environments: --resume and the failure cooldown.
-        if (["artifacts", "environment.json", "runs", "test-ai"].includes(name)) continue;
+        // test-ai's and ready's run histories outlive environments: --resume and the failure cooldown.
+        if (["artifacts", "environment.json", "runs", "test-ai", "ready"].includes(name)) continue;
         await rm(join(env.dir, name), { recursive: true, force: true });
       }
     }

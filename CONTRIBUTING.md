@@ -480,6 +480,7 @@ remote execution is not permission to run paid AI verification.
 ```bash
 vp run ready                 # uncached checks selected from this change's blast radius
 vp run ready --dry-run       # explain changed paths, selected gates and E2E without running them
+vp run ready --resume        # after a failure: rerun only what failed, was not reached or changed
 vp run ready --all           # full local suite, regardless of changed paths
 vp run ready --base <ref>    # compare with another integration branch's merge base
 vp run agent test            # fresh, complete non-AI live E2E only
@@ -490,6 +491,18 @@ vp run agent test-ai         # explicit paid verification of the AI stages your 
 staged, unstaged and untracked files. Renames include both old and new paths. It does
 not fetch: sync the source workspace first. `--base` changes the integration baseline,
 not the requirement to verify all your unlanded work.
+
+Every run records the last attempt of each gate, scenario and the mirror stage in
+`.gitmatrix-agent/ready/history.json`. `--resume` is for rerunning after a failure: it
+reuses a verdict only when its last attempt passed within 24 hours, from the same
+merge base and worktree, with the same command and the same content in the changed
+paths it reads (a gate's workspace and its dependencies, or the paths that select a
+scenario or its prerequisites; paths outside the workspaces count for every gate, and
+agents' full set for every scenario). The environment is always fresh: a rerun
+scenario brings its prerequisites, and the mirror's verdict follows the paths that
+select it (git transport, agents' full set). When every selected journey and the mirror
+are reused, nothing is provisioned. `completion.json` lists the reused verdicts
+and their evidence, and `--dry-run --resume` shows them. `--all` refuses `--resume`.
 
 The root formatting/lint/type-aware `vp check` and remote Worker contract
 typecheck always run. The latter generates the credential-free remote bindings

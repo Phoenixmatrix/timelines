@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, createWriteStream, openSync } from "node:fs";
-import { copyFile, mkdir, readFile, realpath, rename, rm } from "node:fs/promises";
+import { copyFile, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -50,7 +50,26 @@ import {
   readinessPlan,
   type ReadyOptions,
 } from "./ready-plan.ts";
-import { selectReadyE2E, selectsE2E, type ReadyE2ESelection } from "./ready-e2e.ts";
+import {
+  e2eScenarioNames,
+  selectReadyE2E,
+  selectsE2E,
+  type ReadyE2ESelection,
+} from "./ready-e2e.ts";
+import {
+  contentHashes,
+  gateFingerprint,
+  readHistory as readReadyHistory,
+  recordAttempts,
+  resumeDecision,
+  scenarioFingerprints,
+  mirrorFingerprint,
+  mirrorOutcome,
+  scenarioOutcomes,
+  writeHistory,
+  type Attempt,
+  type ResumeDecision,
+} from "./ready-history.ts";
 import {
   AI_STAGES,
   appendHistory,
@@ -83,10 +102,12 @@ const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
   vp run agent gm -- <args>       Use this worktree's binary, server, credentials and replica
   vp run agent exec -- <command>  Run another tool with isolated Git/XDG/GM settings
   vp run agent inspect [db|registry] [SQL]  Read local data; defaults to table inventory
-  vp run agent check [--all] [--dry-run] [--base <ref>] [--foreground-cleanup]
+  vp run agent check [--all] [--resume] [--dry-run] [--base <ref>] [--foreground-cleanup]
                                   Change-aware uncached readiness (also vp run ready): E2E journeys of the
                                   changed areas; --all runs every gate and every non-AI E2E journey,
-                                  --dry-run explains selection without running or provisioning;
+                                  --resume reuses this worktree's passed gates and journeys whose inputs
+                                  are unchanged (in a fresh environment), --dry-run explains selection
+                                  without running or provisioning;
                                   the E2E environment is destroyed in a detached process after the
                                   result unless --foreground-cleanup
   vp run agent test               Fresh non-AI E2E; no AI resources or inference
@@ -821,8 +842,77 @@ async function gates(options: ReadyOptions, foregroundCleanup = false): Promise<
   // Only explicit --all (or no change list) runs main-only journeys; other full
   // fallbacks still select journeys by path.
   const e2e = plan.e2e ? selectReadyE2E(plan.changed, plan.e2eAll) : null;
-  const selection = { ...plan, e2e };
+  // Every run records its verdicts; --resume reuses those whose inputs are unchanged.
+  let prints:
+    | { gates: Record<string, string>; scenarios: Record<string, string>; mirror: string }
+    | undefined;
+  try {
+    const hashes = await contentHashes(root, plan.changed);
+    prints = {
+      gates: Object.fromEntries(
+        plan.gates.map((gate) => [
+          gate.name,
+          gateFingerprint({
+            base: plan.base,
+            gate,
+            changed: plan.changed,
+            hashes,
+            dependencies: plan.dependencies,
+          }),
+        ]),
+      ),
+      scenarios: scenarioFingerprints({
+        base: plan.base,
+        scenarios: e2e?.scenarios ?? e2eScenarioNames,
+        changed: plan.changed,
+        hashes,
+      }),
+      mirror: mirrorFingerprint({ base: plan.base, changed: plan.changed, hashes }),
+    };
+  } catch (error) {
+    console.error(redact(`Ready history disabled: cannot hash changed paths (${String(error)})`));
+  }
+  const read = options.resume ? await readReadyHistory(root) : undefined;
+  const resume: ResumeDecision | undefined =
+    read &&
+    resumeDecision({
+      history: "history" in read ? read.history : null,
+      problem: prints
+        ? "problem" in read
+          ? read.problem
+          : undefined
+        : "changed paths cannot be hashed",
+      root,
+      base: plan.base,
+      gates: plan.gates.map(({ name }) => ({ name, fingerprint: prints?.gates[name] ?? "" })),
+      scenarios: (e2e?.scenarios ?? []).map((name) => ({
+        name,
+        fingerprint: prints?.scenarios[name] ?? "",
+      })),
+      ...(e2e?.mirror ? { mirror: prints?.mirror ?? "" } : {}),
+    });
+  const gatesToRun = resume
+    ? plan.gates.filter(({ name }) => resume.gates.includes(name))
+    : plan.gates;
+  const liveE2E = resume && e2e ? { scenarios: resume.scenarios, mirror: resume.mirror } : e2e;
+  const selection = { ...plan, e2e, ...(resume ? { resume } : {}) };
   console.log(JSON.stringify({ event: "ready.selection", ...selection }, null, 2));
+  if (resume)
+    console.log(
+      JSON.stringify(
+        {
+          event: "ready.resume",
+          reused: Object.fromEntries(
+            resume.reused.map(({ name, reason, evidence }) => [name, `${reason}: ${evidence}`]),
+          ),
+          rerun: resume.rerun,
+          gates: gatesToRun.map(({ name }) => name),
+          e2e: liveE2E,
+        },
+        null,
+        2,
+      ),
+    );
   if (options.dryRun) return;
   const directory = join(root, ".gitmatrix-agent", "artifacts", `gates-${Date.now()}`);
   await privateJson(join(directory, "selection.json"), selection);
@@ -834,7 +924,7 @@ async function gates(options: ReadyOptions, foregroundCleanup = false): Promise<
     outcome: "passed" | "failed";
   }[] = [];
   const runGates = async (): Promise<void> => {
-    for (const { name, binary, args: commandArgs, cwd } of plan.gates) {
+    for (const { name, binary, args: commandArgs, cwd } of gatesToRun) {
       const gateStarted = performance.now();
       let elapsedMs: number | null = null;
       let outcome: "passed" | "failed" = "failed";
@@ -871,20 +961,22 @@ async function gates(options: ReadyOptions, foregroundCleanup = false): Promise<
   let success = false;
   let failure: unknown;
   let overlap: { overlapped: boolean; quotaFallback: boolean } | undefined;
+  // The latest live setup: the quota fallback starts a second one.
+  let live: LiveState | undefined;
   try {
-    // An empty selection provisions no environment.
-    if (e2e && selectsE2E(e2e)) {
+    // An empty selection, or one --resume reused entirely, provisions no environment.
+    if (liveE2E && selectsE2E(liveE2E)) {
       // The environment's setup (about a minute, several when the machine is loaded) needs
       // nothing from the gates, so it starts first and the scenarios start when both are done.
       let attempt = 0;
       overlap = await overlapSetup<LiveState>({
         runGates,
-        startLive: () =>
-          startLive({
+        startLive: async () =>
+          (live = await startLive({
             ai: false,
-            readyE2E: e2e,
+            readyE2E: liveE2E,
             // Only the first attempt overlaps the gates; the quota fallback runs after them.
-            skipTypes: ++attempt === 1 && gatesWriteBindingTypes(plan.gates),
+            skipTypes: ++attempt === 1 && gatesWriteBindingTypes(gatesToRun),
             overlapped: attempt === 1,
             quotaFallback: attempt > 1,
             // The repeat seed guards the bootstrap itself: an unreliable change list keeps it.
@@ -894,23 +986,39 @@ async function gates(options: ReadyOptions, foregroundCleanup = false): Promise<
               foregroundFlag: foregroundCleanup,
               hosted: process.env.GITMATRIX_REMOTE_HOSTED === "1",
             }),
-          }),
+          })),
         setupFailure: (state) => state.setupFailure,
         finishLive: (state, overlapped) => finishLive(state, overlapped),
         abortLive,
       });
     } else await runGates();
     success = true;
+    if (resume && !gatesToRun.length && !(liveE2E && selectsE2E(liveE2E)))
+      console.log(
+        JSON.stringify({
+          event: "ready.reused",
+          reason: "Every selected gate and journey passed earlier with unchanged inputs.",
+          evidence: Object.fromEntries(resume.reused.map(({ name, evidence }) => [name, evidence])),
+        }),
+      );
   } catch (error) {
     failure = error;
   }
+  if (prints)
+    try {
+      await recordReadyHistory(plan.base, prints, directory, timings, live);
+    } catch (error) {
+      // History I/O must not replace the original gate or E2E failure, nor fail a passing run.
+      console.error(redact(`Could not record ready history: ${String(error)}`));
+    }
   try {
     await privateJson(join(directory, "completion.json"), {
       success,
-      gates: plan.gates.map(({ name }) => name),
+      gates: gatesToRun.map(({ name }) => name),
+      ...(resume ? { reused: resume.reused } : {}),
       timings,
       elapsedMs: performance.now() - started,
-      e2e,
+      e2e: liveE2E,
       ...(overlap
         ? { setupOverlappedGates: overlap.overlapped, setupQuotaFallback: overlap.quotaFallback }
         : {}),
@@ -922,6 +1030,79 @@ async function gates(options: ReadyOptions, foregroundCleanup = false): Promise<
     console.error(redact(`Could not retain gate completion evidence: ${String(error)}`));
   }
   if (!success) throw failure;
+}
+
+/**
+ * Records this run's gate, scenario and mirror attempts (ready-history.ts). A scenario the
+ * run never reached keeps its earlier attempt; e2e.json and mirror-e2e.json are copied beside
+ * the gate logs because the live artifacts directory is reused by the next run.
+ */
+async function recordReadyHistory(
+  base: string | null,
+  prints: { gates: Record<string, string>; scenarios: Record<string, string>; mirror: string },
+  directory: string,
+  timings: { name: string; outcome: "passed" | "failed" }[],
+  live: LiveState | undefined,
+): Promise<void> {
+  const finishedAt = new Date().toISOString();
+  const attempts: Attempt[] = timings.map(({ name, outcome }) => ({
+    kind: "gate",
+    name,
+    fingerprint: prints.gates[name]!,
+    base,
+    outcome,
+    finishedAt,
+    evidence: join(directory, `${name}.log`),
+  }));
+  if (live && live.setupFailure === undefined) {
+    const setup = live;
+    // A report older than this setup is an earlier run's: the live artifacts directory is shared.
+    const report = async (name: string): Promise<{ value: unknown; evidence: string } | null> => {
+      const path = join(setup.artifacts, name);
+      let text: string;
+      try {
+        if ((await stat(path)).mtimeMs < setup.started) return null;
+        text = await readFile(path, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      }
+      const evidence = join(directory, name);
+      await writeFile(evidence, text, { mode: 0o600 });
+      return { value: JSON.parse(text), evidence };
+    };
+    const scenarios = setup.readyE2E?.scenarios;
+    const e2e = scenarios?.length ? await report("e2e.json") : null;
+    if (scenarios && e2e) {
+      const outcomes = scenarioOutcomes(e2e.value);
+      for (const name of scenarios)
+        if (outcomes[name] && prints.scenarios[name])
+          attempts.push({
+            kind: "scenario",
+            name,
+            fingerprint: prints.scenarios[name],
+            base,
+            outcome: outcomes[name],
+            finishedAt,
+            evidence: e2e.evidence,
+          });
+    }
+    const mirror = setup.readyE2E?.mirror ? await report("mirror-e2e.json") : null;
+    const outcome = mirror && mirrorOutcome(mirror.value);
+    if (mirror && outcome)
+      attempts.push({
+        kind: "mirror",
+        name: "mirror",
+        fingerprint: prints.mirror,
+        base,
+        outcome,
+        finishedAt,
+        evidence: mirror.evidence,
+      });
+  }
+  if (!attempts.length) return;
+  const read = await readReadyHistory(root);
+  await writeHistory(root, recordAttempts("history" in read ? read.history : null, root, attempts));
 }
 
 async function destroyCurrent(): Promise<void> {
