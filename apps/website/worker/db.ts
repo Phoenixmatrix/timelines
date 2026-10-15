@@ -159,13 +159,38 @@ export function actorFromRow(row: AccountRow): Actor {
 }
 
 export async function findUserById(d1: D1Database, id: string): Promise<Actor | null> {
+  return (await findSignedInUser(d1, id))?.actor ?? null;
+}
+
+/**
+ * A person as sign-in sees them: who they are, and when any of their sessions
+ * was last revoked or their password changed (accounts.sessions_revoked_at,
+ * Unix ms), in the same read.
+ */
+export async function findSignedInUser(
+  d1: D1Database,
+  id: string,
+): Promise<{ actor: Actor; sessionsRevokedAt: number | null } | null> {
   const row = await db(d1)
     .selectFrom("accounts")
     .selectAll()
     .where("id", "=", id)
     .where("kind", "=", "user")
     .executeTakeFirst();
-  return row ? actorFromRow(row) : null;
+  return row ? { actor: actorFromRow(row), sessionsRevokedAt: row.sessions_revoked_at } : null;
+}
+
+/**
+ * Note that one or more of a person's sessions ended, or their password
+ * changed: for a while (auth.ts sessionActor), their reads stop trusting the
+ * signed session cache and read the session from D1.
+ */
+export function markSessionsRevoked(d1: D1Database, id: string, at = Date.now()) {
+  return db(d1)
+    .updateTable("accounts")
+    .set({ sessions_revoked_at: at })
+    .where("id", "=", id)
+    .execute();
 }
 
 export async function findAccountBySlug(d1: D1Database, slug: string): Promise<AccountRow | null> {

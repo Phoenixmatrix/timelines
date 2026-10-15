@@ -14,7 +14,7 @@ import { lastPush, type Timeline, type TimelineList } from "../../shared/timelin
 import type { TrackerList } from "../../shared/tracker.ts";
 import { api } from "../lib/api.ts";
 import { timeAgo } from "../lib/format.ts";
-import { useViewer } from "../lib/session.ts";
+import { onAccessChange, useViewer } from "../lib/session.ts";
 import {
   bookmarkIn,
   scopeBookmark,
@@ -28,17 +28,40 @@ import { popMotion } from "./ui.tsx";
 
 // ---- data ------------------------------------------------------------------
 
+// Lists are reused for a short while, so moving between pages with a timeline
+// selected doesn't read them again; opening the switcher always does
+// (timelines start and end while you work). Entries are per viewer, and every
+// one is dropped when who is signed in or what they hold changes.
+
+const FRESH_MS = 15_000;
+
+interface Entry<T> {
+  at: number;
+  promise: Promise<T>;
+}
+/** By viewer and Space. */
+const lists = new Map<string, Entry<Timeline[]>>();
+/** By viewer: the Space /tracker would open. */
+const defaults = new Map<string, Entry<string | null>>();
 let generation = 0;
 const listeners = new Set<() => void>();
 
 /**
- * Drop a Space's cached timelines after a change; without a Space, refresh
- * every Space and the persisted default selection.
+ * Drop a Space's cached timelines after a change; without a Space, every
+ * Space's and the default selection.
  */
-export function refreshTimelines(_space?: string): void {
+export function refreshTimelines(space?: string): void {
+  if (space === undefined) {
+    lists.clear();
+    defaults.clear();
+  } else {
+    for (const key of lists.keys()) if (key.endsWith(`\n${space}`)) lists.delete(key);
+  }
   generation++;
   for (const listener of listeners) listener();
 }
+
+onAccessChange(() => refreshTimelines());
 
 function useGeneration(): number {
   return useSyncExternalStore(
@@ -50,19 +73,32 @@ function useGeneration(): number {
   );
 }
 
-function timelinesOf(space: string): Promise<Timeline[]> {
-  return api<TimelineList>(`/tracker/${encodeURIComponent(space)}/timelines`).then(
-    (reply) => reply.timelines,
+function fresh<T>(entries: Map<string, Entry<T>>, key: string, read: () => Promise<T>) {
+  const hit = entries.get(key);
+  if (hit && Date.now() - hit.at < FRESH_MS) return hit.promise;
+  const entry = { at: Date.now(), promise: read() };
+  entries.set(key, entry);
+  entry.promise.catch(() => {
+    if (entries.get(key) === entry) entries.delete(key);
+  });
+  return entry.promise;
+}
+
+function timelinesOf(viewerId: string, space: string): Promise<Timeline[]> {
+  return fresh(lists, `${viewerId}\n${space}`, () =>
+    api<TimelineList>(`/tracker/${encodeURIComponent(space)}/timelines`).then(
+      (reply) => reply.timelines,
+    ),
   );
 }
 
-/** Resolve the persisted default against current grants on each opening. */
-function defaultSpace(): Promise<string | null> {
-  return api<TrackerList>("/tracker")
-    .then(
+/** Resolve the persisted default against current grants (reused briefly). */
+function defaultSpace(viewerId: string): Promise<string | null> {
+  return fresh(defaults, viewerId, () =>
+    api<TrackerList>("/tracker").then(
       ({ trackers, defaultSpaceId }) => trackers.find((t) => t.id === defaultSpaceId)?.slug ?? null,
-    )
-    .catch(() => null);
+    ),
+  ).catch(() => null);
 }
 
 interface Scope {
@@ -88,17 +124,25 @@ function useScope(open = false): Scope {
   const needed = Boolean(viewer) && (open || slug !== null);
   const fromPath = scopeSpace(location.pathname, location.search);
   const [fallback, setFallback] = useState<{ viewerId: string; space: string | null } | null>(null);
+  // A saved default (Preferences) or an access change drops the cached
+  // default (refreshTimelines bumps the generation), so it is read again.
+  const gen = useGeneration();
   useEffect(() => {
     if (fromPath || !needed || !viewer) return;
     let live = true;
-    void defaultSpace().then((space) => live && setFallback({ viewerId: viewer.id, space }));
+    // /tracker decides the default, but it is usually the session's default
+    // Space: read that Space's timelines meanwhile rather than after.
+    const likely = viewer.spaces.find((entry) => entry.id === viewer.defaultSpaceId)?.slug;
+    if (likely) timelinesOf(viewer.id, likely).catch(() => {});
+    void defaultSpace(viewer.id).then(
+      (space) => live && setFallback({ viewerId: viewer.id, space }),
+    );
     return () => {
       live = false;
     };
-  }, [fromPath, needed, viewer?.id, location.key]);
+  }, [fromPath, needed, viewer, gen, location.key]);
   const space = fromPath ?? (viewer && fallback?.viewerId === viewer.id ? fallback.space : null);
-  const requestKey = `${viewer?.id ?? ""}:${location.key}:${space ?? ""}`;
-  const gen = useGeneration();
+  const requestKey = `${viewer?.id ?? ""}:${space ?? ""}`;
   const [loaded, setLoaded] = useState<{
     space: string;
     requestKey: string;
@@ -107,9 +151,10 @@ function useScope(open = false): Scope {
   } | null>(null);
   useEffect(() => {
     // Signed out, nobody can list timelines; the banner names the slug alone.
-    if (!space || !needed) return;
+    if (!space || !needed || !viewer) return;
     let live = true;
-    timelinesOf(space).then(
+    // Each navigation asks again; within FRESH_MS that is the same read.
+    timelinesOf(viewer.id, space).then(
       (timelines) => live && setLoaded({ space, requestKey, timelines, error: null }),
       (error: unknown) =>
         live &&
@@ -123,7 +168,7 @@ function useScope(open = false): Scope {
     return () => {
       live = false;
     };
-  }, [space, needed, gen, requestKey]);
+  }, [space, needed, viewer, gen, requestKey, location.key]);
   const current = needed && loaded?.requestKey === requestKey ? loaded : null;
   const timelines = current?.timelines ?? null;
   return {

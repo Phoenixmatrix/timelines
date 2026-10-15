@@ -435,3 +435,36 @@ test("selecting another timeline never shows the last one's checkpoint on Land (
   arrive();
   await expect.element(landButton()).toBeDisabled();
 });
+
+test("landing drops the timeline's cached detail and branch reads, so scoped code re-resolves it", async () => {
+  const server = await TestServer.start({ world: true });
+  const timeline = await timelineWorld(server);
+  const view = await checkpoint(server, timeline, "Ranks results");
+  const request = await askApproval(server, timeline, view.checkpoint.id);
+  await mutate(server, [{ kind: "request.answer", id: request, data: { approved: true } }]);
+  expect(await mergeRunEnded(server, timeline, "conflict")).toMatchObject({ state: "conflict" });
+  const details = (mark: number) =>
+    server
+      .since(mark)
+      .filter(
+        (r) => r.method === "GET" && r.url.pathname === "/api/tracker/orbit/timelines/search",
+      );
+
+  // Scoped code reads the timeline's detail (cached for a while).
+  const app = renderApp(`/orbit/engine?tl=${timeline.slug}`);
+  await expect.poll(() => details(0).length).toBeGreaterThan(0);
+  await expect.poll(() => app.router.state.navigation.state).toBe("idle");
+
+  await app.navigate(`/tracker/orbit/timelines?tl=${timeline.slug}`);
+  const again = panel().getByRole("button", { name: "Land checkpoint #1 again" });
+  await expect.element(again).toBeEnabled();
+  await focusOn(again);
+  await press("Enter");
+  await expect.element(panel()).toMatchTextContent("Checkpoint #1: Preparing the result on main");
+  await expect.poll(() => app.router.state.revalidation).toBe("idle");
+
+  const mark = server.requests.length;
+  await app.navigate(`/orbit/engine?tl=${timeline.slug}`);
+  await expect.poll(() => app.router.state.navigation.state).toBe("idle");
+  expect(details(mark)).toHaveLength(1);
+});

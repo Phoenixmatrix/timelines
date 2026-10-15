@@ -649,7 +649,12 @@ export class Tracker extends DurableObject<Env> implements Purgeable {
   subscribedProjects(access: Access, repoId: string) {
     return this.#authorized(access, () => this.#store.subscribedProjects(repoId));
   }
-  /** subscribedProjects for several repositories under one authorization, by repository id. */
+  /**
+   * subscribedProjects for several repositories under one authorization, by
+   * repository id. Callers fall back to subscribedProjects, unchanged, while an
+   * object still runs the previous release (durable/rpc-compat.ts), until a
+   * later release removes that fallback (expand, then contract).
+   */
   subscribedProjectsFor(access: Access, repoIds: string[]) {
     return this.#authorized(access, () => {
       if (repoIds.length > SUBSCRIBED_PROJECTS_BATCH)

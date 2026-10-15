@@ -91,7 +91,9 @@ export function cachedAdmission(env: Env, timing?: Timing): Promise<Admission> {
  * On a miss this caller reads installationState() and, for a native
  * installation, verifyFreshInstallation(); only then does it prime the
  * isolate's cache. It never advances an installation, and any failure answers
- * false without priming, leaving the decision to a ticket.
+ * false without priming, leaving the decision to a ticket. That includes a
+ * control object still running a release without installationState
+ * (rpc-compat.ts): the ticket path uses only methods it already had.
  */
 export async function verifiedAdmission(env: Env, timing?: Timing): Promise<boolean> {
   if (peekCachedAdmission(env)) {

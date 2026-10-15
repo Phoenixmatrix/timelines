@@ -1,3 +1,4 @@
+import { Hono, type Context } from "hono";
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { authenticate } from "../registry/core/auth/authenticate.ts";
 import {
@@ -11,7 +12,8 @@ import {
   mayJoin,
   recordFailure,
 } from "./better-auth.ts";
-import { issueToken } from "./api/tokens.ts";
+import { issueToken, tokens } from "./api/tokens.ts";
+import { endAllSessions, SESSION_REVOCATION_WINDOW_MS, sessionActor, type AppEnv } from "./auth.ts";
 import { authHygiene } from "./retention/cleanups/auth-hygiene.ts";
 import { advanceRun, createRun, getRun } from "./retention/runs.ts";
 import { createFreshSpaceTestEnvironment } from "./testing/spaces.ts";
@@ -523,5 +525,297 @@ describe("the isolate's Better Auth", () => {
     expect(await createAuth(b.env)).not.toBe(await createAuth(a.env));
     expect(a.store.get).toHaveBeenCalledTimes(1);
     expect(b.store.get).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the signed session cache", () => {
+  /** A signed-in browser: the session row's id and the cookies it now holds. */
+  async function browser() {
+    const t = await setup();
+    const response = await signIn(t.env, t.sent, "owner@example.com");
+    expect(response.status).toBe(200);
+    const cookies = response.headers.getSetCookie().map((value) => value.split(";")[0]!);
+    const named = (name: string) => cookies.find((value) => value.startsWith(`${name}=`))!;
+    const app = new Hono<AppEnv>();
+    const viewer = async (c: Context<AppEnv>) =>
+      c.json({ id: (await sessionActor(c))?.id ?? null });
+    app.get("/viewer", viewer);
+    app.post("/viewer", viewer);
+    app.post("/sign-out", async (c) => {
+      await endAllSessions(c);
+      return c.body(null, 204);
+    });
+    const call = (path: string, cookie: string, method = "GET") =>
+      app.request(path, { method, headers: { cookie } }, t.env);
+    const [session] = t.rows("SELECT id, userId FROM auth_sessions");
+    return { ...t, named, call, session: session as { id: string; userId: string } };
+  }
+
+  test("a read within its age answers without reading the session from D1", async () => {
+    const t = await browser();
+    expect(t.named("gm.session_data")).toBeTruthy();
+    const cookie = `${t.named("gm.session_token")}; ${t.named("gm.session_data")}`;
+    const reads = vi.spyOn(t.env.DB, "prepare");
+    expect(await (await t.call("/viewer", cookie)).json()).toEqual({ id: t.session.userId });
+    const queries = reads.mock.calls.map(([query]) => String(query));
+    expect(queries.some((query) => query.includes("accounts"))).toBe(true);
+    expect(queries.some((query) => query.includes("auth_sessions"))).toBe(false);
+    // Revoked: a read honors the signed cache for its age; a write, or a
+    // browser without the cache, reads D1 and sees the revocation.
+    t.sqlite.prepare("DELETE FROM auth_sessions WHERE id = ?").run(t.session.id);
+    expect(await (await t.call("/viewer", cookie)).json()).toEqual({ id: t.session.userId });
+    expect(await (await t.call("/viewer", cookie, "POST")).json()).toEqual({ id: null });
+    expect(await (await t.call("/viewer", t.named("gm.session_token"))).json()).toEqual({
+      id: null,
+    });
+  });
+
+  test("a read that reads D1 sends the cache back", async () => {
+    const t = await browser();
+    const reads = vi.spyOn(t.env.DB, "prepare");
+    const response = await t.call("/viewer", t.named("gm.session_token"));
+    expect(await response.json()).toEqual({ id: t.session.userId });
+    // The session and its user come back in one joined query.
+    const sessionReads = reads.mock.calls
+      .map(([query]) => String(query))
+      .filter((query) => query.includes("auth_sessions") || query.includes("auth_users"));
+    expect(sessionReads).toHaveLength(1);
+    expect(sessionReads[0]).toMatch(/join/i);
+    expect(
+      response.headers.getSetCookie().some((value) => value.startsWith("gm.session_data=")),
+    ).toBe(true);
+  });
+
+  test("sign-out ends the session and expires the cache", async () => {
+    const t = await browser();
+    const cookie = `${t.named("gm.session_token")}; ${t.named("gm.session_data")}`;
+    const response = await t.call("/sign-out", cookie, "POST");
+    expect(response.status).toBe(204);
+    const expired = response.headers
+      .getSetCookie()
+      .filter((value) => /max-age=0/i.test(value))
+      .map((value) => value.split("=")[0]);
+    expect(expired).toEqual(expect.arrayContaining(["gm.session_token", "gm.session_data"]));
+    expect(t.rows("SELECT id FROM auth_sessions")).toEqual([]);
+  });
+
+  test("approving a device reads the session from D1", async () => {
+    const t = await browser();
+    const cookie = `${t.named("gm.session_token")}; ${t.named("gm.session_data")}`;
+    const approve = async () =>
+      (await createAuth(t.env)).handler(
+        new Request("http://gitmatrix.test/api/identity/device/approve", {
+          ...json({ userCode: "NOSUCHCODE" }),
+          headers: { ...json({}).headers, cookie },
+        }),
+      );
+    // A live session reaches the code check.
+    expect((await approve()).status).toBe(400);
+    t.sqlite.prepare("DELETE FROM auth_sessions WHERE id = ?").run(t.session.id);
+    expect((await approve()).status).toBe(401);
+  });
+
+  test("no Better Auth endpoint trusts it over HTTP, not even get-session", async () => {
+    const t = await browser();
+    const cookie = `${t.named("gm.session_token")}; ${t.named("gm.session_data")}`;
+    const identity = async (path: string, init: { method?: string; body?: string } = {}) =>
+      (await createAuth(t.env)).handler(
+        new Request(`http://gitmatrix.test/api/identity${path}`, {
+          ...init,
+          headers: { ...json({}).headers, cookie },
+        }),
+      );
+    const rename = () => identity("/update-user", { method: "POST", body: '{"name":"Renamed"}' });
+    // Live: each endpoint answers.
+    expect((await identity("/get-session")).status).toBe(200);
+    expect((await identity("/list-accounts")).status).toBe(200);
+    expect((await rename()).status).toBe(200);
+    t.sqlite.prepare("DELETE FROM auth_sessions WHERE id = ?").run(t.session.id);
+    // Revoked: no endpoint answers from the signed cache.
+    expect(await (await identity("/get-session")).json()).toBeNull();
+    expect((await identity("/list-accounts")).status).toBe(401);
+    expect((await rename()).status).toBe(401);
+    expect(t.rows("SELECT name FROM auth_users")).toEqual([{ name: "Renamed" }]);
+  });
+
+  /** The queries a call made, and its response. */
+  async function traced(run: () => Response | Promise<Response>, env: Env) {
+    const reads = vi.spyOn(env.DB, "prepare");
+    try {
+      const response = await run();
+      return { response, queries: reads.mock.calls.map(([query]) => String(query)) };
+    } finally {
+      reads.mockRestore();
+    }
+  }
+  const readsSession = (queries: string[]) =>
+    queries.some((query) => query.includes("auth_sessions"));
+  const expiresCache = (response: Response) =>
+    response.headers
+      .getSetCookie()
+      .some((value) => value.startsWith("gm.session_data=") && /max-age=0/i.test(value));
+
+  test("a session Better Auth revokes stops identifying its holder at once", async () => {
+    const t = await browser();
+    const cookie = `${t.named("gm.session_token")}; ${t.named("gm.session_data")}`;
+    // The same person in a second browser signs everyone else out.
+    const other = (await signIn(t.env, t.sent, "owner@example.com")).headers
+      .getSetCookie()
+      .map((value) => value.split(";")[0]!)
+      .join("; ");
+    expect(t.rows("SELECT sessions_revoked_at FROM accounts WHERE kind = 'user'")).toEqual([
+      { sessions_revoked_at: null },
+    ]);
+    const revoked = await (
+      await createAuth(t.env)
+    ).handler(
+      new Request("http://gitmatrix.test/api/identity/revoke-other-sessions", {
+        ...json({}),
+        headers: { ...json({}).headers, cookie: other },
+      }),
+    );
+    expect(revoked.status).toBe(200);
+    expect(t.rows("SELECT id FROM auth_sessions")).toHaveLength(1);
+    const [{ sessions_revoked_at: at }] = t.rows(
+      `SELECT sessions_revoked_at FROM accounts WHERE id = '${t.session.userId}'`,
+    ) as [{ sessions_revoked_at: number }];
+    expect(Date.now() - at).toBeLessThan(10_000);
+    // The first browser's cache is within its age, but its read now reads D1.
+    const { response, queries } = await traced(() => t.call("/viewer", cookie), t.env);
+    expect(await response.json()).toEqual({ id: null });
+    expect(readsSession(queries)).toBe(true);
+    expect(expiresCache(response)).toBe(true);
+    // The second browser's session is live, and still identifies its holder.
+    expect(await (await t.call("/viewer", other)).json()).toEqual({ id: t.session.userId });
+  });
+
+  test("a revocation costs another person's cached reads nothing", async () => {
+    const t = await browser();
+    const cookie = `${t.named("gm.session_token")}; ${t.named("gm.session_data")}`;
+    t.sqlite.exec("INSERT INTO auth_invites (email) VALUES ('friend@example.com')");
+    const friend = (await signIn(t.env, t.sent, "friend@example.com")).headers
+      .getSetCookie()
+      .map((value) => value.split(";")[0]!)
+      .join("; ");
+    const signedOut = await t.call("/sign-out", friend, "POST");
+    expect(signedOut.status).toBe(204);
+    expect(
+      t.rows("SELECT count(*) AS n FROM accounts WHERE sessions_revoked_at IS NOT NULL"),
+    ).toEqual([{ n: 1 }]);
+    const { response, queries } = await traced(() => t.call("/viewer", cookie), t.env);
+    expect(await response.json()).toEqual({ id: t.session.userId });
+    expect(readsSession(queries)).toBe(false);
+  });
+
+  test("the cache counts again once a revocation is older than its age", async () => {
+    const t = await browser();
+    const cookie = `${t.named("gm.session_token")}; ${t.named("gm.session_data")}`;
+    const stamp = (at: number) =>
+      t.sqlite
+        .prepare("UPDATE accounts SET sessions_revoked_at = ? WHERE id = ?")
+        .run(at, t.session.userId);
+    // Stamped just within the window: the read checks D1 and the session is live.
+    stamp(Date.now() - SESSION_REVOCATION_WINDOW_MS + 5_000);
+    const recent = await traced(() => t.call("/viewer", cookie), t.env);
+    expect(await recent.response.json()).toEqual({ id: t.session.userId });
+    expect(readsSession(recent.queries)).toBe(true);
+    // Older than the window: the cache answers alone, as for anyone else.
+    stamp(Date.now() - SESSION_REVOCATION_WINDOW_MS - 1_000);
+    const old = await traced(() => t.call("/viewer", cookie), t.env);
+    expect(await old.response.json()).toEqual({ id: t.session.userId });
+    expect(readsSession(old.queries)).toBe(false);
+  });
+
+  test("no endpoint lists sessions and their tokens", async () => {
+    const t = await browser();
+    const cookie = `${t.named("gm.session_token")}; ${t.named("gm.session_data")}`;
+    const list = () =>
+      createAuth(t.env).then((auth) =>
+        auth.handler(
+          new Request("http://gitmatrix.test/api/identity/list-sessions", {
+            headers: { cookie },
+          }),
+        ),
+      );
+    expect((await list()).status).toBe(404);
+    // Not even within the cache's age after a revocation.
+    t.sqlite.prepare("DELETE FROM auth_sessions WHERE id = ?").run(t.session.id);
+    await signIn(t.env, t.sent, "owner@example.com");
+    expect((await list()).status).toBe(404);
+  });
+});
+
+describe("trading a device sign-in for a token", () => {
+  const exchange = (env: Env, token: string) =>
+    new Hono<AppEnv>().route("/api/tokens", tokens).request(
+      "/api/tokens/device",
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: '{"name":"gm on laptop"}',
+      },
+      env,
+    );
+
+  test("gm's device login gets a token once", async () => {
+    const t = await setup();
+    const signedIn = await signIn(t.env, t.sent, "owner@example.com");
+    const cookie = signedIn.headers
+      .getSetCookie()
+      .map((value) => value.split(";")[0]!)
+      .join("; ");
+    const identity = async (path: string, body: unknown, headers: Record<string, string> = {}) =>
+      (await createAuth(t.env)).handler(
+        new Request(`http://gitmatrix.test/api/identity${path}`, {
+          ...json(body),
+          headers: { ...json({}).headers, ...headers },
+        }),
+      );
+    const started = (await (await identity("/device/code", { client_id: "gm" })).json()) as {
+      device_code: string;
+      user_code: string;
+    };
+    // The /device page shows the code (claiming it for this person), then approves.
+    const shown = await (
+      await createAuth(t.env)
+    ).handler(
+      new Request(`http://gitmatrix.test/api/identity/device?user_code=${started.user_code}`, {
+        headers: { cookie },
+      }),
+    );
+    expect(shown.status).toBe(200);
+    expect(
+      (await identity("/device/approve", { userCode: started.user_code }, { cookie })).status,
+    ).toBe(200);
+    const granted = await identity("/device/token", {
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      device_code: started.device_code,
+      client_id: "gm",
+    });
+    expect(granted.status).toBe(200);
+    const { access_token } = (await granted.json()) as { access_token: string };
+    expect(t.rows("SELECT kind FROM auth_sessions ORDER BY createdAt")).toEqual([
+      { kind: null },
+      { kind: "device" },
+    ]);
+
+    const traded = await exchange(t.env, access_token);
+    expect(traded.status).toBe(201);
+    expect(((await traded.json()) as { secret: string }).secret).toMatch(/^gmx_/);
+    // The device session existed only for the exchange; the browser's stays.
+    expect(t.rows("SELECT kind FROM auth_sessions")).toEqual([{ kind: null }]);
+    expect((await exchange(t.env, access_token)).status).toBe(401);
+  });
+
+  test("a browser's session token is refused and stays signed in", async () => {
+    const t = await setup();
+    expect((await signIn(t.env, t.sent, "owner@example.com")).status).toBe(200);
+    const [browser] = t.rows("SELECT id, token, kind FROM auth_sessions");
+    expect(browser?.kind).toBeNull();
+    const refused = await exchange(t.env, String(browser!.token));
+    expect(refused.status).toBe(403);
+    expect(((await refused.json()) as { error: string }).error).toMatch(/device sign-in/);
+    expect(t.rows("SELECT id FROM auth_sessions")).toEqual([{ id: browser!.id }]);
+    expect(t.rows("SELECT id FROM access_tokens")).toEqual([]);
   });
 });

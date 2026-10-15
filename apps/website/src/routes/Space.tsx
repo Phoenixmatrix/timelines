@@ -14,10 +14,25 @@ import { Page } from "../components/AppShell.tsx";
 import { RepoList } from "../components/RepoList.tsx";
 import { Card, FormError, SelectField, TextField, link } from "../components/ui.tsx";
 import { api, ApiError, attempt, field, load } from "../lib/api.ts";
-import { useViewer } from "../lib/session.ts";
+import { likelyGrantedSpace, useViewer } from "../lib/session.ts";
+
+type Team = { id: string; key: string; name: string };
+
+/** A Space's Tracker teams, or why they couldn't be read (settled, never rejected). */
+function teamsOf(slug: string, request: Request) {
+  return api<{ teams: Team[] }>(`/tracker/${slug}/teams`, { signal: request.signal }).then(
+    (result) => ({ teams: result.teams, error: null }),
+    (error: unknown) => ({ teams: null, error }),
+  );
+}
 
 export async function spaceLoader({ request, params }: LoaderFunctionArgs) {
   const slug = encodeURIComponent(params.space!);
+  // Content readers' Tracker teams are read alongside the page rather than
+  // after it when the session already listed a grant here; the page's
+  // capabilities still decide whether they're used. Without one, nothing
+  // under the Tracker is read before the page says it may be.
+  const early = likelyGrantedSpace(params.space!) ? teamsOf(slug, request) : null;
   // The repositories and the Space page are independent: read them together.
   const [{ repos }, read] = await Promise.all([
     load<{ repos: RepoSummary[] }>(`/repos?space=${slug}`, request),
@@ -39,7 +54,7 @@ export async function spaceLoader({ request, params }: LoaderFunctionArgs) {
   }
   const space = page?.space ?? repos[0]!.space;
   const base = `/organizations/${encodeURIComponent(space.organization.slug)}`;
-  // Directory administration and the Tracker's teams both follow from the page alone.
+  // Directory administration follows from the page alone.
   const [administration, teams] = await Promise.all([
     page?.capabilities.canManageGrants
       ? Promise.all([
@@ -49,10 +64,12 @@ export async function spaceLoader({ request, params }: LoaderFunctionArgs) {
         ])
       : null,
     page?.capabilities.canReadContent
-      ? load<{ teams: { id: string; key: string; name: string }[] }>(
-          `/tracker/${slug}/teams`,
-          request,
-        ).then((result) => result.teams)
+      ? (early ?? teamsOf(slug, request)).then(({ teams, error }) => {
+          if (teams) return teams;
+          if (error instanceof ApiError)
+            throw data({ message: error.message }, { status: error.status });
+          throw error;
+        })
       : [],
   ]);
   const members: AccountSummary[] = administration?.[0].members ?? [];

@@ -39,6 +39,7 @@ import { api, ApiError } from "../../lib/api.ts";
 import { fullDate, shortOid, timeAgo } from "../../lib/format.ts";
 import { commitsUrl, treeUrl } from "../../lib/refs.ts";
 import { commitPanelUrl } from "../../lib/commitPanel.ts";
+import { forgetTimelineReads } from "../../lib/repoData.ts";
 import { withScope } from "../../lib/timelineScope.ts";
 import {
   DEFAULT_FILTERS,
@@ -561,6 +562,11 @@ export function TrackerTimelines() {
                     headingRef={heading}
                     onChange={() => {
                       refreshTimelines(space);
+                      // Landing queued (or the flag changed): scoped code reads re-resolve it.
+                      forgetTimelineReads(
+                        space,
+                        selected.repos.map((repo) => repo.space),
+                      );
                       void revalidator.revalidate();
                     }}
                   />
@@ -903,6 +909,12 @@ function TimelineDetails({
   const lastLanding = own.findLast((e) => e.kind === "landing");
   const issues = data.issues?.[timeline.id] ?? [];
   const ended = timeline.status === "landed" || timeline.status === "abandoned";
+  // Landed (main advanced) or abandoned, here or with gm: the timeline's
+  // detail and branch reads cached for scoped code pages are stale.
+  const repoSpaces = [...new Set(timeline.repos.map((repo) => repo.space))].join("/");
+  useEffect(() => {
+    if (ended) forgetTimelineReads(space, repoSpaces.split("/"));
+  }, [ended, space, timeline.slug, repoSpaces]);
   const latestStep = feed.records[0];
   const many = timeline.repos.length > 1;
   // One read of the checkpoints for the list and the landing panel (CORE-382).

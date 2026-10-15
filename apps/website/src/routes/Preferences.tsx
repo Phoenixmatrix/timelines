@@ -11,6 +11,7 @@ import type { SessionResponse, Viewer } from "../../shared/api.ts";
 import { preferredSpace, type DefaultScope } from "../../shared/spaces.ts";
 import type { Snapshot, TrackerList, TrackerView } from "../../shared/tracker.ts";
 import { SettingsPage } from "../components/SettingsPage.tsx";
+import { refreshTimelines } from "../components/TimelineScope.tsx";
 import { Card, FormError, SelectField, useToast } from "../components/ui.tsx";
 import { api, ApiError } from "../lib/api.ts";
 import { requireViewer, useViewer } from "../lib/session.ts";
@@ -198,6 +199,9 @@ function DefaultScopeCard({ viewer }: { viewer: Viewer }) {
     setError("");
     try {
       await api<SessionResponse>("/account/default-scope", { method: "PUT", json: scope });
+      // The timeline scope resolves the default Space; the session read that
+      // follows differs too, which drops every cache keyed to the old default.
+      refreshTimelines();
       toast.add({ title });
       await revalidator.revalidate();
     } catch (cause) {

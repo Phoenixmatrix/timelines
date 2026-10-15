@@ -5,7 +5,7 @@ import { redirect, type RouteObject, type ShouldRevalidateFunction } from "react
 import { AppShell } from "./components/AppShell.tsx";
 import { PageTitle, PageTitleError, withPageTitles } from "./components/PageTitle.tsx";
 import { keepPageUnderPanel } from "./lib/commitPanel.ts";
-import { rootLoader } from "./lib/session.ts";
+import { rootLoader, rootShouldRevalidate } from "./lib/session.ts";
 import { timelineScopeMiddleware } from "./lib/timelineScope.ts";
 import { Account, accountLoader } from "./routes/Account.tsx";
 import {
@@ -80,6 +80,7 @@ import {
   timelinesIndexLoader,
   trackerIndexLoader,
   trackerLoader,
+  trackerShouldRevalidate,
 } from "./routes/tracker/loaders.ts";
 import { RepoTracker, repoTrackerLoader } from "./routes/repo/Tracker.tsx";
 import { GoPage, goLoader } from "./refs/GoPage.tsx";
@@ -139,8 +140,9 @@ export const routes: RouteObject[] = withPageTitles([
     // The timeline scope (?tl=) follows every navigation that doesn't name one.
     middleware: [timelineScopeMiddleware],
     loader: rootLoader,
-    // Re-resolve grants on navigation; a cached selector is never access authority.
-    shouldRevalidate: () => true,
+    // The session's selectors follow scope changes and submissions, never
+    // standing in for authorization (rootShouldRevalidate explains).
+    shouldRevalidate: rootShouldRevalidate,
     Component: TitledShell,
     ErrorBoundary: RootError,
     HydrateFallback: InitialPageTitle,
@@ -216,9 +218,7 @@ export const routes: RouteObject[] = withPageTitles([
           {
             path: "tracker/:space",
             loader: trackerLoader,
-            // Navigation revalidates current grant/epoch rather than retaining
-            // a private snapshot after revocation or a context change.
-            shouldRevalidate: () => true,
+            shouldRevalidate: trackerShouldRevalidate,
             Component: Tracker,
             children: [{ path: "issues/:issue" }, { path: "projects" }, { path: "teams" }],
           },

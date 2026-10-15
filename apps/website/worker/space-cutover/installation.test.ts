@@ -392,3 +392,109 @@ describe("absorbing native admission (CORE-439)", () => {
     }
   });
 });
+
+describe("a control object still on the previous release (Durable Object code update)", () => {
+  /** What workerd throws when a Durable Object's running class lacks a method. */
+  const missingMethod = (name: string) =>
+    new TypeError(`The RPC receiver does not implement the method "${name}".`);
+  const quiet = () => vi.spyOn(console, "warn").mockImplementation(() => {});
+
+  test("the gate admits through status/freshStatus/verify, and primes nothing", async () => {
+    const f = await createFreshSpaceTestEnvironment();
+    try {
+      forgetCachedAdmission(f.env);
+      const warn = quiet();
+      const state = vi
+        .spyOn(f.control, "installationState")
+        .mockRejectedValue(missingMethod("installationState"));
+      const verify = vi.spyOn(f.control, "verifyFreshInstallation");
+      const timing = new Timing();
+      await ensureInstallationAdmitted(f.env, timing);
+      // The previous release's round trips, in its order (the object calls
+      // status() itself too, so count them from the Worker's side).
+      expect(
+        timing
+          .header()
+          .split(", ")
+          .map((part) => part.split(";")[0]),
+      ).toEqual([
+        "install-status",
+        "install-run",
+        "install-fresh-status",
+        "install-fresh-verify",
+        "admission-cache-miss",
+        "install-rpc-skew",
+        "total",
+      ]);
+      expect(verify).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("installationState"));
+      expect(peekCachedAdmission(f.env)).toBeNull();
+      // Unprimed: the next request checks again.
+      await ensureInstallationAdmitted(f.env);
+      expect(state).toHaveBeenCalledTimes(2);
+      expect(verify).toHaveBeenCalledTimes(2);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("the previous release's loop still installs a fresh instance", async () => {
+    const f = fixture();
+    try {
+      quiet();
+      vi.spyOn(f.control, "installationState").mockRejectedValue(
+        missingMethod("installationState"),
+      );
+      await initializeFreshSpaceInstallation(f.env);
+      expect(f.control.freshStatus()?.phase).toBe("active");
+      expect(f.control.admission(4)).toEqual({ allowed: true, epoch: 0 });
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a run's admission decides, still fail-closed, and is never primed", async () => {
+    const env = {} as Env;
+    const journal = installCutoverTestControl(env);
+    try {
+      quiet();
+      await journal.fence();
+      vi.spyOn(journal.control, "installationState").mockRejectedValue(
+        missingMethod("installationState"),
+      );
+      const admission = vi.spyOn(journal.control, "admission");
+      await expect(ensureInstallationAdmitted(env)).rejects.toThrow(
+        "space_cutover_requires_reviewed_migration",
+      );
+      expect(admission).toHaveBeenCalledTimes(1);
+      admission.mockReturnValueOnce({ allowed: true, epoch: 1 });
+      await ensureInstallationAdmitted(env);
+      expect(peekCachedAdmission(env)).toBeNull();
+    } finally {
+      journal.close();
+    }
+  });
+
+  test("any other failure of installationState still refuses", async () => {
+    const f = await createFreshSpaceTestEnvironment();
+    try {
+      forgetCachedAdmission(f.env);
+      const state = vi
+        .spyOn(f.control, "installationState")
+        .mockRejectedValueOnce(new Error("control unavailable"))
+        .mockRejectedValueOnce(missingMethod("somethingElse"))
+        .mockRejectedValueOnce(new Error('does not implement the method "installationState"'));
+      const status = vi.spyOn(f.control, "status");
+      const fresh = vi.spyOn(f.control, "freshStatus");
+      await expect(ensureInstallationAdmitted(f.env)).rejects.toThrow("control unavailable");
+      await expect(ensureInstallationAdmitted(f.env)).rejects.toThrow("somethingElse");
+      await expect(ensureInstallationAdmitted(f.env)).rejects.toThrow("does not implement");
+      expect(state).toHaveBeenCalledTimes(3);
+      expect(status).not.toHaveBeenCalled();
+      expect(fresh).not.toHaveBeenCalled();
+      expect(peekCachedAdmission(f.env)).toBeNull();
+    } finally {
+      f.close();
+    }
+  });
+});

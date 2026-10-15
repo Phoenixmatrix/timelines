@@ -14,6 +14,7 @@ import { expect, onTestFinished } from "vite-plus/test";
 import { routes } from "../appRoutes.tsx";
 import { refreshTimelines } from "../components/TimelineScope.tsx";
 import { forgetAllRepoData } from "../lib/repoData.ts";
+import { accessChanged, syncAccess } from "../lib/session.ts";
 import { resetRefResolutions } from "../refs/resolver.ts";
 import { applyTheme, storedTheme } from "../lib/theme.ts";
 import { scopeLinks } from "../lib/timelineScope.ts";
@@ -21,6 +22,8 @@ import "../styles/app.css";
 
 export interface RenderedApp {
   router: DataRouter;
+  /** The cross-tab access channel this app listens on (its own, not other tests'). */
+  accessChannel: string;
   container: HTMLElement;
   /** The address the app is at, as a URL (origin aside). */
   url(): URL;
@@ -35,6 +38,7 @@ export interface RenderedApp {
 /** Mount the app at `path`, for this test only. */
 export function renderApp(path: string): RenderedApp {
   // Nothing an earlier test (or world) read is reused.
+  accessChanged();
   forgetAllRepoData();
   resetRefResolutions();
   refreshTimelines();
@@ -43,6 +47,8 @@ export function renderApp(path: string): RenderedApp {
   history.replaceState(null, "", path);
   const router = createBrowserRouter(routes);
   scopeLinks(router);
+  const accessChannel = `gitmatrix:access:${crypto.randomUUID()}`;
+  const stopAccessSync = syncAccess(router, accessChannel);
   // As index.html does: text inherits the theme's ink, so captures (visual()) look like the app.
   document.body.classList.add("mk-root");
   const container = document.createElement("div");
@@ -62,6 +68,7 @@ export function renderApp(path: string): RenderedApp {
   const unmount = () => {
     if (!mounted) return;
     mounted = false;
+    stopAccessSync();
     root.unmount();
     router.dispose();
     container.remove();
@@ -74,6 +81,7 @@ export function renderApp(path: string): RenderedApp {
   };
   return {
     router,
+    accessChannel,
     container,
     url,
     async waitForUrl(match) {

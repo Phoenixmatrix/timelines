@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { AccessToken, CreatedAccessToken, TokenScope } from "../../shared/api.ts";
 import { generateTokenSecret, hashToken, type AppEnv } from "../auth.ts";
+import { DEVICE_SESSION } from "../better-auth.ts";
 import { db } from "../schema.ts";
 import { fail, readJson, requireActor, requirePerson } from "./http.ts";
 
@@ -86,19 +87,27 @@ tokens.post("/", async (c) => {
 /**
  * Device login for gm: after the device flow (POST /api/identity/device/token)
  * the CLI holds a Better Auth session token. It trades it here, once, for a
- * personal access token, which is what git and the API take.
+ * personal access token, which is what git and the API take. Only a session
+ * the device flow created qualifies: a browser's session token (which a person
+ * never sees, but a leak could expose) is refused, and stays signed in.
  */
 tokens.post("/device", async (c) => {
   const secret = c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
   const session = secret
     ? await db(c.env.DB)
         .selectFrom("auth_sessions")
-        .select(["id", "userId", "expiresAt"])
+        .select(["id", "userId", "expiresAt", "kind"])
         .where("token", "=", secret)
         .executeTakeFirst()
     : undefined;
   if (!session || Date.parse(session.expiresAt) <= Date.now())
     return fail(c, 401, "That device sign-in has expired. Run `gm auth login` again.");
+  if (session.kind !== DEVICE_SESSION)
+    return fail(
+      c,
+      403,
+      "Only a device sign-in can be traded for a token. Run `gm auth login`, or create a token in Settings.",
+    );
   const body = await readJson<{ name?: string }>(c).catch(() => ({ name: undefined }));
   const name = (body.name?.trim() || "gm CLI").slice(0, 80);
   const created = await issueToken(c.env.DB, session.userId, name, "write");

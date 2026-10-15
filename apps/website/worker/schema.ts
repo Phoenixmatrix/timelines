@@ -209,6 +209,11 @@ export interface Database {
     preferred_organization_id: Generated<string | null>;
     /** Their default Space in it; null uses that Organization's default Space. */
     preferred_space_id: Generated<string | null>;
+    /**
+     * When their sessions were last revoked or their password changed (Unix ms);
+     * auth.ts sessionActor skips the signed session cache for a while after it.
+     */
+    sessions_revoked_at: Generated<number | null>;
   };
   // Better Auth's tables (worker/better-auth.ts): only what Gitmatrix reads.
   auth_users: {
@@ -226,6 +231,8 @@ export interface Database {
     expiresAt: string;
     createdAt: string;
     updatedAt: string;
+    /** "device" for gm's device login (worker/better-auth.ts DEVICE_SESSION), else null. */
+    kind: string | null;
   };
   auth_accounts: {
     id: string;

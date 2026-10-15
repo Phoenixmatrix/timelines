@@ -2,7 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
 import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { AppEnv } from "../auth.ts";
-import { tokenCredential } from "../auth.ts";
+import { sessionActor, tokenCredential } from "../auth.ts";
 import { createAuth } from "../better-auth.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import { adminAccounts } from "./admin-accounts.ts";
@@ -55,6 +55,11 @@ async function setup() {
     return next();
   });
   app.route("/admin/accounts", adminAccounts);
+  // Who a browser's cookies identify to a read (auth.ts sessionActor).
+  const viewer = new Hono<AppEnv>().get("/viewer", async (c) =>
+    c.json({ id: (await sessionActor(c))?.id ?? null }),
+  );
+  const view = (cookie: string) => viewer.request("/viewer", { headers: { cookie } }, env);
   const tokens = {
     admin: (await issueToken(env.DB, "acc_admin", "admin", "write")).secret,
     member: (await issueToken(env.DB, "acc_member", "member", "write")).secret,
@@ -88,7 +93,7 @@ async function setup() {
   const signIn = (email: string, password: string, ip?: string) =>
     identity("/sign-in/email", { email, password }, ip);
   const rows = (sql: string) => sqlite.prepare(sql).all() as Record<string, unknown>[];
-  return { env, tokens, call, signIn, identity, rows, sent };
+  return { env, tokens, call, signIn, identity, rows, sent, view };
 }
 
 const demo = {
@@ -277,6 +282,30 @@ describe("site admins set a new password", () => {
     expect(rows("SELECT * FROM auth_accounts WHERE providerId = 'credential'")).toHaveLength(1);
     expect((await signIn("demo-1", PASSWORD, "198.51.100.9")).status).toBe(401);
     expect((await signIn("demo-1", "a brand new passphrase")).status).toBe(200);
+  });
+
+  test("ends a browser's session at once, even within its signed cache's age", async () => {
+    const { tokens, call, signIn, view, rows } = await setup();
+    await call(tokens.admin, "POST", "/admin/accounts", demo);
+    const signedIn = await signIn("demo-1", PASSWORD);
+    const cookie = signedIn.headers
+      .getSetCookie()
+      .map((value) => value.split(";")[0]!)
+      .join("; ");
+    expect(cookie).toContain("gm.session_data=");
+    const [{ id }] = rows("SELECT id FROM accounts WHERE slug = 'demo-1'") as [{ id: string }];
+    expect(await (await view(cookie)).json()).toEqual({ id });
+    const reset = await call(tokens.admin, "PUT", "/admin/accounts/demo-1/password", {
+      password: "a brand new passphrase",
+    });
+    expect(await reset.json()).toEqual({ sessionsRevoked: 1, tokensRevoked: 0 });
+    const after = await view(cookie);
+    expect(await after.json()).toEqual({ id: null });
+    expect(
+      after.headers
+        .getSetCookie()
+        .some((value) => value.startsWith("gm.session_data=") && /max-age=0/i.test(value)),
+    ).toBe(true);
   });
 
   test("revokes the account's access tokens only when asked", async () => {

@@ -60,14 +60,19 @@ export async function atlasFixtureRepo(
   };
 }
 
-/** Wait until the page has made no request for `ms`: what a test means by "settled". */
+/**
+ * Wait until the page has nothing in flight and no request has finished for
+ * `ms`: what a test means by "settled". A request is recorded only once
+ * answered, so a quiet spell alone would let a slow read made before a mark
+ * land after it.
+ */
 export async function settled(server: TestServer, ms = 300): Promise<void> {
   let count = -1;
   let since = Date.now();
   await expect
     .poll(
       () => {
-        if (server.requests.length !== count) {
+        if (server.requests.length !== count || server.pending > 0) {
           count = server.requests.length;
           since = Date.now();
         }

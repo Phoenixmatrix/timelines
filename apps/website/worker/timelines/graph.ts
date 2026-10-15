@@ -12,6 +12,7 @@ import { accessible, authorize } from "../tracker/api.ts";
 import { TrackerError } from "../tracker/store.ts";
 import { SUBSCRIBED_PROJECTS_BATCH, trackerObject } from "../tracker/stub.ts";
 import { chunk } from "../knowledge/util.ts";
+import { isMissingRpcMethod } from "../durable/rpc-compat.ts";
 import { timedCall, timedEnv } from "../timing.ts";
 
 /** Events drawn at most: the newest, so a long history still loads quickly. */
@@ -47,14 +48,37 @@ timelineGraph.get("/", async (c) => {
   const repoIds = [...new Set(timelines.flatMap((timeline) => timeline.repos.map((r) => r.id)))];
   const projects: TimelineGraphData["projects"] = {};
   // One Tracker call per batch of repositories, each authorized once.
+  const subscribedProjects = async (batch: string[]) => {
+    try {
+      const reply = await timedCall(timing, tracker.subscribedProjectsFor(access, batch));
+      if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
+      return reply.value;
+    } catch (error) {
+      // A Tracker still running the previous release while Durable Object code
+      // rolls out after a deploy (durable/rpc-compat.ts): ask per repository,
+      // as that release did. Keep until a later release (expand, then contract).
+      if (!isMissingRpcMethod(error, "subscribedProjectsFor")) throw error;
+      timing.count("tracker-rpc-skew");
+      console.warn(
+        "timeline-graph: the Tracker lacks subscribedProjectsFor (Durable Object code is " +
+          "still rolling out); asking per repository.",
+      );
+      const value: Record<string, { projectId: string; slug: string; name: string }[]> = {};
+      await Promise.all(
+        batch.map(async (repoId) => {
+          const reply = await timedCall(timing, tracker.subscribedProjects(access, repoId));
+          if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
+          value[repoId] = reply.value;
+        }),
+      );
+      return value;
+    }
+  };
   const replies = await Promise.all(
-    chunk(repoIds, SUBSCRIBED_PROJECTS_BATCH).map((batch) =>
-      timedCall(timing, tracker.subscribedProjectsFor(access, batch)),
-    ),
+    chunk(repoIds, SUBSCRIBED_PROJECTS_BATCH).map(subscribedProjects),
   );
-  for (const reply of replies) {
-    if (!reply.ok) throw new TrackerError(reply.status, reply.code, reply.error);
-    for (const [repoId, subscribed] of Object.entries(reply.value))
+  for (const value of replies) {
+    for (const [repoId, subscribed] of Object.entries(value))
       projects[repoId] = subscribed.map((project) => ({
         id: project.projectId,
         slug: project.slug,

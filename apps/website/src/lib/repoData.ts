@@ -12,21 +12,158 @@ import { api, ApiError } from "./api.ts";
 import { sourceUrl } from "./refs.ts";
 import type { TimelineDetail } from "../../shared/timelines.ts";
 import { scopeOf } from "./timelineScope.ts";
+import { accessEpoch, accessRefused, onAccessChange, sessionSettling } from "./session.ts";
 
-// Share concurrent reads only. Even immutable Git content must reauthorize on
-// the next navigation after a Space grant or collaborator access is revoked.
-const cache = new Map<string, Promise<unknown>>();
+// Every repository read goes through this cache, so a link that was hovered
+// (and prefetched) opens instantly, and going back to a page doesn't refetch.
+// Data addressed by a commit id never changes; anything addressed by a branch
+// name, or read through a work source, is reused for a short while.
+//
+// What the cache holds is what this browser was allowed to read, so it never
+// outlives that by more than FRESH_MS:
+//
+// - it is keyed by the request (Space, repository, source, ref or commit id,
+//   path), and every entry belongs to the access epoch it was read in
+//   (lib/session.ts): a sign-in, sign-out or account switch here or in another
+//   tab, a session read that differs, or any 401 starts a new epoch and empties
+//   it. A hit waits for a navigation's session read in flight, so loaders alongside
+//   the read that notices a change don't serve the old identity's entries;
+// - a repository's entries are dropped as soon as the repository is refused
+//   (refusesRepository);
+// - a commit-id read, which is kept for as long as it fits, is served only
+//   while a read of its repository succeeded within FRESH_MS; otherwise the
+//   repository's (cheap, itself cached) metadata read is made first, and its
+//   refusal drops the repository's entries and fails the read. Removing a
+//   collaborator or making a repository private doesn't change the session, so
+//   this bounded window, not an immediate revocation, is the accepted
+//   trade-off: a revoked reader can see commit-addressed data they had already
+//   read for up to 15 s, never anything new.
 
-function cached<T>(path: string): Promise<T> {
+const FRESH_MS = 15_000;
+/** Bounds memory: the least recently used entries go first, by count and by size. */
+const MAX_ENTRIES = 500;
+let maxBytes = 32 * 2 ** 20;
+const COMMIT_ID = /(?:^|[?&])(?:at|ref)=[0-9a-f]{40}(?:%2F|\/|&|$)/;
+const REPO = /^\/repos\/[^/?]+\/[^/?]+/;
+
+/**
+ * Whether a failed read means the repository itself is refused, so nothing
+ * cached for it may be served: a 403 from any read, or a 404 from the
+ * repository's own detail (how the server answers a repository you can no
+ * longer see). A 404 below it is just that thing missing: no knowledge graph
+ * node (AI off), a dead link's path, an unknown branch or commit.
+ */
+function refusesRepository(status: number, path: string, repo: string): boolean {
+  return status === 403 || (status === 404 && (path === repo || path.startsWith(`${repo}?`)));
+}
+
+interface Entry {
+  /** When the request was made. */
+  at: number;
+  epoch: number;
+  promise: Promise<unknown>;
+  /** Approximate size once read (its JSON's length); 0 while in flight. */
+  bytes: number;
+}
+
+const cache = new Map<string, Entry>();
+let totalBytes = 0;
+/** By repository (`/repos/<space>/<name>`): when a read of it last succeeded (as made). */
+const authorizedAt = new Map<string, number>();
+
+/** Immutable reads stay; work sources can be archived or expire, so their reads don't. */
+const immutable = (path: string) => !path.includes("source=") && COMMIT_ID.test(path);
+
+function drop(key: string): void {
+  const entry = cache.get(key);
+  if (!entry) return;
+  totalBytes -= entry.bytes;
+  cache.delete(key);
+}
+
+/** Expired branch and source reads, and anything from another epoch, go. */
+function purge(now: number): void {
+  const current = accessEpoch();
+  for (const [key, entry] of cache)
+    if (entry.epoch !== current || (!immutable(key) && now - entry.at >= FRESH_MS)) drop(key);
+}
+
+/** The least recently used go until both bounds hold. */
+function evict(): void {
+  while (cache.size > MAX_ENTRIES || totalBytes > maxBytes) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    drop(oldest.value);
+  }
+}
+
+/**
+ * `waited`: this lookup already waited for a navigation's session read.
+ * `reauthorized`: the repository's metadata read just succeeded for it, so
+ * the entry is served without measuring the window again; a metadata read
+ * slower than the window would otherwise be asked for forever. authorizedAt
+ * stays the time that read was made (the server checked access no earlier),
+ * so the window for later reads is never stretched by a slow response.
+ */
+function cached<T>(path: string, waited = false, reauthorized = false): Promise<T> {
+  const now = Date.now();
+  purge(now);
   const hit = cache.get(path);
-  if (hit) return hit as Promise<T>;
+  if (hit) {
+    // A session read in flight may say the identity changed: the hit waits
+    // for it, then looks again (it is gone if access changed).
+    const settling = waited ? null : sessionSettling();
+    if (settling) return settling.then(() => cached<T>(path, true));
+    const repo = REPO.exec(path)?.[0];
+    // The entry's own read authorizes it while it is in flight or recent.
+    const authorized = Math.max(hit.at, authorizedAt.get(repo ?? "") ?? -Infinity);
+    if (repo && immutable(path) && !reauthorized && now - authorized >= FRESH_MS) {
+      // Not authorized lately: ask about the repository first (FRESH_MS above).
+      const [space, name] = repo.split("/").slice(2).map(decodeURIComponent);
+      return repoData.detail(space!, name!, null, true).then(() => cached<T>(path, true, true));
+    }
+    // Most recently used last.
+    cache.delete(path);
+    cache.set(path, hit);
+    return hit.promise as Promise<T>;
+  }
+  // Not tied to any one navigation's abort signal: a prefetch and the
+  // navigation that follows it share this request.
   const promise = api<T>(path);
-  cache.set(path, promise);
-  const release = () => {
-    if (cache.get(path) === promise) cache.delete(path);
-  };
-  void promise.then(release, release);
+  const entry: Entry = { at: now, epoch: accessEpoch(), promise, bytes: 0 };
+  cache.set(path, entry);
+  evict();
+  const repo = REPO.exec(path)?.[0];
+  promise.then(
+    (value) => {
+      if (entry.epoch !== accessEpoch()) return;
+      if (repo && entry.at > (authorizedAt.get(repo) ?? -Infinity))
+        authorizedAt.set(repo, entry.at);
+      if (cache.get(path) !== entry) return;
+      const bytes = sizeOf(value);
+      // Larger than the whole budget: returned, never kept (keeping it would
+      // evict everything else).
+      if (bytes > maxBytes) return drop(path);
+      entry.bytes = bytes;
+      totalBytes += bytes;
+      evict();
+    },
+    (error: unknown) => {
+      if (cache.get(path) === entry) drop(path);
+      if (!(error instanceof ApiError) || entry.epoch !== accessEpoch()) return;
+      if (error.status === 401) accessRefused();
+      else if (repo && refusesRepository(error.status, path, repo)) forgetPrefix(repo);
+    },
+  );
   return promise;
+}
+
+function sizeOf(value: unknown): number {
+  try {
+    return JSON.stringify(value)?.length ?? 0;
+  } catch {
+    return 0;
+  }
 }
 
 const base = (space: string, name: string) =>
@@ -106,19 +243,48 @@ export async function requestSource(
   );
 }
 
+function forgetPrefix(prefix: string) {
+  authorizedAt.delete(prefix);
+  for (const key of cache.keys()) {
+    if (key === prefix || key.startsWith(`${prefix}/`) || key.startsWith(`${prefix}?`)) drop(key);
+  }
+}
+
 /** Drop everything cached for a repository (after changing it). */
 export function forgetRepoData(space: string, name: string) {
-  const prefix = base(space, name);
+  forgetPrefix(base(space, name));
+}
+
+/**
+ * After a timeline lands or ends: every timeline detail of `space`, and the
+ * branch and source reads of the repositories in `spaces` (the timeline's
+ * Space and those of its repositories). Commit-id reads stay true.
+ */
+export function forgetTimelineReads(space: string, spaces: Iterable<string> = []) {
+  const timelines = `/tracker/${encodeURIComponent(space)}/timelines/`;
+  const repos = [...new Set([space, ...spaces])].map(
+    (slug) => `/repos/${encodeURIComponent(slug)}/`,
+  );
   for (const key of cache.keys()) {
-    if (key === prefix || key.startsWith(`${prefix}/`) || key.startsWith(`${prefix}?`))
-      cache.delete(key);
+    if (key.startsWith(timelines) || (!immutable(key) && repos.some((p) => key.startsWith(p))))
+      drop(key);
   }
 }
 
 /** Drop everything cached for every repository (a new session, or a test's new world). */
 export function forgetAllRepoData() {
   cache.clear();
+  totalBytes = 0;
+  authorizedAt.clear();
 }
+
+/** For tests: bound the cache's size in bytes (the default is 32 MiB). */
+export function setRepoDataByteLimit(bytes = 32 * 2 ** 20) {
+  maxBytes = bytes;
+  evict();
+}
+
+onAccessChange(forgetAllRepoData);
 
 /** In loaders: turn API failures into route errors for the error boundary. */
 export async function routeData<T>(promise: Promise<T>): Promise<T> {

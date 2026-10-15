@@ -69,12 +69,14 @@ async function setup() {
     ann: (await issueToken(env.DB, "ann", "t", "read")).secret,
     dan: (await issueToken(env.DB, "dan", "t", "read")).secret,
   };
-  const get = async (who: keyof typeof tokens) => {
-    const response = await server.request(
+  const request = async (who: keyof typeof tokens) =>
+    server.request(
       "/api/tracker/orbit/timeline-graph",
       { headers: { authorization: `Bearer ${tokens[who]}`, "X-Gitmatrix-Content-Version": "4" } },
       env,
     );
+  const get = async (who: keyof typeof tokens) => {
+    const response = await request(who);
     return { status: response.status, body: (await response.json()) as TimelineGraphData };
   };
   const bot = await issueToken(env.DB, "ann", "bot", "write", undefined, "agt_bot");
@@ -91,8 +93,12 @@ async function setup() {
     if (!reply.ok) throw new Error(reply.error);
     return reply.value;
   };
-  return { tracker, get, fork, access };
+  return { tracker, get, request, fork, access };
 }
+
+/** What workerd throws when a Durable Object's running class lacks a method. */
+const missingMethod = (name: string) =>
+  new TypeError(`The RPC receiver does not implement the method "${name}".`);
 
 describe("the timeline graph's data", () => {
   test("every timeline and every event once, oldest first, with the names it groups by", async () => {
@@ -141,6 +147,46 @@ describe("the timeline graph's data", () => {
     const ids = Array.from({ length: SUBSCRIBED_PROJECTS_BATCH + 1 }, (_, n) => `repo-${n}`);
     const tooMany = await t.tracker.subscribedProjectsFor(t.access, ids);
     expect(tooMany).toMatchObject({ ok: false, status: 400, code: "invalid_input" });
+  });
+
+  test("a Tracker still on the previous release answers per repository, with the same data", async () => {
+    const t = await setup();
+    await t.fork("ui");
+    const current = await t.get("ann");
+    expect(current.status).toBe(200);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const batched = vi
+      .spyOn(t.tracker, "subscribedProjectsFor")
+      .mockRejectedValue(missingMethod("subscribedProjectsFor"));
+    const single = vi.spyOn(t.tracker, "subscribedProjects");
+    const previous = await t.get("ann");
+    expect(previous).toEqual(current);
+    expect(batched).toHaveBeenCalledTimes(1);
+    expect(single).toHaveBeenCalledTimes(1);
+    expect(single).toHaveBeenCalledWith(expect.anything(), "app");
+
+    // Each repository's projects land under its id, mapped as the batch's are.
+    single.mockResolvedValueOnce({
+      ok: true,
+      value: [{ projectId: "prj_web", slug: "web", name: "Web" }],
+    });
+    expect((await t.get("ann")).body.projects).toEqual({
+      app: [{ id: "prj_web", slug: "web", name: "Web" }],
+    });
+  });
+
+  test("only a missing subscribedProjectsFor falls back; other failures still fail", async () => {
+    const t = await setup();
+    await t.fork("ui");
+    const single = vi.spyOn(t.tracker, "subscribedProjects");
+    const batched = vi
+      .spyOn(t.tracker, "subscribedProjectsFor")
+      .mockRejectedValueOnce(new Error("tracker unavailable"))
+      .mockRejectedValueOnce(missingMethod("somethingElse"));
+    expect((await t.request("ann")).status).toBe(500);
+    expect((await t.request("ann")).status).toBe(500);
+    expect(batched).toHaveBeenCalledTimes(2);
+    expect(single).not.toHaveBeenCalled();
   });
 
   test("people outside the tracker are refused", async () => {

@@ -795,7 +795,10 @@ test("a step's screenshots and diagram, compared with the step before (CORE-383)
     .element(visuals.getByRole("img", { name: "Board" }))
     .toHaveAttribute("src", `${png}#Board-after`);
   await expect.element(visuals.getByText("Architecture", { exact: true })).toBeVisible();
-  await expect.poll(() => visuals.element().querySelector("svg")).not.toBeNull();
+  // Mermaid is a lazily loaded bundle: its first render can take seconds on a busy runner.
+  await expect
+    .poll(() => visuals.element().querySelector("svg"), { timeout: 15_000 })
+    .not.toBeNull();
 
   // Enlarged: Before and After swap the picture; Escape closes it and only it.
   await thumb("Board").click();
