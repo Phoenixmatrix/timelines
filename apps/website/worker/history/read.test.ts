@@ -448,12 +448,20 @@ describe("a directory's last changes in one request (CORE-451)", () => {
           });
           expect(partial.stopped).toBeUndefined();
           expect(g.derived.has(`${LAST_CHANGES}/${derivedId(`c${base}`, path)}`)).toBe(true);
+          // Without the kept change sets, only the base's answer can stand in for its range.
+          for (const key of g.derived.keys())
+            if (key.startsWith(`${CHANGES}/`)) g.derived.delete(key);
+          g.stores.length = 0;
           const merged = await readHistory(g.reader, `c${head}`, path, true, `c${head}`, {
             cover: true,
           });
           expect(plain(merged), `path "${path}", cut base ${distance} back`).toEqual(
             expected(head),
           );
+          // It worked out no commit in the base's range: it took the range whole.
+          const worked = g.stores.filter((key) => key.startsWith(`${CHANGES}/`));
+          for (let at = 0; at < partial.scanned; at++)
+            expect(worked).not.toContain(`${CHANGES}/${derivedId(`c${base - at}`, path)}`);
         }
       }
     });

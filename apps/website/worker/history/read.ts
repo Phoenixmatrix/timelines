@@ -12,8 +12,13 @@ type Trees = ReturnType<typeof treeLoader>;
 export const HISTORY_PAGE_SIZE = 100;
 /**
  * Commits one cover request walks itself (CORE-451) before answering with
- * `next` set. A count, not a time, so the same request stops at the same
- * commit every time and its answer can be kept.
+ * `next` set. A count, not a time, so an answer it ends is exact for the range
+ * it covers and can be kept. Where a head's answer stops still varies: it
+ * takes the range of the newest kept answer it finds below the head (looked up
+ * in the Cache API for the first BASE_PEEK commits, in this isolate's memory
+ * only deeper), so a head found with a base reaches further than one without.
+ * Every kept answer is exact for its range, a complete answer is the same
+ * however it was reached, and the UI shows a plain count only once complete.
  */
 export const COVER_BUDGET = 1000;
 /** Not a budget but a safety stop: a walk still going after this long answers what it has, unkept. */

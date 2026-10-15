@@ -77,8 +77,10 @@ export async function codeLoader({ request, params }: LoaderFunctionArgs) {
   // them up, so its reads start now, beside the detail and the tree, rather
   // than after them (a cold Tracker can take over a second). Each part shows
   // when it arrives and is dropped (null) when it fails. Knowledge and CI
-  // reads are cached; readiness is read live.
+  // reads are cached; readiness is read live. `access` is the identity the
+  // reads were made for (lib/session.ts), so the rail keys on it.
   const rail = {
+    access: accessEpoch(),
     knowledge:
       source && source !== "canonical"
         ? Promise.resolve(null)
@@ -463,10 +465,10 @@ export function Code() {
         )}
       </div>
       <aside aria-label="About this repository" className={`hidden xl:block ${railClass}`}>
-        {/* Never reuse a resolved private count while a different repository or scope loads. */}
+        {/* Never reuse a resolved private count while a different identity, repository or scope loads. */}
         {rail && (
           <AboutRail
-            key={`${repo.id}:${repo.source?.sourceId ?? "canonical"}:${scopeOf(search) ?? "main"}`}
+            key={`${rail.access}:${repo.id}:${repo.source?.sourceId ?? "canonical"}:${scopeOf(search) ?? "main"}`}
             repo={repo}
             reads={rail}
           />

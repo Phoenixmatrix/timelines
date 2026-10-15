@@ -12,6 +12,7 @@ import type {
 } from "../../../shared/api.ts";
 import { commitId } from "../../testing/atlas.ts";
 import { cannedFiles } from "../../testing/git.ts";
+import { announceAccessChange } from "../../lib/session.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
 
@@ -136,5 +137,49 @@ test("moving between folders shows the new one at once and keeps the rail while 
     await expect.element(about.getByRole("heading", { name: "CI on main" })).toBeVisible();
   } finally {
     releaseLater();
+  }
+});
+
+test("an access change empties the rail rather than show the last identity's count", async () => {
+  const server = await TestServer.start({ world: true });
+  await server.repo("orbit", "engine");
+  const head = commitId();
+  await server.push("orbit/engine", "main", head);
+  cannedFiles(server, head, ["README.md", "engine.ts"]);
+  server.on("GET", "/api/repos/orbit/engine/ci", { runs: [], runner: "local" } satisfies CiRunList);
+  // The first identity's count answers; the next one's waits, as a cold Tracker would.
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  let counts = 0;
+  server.on(
+    "GET",
+    "/api/repos/orbit/engine/tracker/summary",
+    async (): Promise<RepoIssueSummary> => {
+      if (++counts === 1) return { ready: 3, projects: 1 };
+      await released;
+      return { ready: 5, projects: 1 };
+    },
+  );
+  try {
+    const app = renderApp("/orbit/engine");
+    const about = page.getByRole("complementary", { name: "About this repository" });
+    await expect
+      .element(about.getByRole("link", { name: "Issues · 3 ready", exact: true }))
+      .toBeVisible();
+
+    // Signed out, or another account signed in: the page reads everything again.
+    announceAccessChange();
+    await app.router.revalidate();
+    await expect.poll(() => counts).toBe(2);
+    // The rail comes back for the new identity with its count still held…
+    await expect.element(about.getByTestId("issues-pending")).toBeInTheDocument();
+    // …and never with the count the last one was shown.
+    expect(about.getByRole("link", { name: /^Issues ·/ }).elements()).toHaveLength(0);
+    release();
+    await expect
+      .element(about.getByRole("link", { name: "Issues · 5 ready", exact: true }))
+      .toBeVisible();
+  } finally {
+    release();
   }
 });

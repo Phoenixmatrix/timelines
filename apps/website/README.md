@@ -268,9 +268,15 @@ commit trailers, not verified account identities.
 most 100 commits, except with `cover=1` (with `entries=true`): then it scans on,
 up to 1000 commits of its own, until every entry and the path itself have their
 latest change, and stops at that commit (from a cursor, after at least 100). The
-budget is a commit count, so a request always stops at the same commit; only a
-5 s safety stop, or a missing parent commit or tree, ends one early, and such an
-answer is neither cached nor kept.
+budget is a commit count, not a time, so an answer it ends is exact for the
+commits it covers. Where an answer from a head stops is not fixed: it depends on
+which kept answers the scan finds below the head (asked of the Cache API for its
+first 32 commits, of the isolate's memory only deeper; see below), so the same
+request can reach further one time than another. Every kept answer is exact for
+its range, a complete answer is the same however it was reached, and the UI
+shows a plain count only once history is complete. Only a 5 s safety stop, or a
+missing parent commit or tree, ends one early, and such an answer is neither
+cached nor kept.
 `next` is the next commit to scan; pass it as `cursor` and pin `ref` to the
 returned `head` for subsequent pages. The file list loads this separately from
 files with `cover=1`, and follows pages until every displayed file and folder has

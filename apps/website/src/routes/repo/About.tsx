@@ -81,8 +81,9 @@ function useSettled<T>(read: Promise<T>): { value: T } | undefined {
 /**
  * Each part renders when its own read arrives, nothing before; CI waits for
  * the About section above it (its read is cached and quick) so it never
- * pushes that down. Key it by the repository and scope so a part never shows
- * another repository's data while the new one loads.
+ * pushes that down. Key it by the access epoch, repository and scope so a
+ * part never shows another identity's or repository's data while the new one
+ * loads.
  */
 export function AboutRail({ repo, reads }: { repo: RepoDetail; reads: AboutReads }) {
   const knowledge = useSettled(reads.knowledge);
