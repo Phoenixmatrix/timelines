@@ -12,6 +12,7 @@ import {
   readinessPlan,
   type ReadyOptions,
   type ReadyPlan,
+  websiteTestSelection,
 } from "./ready-plan.ts";
 import { ciBuildPlan } from "./ci-build.ts";
 
@@ -662,7 +663,7 @@ await test("CI build selection takes the newest candidate that is an ancestor", 
     });
     const env = {
       GITMATRIX_COMMIT: base,
-      GITMATRIX_VERIFIED_BASE: JSON.stringify([
+      GITMATRIX_VERIFIED_BASES: JSON.stringify([
         entry("f".repeat(40), 3),
         entry(other, 2),
         entry(base, 1),
@@ -672,10 +673,34 @@ await test("CI build selection takes the newest candidate that is an ancestor", 
     // Without an ancestor, or with only malformed entries, everything builds.
     for (const list of [[entry(other, 2)], [entry(other, 2), { commit: base }]]) {
       assert.equal(
-        (await ciBuildPlan(root, { ...env, GITMATRIX_VERIFIED_BASE: JSON.stringify(list) })).build,
+        (await ciBuildPlan(root, { ...env, GITMATRIX_VERIFIED_BASES: JSON.stringify(list) })).build,
         true,
       );
     }
+    // A usable list wins over the single object; an unusable one falls back to it.
+    const single = JSON.stringify(entry(base, 1));
+    const stale = JSON.stringify([entry(other, 2)]);
+    assert.equal(
+      (
+        await ciBuildPlan(root, {
+          ...env,
+          GITMATRIX_VERIFIED_BASES: stale,
+          GITMATRIX_VERIFIED_BASE: single,
+        })
+      ).build,
+      true,
+    );
+    for (const bases of [undefined, "not-json", "null"])
+      assert.equal(
+        (
+          await ciBuildPlan(root, {
+            GITMATRIX_COMMIT: base,
+            GITMATRIX_VERIFIED_BASES: bases,
+            GITMATRIX_VERIFIED_BASE: single,
+          })
+        ).build,
+        false,
+      );
   });
 });
 
@@ -833,13 +858,32 @@ await test("local ready slims the full fallback to checks and direct tests", asy
   });
 });
 
+await test("the README's readers are found by name in the real website", () => {
+  const files = websiteTestSelection(["apps/website/README.md"], repository).files;
+  assert.ok(files.includes("worker/ci/config.test.ts"), files.join(","));
+  assert.equal(
+    files.some((file) => file.endsWith(".browser.test.tsx")),
+    false,
+  );
+  assert.deepEqual(websiteTestSelection(["apps/website/worker/ci/jobs.ts"], repository).files, []);
+});
+
 await test("local ready runs the website unit tests a README change reaches", async () => {
   await fixture(async (root, _git, put) => {
+    await put("apps/website/worker/ci/fake.test.ts", "// reads ../../README.md\n");
     await put("apps/website/README.md");
     const { gates } = await local(root);
     const website = gates.find((gate) => gate.name === "website-tests");
     assert.ok(website);
     assert.ok(website.args.some((arg) => arg.startsWith("--changed=")));
+    // Vitest ANDs filters with --changed, so the README's readers run by name in their own gate.
+    const readme = gates.find((gate) => gate.name === "website-readme-tests");
+    assert.ok(readme);
+    assert.deepEqual(readme.args.slice(1, 4), ["--project", "unit", "worker/ci/fake.test.ts"]);
+    assert.equal(
+      readme.args.some((arg) => arg.startsWith("--changed")),
+      false,
+    );
     assert.equal(localNames(gates).includes("website-browser-tests"), false);
   });
 });

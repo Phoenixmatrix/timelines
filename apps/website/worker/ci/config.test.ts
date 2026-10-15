@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vite-plus/test";
-import readme from "../../README.md?raw";
 import {
   branchMatches,
   ConfigError,
@@ -138,6 +137,10 @@ jobs:
   });
 
   test("the README's worked example opts in and splits create from teardown", () => {
+    const readme = readFileSync(
+      fileURLToPath(new URL("../../README.md", import.meta.url).href),
+      "utf8",
+    );
     const section = readme.slice(readme.indexOf("#### The preview contract"));
     const example = /```yaml\n([\s\S]*?)```/.exec(section)![1]!;
     const pipeline = parsePipeline(example);

@@ -25,7 +25,11 @@ const lockPath = join(stateDirectory, "tick.lock");
 // before its own timeout has recorded the result (CORE-406).
 export const installTimeoutMs = 20 * 60_000;
 export const e2eTimeoutMs = 85 * 60_000;
-/** The full unit and browser suites that remote CI no longer runs per push. */
+/**
+ * The full unit and browser suites that remote CI no longer runs per push. The full suite took
+ * about 5 minutes on a 4-CPU host after b8dbf2c5; the budget must fit the unit's
+ * TimeoutStartSec (see the sum asserted in main-e2e.test.ts).
+ */
 export const testsTimeoutMs = 30 * 60_000;
 /** After SIGTERM the run gets this long to destroy its environment before SIGKILL. */
 export const e2eGraceMs = 3 * 60_000;
@@ -53,6 +57,8 @@ export interface MainE2EResult {
   log: string;
   /** The unit and browser suites' log, recorded when they ran for this commit. */
   testsLog?: string;
+  /** The suites hit `testsTimeoutMs` and were killed. */
+  testsTimedOut?: boolean;
   finishedAt: string;
 }
 
@@ -61,6 +67,8 @@ export interface TestsResult {
   sha: string;
   success: boolean;
   log: string;
+  /** The run hit `testsTimeoutMs`. */
+  timedOut: boolean;
   /** A failure was filed (or commented on) while E2E was deferred; not filed twice. */
   reported?: boolean;
 }
@@ -194,6 +202,11 @@ export function failureBody(result: MainE2EResult, heading: string): string {
     ...(e2eFailed || !testsFailed ? ["Failed scenarios:", scenarios] : []),
     ...(testsFailed
       ? [
+          ...(result.testsTimedOut
+            ? [
+                `The full test suite timed out after ${testsTimeoutMs / 60_000} minutes and was killed.`,
+              ]
+            : []),
           `Unit and browser tests log: ${result.testsLog ?? "none retained"}`,
           `Reproduce the tests: check out ${result.sha} and run \`vp run --filter '!cli' --concurrency-limit 1 test\`.`,
         ]
@@ -235,6 +248,7 @@ export function testsFailureResult(tests: TestsResult, finishedAt: string): Main
     evidence: null,
     log: tests.log,
     testsLog: tests.log,
+    testsTimedOut: tests.timedOut,
     finishedAt,
   };
 }
@@ -272,7 +286,7 @@ export function decideOutcome(input: {
 /** A full-suite failure joins the E2E result: the same P0 report, dedupe and recovery apply. */
 export function withTestsOutcome(
   outcome: RunOutcome,
-  tests: Pick<TestsResult, "success" | "log">,
+  tests: Pick<TestsResult, "success" | "log" | "timedOut">,
 ): RunOutcome {
   if (outcome.kind !== "result" || tests.success) return outcome;
   const { result } = outcome;
@@ -282,6 +296,7 @@ export function withTestsOutcome(
       ...result,
       success: false,
       testsLog: tests.log,
+      testsTimedOut: tests.timedOut,
       failedStages: result.failedStages.includes("tests")
         ? result.failedStages
         : [...result.failedStages, "tests"],
@@ -421,8 +436,10 @@ function run(
 
 /**
  * Runs a command in its own process group, output to `descriptor`. On timeout the whole group
- * gets SIGTERM, then SIGKILL after `graceMs`; leftovers (Vitest workers, Chromium) are killed
- * when it exits, so nothing outlives the run.
+ * gets SIGTERM, then SIGKILL after `graceMs`, and the group is SIGKILLed again when the command
+ * exits, so Vitest workers do not outlive it. Playwright launches Chromium detached, in its own
+ * process group, so these kills do not reach it; systemd's control-group kill reclaims it when
+ * the oneshot unit ends.
  */
 function runGroup(
   binary: string,
@@ -878,7 +895,12 @@ export async function tick(): Promise<void> {
           timeoutMs: testsTimeoutMs,
           graceMs: testsGraceMs,
         });
-        tests = { sha: head, success: !ran.timedOut && ran.code === 0, log: testsLogPath };
+        tests = {
+          sha: head,
+          success: !ran.timedOut && ran.code === 0,
+          log: testsLogPath,
+          timedOut: ran.timedOut,
+        };
       } finally {
         closeSync(testsLog);
       }

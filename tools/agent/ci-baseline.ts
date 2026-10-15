@@ -19,9 +19,10 @@ export async function verifiedBaseline(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ baseline: VerifiedBaseline } | { reason: string }> {
   try {
-    // An array of candidates, newest first; an older server names one object.
-    const parsed: unknown = JSON.parse(env.GITMATRIX_VERIFIED_BASE ?? "null");
-    const candidates = (Array.isArray(parsed) ? parsed : [parsed]).filter(valid);
+    // GITMATRIX_VERIFIED_BASES lists candidates, newest first; an older server sets only the
+    // single GITMATRIX_VERIFIED_BASE object, which is the fallback when the list is unusable.
+    const candidates =
+      list(env.GITMATRIX_VERIFIED_BASES) ?? [parse(env.GITMATRIX_VERIFIED_BASE)].filter(valid);
     if (!candidates.length || !/^[a-f0-9]{40}$/.test(env.GITMATRIX_COMMIT ?? ""))
       return { reason: "No executed, runtime-equivalent verification baseline; run everything." };
     const git = async (args: string[]) =>
@@ -47,6 +48,19 @@ export async function verifiedBaseline(
   return {
     reason: "Verification baseline or its ancestor history is unavailable; run everything.",
   };
+}
+
+function parse(text: string | undefined): unknown {
+  try {
+    return JSON.parse(text ?? "null");
+  } catch {
+    return null;
+  }
+}
+
+function list(text: string | undefined): VerifiedBaseline[] | null {
+  const parsed = parse(text);
+  return Array.isArray(parsed) ? parsed.filter(valid) : null;
 }
 
 function valid(value: unknown): value is VerifiedBaseline {

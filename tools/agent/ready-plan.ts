@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
@@ -400,7 +401,7 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
 
 const WEBSITE = "apps/website/";
 
-/** The one README the website's tests read (worker/ci/config.test.ts, as a `?raw` import). */
+/** The one README the website's tests read (worker/ci/config.test.ts). */
 export const WEBSITE_README = `${WEBSITE}README.md`;
 
 /** Configuration or setup that Vitest's changed-file graph cannot be trusted to follow. */
@@ -415,12 +416,42 @@ function websiteConfig(path: string): boolean {
 }
 
 /**
+ * The website unit test files whose source names the README (they read it). Vitest's changed
+ * graph does not trace a README read, so these are selected by name.
+ */
+export function readmeTests(root: string): string[] {
+  const found: string[] = [];
+  for (const dir of ["worker", "registry", "src", "shared"]) {
+    let entries: string[];
+    try {
+      entries = readdirSync(join(root, WEBSITE, dir), { recursive: true, encoding: "utf8" });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!/\.test\.tsx?$/.test(entry) || entry.endsWith(".browser.test.tsx")) continue;
+      if (entry.split("/").includes("node_modules")) continue;
+      const path = `${dir}/${entry}`;
+      try {
+        if (readFileSync(join(root, WEBSITE, path), "utf8").includes("README.md")) found.push(path);
+      } catch {}
+    }
+  }
+  return found.sort();
+}
+
+/**
  * Which website tests a change needs when `website-tests` is selected: whether Vitest's
  * `--changed` graph can be trusted for the unit project, and whether browser tests can be
  * affected. Shared by remote CI (ci-test.ts) and local `ready`.
  */
-export function websiteTestSelection(changed: string[]): {
+export function websiteTestSelection(
+  changed: string[],
+  root: string,
+): {
   unit: "all" | "changed";
+  /** Unit test files, relative to apps/website, to run by name: Vitest does not trace the README read. */
+  files: string[];
   browser: boolean;
   reasons: string[];
 } {
@@ -444,6 +475,7 @@ export function websiteTestSelection(changed: string[]): {
       !code.every((path) => path.endsWith(".test.ts") && !path.endsWith(".browser.test.tsx")));
   return {
     unit: traceable ? "changed" : "all",
+    files: changed.includes(WEBSITE_README) ? readmeTests(root) : [],
     browser,
     reasons: traceable
       ? []
@@ -495,14 +527,18 @@ export async function localGates(root: string, plan: ReadyPlan): Promise<ReadyPl
         args: ["../../tools/agent/website-tests.ts", ...args],
         cwd: "website",
       });
+      const selection = websiteTestSelection(plan.changed, root);
       tests.push(
         runner(
           "website-tests",
-          websiteTestSelection(plan.changed).unit === "changed"
+          selection.unit === "changed"
             ? ["--project", "unit", `--changed=${plan.base}`, "--passWithNoTests"]
             : ["--project", "unit"],
         ),
       );
+      // Vitest ANDs positional filters with `--changed`, so the README's readers get their own run.
+      if (selection.unit === "changed" && selection.files.length)
+        tests.push(runner("website-readme-tests", ["--project", "unit", ...selection.files]));
       const browser = new Set<string>();
       for (const path of plan.changed) {
         if (!path.startsWith("apps/website/src/")) continue;

@@ -778,17 +778,29 @@ describe("verified change-selection baselines", () => {
     expect(await previousVerification(t.env.DB, "production-check")).toEqual([
       { commit, runNumber: 1, jobId: "gates-check" },
     ]);
-    t.sqlite.exec(`UPDATE ci_jobs SET spec=json_set(spec,'$.env.GITMATRIX_VERIFIED_BASE','forged')
-      WHERE name='check'`);
+    t.sqlite.exec(`UPDATE ci_jobs SET spec=json_set(spec,'$.env.GITMATRIX_VERIFIED_BASE','forged',
+      '$.env.GITMATRIX_VERIFIED_BASES','forged') WHERE name='check'`);
     const payload = await jobPayload(t.env, (await loadJob(t.env.DB, "production-check"))!, {
       origin: "https://gm.test",
       token: "test-token",
     });
-    expect(JSON.parse(payload.env.GITMATRIX_VERIFIED_BASE ?? "null")).toEqual([
+    // The published single-object contract, and the newest-first list beside it.
+    expect(JSON.parse(payload.env.GITMATRIX_VERIFIED_BASE ?? "")).toEqual({
+      commit,
+      runNumber: 1,
+      jobId: "gates-check",
+    });
+    expect(JSON.parse(payload.env.GITMATRIX_VERIFIED_BASES ?? "")).toEqual([
       { commit, runNumber: 1, jobId: "gates-check" },
     ]);
     t.sqlite.exec("UPDATE ci_jobs SET status='skipped', verified_by='{}' WHERE id='gates-check'");
     expect(await previousVerification(t.env.DB, "production-check")).toEqual([]);
+    const none = await jobPayload(t.env, (await loadJob(t.env.DB, "production-check"))!, {
+      origin: "https://gm.test",
+      token: "test-token",
+    });
+    expect(none.env.GITMATRIX_VERIFIED_BASE).toBe("null");
+    expect(none.env.GITMATRIX_VERIFIED_BASES).toBe("[]");
   });
 
   test("returns every qualifying candidate newest first and still applies the filters", async () => {
@@ -883,7 +895,7 @@ test.each(["landing", "queue"] as const)(
 const SANDBOX_SOURCES = ["sandbox.ts", "jobs.ts", "registry.ts"];
 const RECORDED_SANDBOX_SOURCES = {
   contract: 1,
-  sha256: "b0ec3fb3ab41e6be4d1b677e0f1dfb26ee0738ef1e826c89a95e7cae0f415cca",
+  sha256: "b42aef0a9326b6489542497d504a4afe2e3f58cd4bb1b65f6284ecc2b735ec64",
 };
 
 test("a change to the sandbox execution sources is a deliberate contract decision", () => {

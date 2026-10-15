@@ -164,8 +164,11 @@ await test("a failed full test suite joins the E2E result and names the stage", 
     code: 0,
     parsed: parseRunLog(JSON.stringify({ event: "e2e.complete", success: true, failedStages: [] })),
   });
-  assert.deepEqual(withTestsOutcome(passed, { success: true, log: "/tests" }), passed);
-  const merged = withTestsOutcome(passed, { success: false, log: "/tests" });
+  assert.deepEqual(
+    withTestsOutcome(passed, { success: true, log: "/tests", timedOut: false }),
+    passed,
+  );
+  const merged = withTestsOutcome(passed, { success: false, log: "/tests", timedOut: false });
   assert.equal(merged.kind === "result" && merged.result.success, false);
   assert.deepEqual(merged.kind === "result" && merged.result.failedStages, ["tests"]);
   assert.equal(
@@ -175,13 +178,16 @@ await test("a failed full test suite joins the E2E result and names the stage", 
   // Alongside an E2E failure the stage is added once, and an environment limit stays a retry.
   const both = withTestsOutcome(
     { kind: "result", result: result({ failedStages: ["tests"] }) },
-    { success: false, log: "/tests" },
+    { success: false, log: "/tests", timedOut: false },
   );
   assert.deepEqual(both.kind === "result" && both.result.failedStages, ["tests"]);
   assert.equal(merged.kind === "result" && merged.result.testsLog, "/tests");
-  assert.deepEqual(withTestsOutcome({ kind: "retry-later" }, { success: false, log: "/tests" }), {
-    kind: "retry-later",
-  });
+  assert.deepEqual(
+    withTestsOutcome({ kind: "retry-later" }, { success: false, log: "/tests", timedOut: false }),
+    {
+      kind: "retry-later",
+    },
+  );
 });
 
 await test("either environment limit retries later without a result; a timeout is a failure of its own", () => {
@@ -315,7 +321,7 @@ await test("the lock is taken atomically with its pid, and a stale one is replac
 });
 
 await test("tests outcomes are reused for the same head and rerun for a new one", () => {
-  const tests = { sha: "a", success: false, log: "/a.tests.log" };
+  const tests = { sha: "a", success: false, log: "/a.tests.log", timedOut: false };
   assert.deepEqual(decideTests("a", { testsResult: tests }), { kind: "reuse", tests });
   assert.deepEqual(decideTests("b", { testsResult: tests }), { kind: "run" });
   assert.deepEqual(decideTests("a", {}), { kind: "run" });
@@ -323,7 +329,7 @@ await test("tests outcomes are reused for the same head and rerun for a new one"
 
 await test("a tests failure with E2E deferred becomes a tests-only result", () => {
   const failed = testsFailureResult(
-    { sha: "a".repeat(40), success: false, log: "/a.tests.log" },
+    { sha: "a".repeat(40), success: false, log: "/a.tests.log", timedOut: false },
     "2026-01-01T00:00:00Z",
   );
   assert.equal(failed.success, false);
@@ -333,6 +339,28 @@ await test("a tests failure with E2E deferred becomes a tests-only result", () =
   assert.match(body, /Unit and browser tests log: \/a\.tests\.log/);
   assert.match(body, /vp run --filter '!cli' --concurrency-limit 1 test/);
   assert.doesNotMatch(body, /vp run agent test/);
+});
+
+await test("a timed-out full suite says so in the body", () => {
+  const timedOut = testsFailureResult(
+    { sha: "a".repeat(40), success: false, log: "/a.tests.log", timedOut: true },
+    "2026-01-01T00:00:00Z",
+  );
+  assert.equal(timedOut.testsTimedOut, true);
+  assert.match(
+    failureBody(timedOut, "Failing"),
+    new RegExp(`The full test suite timed out after ${testsTimeoutMs / 60_000} minutes`),
+  );
+  const merged = withTestsOutcome(finished({ code: 0 }), {
+    success: false,
+    log: "/t.log",
+    timedOut: true,
+  });
+  assert.match(
+    merged.kind === "result" ? failureBody(merged.result, "Failing") : "",
+    /timed out after 30 minutes/,
+  );
+  assert.doesNotMatch(failureBody(result({ failedStages: ["tests"] }), "Failing"), /timed out/);
 });
 
 await test("the body names the tests log and the E2E log when both failed", () => {

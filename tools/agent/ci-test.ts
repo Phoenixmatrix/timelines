@@ -12,6 +12,8 @@ export interface CiTestPlan {
   /** Workspace labels (not website, not cli) whose `test` task runs. */
   workspaces: string[];
   websiteUnit: "all" | "changed" | "none";
+  /** Unit test files (relative to apps/website) to run by name, beyond `websiteUnit`. */
+  websiteFiles: string[];
   websiteBrowser: boolean;
 }
 
@@ -63,6 +65,7 @@ export async function ciTestPlan(
     reasons: [reason],
     workspaces: [],
     websiteUnit: "all" as const,
+    websiteFiles: [],
     websiteBrowser: true,
   });
   const verified = await verifiedBaseline(root, env);
@@ -82,6 +85,7 @@ export async function ciTestPlan(
   );
   const reasons: string[] = [];
   let websiteUnit: CiTestPlan["websiteUnit"] = "none";
+  let websiteFiles: string[] = [];
   let websiteBrowser = false;
   const runner = new Set(websiteRunnerFiles(root));
   if (plan.changed.some((path) => runner.has(path))) {
@@ -89,9 +93,10 @@ export async function ciTestPlan(
     websiteBrowser = true;
     reasons.push("The website's test runner changed: every website test runs.");
   } else if (gates.has("website-tests") || plan.changed.includes(WEBSITE_README)) {
-    // The README is documentation to the plan, but a unit test reads it (as a `?raw` import).
-    const selection = websiteTestSelection(plan.changed);
+    // The README is documentation to the plan, but a unit test reads it.
+    const selection = websiteTestSelection(plan.changed, root);
     websiteUnit = selection.unit;
+    websiteFiles = selection.files;
     websiteBrowser = selection.browser;
     reasons.push(...selection.reasons);
   }
@@ -102,6 +107,7 @@ export async function ciTestPlan(
     reasons: [...plan.reasons, ...reasons],
     workspaces,
     websiteUnit,
+    websiteFiles,
     websiteBrowser,
   };
 }
@@ -137,6 +143,10 @@ if (import.meta.main) {
             "--passWithNoTests",
             ...(plan.websiteUnit === "changed" ? [`--changed=${plan.baseline!.commit}`] : []),
           ]);
+        // Vitest ANDs positional filters with `--changed`, so files chosen by name run apart,
+        // without `--passWithNoTests`: a missing file fails.
+        if (plan.websiteUnit !== "all" && plan.websiteFiles.length)
+          tests(["--project", "unit", ...plan.websiteFiles]);
         if (plan.websiteBrowser) tests(["--project", "browser"]);
       }
     }

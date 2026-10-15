@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { ciTestPlan, websiteRunnerFiles } from "./ci-test.ts";
+import { websiteTestSelection } from "./ready-plan.ts";
 
 const exec = promisify(execFile);
 const repository = resolve(import.meta.dirname, "../..");
@@ -74,6 +75,14 @@ async function fixture(
     await rm(root, { recursive: true, force: true });
   }
 }
+
+await test("the real website README is read by worker/ci/config.test.ts", async () => {
+  assert.ok(
+    websiteTestSelection(["apps/website/README.md"], repository).files.includes(
+      "worker/ci/config.test.ts",
+    ),
+  );
+});
 
 await test("without a verified baseline the full suite runs", async () => {
   await fixture(async (_plan, _put, _git, env) => {
@@ -240,9 +249,11 @@ await test("the test runner's files follow its relative imports", async () => {
 await test("the website README, which a unit test reads, runs the changed unit tests only", async () => {
   await fixture(async (plan, put) => {
     await put("apps/website/README.md");
+    await put("apps/website/worker/ci/fake.test.ts", "// reads ../../README.md\n");
     const selected = await plan();
     assert.equal(selected.full, false);
     assert.equal(selected.websiteUnit, "changed");
+    assert.deepEqual(selected.websiteFiles, ["worker/ci/fake.test.ts"]);
     assert.equal(selected.websiteBrowser, false);
   });
 });

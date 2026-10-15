@@ -3500,6 +3500,8 @@ of those reuse properties.
   `context-invariant-v1` sandbox jobs without secrets can receive evidence.
   It is a candidate comparison baseline, not authorization to skip a required
   job; consumers must prove ancestry and complete input independence.
+  `GITMATRIX_VERIFIED_BASES` is reserved the same way: a JSON array of up to 20
+  such objects, newest first, or `[]`.
 
 API: `/api/repos/:o/:n/ci` (runs, `?ref=<branch>` for one branch's, run detail,
 logs with `?after=`, cancel, re-run, commit statuses, secrets) and

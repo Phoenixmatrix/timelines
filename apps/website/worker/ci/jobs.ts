@@ -93,7 +93,7 @@ export async function jobPayload(
   // source (whose ref is just `work`, CORE-296), names the timeline.
   const timeline = job.timeline_slug ?? timelineSlug ?? timelineSlugOf(`refs/heads/${job.ref}`);
   const gitUrl = `${registry.origin}/${job.full_name}${timelineSlug ? `@${encodeURIComponent(timelineSlug)}` : ""}.git`;
-  const verifiedBase = JSON.stringify(await previousVerification(d1, job.id));
+  const verifiedBases = await previousVerification(d1, job.id);
   await resolveJobAuthority(env, job.id);
   return {
     id: job.id,
@@ -132,7 +132,8 @@ export async function jobPayload(
       ...spec.env,
       ...secrets,
       // Reserved: repository env and secrets cannot manufacture verification provenance.
-      GITMATRIX_VERIFIED_BASE: verifiedBase,
+      GITMATRIX_VERIFIED_BASE: JSON.stringify(verifiedBases[0] ?? null),
+      GITMATRIX_VERIFIED_BASES: JSON.stringify(verifiedBases),
     },
     files: setup.files,
     steps: spec.steps.map((s, i) => ({ position: i, name: s.name, run: s.run })),
