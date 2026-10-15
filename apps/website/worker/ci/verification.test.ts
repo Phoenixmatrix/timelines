@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
 import { onPush, startRun, startWorkflow } from "./trigger.ts";
 import {
   candidateProofs,
   executionIdentity,
+  SANDBOX_CONTRACT,
   prerequisitesSatisfied,
   previousVerification,
 } from "./verification.ts";
@@ -19,7 +20,7 @@ import { tokenCredential, type AppEnv } from "../auth.ts";
 import { claim, jobPayload, loadJob } from "./jobs.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
-import { seedSpaceFixture } from "../testing/spaces.ts";
+import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 
 const fixture = vi.hoisted(() => ({
   yaml: "",
@@ -126,8 +127,8 @@ async function setup(config = yaml) {
   fixture.landing = async () => {};
   fixture.queue = async () => {};
   fixture.refs = [{ shortName: "main", oid: commit }];
-  const sqlite = migratedDatabase();
-  const registry = migratedRegistryDatabase();
+  const fresh = await freshInstallationDatabases();
+  const { sqlite, registry } = fresh;
   databases.push(sqlite, registry);
   const workflows = new Set<string>();
   const env = {
@@ -145,7 +146,7 @@ async function setup(config = yaml) {
       },
     },
   } as unknown as Env;
-  const admission = installCutoverTestControl(env);
+  const admission = installCutoverTestControl(env, fresh.control);
   databases.push(admission.state.db);
   await initializeFreshSpaceInstallation(env);
   sqlite.exec(
@@ -402,7 +403,7 @@ describe("landed candidate verification", () => {
     ).toEqual([{ status: "pending", verified_by: null }]);
   });
 
-  test.each(["sandbox-v1:new-version:image", "sandbox-v1:version:new-image", null])(
+  test.each(["sandbox-v1:new-contract:image", "sandbox-v1:version:new-image", null])(
     "recovery rechecks runtime identity after D1 creation: %s",
     async (identity) => {
       const t = await setup(gatePipeline);
@@ -423,7 +424,7 @@ describe("landed candidate verification", () => {
     },
   );
 
-  test.each(["sandbox-v1:new-version:image", "sandbox-v1:version:new-image", null])(
+  test.each(["sandbox-v1:new-contract:image", "sandbox-v1:version:new-image", null])(
     "a cached plan cannot admit a delayed gate with changed identity: %s",
     async (identity) => {
       const t = await setup(gatePipeline);
@@ -744,10 +745,14 @@ describe("landed candidate verification", () => {
     ).toEqual({ n: 5 });
   });
 
-  test("only platform digest plus immutable Worker version identifies execution", () => {
+  test("platform digest plus sandbox contract identifies execution, from a deployed Worker only", () => {
     const version = { id: "12345678-1234-1234-1234-123456789abc" };
     const image = `registry/image@sha256:${"a".repeat(64)}`;
-    expect(executionIdentity(image, version)).toBe(`sandbox-v1:${version.id}:${image}`);
+    expect(executionIdentity(image, version)).toBe(`sandbox-v2:${SANDBOX_CONTRACT}:${image}`);
+    // Another deploy of the same sandbox contract keeps earlier proofs valid.
+    expect(executionIdentity(image, { id: "87654321-4321-4321-4321-cba987654321" })).toBe(
+      executionIdentity(image, version),
+    );
     expect(executionIdentity("default", version)).toBeNull();
     expect(executionIdentity("registry/image:latest", version)).toBeNull();
     expect(executionIdentity(image, undefined)).toBeNull();

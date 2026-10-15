@@ -46,6 +46,9 @@ const BASE_ENV = {
 };
 const FLUSH_MS = 1000;
 const FLUSH_BYTES = 16 * 1024;
+// How long log writes may keep failing (D1 "Network connection lost") before the
+// job is stopped; a revoked authority stops it at once.
+const FLUSH_FAILURE_MS = 30_000;
 const READY_TIMEOUT_MS = 180_000;
 /** A container that still isn't running after this long is asked to start again. */
 const RESTART_AFTER_MS = 10_000;
@@ -484,6 +487,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     let cancelled = false;
     let timedOut = false;
     let flushing: Promise<void> = Promise.resolve();
+    let failingSince: number | null = null;
     const flush = () => {
       // Even a silent process must observe revocation on the next poll.
       const text = buffer;
@@ -494,15 +498,34 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
           await resolveJobAuthority(this.env, jobId);
           result = await report(this.env, jobId, { logs: [{ step, text }] });
         } catch (error) {
+          // A transient write failure keeps the text for the next flush instead
+          // of throwing away a nearly finished job.
+          failingSince ??= Date.now();
+          if (
+            !(error instanceof WorkAuthorizationError) &&
+            Date.now() - failingSince < FLUSH_FAILURE_MS
+          ) {
+            buffer = text + buffer;
+            return;
+          }
           process.kill();
           throw error;
         }
+        failingSince = null;
         if (result.cancelled && !cancelled) {
           cancelled = true;
           process.kill();
         }
       });
       return flushing;
+    };
+    // Flush until the text is written; flush throws once failures outlast FLUSH_FAILURE_MS.
+    const drain = async () => {
+      await flush();
+      while (buffer) {
+        await new Promise((resolve) => setTimeout(resolve, FLUSH_MS));
+        await flush();
+      }
     };
     const timer = setInterval(() => {
       void flush().catch(() => {});
@@ -524,7 +547,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
       }
       buffer += decoder.decode();
       const code = await process.exitCode;
-      await flush();
+      await drain();
       if (cancelled) throw new Cancelled();
       outcome = { code: timedOut ? 124 : code };
     } catch (error) {
@@ -536,7 +559,7 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     // Drain writes after stopping timers. A flush failure takes precedence over
     // the stream result, but cannot bypass timer cleanup or process shutdown.
     try {
-      await flush();
+      await drain();
     } catch (error) {
       process.kill();
       await process.exitCode;

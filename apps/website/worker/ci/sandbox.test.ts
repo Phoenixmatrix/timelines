@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import type * as Artifacts from "../artifacts.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
 import { TrackerStore } from "../tracker/store.ts";
 import { drainDeletedRepoSources } from "../retention/work-sources.ts";
 import { cancelRun } from "./cancel.ts";
 import { CiSandbox } from "./sandbox.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
-import { seedSpaceFixture } from "../testing/spaces.ts";
+import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 import { issueToken } from "../api/tokens.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import { initializeFreshTrackerSpace } from "../tracker/space-migration.ts";
@@ -32,8 +32,8 @@ describe("Sandbox infrastructure retry cancellation", () => {
   test.each(["stopped", "stop-failed", "stop-unacknowledged"])(
     "%s preserves evidence and releases source purge only after confirmed shutdown",
     async (shutdown) => {
-      const sqlite = migratedDatabase();
-      const registry = migratedRegistryDatabase();
+      const fresh = await freshInstallationDatabases();
+      const { sqlite, registry } = fresh;
       const durable = fakeDurableState({ name: "org" });
       const stopping = Promise.withResolvers<void>();
       const stopped = Promise.withResolvers<void>();
@@ -84,7 +84,7 @@ describe("Sandbox infrastructure retry cancellation", () => {
           },
         },
       } as unknown as Env;
-      const admission = installCutoverTestControl(env);
+      const admission = installCutoverTestControl(env, fresh.control);
       await initializeFreshSpaceInstallation(env);
       sqlite.exec(
         "INSERT INTO accounts(id,kind,slug,display_name) VALUES ('person','user','person','Person')",
@@ -316,6 +316,172 @@ describe("Sandbox infrastructure retry cancellation", () => {
       }
     },
   );
+});
+
+describe("Sandbox log flushing", () => {
+  const MARKER = "flush marker output\n";
+
+  /** A real job on the canonical source whose `build` step prints MARKER. */
+  async function flushFixture(failLogWrite: () => boolean) {
+    const fresh = await freshInstallationDatabases();
+    const { sqlite, registry } = fresh;
+    const kill = vi.fn();
+    let running = false;
+    const container = {
+      get running() {
+        return running;
+      },
+      images: { default: "fixture-image" },
+      start() {
+        running = true;
+      },
+      async exec(command: string[]) {
+        const out = command[4] === "build" ? MARKER : "";
+        return {
+          stdout: new ReadableStream({
+            start(controller) {
+              if (out) controller.enqueue(new TextEncoder().encode(out));
+              controller.close();
+            },
+          }),
+          exitCode: Promise.resolve(0),
+          kill,
+        };
+      },
+      async destroy() {
+        running = false;
+      },
+    } as unknown as Container;
+    // Fail only the log insert carrying MARKER, so setup messages still land.
+    const real = d1(sqlite);
+    const failing = (statement: D1PreparedStatement) =>
+      new Proxy(statement, {
+        get(target, key) {
+          if (key !== "bind") return Reflect.get(target, key, target);
+          return (...params: unknown[]) => {
+            if (params.some((p) => typeof p === "string" && p.includes(MARKER)) && failLogWrite())
+              throw new Error("D1_ERROR: Network connection lost");
+            return target.bind(...params);
+          };
+        },
+      });
+    const DB = new Proxy(real, {
+      get(target, key) {
+        if (key !== "prepare") return Reflect.get(target, key, target);
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          return sql.includes('into "ci_logs"') ? failing(statement) : statement;
+        };
+      },
+    });
+    const env = {
+      DB,
+      REGISTRY_DB: d1(registry),
+      PUBLIC_URL: "https://gitmatrix.example",
+    } as unknown as Env;
+    const admission = installCutoverTestControl(env, fresh.control);
+    await initializeFreshSpaceInstallation(env);
+    sqlite.exec(
+      "INSERT INTO accounts(id,kind,slug,display_name) VALUES ('person','user','person','Person')",
+    );
+    await seedSpaceFixture(env.DB, {
+      organization: {
+        id: "organization",
+        slug: "orbit-company",
+        displayName: "Orbit",
+        kind: "company",
+      },
+      space: { id: "org", slug: "orbit", displayName: "General" },
+      members: [
+        {
+          accountId: "person",
+          role: "owner",
+          grant: { role: "admin", repositoryRole: "write", packageRole: "write" },
+        },
+      ],
+      actorId: "person",
+    });
+    const credential = await issueToken(env.DB, "person", "ci", "write");
+    sqlite.exec(`
+      INSERT INTO repos(id,space_id,name,visibility,artifacts_name,artifacts_remote)
+        VALUES ('repo','org','app','private','app','https://app');
+      INSERT INTO ci_runs(id,repo_id,source_id,number,commit_oid,ref,trigger,status,title)
+        VALUES ('run','repo','canonical',1,'head','main','manual','running','Flush');
+      INSERT INTO ci_jobs(id,run_id,repo_id,source_id,name,spec,status,runner)
+        VALUES ('job','run','repo','canonical','job','{}','queued','sandbox');
+      INSERT INTO ci_steps(job_id,position,name,status) VALUES ('job',0,'build','pending');
+    `);
+    sqlite
+      .prepare(
+        "UPDATE ci_runs SET actor_id=?,space_id=?,migration_epoch=?,authority=? WHERE id='run'",
+      )
+      .run(
+        "person",
+        "org",
+        0,
+        JSON.stringify({
+          spaceId: "org",
+          migrationEpoch: 0,
+          personId: "person",
+          agentId: null,
+          credential: { kind: "token", id: credential.id },
+        }),
+      );
+    sqlite.prepare("UPDATE ci_jobs SET spec=? WHERE id='job'").run(
+      JSON.stringify({
+        secrets: [],
+        env: {},
+        timeoutMinutes: 5,
+        instance: "lite",
+        image: "default",
+        steps: [{ name: "build", run: "build" }],
+      }),
+    );
+    const state = fakeDurableState({ name: "job" });
+    Reflect.set(state.ctx, "container", container);
+    dispose.push(() => {
+      sqlite.close();
+      registry.close();
+      admission.close();
+      state.db.close();
+    });
+    return {
+      kill,
+      run: () => new CiSandbox(state.ctx, env).run("job"),
+      status: () =>
+        (sqlite.prepare("SELECT status FROM ci_jobs WHERE id='job'").get() as { status: string })
+          .status,
+      logs: () =>
+        (sqlite.prepare("SELECT text FROM ci_logs ORDER BY seq").all() as { text: string }[])
+          .map((row) => row.text)
+          .join(""),
+    };
+  }
+
+  test("a transient log write failure does not fail the job", async () => {
+    let failures = 1;
+    const fixture = await flushFixture(() => failures-- > 0);
+    await fixture.run();
+    expect(failures).toBeLessThan(0); // the failure was injected and consumed
+    expect(fixture.status()).toBe("succeeded");
+    expect(fixture.logs()).toContain(MARKER);
+    expect(fixture.kill).not.toHaveBeenCalled();
+  });
+
+  test("log writes that keep failing stop the job", async () => {
+    // Each failed write moves the clock 20 s, so the third crosses FLUSH_FAILURE_MS.
+    let skew = 0;
+    const now = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now() + skew);
+    dispose.push(() => clock.mockRestore());
+    const fixture = await flushFixture(() => {
+      skew += 20_000;
+      return true;
+    });
+    await expect(fixture.run()).rejects.toThrow("Network connection lost");
+    expect(fixture.kill).toHaveBeenCalled();
+    expect(fixture.logs()).not.toContain(MARKER);
+  });
 });
 
 describe("Sandbox cutover admission", () => {

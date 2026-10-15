@@ -4,13 +4,24 @@ import { db } from "../schema.ts";
 import { jobRuns } from "./config.ts";
 import type { StoredJob } from "./jobs.ts";
 
-/** The platform-resolved image, not the repository's mutable `default` alias. */
+/**
+ * How the sandbox runs a job's steps (checkout, environment, step wrapper).
+ * Bump it with any change to that, so proofs from before the change stop counting.
+ */
+export const SANDBOX_CONTRACT = 1;
+
+/**
+ * The platform-resolved image, not the repository's mutable `default` alias,
+ * and the sandbox contract. Only a deployed Worker version identifies anything,
+ * but the version itself isn't part of the identity: every landing deploys, and
+ * a gate whose proof another deploy invalidated ran again on main.
+ */
 export function executionIdentity(image: string | undefined, version: unknown): string | null {
   if (!image || !/(?:^|@)sha256:[0-9a-f]{64}$/.test(image)) return null;
   if (typeof version !== "object" || version === null) return null;
   const id: unknown = Reflect.get(version, "id");
   if (typeof id !== "string" || !/^[0-9a-f-]{36}$/i.test(id)) return null;
-  return `sandbox-v1:${id}:${image}`;
+  return `sandbox-v2:${SANDBOX_CONTRACT}:${image}`;
 }
 
 export interface CandidateVerification {
