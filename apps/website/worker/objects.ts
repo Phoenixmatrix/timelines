@@ -21,12 +21,29 @@
 //   or read replicas); a lagging replica could still return the old generation.
 // - Within a generation, refs up to REFS_FRESH_MS old (counted from when their
 //   listing started) are served as they are, and older ones, up to
-//   REFS_STALE_MS, once while a background listing replaces them. That bounds
-//   only ref changes no bump follows: ones Artifacts makes on its own (an import
-//   finishing), writes made straight to Artifacts rather than through the
-//   Worker, and a bump that failed (D1 unreachable or stalled; logged).
+//   GENERATION_STALE_MS (a day), once while a background listing replaces
+//   them. Since the generation already moves with every write the Worker makes,
+//   that age bounds only ref changes no bump follows: ones Artifacts makes on
+//   its own, writes made straight to Artifacts rather than through the
+//   Worker, and a bump that failed (D1 unreachable or stalled; logged). The first read after such a change that finds the refs older
+//   than REFS_FRESH_MS still gets the old ones, and starts the listing whose
+//   result every later read gets. The day only decides when a quiet
+//   repository's first visit waits for a listing (~2.5 s) instead. Ages count
+//   from when the listing started (listedAt): a stale serve re-stamps only the
+//   freshness clock.
+// - An import gives no such window: until Artifacts finishes it, listing its
+//   refs fails, as api/repos.ts relies on (after a failed listing it reads
+//   IMPORT_IN_PROGRESS from the binding and reports "importing"; app.ts
+//   answers that error with 409 elsewhere), and a
+//   failed listing is never kept. So the first listing that is kept is one
+//   made after the import finished. The Worker never observes that finish
+//   otherwise (POST /repos only starts ARTIFACTS.import; nothing records or
+//   polls an import's state), so there is no write to bump the generation at.
 // - Other readers keep refs in isolate memory only, as before: a push through
 //   this isolate forgets them, and a listing begun before that is not kept.
+//   Nothing tells them of a push through another isolate, so their stale
+//   window stays REFS_STALE_MS, by listing age, even for an entry a reader
+//   with a generation listed and keeps for longer.
 // - Tokens are never cached outside isolate memory.
 
 import { listRefs, type RepoRefs } from "./artifacts.ts";
@@ -36,9 +53,14 @@ import type { Timing } from "./timing.ts";
 const MEMORY_BUDGET = 64 * 1024 * 1024;
 /** Refs are served from cache this long without asking Artifacts… */
 const REFS_FRESH_MS = 5_000;
-/** …and up to this long while a background refresh runs. Pushes through the
- * proxy invalidate them immediately either way. */
+/** …and, to readers without a refs generation, up to this long while a
+ * background refresh runs. Pushes through this isolate invalidate them
+ * immediately either way. */
 const REFS_STALE_MS = 10 * 60_000;
+/** Under a refs generation (memory and the Cache API), up to this long: every
+ * ref write the Worker makes moves the generation, so age only bounds changes
+ * no bump follows (see the consistency model above). */
+const GENERATION_STALE_MS = 24 * 60 * 60_000;
 const CACHE_ORIGIN = "https://objects.gitmatrix.internal";
 
 const memory = new Map<string, { value: unknown; size: number }>();
@@ -76,6 +98,12 @@ export function forgetObjectMemory() {
 interface RefsEntry {
   /** Freshness clock: when these refs were listed, or last handed out while a refresh runs. */
   at: number;
+  /**
+   * When the listing behind these refs started. Handing them out stale moves
+   * `at`, never this: the stale bounds count from here, so re-stamping can't
+   * stretch them.
+   */
+  listedAt: number;
   refs: RepoRefs;
   /** The refs generation they were listed under; undefined from a reader without one. */
   generation: number | undefined;
@@ -452,18 +480,23 @@ export class RepoReader {
     // A shared reader takes only its own generation; others never take another isolate's refs.
     if (this.generation === undefined ? cached.shared : cached.generation !== this.generation)
       return undefined;
+    // Past its bound by listing age, an entry is never served, however recently
+    // a stale serve re-stamped it: a reader without a generation never gets
+    // refs listed more than REFS_STALE_MS ago, even ones a generation reader
+    // listed here and keeps for a day.
+    const bound = this.generation === undefined ? REFS_STALE_MS : GENERATION_STALE_MS;
+    if (Date.now() - cached.listedAt >= bound) return undefined;
     const age = Date.now() - cached.at;
     if (age < REFS_FRESH_MS) {
       this.timing.count("refs-memory");
       return cached.refs;
     }
-    if (age >= REFS_STALE_MS) return undefined;
     this.timing.count("refs-stale");
     this.#refreshInBackground(cached);
     return cached.refs;
   }
 
-  /** The colo's copy for `generation`, if younger than REFS_STALE_MS; fills memory. */
+  /** The colo's copy for `generation`, if younger than GENERATION_STALE_MS; fills memory. */
   async #cachedRefs(generation: number): Promise<RepoRefs | undefined> {
     const cache = cacheApi();
     if (!cache) return undefined;
@@ -476,11 +509,17 @@ export class RepoReader {
     }
     if (typeof stored?.startedAt !== "number" || !stored.refs) return undefined;
     const age = Date.now() - stored.startedAt;
-    if (age >= REFS_STALE_MS) return undefined;
+    if (age >= GENERATION_STALE_MS) return undefined;
     // Another request here may have listed or read them meanwhile.
     const remembered = this.#memoryRefs();
     if (remembered) return remembered;
-    const entry: RefsEntry = { at: stored.startedAt, refs: stored.refs, generation, shared: true };
+    const entry: RefsEntry = {
+      at: stored.startedAt,
+      listedAt: stored.startedAt,
+      refs: stored.refs,
+      generation,
+      shared: true,
+    };
     refsCache.set(this.artifactsName, entry);
     if (age < REFS_FRESH_MS) this.timing.count("refs-cache");
     else {
@@ -513,13 +552,13 @@ export class RepoReader {
     const startedAt = Date.now();
     const refs = await listRefs(this.env, name, this.remote, this.timing);
     if (invalidationsOf(name) !== invalidations) return refs;
-    refsCache.set(name, { at: Date.now(), refs, generation, shared: false });
+    refsCache.set(name, { at: Date.now(), listedAt: startedAt, refs, generation, shared: false });
     const cache = cacheApi();
     if (cache && generation !== undefined) {
       const response = new Response(JSON.stringify({ startedAt, refs }), {
         headers: {
           "content-type": "application/json",
-          "cache-control": `public, max-age=${REFS_STALE_MS / 1000}`,
+          "cache-control": `public, max-age=${GENERATION_STALE_MS / 1000}`,
         },
       });
       this.waitUntil(

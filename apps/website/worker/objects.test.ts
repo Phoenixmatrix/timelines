@@ -354,17 +354,101 @@ describe("refs shared through the Cache API under a refs generation (CORE-444)",
     expect(next.header).toContain("refs-cache;");
   });
 
-  test("an entry older than REFS_STALE_MS is not served", async () => {
+  test("the Cache API keeps a generation's refs for a day", async () => {
+    const w = await world("shared-day");
+    await w.read();
+    await w.settle();
+    const put = w.cache.put.mock.calls.at(-1)![1] as Response;
+    expect(put.headers.get("cache-control")).toBe("public, max-age=86400");
+    // Hours later, a fresh isolate is still served at once while a listing runs.
+    forgetRefsMemory();
+    w.remote.refs.set("refs/heads/main", C);
+    w.advance(23 * 60 * 60_000);
+    const stale = await w.read();
+    expect(stale.refs.head).toBe(A);
+    expect(stale.header).toContain("refs-cache-stale");
+    expect(stale.header).not.toContain("ls-refs");
+    await w.settle();
+    expect((await w.read()).refs.head).toBe(C);
+  });
+
+  test("this isolate's memory keeps a generation's refs for a day", async () => {
+    const w = await world("shared-memory-day");
+    await w.read();
+    await w.settle();
+    w.remote.refs.set("refs/heads/main", C);
+    w.advance(60 * 60_000);
+    const stale = await w.read();
+    expect(stale.refs.head).toBe(A);
+    expect(stale.header).toContain("refs-stale");
+    expect(stale.header).not.toContain("ls-refs");
+    await w.settle();
+    expect((await w.read()).refs.head).toBe(C);
+  });
+
+  test("an entry a day old is not served", async () => {
     const w = await world("shared-expired");
     await w.read();
     await w.settle();
-    forgetRefsMemory();
     w.remote.refs.set("refs/heads/main", C);
-    w.advance(10 * 60_000);
+    w.advance(24 * 60 * 60_000);
+    // Neither from this isolate's memory…
     const listed = await w.read();
     expect(listed.refs.head).toBe(C);
     expect(listed.header).toContain("ls-refs");
-    expect(listed.header).not.toContain("refs-cache");
+    expect(listed.header).not.toContain("refs-stale");
+    // …nor from the colo's Cache API.
+    await w.settle();
+    forgetRefsMemory();
+    w.remote.refs.set("refs/heads/main", B);
+    w.advance(24 * 60 * 60_000);
+    const relisted = await w.read();
+    expect(relisted.refs.head).toBe(B);
+    expect(relisted.header).toContain("ls-refs");
+    expect(relisted.header).not.toContain("refs-cache");
+  });
+
+  test("a stale serve's re-stamp never hands a reader without a generation day-old refs", async () => {
+    const w = await world("unshared-restamped");
+    // A generation reader lists here, and keeps the entry for a day…
+    await w.read();
+    await w.settle();
+    w.remote.refs.set("refs/heads/main", C);
+    w.advance(23 * 60 * 60_000);
+    // …so hours later it is served stale (and re-stamped) while a listing runs.
+    const listing = w.holdNextListing();
+    const stale = await w.read();
+    expect(stale.refs.head).toBe(A);
+    expect(stale.header).toContain("refs-stale");
+    await listing.answered;
+    try {
+      // Re-stamped just now, but listed 23 hours ago: past this reader's bound.
+      const unshared = await w.read({});
+      expect(unshared.refs.head).toBe(C);
+      expect(unshared.header).toContain("ls-refs");
+      expect(unshared.header).not.toContain("refs-memory");
+    } finally {
+      listing.release();
+      await w.settle();
+    }
+  });
+
+  test("readers without a generation keep refs in memory for ten minutes, not a day", async () => {
+    const w = await world("unshared-expired");
+    await w.read({});
+    w.remote.refs.set("refs/heads/main", C);
+    w.advance(10 * 60_000 - 1);
+    // Nothing moves the generation for them: a push through another isolate is bounded only by age.
+    const stale = await w.read({});
+    expect(stale.refs.head).toBe(A);
+    expect(stale.header).toContain("refs-stale");
+    await w.settle();
+    w.remote.refs.set("refs/heads/main", B);
+    w.advance(10 * 60_000);
+    const listed = await w.read({});
+    expect(listed.refs.head).toBe(B);
+    expect(listed.header).toContain("ls-refs");
+    expect(listed.header).not.toContain("refs-stale");
   });
 
   test("a write in another isolate or colo leaves earlier refs unreachable, with no delete", async () => {
