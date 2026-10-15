@@ -176,6 +176,11 @@ describe("history cover requests (CORE-451)", () => {
     ).json<HistoryPage>();
     expect(folder.scanned).toBe(1);
     expect(Object.keys(folder.entries)).toEqual(["src/app.ts"]);
+    // "Load older history" from there still loads a page at a time.
+    const older = await (
+      await call(`ref=${head}&path=src&entries=true&cover=1&cursor=${folder.next}`)
+    ).json<HistoryPage>();
+    expect(older.scanned).toBe(100);
     const plain = await (await call(`ref=${head}&path=src&entries=true`)).json<HistoryPage>();
     expect(plain.scanned).toBe(100);
     expect(plain.entries["src/app.ts"]?.latest.oid).toBe(folder.entries["src/app.ts"]?.latest.oid);

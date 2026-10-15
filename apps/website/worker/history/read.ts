@@ -166,7 +166,8 @@ export async function readHistory(
     if (!cover) return false;
     for (const name of names) unresolved.delete(name);
     if (changed) needSelf = false;
-    return !unresolved.size && !needSelf;
+    // From a cursor ("Load older history"), at least a page, as before.
+    return !unresolved.size && !needSelf && (fromHead || scanned >= HISTORY_PAGE_SIZE);
   };
 
   // The commits from `next` on, in walk order, as a log read them.
@@ -218,20 +219,28 @@ export async function readHistory(
         const id = commit.parents[0];
         if (!id) return null;
         const after = following[index + 1];
-        const parent = after?.hash === id ? after : await reader.commit(id);
-        if (!parent) throw new Error("History is incomplete: a parent commit is unavailable.");
-        return parent;
+        // Undefined: missing, as in pruned history.
+        return (after?.hash === id ? after : await reader.commit(id)) ?? undefined;
       }),
     );
     const sets = await changeSets(reader, trees, path, entries, chunk, parents, worked);
+    // A cover walk answers what it scanned before a missing parent, cut short:
+    // a page loads, the request for the next fails, as paging always did.
+    const broken = (await parents).indexOf(undefined);
+    if (broken !== -1 && (!cover || scanned + broken === 0))
+      throw new Error("History is incomplete: a parent commit is unavailable.");
     walked += chunk.length;
     pending = pending.slice(take);
-    for (const [index, commit] of chunk.entries()) {
+    for (const [index, commit] of chunk.slice(0, broken === -1 ? take : broken).entries()) {
       const set = sets[index]!;
       if (consume(scanned, commitSummary(commit), set.changed, set.names ?? [])) {
         done = true;
         break;
       }
+    }
+    if (!done && broken !== -1) {
+      cut = true;
+      break;
     }
     if (!cover) break;
     if (!done && base?.at === scanned) {
@@ -311,17 +320,20 @@ async function changeSets(
   path: string,
   entries: boolean,
   commits: Commit[],
-  parentsOf: Promise<(Commit | null)[]>,
+  parentsOf: Promise<(Commit | null | undefined)[]>,
   worked: [string, ChangeSet][],
-): Promise<ChangeSet[]> {
+): Promise<(ChangeSet | undefined)[]> {
   const ids = commits.map((commit) => derivedId(commit.hash, path));
   const [parents, stored] = await Promise.all([
     parentsOf,
     Promise.all(ids.map((id) => reader.peekDerived<ChangeSet>(CHANGES, id))),
   ]);
   const sets = stored.map((set) => (set && (!entries || set.names) ? set : undefined));
-  const missing = sets.flatMap((set, index) => (set ? [] : [index]));
-  if (!missing.length) return sets as ChangeSet[];
+  // Not where the parent is missing: there is nothing to compare with.
+  const missing = sets.flatMap((set, index) =>
+    set || parents[index] === undefined ? [] : [index],
+  );
+  if (!missing.length) return sets;
   const roots = missing.flatMap((index) => {
     const parent = parents[index];
     return parent ? [commits[index]!.treeHash, parent.treeHash] : [commits[index]!.treeHash];
@@ -357,7 +369,7 @@ async function changeSets(
     sets[index] = set;
     worked.push([ids[index]!, set]);
   }
-  return sets as ChangeSet[];
+  return sets;
 }
 
 /** The entry at `path` in each root tree, read a level at a time for all of them. */

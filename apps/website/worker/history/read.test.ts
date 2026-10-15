@@ -467,14 +467,38 @@ describe("a directory's last changes in one request (CORE-451)", () => {
     expect(fromStored.entries.constructor).toMatchObject({ count: 1, latest: { oid: "c0" } });
   });
 
-  test("a missing parent fails and stores no answer", async () => {
+  test("a missing parent cuts a cover answer short there, stores nothing, and fails the next", async () => {
     const { trees, roots } = history(randomStates(9, 20));
     const g = fixture(trees, roots);
     g.commits[10]!.parents = ["missing"];
-    await expect(readHistory(g.reader, "c19", "", true, "c19", { cover: true })).rejects.toThrow(
-      "parent commit is unavailable",
+    const first = await readHistory(g.reader, "c19", "", true, "c19", { cover: true });
+    // c10 can't be compared with its parent: the answer ends above it.
+    expect(first).toMatchObject({ cut: true, scanned: 9, next: "c10" });
+    const intact = fixture(trees, roots);
+    const sameRange = { cover: true, budget: { commits: 9, ms: 1e9 } };
+    expect(plain(first)).toEqual(
+      plain(await readHistory(intact.reader, "c19", "", true, "c19", sameRange)),
     );
     expect([...g.derived.keys()].filter((key) => key.startsWith(`${LAST_CHANGES}/`))).toEqual([]);
+    await expect(readHistory(g.reader, "c19", "", true, "c10", { cover: true })).rejects.toThrow(
+      "parent commit is unavailable",
+    );
+    await expect(readHistory(g.reader, "c19", "", true)).rejects.toThrow(
+      "parent commit is unavailable",
+    );
+  });
+
+  test("from a cursor, a cover request still loads at least a page", async () => {
+    const { trees, roots } = history(randomStates(6, 330));
+    const g = fixture(trees, roots);
+    let cursor = (await readHistory(g.reader, "c329", "src", true, "c329", { cover: true })).next;
+    expect(cursor).not.toBeNull();
+    while (cursor) {
+      const left = Number(cursor.slice(1)) + 1;
+      const page = await readHistory(g.reader, "c329", "src", true, cursor, { cover: true });
+      expect(page.scanned).toBeGreaterThanOrEqual(Math.min(HISTORY_PAGE_SIZE, left));
+      cursor = page.next;
+    }
   });
 
   test("a walk its budget cuts short says so, stores nothing, and pages on exactly", async () => {
