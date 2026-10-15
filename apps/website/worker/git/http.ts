@@ -201,7 +201,18 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     service === "git-receive-pack" && c.req.method === "POST" && body
       ? meterPack(body, c.req.header("content-length"))
       : null;
-  const upstream = await forward(c, repo, service, endpoint, pack?.body ?? body);
+  // A push may have moved refs whatever becomes of it: unless finishPush runs,
+  // forget them once its outcome is settled (CORE-444).
+  const pushing = service === "git-receive-pack" && endpoint !== "info/refs";
+  const unsettled = () => (pushing ? invalidateRefs(c.env.DB, repo.artifacts_name) : undefined);
+  let upstream: Awaited<ReturnType<typeof forward>>;
+  try {
+    upstream = await forward(c, repo, service, endpoint, pack?.body ?? body);
+  } catch (error) {
+    await unsettled();
+    throw error;
+  }
+  if (pushing && !(upstream instanceof Response && upstream.ok)) await unsettled();
   if (upstream instanceof Response) {
     if (credential.kind === "token") {
       c.executionCtx.waitUntil(
@@ -215,9 +226,9 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
     if (service === "git-receive-pack" && endpoint !== "info/refs" && upstream.ok) {
       const finishPush = async () => {
         // The ref transaction is over, and the client has not seen it end: a
-        // read it makes next must not get this isolate's cached refs. Push
-        // effects invalidate again, but only after their own round trips.
-        invalidateRefs(repo.artifacts_name);
+        // read it makes next, in any isolate, must not get refs listed before
+        // it. Push effects invalidate again, but only after their own round trips.
+        await invalidateRefs(c.env.DB, repo.artifacts_name);
         if (!(await sourceOnly))
           afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
         else {
@@ -234,13 +245,19 @@ async function proxy(c: Context<AppEnv>, service: Service, endpoint: string) {
         // but hold its final EOF until source-stage provenance has been recorded.
         const { readable, writable } = new TransformStream<Uint8Array>();
         c.executionCtx.waitUntil(
-          upstream.body.pipeTo(writable, { preventClose: true }).then(async () => {
-            try {
-              await finishPush();
-            } finally {
-              await writable.close();
-            }
-          }),
+          upstream.body.pipeTo(writable, { preventClose: true }).then(
+            async () => {
+              try {
+                await finishPush();
+              } finally {
+                await writable.close();
+              }
+            },
+            async (error: unknown) => {
+              await unsettled();
+              throw error;
+            },
+          ),
         );
         return respond(upstream, readable);
       }
@@ -361,6 +378,7 @@ async function workPush(
     return c.text(`${admitted.error}\n`, admitted.status);
   }
   let forwarding = false;
+  let invalidated = false;
   try {
     for (const command of commands)
       if (command.old) await retainProgress(c.env, repo, operationId, command.old);
@@ -393,9 +411,11 @@ async function workPush(
     // Consume the response before checking durable state. A 200 is not a Git acknowledgement.
     const response = respond(upstream);
     const bytes = await protocolBytes(response);
-    // Whatever the outcome, the provider is done: the pusher's next read must
-    // not get this isolate's cached refs (push effects invalidate only later).
-    invalidateRefs(repo.artifacts_name);
+    // Whatever the outcome, the provider is done: the pusher's next read, in
+    // any isolate, must not get refs listed before it (push effects invalidate
+    // only later).
+    await invalidateRefs(c.env.DB, repo.artifacts_name);
+    invalidated = true;
     if (!response.ok) throw new Error("Ambiguous source push HTTP outcome.");
     const report = receivePackReport(bytes, request);
     const refs = await lsRefs(c.env, repo.artifacts_name, repo.artifacts_remote, [
@@ -428,6 +448,8 @@ async function workPush(
     if (accepted) afterPush(c.env, repo, actor, (work) => c.executionCtx.waitUntil(work));
     return new Response(bytes, { status: response.status, headers: response.headers });
   } catch (error) {
+    // Forwarded, the push may have moved refs before failing here (CORE-444).
+    if (forwarding && !invalidated) await invalidateRefs(c.env.DB, repo.artifacts_name);
     await tracker.finishSourcePushForSettlement(
       { spaceId: repo.space_id, repoId: repo.id, sourceId: repo.source_id, operationId },
       forwarding ? "ambiguous" : "rejected",
@@ -512,12 +534,32 @@ async function landingProxy(
       return c.text("This queue merge attempt is no longer current.\n", 403);
     }
   }
-  // The body goes on decompressed, so without its encoding.
-  const upstream = await forward(c, access.repo, service, endpoint, request.body, true);
   // Like the Worker's own ref writes (timelines/bookmarks.ts): a landing branch
-  // is the landing's, so what follows a push (git/effects.ts) doesn't.
-  if (upstream instanceof Response && upstream.ok) invalidateRefs(access.repo.artifacts_name);
-  return respond(upstream);
+  // is the landing's, so what follows a push (git/effects.ts) doesn't. Its refs
+  // are forgotten once the ref transaction is over, or its outcome unknown, and
+  // before the job sees the push end (CORE-444).
+  const settled = () => invalidateRefs(c.env.DB, access.repo.artifacts_name);
+  let upstream: Awaited<ReturnType<typeof forward>>;
+  try {
+    // The body goes on decompressed, so without its encoding.
+    upstream = await forward(c, access.repo, service, endpoint, request.body, true);
+  } catch (error) {
+    await settled();
+    throw error;
+  }
+  if (!(upstream instanceof Response && upstream.ok && upstream.body)) {
+    await settled();
+    return respond(upstream);
+  }
+  // Headers can precede the ref transaction: hold the final EOF until it is forgotten.
+  const { readable, writable } = new TransformStream<Uint8Array>();
+  c.executionCtx.waitUntil(
+    upstream.body
+      .pipeTo(writable, { preventClose: true })
+      .finally(settled)
+      .then(() => writable.close()),
+  );
+  return respond(upstream, readable);
 }
 
 /** Why a landing's merge job may not make this push, or null when it may. */

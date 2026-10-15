@@ -35,7 +35,7 @@ export interface QueueFixture {
   git(args: string[], cwd?: string, raw?: boolean): Promise<string>;
   tip(): Promise<string>;
   show(id: string): Promise<QueueEntry>;
-  wait(id: string, done?: (entry: QueueEntry) => boolean): Promise<QueueEntry>;
+  wait(id: string, done?: (entry: QueueEntry) => boolean, timeoutMs?: number): Promise<QueueEntry>;
   landed(id: string): Promise<QueueEntry>;
   idle(): Promise<void>;
 }
@@ -166,15 +166,19 @@ export async function queueFixture(
     id: string,
     done = (entry: QueueEntry) =>
       ["landed", "failed", "cancelled", "covered"].includes(entry.status),
+    timeoutMs = 300_000,
   ) {
-    const deadline = Date.now() + 300_000;
+    const deadline = Date.now() + timeoutMs;
     while (true) {
       const entry = await show(id);
       if (done(entry)) {
         record({ entry });
         return entry;
       }
-      assert(Date.now() < deadline, `Queue ${id}: timed out in ${entry.status}`);
+      assert(
+        Date.now() < deadline,
+        `Queue ${id}: timed out in ${entry.status} (deploy ${entry.deployStatus ?? "none"})`,
+      );
       await delay(1_000);
     }
   }
@@ -289,8 +293,17 @@ export async function runQueueE2E(
   const files = (await f.git(["ls-tree", "--name-only", "origin/main"])).split("\n");
   assert(!files.includes("next.txt"), "Queue must not consume subsequent local work");
   const finalEntry = (await f.show(a)).candidate === (await f.tip()) ? a : b;
-  await gm(["queue", "wait", finalEntry, "-R", f.repo, "--deploy", "--timeout", "300"]);
-  const deployed = await f.show(finalEntry);
+  const waited = JSON.parse(
+    await gm(["queue", "wait", finalEntry, "-R", f.repo, "--deploy", "--timeout", "300"]),
+  ) as { entry: QueueEntry };
+  assert(waited.entry.deployRun, "gm queue wait --deploy reports the main pipeline run");
+  assert.equal(waited.entry.deployStatus, "succeeded");
+  // gm reads the pipeline run's verdict; the stored entry records it a moment later.
+  const deployed = await f.wait(
+    finalEntry,
+    (entry) => ["succeeded", "failed", "cancelled"].includes(entry.deployStatus ?? ""),
+    30_000,
+  );
   assert.equal(deployed.deployStatus, "succeeded");
   assert(deployed.deployRun);
   const deployments = await f.json<DeploymentList>(

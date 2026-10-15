@@ -434,7 +434,7 @@ export async function world(action: string, input: unknown): Promise<unknown> {
         world.git.commits.add(args.commit);
         commits.add(args.commit);
       } else refs.delete(ref);
-      invalidateRefs(artifacts);
+      await invalidateRefs(world.env.DB, artifacts);
       await world.env.DB.prepare(`UPDATE repos SET pushed_at = ? WHERE artifacts_name = ?`)
         .bind(new Date().toISOString(), artifacts)
         .run();

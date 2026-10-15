@@ -1,6 +1,7 @@
 import type { GitRef } from "../shared/api.ts";
 import { lsRefsRequest, parseLsRefs, type LsRefsEntry } from "./git/pktline.ts";
 import { retrying, UPSTREAM_TIMEOUT_MS, withTimeout } from "./retry.ts";
+import type { Timing } from "./timing.ts";
 
 const TOKEN_TTL_SECONDS = 60 * 60;
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
@@ -23,13 +24,18 @@ export async function upstreamToken(
   env: Env,
   artifactsName: string,
   scope: "read" | "write",
+  /** Server-Timing: `artifacts-token` for a mint, a `token-memory` count for reuse. */
+  timing?: Timing,
 ): Promise<string> {
   const key = `${artifactsName}:${scope}`;
   const cached = tokenCache.get(key);
-  if (cached && cached.expiresAt - Date.now() > TOKEN_REFRESH_MARGIN_MS) return cached.secret;
+  if (cached && cached.expiresAt - Date.now() > TOKEN_REFRESH_MARGIN_MS) {
+    timing?.count("token-memory");
+    return cached.secret;
+  }
   // A pending binding call cannot be shared with a different request's lifetime.
   // An extra token from a retried call is harmless; it expires unused.
-  const created = await retrying(
+  const minting = retrying(
     async () => {
       // Binding calls take no AbortSignal: bounded by racing a timer instead.
       using repo = await withTimeout(env.ARTIFACTS.get(artifactsName), UPSTREAM_TIMEOUT_MS);
@@ -37,6 +43,7 @@ export async function upstreamToken(
     },
     { retryable: isTransientArtifactsError, label: "Artifacts token" },
   );
+  const created = await (timing ? timing.measure("artifacts-token", minting) : minting);
   const token = { secret: created.plaintext, expiresAt: Date.parse(created.expiresAt) };
   tokenCache.set(key, token);
   return token.secret;
@@ -59,8 +66,13 @@ export interface RepoRefs {
  * The binding has no ref listing, so ask the git endpoint directly with a
  * protocol v2 `ls-refs` command.
  */
-export async function listRefs(env: Env, artifactsName: string, remote: string): Promise<RepoRefs> {
-  const refs = await lsRefs(env, artifactsName, remote);
+export async function listRefs(
+  env: Env,
+  artifactsName: string,
+  remote: string,
+  timing?: Timing,
+): Promise<RepoRefs> {
+  const refs = await lsRefs(env, artifactsName, remote, undefined, timing);
   const result: RepoRefs = { headBranch: null, head: null, branches: [], tags: [] };
   for (const ref of refs) {
     if (ref.name === "HEAD") {
@@ -87,17 +99,23 @@ export async function listRefs(env: Env, artifactsName: string, remote: string):
   return result;
 }
 
-/** HEAD, branches and tags (or the refs under `prefixes`; [] for every ref) as `ls-refs` lists them: tags unpeeled, with `peeled`. */
+/**
+ * HEAD, branches and tags (or the refs under `prefixes`; [] for every ref) as
+ * `ls-refs` lists them: tags unpeeled, with `peeled`. With `timing`, the token
+ * shows apart from the listing (`artifacts-token` or `token-memory`); a
+ * caller's own `ls-refs` measure still includes it.
+ */
 export async function lsRefs(
   env: Env,
   artifactsName: string,
   remote: string,
   prefixes?: readonly string[],
+  timing?: Timing,
 ): Promise<LsRefsEntry[]> {
   // A read: retried through the provider's transient failures, each try bounded.
   return retrying(
     async () => {
-      const token = await upstreamToken(env, artifactsName, "read");
+      const token = await upstreamToken(env, artifactsName, "read", timing);
       const response = await fetch(`${remote}/git-upload-pack`, {
         method: "POST",
         headers: {

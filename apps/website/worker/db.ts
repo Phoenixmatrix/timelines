@@ -53,6 +53,8 @@ export interface RepoRow {
   pushed_at: string | null;
   /** Set while the repository is being deleted (only `deleting` lookups return one). */
   deleted_at: string | null;
+  /** Its refs generation (CORE-444); a work source's own once resolved (timelines/sources.ts). */
+  refs_generation: number;
   space_slug: string;
   space_display_name: string;
   space_archived_at: string | null;

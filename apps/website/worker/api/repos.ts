@@ -110,6 +110,7 @@ export async function loadSourceRepo(
             artifacts_name: owned.artifacts_name,
             artifacts_remote: owned.artifacts_remote ?? "",
             default_branch: owned.work_ref.replace(/^refs\/heads\//, ""),
+            refs_generation: owned.refs_generation,
           },
           canonical: loaded.row,
           source,
@@ -347,7 +348,11 @@ repos.post("/", async (c) => {
   return c.json(row && repoSummary(row, actor), 201);
 });
 
-/** Open a cached object reader for a repo; always closed by the caller. */
+/**
+ * Open a cached object reader for a repo; always closed by the caller. These
+ * are interactive reads, so refs may come from the colo's Cache API, under the
+ * refs generation this request loaded with the row (CORE-444).
+ */
 function reader(c: Context<AppEnv>, row: RepoRow & { source_id?: string }): RepoReader {
   return new RepoReader(
     c.env,
@@ -356,6 +361,7 @@ function reader(c: Context<AppEnv>, row: RepoRow & { source_id?: string }): Repo
     c.get("timing"),
     (work) => c.executionCtx.waitUntil(work),
     row.source_id && row.source_id !== "canonical" ? `refs/heads/${row.default_branch}` : undefined,
+    { sharedRefs: { generation: row.refs_generation } },
   );
 }
 

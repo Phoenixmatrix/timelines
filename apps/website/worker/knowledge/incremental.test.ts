@@ -55,7 +55,7 @@ vi.mock("cloudflare:workflows", () => ({
 }));
 vi.mock(import("../objects.ts"), async (original) => ({
   ...(await original()),
-  invalidateRefs: () => {},
+  forgetRefs: () => {},
   // Every build reads the fixture's git objects.
   RepoReader: class {
     constructor() {

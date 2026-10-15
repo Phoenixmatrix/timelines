@@ -27,7 +27,7 @@ import { coAuthors } from "../../lib/commitAttribution.ts";
 import { firstLine, fullDate, timeAgo } from "../../lib/format.ts";
 import { blobUrl, commitsUrl, treeUrl } from "../../lib/refs.ts";
 import { CommitLink } from "../../components/CommitLink.tsx";
-import { repoData, requestSource, routeData } from "../../lib/repoData.ts";
+import { repoData, requestSource, requireLiveSource, routeData } from "../../lib/repoData.ts";
 import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { api, ApiError } from "../../lib/api.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
@@ -49,11 +49,15 @@ export async function codeLoader({ request, params }: LoaderFunctionArgs) {
   // bookmark when it has one; a path that names a branch keeps it.
   const scope = at ? null : scopeOf(new URL(request.url).search);
   // Otherwise the tree and the repo detail load in parallel; the server splits
-  // the branch from the path, so neither waits for the other.
+  // the branch from the path, so neither waits for the other. The detail is
+  // the layout's own request (?metadata=1), so the page reads it once.
+  const detailRead = repoData.detail(space, name, source, true);
   const [repo, tree] = await Promise.all([
-    routeData(repoData.detail(space, name, source)),
+    routeData(detailRead),
     (scope
-      ? repoData.detail(space, name, source).then((detail) => {
+      ? detailRead.then((detail) => {
+          // Expiry fails the page below (requireLiveSource), not as a missing bookmark.
+          if (detail.sourceState === "expired") throw new ApiError(410, "Expired source.");
           const bookmark = bookmarkIn(detail, scope);
           if (!bookmark && source)
             throw new ApiError(
@@ -67,6 +71,7 @@ export async function codeLoader({ request, params }: LoaderFunctionArgs) {
       .then((path) => repoData.tree(space, name, path, source))
       .catch((error: unknown) => error),
   ]);
+  requireLiveSource(repo);
   if (!repo.head || repo.state !== "ready") return { tree: null, about: null };
   if (tree instanceof Error || !tree) {
     return { tree: await routeData(Promise.reject(tree)), about: null };

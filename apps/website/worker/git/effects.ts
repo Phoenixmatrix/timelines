@@ -51,7 +51,7 @@ async function pushEffects(
 ): Promise<void> {
   const authorization = originalAuthority ?? (await captureWorkAuthority(env, repo.id, actor));
   const current = await resolveWorkAuthority(env, authorization, repo.id);
-  invalidateRefs(repo.artifacts_name);
+  await invalidateRefs(env.DB, repo.artifacts_name);
   // Updates already in the push log (a replay): index their mentions here, as
   // recording them would have, under the replaying person's authority.
   if (replayed)

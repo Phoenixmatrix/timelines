@@ -51,7 +51,7 @@ import {
 import { describeRepoCapabilities, type DescribeStats } from "../atlas/describe.ts";
 import { admitProjection, enforceRetention } from "../atlas/retention.ts";
 import { recordPublishedPackages, recordsPackages } from "../atlas/publishers.ts";
-import { invalidateRefs, RepoReader } from "../objects.ts";
+import { forgetRefs, RepoReader } from "../objects.ts";
 import { db, nowIso } from "../schema.ts";
 import { Timing } from "../timing.ts";
 import { ANALYZER, analyzeFiles, loadAnalyses, type FileToAnalyze } from "./analyze.ts";
@@ -453,7 +453,7 @@ export class KnowledgeBuild extends WorkflowEntrypoint<Env, BuildParams | Workfl
       const start = await progress("start", "snapshot", async () => {
         const row = await knowledgeRepo(env, repoId);
         if (!row) return null;
-        invalidateRefs(row.artifacts_name);
+        forgetRefs(row.artifacts_name);
         const refs = await this.#withReader(row, (reader) => reader.refs());
         const head = event.payload.commit ?? refs.head;
         const state = await db(env.DB)
