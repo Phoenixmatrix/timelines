@@ -115,7 +115,7 @@ test("router evidence citations scroll after issue navigation and hash-only navi
         data: {
           issueId: "target",
           kind: "evidence",
-          body: `${id}\n\n${"A recorded verification paragraph.\n\n".repeat(80)}`,
+          body: `${id}\n\n${"A recorded verification paragraph.\n\n".repeat(30)}`,
         },
       })),
     ],

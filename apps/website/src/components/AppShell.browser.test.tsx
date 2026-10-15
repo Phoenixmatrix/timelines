@@ -87,59 +87,61 @@ test("the phone rail stays in one row and every control is reachable without pag
   }
 });
 
-for (const width of [390, 320]) {
-  for (const scoped of [false, true]) {
-    test(`${width}px ${scoped ? "timeline" : "main"} issue deep links, selection and anchors clear the sticky rail`, async () => {
-      const server = await TestServer.start({ world: true });
-      await seedIssue(server);
-      if (scoped) {
-        await server.repo("orbit", "engine");
-        await server.push("orbit/engine", "main", commitId());
-        await server.call("POST", "/api/tracker/orbit/timelines", {
-          slug: "phone-rail",
-          name: "Phone rail",
-          repos: ["orbit/engine"],
-        });
-      }
-      const scope = scoped ? "?tl=phone-rail" : "";
-      await page.viewport(width, 844);
-      try {
-        const app = renderApp(`/tracker/orbit/issues/ENG-1${scope}`);
-        const back = page.getByRole("link", { name: "Back to issues", exact: true });
-        const clear = () => {
-          const box = back.element().getBoundingClientRect();
-          const nav = rail().element().getBoundingClientRect();
-          return box.top >= nav.bottom && box.bottom <= window.innerHeight;
-        };
-        await expect.element(back).toBeVisible();
-        await expect.poll(clear).toBe(true);
-        if (scoped)
-          await expect.element(page.getByRole("region", { name: "Timeline scope" })).toBeVisible();
-        await userEvent.click(back);
-        await app.waitForUrl((url) => !url.pathname.includes("/issues/"));
-        await userEvent.click(
-          page
-            .getByRole("table", { name: "Issues", exact: true })
-            .getByText("Keep navigation reachable", { exact: true }),
-        );
-        await app.waitForUrl((url) => url.pathname.includes("/issues/"));
-        await expect.element(back).toBeVisible();
-        await expect.poll(clear).toBe(true);
-        expect(app.url().searchParams.get("tl")).toBe(scoped ? "phone-rail" : null);
+// The same rail check at each width and scope: one scope per width covers both.
+for (const [width, scoped] of [
+  [320, false],
+  [390, true],
+] as const) {
+  test(`${width}px ${scoped ? "timeline" : "main"} issue deep links, selection and anchors clear the sticky rail`, async () => {
+    const server = await TestServer.start({ world: true });
+    await seedIssue(server);
+    if (scoped) {
+      await server.repo("orbit", "engine");
+      await server.push("orbit/engine", "main", commitId());
+      await server.call("POST", "/api/tracker/orbit/timelines", {
+        slug: "phone-rail",
+        name: "Phone rail",
+        repos: ["orbit/engine"],
+      });
+    }
+    const scope = scoped ? "?tl=phone-rail" : "";
+    await page.viewport(width, 844);
+    try {
+      const app = renderApp(`/tracker/orbit/issues/ENG-1${scope}`);
+      const back = page.getByRole("link", { name: "Back to issues", exact: true });
+      const clear = () => {
+        const box = back.element().getBoundingClientRect();
+        const nav = rail().element().getBoundingClientRect();
+        return box.top >= nav.bottom && box.bottom <= window.innerHeight;
+      };
+      await expect.element(back).toBeVisible();
+      await expect.poll(clear).toBe(true);
+      if (scoped)
+        await expect.element(page.getByRole("region", { name: "Timeline scope" })).toBeVisible();
+      await userEvent.click(back);
+      await app.waitForUrl((url) => !url.pathname.includes("/issues/"));
+      await userEvent.click(
+        page
+          .getByRole("table", { name: "Issues", exact: true })
+          .getByText("Keep navigation reachable", { exact: true }),
+      );
+      await app.waitForUrl((url) => url.pathname.includes("/issues/"));
+      await expect.element(back).toBeVisible();
+      await expect.poll(clear).toBe(true);
+      expect(app.url().searchParams.get("tl")).toBe(scoped ? "phone-rail" : null);
 
-        // Exercise the browser's native fragment algorithm on real page content,
-        // not a CSS-source assertion or a URL-specific shell scroll handler.
-        back.element().id = "rail-return-anchor";
-        window.scrollTo(0, document.documentElement.scrollHeight);
-        window.location.hash = "rail-return-anchor";
-        await expect.poll(clear).toBe(true);
-        expect(rail().element().getBoundingClientRect().top).toBe(0);
-        expect(sidewaysOverflow()).toBeLessThanOrEqual(0);
-      } finally {
-        await page.viewport(1280, 900);
-      }
-    });
-  }
+      // Exercise the browser's native fragment algorithm on real page content,
+      // not a CSS-source assertion or a URL-specific shell scroll handler.
+      back.element().id = "rail-return-anchor";
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      window.location.hash = "rail-return-anchor";
+      await expect.poll(clear).toBe(true);
+      expect(rail().element().getBoundingClientRect().top).toBe(0);
+      expect(sidewaysOverflow()).toBeLessThanOrEqual(0);
+    } finally {
+      await page.viewport(1280, 900);
+    }
+  });
 }
 
 test("the rail's Repositories place opens the repository list and owns its current state", async () => {

@@ -182,6 +182,10 @@ export default defineConfig({
           // few that build migrated databases ran past Vitest's 5s default.
           testTimeout: 20_000,
           hookTimeout: 30_000,
+          // Migrate and initialize a fresh installation once per run, not once
+          // per test file (worker/testing/provided.ts).
+          globalSetup: ["./worker/testing/global-setup.ts"],
+          setupFiles: ["./worker/testing/unit-setup.ts"],
           // Transform the real Worker SDKs so platform imports use the unit
           // aliases/mocks instead of escaping into Node's native ESM loader.
           server: {

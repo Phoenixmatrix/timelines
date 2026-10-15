@@ -27,9 +27,9 @@ const base = "a".repeat(40);
 const now = Date.parse("2026-10-14T12:00:00Z");
 const earlier = new Date(now - 60 * 60_000).toISOString();
 const dependencies = {
-  "apps/website": ["packages/formats", "packages/utils"],
+  "apps/website": ["packages/formats", "packages/testing"],
   "apps/cli": [],
-  "tools/agent": ["apps/website", "packages/formats", "packages/utils"],
+  "tools/agent": ["apps/website", "packages/formats", "packages/testing"],
 };
 const websiteTests: ReadyPlan["gates"][number] = {
   name: "website-tests",
@@ -144,7 +144,7 @@ await test("gate fingerprints: same inputs reused, closure and command changes r
   assert.deepEqual(rerun.gates, ["website-tests"]);
   assert.match(rerun.rerun["website-tests"]!, /differs/);
   // A dependency's change, a root path, and a path leaving the change list all count.
-  assert.notEqual(gatePrint(websiteTests, { ...hashes, "packages/utils/src/a.ts": "4" }), print);
+  assert.notEqual(gatePrint(websiteTests, { ...hashes, "packages/testing/src/a.ts": "4" }), print);
   assert.notEqual(gatePrint(websiteTests, { ...hashes, "tsconfig.json": "4" }), print);
   assert.notEqual(gatePrint(websiteTests, { "apps/cli/src/main.rs": "2" }), print);
 

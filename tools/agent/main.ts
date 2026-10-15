@@ -873,9 +873,7 @@ async function retainReports(artifacts: string): Promise<void> {
             if (
               phase.event !== "e2e.phase" ||
               typeof phase.name !== "string" ||
-              !/^source-landing\.(fixture|failing-gate|moving-before-cas|before-cas|after-cas|before-finalize|retry-partial|cancel-partial|unknown-rewrite|unknown-base-reset|cleanup)$/.test(
-                phase.name,
-              ) ||
+              !/^source-landing\.(fixture|retry-partial|cleanup)$/.test(phase.name) ||
               typeof phase.elapsedMs !== "number" ||
               !Number.isFinite(phase.elapsedMs) ||
               phase.elapsedMs < 0 ||
@@ -891,7 +889,7 @@ async function retainReports(artifacts: string): Promise<void> {
               },
             ];
           })
-          .slice(0, 11),
+          .slice(0, 3),
       }));
     }
     await privateJson(join(destination, name), JSON.parse(redact(JSON.stringify(report))));

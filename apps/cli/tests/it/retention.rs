@@ -248,6 +248,7 @@ impl Env {
             .env("HOME", &self.root)
             .env("PATH", "/usr/bin:/bin")
             .env("GM_AGENT", "1")
+            .env("GM_POLL_MS", "20")
             .env("GM_SERVER", format!("http://{}", self.api.address))
             .env("GM_TOKEN", token)
             .env("XDG_CONFIG_HOME", self.root.join("config"))

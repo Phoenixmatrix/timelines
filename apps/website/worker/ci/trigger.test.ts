@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import { d1 } from "../testing/d1.ts";
 import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
+import { withoutWaiting } from "../testing/timers.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import type { DatabaseSync } from "node:sqlite";
@@ -543,7 +544,8 @@ jobs:
     const t = await setup();
     refs.branches = [{ shortName: "main", oid: oid(2) }];
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    await onPush(t.env, t.repo, initiatingActor, () => {});
+    // The retry's pause (START_RETRY_MS) takes no real second.
+    await withoutWaiting(() => onPush(t.env, t.repo, initiatingActor, () => {}));
     expect(runs(t).map((r) => [r.ref, r.trigger, r.step, r.commit_oid])).toEqual([
       ["main", "push", 0, oid(2)],
     ]);

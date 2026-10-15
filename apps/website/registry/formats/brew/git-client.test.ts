@@ -12,7 +12,7 @@ import { makeHarness, type Harness } from "../../testing/harness.ts";
 /**
  * Drives the real `git` client against the registry app served on a local
  * port: clone, incremental fetch, shallow clone, credentials and push refusal,
- * over protocol v0 and v2.
+ * over protocol v2 (brew.test.ts answers v0 requests).
  */
 
 function hasGit(): boolean {
@@ -140,58 +140,56 @@ describe.skipIf(!hasGit())("brew taps with the real git client", () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
-  for (const version of ["2", "0"]) {
-    it(`clones and fetches over protocol v${version}`, { timeout: 60_000 }, async () => {
-      await publish("foo", "1.0.0");
-      const dir = join(tempDir(), "homebrew-tools");
-      await ok(["-c", `protocol.version=${version}`, "clone", url(), dir]);
-      expect(readFileSync(join(dir, "Formula/foo.rb"), "utf8")).toContain("foo-1.0.0.tar.gz");
-      expect(readFileSync(join(dir, "lib/gitmatrix_download_strategy.rb"), "utf8")).toContain(
-        "class GitmatrixDownloadStrategy < CurlDownloadStrategy",
-      );
-      expect(readFileSync(join(dir, "README.md"), "utf8")).toContain("brew tap gitmatrix/tools");
-      expect((await ok(["rev-parse", "--abbrev-ref", "HEAD"], dir)).trim()).toBe("main");
-      await ok(["fsck", "--strict", "--no-dangling"], dir);
+  it("clones and fetches over protocol v2", { timeout: 60_000 }, async () => {
+    await publish("foo", "1.0.0");
+    const dir = join(tempDir(), "homebrew-tools");
+    await ok(["-c", "protocol.version=2", "clone", url(), dir]);
+    expect(readFileSync(join(dir, "Formula/foo.rb"), "utf8")).toContain("foo-1.0.0.tar.gz");
+    expect(readFileSync(join(dir, "lib/gitmatrix_download_strategy.rb"), "utf8")).toContain(
+      "class GitmatrixDownloadStrategy < CurlDownloadStrategy",
+    );
+    expect(readFileSync(join(dir, "README.md"), "utf8")).toContain("brew tap gitmatrix/tools");
+    expect((await ok(["rev-parse", "--abbrev-ref", "HEAD"], dir)).trim()).toBe("main");
+    await ok(["fsck", "--strict", "--no-dangling"], dir);
 
-      await publish("bar", "2.0.0");
-      await publish("foo", "1.1.0");
-      const traced = await git(["-c", `protocol.version=${version}`, "fetch", "origin"], dir, {
-        GIT_TRACE_PACKET: "1",
-      });
-      expect(traced.code).toBe(0);
-      // The right protocol was spoken, and the client's HEAD was recognised as common.
-      expect(traced.stderr.includes("version 2")).toBe(version === "2");
-      expect(traced.stderr).toMatch(/(fetch|fetch-pack)< ACK [0-9a-f]{40}/);
-      await ok(["merge", "--ff-only", "origin/main"], dir);
-      expect(readFileSync(join(dir, "Formula/foo.rb"), "utf8")).toContain("foo-1.1.0.tar.gz");
-      expect(existsSync(join(dir, "Formula/bar.rb"))).toBe(true);
-      const log = (await ok(["log", "--format=%s|%an <%ae>"], dir)).trim().split("\n");
-      expect(log).toEqual([
-        "Update foo 1.1.0|gitmatrix <noreply@gitmatrix.dev>",
-        "Add bar 2.0.0|gitmatrix <noreply@gitmatrix.dev>",
-        "Add foo 1.0.0|gitmatrix <noreply@gitmatrix.dev>",
-      ]);
-      await ok(["fsck", "--strict", "--no-dangling"], dir);
-
-      // Nothing new: fetch is a no-op.
-      await ok(["-c", `protocol.version=${version}`, "fetch", "origin"], dir);
-      const remote = await ok(["-c", `protocol.version=${version}`, "ls-remote", url()]);
-      expect(remote).toMatch(/^[0-9a-f]{40}\tHEAD\n[0-9a-f]{40}\trefs\/heads\/main\n$/);
+    await publish("bar", "2.0.0");
+    await publish("foo", "1.1.0");
+    const traced = await git(["-c", "protocol.version=2", "fetch", "origin"], dir, {
+      GIT_TRACE_PACKET: "1",
     });
+    expect(traced.code).toBe(0);
+    // The right protocol was spoken, and the client's HEAD was recognised as common.
+    expect(traced.stderr).toContain("version 2");
+    expect(traced.stderr).toMatch(/(fetch|fetch-pack)< ACK [0-9a-f]{40}/);
+    await ok(["merge", "--ff-only", "origin/main"], dir);
+    expect(readFileSync(join(dir, "Formula/foo.rb"), "utf8")).toContain("foo-1.1.0.tar.gz");
+    expect(existsSync(join(dir, "Formula/bar.rb"))).toBe(true);
+    const log = (await ok(["log", "--format=%s|%an <%ae>"], dir)).trim().split("\n");
+    expect(log).toEqual([
+      "Update foo 1.1.0|gitmatrix <noreply@gitmatrix.dev>",
+      "Add bar 2.0.0|gitmatrix <noreply@gitmatrix.dev>",
+      "Add foo 1.0.0|gitmatrix <noreply@gitmatrix.dev>",
+    ]);
+    await ok(["fsck", "--strict", "--no-dangling"], dir);
 
-    it(`shallow-clones and unshallows over protocol v${version}`, { timeout: 60_000 }, async () => {
-      await publish("foo", "1.0.0");
-      await publish("foo", "1.1.0");
-      await publish("bar", "1.0.0");
-      const dir = join(tempDir(), "shallow");
-      await ok(["-c", `protocol.version=${version}`, "clone", "--depth", "1", url(), dir]);
-      expect((await ok(["rev-list", "--count", "HEAD"], dir)).trim()).toBe("1");
-      expect(existsSync(join(dir, "Formula/bar.rb"))).toBe(true);
-      await ok(["-c", `protocol.version=${version}`, "fetch", "--unshallow", "origin"], dir);
-      expect((await ok(["rev-list", "--count", "HEAD"], dir)).trim()).toBe("3");
-      await ok(["fsck", "--strict", "--no-dangling"], dir);
-    });
-  }
+    // Nothing new: fetch is a no-op.
+    await ok(["-c", "protocol.version=2", "fetch", "origin"], dir);
+    const remote = await ok(["-c", "protocol.version=2", "ls-remote", url()]);
+    expect(remote).toMatch(/^[0-9a-f]{40}\tHEAD\n[0-9a-f]{40}\trefs\/heads\/main\n$/);
+  });
+
+  it("shallow-clones and unshallows over protocol v2", { timeout: 60_000 }, async () => {
+    await publish("foo", "1.0.0");
+    await publish("foo", "1.1.0");
+    await publish("bar", "1.0.0");
+    const dir = join(tempDir(), "shallow");
+    await ok(["-c", "protocol.version=2", "clone", "--depth", "1", url(), dir]);
+    expect((await ok(["rev-list", "--count", "HEAD"], dir)).trim()).toBe("1");
+    expect(existsSync(join(dir, "Formula/bar.rb"))).toBe(true);
+    await ok(["-c", "protocol.version=2", "fetch", "--unshallow", "origin"], dir);
+    expect((await ok(["rev-list", "--count", "HEAD"], dir)).trim()).toBe("3");
+    await ok(["fsck", "--strict", "--no-dangling"], dir);
+  });
 
   it("clones public taps anonymously, with or without .git", { timeout: 60_000 }, async () => {
     await h.createRepo({ key: "pub", format: "brew", kind: "local", visibility: "public" });

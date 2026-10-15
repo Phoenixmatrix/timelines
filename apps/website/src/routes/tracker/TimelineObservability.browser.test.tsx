@@ -3,11 +3,12 @@
 // checkpoints above, a step the live feed brings arriving without a reload,
 // the span inspector with CI's jobs by duration, and a phone width.
 
-import { expect, test } from "vite-plus/test";
+import { expect, onTestFinished, test, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { StepFeedRecord, StepUpload } from "../../../shared/steps.ts";
 import { commitId, sidewaysOverflow } from "../../testing/atlas.ts";
 import { renderApp } from "../../testing/render.tsx";
+import { cannedFeed } from "../../testing/stepFeed.ts";
 import { TestServer } from "../../testing/server.ts";
 import { checkpoint, ciRun, deployment, timelineWorld } from "../../testing/timelines.ts";
 
@@ -126,34 +127,27 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
       at: minutes(30),
     },
   ];
-  // Steps the feed later says an admin deleted (CORE-399).
-  const removals: StepFeedRecord[] = [];
-  server.on("GET", "/api/repos/:owner/:name/steps/live", () => {
-    const body =
-      feed
-        .map((record) => `id: ${record.seq}\nevent: step\ndata: ${JSON.stringify(record)}\n\n`)
-        .join("") +
-      removals
-        .map(
-          ({ repo, changeId, commitOid }) =>
-            `event: removed\ndata: ${JSON.stringify({ repo, changeId, commitOid })}\n\n`,
-        )
-        .join("");
-    return new Response(body, { headers: { "content-type": "text/event-stream" } });
-  });
+  const live = cannedFeed(server, feed);
 
+  // The page's waits run on a fake clock: checkpoints read again 5 s after a
+  // step arrives, a step the feed brings is asked for 2 s later, and a dropped
+  // feed reconnects after 5 s.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
+  const later = () => vi.advanceTimersByTimeAsync(5_000);
   const app = renderApp(`/tracker/orbit/timelines?tl=${world.slug}`);
   const observed = page.getByRole("region", { name: "Observability" });
   const vitals = observed.getByLabelText("Vitals");
-  await expect.element(vitals).toMatchTextContent(/steps\s*3(?!\d)/);
-  // 9 + 12 local passes and CI's one pass, against CI's one failure.
+  // Each label, then its value (shown above it); the arithmetic is
+  // timelineSpans.test.ts's. 9 + 12 local passes and CI's one pass, against
+  // CI's one failure.
   await expect.element(vitals).toMatchTextContent(/checks passing \(3 of 4\)\s*75%/);
-  await expect.element(vitals).toMatchTextContent(/times a person steered\s*1(?!\d)/);
-  await expect.element(vitals).toMatchTextContent(/steps that say why\s*67%/);
-  await expect.element(vitals).toMatchTextContent(/checkpoints, preview live\s*1(?!\d)/);
-  await expect.element(vitals).toMatchTextContent(/authors\s*2(?!\d)/);
+  await expect
+    .poll(async () => (await later(), vitals.element().textContent))
+    .toMatch(/checkpoints, preview live\s*1(?!\d)/);
 
-  // Each label, then its value (shown above it).
   // A lane per author, the most recently active first; each step a button.
   const builder = observed.getByRole("list", { name: "builder's steps" });
   expect(builder.getByRole("button").elements()).toHaveLength(2);
@@ -210,8 +204,9 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
   expect(target.searchParams.get("step")).toBe(rank);
   expect(target.searchParams.get("repo")).toBe("orbit/engine");
 
-  // A step the live feed brings appears without a reload, marked new and announced.
-  feed.push({
+  // A step the live feed brings appears without a reload, marked new and
+  // announced.
+  live.push({
     seq: 9,
     repo: "orbit/engine",
     timeline: world.slug,
@@ -226,14 +221,10 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
     at: minutes(1),
   });
   await expect
-    .poll(
-      () =>
-        builder
-          .getByRole("button", { name: /^Keep score as tie-breaker, checks pass, .*, new$/ })
-          .elements().length,
-      { timeout: 20_000 },
+    .element(
+      builder.getByRole("button", { name: /^Keep score as tie-breaker, checks pass, .*, new$/ }),
     )
-    .toBe(1);
+    .toBeVisible();
   await expect
     .element(observed.getByText("New step from builder: Keep score as tie-breaker"))
     .toBeInTheDocument();
@@ -243,10 +234,10 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
       (r) =>
         r.url.pathname === "/api/repos/orbit/engine/steps" && r.url.searchParams.has("commits"),
     ).length;
-  await expect.poll(asked, { timeout: 10_000 }).toBe(1);
+  await expect.poll(async () => (await later(), asked())).toBe(1);
   // Another arrives: only its commit is asked for, never the first again.
   const first = feed.at(-1)!.commitOid;
-  feed.push({
+  live.push({
     ...feed.at(-1)!,
     seq: 10,
     changeId: "secondlive",
@@ -255,8 +246,12 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
     committedAt: minutes(0),
     at: minutes(0),
   });
-  await expect.poll(asked, { timeout: 20_000 }).toBe(2);
-  await new Promise((resolve) => setTimeout(resolve, 7_000));
+  await expect.poll(async () => (await later(), asked())).toBe(2);
+  // The stream drops; the page reconnects and the backlog replays both.
+  const connections = live.connections;
+  live.drop();
+  await expect.poll(async () => (await later(), live.connections)).toBeGreaterThan(connections);
+  await later();
   const commitsAsked = server.requests
     .filter((r) => r.url.pathname === "/api/repos/orbit/engine/steps")
     .map((r) => r.url.searchParams.get("commits"))
@@ -269,19 +264,15 @@ test("observability: vitals, lanes by author, checkpoints, live arrival, the spa
 
   // An admin deletes a step already loaded in full: the feed says so, and its
   // span goes, inspector and all, without a reload (CORE-399).
-  removals.push(feed.find((record) => record.changeId === "livechange")!);
+  live.remove(feed.find((record) => record.changeId === "livechange")!);
   await expect
-    .poll(
-      () => builder.getByRole("button", { name: /Keep score as tie-breaker/ }).elements().length,
-      {
-        timeout: 20_000,
-      },
-    )
-    .toBe(0);
+    .element(builder.getByRole("button", { name: /Keep score as tie-breaker/ }))
+    .not.toBeInTheDocument();
   expect(builder.getByRole("button").elements()).toHaveLength(3);
   await expect
     .element(observed)
     .not.toMatchTextContent(/Keep score as tie-breaker|Ties need an order/);
+  vi.useRealTimers();
 
   // A phone: nothing scrolls sideways but the lanes themselves.
   await page.viewport(390, 844);

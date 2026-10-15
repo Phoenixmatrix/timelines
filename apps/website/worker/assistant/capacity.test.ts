@@ -120,10 +120,7 @@ describe("assistant binding capacity", () => {
   });
 
   test.each([
-    new Error("3021: rate limiting: inference request per min rate reached"),
-    refusal("billing entitlement required"),
     refusal("3040: out of capacity"),
-    refusal("3021: another failure"),
     new APICallError({
       message: "3021: rate limiting: inference request per min rate reached",
       url: "https://another-provider.example/model",

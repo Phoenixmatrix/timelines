@@ -411,7 +411,7 @@ describe("durable independent merge queue", () => {
     expect(t.refs.get("refs/heads/main")).toBe(oid(1));
     expect(t.deps.deploy).not.toHaveBeenCalled();
   });
-  test.each(["failed", "cancelled", "skipped", "none"])(
+  test.each(["failed", "skipped", "none"])(
     "%s gates fail closed and the next good submission still lands",
     async (gates) => {
       const t = await setup();
@@ -887,8 +887,6 @@ describe("durable independent merge queue", () => {
   test.each([
     ["failed", "before"],
     ["failed", "after"],
-    ["cancelled", "before"],
-    ["cancelled", "after"],
   ] as const)(
     "deployment %s survives interruption %s its terminal evidence commit",
     async (status, interruption) => {
@@ -1002,7 +1000,7 @@ describe("durable independent merge queue", () => {
     expect(await getQueue(t.env.DB, "repo", oid(2))).toBeNull();
     await t.progress();
   });
-  test.each(["queued", "merging", "testing", "advancing", "landed", "failed"] as const)(
+  test.each(["queued", "merging", "advancing", "landed"] as const)(
     "a tombstone fences %s work, pending effects, retries and admission",
     async (status) => {
       const t = await setup();

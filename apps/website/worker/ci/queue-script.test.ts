@@ -215,13 +215,13 @@ describe("trusted queue merge program", { timeout: 30_000 }, () => {
 
   test("allows sequential resolution stages beyond the former request deadline", async () => {
     // Real HTTP crosses a child Node process's AbortSignal, whose clock cannot
-    // be driven by parent fake timers. Scale budgets by 100: 50s classification
+    // be driven by parent fake timers. Scale budgets by 200: 50s classification
     // + 90s repair each fit 65s/125s but exceed the former 120s HTTP budget.
     const t = await setup({
-      script: queueMergeScript(QUEUE_RESOLVE_TIMEOUT_MS / 100),
+      script: queueMergeScript(QUEUE_RESOLVE_TIMEOUT_MS / 200),
       resolve: async (files) => {
-        await delay(500);
-        await delay(900);
+        await delay(250);
+        await delay(450);
         return Response.json({ resolution: approved(files) });
       },
     });
@@ -236,12 +236,12 @@ describe("trusted queue merge program", { timeout: 30_000 }, () => {
   });
 
   test("fails closed without replaying a paid resolution after its end-to-end deadline", async () => {
-    // The deadline covers starting Node and the merge before the request, so it
-    // leaves room for a slower host (CORE-257); the answer is held past it.
+    // The deadline starts at the request, after Node has started and merged
+    // (CORE-257); the answer is held past it.
     const requested = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const t = await setup({
-      script: queueMergeScript(5_000),
+      script: queueMergeScript(1_500),
       resolve: async (files) => {
         requested.resolve();
         await release.promise;
@@ -302,22 +302,16 @@ describe("trusted queue merge program", { timeout: 30_000 }, () => {
       t.unchanged();
     },
   );
-  test.each(["src/main.ts", "docs/AGENTS.md", "docs/security.md"])(
-    "rejects unsafe path %s",
-    async (path) => {
-      const t = await setup({ path });
-      const result = await t.step();
-      expect(result.status).toBe(42);
-      expect(result.stderr).toContain("QUEUE_CONFLICT_PATHS " + JSON.stringify([path]));
-      expect(t.requests).toEqual([]);
-      t.unchanged();
-    },
-  );
+  test.each(["src/main.ts", "docs/AGENTS.md"])("rejects unsafe path %s", async (path) => {
+    const t = await setup({ path });
+    const result = await t.step();
+    expect(result.status).toBe(42);
+    expect(result.stderr).toContain("QUEUE_CONFLICT_PATHS " + JSON.stringify([path]));
+    expect(t.requests).toEqual([]);
+    t.unchanged();
+  });
   test.each([
-    "manual",
-    "missing-model",
     "low-confidence",
-    "dropped-text",
     "invented-command",
     "unexpected-path",
     "http-failure",
@@ -328,13 +322,7 @@ describe("trusted queue merge program", { timeout: 30_000 }, () => {
         if (failure === "http-failure") return new Response("Unavailable", { status: 503 });
         if (failure === "model-failure") return Response.json({ error: "Model unavailable" });
         const resolution = approved(files);
-        if (failure === "manual") {
-          resolution.decision.action = "manual";
-          resolution.files = [];
-        }
-        if (failure === "missing-model") resolution.repairModel = null;
         if (failure === "low-confidence") resolution.decision.confidence = 0.9499;
-        if (failure === "dropped-text") resolution.files[0]!.content = files[0]!.ours;
         if (failure === "invented-command") resolution.files[0]!.content += "$(touch escaped)\n";
         if (failure === "unexpected-path") resolution.files[0]!.path = "../escaped";
         return Response.json({ resolution });

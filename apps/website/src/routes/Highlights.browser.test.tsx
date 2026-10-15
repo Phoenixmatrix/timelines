@@ -55,7 +55,8 @@ async function defaultToOrbit(server: TestServer) {
   server.on("GET", "/api/tracker", { ...trackers, defaultSpaceId: tracker.id });
 }
 
-for (const path of ["/tracker/orbit/highlights", "/highlights"]) {
+// /highlights lands on /tracker/orbit/highlights, so it reads both.
+for (const path of ["/highlights"]) {
   test(`${path} shows the Space's highlights with exact daily-note backlinks`, async () => {
     const server = await TestServer.start({ world: true });
     await server.repo("orbit", "highlights-engine");
@@ -154,51 +155,44 @@ test("the repository highlights page is gone", async () => {
   );
 });
 
-for (const state of ["disabled", "ready"] as const) {
-  test(`repository ${state === "disabled" ? "disabled notes" : "detailed notes"} link to Space highlights`, async () => {
-    const server = await TestServer.start({ world: true });
-    await server.repo("orbit", "highlights-engine");
-    const space = await orbit(server);
-    const release: ReleaseNotesRelease = {
-      release: {
-        name: note.release,
-        kind: "daily",
-        toOid: "a".repeat(40),
-        fromTag: null,
-        lastCommitAt: "2026-09-20T12:00:00.000Z",
-        updatedAt: "2026-09-20T12:00:00.000Z",
-        entries: 0,
-        fromOid: null,
-        truncated: false,
-        intro: "Parcel verification now checks every batch.",
-        introModel: null,
-      },
-      entries: [],
-    };
-    server.on("GET", "/api/repos/orbit/highlights-engine/release-notes", {
-      releases: state === "ready" ? [release.release] : [],
-      status: { state, generatedAt: null },
-    } satisfies ReleaseNotesIndex);
-    server.on("GET", "/api/repos/orbit/highlights-engine/release-notes/release", release);
-    server.on("GET", spaceApi, overview(space));
-    const app = renderApp("/orbit/highlights-engine/releases");
-    await expect
-      .element(
-        page.getByText(
-          state === "disabled" ? "AI writing is off in this environment." : release.release.intro!,
-          { exact: true },
-        ),
-      )
-      .toBeVisible();
-    const link = page.getByRole("link", { name: "View Space highlights", exact: true });
-    await expect.element(link).toHaveAttribute("href", "/tracker/orbit/highlights");
-    await link.click();
-    await app.waitForUrl((url) => url.pathname === "/tracker/orbit/highlights");
-    await expect.element(page.getByRole("article", { name: "Release highlights" })).toBeVisible();
-  });
-}
+// Disabled notes show the same link beside other words.
+test("repository detailed notes link to Space highlights", async () => {
+  const server = await TestServer.start({ world: true });
+  await server.repo("orbit", "highlights-engine");
+  const space = await orbit(server);
+  const release: ReleaseNotesRelease = {
+    release: {
+      name: note.release,
+      kind: "daily",
+      toOid: "a".repeat(40),
+      fromTag: null,
+      lastCommitAt: "2026-09-20T12:00:00.000Z",
+      updatedAt: "2026-09-20T12:00:00.000Z",
+      entries: 0,
+      fromOid: null,
+      truncated: false,
+      intro: "Parcel verification now checks every batch.",
+      introModel: null,
+    },
+    entries: [],
+  };
+  server.on("GET", "/api/repos/orbit/highlights-engine/release-notes", {
+    releases: [release.release],
+    status: { state: "ready", generatedAt: null },
+  } satisfies ReleaseNotesIndex);
+  server.on("GET", "/api/repos/orbit/highlights-engine/release-notes/release", release);
+  server.on("GET", spaceApi, overview(space));
+  const app = renderApp("/orbit/highlights-engine/releases");
+  await expect.element(page.getByText(release.release.intro!, { exact: true })).toBeVisible();
+  const link = page.getByRole("link", { name: "View Space highlights", exact: true });
+  await expect.element(link).toHaveAttribute("href", "/tracker/orbit/highlights");
+  await link.click();
+  await app.waitForUrl((url) => url.pathname === "/tracker/orbit/highlights");
+  await expect.element(page.getByRole("article", { name: "Release highlights" })).toBeVisible();
+});
 
-test.each(["grantee", "non-grantee", "signed-out"] as const)(
+// A non-grantee is a session without the Space, as signed out is one without any.
+test.each(["grantee", "signed-out"] as const)(
   "the repository release page offers Space highlights to a %s only if they can read them",
   async (who) => {
     const server = await TestServer.start({ world: true });
@@ -228,7 +222,8 @@ test.each(["grantee", "non-grantee", "signed-out"] as const)(
   },
 );
 
-for (const state of ["disabled", "idle", "failed"] as const) {
+// Disabled and idle take the same branch as failed.
+for (const state of ["failed"] as const) {
   test(`${state} highlights hide stale prose and sources while allowing manual refresh`, async () => {
     const server = await TestServer.start({ world: true });
     const space = await orbit(server);

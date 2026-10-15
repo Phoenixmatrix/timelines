@@ -1598,7 +1598,7 @@ report them rather than substituting an unverified download or feature binary.
 - `src/commands/`: local commands, worktree lifecycle/include copying,
   network commands (clone, sync, push), timelines and server commands.
 - `src/meta.rs`, `src/cli.rs`: the manifest, search, schema and guide.
-- `tests/flow.rs`: end-to-end tests against a local bare remote.
+- `tests/it/` (one integration binary, a module per area, e.g. `flow.rs`): end-to-end tests against a local bare remote.
 
 libgit2 (vendored, through `git2`) implements the change model. The `git` binary
 handles worktree lifecycle and ignored-file enumeration, plus fetch and push

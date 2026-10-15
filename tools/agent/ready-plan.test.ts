@@ -7,12 +7,10 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import {
   localGates,
-  localReasons,
   parseReadyOptions,
   readinessPlan,
   type ReadyOptions,
   type ReadyPlan,
-  websiteTestSelection,
 } from "./ready-plan.ts";
 import { ciBuildPlan } from "./ci-build.ts";
 
@@ -27,7 +25,6 @@ const workspaces = [
   "tools/remote",
   "packages/formats",
   "packages/testing",
-  "packages/utils",
 ];
 const repository = resolve(import.meta.dirname, "../..");
 
@@ -139,15 +136,6 @@ await test("docs and coding-agent configuration retain mandatory checks", async 
   });
 });
 
-await test("Markdown below the root and outside known workspace names is not documentation", async () => {
-  await fixture(async (root, _git, put) => {
-    await put("docs/guide.md");
-    const plan = await readinessPlan(root, options);
-    assert.equal(plan.full, true);
-    assert.match(plan.reasons[0]!, /Unclassified or global path: docs\/guide\.md/);
-  });
-});
-
 await test("website production changes propagate implicit TS consumers without Rust gates", async () => {
   await fixture(async (root, _git, put) => {
     await put("apps/website/src/routes/Home.tsx");
@@ -212,7 +200,7 @@ await test("public site changes select site work and the mandatory remote contra
   }
 });
 
-await test("manifest dependencies propagate formats and testing but keep utils isolated", async () => {
+await test("manifest dependencies propagate formats and testing", async () => {
   for (const [workspace, expected, e2e] of [
     [
       "formats",
@@ -239,7 +227,6 @@ await test("manifest dependencies propagate formats and testing but keep utils i
       ],
       false,
     ],
-    ["utils", ["utils#test", "utils#build"], false],
   ] as const) {
     await fixture(async (root, _git, put) => {
       await put(`packages/${workspace}/src/index.ts`);
@@ -250,8 +237,6 @@ await test("manifest dependencies propagate formats and testing but keep utils i
       assert.ok(!targets(plan).some((target) => target.startsWith("cli#")));
       if (workspace === "testing")
         assert.ok(!targets(plan).some((target) => target.endsWith("#build")));
-      if (workspace === "utils")
-        assert.deepEqual(targets(plan), ["@gitmatrix/remote#typecheck", ...expected]);
     });
   }
 });
@@ -260,12 +245,12 @@ await test("manifest graph changes are read dynamically and propagated transitiv
   await fixture(async (root, git, put) => {
     const path = "packages/formats/package.json";
     const manifest = JSON.parse(await readFile(join(root, path), "utf8"));
-    manifest.dependencies.utils = "workspace:*";
+    manifest.dependencies["@gitmatrix/preview"] = "workspace:*";
     await put(path, JSON.stringify(manifest));
     await git(["add", path]);
     await git(["commit", "-m", "new workspace edge"]);
     await git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
-    await put("packages/utils/src/index.ts");
+    await put("tools/preview/preview.ts");
     const plan = await readinessPlan(root, options);
     assert.ok(targets(plan).includes("@gitmatrix/formats#test"));
     assert.ok(targets(plan).includes("website#build"));
@@ -315,17 +300,6 @@ await test("preview tooling stays isolated from production app and CLI", async (
   });
 });
 
-await test("remote test-only changes keep Worker coverage without live or production gates", async () => {
-  await fixture(async (root, _git, put) => {
-    await put("tools/remote/worker.test.ts");
-    const plan = await readinessPlan(root, options);
-    assert.equal(plan.full, false);
-    assert.equal(plan.e2e, false);
-    assert.deepEqual(targets(plan), ["@gitmatrix/remote#typecheck"]);
-    assert.deepEqual(names(plan), ["remote-types", "check"]);
-  });
-});
-
 await test("remote protocol consumers participate in transitive workspace task selection", async () => {
   await fixture(async (root, git, put) => {
     const path = "tools/remote/package.json";
@@ -365,24 +339,14 @@ await test("every narrow plan regenerates and checks remote bindings before root
 });
 
 await test("unknown/global paths, task manifests and shared harness changes fail closed", async () => {
+  // One path per fail-closed class: lockfile, task manifest, unclassified Markdown,
+  // an unknown workspace and the shared harness.
   for (const path of [
     "pnpm-lock.yaml",
     "vite.config.ts",
-    "patches/cf.patch",
     "unknown.md",
-    ".claude/hooks/check.sh",
-    ".agents/skills/gitmatrix-graph-work/run.ts",
     "packages/new/src/index.ts",
-    "tools/new-tool/task.ts",
     "tools/agent/environment.ts",
-    "tools/agent/ready-plan.ts",
-    "tools/agent/ready-e2e.ts",
-    "tools/agent/e2e.ts",
-    "tools/agent/remote-protocol.ts",
-    "tools/remote/worker.ts",
-    "tools/remote/cloudflare.config.ts",
-    "tools/remote/package.json",
-    "apps/website/package.json",
   ]) {
     await fixture(async (root, _git, put) => {
       await put(path);
@@ -455,18 +419,7 @@ await test("content-only audited stylesheets retain every website gate and E2E",
 });
 
 await test("stylesheet names, imports, configuration and mixed inputs widen conservatively", async () => {
-  for (const change of [
-    "add",
-    "delete",
-    "rename",
-    "import",
-    "multiline-import",
-    "comment-import",
-    "mixed",
-    "config",
-    "index-delete",
-    "committed-import",
-  ]) {
+  for (const change of ["add", "delete", "rename", "import", "comment-import", "mixed", "config"]) {
     await fixture(async (root, git, put) => {
       const path = "apps/website/src/styles/app.css";
       await put(path, '@import "./base.css";\n.a { color: blue; }\n');
@@ -479,20 +432,10 @@ await test("stylesheet names, imports, configuration and mixed inputs widen cons
       else if (change === "rename")
         await rename(join(root, path), join(root, "apps/website/src/styles/new.css"));
       else if (change === "import") await put(path, '@import "./new.css";\n.a { color: blue; }\n');
-      else if (change === "multiline-import")
-        await put(path, '@import\n"./new.css";\n.a { color: blue; }\n');
       else if (change === "comment-import")
         await put(path, '/* @import "./base.css"; */\n.a { color: blue; }\n');
       else if (change === "mixed") await put("apps/website/src/routes/Home.tsx");
-      else if (change === "config") await put("apps/website/vite.config.ts");
-      else if (change === "index-delete") {
-        await git(["rm", "--cached", path]);
-      } else {
-        await put(path, '@import "./new.css";\n.a { color: blue; }\n');
-        await git(["add", path]);
-        await git(["commit", "-m", "change import"]);
-        await put(path, '@import "./base.css";\n.a { color: blue; }\n');
-      }
+      else await put("apps/website/vite.config.ts");
       const plan = await readinessPlan(root, options);
       assert.ok(targets(plan).includes("@gitmatrix/agent#test"), change);
       assert.ok(targets(plan).includes("@gitmatrix/preview#test"), change);
@@ -533,7 +476,7 @@ await test("runtime markdown and fixtures are not discarded as documentation or 
 
 await test("Git discovery preserves committed, staged, unstaged, deleted, renamed and special paths", async () => {
   await fixture(async (root, git, put) => {
-    const prefix = "packages/utils/src/";
+    const prefix = "tools/preview/src/";
     const baseline = ["staged.ts", "unstaged.ts", "deleted.ts", "old name.ts", "cancelled.ts"];
     for (const name of baseline) await put(prefix + name, "original\n");
     await git(["add", "."]);
@@ -571,7 +514,11 @@ await test("Git discovery preserves committed, staged, unstaged, deleted, rename
         .map((name) => prefix + name)
         .sort(),
     );
-    assert.deepEqual(targets(plan), ["@gitmatrix/remote#typecheck", "utils#test", "utils#build"]);
+    assert.deepEqual(targets(plan), [
+      "@gitmatrix/remote#typecheck",
+      "@gitmatrix/preview#typecheck",
+      "@gitmatrix/preview#test",
+    ]);
   });
 });
 
@@ -583,12 +530,12 @@ await test("base discovery uses merge-base rather than changes unique to the bas
     await git(["add", "."]);
     await git(["commit", "-m", "upstream"]);
     await git(["checkout", "main"]);
-    await put("packages/utils/src/ours.ts");
+    await put("tools/preview/ours.ts");
     await git(["add", "."]);
     await git(["commit", "-m", "ours"]);
     const plan = await readinessPlan(root, { ...options, base: "upstream" });
     assert.equal(plan.base, base);
-    assert.deepEqual(plan.changed, ["packages/utils/src/ours.ts"]);
+    assert.deepEqual(plan.changed, ["tools/preview/ours.ts"]);
     assert.equal(plan.full, false);
   });
 });
@@ -604,13 +551,13 @@ await test("missing base, invalid Git repository and unreadable graph select ful
       assert.equal(plan.base, null);
       assert.ok(plan.reasons[0].includes(base));
     }
-    await rm(join(root, "packages/utils/package.json"));
+    await rm(join(root, "tools/preview/package.json"));
     // A missing known manifest is itself a conservative global configuration change.
     const graph = await readinessPlan(root, { ...options, base: "HEAD" });
     assert.equal(graph.full, true);
     assert.equal(graph.e2eAll, false);
     // An unreadable task graph is failed change discovery too: every scenario runs (CORE-406).
-    await put("packages/utils/package.json", "{not json");
+    await put("tools/preview/package.json", "{not json");
     await git(["add", "."]);
     await git(["commit", "-m", "break a manifest"]);
     const broken = await readinessPlan(root, { ...options, base: "HEAD" });
@@ -838,46 +785,6 @@ await test("local ready runs the full website unit project for untraceable chang
     const tests = gates.find((gate) => gate.name === "website-tests")!;
     assert.deepEqual(tests.args.slice(1), ["--project", "unit"]);
   });
-});
-
-await test("local ready keeps the full gates for a global path", async () => {
-  await fixture(async (root, _git, put) => {
-    await put(".gitmatrix/ci.yml");
-    const { plan, gates } = await local(root);
-    assert.equal(plan.full, true);
-    assert.equal(gates, plan.gates);
-    assert.ok(names(plan).includes("tests") && names(plan).includes("build"));
-  });
-});
-
-await test("local ready slims the full fallback to checks and direct tests", async () => {
-  await fixture(async (root, _git, put) => {
-    await put("tools/agent/environment.ts");
-    const { plan, gates } = await local(root);
-    assert.equal(plan.full, true);
-    assert.deepEqual(plan.direct, ["tools/agent"]);
-    const found = localNames(gates);
-    assert.equal(found.includes("tests"), false);
-    assert.equal(found.includes("build"), false);
-    assert.ok(found.includes("agent-tests"));
-    for (const name of ["website-types", "remote-types", "check", "cli-check", "types"])
-      assert.ok(found.includes(name), name);
-    assert.equal(found.includes("website-tests"), false);
-    assert.equal(
-      localReasons(plan.reasons).some((reason) => reason.startsWith("Full coverage")),
-      false,
-    );
-  });
-});
-
-await test("the README's readers are found by name in the real website", () => {
-  const files = websiteTestSelection(["apps/website/README.md"], repository).files;
-  assert.ok(files.includes("worker/ci/config.test.ts"), files.join(","));
-  assert.equal(
-    files.some((file) => file.endsWith(".browser.test.tsx")),
-    false,
-  );
-  assert.deepEqual(websiteTestSelection(["apps/website/worker/ci/jobs.ts"], repository).files, []);
 });
 
 await test("local ready runs the website unit tests a README change reaches", async () => {

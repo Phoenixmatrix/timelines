@@ -162,24 +162,27 @@ describe("site admins create password accounts", () => {
     expect(rows("SELECT * FROM accounts WHERE slug = 'demo-1'")).toEqual([]);
   });
 
-  test.each([
-    [{ username: "member" }, 409, /username is taken/],
-    [{ username: "settings" }, 400, /reserved/],
-    [{ username: "-bad" }, 400, /lowercase letters/],
-    [{ email: "persona@example.com" }, 409, /already has an account/],
-    [{ email: "nope" }, 400, /email address/],
-    // Better Auth refuses these at sign-in, so they'd never sign in.
-    [{ email: "carol@demo.c" }, 400, /email address/],
-    [{ email: "bob..x@example.com" }, 400, /email address/],
-    [{ email: "Owner@Example.com" }, 400, /instance owner/],
-    [{ password: "short" }, 400, /at least 12/],
-    [{ password: "x".repeat(129) }, 400, /at most 128/],
-    [{ displayName: "x".repeat(101) }, 400, /at most 100/],
-  ])("refuses %o", async (change, status, message) => {
+  test("refuses taken, reserved or malformed details", async () => {
     const { tokens, call } = await setup();
-    const response = await call(tokens.admin, "POST", "/admin/accounts", { ...demo, ...change });
-    expect(response.status).toBe(status);
-    expect(await response.json()).toMatchObject({ error: expect.stringMatching(message) });
+    for (const [change, status, message] of [
+      [{ username: "member" }, 409, /username is taken/],
+      [{ username: "settings" }, 400, /reserved/],
+      [{ username: "-bad" }, 400, /lowercase letters/],
+      [{ email: "persona@example.com" }, 409, /already has an account/],
+      [{ email: "nope" }, 400, /email address/],
+      // Better Auth refuses these at sign-in, so they'd never sign in.
+      [{ email: "carol@demo.c" }, 400, /email address/],
+      [{ email: "bob..x@example.com" }, 400, /email address/],
+      [{ email: "Owner@Example.com" }, 400, /instance owner/],
+      [{ password: "short" }, 400, /at least 12/],
+      [{ password: "x".repeat(129) }, 400, /at most 128/],
+      [{ displayName: "x".repeat(101) }, 400, /at most 100/],
+    ] as const) {
+      const response = await call(tokens.admin, "POST", "/admin/accounts", { ...demo, ...change });
+      const label = JSON.stringify(change);
+      expect(response.status, label).toBe(status);
+      expect(await response.json(), label).toMatchObject({ error: expect.stringMatching(message) });
+    }
   });
 });
 

@@ -76,7 +76,6 @@ const WORKSPACES = [
   "apps/site",
   "packages/formats",
   "packages/testing",
-  "packages/utils",
 ] as const;
 type Workspace = (typeof WORKSPACES)[number];
 interface Manifest {
@@ -97,7 +96,6 @@ export const labels: Record<Workspace, string> = {
   "apps/site": "site",
   "packages/formats": "formats",
   "packages/testing": "testing",
-  "packages/utils": "utils",
 };
 
 const exec = promisify(execFile);

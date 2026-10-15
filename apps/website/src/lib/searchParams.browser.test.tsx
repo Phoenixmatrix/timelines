@@ -6,7 +6,7 @@
 
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { createBrowserRouter, RouterProvider, useSearchParams } from "react-router";
+import { createBrowserRouter, RouterProvider } from "react-router";
 import { afterEach, expect, test } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
 import { useLiveSearchParams } from "./searchParams.ts";
@@ -61,26 +61,4 @@ test("two updates in one turn both reach the address", async () => {
   await page.getByRole("button", { name: "Both" }).click();
   await expect.element(page.getByRole("status")).toHaveTextContent("keep=1&lens=in&links=related");
   expect(new URL(location.href).searchParams.get("lens")).toBe("in");
-});
-
-test("React Router's own functional update drops the first (why the hook exists)", async () => {
-  mount(function Page() {
-    const [params, setParams] = useSearchParams();
-    return (
-      <>
-        <output>{params.toString()}</output>
-        <button
-          type="button"
-          onClick={() => {
-            setParams(set("lens", "in"));
-            setParams(set("links", "related"));
-          }}
-        >
-          Both
-        </button>
-      </>
-    );
-  });
-  await page.getByRole("button", { name: "Both" }).click();
-  await expect.element(page.getByRole("status")).toHaveTextContent("keep=1&links=related");
 });

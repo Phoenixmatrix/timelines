@@ -60,7 +60,6 @@ const workspaces = [
   "apps/site",
   "packages/formats",
   "packages/testing",
-  "packages/utils",
 ];
 // As ready-plan.ts's documentation().
 const documentation = (path: string) =>
@@ -83,7 +82,7 @@ function readyRunsE2E(changed: readonly string[]): boolean {
     const workspace = workspaces.find((w) => path.startsWith(`${w}/`));
     if (!workspace || path === `${workspace}/package.json`) return true;
     if (testOnly(path) || workspace === "packages/testing") return false;
-    // Production changes that reach the website or gm (formats/utils are their dependencies).
+    // Production changes that reach the website or gm (formats is their dependency).
     return !["tools/preview", "apps/site"].includes(workspace);
   });
 }

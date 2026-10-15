@@ -574,7 +574,7 @@ fn wait(ctx: &Ctx, config: &Config, paths: &Paths, mut run: Value, timeout: u64)
                 }
             }
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(remote::poll_interval(Duration::from_secs(1)));
         run = remote::api(config, "GET", &format!("{}/{id}", paths.runs), None)?;
     }
 }

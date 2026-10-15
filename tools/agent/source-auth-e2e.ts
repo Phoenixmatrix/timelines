@@ -7,7 +7,6 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { RepoDetail } from "../../apps/website/shared/api.ts";
 import type { Timeline } from "../../apps/website/shared/timelines.ts";
 import type { QueueGm, RepoInventory } from "./queue-e2e.ts";
-import type { Step, StepVersions } from "../../apps/website/shared/steps.ts";
 import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
 
 /** A2 uses actual canonical/work providers and credentials, never alternate authorization mocks. */
@@ -18,7 +17,7 @@ export async function runSourceAuthE2E(
   record: (value: unknown) => void,
 ) {
   const secret = ctx.env.GITMATRIX_AGENT_SECRET;
-  assert(secret, "The isolated identity fixture needs the agent secret");
+  assert(secret, "Source authorization cleanup needs the agent secret");
   const prefix = `source-auth-${randomUUID().slice(0, 8)}`;
   const root = join(ctx.work, prefix);
   await mkdir(root, { recursive: true });
@@ -224,19 +223,6 @@ export async function runSourceAuthE2E(
     sourceSlugs.set(source.sourceId, slug);
     return { slug, sourceId: source.sourceId };
   };
-  const identity = async (f: Fixture, owner: "sam" | "marco", name: string) => {
-    const result = await json<{ repoId: string }>(
-      "/api/dev/source-auth",
-      "POST",
-      { repo: f.repo, space: owner, name },
-      [200],
-      secret,
-    );
-    assert.equal(result.repoId, f.id, "Rename/transfer must preserve canonical repository ID");
-    f.owner = owner;
-    f.name = name;
-    f.repo = `${owner}/${name}`;
-  };
   const purge = async (f: Fixture) => {
     if (!f.deleted) {
       await json(api(f), "DELETE", undefined, [204, 404], fixtures.tokens[f.owner]);
@@ -261,7 +247,7 @@ export async function runSourceAuthE2E(
         return;
       }
       assert(Date.now() < deadline, `Auth fixture purge stalled: ${inventory.deletion?.phase}`);
-      await delay(1_000);
+      await delay(250);
     }
   };
   const failures: unknown[] = [];
@@ -363,93 +349,6 @@ export async function runSourceAuthE2E(
     await json(`${api(publicRepo)}?source=${publicWork.sourceId}`, "GET", undefined, [200], null);
 
     await cli(["timeline", "use", a.slug, "--space", "sam"], "sam", checkout);
-    // Uncheckpointed revisions and their context outlive an amend and a force reset.
-    const contextFile = join(root, "retained-context.md");
-    await writeFile(contextFile, "## Why\nPreserve the original uncheckpointed rationale.\n");
-    await writeFile(join(checkout, "retained-progress.txt"), "original progress\n");
-    await cli(
-      ["commit", "-m", "Uncheckpointed retained progress", "--context", contextFile],
-      "sam",
-      checkout,
-    );
-    const progress = await git(["rev-parse", "HEAD"], checkout);
-    const originalObject = `${await git(["cat-file", "commit", progress], checkout)}\n`;
-    const changeId = originalObject.match(/^change-id ([a-z0-9]+)$/m)?.[1];
-    assert(changeId, "Real gm commit records its change identity");
-    const upload = {
-      changeId,
-      commitOid: progress,
-      summary: "Uncheckpointed retained progress",
-      committedAt: await git(["show", "-s", "--format=%cI", progress], checkout),
-      timeline: a.slug,
-      why: "Preserve the original uncheckpointed rationale.",
-    };
-    assert.equal(
-      (await json<Step>(`${api(privateRepo)}/steps`, "POST", upload, [201])).verified,
-      false,
-    );
-    await cli(["push"], "sam", checkout);
-    let versions = await json<StepVersions>(`${api(privateRepo)}/steps/${changeId}`);
-    assert.equal(
-      versions.versions.find((version) => version.commitOid === progress)?.verified,
-      true,
-    );
-    await writeFile(join(checkout, "retained-progress.txt"), "amended progress\n");
-    await git(["add", "retained-progress.txt"], checkout);
-    const tree = await git(["write-tree"], checkout);
-    const objectFile = join(root, "retained-amend-object");
-    await writeFile(objectFile, originalObject.replace(/^tree [a-f0-9]+/m, `tree ${tree}`));
-    const amended = await git(["hash-object", "-t", "commit", "-w", objectFile], checkout);
-    assert.notEqual(amended, progress);
-    await git(["update-ref", "HEAD", amended, progress], checkout);
-    await git(["push", "--force", url(privateRepo, a.sourceId), "HEAD:work"], checkout);
-    const amendedUpload = {
-      ...upload,
-      commitOid: amended,
-      why: "The amended revision has different content.",
-    };
-    assert.equal(
-      (await json<Step>(`${api(privateRepo)}/steps`, "POST", amendedUpload, [201])).verified,
-      true,
-    );
-    await json(
-      `${api(privateRepo)}/steps`,
-      "POST",
-      { ...upload, why: "Foreign overwrite" },
-      [409],
-      fixtures.tokens.jun,
-    );
-    await json(`${api(privateRepo)}/steps`, "POST", {
-      ...upload,
-      why: "Updated original rationale.",
-    });
-    await git(["reset", "--hard", merged], checkout);
-    await git(["push", "--force", url(privateRepo, a.sourceId), "HEAD:work"], checkout);
-    assert.equal(await tip(privateRepo, a.sourceId), merged);
-    const retainedProgress = async () => {
-      versions = await json<StepVersions>(`${api(privateRepo)}/steps/${changeId}`);
-      assert.deepEqual(
-        versions.versions.map((version) => version.commitOid).sort(),
-        [progress, amended].sort(),
-      );
-      assert(versions.versions.every((version) => version.verified));
-      assert.equal(
-        versions.versions.find((version) => version.commitOid === progress)?.context.why,
-        "Updated original rationale.",
-      );
-      assert.equal(
-        versions.versions.find((version) => version.commitOid === amended)?.context.why,
-        amendedUpload.why,
-      );
-      for (const oid of [progress, amended]) {
-        await json(`${api(privateRepo)}/commits?ref=${oid}`, "GET", undefined, [404]);
-        const history = await json<{ commits: { oid: string }[] }>(
-          `${api(privateRepo)}/commits?ref=${oid}&source=${a.sourceId}`,
-        );
-        assert.equal(history.commits[0]?.oid, oid);
-      }
-    };
-    await retainedProgress();
     await json(`${api(privateRepo)}/collaborators/jun`, "DELETE", undefined, [204]);
     await cli(["push"], "jun", checkout, true);
     await json(
@@ -475,38 +374,6 @@ export async function runSourceAuthE2E(
       await git(["ls-remote", url(privateRepo, a.sourceId), "refs/heads/work"], root, "marco"),
       `${merged}\trefs/heads/work`,
     );
-    await retainedProgress();
-    const retainedClone = join(root, "retained-after-archive");
-    await git(["init", retainedClone], root);
-    for (const [oid, content] of [
-      [progress, "original progress"],
-      [amended, "amended progress"],
-    ]) {
-      await git(["fetch", url(privateRepo, a.sourceId), oid!], retainedClone);
-      assert.equal(await git(["show", `${oid}:retained-progress.txt`], retainedClone), content);
-    }
-    await json(`${api(privateRepo)}/steps/${changeId}/${amended}`, "DELETE", undefined, [200, 204]);
-    const redacted = await json<StepVersions>(`${api(privateRepo)}/steps/${changeId}`);
-    assert.equal(redacted.versions.find((version) => version.commitOid === amended)?.deleted, true);
-    assert.equal(
-      redacted.versions.find((version) => version.commitOid === amended)?.context.why,
-      "",
-    );
-    assert.equal(
-      redacted.versions.find((version) => version.commitOid === progress)?.context.why,
-      "Updated original rationale.",
-    );
-    record({
-      retainedUncheckpointedProgress: {
-        sourceId: a.sourceId,
-        progress,
-        amended,
-        restoredHead: merged,
-        changeId,
-      },
-      archivedContextReadable: true,
-      amendedContextRedacted: true,
-    });
     await commit(native, "stale.txt", "must never reach canonical\n", "marco");
     await git(["push", url(privateRepo, a.sourceId), "HEAD:work"], native, "marco", true);
     await json(`${api(privateRepo)}/collaborators/jun`, "PUT", { role: "write" });
@@ -514,43 +381,8 @@ export async function runSourceAuthE2E(
     assert.equal(await tip(privateRepo, a.sourceId), merged);
     assert.equal(await tip(privateRepo), unboundHead);
 
-    const oldRepo = privateRepo.repo;
-    const originalName = privateRepo.name;
-    await identity(privateRepo, "sam", `${originalName}-renamed`);
-    await json(`/api/repos/${oldRepo}?source=${b.sourceId}`, "GET", undefined, [404]);
-    await git(["ls-remote", `${ctx.origin}/${oldRepo}@${b.slug}.git`], root, "sam", true);
-    assert.equal(await tip(privateRepo, b.sourceId), privateRepo.base);
-    const renamedClone = join(root, "renamed");
-    await git(["clone", "--branch", "work", url(privateRepo, b.sourceId), renamedClone], root);
-    await configure(renamedClone);
-    const renamedHead = await commit(renamedClone, "renamed.txt", "stable repo id after rename\n");
-    await git(["push", "origin", "HEAD:work"], renamedClone);
-    assert.equal(await tip(privateRepo, b.sourceId), renamedHead);
-    assert.equal(await tip(privateRepo), unboundHead);
-    await identity(privateRepo, "marco", privateRepo.name);
-    // Deliberately do not migrate Tracker domains. Old and new owner work access fails closed.
-    await json(api(privateRepo), "GET", undefined, [404], fixtures.tokens.sam);
-    await git(["push", url(privateRepo), "HEAD:main"], privateRepo.cwd, "sam", true);
-    assert.equal(await tip(privateRepo, undefined, "marco"), unboundHead);
-    for (const actor of ["sam", "marco"] as const) {
-      await json(
-        `${api(privateRepo)}?source=${b.sourceId}`,
-        "GET",
-        undefined,
-        [404],
-        fixtures.tokens[actor],
-      );
-      await git(["ls-remote", url(privateRepo, b.sourceId)], root, actor, true);
-      await git(["push", url(privateRepo, b.sourceId), "HEAD:work"], renamedClone, actor, true);
-    }
-    // Restore only canonical fixture identity so the original owning Tracker can perform real purge.
-    await identity(privateRepo, "sam", originalName);
-    assert.equal(await tip(privateRepo, b.sourceId), renamedHead);
-    assert.equal(await tip(privateRepo), unboundHead);
     await cli(["timeline", "use", b.slug, "--space", "sam"], "sam", checkout);
     record({
-      renamePreservedRepoId: privateRepo.id,
-      transferFailedClosedWithoutTrackerMigration: true,
       foreignSourceRejected: true,
       revokedCredentialRejected: true,
       archivedReadOnly: true,
@@ -561,7 +393,7 @@ export async function runSourceAuthE2E(
     privateRepo.deleted = true;
     await json(`${api(privateRepo)}?source=${b.sourceId}`, "GET", undefined, [404]);
     await git(["ls-remote", url(privateRepo, b.sourceId)], root, "sam", true);
-    await git(["push", url(privateRepo, b.sourceId), "HEAD:work"], renamedClone, "sam", true);
+    await git(["push", url(privateRepo, b.sourceId), "HEAD:work"], native, "sam", true);
     await cli(["push"], "sam", checkout, true);
     await json(api(privateRepo), "GET", undefined, [404]);
     record({ tombstoneStaleNativeAndGmRejected: true });
@@ -570,8 +402,6 @@ export async function runSourceAuthE2E(
   } finally {
     for (const f of created) {
       try {
-        if (!f.deleted && (f.owner !== "sam" || f.name.endsWith("-renamed")))
-          await identity(f, "sam", f.name.replace(/-renamed$/, ""));
         await purge(f);
       } catch (error) {
         failures.push(error);

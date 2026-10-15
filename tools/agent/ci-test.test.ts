@@ -19,7 +19,6 @@ const workspaces = [
   "tools/remote",
   "packages/formats",
   "packages/testing",
-  "packages/utils",
 ];
 
 /** A committed baseline plus a CI environment naming it, then `run` changes the tree. */
@@ -191,7 +190,7 @@ await test("a harness change selects its workspace instead of the full suite", a
 
 await test("the lockfile, CI configuration and workspace manifests select the full suite", async () => {
   await fixture(async (plan, put, git) => {
-    for (const path of ["pnpm-lock.yaml", ".gitmatrix/ci.yml", "packages/utils/package.json"]) {
+    for (const path of ["pnpm-lock.yaml", ".gitmatrix/ci.yml", "packages/testing/package.json"]) {
       await put(path, "changed\n");
       const selected = await plan();
       assert.equal(selected.full, true, path);

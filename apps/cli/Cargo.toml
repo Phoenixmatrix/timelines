@@ -34,6 +34,10 @@ ureq = { version = "3.4.2", features = ["json"] }
 name = "gm"
 path = "src/main.rs"
 
+# Debuginfo only helps a debugger; panics still print backtraces, and it costs ~20% of a cold test build.
+[profile.dev]
+debug = 0
+
 [profile.release]
 strip = true
 lto = "thin"

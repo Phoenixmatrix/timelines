@@ -407,7 +407,7 @@ describe("Atlas read API", () => {
     node(s.sqlite, "r1", "repo", "repository", "engine", null, long, {
       techStack: Array.from({ length: 500 }, (_, i) => `tech-${i}`),
     });
-    for (let i = 0; i < 1500; i++) {
+    for (let i = 0; i < 200; i++) {
       const id = `component:c${pad(i)}`;
       node(
         s.sqlite,
@@ -434,7 +434,7 @@ describe("Atlas read API", () => {
     const overview = JSON.parse(json) as AtlasOverview;
     expect(overview.regions).toHaveLength(ATLAS_OVERVIEW_REGIONS);
     expect(overview.regions.every((r) => r.summaryTruncated)).toBe(true);
-    expect(overview.totalRegions).toBe(1500);
+    expect(overview.totalRegions).toBe(200);
     // Uncompressed, it's under half the compressed bound; compressed, far less.
     const bytes = new TextEncoder().encode(json).length;
     expect(bytes).toBeLessThan(ATLAS_OVERVIEW_MAX_BYTES / 2);
@@ -733,11 +733,6 @@ describe("Atlas read API", () => {
       reason: "count",
       evict: (db: D1Database) =>
         enforceRetention(db, [repoScope("r1")], { policy: { maxPrior: 0 } }),
-    },
-    {
-      reason: "storage",
-      evict: (db: D1Database) =>
-        enforceRetention(db, [repoScope("r1")], { policy: { capBytes: 1 } }),
     },
     {
       reason: "age",

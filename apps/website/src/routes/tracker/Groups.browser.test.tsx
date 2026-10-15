@@ -148,15 +148,15 @@ test("progress groups: the group being read stays pinned under the header until 
       id: "pin",
       data: { key: "PIN", name: "Pinned", memberIds: ["acc_marco"] },
     },
-    ...Array.from({ length: 80 }, (_, n) => ({
+    ...Array.from({ length: 60 }, (_, n) => ({
       kind: "issue.create",
       id: `pin-${n}`,
-      data: { teamId: "pin", title: `Pinned ${n}`, ...(n >= 40 ? { status: "backlog" } : {}) },
+      data: { teamId: "pin", title: `Pinned ${n}`, ...(n >= 30 ? { status: "backlog" } : {}) },
     })),
   ]);
   renderApp("/tracker/orbit?q=team%3Apin+is%3Aopen");
   const table = page.getByRole("table", { name: "Issues" });
-  await expect.element(table.getByRole("button", { name: /^Up next 40/ })).toBeVisible();
+  await expect.element(table.getByRole("button", { name: /^Up next 30/ })).toBeVisible();
   const pane = table.element() as HTMLElement;
   // Organization/Space controls must leave the entire scroll pane on screen.
   await expect
@@ -172,18 +172,18 @@ test("progress groups: the group being read stays pinned under the header until 
   expect(pinned()).toBeNull();
   // Inside Up next, its row is pinned.
   await scrollTo(10 * 32);
-  await expect.poll(() => pinned()?.textContent).toMatch(/^Up next40/);
+  await expect.poll(() => pinned()?.textContent).toMatch(/^Up next30/);
   expect(pinned()!.style.transform).toBe("translateY(0px)");
-  // Backlog's row (row 41) arriving pushes Up next up and out.
-  await scrollTo(41 * 32 - 10);
+  // Backlog's row (row 31) arriving pushes Up next up and out.
+  await scrollTo(31 * 32 - 10);
   await expect.poll(() => pinned()?.style.transform).toBe("translateY(-22px)");
-  await scrollTo(41 * 32 + 5);
-  await expect.poll(() => pinned()?.textContent).toMatch(/^Backlog40/);
+  await scrollTo(31 * 32 + 5);
+  await expect.poll(() => pinned()?.textContent).toMatch(/^Backlog30/);
   // Folding from the pinned row folds the group and brings its own row back into view.
   await userEvent.click(pinned()!.querySelector("button")!);
-  const backlog = table.getByRole("button", { name: /^Backlog 40/ });
+  const backlog = table.getByRole("button", { name: /^Backlog 30/ });
   await expect.element(backlog).toHaveAttribute("aria-expanded", "false");
   await expect.element(backlog).toBeInViewport();
   await expect.poll(() => pinned()?.textContent ?? "").not.toMatch(/^Backlog/);
-  expect(pane.textContent).not.toContain("Pinned 79");
+  expect(pane.textContent).not.toContain("Pinned 59");
 });

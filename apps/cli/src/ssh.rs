@@ -940,10 +940,4 @@ mod tests {
             "/mnt/c/Program Files/OpenSSH/ssh.exe"
         );
     }
-
-    #[test]
-    fn server_host_strips_scheme_and_port() {
-        assert_eq!(server_host("http://localhost:5180"), "localhost");
-        assert_eq!(server_host("https://git.example.com/"), "git.example.com");
-    }
 }

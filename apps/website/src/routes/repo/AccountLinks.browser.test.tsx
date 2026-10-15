@@ -1,61 +1,10 @@
 import { expect, test } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
 import type { RepoIssueSummary } from "../../../shared/api.ts";
-import type { Snapshot } from "../../../shared/tracker.ts";
 import { commitId } from "../../testing/atlas.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
 import { mutate } from "../../testing/timelines.ts";
-
-// Real explicit Space grants and tracker storage, with no AI responses involved.
-test("Space teams and repo counts require explicit grants, not public repo visibility", async () => {
-  const server = await TestServer.start({ world: true });
-  const repo = await server.repo("orbit", "engine");
-  await mutate(server, [
-    { kind: "team.create", id: "eng", data: { key: "ENG", name: "Engineering" } },
-    { kind: "project.create", id: "workspace", data: { slug: "engine", name: "Engine" } },
-    {
-      kind: "subscription.add",
-      id: "subscription",
-      data: { projectId: "workspace", repoId: repo.id },
-    },
-    {
-      kind: "issue.create",
-      id: "ready",
-      data: { teamId: "eng", title: "Ready work", status: "todo", projectIds: ["workspace"] },
-    },
-  ]);
-  expect((await server.call<Snapshot>("GET", "/api/tracker/orbit/snapshot")).teams).toEqual([
-    expect.objectContaining({ id: "eng", key: "ENG", name: "Engineering" }),
-  ]);
-  expect(
-    await server.call<RepoIssueSummary>("GET", "/api/repos/orbit/engine/tracker/summary"),
-  ).toEqual({ ready: 1, projects: 1 });
-  expect((await server.call<Snapshot>("GET", "/api/tracker/marco/snapshot")).teams).toEqual([]);
-  // Revoke only the Space grant; Organization membership and the public repository remain.
-  await server.sql(
-    "DELETE FROM space_grants WHERE space_id = (SELECT id FROM spaces WHERE slug = 'orbit') AND account_id = 'acc_marco'",
-  );
-  await expect(server.call("GET", "/api/tracker/orbit/snapshot")).rejects.toThrow("403");
-  expect(
-    await server.call<RepoIssueSummary>("GET", "/api/repos/orbit/engine/tracker/summary"),
-  ).toEqual({ ready: null, projects: 0 });
-  expect(
-    (await server.call<{ canManage: boolean }>("GET", "/api/repos/orbit/engine/tracker")).canManage,
-  ).toBe(false);
-  await server.as("priya");
-  // Site-wide repository administration still does not grant private tracker access.
-  await expect(server.call("GET", "/api/tracker/orbit/snapshot")).rejects.toThrow("403");
-  expect(
-    await server.call<RepoIssueSummary>("GET", "/api/repos/orbit/engine/tracker/summary"),
-  ).toEqual({ ready: null, projects: 0 });
-  await server.as(null);
-  await expect(server.call("GET", "/api/tracker/orbit/snapshot")).rejects.toThrow("401");
-  await expect(server.call("GET", "/api/tracker/marco/snapshot")).rejects.toThrow("401");
-  expect(
-    await server.call<RepoIssueSummary>("GET", "/api/repos/orbit/engine/tracker/summary"),
-  ).toEqual({ ready: null, projects: 0 });
-});
 
 test("Space team links open filtered work and personal Space Issues opens an empty tracker", async () => {
   const server = await TestServer.start({ world: true });
@@ -126,30 +75,7 @@ test("About uses actual zero and positive ready counts, opens repository Issues 
   expect(
     server.requests.filter((r) => r.url.pathname.endsWith("/tracker/summary")).length,
   ).toBeGreaterThan(0);
-  await server.call("POST", "/api/tracker/orbit/timelines", {
-    slug: "focus",
-    name: "Focus",
-    policy: "approval",
-    repos: ["orbit/engine"],
-  });
-  await app.navigate("/orbit/engine?tl=focus");
-  await page.getByRole("link", { name: "Issues · 1 ready", exact: true }).click();
-  await app.waitForUrl(
-    (url) => url.pathname === "/orbit/engine/tracker" && url.searchParams.get("tl") === "focus",
-  );
-  await expect
-    .poll(() =>
-      server.requests.some(
-        (r) =>
-          r.url.pathname === "/api/tracker/orbit/snapshot" &&
-          r.url.searchParams.get("timeline") === "focus",
-      ),
-    )
-    .toBe(true);
-  await app.navigate("/orbit/engine?tl=focus");
-  await page.getByRole("link", { name: "Releases", exact: true }).last().click();
-  await expect.poll(() => app.router.state.location.pathname).toBe("/orbit/engine/releases");
-  expect(app.url().searchParams.get("tl")).toBe("focus");
+  // A timeline's scope carried through these links is TimelineScope.browser.test.tsx's.
   await server.repo("orbit", "empty");
   await server.push("orbit/empty", "main", head);
   const emptySummary = await server.call<RepoIssueSummary>(

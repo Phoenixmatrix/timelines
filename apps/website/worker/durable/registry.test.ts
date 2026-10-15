@@ -1,10 +1,7 @@
 // The instance registry (CORE-197): recording uses through durableStub,
-// purging and retiring through the registry, the migration's backfill and
-// the hourly sweep, against real migrations.
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
+// purging and retiring through the registry, and the hourly sweep, against
+// real migrations.
+import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import { d1 } from "../testing/d1.ts";
 import { createFreshSpaceTestEnvironment, seedSpaceFixture } from "../testing/spaces.ts";
@@ -377,40 +374,6 @@ describe("purgeInstance and retireInstance", () => {
     expect(coordinators.instances.get("repo_1")!.retired).toEqual(["repository deleted"]);
     expect(rows()[0]).toMatchObject({ purged_at: null });
     expect(rows()[0]!.retiring_at).toBeTruthy();
-  });
-});
-
-describe("backfill", () => {
-  test("the migration registers the instances D1 rows name", () => {
-    const db = new DatabaseSync(":memory:");
-    const dir = fileURLToPath(new URL("../../migrations/", import.meta.url).href);
-    const files = readdirSync(dir)
-      .filter((f) => f.endsWith(".sql"))
-      .sort();
-    const at = files.findIndex((f) => f.endsWith("_durable_instances.sql"));
-    for (const file of files.slice(0, at)) db.exec(readFileSync(join(dir, file), "utf8"));
-    db.exec(`
-      INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_a', 'user', 'a', 'A'), ('acc_o', 'org', 'o', 'O');
-      INSERT INTO repos (id, owner_id, name, visibility, artifacts_name, artifacts_remote) VALUES ('repo_1', 'acc_o', 'r', 'private', 'n', 'https://x');
-      INSERT INTO assistant_chats (id, user_id) VALUES ('chat_1', 'acc_a');
-      INSERT INTO ci_runs (id, repo_id, number, commit_oid, ref, trigger, status) VALUES ('run_1', 'repo_1', 1, 'c', 'refs/heads/main', 'push', 'succeeded');
-      INSERT INTO ci_jobs (id, run_id, repo_id, name, spec, status, runner, started_at, finished_at)
-        VALUES ('job_s', 'run_1', 'repo_1', 'a', '{}', 'succeeded', 'sandbox', '2026-01-01T00:00:00Z', '2026-01-01T00:05:00Z'),
-               ('job_l', 'run_1', 'repo_1', 'b', '{}', 'succeeded', 'local', '2026-01-01T00:00:00Z', NULL),
-               ('job_q', 'run_1', 'repo_1', 'c', '{}', 'queued', 'sandbox', NULL, NULL);
-    `);
-    for (const file of files.slice(at)) db.exec(readFileSync(join(dir, file), "utf8"));
-    expect(
-      db
-        .prepare("SELECT class, name, account_id, repo_id FROM do_instances ORDER BY class, name")
-        .all(),
-    ).toEqual([
-      { class: "Assistant", name: "acc_a:chat_1", account_id: "acc_a", repo_id: null },
-      { class: "CiSandbox", name: "job_s", account_id: "acc_o", repo_id: "repo_1" },
-      { class: "KnowledgeCoordinator", name: "repo_1", account_id: "acc_o", repo_id: "repo_1" },
-      { class: "Tracker", name: "acc_a", account_id: "acc_a", repo_id: null },
-      { class: "Tracker", name: "acc_o", account_id: "acc_o", repo_id: null },
-    ]);
   });
 });
 

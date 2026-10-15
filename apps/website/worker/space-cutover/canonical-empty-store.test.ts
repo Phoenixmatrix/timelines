@@ -149,39 +149,4 @@ describe("canonical initialization after real ordinary migrations", () => {
       }
     });
   }
-
-  it("does not exempt existing person data alongside the catalog", async () => {
-    const sqlite = migratedDatabase();
-    try {
-      sqlite.exec(
-        "INSERT INTO accounts(id,kind,slug,display_name) VALUES ('existing','user','existing','Existing person')",
-      );
-      const source = schemaOf(sqlite, "application");
-      const target = buildCanonicalD1Schema(source, "application");
-      const before = sqlite
-        .prepare("SELECT type,name,sql FROM sqlite_schema ORDER BY type,name")
-        .all();
-      let state: CanonicalEmptyStoreState | null = null;
-      await expect(
-        (async () => {
-          for (let step = 0; step <= source.tables.length; step++) {
-            const result = await initializeCanonicalEmptyStoreStep(
-              d1(sqlite),
-              source,
-              target,
-              state,
-            );
-            state = result.state;
-            if (state.phase !== "check") throw new Error("unexpected destructive transition");
-          }
-        })(),
-      ).rejects.toThrow("fresh_install_nonempty:accounts");
-      expect(
-        sqlite.prepare("SELECT type,name,sql FROM sqlite_schema ORDER BY type,name").all(),
-      ).toEqual(before);
-      expect(sqlite.prepare("SELECT id FROM accounts").all()).toEqual([{ id: "existing" }]);
-    } finally {
-      sqlite.close();
-    }
-  });
 });

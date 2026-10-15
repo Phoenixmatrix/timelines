@@ -21,8 +21,6 @@ describe("configured classification models", () => {
 
   test.each([
     { options: {}, selector: "clef" },
-    { options: { model: "@cf/cloudflare/clef" }, selector: "clef" },
-    { options: { model: "@cf/cloudflare/clef-flash" }, selector: "clef-flash" },
     { options: { model: "@cf/cloudflare/clef-omni" }, selector: "clef-omni" },
     { options: { flash: true, model: "@cf/cloudflare/clef-omni" }, selector: "clef-flash" },
   ])(

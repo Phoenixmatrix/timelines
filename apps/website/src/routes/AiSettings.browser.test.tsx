@@ -40,14 +40,7 @@ test("an Instance operator turns body logging on, then back to the environment d
   });
   expect(entry(saved, "assistant")).toMatchObject({ site: true, siteFrom: "site" });
   expect(entry(saved, "avatars")).toMatchObject({ site: false, siteFrom: "environment" });
-  // Spaces without an override follow it.
-  const orbit = await server.call<AiSettingsView>(
-    "GET",
-    "/api/spaces/orbit/settings/ai",
-    undefined,
-    "marco",
-  );
-  expect(entry(orbit, "knowledge")).toMatchObject({ space: null, effective: true });
+  // (Spaces without an override follow it: worker/settings/ai.test.ts.)
 
   await userEvent.click(page.getByRole("button", { name: "Use the environment default" }));
   await expect
@@ -160,44 +153,27 @@ test("invalid highlights intervals block saving other edits and can be discarded
     await userEvent.fill(cadence, value);
     await expect.element(cadence).toHaveAttribute("aria-invalid", "true");
     await expect.element(save).toBeDisabled();
-    const unchanged = await server.call<AiSettingsView>("GET", "/api/spaces/orbit/settings/ai");
-    expect(unchanged.releaseHighlights.intervalHours).toBe(24);
-    expect(unchanged.features.releaseNotes).toBe(true);
   }
+  const unchanged = await server.call<AiSettingsView>("GET", "/api/spaces/orbit/settings/ai");
+  expect(unchanged.releaseHighlights.intervalHours).toBe(24);
+  expect(unchanged.features.releaseNotes).toBe(true);
   await userEvent.click(page.getByRole("button", { name: "Discard changes" }));
   await expect.element(cadence).toHaveValue(24);
   await expect.element(cadence).not.toHaveAttribute("aria-invalid", "true");
   await expect.element(save).toBeDisabled();
-  // Both inclusive bounds are accepted and persisted by the real API.
-  for (const value of [1, 168]) {
-    await userEvent.fill(cadence, String(value));
-    await expect.element(save).toBeEnabled();
-    await userEvent.click(save);
-    await expect
-      .poll(
-        async () =>
-          (await server.call<AiSettingsView>("GET", "/api/spaces/orbit/settings/ai"))
-            .releaseHighlights.intervalHours,
-      )
-      .toBe(value);
-    await expect.element(save).toBeDisabled();
-  }
-});
-
-test("an Instance operator retains the separate power to change a Space's highlights cadence", async () => {
-  const server = await TestServer.start({ world: true, persona: "priya" });
-  renderApp("/settings/ai?space=orbit");
-  const cadence = page.getByRole("spinbutton", { name: "Highlights refresh interval" });
-  await expect.element(cadence).toBeEnabled();
-  await userEvent.fill(cadence, "12");
-  await userEvent.click(page.getByRole("button", { name: "Save AI settings" }));
+  // An inclusive bound is accepted and persisted by the real API (both are
+  // worker/settings/ai.test.ts's).
+  await userEvent.fill(cadence, "168");
+  await expect.element(save).toBeEnabled();
+  await userEvent.click(save);
   await expect
     .poll(
       async () =>
         (await server.call<AiSettingsView>("GET", "/api/spaces/orbit/settings/ai"))
           .releaseHighlights.intervalHours,
     )
-    .toBe(12);
+    .toBe(168);
+  await expect.element(save).toBeDisabled();
 });
 
 test("personal assistant logging never becomes Space spending policy", async () => {

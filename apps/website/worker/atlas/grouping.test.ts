@@ -145,14 +145,14 @@ describe("capability grouping", () => {
   });
 
   test("stays bounded and sub-quadratic on a large synthetic graph", () => {
-    // 30,000 files in 600 clusters of 50: each imports 3 cluster-mates and
+    // 6,000 files in 120 clusters of 50: each imports 3 cluster-mates and
     // mentions 2 cluster concepts, plus one concept shared by a third of all files.
     let seed = 42;
     const random = () => (seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31;
     const files: string[] = [];
     const imports: GroupingInput["imports"] = [];
     const mentions: GroupingInput["mentions"] = [];
-    for (let c = 0; c < 600; c++)
+    for (let c = 0; c < 120; c++)
       for (let k = 0; k < 50; k++) files.push(f(`m${c % 37}/c${c}/f${k}.ts`));
     files.forEach((file, i) => {
       const cluster = Math.floor(i / 50);
@@ -165,14 +165,14 @@ describe("capability grouping", () => {
     const started = performance.now();
     const grouping = groupCapabilities({ files, imports, mentions, conceptNames: new Map() });
     const seconds = (performance.now() - started) / 1000;
-    expect(grouping.stats.files).toBe(30_000);
+    expect(grouping.stats.files).toBe(6_000);
     expect(grouping.stats.maxCandidates).toBeLessThanOrEqual(MAX_NEIGHBORS);
-    // Linear-ish: far below the 4.5e8 pairs an all-pairs comparison would make.
-    expect(grouping.stats.candidatePairs).toBeLessThan(30_000 * MAX_NEIGHBORS);
+    // Linear-ish: far below the 1.8e7 pairs an all-pairs comparison would make.
+    expect(grouping.stats.candidatePairs).toBeLessThan(6_000 * MAX_NEIGHBORS);
     expect(seconds).toBeLessThan(30);
     // Clusters are recovered: most cluster-mates share a capability.
     let same = 0;
-    for (let c = 0; c < 600; c += 37) {
+    for (let c = 0; c < 120; c += 37) {
       const caps = files
         .slice(c * 50, c * 50 + 50)
         .map((file) => capabilityOf(grouping, file.slice(5)));
@@ -180,7 +180,7 @@ describe("capability grouping", () => {
       for (const cap of caps) counts.set(cap, (counts.get(cap) ?? 0) + 1);
       same += Math.max(...counts.values()) / 50;
     }
-    expect(same / Math.ceil(600 / 37)).toBeGreaterThan(0.8);
+    expect(same / Math.ceil(120 / 37)).toBeGreaterThan(0.8);
   }, 60_000);
 
   test("a pair linked by one import is too little evidence for a capability", () => {

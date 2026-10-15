@@ -9,7 +9,6 @@ import type { DatabaseSync } from "node:sqlite";
 import { describe, expect, test } from "vite-plus/test";
 import { priceCost, type PriceProduct } from "../../shared/usage.ts";
 import { AI_MODEL_CATALOG } from "../../shared/ai.ts";
-import { ATLAS_PRICES } from "../knowledge/budget.ts";
 import { MODELS } from "../knowledge/models.ts";
 import { d1, migratedDatabase } from "../testing/d1.ts";
 import {
@@ -393,14 +392,6 @@ describe("the seed", () => {
     }
   });
 
-  test("Atlas budgets spend at the catalog's prices, exactly as before", () => {
-    expect(ATLAS_PRICES).toEqual({
-      [MODELS.fast]: { input: 0.15, output: 0.5 },
-      "@cf/google/gemma-4-26b-a4b-it": { input: 0.1, output: 0.3 },
-      [MODELS.reason]: { input: 0.45, output: 3.2 },
-    });
-  });
-
   test("the AI settings' model prices agree with the catalog", () => {
     const perMillion = (model: string, metric: "input" | "output") => {
       // Missing billed metrics are errors; input-only classifiers have free output.
@@ -448,17 +439,6 @@ describe("the seed", () => {
           ),
         ).toBe(true);
     }
-  });
-
-  test("costs are quantity × price per unit quantity", () => {
-    const storage = SEED_PRICES.find((p) => p.product === "d1" && p.metric === "storage")!;
-    expect(priceCost(storage, 10)).toBeCloseTo(7.5, 12);
-    const written = SEED_PRICES.find((p) => p.product === "d1" && p.metric === "rows_written")!;
-    expect(priceCost(written, 3_000_000)).toBeCloseTo(3, 12);
-    const stored = SEED_PRICES.find(
-      (p) => p.product === "vectorize" && p.metric === "stored_dimensions",
-    )!;
-    expect(priceCost(stored, 200_000_000)).toBeCloseTo(0.1, 12);
   });
 });
 

@@ -100,38 +100,7 @@ test("Organization ownership without a Space grant exposes directory administrat
   ).toBe(false);
 });
 
-test("scope menus support keyboard dismissal without switching or creating", async () => {
-  const server = await TestServer.start({ world: true });
-  const created = await organization(server, "keyboard-space-browser");
-  renderApp(`/${created.spaces[0]!.space.slug}`);
-  await expect.element(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
-  await focusOn(accountMenu());
-  const mark = server.requests.length;
-  await press("Enter");
-  await expect.element(scopeItem("Organization")).toHaveFocus();
-  await press("ArrowRight");
-  const choice = page.getByRole("menuitem", { name: "Navigation Company", exact: true });
-  await expect.element(choice).toHaveFocus();
-  // Escape leaves only the submenu, then the menu, returning focus each step.
-  await press("Escape");
-  await expect.element(choice).not.toBeInTheDocument();
-  await expect.element(scopeItem("Organization")).toHaveFocus();
-  await press("ArrowDown");
-  await expect.element(scopeItem("Space")).toHaveFocus();
-  await press("ArrowRight");
-  await expect
-    .element(page.getByRole("menuitem", { name: /^General/ }))
-    .toHaveAttribute("aria-current", "true");
-  await press("ArrowLeft");
-  await expect.element(scopeItem("Space")).toHaveFocus();
-  await press("Escape");
-  await expect.element(page.getByRole("menu")).not.toBeInTheDocument();
-  expect(focused().name).toMatch(/account menu$/);
-  expect(server.since(mark).some((request) => request.method !== "GET")).toBe(false);
-  await expect.element(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
-});
-
-test("Space switching is offered on every page, marking a Space current only inside it", async () => {
+test("Space switching is offered on every page, marking a Space current only inside it; Escape switches nothing", async () => {
   const server = await TestServer.start({ world: true });
   const created = await organization(server, "anywhere-space-browser");
   const general = created.spaces[0]!.space;
@@ -189,45 +158,21 @@ test("Space switching is offered on every page, marking a Space current only ins
   // A repository page is in its Space.
   await app.navigate(`/${general.slug}/engine`);
   await expect.element(page.getByRole("link", { name: "CI", exact: true })).toBeVisible();
+  const mark = server.requests.length;
   await openSpaces();
   expect(scopeItem("Space").element()).toHaveAccessibleName("Space: General");
   expect(choices().general.element()).toHaveAttribute("aria-current", "true");
   expect(choices().tools.element()).not.toHaveAttribute("aria-current");
-  await close();
-});
-
-test("Space navigation and browser history retain concrete destinations without creating repositories", async () => {
-  const server = await TestServer.start({ world: true });
-  const created = await organization(server, "history-space-browser");
-  const second = await server.call<SpacePage>("POST", "/api/spaces", {
-    organizationId: created.organization.id,
-    slug: "history-space-browser-tools",
-    displayName: "Tools",
-  });
-  const first = created.spaces[0]!.space;
-  const app = renderApp(`/${first.slug}?source=retained-source#repositories-heading`);
-  await expect.element(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
-  const mark = server.requests.length;
-  await app.navigate(`/${second.space.slug}`);
-  await expect.element(page.getByRole("heading", { name: "Tools", exact: true })).toBeVisible();
-  await expect
-    .element(page.getByRole("link", { name: "New repository", exact: true }))
-    .toHaveAttribute("href", `/${second.space.slug}/-/repositories/new`);
-  await app.back();
-  await app.waitForUrl(
-    (url) =>
-      url.pathname === `/${first.slug}` &&
-      url.searchParams.get("source") === "retained-source" &&
-      url.hash === "#repositories-heading",
-  );
-  await expect.element(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
-  await app.forward();
-  await app.waitForUrl((url) => url.pathname === `/${second.space.slug}`);
-  expect(
-    server
-      .since(mark)
-      .some((request) => request.method === "POST" && request.url.pathname === "/api/repos"),
-  ).toBe(false);
+  // Escape leaves only the submenu, then the menu, returning focus each step,
+  // and neither switches nor creates anything.
+  await press("Escape");
+  await expect.element(choices().general).not.toBeInTheDocument();
+  await expect.element(scopeItem("Space")).toHaveFocus();
+  await press("Escape");
+  await expect.element(page.getByRole("menu")).not.toBeInTheDocument();
+  expect(focused().name).toMatch(/account menu$/);
+  expect(server.since(mark).some((request) => request.method !== "GET")).toBe(false);
+  expect(app.url().pathname).toBe(`/${general.slug}/engine`);
 });
 
 test("phone scope menus remain reachable and repository creation stays in Repositories", async () => {

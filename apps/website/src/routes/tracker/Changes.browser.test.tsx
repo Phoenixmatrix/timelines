@@ -253,43 +253,43 @@ test("several repositories: a switcher with each one's size, and never a silent 
     .toHaveAttribute("href", "/tracker/orbit/timelines/search/story?repo=orbit%2Fweb");
 });
 
-test("a diff too large to show says what to do instead", async () => {
+test("a diff too large to show, a failed comparison and one that couldn't find main each say what to do", async () => {
   const server = await TestServer.start({ world: true });
   await timelineWorld(server);
-  server.on("GET", "/api/repos/:owner/:name/compare", () =>
-    reply({ error: "These changes are too large to show here." }, 413),
+  let answer: "large" | "broken" | "ok" | "unmet" = "large";
+  server.on("GET", "/api/repos/:owner/:name/compare", (request) =>
+    answer === "large"
+      ? reply({ error: "These changes are too large to show here." }, 413)
+      : answer === "broken"
+        ? reply({ error: "Something broke." }, 500)
+        : answer === "ok"
+          ? compared(request, { commits: [] }, [])
+          : compared(request, { mergeBase: null, historyTruncated: true }),
   );
-  renderApp("/tracker/orbit/timelines/search/changes");
+  const path = "/tracker/orbit/timelines/search/changes";
 
+  // Too large: open the commits instead.
+  let app = renderApp(path);
   await expect
     .element(page.getByText("These changes are too large to show here. Open the commits instead."))
     .toBeVisible();
   await expect
     .element(page.getByRole("link", { name: "The commits" }))
     .toHaveAttribute("href", expect.stringContaining("/orbit/engine/commits/"));
-});
+  app.unmount();
 
-test("a failed comparison can be retried", async () => {
-  const server = await TestServer.start({ world: true });
-  await timelineWorld(server);
-  let broken = true;
-  server.on("GET", "/api/repos/:owner/:name/compare", (request) =>
-    broken ? reply({ error: "Something broke." }, 500) : compared(request, { commits: [] }, []),
-  );
-  renderApp("/tracker/orbit/timelines/search/changes");
+  // Failed: it can be retried.
+  answer = "broken";
+  app = renderApp(path);
   await expect.element(page.getByRole("alert")).toHaveTextContent("Something broke.");
-  broken = false;
+  answer = "ok";
   await page.getByRole("button", { name: "Retry" }).click();
   await expect.element(page.getByText("No changes compared with main yet.")).toBeVisible();
-});
+  app.unmount();
 
-test("a compare that couldn't find where it meets main says so", async () => {
-  const server = await TestServer.start({ world: true });
-  await timelineWorld(server);
-  server.on("GET", "/api/repos/:owner/:name/compare", (request) =>
-    compared(request, { mergeBase: null, historyTruncated: true }),
-  );
-  renderApp("/tracker/orbit/timelines/search/changes");
+  // No merge base: compared with main's tip, and said so.
+  answer = "unmet";
+  renderApp(path);
   await expect
     .element(page.getByRole("note"))
     .toMatchTextContent(/compared with\s+main.s tip directly/);

@@ -2,12 +2,13 @@
 // each agent from the repository's live feed, linked into the story. The
 // in-memory API has no Durable Objects, so the feed is canned here.
 
-import { expect, test } from "vite-plus/test";
+import { expect, onTestFinished, test, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import type { StepFeedRecord } from "../../../shared/steps.ts";
 import { commitId } from "../../testing/atlas.ts";
 import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
+import { cannedFeed } from "../../testing/stepFeed.ts";
 
 test("live now: each agent's latest step, from the feed, into the story", async () => {
   const server = await TestServer.start({ world: true });
@@ -98,6 +99,11 @@ test("live now says how steps arrive, and stays quiet without access", async () 
     asked += 1;
     return new Response(JSON.stringify({ error: "Not found." }), { status: 404 });
   });
+  // On a fake clock from the start, so no retry can be scheduled out of reach.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
   const app = renderApp("/tracker/orbit/timelines?tl=quiet");
   await expect
     .element(page.getByRole("region", { name: "Live now" }))
@@ -106,7 +112,8 @@ test("live now says how steps arrive, and stays quiet without access", async () 
   // (development React may mount the effect twice).
   await expect.poll(() => asked).toBeGreaterThanOrEqual(1);
   const first = asked;
-  await new Promise((resolve) => setTimeout(resolve, 5_500));
+  await vi.advanceTimersByTimeAsync(60_000);
+  await expect.element(page.getByRole("region", { name: "Live now" })).toBeVisible();
   expect(asked).toBe(first);
   app.unmount();
 });
@@ -152,16 +159,15 @@ test("live now drops a step an admin deleted, even one removed while it reconnec
   // on reconnect: a removal the page missed while it was away.
   let away = false;
   let reconnects = 0;
-  server.on("GET", "/api/repos/:owner/:name/steps/live", () => {
+  const feed = cannedFeed(server, [], () => {
     if (away) reconnects += 1;
-    const body = away
-      ? removed(secret)
-      : [earlier, secret, docs].map(step).join("") + removed(docs);
-    return new Response(`retry: 5000\n\n${body}`, {
-      headers: { "content-type": "text/event-stream" },
-    });
+    return away ? removed(secret) : [earlier, secret, docs].map(step).join("") + removed(docs);
   });
-
+  // The reconnect waits 5 s, on a fake clock.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
   const app = renderApp(`/tracker/orbit/timelines?tl=${slug}`);
   const live = page.getByRole("region", { name: "Live now" });
   const agents = live.getByRole("listitem");
@@ -170,14 +176,13 @@ test("live now drops a step an admin deleted, even one removed while it reconnec
   await expect.poll(() => agents.elements().length).toBe(1);
   await expect.element(live).not.toMatchTextContent(/Leak the roadmap|Roadmap says Q3/);
   away = true;
+  feed.drop();
   // Reconnected from its last event, it drops the step removed meanwhile:
   // builder falls back to its earlier step.
-  await expect
-    .element(agents.nth(0), { timeout: 12_000 })
-    .toMatchTextContent(/builder\s*Index by date/);
+  await expect.poll(async () => (await vi.advanceTimersByTimeAsync(5_000), reconnects)).toBe(1);
+  await expect.element(agents.nth(0)).toMatchTextContent(/builder\s*Index by date/);
   await expect.element(agents.nth(0)).toMatchTextContent(/Dates first\./);
   await expect.element(agents.nth(0)).toMatchTextContent(/1 step since/);
   await expect.element(live).not.toMatchTextContent(/Paste the API key|hunter2/);
-  expect(reconnects).toBeGreaterThanOrEqual(1);
   app.unmount();
-}, 20_000);
+});

@@ -123,7 +123,7 @@ const repoRow = (name: string) =>
 
 test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages; approving lands it", async () => {
   const server = await TestServer.start({ world: true });
-  const { timeline, view, engine, web, docs, site } = await approvalWorld(server);
+  const { timeline, view, engine, web, docs } = await approvalWorld(server);
 
   // Every repository compares to the same canned diffstat.
   server.on("GET", "/api/repos/:owner/:name/compare", ({ url }) =>
@@ -157,8 +157,9 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
   await visual("Checkpoint - approval card");
 
   // Each repository: its work's commit (in its owned source, which canonical
-  // history never has) onto main's, its changes, CI runs and previews.
-  for (const repo of [engine, web, docs, site]) {
+  // history never has) onto main's, its changes, CI runs and previews. Every
+  // row is built alike: two of them are checked in full.
+  for (const repo of [engine, web]) {
     const row = repoRow(repo.name);
     await expect
       .element(row.getByRole("link", { name: short(repo.tip), exact: true }))
@@ -186,6 +187,7 @@ test("Needs you: the checkpoint's summary, commits, CI, previews and wiki pages;
       .element(row.getByRole("link", { name: "Knowledge diff" }))
       .toHaveAttribute("href", `/orbit/${repo.name}/knowledge?timeline=search`);
   }
+  await repoRow(docs.name).getByText("Details", { exact: true }).click();
   // The diffstat is shown beside the commits link, which stays under Details.
   await expect.element(repoRow("engine")).toMatchTextContent("+3 \u22121 \u00b7 1 file");
   const engineChanges = repoRow("engine").getByRole("link", { name: "3 changes" });
@@ -307,7 +309,7 @@ function compared(
   };
 }
 
-test("a repository's diffstat is what the checkpoint added, from main for #1; too large falls back to the commits (CORE-382)", async () => {
+test("a repository's diffstat is what the checkpoint added: from main for #1, the commits when too large, then from the previous checkpoint, and one quiet line when left alone (CORE-382)", async () => {
   const server = await TestServer.start({ world: true });
   const timeline = await timelineWorld(server, { names: ["engine", "web"] });
   const [engine, web] = timeline.repos as [
@@ -319,8 +321,10 @@ test("a repository's diffstat is what the checkpoint added, from main for #1; to
   const view = await checkpoint(server, timeline, "Ranks results");
   await askApproval(server, timeline, view.checkpoint.id);
   const asked: URL[] = [];
+  let before: string | null = null;
   server.on("GET", "/api/repos/:owner/:name/compare", ({ url, params }) => {
     asked.push(url);
+    if (before) return compared(before, engine.tip, [[4, 0]], true);
     return params.name === "engine"
       ? compared(engine.main, engine.tip, [
           [10, 1],
@@ -329,7 +333,7 @@ test("a repository's diffstat is what the checkpoint added, from main for #1; to
       : reply({ error: "These changes are too large to show here." }, 413);
   });
 
-  renderApp("/needs-you");
+  const app = renderApp("/needs-you");
   await expect.element(card()).toBeVisible();
   await expect.element(repoRow("engine")).toMatchTextContent("+12 \u22123 \u00b7 2 files");
   // The first checkpoint is measured from main, in the repository's own source.
@@ -343,23 +347,14 @@ test("a repository's diffstat is what the checkpoint added, from main for #1; to
   // Too large: no diffstat, the commit list in its place.
   await expect.element(repoRow("web").getByRole("link", { name: "1 change" })).toBeVisible();
   await expect.element(repoRow("web")).not.toMatchTextContent("files");
-});
+  app.unmount();
 
-test("a repository the checkpoint left alone is one quiet line; the rest is measured from the previous checkpoint (CORE-382)", async () => {
-  const server = await TestServer.start({ world: true });
-  const timeline = await timelineWorld(server, { names: ["engine", "web"] });
-  const [engine] = timeline.repos as [WorldTimeline["repos"][number]];
-  await checkpoint(server, timeline, "First pass");
-  const before = engine.tip;
+  // A second checkpoint that moved engine alone.
+  before = engine.tip;
   await work(server, timeline, engine);
   const second = await checkpoint(server, timeline, "Second pass");
-  await askApproval(server, timeline, second.checkpoint.id);
-  const asked: URL[] = [];
-  server.on("GET", "/api/repos/:owner/:name/compare", ({ url }) => {
-    asked.push(url);
-    return compared(before, engine.tip, [[4, 0]], true);
-  });
-
+  await askApproval(server, timeline, second.checkpoint.id, "approve-second");
+  asked.length = 0;
   renderApp("/needs-you");
   const card2 = page.getByRole("region", { name: "Checkpoint #2 of search" });
   await expect.element(card2).toBeVisible();
@@ -442,16 +437,26 @@ test("a superseded checkpoint can't be approved, and the withdrawn request says 
   expect(withdrawn.getByRole("button", { name: "Approve" }).elements()).toHaveLength(0);
 });
 
-test("a checkpoint approved by approve-when-green says whose setting approved it (CORE-378)", async () => {
+test("approve-when-green on Needs you: the requests it will answer, one it left for CI configuration, and whose setting approved one (CORE-378)", async () => {
   const server = await TestServer.start({ world: true });
   const timeline = await timelineWorld(server);
   const made = await checkpoint(server, timeline, "Ready");
   await askApproval(server, timeline, made.checkpoint.id);
-  // As a second open request on it would show it: approved by Marco's own setting.
+  const reason =
+    "Changes CI configuration (.gitmatrix/ci.yml in orbit/engine): approve it yourself.";
+  let state: "waiting" | "skipped" | "approved" = "waiting";
   server.on("GET", "/api/requests", async () => {
     const open = await server.call<OpenRequests>("GET", "/api/requests");
-    for (const item of open.requests)
-      if (item.checkpoint)
+    for (const item of open.requests) {
+      if (state !== "approved") item.approvesWhenGreen = true;
+      if (state === "skipped")
+        item.request.autoApproveSkipped = {
+          checkpointId: made.checkpoint.id,
+          reason,
+          at: new Date().toISOString(),
+        };
+      // As a second open request on it would show it: approved by Marco's own setting.
+      if (state === "approved" && item.checkpoint)
         item.checkpoint = {
           ...item.checkpoint,
           approved: true,
@@ -464,8 +469,29 @@ test("a checkpoint approved by approve-when-green says whose setting approved it
             via: "auto-approve",
           },
         };
+    }
     return open;
   });
+  const request = page.getByRole("article", { name: "Approval for you" });
+
+  // Its CI still running: marked as one the setting will answer.
+  let app = renderApp("/needs-you");
+  await expect.element(request.getByText("Approves when green", { exact: true })).toBeVisible();
+  app.unmount();
+
+  // It changes CI configuration: approve it yourself.
+  state = "skipped";
+  app = renderApp("/needs-you");
+  await expect.element(request.getByText("Approve it yourself", { exact: true })).toBeVisible();
+  await expect.element(request.getByText(reason, { exact: true })).toBeVisible();
+  await expect
+    .element(request.getByText("Approves when green", { exact: true }))
+    .not.toBeInTheDocument();
+  await expect.element(page.getByRole("button", { name: "Approve" })).toBeEnabled();
+  app.unmount();
+
+  // Approved by the setting, and whose it was.
+  state = "approved";
   renderApp("/needs-you");
   await expect.element(card()).toBeVisible();
   await expect.element(card().getByText("Approved automatically", { exact: true })).toBeVisible();
@@ -474,35 +500,6 @@ test("a checkpoint approved by approve-when-green says whose setting approved it
     .toMatchTextContent(
       "Approved automatically: your approve-when-green setting, once its CI was green.",
     );
-});
-
-test("a checkpoint that changes CI configuration says to approve it yourself (CORE-378)", async () => {
-  const server = await TestServer.start({ world: true });
-  const timeline = await timelineWorld(server);
-  const made = await checkpoint(server, timeline, "Ready");
-  await askApproval(server, timeline, made.checkpoint.id);
-  const reason =
-    "Changes CI configuration (.gitmatrix/ci.yml in orbit/engine): approve it yourself.";
-  server.on("GET", "/api/requests", async () => {
-    const open = await server.call<OpenRequests>("GET", "/api/requests");
-    for (const item of open.requests) {
-      item.approvesWhenGreen = true;
-      item.request.autoApproveSkipped = {
-        checkpointId: made.checkpoint.id,
-        reason,
-        at: new Date().toISOString(),
-      };
-    }
-    return open;
-  });
-  renderApp("/needs-you");
-  const request = page.getByRole("article", { name: "Approval for you" });
-  await expect.element(request.getByText("Approve it yourself", { exact: true })).toBeVisible();
-  await expect.element(request.getByText(reason, { exact: true })).toBeVisible();
-  await expect
-    .element(request.getByText("Approves when green", { exact: true }))
-    .not.toBeInTheDocument();
-  await expect.element(page.getByRole("button", { name: "Approve" })).toBeEnabled();
 });
 
 test("an auto timeline's card says it lands when green; Revive preview starts a rebuild", async () => {

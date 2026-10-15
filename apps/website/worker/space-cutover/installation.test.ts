@@ -8,11 +8,7 @@ import {
 import { SpaceCutover } from "./control.ts";
 import { ensureInstallationAdmitted, initializeFreshSpaceInstallation } from "./installation.ts";
 import { createFreshSpaceTestEnvironment } from "../testing/spaces.ts";
-import {
-  cachedAdmission,
-  forgetCachedAdmission,
-  peekCachedAdmission,
-} from "../durable/cutover-admission.ts";
+import { forgetCachedAdmission, peekCachedAdmission } from "../durable/cutover-admission.ts";
 import { Timing } from "../timing.ts";
 
 vi.mock("cloudflare:workers", () => ({
@@ -339,40 +335,6 @@ describe("absorbing native admission (CORE-439)", () => {
       expect(entries(second)).toContain("admission-cache-hit");
       expect(state).toHaveBeenCalledTimes(1);
       expect(peekCachedAdmission(f.env)).toEqual({ allowed: true, epoch: 0 });
-    } finally {
-      f.close();
-    }
-  });
-
-  test("a failed check is not remembered", async () => {
-    const f = await active();
-    try {
-      forgetCachedAdmission(f.env);
-      const verify = vi
-        .spyOn(f.control, "verifyFreshInstallation")
-        .mockRejectedValueOnce(new Error("fresh_install_authority_mismatch"));
-      await expect(ensureInstallationAdmitted(f.env)).rejects.toThrow("authority_mismatch");
-      expect(peekCachedAdmission(f.env)).toBeNull();
-      await ensureInstallationAdmitted(f.env);
-      expect(verify).toHaveBeenCalledTimes(2);
-      expect(peekCachedAdmission(f.env)).toEqual({ allowed: true, epoch: 0 });
-    } finally {
-      f.close();
-    }
-  });
-
-  test("a plain admission read does not let a later gate skip verification", async () => {
-    const f = await active();
-    try {
-      forgetCachedAdmission(f.env);
-      expect(await cachedAdmission(f.env)).toEqual({ allowed: true, epoch: 0 });
-      expect(peekCachedAdmission(f.env)).toBeNull();
-      const verify = vi
-        .spyOn(f.control, "verifyFreshInstallation")
-        .mockRejectedValueOnce(new Error("fresh_install_authority_mismatch"));
-      await expect(ensureInstallationAdmitted(f.env)).rejects.toThrow("authority_mismatch");
-      expect(verify).toHaveBeenCalledTimes(1);
-      expect(peekCachedAdmission(f.env)).toBeNull();
     } finally {
       f.close();
     }

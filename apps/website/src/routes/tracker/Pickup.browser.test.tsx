@@ -5,10 +5,9 @@ import { renderApp } from "../../testing/render.tsx";
 import { TestServer } from "../../testing/server.ts";
 import { mutate } from "../../testing/timelines.ts";
 
-test.each([
-  ["not_ready", "Not ready"],
-  ["human_only", "Human only"],
-] as const)(
+// human_only takes the same path with another option; query.test.ts and
+// worker/tracker/requirements.test.ts cover what it means.
+test.each([["not_ready", "Not ready"]] as const)(
   "%s creation stays out of agent-ready work until a person enables pickup",
   async (pickup, label) => {
     const server = await TestServer.start({ world: true });

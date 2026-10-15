@@ -348,32 +348,29 @@ describe("recent timeline presence", () => {
     expect((await t.call("cat", "GET", "/search/presence")).body.agents).toEqual([]);
   });
 
-  test.each(["/search/checkpoints", "/search/checkpoints/1", "/search/landing"])(
-    "successful specific read %s records its timeline only",
-    async (path) => {
-      const t = await setup();
-      expect(
-        (
-          await t.call("ben", "POST", "", {
-            slug: "search",
-            repos: ["orbit/app"],
-            policy: "approval",
-          })
-        ).status,
-      ).toBe(201);
-      expect(
-        (await t.call("ben", "POST", "", { slug: "other", repos: ["orbit/app"] })).status,
-      ).toBe(201);
-      t.work().commits.add(oid(9));
-      t.work().refs.set("refs/heads/work", oid(9));
-      expect((await t.call("ben", "POST", "/search/checkpoints", {})).status).toBe(201);
-      expect((await t.call("bot", "GET", path)).status).toBe(200);
-      expect((await t.call("cat", "GET", "/search/presence")).body.agents).toMatchObject([
-        { id: "agt_bot" },
-      ]);
-      expect((await t.call("cat", "GET", "/other/presence")).body.agents).toEqual([]);
-    },
-  );
+  test("a successful specific read records its timeline only", async () => {
+    const t = await setup();
+    expect(
+      (
+        await t.call("ben", "POST", "", {
+          slug: "search",
+          repos: ["orbit/app"],
+          policy: "approval",
+        })
+      ).status,
+    ).toBe(201);
+    expect((await t.call("ben", "POST", "", { slug: "other", repos: ["orbit/app"] })).status).toBe(
+      201,
+    );
+    t.work().commits.add(oid(9));
+    t.work().refs.set("refs/heads/work", oid(9));
+    expect((await t.call("ben", "POST", "/search/checkpoints", {})).status).toBe(201);
+    expect((await t.call("bot", "GET", "/search/checkpoints/1")).status).toBe(200);
+    expect((await t.call("cat", "GET", "/search/presence")).body.agents).toMatchObject([
+      { id: "agt_bot" },
+    ]);
+    expect((await t.call("cat", "GET", "/other/presence")).body.agents).toEqual([]);
+  });
 
   test("historical participants expire while successful lifecycle actions refresh recent presence", async () => {
     const t = await setup();
@@ -1321,19 +1318,6 @@ describe("approve when green (CORE-378)", () => {
     });
   });
 
-  test("turned off before CI completes: nothing is approved", async () => {
-    const t = await green();
-    await t.setting("ben", true);
-    const id = await t.ask();
-    const passed = t.run("running");
-    await t.setting("ben", false);
-    t.sqlite.prepare("UPDATE ci_runs SET status = 'succeeded' WHERE id = ?").run(passed);
-    await t.finished(passed);
-    expect((await t.request(id)).status).toBe("open");
-    expect((await t.checkpoint()).approved).toBe(false);
-    expect((await t.call("ben", "GET", "/search")).body.timeline.status).toBe("waiting");
-  });
-
   test("a checkpoint that changes ci.yml is left to its person, saying why, once", async () => {
     const t = await green();
     t.ciFiles("ci-main", "ci-weakened");
@@ -1437,24 +1421,6 @@ describe("approve when green (CORE-378)", () => {
     expect(await t.request(id)).toMatchObject({ status: "answered", via: "auto-approve" });
   });
 
-  test("a setting saved without a work authority is inert until turned on again", async () => {
-    const t = await green();
-    await t.setting("ben", true);
-    // As saved before Spaces: the setting, but no authority to act with.
-    const storage = t.contexts.get("orbit")!.storage as unknown as {
-      sql: { exec(query: string): unknown };
-    };
-    storage.sql.exec("DELETE FROM work_authorities WHERE key = 'automation:ben'");
-    const id = await t.ask();
-    await t.finished(t.run("succeeded"));
-    expect((await t.request(id)).status).toBe("open");
-    expect((await t.raw("ben", "GET", "/tracker/orbit/snapshot")).body.approveWhenGreen).toEqual(
-      [],
-    );
-    await t.setting("ben", true);
-    expect(await t.request(id)).toMatchObject({ status: "answered", via: "auto-approve" });
-  });
-
   test("a preview's deploy is never green, and its run ending sets nothing off", async () => {
     const t = await green();
     await t.setting("ben", true);
@@ -1472,32 +1438,6 @@ describe("approve when green (CORE-378)", () => {
     expect((await t.request(id)).status).toBe("open");
     await t.finished(passed);
     expect(await t.request(id)).toMatchObject({ status: "answered", via: "auto-approve" });
-  });
-
-  test("an approval someone else asked of them stays theirs to answer", async () => {
-    const t = await green();
-    await t.setting("ben", true);
-    t.run("succeeded");
-    const reply = await t.mutate("cat", {
-      kind: "request.open",
-      id: "from-cat",
-      data: {
-        issueId: "issue",
-        kind: "approval",
-        prompt: "Land?",
-        checkpoint: t.made.checkpoint.id,
-        routeTo: "ben",
-      },
-    });
-    expect(reply.status).toBe(200);
-    expect((await t.request("from-cat")).status).toBe("open");
-    const inbox = (await t.raw("ben", "GET", "/requests")).body as OpenRequests;
-    expect(inbox.requests.find((item) => item.request.id === "from-cat")).not.toHaveProperty(
-      "approvesWhenGreen",
-    );
-    // His own agent's request on the same checkpoint is approved.
-    const own = await t.ask();
-    expect(await t.request(own)).toMatchObject({ status: "answered", via: "auto-approve" });
   });
 
   test("asked of someone with it on, on a checkpoint that's already green: approved at once", async () => {

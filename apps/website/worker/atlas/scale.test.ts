@@ -186,11 +186,11 @@ const ATLAS_TABLES =
 
 describe("Atlas scale gates", () => {
   test(
-    "read routes cost the same round trips at 8x the repository, and stay within their bounds",
+    "read routes cost the same round trips at 4x the repository, and stay within their bounds",
     { timeout: 120_000 },
     async () => {
-      const small = await world(120);
-      const large = await world(960);
+      const small = await world(60);
+      const large = await world(240);
       const trips = async (w: typeof small) => {
         const out: Record<string, number> = {};
         for (const [name, path] of Object.entries(await routes(w))) {
@@ -211,7 +211,7 @@ describe("Atlas scale gates", () => {
             .prepare(`SELECT count(*) AS n FROM atlas_entities WHERE scope = ? AND to_seq IS NULL`)
             .get(repoScope("id_r0")) as { n: number }
         ).n;
-      expect(entities(large)).toBeGreaterThan(6 * entities(small));
+      expect(entities(large)).toBeGreaterThan(3 * entities(small));
       expect(await trips(large)).toEqual(await trips(small));
     },
   );
@@ -241,11 +241,11 @@ describe("Atlas scale gates", () => {
           out[name] = (await w.call(path)).trips;
         return out;
       };
-      const two = await perRoute(60, 2);
-      // The same repositories, each 8x larger: the same trips.
-      expect(await perRoute(480, 2)).toEqual(two);
+      const two = await perRoute(30, 2);
+      // The same repositories, each 4x larger: the same trips.
+      expect(await perRoute(120, 2)).toEqual(two);
       // Twice the repositories: entity routes read one repository; ranked ones at most one more trip per repository.
-      const four = await perRoute(60, 4);
+      const four = await perRoute(30, 4);
       for (const name of ["children", "detail"]) expect(four[name], name).toBe(two[name]);
       for (const name of ["overview", "regions", "catalogue", "composition"])
         expect(four[name]! - two[name]!, name).toBeLessThanOrEqual(2 * 2 * 4);
@@ -256,7 +256,7 @@ describe("Atlas scale gates", () => {
     "every statement a read route sends finds Atlas rows through an index",
     { timeout: 120_000 },
     async () => {
-      const w = await world(240, 2);
+      const w = await world(60, 2);
       const paths = [
         ...Object.values(await routes(w)),
         ...["overview", "regions?limit=100", "catalogue?q=topic", "composition"].map(

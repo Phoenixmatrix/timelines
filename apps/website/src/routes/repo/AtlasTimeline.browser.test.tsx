@@ -5,10 +5,8 @@
 // facts, the capabilities it touches, each file placed where main's map puts
 // it, a capability filter in the address and a source handoff on the
 // timeline's commit that Back returns from; the workspace Atlas reads the same
-// timeline per repository. Then it ends: read-only, nothing asks for a
-// computation. Then the map's snapshot expires: the link explains and keeps
-// the route to the overlay. Then retention removes the ended overlay's data
-// (CORE-201) and the panel says so.
+// timeline per repository. Then it ends, and retention removes the ended
+// overlay's data (CORE-201) and the panel says so.
 
 import { expect, test } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
@@ -21,7 +19,7 @@ import { TestServer, type Recorded } from "../../testing/server.ts";
 
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-test("a timeline in capabilities, across repositories, ended and expired", async () => {
+test("a timeline in capabilities, across repositories, ended, then removed by retention", async () => {
   const server = await TestServer.start({ world: true });
   const repo = await atlasFixtureRepo(server);
   await server.repo("orbit", "engine");
@@ -214,50 +212,14 @@ test("a timeline in capabilities, across repositories, ended and expired", async
     "The workspace panel read GET /api/spaces/:space/atlas/timeline",
   ).toBe(true);
 
-  // 5. The timeline lands: its overlay is kept read-only, and reading it asks
-  // for nothing (no write, no page writing offered).
+  // 5. The timeline lands: the panel says so. That its overlay is read-only
+  // and asks for nothing is worker/knowledge/ended.test.ts's; an expired
+  // snapshot's link, Atlas.browser.test.tsx's.
   await repo.dev({ action: "end", ref: bookmark, sourceId, reason: "landed" });
-  mark = server.requests.length;
   await app.navigate(`${repo.base}?tl=${slug}`);
   await expect.element(panel).toMatchTextContent("This timeline landed");
-  await expect.element(panel).toMatchTextContent("kept read-only: nothing here computes it again");
-  await expect.element(facts).toMatchTextContent("Ended");
-  await expect.poll(() => files.getByRole("listitem").elements().length).toBe(4);
-  await expect
-    .element(panel.getByRole("region", { name: "Timeline wiki pages" }))
-    .toMatchTextContent("None were written before this timeline ended.");
-  expect(panel.getByRole("button", { name: "Write pages now" }).elements()).toHaveLength(0);
-  await settled(server);
-  expect(
-    server.since(mark).filter((r) => r.method !== "GET"),
-    "Reading an ended timeline writes nothing",
-  ).toEqual([]);
-  expectBounded(server.since(mark));
 
-  // 6. The map's snapshot expires: the link explains, keeps the route to the
-  // overlay, and the current view reads it there.
-  await repo.dev({ action: "publish", commit: repo.head });
-  await repo.dev({ action: "expire" });
-  app.unmount();
-  const cold = renderApp(`${repo.base}?snapshot=${repo.first.snapshotId}&tl=${slug}`);
-  await expect
-    .element(
-      page.getByRole("heading", { name: "This link's Atlas snapshot has expired", level: 2 }),
-    )
-    .toHaveFocus();
-  await expect
-    .element(page.getByText(new RegExp(`Timeline ${slug}.s overlay is kept apart`)))
-    .toBeVisible();
-  await userEvent.click(page.getByRole("link", { name: "Open the current view" }));
-  await cold.waitForUrl(
-    (url) =>
-      url.searchParams.get("tl") === slug &&
-      url.searchParams.get("snapshot") !== repo.first.snapshotId,
-  );
-  await expect.element(panel).toMatchTextContent("This timeline landed");
-  await expect.poll(() => files.getByRole("listitem").elements().length).toBe(4);
-
-  // 7. CORE-201: 100 days on, retention ("ended-timeline-data", 90 days)
+  // 6. CORE-201: 100 days on, retention ("ended-timeline-data", 90 days)
   // removes the ended overlay's changes and pages; the panel says so.
   const resource = await server.call<RepoSummary>("GET", repo.api);
   const { run } = await server.call<{ run: { status: string; items: number } }>(
@@ -271,7 +233,7 @@ test("a timeline in capabilities, across repositories, ended and expired", async
   );
   expect(run.status).toBe("succeeded");
   expect(run.items, "The overlay's changes go").toBeGreaterThanOrEqual(4);
-  cold.unmount();
+  app.unmount();
   renderApp(`${repo.base}?tl=${slug}`);
   await expect.element(panel).toMatchTextContent("This timeline landed");
   await expect

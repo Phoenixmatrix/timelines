@@ -9,6 +9,7 @@ import { MAX_CHUNK } from "./jobs.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
 import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
+import { withoutWaiting } from "../testing/timers.ts";
 import { issueToken } from "../api/tokens.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import { initializeFreshTrackerSpace } from "../tracker/space-migration.ts";
@@ -497,7 +498,8 @@ describe("Sandbox log flushing", () => {
   test("a transient log write failure does not fail the job", async () => {
     let failures = 1;
     const fixture = await flushFixture(() => failures-- > 0);
-    await fixture.run();
+    // The retry waits for the next flush (FLUSH_MS): no real second.
+    await withoutWaiting(fixture.run);
     expect(failures).toBeLessThan(0); // the failure was injected and consumed
     expect(fixture.status()).toBe("succeeded");
     expect(fixture.logs()).toContain(MARKER);
@@ -619,7 +621,7 @@ describe("Sandbox log flushing", () => {
       skew += 20_000;
       return true;
     });
-    await expect(fixture.run()).rejects.toThrow("Network connection lost");
+    await expect(withoutWaiting(fixture.run)).rejects.toThrow("Network connection lost");
     expect(fixture.kill).toHaveBeenCalled();
     expect(fixture.logs()).not.toContain(MARKER);
   });

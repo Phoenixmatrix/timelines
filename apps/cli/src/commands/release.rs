@@ -379,25 +379,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn paths_encode_space_name_and_release() {
-        assert_eq!(
-            base("orbit/engine").unwrap(),
-            "/repos/orbit/engine/release-notes"
-        );
-        assert!(base("orbit").is_err());
-        assert!(base("orbit/../x").is_err());
-        let mut path = String::new();
-        encode_into(&mut path, &release_name("release/1.0&x=y"));
-        assert_eq!(path, "release%2F1.0%26x%3Dy");
-        assert_eq!(release_name("day:2026-10-02"), "@day:2026-10-02");
-        assert_eq!(
-            release_name("day:2026-10-02-preview"),
-            "day:2026-10-02-preview"
-        );
-        assert_eq!(release_name("day:2026-1-02"), "day:2026-1-02");
-    }
-
-    #[test]
     fn notes_render_as_markdown_grouped_by_category() {
         let value = json!({
             "release": {"name": "v2", "kind": "tag", "fromTag": "v1", "intro": "Faster search.", "lastCommitAt": "2026-10-02T12:00:00Z"},

@@ -6,8 +6,8 @@
 // landing under a keyboard reader; light and dark themes; and reduced motion
 // keeping the camera still.
 
-import { describe, expect, test } from "vite-plus/test";
-import { page, userEvent } from "vite-plus/test/browser";
+import { describe, expect, onTestFinished, test, vi } from "vite-plus/test";
+import { type Locator, page, userEvent } from "vite-plus/test/browser";
 import type { AtlasAncestors } from "../../../shared/atlas.ts";
 import { atlasFixtureRepo, settled, sidewaysOverflow } from "../../testing/atlas.ts";
 import { focused, focusOn, press, pressUntil, tap } from "../../testing/focus.ts";
@@ -162,7 +162,16 @@ describe("by keyboard alone", () => {
     // while someone reads the outline by keyboard (CORE-187). The view isn't
     // pinned, so it moves to the new map on its own: no page reload, the same
     // entries open and focus on the same row; the outline and the inspector
-    // say what changed in words.
+    // say what changed in words. The page checks a build's status every 2 s,
+    // on a fake clock here.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const polled = (locator: Locator) =>
+      expect
+        .poll(async () => (await vi.advanceTimersByTimeAsync(2_000), locator.elements().length))
+        .toBeGreaterThan(0);
     const app = renderApp(`${repo.base}?view=outline`);
     const tree = outline(repo.name);
     const status = (text: RegExp) => page.getByRole("status").filter({ hasText: text }).first();
@@ -182,7 +191,8 @@ describe("by keyboard alone", () => {
     // (A page reload would end this test: it runs in the page.)
     await repo.dev({ action: "publish", commit: repo.head, variant: "merged", land: true });
     const changed = tree.getByRole("treeitem", { name: /changed in this build/ }).first();
-    await expect.element(changed, { timeout: 10_000 }).toBeVisible();
+    await polled(changed);
+    await expect.element(changed).toBeVisible();
     await expect.element(status(/^Up to date with/)).toBeVisible();
     expect(app.url().searchParams.get("snapshot")).toBeNull();
     await expect.element(opened).toHaveAttribute("aria-expanded", "true");
@@ -194,13 +204,13 @@ describe("by keyboard alone", () => {
     await focusOn(changed);
     await press("Enter");
     await expect.element(selection().getByText(/changed in this build/)).toBeVisible();
-    await expect.element(status(/ · update queued$/), { timeout: 10_000 }).toBeVisible();
+    await polled(status(/ · update queued$/));
     const pinnedAt = app.url().href;
     expect(app.url().searchParams.get("snapshot"), "A selection pins the snapshot").toBeTruthy();
     const reader = selection().getByRole("heading", { level: 2 });
     await focusOn(reader);
     await repo.dev({ action: "publish", commit: repo.head, variant: "merged", land: true });
-    await expect.element(status(/^Up to date with/), { timeout: 10_000 }).toBeVisible();
+    await polled(status(/^Up to date with/));
     await expect.element(reader).toHaveFocus();
     expect(app.url().href, "A landing build must not move a pinned view").toBe(pinnedAt);
     await expect.element(selection().getByText(/changed in this build/)).toBeVisible();
@@ -233,7 +243,6 @@ describe("themes and motion", () => {
         .element();
       await choose(region, capability.name);
       await choose(other!, other!.querySelector("span > span")?.textContent?.trim() ?? "");
-      await new Promise((resolve) => setTimeout(resolve, 600));
       (region as HTMLElement).focus();
       await press("Enter");
       await app.waitForUrl((url) => url.searchParams.get("select") === capability.id);
@@ -273,52 +282,51 @@ describe("themes and motion", () => {
 });
 
 describe("a 320px phone, by touch", () => {
-  for (const scheme of ["light", "dark"] as const)
-    test(`the outline is the default, in the ${scheme} theme`, async () => {
-      const { repo, chain, capability } = await setup();
-      localStorage.setItem("gitmatrix.theme", scheme);
-      await page.viewport(320, 640);
-      try {
-        const app = renderApp(repo.base);
-        const tree = outline(repo.name);
-        await expect.element(tree).toBeVisible();
-        expect(document.documentElement.getAttribute("data-theme")).toBe(scheme);
-        expect(document.querySelectorAll("canvas"), "Phones open on the outline").toHaveLength(0);
-        expect(sidewaysOverflow(), "The phone outline scrolls sideways").toBeLessThanOrEqual(0);
-        // Tap a capability: it's read in line, with focus on it.
-        await tap(treeitem(tree, capability.name));
-        await expect
-          .element(page.getByRole("heading", { name: capability.name, level: 2 }))
-          .toHaveFocus();
-        // Drill down from what's inside, by tap.
-        const inside = page.getByRole("list", { name: `Inside ${capability.name}` });
-        const child = inside.getByRole("button").first();
-        await expect.element(child).toBeVisible();
-        const childName = child.element().querySelector("span")?.textContent?.trim() ?? "";
-        await tap(child);
-        await expect
-          .element(page.getByRole("heading", { name: childName, level: 2 }))
-          .toHaveFocus();
-        expect(sidewaysOverflow(), "The phone reader scrolls sideways").toBeLessThanOrEqual(0);
-        // Back to the outline, at the same place.
-        await tap(page.getByRole("button", { name: "Back to the outline" }));
-        await expect
-          .poll(() => document.activeElement?.matches('[role="treeitem"][aria-selected="true"]'))
-          .toBe(true);
-        // Lookup by touch.
-        await tap(page.getByRole("searchbox", { name: "Find a capability, file or symbol" }));
-        await userEvent.keyboard("post");
-        await tap(page.getByRole("list", { name: "Matches" }).getByRole("button").first());
-        await app.waitForUrl((url) => url.searchParams.get("select") === chain.entity.id);
-        await expect
-          .element(page.getByRole("heading", { name: chain.entity.name, level: 2 }))
-          .toHaveFocus();
-        expect(sidewaysOverflow(), "The phone after a lookup").toBeLessThanOrEqual(0);
-        expect(focused().role).not.toBe("body");
-      } finally {
-        localStorage.removeItem("gitmatrix.theme");
-        document.documentElement.setAttribute("data-theme", "dark");
-        await page.viewport(1280, 900);
-      }
-    });
+  // In the light theme: dark is the default, and no step depends on it.
+  const scheme = "light";
+  test("the outline is the default, in the light theme", async () => {
+    const { repo, chain, capability } = await setup();
+    localStorage.setItem("gitmatrix.theme", scheme);
+    await page.viewport(320, 640);
+    try {
+      const app = renderApp(repo.base);
+      const tree = outline(repo.name);
+      await expect.element(tree).toBeVisible();
+      expect(document.documentElement.getAttribute("data-theme")).toBe(scheme);
+      expect(document.querySelectorAll("canvas"), "Phones open on the outline").toHaveLength(0);
+      expect(sidewaysOverflow(), "The phone outline scrolls sideways").toBeLessThanOrEqual(0);
+      // Tap a capability: it's read in line, with focus on it.
+      await tap(treeitem(tree, capability.name));
+      await expect
+        .element(page.getByRole("heading", { name: capability.name, level: 2 }))
+        .toHaveFocus();
+      // Drill down from what's inside, by tap.
+      const inside = page.getByRole("list", { name: `Inside ${capability.name}` });
+      const child = inside.getByRole("button").first();
+      await expect.element(child).toBeVisible();
+      const childName = child.element().querySelector("span")?.textContent?.trim() ?? "";
+      await tap(child);
+      await expect.element(page.getByRole("heading", { name: childName, level: 2 })).toHaveFocus();
+      expect(sidewaysOverflow(), "The phone reader scrolls sideways").toBeLessThanOrEqual(0);
+      // Back to the outline, at the same place.
+      await tap(page.getByRole("button", { name: "Back to the outline" }));
+      await expect
+        .poll(() => document.activeElement?.matches('[role="treeitem"][aria-selected="true"]'))
+        .toBe(true);
+      // Lookup by touch.
+      await tap(page.getByRole("searchbox", { name: "Find a capability, file or symbol" }));
+      await userEvent.keyboard("post");
+      await tap(page.getByRole("list", { name: "Matches" }).getByRole("button").first());
+      await app.waitForUrl((url) => url.searchParams.get("select") === chain.entity.id);
+      await expect
+        .element(page.getByRole("heading", { name: chain.entity.name, level: 2 }))
+        .toHaveFocus();
+      expect(sidewaysOverflow(), "The phone after a lookup").toBeLessThanOrEqual(0);
+      expect(focused().role).not.toBe("body");
+    } finally {
+      localStorage.removeItem("gitmatrix.theme");
+      document.documentElement.setAttribute("data-theme", "dark");
+      await page.viewport(1280, 900);
+    }
+  });
 });
