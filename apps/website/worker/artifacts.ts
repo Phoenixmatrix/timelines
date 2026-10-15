@@ -35,7 +35,7 @@ export async function upstreamToken(
       using repo = await withTimeout(env.ARTIFACTS.get(artifactsName), UPSTREAM_TIMEOUT_MS);
       return await withTimeout(repo.createToken(scope, TOKEN_TTL_SECONDS), UPSTREAM_TIMEOUT_MS);
     },
-    { retryable: isTransientArtifactsError, label: "Artifacts token", context: { artifactsName } },
+    { retryable: isTransientArtifactsError, label: "Artifacts token" },
   );
   const token = { secret: created.plaintext, expiresAt: Date.parse(created.expiresAt) };
   tokenCache.set(key, token);
@@ -118,7 +118,6 @@ export async function lsRefs(
     {
       retryable: isTransientArtifactsError,
       label: "Artifacts ls-refs",
-      context: { artifactsName },
     },
   );
 }

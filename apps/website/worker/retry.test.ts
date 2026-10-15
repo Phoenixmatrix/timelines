@@ -33,6 +33,32 @@ describe("retrying", () => {
     );
   });
 
+  test("a retry warning names no provider handle (CORE-448)", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const name = `w-${"a".repeat(32)}`;
+    const remote = `https://0e28c6400ae60277.artifacts.cloudflare.net/git/${name}.git`;
+    let calls = 0;
+    await retrying(
+      async () => {
+        if (++calls < 2) throw new Error(`flaky: ls-refs on ${remote} for ${name}`);
+        return "done";
+      },
+      {
+        retryable: (error) => String(error).includes("flaky"),
+        label: "Test",
+        context: { repo: "repo_1", artifactsName: name, artifacts_remote: remote, note: name },
+        wait: async () => {},
+      },
+    );
+    const [, logged] = vi.mocked(console.warn).mock.calls[0]!;
+    expect(logged).toEqual({
+      repo: "repo_1",
+      note: "[provider]",
+      attempt: 1,
+      error: "Error: flaky: ls-refs on [provider] for [provider]",
+    });
+  });
+
   test("after its retries the last failure is thrown", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     let calls = 0;

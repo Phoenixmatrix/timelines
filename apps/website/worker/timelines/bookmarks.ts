@@ -64,7 +64,6 @@ export async function writeRefs(
     {
       retryable: isTransientArtifactsError,
       label: "Artifacts receive-pack advertisement",
-      context: { artifactsName: repo.artifacts_name },
     },
   );
   const updates = writes.map((w) => ({

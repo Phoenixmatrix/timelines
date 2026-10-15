@@ -168,7 +168,7 @@ async function headerChangeId(env: Env, row: RepoRow, oid: string): Promise<stri
       {
         retryable: isTransientArtifactsError,
         label: "Why: reading a commit header",
-        context: { artifactsName: row.artifacts_name },
+        context: { repo: row.id },
       },
     );
   } catch (error) {

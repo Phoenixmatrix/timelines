@@ -410,7 +410,7 @@ async function fetchNewCommits(
     {
       retryable: isTransientArtifactsError,
       label: "Push log: reading new commits",
-      context: { artifactsName: repo.artifacts_name },
+      context: { repo: repo.id },
     },
   );
 }
