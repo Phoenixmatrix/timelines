@@ -20,7 +20,9 @@ import {
   shouldSkipRetest,
   stuckIssuesToClose,
   stuckTitle,
+  testsTimeoutMs,
   unitTimeoutMinutes,
+  withTestsOutcome,
   type MainE2EResult,
   type TrackedIssue,
 } from "./main-e2e.ts";
@@ -150,6 +152,28 @@ const finished = (overrides: Partial<Parameters<typeof decideOutcome>[0]> = {}) 
     ...overrides,
   });
 
+await test("a failed full test suite joins the E2E result and names the stage", () => {
+  const passed = finished({
+    code: 0,
+    parsed: parseRunLog(JSON.stringify({ event: "e2e.complete", success: true, failedStages: [] })),
+  });
+  assert.deepEqual(withTestsOutcome(passed, true), passed);
+  const merged = withTestsOutcome(passed, false);
+  assert.equal(merged.kind === "result" && merged.result.success, false);
+  assert.deepEqual(merged.kind === "result" && merged.result.failedStages, ["tests"]);
+  assert.equal(
+    buildTitle(merged.kind === "result" ? merged.result : result()),
+    "Main E2E failing: stage tests",
+  );
+  // Alongside an E2E failure the stage is added once, and an environment limit stays a retry.
+  const both = withTestsOutcome(
+    { kind: "result", result: result({ failedStages: ["tests"] }) },
+    false,
+  );
+  assert.deepEqual(both.kind === "result" && both.result.failedStages, ["tests"]);
+  assert.deepEqual(withTestsOutcome({ kind: "retry-later" }, false), { kind: "retry-later" });
+});
+
 await test("either environment limit retries later without a result; a timeout is a failure of its own", () => {
   for (const message of [
     "Installation environment limit reached (4/4).",
@@ -176,7 +200,9 @@ await test("either environment limit retries later without a result; a timeout i
 });
 
 await test("budgets fit under the unit timeout, with room for the grace period", () => {
-  assert(installTimeoutMs + e2eTimeoutMs + e2eGraceMs < unitTimeoutMinutes * 60_000);
+  assert(
+    installTimeoutMs + testsTimeoutMs + e2eTimeoutMs + e2eGraceMs < unitTimeoutMinutes * 60_000,
+  );
   assert(e2eGraceMs >= 3 * 60_000);
 });
 
@@ -189,7 +215,7 @@ await test("the service unit writes WorkingDirectory unquoted, absolute and esca
   });
   assert.match(unit, /^WorkingDirectory=\/home\/u\/\.local\/state\/main-e2e\/checkout$/m);
   assert.match(unit, /^ExecStart="\/usr\/bin\/node" "/m);
-  assert.match(unit, /^TimeoutStartSec=120min$/m);
+  assert.match(unit, /^TimeoutStartSec=150min$/m);
   assert.match(
     serviceUnit({ checkout: "/a/100%/c", node: "/n", entry: "/e", path: "/p" }),
     /^WorkingDirectory=\/a\/100%%\/c$/m,

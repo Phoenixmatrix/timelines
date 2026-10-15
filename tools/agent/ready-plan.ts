@@ -7,6 +7,12 @@ export interface ReadyOptions {
   all: boolean;
   dryRun: boolean;
   base: string;
+  /**
+   * `ci-tests`: remote CI's test selection. Changes under tools/agent and tools/remote are
+   * classified like any other workspace's instead of forcing full coverage; the full suite
+   * runs on the main watcher.
+   */
+  scope?: "ci-tests";
 }
 
 export interface ReadyPlan {
@@ -71,7 +77,7 @@ interface Manifest {
   optionalDependencies?: Record<string, string>;
 }
 
-const labels: Record<Workspace, string> = {
+export const labels: Record<Workspace, string> = {
   "apps/cli": "cli",
   "tools/agent": "agent",
   "tools/preview": "preview",
@@ -259,9 +265,9 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
     if (!workspace) return full(`Unclassified or global path: ${path}`);
     if (path === `${workspace}/package.json`)
       return full(`Workspace task/dependency configuration changed: ${path}`);
-    if (workspace === "tools/agent" && !testOnly(path))
+    if (workspace === "tools/agent" && !testOnly(path) && options.scope !== "ci-tests")
       return full(`Shared harness lifecycle or readiness implementation changed: ${path}`);
-    if (workspace === "tools/remote" && !testOnly(path))
+    if (workspace === "tools/remote" && !testOnly(path) && options.scope !== "ci-tests")
       return full(`Shared remote execution backend changed: ${path}`);
     affected.add(workspace);
     if (!testOnly(path) && workspace !== "packages/testing") production.add(workspace);

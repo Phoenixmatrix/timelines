@@ -99,8 +99,14 @@ jobs:
     verification: context-invariant-v1
     instance: standard-4
     # Run #745 timed out at 30 minutes before tests restored a snapshot of the
-    # fresh installation instead of building one per test.
-    timeout_minutes: 60
+    # fresh installation instead of building one per test. This job now runs only
+    # the tests a change affects (tools/agent/ci-test.ts), measured against the
+    # last verified successful test job, as the build job does; no baseline, a
+    # global or unclassified path, a workspace package.json, the lockfile or this
+    # file select the full suite. The complete unit and browser suites run on
+    # every new main commit in the main-E2E watcher, which files a P0 issue when
+    # they fail.
+    timeout_minutes: 30
     # The browser tests save a picture of the app at their key states here
     # (src/testing/visual.ts); the last step attaches them to the commit's step
     # for the Story's step view (CORE-383).
@@ -128,7 +134,7 @@ jobs:
       - name: Tests (everything but gm, which the cli job tests)
         run: |
           rm -rf "$GITMATRIX_VISUALS_DIR"
-          vp run --filter '!cli' --concurrency-limit 1 --no-cache test
+          node tools/agent/ci-test.ts
       - name: Upload screenshots for the step view
         run: node tools/visuals/upload.ts
 

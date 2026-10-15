@@ -25,9 +25,11 @@ const lockPath = join(stateDirectory, "tick.lock");
 // before its own timeout has recorded the result (CORE-406).
 export const installTimeoutMs = 20 * 60_000;
 export const e2eTimeoutMs = 85 * 60_000;
+/** The full unit and browser suites that remote CI no longer runs per push. */
+export const testsTimeoutMs = 30 * 60_000;
 /** After SIGTERM the run gets this long to destroy its environment before SIGKILL. */
 export const e2eGraceMs = 3 * 60_000;
-export const unitTimeoutMinutes = 120;
+export const unitTimeoutMinutes = 150;
 const OPEN_STATUSES = new Set(["backlog", "todo", "in_progress"]);
 
 export interface MainE2EResult {
@@ -202,6 +204,22 @@ export function decideOutcome(input: {
       evidence: parsed.complete?.evidence ?? null,
       log: input.log,
       finishedAt: input.finishedAt,
+    },
+  };
+}
+
+/** A full-suite failure joins the E2E result: the same P0 report, dedupe and recovery apply. */
+export function withTestsOutcome(outcome: RunOutcome, testsPassed: boolean): RunOutcome {
+  if (outcome.kind !== "result" || testsPassed) return outcome;
+  const { result } = outcome;
+  return {
+    kind: "result",
+    result: {
+      ...result,
+      success: false,
+      failedStages: result.failedStages.includes("tests")
+        ? result.failedStages
+        : [...result.failedStages, "tests"],
     },
   };
 }
@@ -702,13 +720,36 @@ export async function tick(): Promise<void> {
     log("start", { sha: head });
     await ok("vp", ["install"], { cwd, timeout: installTimeoutMs });
     await mkdir(join(stateDirectory, "runs"), { recursive: true, mode: 0o700 });
+    // The full unit and browser suites, which remote CI no longer runs per push (it tests only
+    // what a change affects). A failure is reported with the E2E result; E2E runs regardless.
+    const testsLog = openSync(join(stateDirectory, "runs", `${head}.tests.log`), "w", 0o600);
+    let testsPassed: boolean;
+    try {
+      testsPassed = await new Promise<boolean>((resolve, reject) => {
+        const child = spawn("vp", ["run", "--filter", "!cli", "--no-cache", "test"], {
+          cwd,
+          env: { ...process.env, NO_COLOR: "1" },
+          stdio: ["ignore", testsLog, testsLog],
+        });
+        const timer = setTimeout(() => child.kill("SIGKILL"), testsTimeoutMs);
+        child.on("error", reject);
+        child.on("close", (exit) => {
+          clearTimeout(timer);
+          resolve(exit === 0);
+        });
+      });
+    } finally {
+      closeSync(testsLog);
+    }
+    log("tests", { sha: head, passed: testsPassed });
     const logPath = join(stateDirectory, "runs", `${head}.log`);
     const descriptor = openSync(logPath, "w", 0o600);
     let code: number | null;
     let timedOut = false;
     try {
       code = await new Promise<number | null>((resolve, reject) => {
-        // The same full non-AI suite as `vp run agent test`: no ready selection.
+        // The same full non-AI suite as `vp run agent test`: no ready selection. With the unit
+        // and browser suites above, the watcher runs everything remote CI skips per push.
         const child = spawn(
           process.execPath,
           [join(cwd, "tools/agent/entry.ts"), "--execution", "local", "test"],
@@ -731,14 +772,17 @@ export async function tick(): Promise<void> {
     } finally {
       closeSync(descriptor);
     }
-    const outcome = decideOutcome({
-      sha: head,
-      code,
-      timedOut,
-      parsed: parseRunLog(await readFile(logPath, "utf8")),
-      log: logPath,
-      finishedAt: new Date().toISOString(),
-    });
+    const outcome = withTestsOutcome(
+      decideOutcome({
+        sha: head,
+        code,
+        timedOut,
+        parsed: parseRunLog(await readFile(logPath, "utf8")),
+        log: logPath,
+        finishedAt: new Date().toISOString(),
+      }),
+      testsPassed,
+    );
     if (outcome.kind === "retry-later") {
       log("environment-limit", { sha: head, log: logPath });
       return;

@@ -1,0 +1,194 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { test } from "node:test";
+import { promisify } from "node:util";
+import { ciTestPlan } from "./ci-test.ts";
+
+const exec = promisify(execFile);
+const repository = resolve(import.meta.dirname, "../..");
+const workspaces = [
+  "apps/cli",
+  "apps/website",
+  "apps/site",
+  "tools/agent",
+  "tools/preview",
+  "tools/remote",
+  "packages/formats",
+  "packages/testing",
+  "packages/utils",
+];
+
+/** A committed baseline plus a CI environment naming it, then `run` changes the tree. */
+async function fixture(
+  run: (
+    plan: () => ReturnType<typeof ciTestPlan>,
+    put: (path: string, content?: string) => Promise<void>,
+    git: (args: string[]) => Promise<string>,
+    env: NodeJS.ProcessEnv,
+  ) => Promise<void>,
+) {
+  const root = await mkdtemp(join(tmpdir(), "ci-test-"));
+  const git = async (args: string[]) =>
+    (
+      await exec("git", args, {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_AUTHOR_NAME: "CI test",
+          GIT_AUTHOR_EMAIL: "ci@example.invalid",
+          GIT_COMMITTER_NAME: "CI test",
+          GIT_COMMITTER_EMAIL: "ci@example.invalid",
+        },
+      })
+    ).stdout.trim();
+  const put = async (path: string, content = "changed\n") => {
+    await mkdir(dirname(join(root, path)), { recursive: true });
+    await writeFile(join(root, path), content);
+  };
+  try {
+    await git(["init", "-b", "main"]);
+    for (const workspace of workspaces)
+      await put(
+        `${workspace}/package.json`,
+        await readFile(join(repository, workspace, "package.json"), "utf8"),
+      );
+    await put(".gitignore", ".cloudflare/\n");
+    await put("apps/website/.cloudflare/types/index.d.ts", "// generated\n");
+    await put("pnpm-lock.yaml", "lockfileVersion: 9\n");
+    await put(".gitmatrix/ci.yml", "jobs: {}\n");
+    await git(["add", "."]);
+    await git(["commit", "-m", "baseline"]);
+    const base = await git(["rev-parse", "HEAD"]);
+    const env = {
+      GITMATRIX_COMMIT: base,
+      GITMATRIX_VERIFIED_BASE: JSON.stringify({ commit: base, runNumber: 1, jobId: "test-1" }),
+    };
+    await run(() => ciTestPlan(root, env), put, git, env);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+await test("without a verified baseline the full suite runs", async () => {
+  await fixture(async (_plan, _put, _git, env) => {
+    const root = await mkdtemp(join(tmpdir(), "ci-test-none-"));
+    try {
+      const plan = await ciTestPlan(root, { ...env, GITMATRIX_VERIFIED_BASE: undefined });
+      assert.equal(plan.full, true);
+      assert.equal(plan.baseline, null);
+      assert.equal(plan.websiteUnit, "all");
+      assert.equal(plan.websiteBrowser, true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+await test("a documentation change runs no tests", async () => {
+  await fixture(async (plan, put) => {
+    await put("README.md");
+    const selected = await plan();
+    assert.equal(selected.full, false);
+    assert.deepEqual(selected.workspaces, []);
+    assert.equal(selected.websiteUnit, "none");
+    assert.equal(selected.websiteBrowser, false);
+  });
+});
+
+await test("a gm change tests the site that reads its manifest, not the website", async () => {
+  await fixture(async (plan, put) => {
+    await put("apps/cli/src/main.rs");
+    const selected = await plan();
+    assert.equal(selected.full, false);
+    assert.ok(selected.workspaces.includes("site"));
+    assert.equal(selected.workspaces.includes("cli"), false);
+    assert.equal(selected.websiteUnit, "none");
+    assert.equal(selected.websiteBrowser, false);
+  });
+});
+
+await test("a website source change runs related unit tests and all browser tests", async () => {
+  await fixture(async (plan, put) => {
+    await put("apps/website/worker/foo.ts");
+    const selected = await plan();
+    assert.equal(selected.websiteUnit, "changed");
+    assert.equal(selected.websiteBrowser, true);
+  });
+});
+
+await test("a website unit test file alone skips the browser project", async () => {
+  await fixture(async (plan, put) => {
+    await put("apps/website/worker/foo.test.ts");
+    const selected = await plan();
+    assert.equal(selected.websiteUnit, "changed");
+    assert.equal(selected.websiteBrowser, false);
+  });
+});
+
+await test("a browser test file runs the browser project", async () => {
+  await fixture(async (plan, put) => {
+    await put("apps/website/src/X.browser.test.tsx");
+    const selected = await plan();
+    assert.equal(selected.websiteUnit, "changed");
+    assert.equal(selected.websiteBrowser, true);
+  });
+});
+
+await test("paths that imports cannot trace run every website unit test", async () => {
+  await fixture(async (plan, put, git) => {
+    for (const path of [
+      "apps/website/migrations/20260101000000_add.sql",
+      "apps/website/src/styles/app.css",
+      "apps/website/vite.config.ts",
+      "apps/website/tsconfig.json",
+      "apps/website/worker/testing/runtime.ts",
+    ]) {
+      await put(path);
+      const selected = await plan();
+      assert.equal(selected.websiteUnit, "all", path);
+      assert.equal(selected.websiteBrowser, true, path);
+      await git(["clean", "-fdq"]);
+    }
+  });
+});
+
+await test("a shared package change runs everything that consumes it", async () => {
+  await fixture(async (plan, put) => {
+    await put("packages/formats/src/x.ts");
+    const selected = await plan();
+    assert.equal(selected.full, false);
+    assert.ok(selected.workspaces.includes("formats"));
+    assert.equal(selected.websiteUnit, "all");
+    assert.equal(selected.websiteBrowser, true);
+  });
+});
+
+await test("a harness change selects its workspace instead of the full suite", async () => {
+  await fixture(async (plan, put) => {
+    await put("tools/agent/helper.ts");
+    const selected = await plan();
+    assert.equal(selected.full, false);
+    assert.ok(selected.workspaces.includes("agent"));
+    assert.equal(selected.websiteUnit, "none");
+    assert.equal(selected.websiteBrowser, false);
+  });
+});
+
+await test("the lockfile, CI configuration and workspace manifests select the full suite", async () => {
+  await fixture(async (plan, put, git) => {
+    for (const path of ["pnpm-lock.yaml", ".gitmatrix/ci.yml", "packages/utils/package.json"]) {
+      await put(path, "changed\n");
+      const selected = await plan();
+      assert.equal(selected.full, true, path);
+      assert.equal(selected.websiteUnit, "all", path);
+      assert.equal(selected.websiteBrowser, true, path);
+      await git(["checkout", "--", path]);
+    }
+  });
+});

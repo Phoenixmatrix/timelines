@@ -1,0 +1,139 @@
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
+import { verifiedBaseline, type VerifiedBaseline } from "./ci-baseline.ts";
+import { labels, readinessPlan } from "./ready-plan.ts";
+
+export interface CiTestPlan {
+  full: boolean;
+  baseline: VerifiedBaseline | null;
+  changed: string[];
+  reasons: string[];
+  /** Workspace labels (not website, not cli) whose `test` task runs. */
+  workspaces: string[];
+  websiteUnit: "all" | "changed" | "none";
+  websiteBrowser: boolean;
+}
+
+const WEBSITE = "apps/website/";
+
+/** Configuration or setup that Vitest's changed-file graph cannot be trusted to follow. */
+function websiteConfig(path: string): boolean {
+  const relative = path.slice(WEBSITE.length);
+  return (
+    relative === "vite.config.ts" ||
+    relative.startsWith("vite/") ||
+    /^tsconfig[^/]*\.json$/.test(basename(relative)) ||
+    relative === "worker/testing/runtime.ts"
+  );
+}
+
+/**
+ * Remote CI's `test` job runs what a change affects, measured against the last verified
+ * successful `test` job, not the whole suite: that runs on the main watcher (main-e2e.ts),
+ * which files a P0 issue when it fails.
+ */
+export async function ciTestPlan(
+  root: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<CiTestPlan> {
+  const everything = (
+    reason: string,
+    baseline: VerifiedBaseline | null,
+    changed: string[] = [],
+  ) => ({
+    full: true,
+    baseline,
+    changed,
+    reasons: [reason],
+    workspaces: [],
+    websiteUnit: "all" as const,
+    websiteBrowser: true,
+  });
+  const verified = await verifiedBaseline(root, env);
+  if ("reason" in verified) return everything(verified.reason, null);
+  const { baseline } = verified;
+  const plan = await readinessPlan(root, {
+    all: false,
+    dryRun: true,
+    base: baseline.commit,
+    scope: "ci-tests",
+  });
+  if (plan.full) return everything(plan.reasons[0], baseline, plan.changed);
+
+  const gates = new Set(plan.gates.map((gate) => gate.name));
+  const workspaces = Object.values(labels).filter(
+    (label) => label !== "website" && label !== "cli" && gates.has(`${label}-tests`),
+  );
+  const reasons: string[] = [];
+  let websiteUnit: CiTestPlan["websiteUnit"] = "none";
+  let websiteBrowser = false;
+  if (gates.has("website-tests")) {
+    const web = plan.changed.filter((path) => path.startsWith(WEBSITE));
+    const packages = plan.changed.some((path) => path.startsWith("packages/"));
+    // Workspace sources may not be in Vitest's module graph, and fixtures, migrations, seeds,
+    // CSS and configuration cannot be traced through imports.
+    const traceable =
+      web.length > 0 &&
+      !packages &&
+      web.every((path) => /\.tsx?$/.test(path)) &&
+      !web.some(websiteConfig);
+    websiteUnit = traceable ? "changed" : "all";
+    if (!traceable)
+      reasons.push(
+        "Website unit tests run in full: a changed path cannot be traced through imports (workspace package, non-TypeScript file, configuration, or no website path).",
+      );
+    // Browser tests run against worker/testing/browser-api.ts, which imports the real Worker
+    // routes, so any website source change can affect them. Only a unit test file cannot.
+    websiteBrowser =
+      packages ||
+      web.length === 0 ||
+      !web.every((path) => path.endsWith(".test.ts") && !path.endsWith(".browser.test.tsx"));
+  }
+  return {
+    full: false,
+    baseline,
+    changed: plan.changed,
+    reasons: [...plan.reasons, ...reasons],
+    workspaces,
+    websiteUnit,
+    websiteBrowser,
+  };
+}
+
+function manifestName(root: string, label: string): string {
+  const workspace = Object.entries(labels).find(([, value]) => value === label)![0];
+  return JSON.parse(readFileSync(join(root, workspace, "package.json"), "utf8")).name;
+}
+
+if (import.meta.main) {
+  const root = resolve(import.meta.dirname, "../..");
+  const plan = await ciTestPlan(root);
+  console.log(JSON.stringify({ event: "ci.test.plan", ...plan }));
+  if (!process.argv.includes("--plan")) {
+    const run = (binary: string, args: string[], cwd = root) =>
+      execFileSync(binary, args, { cwd, stdio: "inherit" });
+    if (plan.full) {
+      run("vp", ["run", "--filter", "!cli", "--concurrency-limit", "1", "--no-cache", "test"]);
+    } else {
+      for (const label of plan.workspaces)
+        run("vp", ["run", "--no-cache", `${manifestName(root, label)}#test`]);
+      const website = join(root, "apps/website");
+      const tests = (args: string[]) =>
+        run("node", ["../../tools/agent/website-tests.ts", ...args], website);
+      // website-tests.ts retries a crashed browser run only for a lone `--project browser`
+      // (or no filters at all), so the projects run apart unless the whole suite is wanted.
+      if (plan.websiteUnit === "all" && plan.websiteBrowser) tests([]);
+      else {
+        if (plan.websiteUnit !== "none")
+          tests([
+            "--project",
+            "unit",
+            "--passWithNoTests",
+            ...(plan.websiteUnit === "changed" ? [`--changed=${plan.baseline!.commit}`] : []),
+          ]);
+        if (plan.websiteBrowser) tests(["--project", "browser"]);
+      }
+    }
+  }
+}
