@@ -814,23 +814,31 @@ tracker.get("/repos/:space/:name/tracker", async (c) => {
 
 tracker.get("/repos/:space/:name/tracker/summary", async (c) => {
   const actor = c.get("actor");
-  const repo = await findRepo(c.env.DB, actor, c.req.param("space"), c.req.param("name"));
+  const timing = requestTiming(c);
+  const env = timedEnv(c.env, timing);
+  // The grant list doesn't depend on the repository, so it is read alongside
+  // it; its failure only counts once the repository is known and visible.
+  const listed = actor ? accessibleGrants(env.DB, actor) : Promise.resolve([]);
+  listed.catch(() => {});
+  const repo = await findRepo(env.DB, actor, c.req.param("space"), c.req.param("name"));
   if (!repo || roleFor(repo, actor) === "none")
     return c.json({ error: "Repository not found." }, 404);
   const summary: RepoIssueSummary = { ready: null, projects: 0 };
   if (!actor) return c.json(summary);
   const timeline = timelineParam(c);
-  for (const space of await accessible(c.env.DB, actor)) {
-    if (space.id !== repo.space_id) continue;
-    const access = await accessFor(
-      c.env,
-      space,
-      actor.id,
-      actor.agent?.id ?? null,
-      false,
-      actor.credential,
+  // Only a grant in the repository's own Space counts anything. Its access is
+  // built from that grant and this request's admission read, exactly as
+  // accessFor(…, includeMembers = false) would, without resolving the grant
+  // again (CORE-439's accessFromGrant).
+  const grants = (await listed).filter((access) => access.spaceId === repo.space_id);
+  if (!grants.length) return c.json(summary);
+  const admission = await requestAdmission(c);
+  for (const grant of grants) {
+    const access = accessFromGrant(grant, admission, actor.credential);
+    const result = await timedCall(
+      timing,
+      trackerObject(env, access.spaceId).repoReadySummary(access, repo.id, timeline),
     );
-    const result = await trackerObject(c.env, space.id).repoReadySummary(access, repo.id, timeline);
     if (!result.ok) return response(c, result);
     if (!result.value.projects) continue;
     summary.projects += result.value.projects;

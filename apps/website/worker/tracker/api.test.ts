@@ -667,3 +667,149 @@ describe("Needs you summary (CORE-301)", () => {
     expect(closed.openRequests).not.toHaveBeenCalled();
   });
 });
+
+describe("repository tracker summary (CORE-451)", () => {
+  type Reply =
+    | { ok: true; value: { projects: number; ready: number } }
+    | { ok: false; status: 409; error: string; code: string };
+  async function world(actor: Actor | null, reply?: Reply) {
+    const t = await setup(actor);
+    t.sqlite.exec(`
+      INSERT INTO repos (id, space_id, name, visibility, artifacts_name, artifacts_remote) VALUES
+        ('r-engine', 'space-orbit', 'engine', 'public', 'a-engine', 'https://artifacts.test/a-engine'),
+        ('r-hidden', 'space-private', 'hidden', 'public', 'a-hidden', 'https://artifacts.test/a-hidden');
+    `);
+    const asked: { access: Access; repoId: string; timeline: string | undefined }[] = [];
+    const repoReadySummary = vi.fn(
+      async (access: Access, repoId: string, timeline?: string): Promise<Reply> => {
+        asked.push({ access, repoId, timeline });
+        return reply ?? { ok: true, value: { projects: 2, ready: 5 } };
+      },
+    );
+    Reflect.set(t.env, "TRACKER", { getByName: () => ({ repoReadySummary }) });
+    // As app.ts does: every /api response carries this request's Server-Timing.
+    const app = new Hono<AppEnv>();
+    app.use("*", async (c, next) => {
+      c.set("actor", actor);
+      await next();
+      const timing = c.get("timing");
+      if (timing) c.res.headers.set("server-timing", timing.header());
+    });
+    app.route("/api", tracker);
+    const call = (path: string) =>
+      app.request(`/api${path}`, { headers: { [CONTENT_CONTRACT_HEADER]: "4" } }, t.env);
+    const closeAdmission = () => {
+      vi.spyOn(t.control, "admission").mockResolvedValue({
+        allowed: false,
+        epoch: 0,
+        [Symbol.dispose]() {},
+      });
+      // Open admission never closes in protocol; model an isolate that never saw it open.
+      forgetCachedAdmission(t.env);
+    };
+    return { ...t, call, asked, repoReadySummary, closeAdmission };
+  }
+
+  test("asks the repository's Space with exactly the access accessFor builds, timed", async () => {
+    const credential = { kind: "token" as const, id: "tok-ann" };
+    const t = await world({ ...ann, credential });
+    const response = await t.call("/repos/orbit/engine/tracker/summary?timeline=focus");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ready: 5, projects: 2 });
+    expect(t.asked).toHaveLength(1);
+    const [{ access, repoId, timeline }] = t.asked as [(typeof t.asked)[number]];
+    expect([repoId, timeline]).toEqual(["r-engine", "focus"]);
+    const space = (await findSpaceById(t.env.DB, "space-orbit"))!;
+    expect(access).toEqual(await accessFor(t.env, space, "ann", null, false, credential));
+    const timings = response.headers.get("server-timing") ?? "";
+    expect(timings).toMatch(/\bd1;desc="\d+ queries \(summed\)"/);
+    expect(timings).toContain('do;desc="1 calls (summed)"');
+    // main is the default view, as before.
+    await t.call("/repos/orbit/engine/tracker/summary?timeline=main");
+    expect(t.asked[1]!.timeline).toBeUndefined();
+  });
+
+  test("an agent asks as itself, and counts nothing once revoked", async () => {
+    const t = await world({ ...ann, agent: { id: "agent-1", name: "claude" } });
+    expect(await (await t.call("/repos/orbit/engine/tracker/summary")).json()).toEqual({
+      ready: 5,
+      projects: 2,
+    });
+    const space = (await findSpaceById(t.env.DB, "space-orbit"))!;
+    expect(t.asked[0]!.access).toEqual(await accessFor(t.env, space, "ann", "agent-1", false));
+    expect([t.asked[0]!.access.actorId, t.asked[0]!.access.agentId]).toEqual([
+      "agent-1",
+      "agent-1",
+    ]);
+    t.sqlite.exec("UPDATE agents SET revoked_at='2026-10-11T00:00:00.000Z' WHERE id='agent-1'");
+    expect(await (await t.call("/repos/orbit/engine/tracker/summary")).json()).toEqual({
+      ready: null,
+      projects: 0,
+    });
+    expect(t.repoReadySummary).toHaveBeenCalledTimes(1);
+  });
+
+  test("a repository nobody subscribed counts nothing, not zero", async () => {
+    const t = await world(ann, { ok: true, value: { projects: 0, ready: 0 } });
+    expect(await (await t.call("/repos/orbit/engine/tracker/summary")).json()).toEqual({
+      ready: null,
+      projects: 0,
+    });
+  });
+
+  test("an unknown repository is not found, before anything else", async () => {
+    const t = await world(ann);
+    t.closeAdmission();
+    const response = await t.call(
+      `/repos/orbit/missing/tracker/summary?timeline=${"x".repeat(101)}`,
+    );
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: "Repository not found." });
+    expect(t.repoReadySummary).not.toHaveBeenCalled();
+  });
+
+  test("signed out, a public repository counts nothing and asks no Tracker", async () => {
+    const t = await world(null);
+    const response = await t.call(
+      `/repos/orbit/engine/tracker/summary?timeline=${"x".repeat(101)}`,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ready: null, projects: 0 });
+    expect(t.repoReadySummary).not.toHaveBeenCalled();
+  });
+
+  test("an invalid timeline is refused before any Tracker is asked", async () => {
+    const t = await world(ann);
+    const response = await t.call(
+      `/repos/orbit/engine/tracker/summary?timeline=${"x".repeat(101)}`,
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: "invalid_input" });
+    expect(t.repoReadySummary).not.toHaveBeenCalled();
+  });
+
+  test("without a grant in the repository's Space it counts nothing, even with admission closed", async () => {
+    const t = await world(ann);
+    t.closeAdmission();
+    const response = await t.call("/repos/private/hidden/tracker/summary");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ready: null, projects: 0 });
+    expect(t.repoReadySummary).not.toHaveBeenCalled();
+  });
+
+  test("closed admission refuses a granted reader without asking the Tracker", async () => {
+    const t = await world(ann);
+    t.closeAdmission();
+    const response = await t.call("/repos/orbit/engine/tracker/summary");
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: "migration_epoch_mismatch" });
+    expect(t.repoReadySummary).not.toHaveBeenCalled();
+  });
+
+  test("the Tracker's refusal is passed on as it is", async () => {
+    const t = await world(ann, { ok: false, status: 409, error: "Stale.", code: "stale" });
+    const response = await t.call("/repos/orbit/engine/tracker/summary");
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "Stale.", code: "stale" });
+  });
+});
