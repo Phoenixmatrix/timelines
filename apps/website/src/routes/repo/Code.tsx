@@ -5,10 +5,9 @@ import {
   LinkSimpleIcon,
   UsersThreeIcon,
 } from "@phosphor-icons/react";
-import { Suspense, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import {
-  Await,
   Link,
   useLoaderData,
   useLocation,
@@ -32,13 +31,38 @@ import { bookmarkIn, scopeOf } from "../../lib/timelineScope.ts";
 import { api, ApiError } from "../../lib/api.ts";
 import { PrefetchLink } from "../../components/PrefetchLink.tsx";
 import { railClass } from "../../components/Rail.tsx";
-import { useViewer } from "../../lib/session.ts";
+import { accessEpoch, useViewer } from "../../lib/session.ts";
 import { LinkedText } from "../../refs/RefLink.tsx";
 import { useRefMarkdown } from "../../refs/remark.tsx";
-import { CommitInfo, HistoryProgress, countLabel, useHistory } from "./History.tsx";
-import { About } from "./About.tsx";
+import { CommitInfo, HistoryProgress, folderHistoryLabel, useHistory } from "./History.tsx";
+import { AboutRail } from "./About.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
+
+/** Tracker summaries still on their way, by request and identity (lib/session.ts). */
+const summaries = new Map<string, Promise<RepoIssueSummary | null>>();
+
+/**
+ * The repository's ready count, read live (never cached once answered), but a
+ * navigation that finds one still on its way, from folder to folder, shares
+ * it. So it belongs to no one navigation's abort signal.
+ */
+function issueSummary(
+  space: string,
+  name: string,
+  timeline: string,
+): Promise<RepoIssueSummary | null> {
+  const path = `/repos/${encodeURIComponent(space)}/${encodeURIComponent(name)}/tracker/summary?${new URLSearchParams({ timeline })}`;
+  const key = `${accessEpoch()} ${path}`;
+  const pending = summaries.get(key);
+  if (pending) return pending;
+  const read = api<RepoIssueSummary>(path).catch(() => null);
+  summaries.set(key, read);
+  void read.then(() => {
+    if (summaries.get(key) === read) summaries.delete(key);
+  });
+  return read;
+}
 
 export async function codeLoader({ request, params }: LoaderFunctionArgs) {
   const space = params.space ?? "";
@@ -48,10 +72,25 @@ export async function codeLoader({ request, params }: LoaderFunctionArgs) {
   // In a timeline's scope (?tl=) the repository opens on the timeline's
   // bookmark when it has one; a path that names a branch keeps it.
   const scope = at ? null : scopeOf(new URL(request.url).search);
-  // Otherwise the tree and the repo detail load in parallel; the server splits
-  // the branch from the path, so neither waits for the other. The detail is
-  // the layout's own request (?metadata=1), so the page reads it once.
   const detailRead = repoData.detail(space, name, source, true);
+  // The About rail is extra: it streams in beside the files and never holds
+  // them up, so its reads start now, beside the detail and the tree, rather
+  // than after them (a cold Tracker can take over a second). Each part shows
+  // when it arrives and is dropped (null) when it fails. Knowledge and CI
+  // reads are cached; readiness is read live. `access` is the identity the
+  // reads were made for (lib/session.ts), so the rail keys on it.
+  const rail = {
+    access: accessEpoch(),
+    knowledge:
+      source && source !== "canonical"
+        ? Promise.resolve(null)
+        : repoData.graphNode(space, name, "repo").catch(() => null),
+    ci: repoData.ciRuns(space, name, source).catch(() => null),
+    issues: issueSummary(space, name, scopeOf(new URL(request.url).search) ?? "main"),
+  };
+  // The tree and the repo detail load in parallel; the server splits the
+  // branch from the path, so neither waits for the other. The detail is the
+  // layout's own request (?metadata=1), so the page reads it once.
   const [repo, tree] = await Promise.all([
     routeData(detailRead),
     (scope
@@ -72,23 +111,11 @@ export async function codeLoader({ request, params }: LoaderFunctionArgs) {
       .catch((error: unknown) => error),
   ]);
   requireLiveSource(repo);
-  if (!repo.head || repo.state !== "ready") return { tree: null, about: null };
+  if (!repo.head || repo.state !== "ready") return { tree: null, rail: null };
   if (tree instanceof Error || !tree) {
-    return { tree: await routeData(Promise.reject(tree)), about: null };
+    return { tree: await routeData(Promise.reject(tree)), rail: null };
   }
-  // The About rail is extra: it streams in beside the files and never holds
-  // them up. Knowledge and CI reads are cached; readiness is read live.
-  const about = Promise.all([
-    source && source !== "canonical"
-      ? Promise.resolve(null)
-      : repoData.graphNode(space, name, "repo").catch(() => null),
-    repoData.ciRuns(space, name, source).catch(() => null),
-    api<RepoIssueSummary>(
-      `/repos/${encodeURIComponent(space)}/${encodeURIComponent(name)}/tracker/summary?${new URLSearchParams({ timeline: scopeOf(new URL(request.url).search) ?? "main" })}`,
-      { signal: request.signal },
-    ).catch(() => null),
-  ]).then(([knowledge, ci, issues]) => ({ knowledge, ci, issues }));
-  return { tree: tree as TreeResponse, about };
+  return { tree: tree as TreeResponse, rail };
 }
 
 const ICONS = {
@@ -310,7 +337,7 @@ function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
             repo.source?.sourceId,
           )}
         >
-          {history ? countLabel(history.commits.length, !!history.next) : "History"}
+          {folderHistoryLabel(history)}
         </Link>
       </div>
       <ul className="m-0 list-none divide-y divide-line-soft p-0">
@@ -391,7 +418,7 @@ function EmptyRepo({ repo }: { repo: RepoDetail }) {
 }
 
 export function Code() {
-  const { tree, about } = useLoaderData<typeof codeLoader>();
+  const { tree, rail } = useLoaderData<typeof codeLoader>();
   const repo = useRepo();
   const navigate = useNavigate();
   const { search } = useLocation();
@@ -438,15 +465,14 @@ export function Code() {
         )}
       </div>
       <aside aria-label="About this repository" className={`hidden xl:block ${railClass}`}>
-        {/* Never reuse a resolved private count while a different repository or scope loads. */}
-        <Suspense
-          key={`${repo.id}:${repo.source?.sourceId ?? "canonical"}:${scopeOf(search) ?? "main"}`}
-          fallback={null}
-        >
-          <Await resolve={about} errorElement={null}>
-            {(data: Awaited<NonNullable<typeof about>>) => <About repo={repo} {...data} />}
-          </Await>
-        </Suspense>
+        {/* Never reuse a resolved private count while a different identity, repository or scope loads. */}
+        {rail && (
+          <AboutRail
+            key={`${rail.access}:${repo.id}:${repo.source?.sourceId ?? "canonical"}:${scopeOf(search) ?? "main"}`}
+            repo={repo}
+            reads={rail}
+          />
+        )}
       </aside>
     </div>
   );

@@ -14,7 +14,8 @@
 // - post-open: once write admission is open, for anything that landed between.
 //
 // A divergence is journaled before its repair, then logged with no known
-// pusher. Push effects (CI, mirror, knowledge, release notes, timeline activity,
+// pusher, and the repository's refs generation is bumped so no reader is
+// served refs cached before the write (objects.ts). Push effects (CI, mirror, knowledge, release notes, timeline activity,
 // mentions) are new-epoch work, so they replay only after admission opens,
 // initiated by a current human session, from the journaled updates themselves.
 // A replay that cannot run (no write access in its Space, a failed delivery) is
@@ -59,6 +60,7 @@ import {
 } from "./control.ts";
 import { migrationContext } from "./engine.ts";
 import { migrationDatabase } from "./storage-fence.ts";
+import { invalidateRefs } from "../objects.ts";
 
 /** Pending effect replays per request: each runs its push's whole effect set. */
 const REPLAYS_PER_STEP = 4;
@@ -220,6 +222,12 @@ export async function advanceRefReconciliation(
       changes,
     });
     await recordObservedRefs(env, writer, repo, tips);
+    // The write behind this divergence moved refs without a refs generation
+    // bump (its own was fenced, or never ran), so readers could still be served
+    // refs cached before it for up to a day (objects.ts). Bump it now, through
+    // the same writer: under the fence only the run's authority may write, and
+    // a bump that fails is logged by invalidateRefs, leaving the age bound.
+    await invalidateRefs(writer, target.artifactsName);
     if (stage === "post-open") await control.clearRefDeferral(runId, target);
   }
   const last = targets.at(-1);

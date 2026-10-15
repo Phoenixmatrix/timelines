@@ -608,14 +608,18 @@ repos.get("/:space/:name/history", async (c) => {
     }
     if (!head || !(await objects.commit(head)))
       return fail(c, 404, `No branch, tag or commit named ${ref}.`);
-    const history = await readHistory(
+    // cover=1 (CORE-451): one answer holds every entry's last change, where
+    // the budget allows, rather than a page the client pages on from.
+    const { stopped, ...history } = await readHistory(
       objects,
       head,
       path,
       c.req.query("entries") === "true",
       cursor,
+      { cover: c.req.query("cover") === "1" },
     );
-    cacheIfImmutable(c, ref);
+    // An answer cut short by time or missing objects may differ next time.
+    if (!stopped) cacheIfImmutable(c, ref);
     return c.json({ ...history, source: loaded.source, ref });
   } finally {
     await objects.close();

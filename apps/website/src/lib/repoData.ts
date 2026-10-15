@@ -192,6 +192,7 @@ export const repoData = {
     cached<CommitsResponse>(
       sourceUrl(`${base(space, name)}/commits?at=${encodeURIComponent(at)}&page=${page}`, source),
     ),
+  /** With entries, a cover read (CORE-451): the server walks on until every entry has its last change. */
   history: (
     space: string,
     name: string,
@@ -202,7 +203,7 @@ export const repoData = {
   ) =>
     cached<HistoryPage>(
       sourceUrl(
-        `${base(space, name)}/history?at=${encodeURIComponent(at)}&entries=${entries}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+        `${base(space, name)}/history?at=${encodeURIComponent(at)}&entries=${entries}${entries ? "&cover=1" : ""}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
         source,
       ),
     ),

@@ -137,7 +137,14 @@ async function fixture() {
       credential: { kind: "token", id: credential.id },
     };
   };
-  return { ...h, run, remote, operator, log, logged, updateId, person };
+  /** The repository's refs generation (objects.ts): what readers' cached refs are keyed by. */
+  const generation = () =>
+    (
+      h.sqlite.prepare("SELECT refs_generation AS g FROM repos WHERE id='repo'").get() as {
+        g: number;
+      }
+    ).g;
+  return { ...h, run, remote, operator, log, logged, updateId, person, generation };
 }
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
@@ -212,6 +219,8 @@ describe("Artifacts ref barrier instead of a provider drain", () => {
     await expect(advanceRefReconciliation(h.env, h.run.runId)).rejects.toThrow("acknowledgement");
     lost.mockRestore();
     expect(h.logged()).toBe(oid(2));
+    // The repair bumps the refs generation under the fence, through the run's authority.
+    expect(h.generation()).toBe(1);
     expect(h.log()).toEqual([
       { ref: "refs/heads/main", old_oid: oid(1), new_oid: oid(2), actor_id: null },
     ]);
@@ -222,6 +231,7 @@ describe("Artifacts ref barrier instead of a provider drain", () => {
 
     // The retried page finds nothing new, but its pass still saw the divergence.
     let status = await advanceRefReconciliation(h.env, h.run.runId);
+    expect(h.generation()).toBe(1);
     expect(status.stages.fenced.latest).toMatchObject({ complete: true, divergent: 1 });
     expect(status.stages.fenced.clean).toBe(false);
     expect(status.pendingReplays).toBe(1);
@@ -278,6 +288,7 @@ describe("Artifacts ref barrier instead of a provider drain", () => {
       latest: { phase: "reconciled", complete: true, divergent: 1 },
     });
     expect(h.logged()).toBe(oid(3));
+    expect(h.generation()).toBe(1);
     await expect(h.control.openWriteAdmission(h.run.runId)).rejects.toThrow(
       "Artifacts refs must reconcile",
     );
@@ -298,6 +309,7 @@ describe("Artifacts ref barrier instead of a provider drain", () => {
       latest: { phase: "active", complete: true, divergent: 0, deferred: 1 },
     });
     expect(h.logged()).toBe(oid(3));
+    expect(h.generation()).toBe(1);
 
     // The migration-time divergence replays for a person, from its journaled entry.
     status = await advanceRefReconciliation(h.env, h.run.runId, { actor: h.operator });
@@ -339,6 +351,8 @@ describe("Artifacts ref barrier instead of a provider drain", () => {
     });
     expect(status.pendingReplays).toBe(1);
     expect(h.logged()).toBe(oid(4));
+    // A deferred divergence bumps nothing; its repair after opening does.
+    expect(h.generation()).toBe(2);
     status = await advanceRefReconciliation(h.env, h.run.runId, { actor: h.operator });
     expect(afterReplayedPush).toHaveBeenCalledTimes(2);
     expect(vi.mocked(afterReplayedPush).mock.calls[1]![4]).toEqual([

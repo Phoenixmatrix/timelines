@@ -51,7 +51,8 @@ export function useHistory(
   const [error, setError] = useState(false);
   const withEntries = entries !== undefined;
   // Resolve the whole directory with shared, bounded history pages, not one
-  // walk per row. Stop as soon as every visible entry has its newest change.
+  // walk per row. Stop as soon as every visible entry has its newest change:
+  // usually after the first, which the server extends until then (cover).
   const next = history?.next;
   const seeking = !!next && entries?.some((entry) => !Object.hasOwn(history!.entries, entry.path));
   useEffect(() => {
@@ -108,6 +109,14 @@ export function useHistory(
   };
 }
 export type HistoryState = ReturnType<typeof useHistory>;
+/**
+ * A folder's history link: its commit count only once the history is complete.
+ * A cover answer stops where the last entry's change is found (CORE-451), so a
+ * partial count says nothing about the folder ("1+ commits").
+ */
+export function folderHistoryLabel(history: HistoryPage | null) {
+  return history && !history.next ? countLabel(history.commits.length, false) : "History";
+}
 export function countLabel(count: number, incomplete: boolean) {
   return `${count}${incomplete ? "+" : ""} ${count === 1 && !incomplete ? "commit" : "commits"}`;
 }

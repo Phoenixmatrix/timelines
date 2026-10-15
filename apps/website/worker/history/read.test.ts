@@ -1,5 +1,17 @@
+import { createHash } from "node:crypto";
 import { describe, expect, test } from "vite-plus/test";
-import { HISTORY_PAGE_SIZE, readHistory } from "./read.ts";
+import type { HistoryPage } from "../../shared/api.ts";
+import {
+  CHANGES,
+  CHUNK,
+  COVER_PAGES,
+  commitSummary,
+  derivedId,
+  HISTORY_PAGE_SIZE,
+  LAST_CHANGES,
+  readHistory,
+  type HistoryRead,
+} from "./read.ts";
 
 const author = { name: "Dev", email: "dev@example.test" };
 const file = (name: string, hash: string, mode = "100644"): ArtifactsTreeEntry => ({
@@ -26,6 +38,13 @@ function fixture(trees: Record<string, ArtifactsTreeEntry[]>, roots: string[]) {
     parents: n ? [`c${n - 1}`] : [],
   }));
   let reads = 0;
+  // The derived-data caches, serialized as the Cache API would.
+  const derived = new Map<string, string>();
+  const stores: string[] = [];
+  const recall = <T>(kind: string, id: string): T | undefined => {
+    const value = derived.get(`${kind}/${id}`);
+    return value === undefined ? undefined : (JSON.parse(value) as T);
+  };
   const reader = {
     async commit(oid: string) {
       return commits.find((c) => c.hash === oid) ?? null;
@@ -37,26 +56,23 @@ function fixture(trees: Record<string, ArtifactsTreeEntry[]>, roots: string[]) {
         .reverse()
         .slice(offset, offset + limit);
     },
-    async tree(oid: string) {
+    async peekTree(_oid: string): Promise<ArtifactsTreeEntry[] | undefined> {
+      return undefined;
+    },
+    async fetchTree(oid: string) {
       reads++;
       return trees[oid] ?? null;
     },
-    async treeAt(root: string, path: string): Promise<string | null> {
-      if (!path) return root;
-      const entry = await reader.entryAt(root, path);
-      return entry?.type === "tree" ? entry.hash : null;
+    async peekDerived<T>(kind: string, id: string) {
+      return recall<T>(kind, id);
     },
-    async entryAt(root: string, path: string): Promise<ArtifactsTreeEntry | null> {
-      const [name, ...rest] = path.split("/");
-      const entry = trees[root]?.find((e) => e.name === name) ?? null;
-      return rest.length
-        ? entry?.type === "tree"
-          ? reader.entryAt(entry.hash, rest.join("/"))
-          : null
-        : entry;
+    recallDerived: recall,
+    storeDerived(kind: string, id: string, value: unknown) {
+      stores.push(`${kind}/${id}`);
+      derived.set(`${kind}/${id}`, JSON.stringify(value));
     },
   };
-  return { reader, commits, reads: () => reads };
+  return { reader, commits, reads: () => reads, derived, stores };
 }
 
 describe("repository file history", () => {
@@ -147,5 +163,490 @@ describe("repository file history", () => {
     await expect(readHistory(reader, "c0", "file", false)).rejects.toThrow(
       "parent commit is unavailable",
     );
+  });
+});
+
+// A history of whole trees from flat path specs, content-addressed as Git is.
+interface Spec {
+  mode: string;
+  content: string;
+}
+/** Path to file; a Map, since `__proto__` is one of the names. */
+type Files = Map<string, Spec>;
+const typeOf = (mode: string): ArtifactsTreeEntry["type"] =>
+  mode === "100755" ? "exec" : mode === "120000" ? "symlink" : "blob";
+function history(states: Files[]) {
+  const trees: Record<string, ArtifactsTreeEntry[]> = {};
+  const write = (files: Files): string => {
+    const here = new Map<string, Files | Spec>();
+    for (const [path, spec] of files) {
+      const [first, ...rest] = path.split("/");
+      if (!rest.length) here.set(first!, spec);
+      else {
+        const sub = (here.get(first!) as Files | undefined) ?? new Map<string, Spec>();
+        sub.set(rest.join("/"), spec);
+        here.set(first!, sub);
+      }
+    }
+    const entries = [...here]
+      .sort(([a], [b]) => (a < b ? -1 : 1))
+      .map(([name, value]): ArtifactsTreeEntry => {
+        if (value instanceof Map) return { name, mode: "040000", hash: write(value), type: "tree" };
+        return { name, mode: value.mode, hash: `b-${value.content}`, type: typeOf(value.mode) };
+      });
+    const hash = createHash("sha1").update(JSON.stringify(entries)).digest("hex");
+    trees[hash] = entries;
+    return hash;
+  };
+  const roots = states.map(write);
+  return { trees, roots };
+}
+
+/** Every commit's changes at a path worked out naively, and the cover answer from them. */
+function reference(
+  trees: Record<string, ArtifactsTreeEntry[]>,
+  commits: ArtifactsCommitMetadata[],
+  path: string,
+) {
+  const at = (root: string) => {
+    let entries = trees[root] ?? [];
+    let entry: ArtifactsTreeEntry | null = { name: "", mode: "040000", hash: root, type: "tree" };
+    for (const segment of path ? path.split("/") : []) {
+      entry = entry?.type === "tree" ? (entries.find((e) => e.name === segment) ?? null) : null;
+      entries = entry?.type === "tree" ? (trees[entry.hash] ?? []) : [];
+    }
+    return {
+      identity: entry ? `${entry.type}:${entry.mode}:${entry.hash}` : null,
+      children: new Map(
+        (entry?.type === "tree" ? entries : []).map((e) => [
+          e.name,
+          `${e.type}:${e.mode}:${e.hash}`,
+        ]),
+      ),
+    };
+  };
+  const change = (i: number) => {
+    const after = at(commits[i]!.treeHash);
+    const before = i ? at(commits[i - 1]!.treeHash) : { identity: null, children: new Map() };
+    const names = new Set(
+      [...after.children.keys(), ...before.children.keys()].filter(
+        (name) => after.children.get(name) !== before.children.get(name),
+      ),
+    );
+    return { changed: !path || after.identity !== before.identity, names };
+  };
+  return (head: number) => {
+    const names = new Set(at(commits[head]!.treeHash).children.keys());
+    const unresolved = new Set(names);
+    let self = false;
+    const result: Omit<HistoryPage, "ref"> = {
+      head: commits[head]!.hash,
+      path,
+      scanned: 0,
+      next: null,
+      commits: [],
+      entries: {},
+    };
+    for (let i = head; i >= 0; i--) {
+      const { changed, names: changedNames } = change(i);
+      const commit = commitSummary(commits[i]!);
+      result.scanned++;
+      if (changed) result.commits.push(commit);
+      for (const name of changedNames) {
+        if (!names.has(name)) continue;
+        const key = path ? `${path}/${name}` : name;
+        const previous = Object.hasOwn(result.entries, key) ? result.entries[key] : undefined;
+        Object.defineProperty(result.entries, key, {
+          value: { latest: previous?.latest ?? commit, count: (previous?.count ?? 0) + 1 },
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+        unresolved.delete(name);
+      }
+      self ||= changed;
+      if (!unresolved.size && self) {
+        result.next = i ? commits[i - 1]!.hash : null;
+        break;
+      }
+    }
+    return plain(result);
+  };
+}
+
+/** What the client receives: JSON, with the server-only flag aside. */
+const plain = (page: Omit<HistoryPage, "ref"> | HistoryRead) => {
+  const { stopped: _stopped, ...rest } = page as HistoryRead;
+  return JSON.parse(JSON.stringify(rest)) as Omit<HistoryPage, "ref">;
+};
+
+/** The client's merge of consecutive pages (History.tsx mergeHistory). */
+function merge(previous: Omit<HistoryPage, "ref"> | null, page: Omit<HistoryPage, "ref">) {
+  if (!previous) return plain(page);
+  const entries = JSON.parse(JSON.stringify(previous.entries)) as HistoryPage["entries"];
+  for (const [key, entry] of Object.entries(plain(page).entries)) {
+    const old = Object.hasOwn(entries, key) ? entries[key] : undefined;
+    Object.defineProperty(entries, key, {
+      value: { latest: old?.latest ?? entry.latest, count: (old?.count ?? 0) + entry.count },
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return plain({
+    ...page,
+    scanned: previous.scanned + page.scanned,
+    commits: [...previous.commits, ...page.commits],
+    entries,
+  });
+}
+
+type Reader = ReturnType<typeof fixture>["reader"];
+async function plainPages(reader: Reader, head: string, path: string, cursor: string | null) {
+  let merged: Omit<HistoryPage, "ref"> | null = null;
+  for (let next = cursor; next;) {
+    const page = await readHistory(reader, head, path, true, next);
+    merged = merge(merged, page);
+    next = page.next;
+  }
+  return merged;
+}
+
+/** A seeded generator, so a failure names the history that caused it. */
+function random(seed: number) {
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const PATHS = [
+  "readme",
+  "__proto__",
+  "constructor",
+  "src/a",
+  "src/b",
+  "src/lib",
+  "src/lib/x",
+  "src/lib/y",
+  "docs",
+  "docs/guide",
+  "tool",
+];
+/** Random edits: content changes that sometimes restore an old one, chmod, symlinks,
+ * deletion, and files that become folders and back. LICENSE never changes after
+ * the first commit, so the root's answer always reaches it; the rare files make
+ * the folders' answers reach far back, but not that far. */
+function randomStates(seed: number, length: number): Files[] {
+  const next = random(seed);
+  const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
+  let files: Files = new Map([
+    ["LICENSE", { mode: "100644", content: "mit" }],
+    ["src/rare", { mode: "100644", content: "0" }],
+    ["src/lib/rare", { mode: "100644", content: "0" }],
+  ]);
+  const states: Files[] = [];
+  const put = (path: string, spec: Spec) => {
+    for (const other of files.keys())
+      if (other.startsWith(`${path}/`) || path.startsWith(`${other}/`)) files.delete(other);
+    files.set(path, spec);
+  };
+  for (let n = 0; n < length; n++) {
+    files = new Map(files);
+    for (const rare of ["src/rare", "src/lib/rare"])
+      if (next() < 0.008) put(rare, { mode: "100644", content: String(n) });
+    const edits = next() < 0.15 ? 0 : 1 + Math.floor(next() * 2);
+    for (let e = 0; e < edits; e++) {
+      const path = pick(PATHS);
+      const old = files.get(path);
+      const roll = next();
+      if (roll < 0.25) files.delete(path);
+      else
+        put(
+          path,
+          roll < 0.4 && old
+            ? { ...old, mode: old.mode === "100644" ? "100755" : "100644" }
+            : roll < 0.5
+              ? { mode: "120000", content: pick(["a", "b"]) }
+              : { mode: "100644", content: pick(["1", "2", "3"]) },
+        );
+    }
+    states.push(files);
+  }
+  return states;
+}
+
+describe("a directory's last changes in one request (CORE-451)", () => {
+  const LENGTH = 330;
+  for (const seed of [1, 2, 3, 4, 5, 6]) {
+    test(`equal the full walk, paged or merged from a stored base (history ${seed})`, async () => {
+      const { trees, roots } = history(randomStates(seed, LENGTH));
+      const head = LENGTH - 1;
+      for (const path of ["", "src", "src/lib", "docs", "absent"]) {
+        const f = fixture(trees, roots);
+        const expected = reference(trees, f.commits, path);
+        const cover = await readHistory(f.reader, `c${head}`, path, true, `c${head}`, {
+          cover: true,
+        });
+        expect(plain(cover), `path "${path}"`).toEqual(expected(head));
+        expect(cover.stopped).toBeUndefined();
+        expect(f.derived.has(`${LAST_CHANGES}/${derivedId(`c${head}`, path)}`)).toBe(true);
+        // A stored answer reads back the same.
+        f.stores.length = 0;
+        expect(
+          plain(await readHistory(f.reader, `c${head}`, path, true, `c${head}`, { cover: true })),
+        ).toEqual(expected(head));
+        expect(f.stores).toEqual([]);
+        // Paging on from the cover answer adds up to paging from the head.
+        const paged = await plainPages(f.reader, `c${head}`, path, `c${head}`);
+        expect(
+          merge(
+            plain(cover),
+            (await plainPages(f.reader, `c${head}`, path, cover.next)) ?? {
+              ...plain(cover),
+              scanned: 0,
+              commits: [],
+              entries: {},
+            },
+          ),
+        ).toEqual(paged);
+
+        // 101: the first commit of the walk's second chunk.
+        for (const distance of [1, 2, 7, 31, 40, 101, 150]) {
+          const g = fixture(trees, roots);
+          const base = head - distance;
+          await readHistory(g.reader, `c${base}`, path, true, `c${base}`, { cover: true });
+          expect(g.derived.has(`${LAST_CHANGES}/${derivedId(`c${base}`, path)}`)).toBe(true);
+          for (const key of g.derived.keys())
+            if (key.startsWith(`${CHANGES}/`)) g.derived.delete(key);
+          g.stores.length = 0;
+          const merged = await readHistory(g.reader, `c${head}`, path, true, `c${head}`, {
+            cover: true,
+          });
+          expect(plain(merged), `path "${path}", base ${distance} back`).toEqual(expected(head));
+          // It walked no further than the base.
+          expect(
+            g.stores.filter((key) => key.startsWith(`${CHANGES}/`)).length,
+          ).toBeLessThanOrEqual(distance);
+          expect(g.derived.has(`${LAST_CHANGES}/${derivedId(`c${head}`, path)}`)).toBe(true);
+          // And what it stored serves a later head too.
+          g.stores.length = 0;
+          expect(
+            plain(await readHistory(g.reader, `c${head}`, path, true, `c${head}`, { cover: true })),
+          ).toEqual(expected(head));
+        }
+
+        // A base its budget cut short: the head takes its range, then walks on from its `next`.
+        for (const distance of [1, 7, 40, 101]) {
+          const g = fixture(trees, roots);
+          const base = head - distance;
+          const partial = await readHistory(g.reader, `c${base}`, path, true, `c${base}`, {
+            cover: true,
+            budget: 15,
+          });
+          expect(partial.stopped).toBeUndefined();
+          expect(g.derived.has(`${LAST_CHANGES}/${derivedId(`c${base}`, path)}`)).toBe(true);
+          // Without the kept change sets, only the base's answer can stand in for its range.
+          for (const key of g.derived.keys())
+            if (key.startsWith(`${CHANGES}/`)) g.derived.delete(key);
+          g.stores.length = 0;
+          const merged = await readHistory(g.reader, `c${head}`, path, true, `c${head}`, {
+            cover: true,
+          });
+          expect(plain(merged), `path "${path}", cut base ${distance} back`).toEqual(
+            expected(head),
+          );
+          // It worked out no commit in the base's range: it took the range whole.
+          const worked = g.stores.filter((key) => key.startsWith(`${CHANGES}/`));
+          for (let at = 0; at < partial.scanned; at++)
+            expect(worked).not.toContain(`${CHANGES}/${derivedId(`c${base - at}`, path)}`);
+        }
+      }
+    });
+  }
+
+  test("keys keep paths apart, dot segments included", () => {
+    const key = (path: string) =>
+      new URL(`https://objects.test/repo/${CHANGES}/${derivedId("c1", path)}`).pathname;
+    expect(new Set(["", ".", "..", "a/..", "a%2F"].map(key)).size).toBe(5);
+    expect(key("..")).toBe(`/repo/${CHANGES}/v2/c1/p=..`);
+  });
+
+  test("a long walk holds only one chunk's trees at a time", async () => {
+    const { trees, roots } = history(
+      Array.from(
+        { length: 1000 },
+        (_, n) =>
+          new Map([
+            ["LICENSE", { mode: "100644", content: "mit" }],
+            ["counter", { mode: "100644", content: String(n) }],
+          ]),
+      ),
+    );
+    const g = fixture(trees, roots);
+    const held: number[] = [];
+    const answer = await readHistory(g.reader, "c999", "", true, "c999", {
+      cover: true,
+      trace: (size) => held.push(size),
+    });
+    expect(answer).toMatchObject({ scanned: 1000, next: null });
+    expect(held.length).toBeGreaterThanOrEqual(5);
+    expect(Math.max(...held)).toBeLessThanOrEqual(CHUNK + 2);
+  });
+
+  test("a missing tree ends a cover answer above it, unkept; plain pages fail", async () => {
+    const { trees, roots } = history(
+      Array.from(
+        { length: 20 },
+        (_, n) =>
+          new Map([
+            ["LICENSE", { mode: "100644", content: "mit" }],
+            ["counter", { mode: "100644", content: String(n) }],
+          ]),
+      ),
+    );
+    delete trees[roots[10]!];
+    const g = fixture(trees, roots);
+    // c11 can't be compared with c10, whose tree is gone.
+    const first = await readHistory(g.reader, "c19", "", true, "c19", { cover: true });
+    expect(first).toMatchObject({ stopped: true, scanned: 8, next: "c11" });
+    expect([...g.derived.keys()].filter((key) => key.startsWith(`${LAST_CHANGES}/`))).toEqual([]);
+    await expect(readHistory(g.reader, "c19", "", true)).rejects.toThrow("a tree is unavailable");
+
+    // A tree missing on the way to a nested path.
+    const nested = history(
+      Array.from(
+        { length: 20 },
+        (_, n) =>
+          new Map([
+            ["src/lib/stale", { mode: "100644", content: "0" }],
+            ["src/lib/counter", { mode: "100644", content: String(n) }],
+          ]),
+      ),
+    );
+    const src = nested.trees[nested.roots[10]!]!.find((entry) => entry.name === "src")!.hash;
+    delete nested.trees[src];
+    const h = fixture(nested.trees, nested.roots);
+    expect(
+      await readHistory(h.reader, "c19", "src/lib", true, "c19", { cover: true, budget: 20 }),
+    ).toMatchObject({ stopped: true, scanned: 8, next: "c11" });
+    await expect(readHistory(h.reader, "c19", "src/lib", false)).rejects.toThrow(
+      "a tree is unavailable",
+    );
+  });
+
+  test("a name missing at the base keeps its older changes; special names survive storage", async () => {
+    const f = (content: string, mode = "100644") => ({ mode, content });
+    const { trees, roots } = history(
+      [
+        { LICENSE: f("mit"), keep: f("1"), gone: f("g"), other: f("p") },
+        { LICENSE: f("mit"), keep: f("1"), other: f("p") },
+        { LICENSE: f("mit"), keep: f("1"), other: f("q") },
+        { LICENSE: f("mit"), keep: f("1"), gone: f("g"), fresh: f("n"), other: f("q") },
+        { LICENSE: f("mit"), keep: f("1", "100755"), gone: f("g"), fresh: f("n"), other: f("q") },
+      ].map((files) => new Map(Object.entries(files))),
+    );
+    const g = fixture(trees, roots);
+    const expected = reference(trees, g.commits, "")(4);
+    await readHistory(g.reader, "c2", "", true, "c2", { cover: true });
+    const merged = await readHistory(g.reader, "c4", "", true, "c4", { cover: true });
+    expect(plain(merged)).toEqual(expected);
+    expect(merged.entries.gone).toMatchObject({ count: 3, latest: { oid: "c3" } });
+    expect(merged.entries.keep).toMatchObject({ count: 2, latest: { oid: "c4" } });
+    // `__proto__` itself, through the stored answer.
+    const special = fixture(
+      { a: [file("__proto__", "1"), file("constructor", "2")] },
+      Array(5).fill("a"),
+    );
+    await readHistory(special.reader, "c3", "", true, "c3", { cover: true });
+    const fromStored = await readHistory(special.reader, "c4", "", true, "c4", { cover: true });
+    expect(JSON.parse(JSON.stringify(fromStored.entries)).__proto__).toMatchObject({ count: 1 });
+    expect(fromStored.entries.constructor).toMatchObject({ count: 1, latest: { oid: "c0" } });
+  });
+
+  test("a missing parent cuts a cover answer short there, stores nothing, and fails the next", async () => {
+    const { trees, roots } = history(randomStates(9, 20));
+    const g = fixture(trees, roots);
+    g.commits[10]!.parents = ["missing"];
+    const first = await readHistory(g.reader, "c19", "", true, "c19", { cover: true });
+    // c10 can't be compared with its parent: the answer ends above it.
+    expect(first).toMatchObject({ stopped: true, scanned: 9, next: "c10" });
+    const intact = fixture(trees, roots);
+    const sameRange = { cover: true, budget: 9 };
+    expect(plain(first)).toEqual(
+      plain(await readHistory(intact.reader, "c19", "", true, "c19", sameRange)),
+    );
+    expect([...g.derived.keys()].filter((key) => key.startsWith(`${LAST_CHANGES}/`))).toEqual([]);
+    await expect(readHistory(g.reader, "c19", "", true, "c10", { cover: true })).rejects.toThrow(
+      "parent commit is unavailable",
+    );
+    await expect(readHistory(g.reader, "c19", "", true)).rejects.toThrow(
+      "parent commit is unavailable",
+    );
+  });
+
+  test("from a cursor, a cover request still loads at least a page", async () => {
+    const { trees, roots } = history(randomStates(6, 330));
+    const g = fixture(trees, roots);
+    let cursor = (await readHistory(g.reader, "c329", "src", true, "c329", { cover: true })).next;
+    expect(cursor).not.toBeNull();
+    while (cursor) {
+      const left = Number(cursor.slice(1)) + 1;
+      const page = await readHistory(g.reader, "c329", "src", true, cursor, { cover: true });
+      expect(page.scanned).toBeGreaterThanOrEqual(Math.min(HISTORY_PAGE_SIZE, left));
+      cursor = page.next;
+    }
+  });
+
+  test("a budget-cut answer is exact, kept and reused; pages on from it are kept too", async () => {
+    const { trees, roots } = history(randomStates(5, 150));
+    const g = fixture(trees, roots);
+    const options = { cover: true, budget: 10 };
+    const first = await readHistory(g.reader, "c149", "", true, "c149", options);
+    expect(first).toMatchObject({ scanned: 10, next: "c139" });
+    expect(first.stopped).toBeUndefined();
+    expect(g.derived.has(`${LAST_CHANGES}/${derivedId("c149", "")}`)).toBe(true);
+    const pageOn = async () => {
+      let merged = plain(await readHistory(g.reader, "c149", "", true, "c149", options));
+      for (let next = merged.next; next;) {
+        const page = await readHistory(g.reader, "c149", "", true, next, options);
+        expect(page.stopped).toBeUndefined();
+        merged = merge(merged, page);
+        next = page.next;
+      }
+      return merged;
+    };
+    expect(await pageOn()).toEqual(reference(trees, g.commits, "")(149));
+    expect([...g.derived.keys()].some((key) => key.startsWith(`${COVER_PAGES}/`))).toBe(true);
+    // The same requests again: every answer comes back kept, nothing is worked out.
+    g.stores.length = 0;
+    expect(await pageOn()).toEqual(reference(trees, g.commits, "")(149));
+    expect(g.stores).toEqual([]);
+  });
+
+  test("a safety stop answers what it has, unkept, and paging on still adds up", async () => {
+    const { trees, roots } = history(randomStates(5, 150));
+    const g = fixture(trees, roots);
+    let clock = 0;
+    const first = await readHistory(g.reader, "c149", "", true, "c149", {
+      cover: true,
+      safetyMs: 500,
+      now: () => (clock += 1000),
+    });
+    expect(first).toMatchObject({ stopped: true, scanned: HISTORY_PAGE_SIZE + 1 });
+    expect(
+      [...g.derived.keys()].filter(
+        (key) => key.startsWith(`${LAST_CHANGES}/`) || key.startsWith(`${COVER_PAGES}/`),
+      ),
+    ).toEqual([]);
+    let merged = plain(first);
+    for (let next = first.next; next;) {
+      const page = await readHistory(g.reader, "c149", "", true, next, { cover: true });
+      merged = merge(merged, page);
+      next = page.next;
+    }
+    expect(merged).toEqual(reference(trees, g.commits, "")(149));
   });
 });

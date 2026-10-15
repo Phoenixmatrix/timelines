@@ -11,6 +11,8 @@ import { repoLoader } from "./RepoLayout.tsx";
 const HEAD = "0123456789abcdef0123456789abcdef01234567";
 let reads: string[] = [];
 let expired = false;
+/** Paths whose answer waits until the test releases it. */
+let held = new Map<string, Promise<void>>();
 
 function detail() {
   return {
@@ -50,11 +52,13 @@ beforeEach(() => {
   forgetAllRepoData();
   reads = [];
   expired = false;
+  held = new Map();
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: string) => {
       reads.push(input);
       const path = new URL(input, "https://gitmatrix.test").pathname;
+      await held.get(path);
       const json = (body: unknown, status = 200) =>
         new Response(JSON.stringify(body), {
           status,
@@ -104,6 +108,51 @@ test("the layout and the history page share one detail request in a timeline's s
   ]);
   expect(history).toMatchObject({ ref: "timeline/feature" });
   expect(detailReads()).toEqual(["/api/repos/orbit/demo?metadata=1&source=canonical"]);
+});
+
+test("the About rail's reads start beside the tree, and none of them holds up the page", async () => {
+  const hold = (path: string) => {
+    let release!: () => void;
+    held.set(path, new Promise<void>((resolve) => (release = resolve)));
+    return release;
+  };
+  const releaseTree = hold("/api/repos/orbit/demo/tree");
+  const releaseSummary = hold("/api/repos/orbit/demo/tracker/summary");
+  try {
+    const loading = codeLoader(args("/orbit/demo?tl=main"));
+    let loaded = false;
+    void loading.then(() => (loaded = true));
+    // With the tree still on its way, every rail read has already been asked for.
+    await vi.waitFor(() => {
+      const paths = reads.map((input) => new URL(input, "https://gitmatrix.test"));
+      expect(paths.map((url) => url.pathname)).toEqual(
+        expect.arrayContaining([
+          "/api/repos/orbit/demo/tree",
+          "/api/repos/orbit/demo/knowledge/graph/node",
+          "/api/repos/orbit/demo/ci",
+          "/api/repos/orbit/demo/tracker/summary",
+        ]),
+      );
+      const summary = paths.find((url) => url.pathname.endsWith("/tracker/summary"));
+      expect(summary?.searchParams.get("timeline")).toBe("main");
+    });
+    expect(loaded).toBe(false);
+    // The page renders on the detail and the tree; the Tracker's count streams in later.
+    releaseTree();
+    const code = await loading;
+    expect(code.tree).toMatchObject({ oid: HEAD });
+    expect(code.rail).not.toBeNull();
+    await expect(code.rail!.ci).resolves.toEqual({});
+    let counted = false;
+    void code.rail!.issues.then(() => (counted = true));
+    await Promise.resolve();
+    expect(counted).toBe(false);
+    releaseSummary();
+    await expect(code.rail!.issues).resolves.toEqual({});
+  } finally {
+    releaseTree();
+    releaseSummary();
+  }
 });
 
 for (const url of ["/orbit/demo?source=w-1", "/orbit/demo?source=w-1&tl=feature"])
