@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import {
   localGates,
+  localReasons,
   parseReadyOptions,
   readinessPlan,
   type ReadyOptions,
@@ -738,7 +739,7 @@ await test("local ready selects colocated and changed browser tests by path", as
   });
 });
 
-await test("local ready keeps tests of directly changed workspaces, not propagated ones", async () => {
+await test("local ready keeps tests of directly changed workspaces and a package's consumers", async () => {
   await fixture(async (root, _git, put) => {
     await put("packages/formats/src/index.ts");
     const { plan, gates } = await local(root);
@@ -746,11 +747,37 @@ await test("local ready keeps tests of directly changed workspaces, not propagat
     const found = localNames(gates);
     assert.ok(found.includes("formats-tests"));
     assert.ok(found.includes("website-types"));
-    assert.equal(found.includes("website-tests"), false);
+    assert.ok(found.includes("website-tests"));
     assert.equal(
       found.some((name) => name.endsWith("-build")),
       false,
     );
+  });
+});
+
+await test("local ready runs the full website unit project for untraceable changes", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("apps/website/migrations/20990101000000_throwaway.sql", "select 1;\n");
+    const { gates } = await local(root);
+    const tests = gates.find((gate) => gate.name === "website-tests")!;
+    assert.deepEqual(tests.args.slice(1), ["--project", "unit"]);
+  });
+  await fixture(async (root, _git, put) => {
+    await put("packages/testing/src/index.ts");
+    const { plan, gates } = await local(root);
+    assert.deepEqual(plan.direct, ["packages/testing"]);
+    const tests = gates.find((gate) => gate.name === "website-tests")!;
+    assert.deepEqual(tests.args.slice(1), ["--project", "unit"]);
+  });
+});
+
+await test("local ready keeps the full gates for a global path", async () => {
+  await fixture(async (root, _git, put) => {
+    await put(".gitmatrix/ci.yml");
+    const { plan, gates } = await local(root);
+    assert.equal(plan.full, true);
+    assert.equal(gates, plan.gates);
+    assert.ok(names(plan).includes("tests") && names(plan).includes("build"));
   });
 });
 
@@ -767,6 +794,10 @@ await test("local ready slims the full fallback to checks and direct tests", asy
     for (const name of ["website-types", "remote-types", "check", "cli-check", "types"])
       assert.ok(found.includes(name), name);
     assert.equal(found.includes("website-tests"), false);
+    assert.equal(
+      localReasons(plan.reasons).some((reason) => reason.startsWith("Full coverage")),
+      false,
+    );
   });
 });
 

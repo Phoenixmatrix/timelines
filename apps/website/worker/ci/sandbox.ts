@@ -8,7 +8,15 @@ import { DurableObject } from "cloudflare:workers";
 import type { CiClaimedJob, CiJobReport } from "../../shared/api.ts";
 import { upstreamToken } from "../artifacts.ts";
 import { batch, db, nowIso } from "../schema.ts";
-import { jobPayload, loadJob, report, settleStoppedJob, type StoredJob } from "./jobs.ts";
+import {
+  JobCredentialsRevoked,
+  jobPayload,
+  loadJob,
+  MAX_CHUNK,
+  report,
+  settleStoppedJob,
+  type StoredJob,
+} from "./jobs.ts";
 import { mintJobToken, revokeJobTokens, withConfigDir } from "./registry.ts";
 import {
   clearStorage,
@@ -489,20 +497,26 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     let flushing: Promise<void> = Promise.resolve();
     let failingSince: number | null = null;
     const flush = () => {
-      // Even a silent process must observe revocation on the next poll.
-      const text = buffer;
-      buffer = "";
+      // One write at a time, taking the buffer when it starts, so text kept for a
+      // retry stays ahead of what arrived since. Even a silent process must
+      // observe revocation on the next poll.
       flushing = flushing.then(async () => {
+        const text = buffer;
+        buffer = "";
         let result: { cancelled: boolean };
         try {
           await resolveJobAuthority(this.env, jobId);
-          result = await report(this.env, jobId, { logs: [{ step, text }] });
+          result = await report(this.env, jobId, {
+            logs: chunks(text).map((t) => ({ step, text: t })),
+          });
         } catch (error) {
           // A transient write failure keeps the text for the next flush instead
-          // of throwing away a nearly finished job.
+          // of throwing away a nearly finished job. A write that committed before
+          // failing is stored twice. Revoked authority or credentials end the job.
           failingSince ??= Date.now();
           if (
             !(error instanceof WorkAuthorizationError) &&
+            !(error instanceof JobCredentialsRevoked) &&
             Date.now() - failingSince < FLUSH_FAILURE_MS
           ) {
             buffer = text + buffer;
@@ -568,6 +582,18 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     if ("error" in outcome) throw outcome.error;
     return outcome.code;
   }
+}
+
+/** Text as pieces a log chunk stores whole, cut after a newline where one fits. */
+export function chunks(text: string, size = MAX_CHUNK): string[] {
+  const out: string[] = [];
+  while (text.length > size) {
+    const cut = text.lastIndexOf("\n", size - 1) + 1 || size;
+    out.push(text.slice(0, cut));
+    text = text.slice(cut);
+  }
+  if (text) out.push(text);
+  return out;
 }
 
 /** The sandbox for one job. */

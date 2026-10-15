@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { verifiedBaseline, type VerifiedBaseline } from "./ci-baseline.ts";
-import { labels, readinessPlan } from "./ready-plan.ts";
+import { labels, readinessPlan, websiteTestSelection } from "./ready-plan.ts";
 
 export interface CiTestPlan {
   full: boolean;
@@ -13,19 +13,6 @@ export interface CiTestPlan {
   workspaces: string[];
   websiteUnit: "all" | "changed" | "none";
   websiteBrowser: boolean;
-}
-
-const WEBSITE = "apps/website/";
-
-/** Configuration or setup that Vitest's changed-file graph cannot be trusted to follow. */
-function websiteConfig(path: string): boolean {
-  const relative = path.slice(WEBSITE.length);
-  return (
-    relative === "vite.config.ts" ||
-    relative.startsWith("vite/") ||
-    /^tsconfig[^/]*\.json$/.test(basename(relative)) ||
-    relative === "worker/testing/runtime.ts"
-  );
 }
 
 /**
@@ -69,26 +56,10 @@ export async function ciTestPlan(
   let websiteUnit: CiTestPlan["websiteUnit"] = "none";
   let websiteBrowser = false;
   if (gates.has("website-tests")) {
-    const web = plan.changed.filter((path) => path.startsWith(WEBSITE));
-    const packages = plan.changed.some((path) => path.startsWith("packages/"));
-    // Workspace sources may not be in Vitest's module graph, and fixtures, migrations, seeds,
-    // CSS and configuration cannot be traced through imports.
-    const traceable =
-      web.length > 0 &&
-      !packages &&
-      web.every((path) => /\.tsx?$/.test(path)) &&
-      !web.some(websiteConfig);
-    websiteUnit = traceable ? "changed" : "all";
-    if (!traceable)
-      reasons.push(
-        "Website unit tests run in full: a changed path cannot be traced through imports (workspace package, non-TypeScript file, configuration, or no website path).",
-      );
-    // Browser tests run against worker/testing/browser-api.ts, which imports the real Worker
-    // routes, so any website source change can affect them. Only a unit test file cannot.
-    websiteBrowser =
-      packages ||
-      web.length === 0 ||
-      !web.every((path) => path.endsWith(".test.ts") && !path.endsWith(".browser.test.tsx"));
+    const selection = websiteTestSelection(plan.changed);
+    websiteUnit = selection.unit;
+    websiteBrowser = selection.browser;
+    reasons.push(...selection.reasons);
   }
   return {
     full: false,

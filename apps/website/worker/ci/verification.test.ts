@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, test, vi } from "vite-plus/test";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { d1 } from "../testing/d1.ts";
 import { onPush, startRun, startWorkflow } from "./trigger.ts";
 import {
@@ -850,3 +854,27 @@ test.each(["landing", "queue"] as const)(
     });
   },
 );
+
+// The sources that define how a sandbox job runs and what its success proves.
+// A change here may leave earlier proofs wrong, so it must be a decision.
+const SANDBOX_SOURCES = ["sandbox.ts", "jobs.ts", "registry.ts"];
+const RECORDED_SANDBOX_SOURCES = {
+  contract: 1,
+  sha256: "7c7f47ecd5ddcaddd86c5aa92c4bae13c10785f622381d64ddfdbba15310abcf",
+};
+
+test("a change to the sandbox execution sources is a deliberate contract decision", () => {
+  const hash = createHash("sha256");
+  for (const file of SANDBOX_SOURCES)
+    hash
+      .update(`${file}\0`)
+      .update(readFileSync(join(dirname(fileURLToPath(import.meta.url)), file)));
+  expect(
+    hash.digest("hex"),
+    "Sandbox execution sources changed. If the change alters how a job runs or what its success proves, bump SANDBOX_CONTRACT in verification.ts. Either way, record the new hash here.",
+  ).toBe(RECORDED_SANDBOX_SOURCES.sha256);
+  expect(
+    RECORDED_SANDBOX_SOURCES.contract,
+    "SANDBOX_CONTRACT was bumped: record the sources' hash again next to it.",
+  ).toBe(SANDBOX_CONTRACT);
+});

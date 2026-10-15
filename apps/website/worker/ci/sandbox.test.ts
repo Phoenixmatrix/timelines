@@ -4,7 +4,8 @@ import { d1 } from "../testing/d1.ts";
 import { TrackerStore } from "../tracker/store.ts";
 import { drainDeletedRepoSources } from "../retention/work-sources.ts";
 import { cancelRun } from "./cancel.ts";
-import { CiSandbox } from "./sandbox.ts";
+import { chunks, CiSandbox } from "./sandbox.ts";
+import { MAX_CHUNK } from "./jobs.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
 import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
@@ -321,8 +322,20 @@ describe("Sandbox infrastructure retry cancellation", () => {
 describe("Sandbox log flushing", () => {
   const MARKER = "flush marker output\n";
 
-  /** A real job on the canonical source whose `build` step prints MARKER. */
-  async function flushFixture(failLogWrite: () => boolean) {
+  /**
+   * A real job on the canonical source whose `build` step runs `script`, by
+   * default printing MARKER. A log write carrying MARKER fails when `failLogWrite`
+   * returns true, or, when it returns a promise, once that settles.
+   * `failAuthority` fails the job's authority reads.
+   */
+  async function flushFixture(
+    failLogWrite: () => boolean | Promise<void>,
+    options: {
+      script?: (emit: (text: string) => void) => Promise<void> | void;
+      failAuthority?: () => boolean;
+    } = {},
+  ) {
+    const script = options.script ?? ((emit) => emit(MARKER));
     const fresh = await freshInstallationDatabases();
     const { sqlite, registry } = fresh;
     const kill = vi.fn();
@@ -336,11 +349,11 @@ describe("Sandbox log flushing", () => {
         running = true;
       },
       async exec(command: string[]) {
-        const out = command[4] === "build" ? MARKER : "";
+        const build = command[4] === "build";
         return {
           stdout: new ReadableStream({
-            start(controller) {
-              if (out) controller.enqueue(new TextEncoder().encode(out));
+            async start(controller) {
+              if (build) await script((text) => controller.enqueue(new TextEncoder().encode(text)));
               controller.close();
             },
           }),
@@ -354,21 +367,37 @@ describe("Sandbox log flushing", () => {
     } as unknown as Container;
     // Fail only the log insert carrying MARKER, so setup messages still land.
     const real = d1(sqlite);
+    const slow = new WeakMap<object, Promise<void>>();
     const failing = (statement: D1PreparedStatement) =>
       new Proxy(statement, {
         get(target, key) {
           if (key !== "bind") return Reflect.get(target, key, target);
           return (...params: unknown[]) => {
-            if (params.some((p) => typeof p === "string" && p.includes(MARKER)) && failLogWrite())
-              throw new Error("D1_ERROR: Network connection lost");
-            return target.bind(...params);
+            const failure = params.some((p) => typeof p === "string" && p.includes(MARKER.trim()))
+              ? failLogWrite()
+              : false;
+            if (failure === true) throw new Error("D1_ERROR: Network connection lost");
+            const bound = target.bind(...params);
+            if (failure) slow.set(bound, failure);
+            return bound;
           };
         },
       });
     const DB = new Proxy(real, {
       get(target, key) {
+        if (key === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            const pending = statements.map((s) => slow.get(s)).find(Boolean);
+            if (pending) {
+              await pending;
+              throw new Error("D1_ERROR: Network connection lost");
+            }
+            return target.batch(statements);
+          };
         if (key !== "prepare") return Reflect.get(target, key, target);
         return (sql: string) => {
+          if (/run_repo_id/.test(sql) && options.failAuthority?.())
+            throw new Error("D1_ERROR: Network connection lost");
           const statement = target.prepare(sql);
           return sql.includes('into "ci_logs"') ? failing(statement) : statement;
         };
@@ -447,6 +476,8 @@ describe("Sandbox log flushing", () => {
     });
     return {
       kill,
+      tokens: () =>
+        (sqlite.prepare("SELECT count(*) AS n FROM ci_job_tokens").get() as { n: number }).n,
       run: () => new CiSandbox(state.ctx, env).run("job"),
       status: () =>
         (sqlite.prepare("SELECT status FROM ci_jobs WHERE id='job'").get() as { status: string })
@@ -468,6 +499,88 @@ describe("Sandbox log flushing", () => {
     expect(fixture.kill).not.toHaveBeenCalled();
   });
 
+  /** A write that fails only after `release`, and a promise for when it began. */
+  function slowFailure() {
+    const gate = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    let first = true;
+    return {
+      started: started.promise,
+      release: gate.resolve,
+      failLogWrite: () => {
+        if (!first) return false;
+        first = false;
+        started.resolve();
+        return gate.promise;
+      },
+    };
+  }
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  test("retried text keeps its order behind a slow failing write", async () => {
+    const A = `${MARKER.trim()} A ${"a".repeat(20 * 1024)}\n`;
+    const B = `B ${"b".repeat(20 * 1024)}\n`;
+    const write = slowFailure();
+    const fixture = await flushFixture(write.failLogWrite, {
+      async script(emit) {
+        emit(A); // large enough to flush at once; that write is still failing...
+        await write.started;
+        emit(B); // ...when its successor is queued
+        await settle();
+        write.release();
+      },
+    });
+    await fixture.run();
+    expect(fixture.status()).toBe("succeeded");
+    expect(fixture.logs()).toContain(A + B);
+  });
+
+  test("retried text longer than a log chunk is stored whole", async () => {
+    const lines = ["a", "b", "c"].map(
+      (c, i) => `${i === 0 ? MARKER.trim() : "line"} ${c.repeat(40 * 1024)}\n`,
+    );
+    const write = slowFailure();
+    const fixture = await flushFixture(write.failLogWrite, {
+      async script(emit) {
+        emit(lines[0]!);
+        await write.started;
+        emit(lines[1]!);
+        emit(lines[2]!);
+        await settle();
+        write.release();
+      },
+    });
+    await fixture.run();
+    expect(fixture.status()).toBe("succeeded");
+    expect(lines.join("").length).toBeGreaterThan(MAX_CHUNK);
+    expect(fixture.logs()).toContain(lines.join(""));
+  });
+
+  test("a transient failure confirming authority revokes the credentials and stops the job", async () => {
+    let armed = false;
+    let reads = 0;
+    let tokensWhenFailing = 0;
+    let fixture!: Awaited<ReturnType<typeof flushFixture>>;
+    fixture = await flushFixture(() => false, {
+      script(emit) {
+        armed = true;
+        emit(MARKER);
+      },
+      // The first read is the sandbox's own; the second is report()'s.
+      failAuthority: () => {
+        if (!armed || ++reads !== 2) return false;
+        tokensWhenFailing = fixture.tokens();
+        return true;
+      },
+    });
+    await expect(fixture.run()).rejects.toThrow("Network connection lost");
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(tokensWhenFailing).toBeGreaterThan(0);
+    expect(fixture.kill).toHaveBeenCalled();
+    expect(fixture.tokens()).toBe(0);
+    expect(fixture.logs()).not.toContain(MARKER);
+  });
+
   test("log writes that keep failing stop the job", async () => {
     // Each failed write moves the clock 20 s, so the third crosses FLUSH_FAILURE_MS.
     let skew = 0;
@@ -481,6 +594,38 @@ describe("Sandbox log flushing", () => {
     await expect(fixture.run()).rejects.toThrow("Network connection lost");
     expect(fixture.kill).toHaveBeenCalled();
     expect(fixture.logs()).not.toContain(MARKER);
+  });
+});
+
+describe("chunks", () => {
+  test("short text is one piece", () => {
+    expect(chunks("abc\n", 10)).toEqual(["abc\n"]);
+  });
+
+  test("long text is cut after the last newline that fits", () => {
+    expect(chunks("aaa\nbbb\nccc", 9)).toEqual(["aaa\nbbb\n", "ccc"]);
+  });
+
+  test("a line longer than the size is cut at the size", () => {
+    expect(chunks("x".repeat(25), 10)).toEqual(["x".repeat(10), "x".repeat(10), "x".repeat(5)]);
+  });
+
+  test("the pieces joined equal the input", () => {
+    const text = `${"a".repeat(7)}\n${"b".repeat(30)}\n\n${"c".repeat(4)}\n`;
+    for (const size of [1, 5, 8, 10, 100]) {
+      const pieces = chunks(text, size);
+      expect(pieces.join("")).toBe(text);
+      expect(pieces.every((p) => p.length <= size)).toBe(true);
+    }
+  });
+
+  test("the default size is the stored chunk size", () => {
+    const pieces = chunks("x".repeat(MAX_CHUNK + 1));
+    expect(pieces.map((p) => p.length)).toEqual([MAX_CHUNK, 1]);
+  });
+
+  test("empty text is no pieces", () => {
+    expect(chunks("")).toEqual([]);
   });
 });
 

@@ -54,7 +54,8 @@ release. Add a tool name to select part of the graph. For example, run
   gate: it runs uncached checks and typechecks selected from changed paths and
   dependencies, the tests related to the change (website unit tests via Vitest's
   changed-file graph, colocated browser tests, and the tests of directly changed
-  workspaces; remote CI runs the full test suite and builds), plus only the non-AI E2E journeys of the areas those
+  workspaces and a changed package's consumers; remote CI runs only the affected
+  tests and the builds, and the main watcher the full suite), plus only the non-AI E2E journeys of the areas those
   paths touch (with their prerequisite scenarios). Do not routinely prepend or append
   blanket `vp check`, `vp test`, recursive builds or `vp run agent test`;
   targeted checks for development/debugging are still appropriate.
@@ -63,8 +64,8 @@ release. Add a tool name to select part of the graph. For example, run
   local `origin/main`, not just the last edit, and does not fetch.
   Use `--all` only for deliberately required comprehensive verification.
   Use `--base <ref>` only for the actual integration branch, never to hide
-  unlanded changes or force a smaller plan. Unknown/global/shared harness
-  changes automatically fall back to full code gates and every E2E journey
+  unlanded changes or force a smaller plan. Unknown or global paths automatically
+  keep the full code gates, and those and shared harness changes run every E2E journey
   except the main-only ones and the four heavy area-only ones (which run only when a
   change reaches their area); harness-only files no local run executes select no
   E2E, and failed change discovery (including an unreadable task graph) runs

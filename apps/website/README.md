@@ -3389,10 +3389,13 @@ OID. Leave it off context-sensitive jobs, especially deployment.
 Reuse requires successful **actual sandbox execution** for the exact current
 canonical repository, candidate commit, queue attempt and job specification. The
 producer must also match the current known resolved container image digest and
-Worker `CI_VERSION` metadata. A tag or configuration fingerprint is not an image
-identity. Local runners, custom images, jobs with secrets and jobs with concurrency
-controls are ineligible. Missing or unknown identity, failed verification or a
-changed candidate, attempt, specification, image or Worker version falls back to
+`SANDBOX_CONTRACT`, which only a deployed Worker version produces; a deploy that
+leaves the contract alone keeps earlier proofs valid. A guard test hashes the
+sandbox execution sources and fails until a change to them is recorded, bumping
+`SANDBOX_CONTRACT` when it alters how a job runs or what its success proves. A
+tag or configuration fingerprint is not an image identity. Local runners, custom
+images, jobs with secrets and jobs with concurrency controls are ineligible. Missing or unknown identity, failed verification or a
+changed candidate, attempt, specification, image or sandbox contract falls back to
 normal execution.
 
 The persisted queue owns main CI for its exact canonical candidate from the

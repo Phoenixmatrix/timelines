@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 
 export interface ReadyOptions {
@@ -395,23 +395,85 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
   return plan;
 }
 
+const WEBSITE = "apps/website/";
+
+/** Configuration or setup that Vitest's changed-file graph cannot be trusted to follow. */
+function websiteConfig(path: string): boolean {
+  const relative = path.slice(WEBSITE.length);
+  return (
+    relative === "vite.config.ts" ||
+    relative.startsWith("vite/") ||
+    /^tsconfig[^/]*\.json$/.test(basename(relative)) ||
+    relative === "worker/testing/runtime.ts"
+  );
+}
+
 /**
- * What local `ready` runs instead of the plan's gates: remote CI runs the full tests and builds,
- * so keep the cheap checks and typechecks, plus the tests related to the change. Website unit
- * tests follow Vitest's changed-file graph, its browser tests are picked by colocated path, and
- * other directly changed workspaces keep their own tests. Workspaces only reached through
- * dependency propagation get no tests. `--all` is not slimmed by the caller.
+ * Which website tests a change needs when `website-tests` is selected: whether Vitest's
+ * `--changed` graph can be trusted for the unit project, and whether browser tests can be
+ * affected. Shared by remote CI (ci-test.ts) and local `ready`.
+ */
+export function websiteTestSelection(changed: string[]): {
+  unit: "all" | "changed";
+  browser: boolean;
+  reasons: string[];
+} {
+  const web = changed.filter((path) => path.startsWith(WEBSITE));
+  const packages = changed.some((path) => path.startsWith("packages/"));
+  // Workspace sources may not be in Vitest's module graph, and fixtures, migrations, seeds,
+  // CSS and configuration cannot be traced through imports.
+  const traceable =
+    web.length > 0 &&
+    !packages &&
+    web.every((path) => /\.tsx?$/.test(path)) &&
+    !web.some(websiteConfig);
+  // Browser tests run against worker/testing/browser-api.ts, which imports the real Worker
+  // routes, so any website source change can affect them. Only a unit test file cannot.
+  const browser =
+    packages ||
+    web.length === 0 ||
+    !web.every((path) => path.endsWith(".test.ts") && !path.endsWith(".browser.test.tsx"));
+  return {
+    unit: traceable ? "changed" : "all",
+    browser,
+    reasons: traceable
+      ? []
+      : [
+          "Website unit tests run in full: a changed path cannot be traced through imports (workspace package, non-TypeScript file, configuration, or no website path).",
+        ],
+  };
+}
+
+/**
+ * What local `ready` runs instead of the plan's gates: remote CI runs the tests and builds, so
+ * keep the cheap checks and typechecks, plus the tests related to the change. Website unit
+ * tests follow Vitest's changed-file graph when every changed path is traceable (else the whole
+ * unit project runs), its browser tests are picked by colocated path, and other directly changed
+ * workspaces keep their own tests, as do a changed package's consumers. A global or unclassified
+ * path, or failed change discovery, keeps the plan's gates unchanged (the same array).
+ * `--all` is not slimmed by the caller.
  */
 export async function localGates(root: string, plan: ReadyPlan): Promise<ReadyPlan["gates"]> {
   if (plan.base === null) return plan.gates;
+  if (
+    plan.changed.some(
+      (path) =>
+        !documentation(path) &&
+        !agentConfig(path) &&
+        !WORKSPACES.some((workspace) => path.startsWith(`${workspace}/`)),
+    )
+  )
+    return plan.gates;
   const kept = plan.gates.filter(
     ({ name }) => name !== "tests" && name !== "build" && !/-(?:tests|build)$/.test(name),
   );
   const tests: ReadyPlan["gates"] = [];
+  const packages = plan.changed.some((path) => path.startsWith("packages/"));
   for (const workspace of WORKSPACES) {
-    if (!plan.direct.includes(workspace)) continue;
     const label = labels[workspace];
+    const direct = plan.direct.includes(workspace);
     if (workspace === "apps/website") {
+      if (!direct && !plan.gates.some(({ name }) => name === "website-tests")) continue;
       // `vp run website#test` does not forward extra Vitest arguments, so run its script directly.
       const runner = (name: string, args: string[]): ReadyPlan["gates"][number] => ({
         name,
@@ -420,12 +482,12 @@ export async function localGates(root: string, plan: ReadyPlan): Promise<ReadyPl
         cwd: "website",
       });
       tests.push(
-        runner("website-tests", [
-          "--project",
-          "unit",
-          `--changed=${plan.base}`,
-          "--passWithNoTests",
-        ]),
+        runner(
+          "website-tests",
+          websiteTestSelection(plan.changed).unit === "changed"
+            ? ["--project", "unit", `--changed=${plan.base}`, "--passWithNoTests"]
+            : ["--project", "unit"],
+        ),
       );
       const browser = new Set<string>();
       for (const path of plan.changed) {
@@ -446,10 +508,10 @@ export async function localGates(root: string, plan: ReadyPlan): Promise<ReadyPl
     }
     const existing = plan.gates.find(({ name }) => name === `${label}-tests`);
     if (existing) {
-      tests.push(existing);
+      if (direct || (packages && workspace !== "apps/cli")) tests.push(existing);
       continue;
     }
-    if (!plan.gates.some(({ name }) => name === "tests")) continue;
+    if (!direct || !plan.gates.some(({ name }) => name === "tests")) continue;
     try {
       const manifest: Manifest = JSON.parse(
         await readFile(join(root, workspace, "package.json"), "utf8"),
@@ -460,6 +522,19 @@ export async function localGates(root: string, plan: ReadyPlan): Promise<ReadyPl
     }
   }
   return [...kept, ...tests];
+}
+
+/** The plan's reasons once `localGates` has slimmed its gates: coverage lines would be false. */
+export function localReasons(reasons: string[]): string[] {
+  return [
+    ...reasons.filter(
+      (reason) =>
+        !reason.startsWith("Full coverage:") &&
+        !reason.startsWith("Build affected production workspaces") &&
+        !reason.startsWith("Skip builds:"),
+    ),
+    "Local ready runs checks, typechecks, related tests and E2E; remote CI's check, test, build and cli jobs run the rest.",
+  ];
 }
 
 async function exists(path: string): Promise<boolean> {

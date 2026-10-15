@@ -3,7 +3,7 @@ import { issueToken } from "../api/tokens.ts";
 import { d1 } from "../testing/d1.ts";
 import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
-import { claim, jobPayload, loadJob, report } from "./jobs.ts";
+import { claim, JobCredentialsRevoked, jobPayload, loadJob, report } from "./jobs.ts";
 import { mintJobToken } from "./registry.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 
@@ -115,3 +115,32 @@ test.each(["grant", "membership", "credential", "agent", "epoch"])(
     });
   },
 );
+
+test("a transient failure confirming authority revokes the job's tokens and throws", async () => {
+  const t = await fixture();
+  expect(await claim(t.env, "job", "person/runner")).toBe(true);
+  await mintJobToken(t.env, "job", 5);
+  const tokens = () => t.sqlite.prepare("SELECT count(*) AS n FROM ci_job_tokens").get();
+  expect(tokens()).toEqual({ n: 1 });
+  const real = t.env.DB;
+  let failing = true;
+  t.env.DB = new Proxy(real, {
+    get(target, key) {
+      if (key !== "prepare") return Reflect.get(target, key, target);
+      return (sql: string) => {
+        // resolveJobAuthority's join, not loadJob's lookup.
+        if (failing && sql.includes("run_repo_id"))
+          throw new Error("D1_ERROR: Network connection lost");
+        return target.prepare(sql);
+      };
+    },
+  });
+  const rejected = await report(t.env, "job", { logs: [{ step: 0, text: "output" }] }).catch(
+    (error: unknown) => error,
+  );
+  expect(rejected).toBeInstanceOf(JobCredentialsRevoked);
+  expect((rejected as Error).message).toContain("Network connection lost");
+  expect(tokens()).toEqual({ n: 0 });
+  expect(t.sqlite.prepare("SELECT count(*) AS n FROM ci_logs").get()).toEqual({ n: 0 });
+  failing = false;
+});

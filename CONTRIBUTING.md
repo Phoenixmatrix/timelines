@@ -495,7 +495,9 @@ The root formatting/lint/type-aware `vp check` and remote Worker contract
 typecheck always run. The latter generates the credential-free remote bindings
 required by root lint. Website bindings are generated once before consumer checks.
 Other uncached gates follow workspace dependencies, including the harness and
-preview tools' relative imports of website contracts:
+preview tools' relative imports of website contracts. The table is the plan's
+coverage, which `--all` and remote CI draw on; local `ready` runs the slimmed subset
+described after it:
 
 | Change                                                                                                 | Selected coverage                                                                                                                             |
 | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -507,13 +509,14 @@ preview tools' relative imports of website contracts:
 | Tests only                                                                                             | Their workspace's checks/tests; no builds or live E2E                                                                                         |
 | Known root/workspace README, AGENTS, CONTRIBUTING or CHANGELOG                                         | Mandatory checks only; Markdown runtime assets are not exempt                                                                                 |
 | Coding-agent Markdown instructions/skills and `.claude/settings.json`                                  | Mandatory checks only; executable hooks and scripts are not exempt                                                                            |
-| Global/task/dependency configuration, shared harness or unknown paths                                  | Full code gates and every E2E journey except the main-only and the four area-only ones                                                        |
+| Global/task/dependency configuration, shared harness or unknown paths                                  | Full code gates (local `ready` too, for global and unknown paths) and every E2E journey except the main-only and the four area-only ones      |
 | Harness-only files no local run executes (AI stages, deploys, the main E2E watcher, remote helpers, …) | Full code gates; no E2E                                                                                                                       |
 | `--all`, or failed change discovery (no base, unreadable changes, unreadable task graph)               | Full suite, main-only and area-only journeys included                                                                                         |
 
 Content-only edits to the three audited stylesheets
-`apps/website/src/styles/{app,tokens,matrixkit}.css` preserve all website unit and
-browser tests, the website build and selected live E2E. They omit only the implicit
+`apps/website/src/styles/{app,tokens,matrixkit}.css` keep the website tests and build
+in the plan (local `ready` runs the whole website unit project and the colocated browser
+tests) and the selected live E2E. They omit only the implicit
 agent/preview TypeScript consumer checks. Changed imports, URLs or at-rules,
 renames, and mixed or unknown changes widen coverage instead of taking that shortcut.
 
@@ -550,11 +553,16 @@ and checks the explicit expired-source browser state. Full profiles keep both
 journeys.
 
 Local `ready` does not repeat what remote CI runs. It keeps the checks and typechecks
-above, the tests related to the change (website unit tests through Vitest's
-changed-file graph, the colocated `*.browser.test.tsx` of changed website sources, and
-the tests of directly changed workspaces) and the selected E2E journeys. It skips
-builds and the tests of workspaces reached only through dependencies: remote CI's
-check, test, build and cli jobs run the full suite and builds.
+above, the tests related to the change and the selected E2E journeys. Website unit
+tests go through Vitest's changed-file graph when every changed path is a traceable
+website TypeScript file, and run the whole unit project otherwise (a change to a
+workspace package, migration, seed, fixture, stylesheet or configuration); the
+colocated `*.browser.test.tsx` of changed website sources run too. Directly changed
+workspaces keep their tests, and so do a changed package's consumers. Local `ready` skips builds
+and the tests of other workspaces reached only through dependencies. A global or
+unknown path, or failed change discovery, keeps the full local gates. Remote CI runs
+only the affected tests (`tools/agent/ci-test.ts`) and its builds; the main watcher
+runs the full suite on each new main commit.
 
 Unchanged workspaces are skipped, not reported as tested. The selection and its
 reasons print before execution and are saved as `selection.json` beside the gate

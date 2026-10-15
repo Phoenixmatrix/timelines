@@ -16,7 +16,8 @@ export type StoredJob = Omit<JobSpec, "name">;
 
 type JobContext = NonNullable<Awaited<ReturnType<typeof loadJob>>>;
 
-const MAX_CHUNK = 64 * 1024;
+/** The most text one stored log chunk keeps; a runner sends longer text as several. */
+export const MAX_CHUNK = 64 * 1024;
 const MAX_CHUNKS_PER_JOB = 4000;
 
 /** The Workflow event a job's end is announced with. */
@@ -147,6 +148,14 @@ export function mask(text: string, secrets: string[]): string {
   return out;
 }
 
+/** report() could not confirm the job's authority and revoked its credentials: the job cannot go on. */
+export class JobCredentialsRevoked extends Error {
+  override name = "JobCredentialsRevoked";
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+  }
+}
+
 /** Apply a runner's report. Returns whether the job was cancelled meanwhile. */
 export async function report(
   env: Env,
@@ -163,7 +172,7 @@ export async function report(
       return true;
     } catch (error) {
       await revokeJobTokens(d1, jobId);
-      if (!(error instanceof WorkAuthorizationError)) throw error;
+      if (!(error instanceof WorkAuthorizationError)) throw new JobCredentialsRevoked(error);
       // Ask the runner to stop without accepting logs, steps or success.
       // Only its later terminal acknowledgment releases the source claim.
       if (update.done) await settleStoppedJob(env, jobId, "Job authority is no longer current.");
