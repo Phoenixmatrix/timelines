@@ -318,6 +318,9 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
   }
   dependencies.get("tools/preview")!.add("tools/agent");
   dependencies.get("tools/remote")!.add("tools/agent");
+  // The agent tests import the remote runtime and copy its Worker configuration, and remote CI
+  // runs a tools/remote change by test selection alone; ready's full fallback covers it locally.
+  if (options.scope === "ci-tests") dependencies.get("tools/agent")!.add("tools/remote");
   // The site's gm reference is checked against gm's manifest (apps/cli/src/meta.rs).
   dependencies.get("apps/site")!.add("apps/cli");
   const propagate = (selected: Set<Workspace>) => {
@@ -397,6 +400,9 @@ export async function readinessPlan(root: string, options: ReadyOptions): Promis
 
 const WEBSITE = "apps/website/";
 
+/** The one README the website's tests read (worker/ci/config.test.ts, as a `?raw` import). */
+export const WEBSITE_README = `${WEBSITE}README.md`;
+
 /** Configuration or setup that Vitest's changed-file graph cannot be trusted to follow. */
 function websiteConfig(path: string): boolean {
   const relative = path.slice(WEBSITE.length);
@@ -419,20 +425,23 @@ export function websiteTestSelection(changed: string[]): {
   reasons: string[];
 } {
   const web = changed.filter((path) => path.startsWith(WEBSITE));
+  const code = web.filter((path) => path !== WEBSITE_README);
   const packages = changed.some((path) => path.startsWith("packages/"));
   // Workspace sources may not be in Vitest's module graph, and fixtures, migrations, seeds,
   // CSS and configuration cannot be traced through imports.
   const traceable =
     web.length > 0 &&
     !packages &&
-    web.every((path) => /\.tsx?$/.test(path)) &&
+    web.every((path) => path === WEBSITE_README || /\.tsx?$/.test(path)) &&
     !web.some(websiteConfig);
   // Browser tests run against worker/testing/browser-api.ts, which imports the real Worker
-  // routes, so any website source change can affect them. Only a unit test file cannot.
+  // routes, so any website source change can affect them. Only a unit test file or the README
+  // (read by a unit test) cannot.
   const browser =
     packages ||
     web.length === 0 ||
-    !web.every((path) => path.endsWith(".test.ts") && !path.endsWith(".browser.test.tsx"));
+    (code.length > 0 &&
+      !code.every((path) => path.endsWith(".test.ts") && !path.endsWith(".browser.test.tsx")));
   return {
     unit: traceable ? "changed" : "all",
     browser,
@@ -473,7 +482,12 @@ export async function localGates(root: string, plan: ReadyPlan): Promise<ReadyPl
     const label = labels[workspace];
     const direct = plan.direct.includes(workspace);
     if (workspace === "apps/website") {
-      if (!direct && !plan.gates.some(({ name }) => name === "website-tests")) continue;
+      if (
+        !direct &&
+        !plan.changed.includes(WEBSITE_README) &&
+        !plan.gates.some(({ name }) => name === "website-tests")
+      )
+        continue;
       // `vp run website#test` does not forward extra Vitest arguments, so run its script directly.
       const runner = (name: string, args: string[]): ReadyPlan["gates"][number] => ({
         name,

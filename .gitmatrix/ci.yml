@@ -106,7 +106,9 @@ jobs:
     # file select the full suite. The complete unit and browser suites run on
     # every new main commit in the main-E2E watcher, which files a P0 issue when
     # they fail.
-    timeout_minutes: 30
+    # Full mode (the first run after a spec change, no ancestor baseline, global
+    # paths) must still fit, so keep 60 until its new duration is measured.
+    timeout_minutes: 60
     # The browser tests save a picture of the app at their key states here
     # (src/testing/visual.ts); the last step attaches them to the commit's step
     # for the Story's step view (CORE-383).

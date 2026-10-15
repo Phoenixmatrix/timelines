@@ -139,6 +139,18 @@ export async function jobPayload(
   };
 }
 
+/** Text as pieces a log chunk stores whole, cut after a newline where one fits. */
+export function chunks(text: string, size = MAX_CHUNK): string[] {
+  const out: string[] = [];
+  while (text.length > size) {
+    const cut = text.lastIndexOf("\n", size - 1) + 1 || size;
+    out.push(text.slice(0, cut));
+    text = text.slice(cut);
+  }
+  if (text) out.push(text);
+  return out;
+}
+
 /** Hide secret values (and any CI job credential) in output. */
 export function mask(text: string, secrets: string[]): string {
   let out = text.replace(/gmj_[A-Za-z0-9]+/g, "gmj_***");
@@ -186,23 +198,25 @@ export async function report(
 
   for (const log of update.logs ?? []) {
     if (!log.text) continue;
-    statements.push(
-      kdb
-        .insertInto("ci_logs")
-        .columns(["job_id", "seq", "step", "text"])
-        .expression((eb) =>
-          eb
-            .selectFrom("ci_logs")
-            .select([
-              eb.val(jobId).as("job_id"),
-              eb(eb.fn.coalesce(eb.fn.max("seq"), eb.lit(0)), "+", eb.lit(1)).as("seq"),
-              eb.val(log.step).as("step"),
-              eb.val(mask(log.text, secrets).slice(0, MAX_CHUNK)).as("text"),
-            ])
-            .where("job_id", "=", jobId)
-            .having(eb.fn.countAll(), "<", MAX_CHUNKS_PER_JOB),
-        ),
-    );
+    // Mask the whole text before cutting it, so a secret can't straddle a cut.
+    for (const text of chunks(mask(log.text, secrets)))
+      statements.push(
+        kdb
+          .insertInto("ci_logs")
+          .columns(["job_id", "seq", "step", "text"])
+          .expression((eb) =>
+            eb
+              .selectFrom("ci_logs")
+              .select([
+                eb.val(jobId).as("job_id"),
+                eb(eb.fn.coalesce(eb.fn.max("seq"), eb.lit(0)), "+", eb.lit(1)).as("seq"),
+                eb.val(log.step).as("step"),
+                eb.val(text).as("text"),
+              ])
+              .where("job_id", "=", jobId)
+              .having(eb.fn.countAll(), "<", MAX_CHUNKS_PER_JOB),
+          ),
+      );
   }
   for (const step of update.steps ?? []) {
     const terminal = step.status !== "running" && step.status !== "pending";

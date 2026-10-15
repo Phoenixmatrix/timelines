@@ -1,9 +1,17 @@
-import { afterEach, expect, test, vi } from "vite-plus/test";
+import { afterEach, describe, expect, test, vi } from "vite-plus/test";
 import { issueToken } from "../api/tokens.ts";
 import { d1 } from "../testing/d1.ts";
 import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
-import { claim, JobCredentialsRevoked, jobPayload, loadJob, report } from "./jobs.ts";
+import {
+  chunks,
+  claim,
+  JobCredentialsRevoked,
+  jobPayload,
+  loadJob,
+  MAX_CHUNK,
+  report,
+} from "./jobs.ts";
 import { mintJobToken } from "./registry.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 
@@ -143,4 +151,54 @@ test("a transient failure confirming authority revokes the job's tokens and thro
   expect(tokens()).toEqual({ n: 0 });
   expect(t.sqlite.prepare("SELECT count(*) AS n FROM ci_logs").get()).toEqual({ n: 0 });
   failing = false;
+});
+
+test("a secret straddling a log chunk boundary is masked before the text is cut", async () => {
+  const t = await fixture();
+  expect(await claim(t.env, "job", "person/runner")).toBe(true);
+  const secret = "private-secret";
+  // The secret's first half ends the first 64 KiB piece when cut unmasked.
+  const text = `${"a".repeat(MAX_CHUNK - 7)}${secret}${"b".repeat(10)}\n`;
+  await report(t.env, "job", { logs: [{ step: 0, text }] });
+  const rows = (
+    t.sqlite.prepare("SELECT text FROM ci_logs ORDER BY seq").all() as { text: string }[]
+  ).map((row) => row.text);
+  expect(rows.length).toBeGreaterThan(1);
+  expect(rows.every((row) => row.length <= MAX_CHUNK)).toBe(true);
+  const stored = rows.join("");
+  expect(stored).toBe(text.replace(secret, "***"));
+  expect(stored).not.toContain("private");
+  expect(stored).not.toContain("secret");
+});
+
+describe("chunks", () => {
+  test("short text is one piece", () => {
+    expect(chunks("abc\n", 10)).toEqual(["abc\n"]);
+  });
+
+  test("long text is cut after the last newline that fits", () => {
+    expect(chunks("aaa\nbbb\nccc", 9)).toEqual(["aaa\nbbb\n", "ccc"]);
+  });
+
+  test("a line longer than the size is cut at the size", () => {
+    expect(chunks("x".repeat(25), 10)).toEqual(["x".repeat(10), "x".repeat(10), "x".repeat(5)]);
+  });
+
+  test("the pieces joined equal the input", () => {
+    const text = `${"a".repeat(7)}\n${"b".repeat(30)}\n\n${"c".repeat(4)}\n`;
+    for (const size of [1, 5, 8, 10, 100]) {
+      const pieces = chunks(text, size);
+      expect(pieces.join("")).toBe(text);
+      expect(pieces.every((p) => p.length <= size)).toBe(true);
+    }
+  });
+
+  test("the default size is the stored chunk size", () => {
+    const pieces = chunks("x".repeat(MAX_CHUNK + 1));
+    expect(pieces.map((p) => p.length)).toEqual([MAX_CHUNK, 1]);
+  });
+
+  test("empty text is no pieces", () => {
+    expect(chunks("")).toEqual([]);
+  });
 });

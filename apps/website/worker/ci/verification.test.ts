@@ -775,24 +775,47 @@ describe("verified change-selection baselines", () => {
 
   test("only executed equivalent success supplies a baseline; repository env cannot forge it", async () => {
     const t = await baseline();
-    expect(await previousVerification(t.env.DB, "production-check")).toEqual({
-      commit,
-      runNumber: 1,
-      jobId: "gates-check",
-    });
+    expect(await previousVerification(t.env.DB, "production-check")).toEqual([
+      { commit, runNumber: 1, jobId: "gates-check" },
+    ]);
     t.sqlite.exec(`UPDATE ci_jobs SET spec=json_set(spec,'$.env.GITMATRIX_VERIFIED_BASE','forged')
       WHERE name='check'`);
     const payload = await jobPayload(t.env, (await loadJob(t.env.DB, "production-check"))!, {
       origin: "https://gm.test",
       token: "test-token",
     });
-    expect(JSON.parse(payload.env.GITMATRIX_VERIFIED_BASE ?? "null")).toEqual({
-      commit,
-      runNumber: 1,
-      jobId: "gates-check",
-    });
+    expect(JSON.parse(payload.env.GITMATRIX_VERIFIED_BASE ?? "null")).toEqual([
+      { commit, runNumber: 1, jobId: "gates-check" },
+    ]);
     t.sqlite.exec("UPDATE ci_jobs SET status='skipped', verified_by='{}' WHERE id='gates-check'");
-    expect(await previousVerification(t.env.DB, "production-check")).toBeNull();
+    expect(await previousVerification(t.env.DB, "production-check")).toEqual([]);
+  });
+
+  test("returns every qualifying candidate newest first and still applies the filters", async () => {
+    const t = await baseline();
+    // Copy the verified run, job and steps as runs 10 and 11.
+    const copy = (table: string, where: string, set: Record<string, string>) => {
+      const columns = (
+        t.sqlite.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+      ).map((c) => c.name);
+      const select = columns.map((c) => (c in set ? set[c] : c)).join(",");
+      t.sqlite.exec(
+        `INSERT INTO ${table}(${columns.join(",")}) SELECT ${select} FROM ${table} WHERE ${where}`,
+      );
+    };
+    for (const n of [10, 11]) {
+      copy("ci_runs", "id='gates'", { id: `'gates-${n}'`, number: String(n) });
+      copy("ci_jobs", "id='gates-check'", { id: `'gates-check-${n}'`, run_id: `'gates-${n}'` });
+      copy("ci_steps", "job_id='gates-check'", { job_id: `'gates-check-${n}'` });
+    }
+    expect(
+      (await previousVerification(t.env.DB, "production-check")).map((b) => b.runNumber),
+    ).toEqual([11, 10, 1]);
+    t.sqlite.exec("UPDATE ci_jobs SET exit_code=1, status='failed' WHERE id='gates-check-11'");
+    t.sqlite.exec("DELETE FROM ci_steps WHERE job_id='gates-check-10'");
+    expect(await previousVerification(t.env.DB, "production-check")).toEqual([
+      { commit, runNumber: 1, jobId: "gates-check" },
+    ]);
   });
 
   test.each([
@@ -814,7 +837,7 @@ describe("verified change-selection baselines", () => {
   ])("falls back without complete equivalent evidence: %s", async (change) => {
     const t = await baseline();
     t.sqlite.exec(change);
-    expect(await previousVerification(t.env.DB, "production-check")).toBeNull();
+    expect(await previousVerification(t.env.DB, "production-check")).toEqual([]);
   });
 });
 
@@ -860,7 +883,7 @@ test.each(["landing", "queue"] as const)(
 const SANDBOX_SOURCES = ["sandbox.ts", "jobs.ts", "registry.ts"];
 const RECORDED_SANDBOX_SOURCES = {
   contract: 1,
-  sha256: "7c7f47ecd5ddcaddd86c5aa92c4bae13c10785f622381d64ddfdbba15310abcf",
+  sha256: "b0ec3fb3ab41e6be4d1b677e0f1dfb26ee0738ef1e826c89a95e7cae0f415cca",
 };
 
 test("a change to the sandbox execution sources is a deliberate contract decision", () => {

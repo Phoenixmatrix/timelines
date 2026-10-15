@@ -4,7 +4,7 @@ import { d1 } from "../testing/d1.ts";
 import { TrackerStore } from "../tracker/store.ts";
 import { drainDeletedRepoSources } from "../retention/work-sources.ts";
 import { cancelRun } from "./cancel.ts";
-import { chunks, CiSandbox } from "./sandbox.ts";
+import { CiSandbox } from "./sandbox.ts";
 import { MAX_CHUNK } from "./jobs.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { fakeDurableObjectId, fakeDurableState } from "../testing/durable-state.ts";
@@ -333,6 +333,8 @@ describe("Sandbox log flushing", () => {
     options: {
       script?: (emit: (text: string) => void) => Promise<void> | void;
       failAuthority?: () => boolean;
+      /** Holds every log write until it settles. */
+      delayLogWrite?: () => Promise<void>;
     } = {},
   ) {
     const script = options.script ?? ((emit) => emit(MARKER));
@@ -368,6 +370,7 @@ describe("Sandbox log flushing", () => {
     // Fail only the log insert carrying MARKER, so setup messages still land.
     const real = d1(sqlite);
     const slow = new WeakMap<object, Promise<void>>();
+    const logWrites = new WeakSet<object>();
     const failing = (statement: D1PreparedStatement) =>
       new Proxy(statement, {
         get(target, key) {
@@ -378,6 +381,7 @@ describe("Sandbox log flushing", () => {
               : false;
             if (failure === true) throw new Error("D1_ERROR: Network connection lost");
             const bound = target.bind(...params);
+            logWrites.add(bound);
             if (failure) slow.set(bound, failure);
             return bound;
           };
@@ -387,6 +391,7 @@ describe("Sandbox log flushing", () => {
       get(target, key) {
         if (key === "batch")
           return async (statements: D1PreparedStatement[]) => {
+            if (statements.some((s) => logWrites.has(s))) await options.delayLogWrite?.();
             const pending = statements.map((s) => slow.get(s)).find(Boolean);
             if (pending) {
               await pending;
@@ -556,6 +561,29 @@ describe("Sandbox log flushing", () => {
     expect(fixture.logs()).toContain(lines.join(""));
   });
 
+  test("fast output behind a slow write queues one flush, not one per chunk", async () => {
+    // Every flush confirms authority twice (the sandbox, then report()), each
+    // costing D1 reads, so count those.
+    let reads = 0;
+    const fixture = await flushFixture(() => false, {
+      async script(emit) {
+        for (let i = 0; i < 200; i++) {
+          emit(`${MARKER.trim()} ${i} ${"x".repeat(17 * 1024)}\n`);
+          await Promise.resolve();
+        }
+      },
+      failAuthority: () => {
+        reads++;
+        return false;
+      },
+      delayLogWrite: () => new Promise((resolve) => setTimeout(resolve, 20)),
+    });
+    await fixture.run();
+    expect(fixture.status()).toBe("succeeded");
+    expect(fixture.logs()).toContain(`${MARKER.trim()} 199 `);
+    expect(reads).toBeLessThan(40);
+  });
+
   test("a transient failure confirming authority revokes the credentials and stops the job", async () => {
     let armed = false;
     let reads = 0;
@@ -594,38 +622,6 @@ describe("Sandbox log flushing", () => {
     await expect(fixture.run()).rejects.toThrow("Network connection lost");
     expect(fixture.kill).toHaveBeenCalled();
     expect(fixture.logs()).not.toContain(MARKER);
-  });
-});
-
-describe("chunks", () => {
-  test("short text is one piece", () => {
-    expect(chunks("abc\n", 10)).toEqual(["abc\n"]);
-  });
-
-  test("long text is cut after the last newline that fits", () => {
-    expect(chunks("aaa\nbbb\nccc", 9)).toEqual(["aaa\nbbb\n", "ccc"]);
-  });
-
-  test("a line longer than the size is cut at the size", () => {
-    expect(chunks("x".repeat(25), 10)).toEqual(["x".repeat(10), "x".repeat(10), "x".repeat(5)]);
-  });
-
-  test("the pieces joined equal the input", () => {
-    const text = `${"a".repeat(7)}\n${"b".repeat(30)}\n\n${"c".repeat(4)}\n`;
-    for (const size of [1, 5, 8, 10, 100]) {
-      const pieces = chunks(text, size);
-      expect(pieces.join("")).toBe(text);
-      expect(pieces.every((p) => p.length <= size)).toBe(true);
-    }
-  });
-
-  test("the default size is the stored chunk size", () => {
-    const pieces = chunks("x".repeat(MAX_CHUNK + 1));
-    expect(pieces.map((p) => p.length)).toEqual([MAX_CHUNK, 1]);
-  });
-
-  test("empty text is no pieces", () => {
-    expect(chunks("")).toEqual([]);
   });
 });
 

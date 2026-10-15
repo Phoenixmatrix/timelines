@@ -11,15 +11,22 @@ import {
   decideReport,
   decideStuck,
   decideStuckReport,
+  decideTests,
   e2eGraceMs,
   e2eTimeoutMs,
+  failureBody,
   failureNames,
+  installedTimeoutMinutes,
   installTimeoutMs,
   parseRunLog,
   serviceUnit,
   shouldSkipRetest,
+  staleUnitWarning,
   stuckIssuesToClose,
   stuckTitle,
+  testsCommand,
+  testsFailureResult,
+  testsGraceMs,
   testsTimeoutMs,
   unitTimeoutMinutes,
   withTestsOutcome,
@@ -157,8 +164,8 @@ await test("a failed full test suite joins the E2E result and names the stage", 
     code: 0,
     parsed: parseRunLog(JSON.stringify({ event: "e2e.complete", success: true, failedStages: [] })),
   });
-  assert.deepEqual(withTestsOutcome(passed, true), passed);
-  const merged = withTestsOutcome(passed, false);
+  assert.deepEqual(withTestsOutcome(passed, { success: true, log: "/tests" }), passed);
+  const merged = withTestsOutcome(passed, { success: false, log: "/tests" });
   assert.equal(merged.kind === "result" && merged.result.success, false);
   assert.deepEqual(merged.kind === "result" && merged.result.failedStages, ["tests"]);
   assert.equal(
@@ -168,10 +175,13 @@ await test("a failed full test suite joins the E2E result and names the stage", 
   // Alongside an E2E failure the stage is added once, and an environment limit stays a retry.
   const both = withTestsOutcome(
     { kind: "result", result: result({ failedStages: ["tests"] }) },
-    false,
+    { success: false, log: "/tests" },
   );
   assert.deepEqual(both.kind === "result" && both.result.failedStages, ["tests"]);
-  assert.deepEqual(withTestsOutcome({ kind: "retry-later" }, false), { kind: "retry-later" });
+  assert.equal(merged.kind === "result" && merged.result.testsLog, "/tests");
+  assert.deepEqual(withTestsOutcome({ kind: "retry-later" }, { success: false, log: "/tests" }), {
+    kind: "retry-later",
+  });
 });
 
 await test("either environment limit retries later without a result; a timeout is a failure of its own", () => {
@@ -201,7 +211,8 @@ await test("either environment limit retries later without a result; a timeout i
 
 await test("budgets fit under the unit timeout, with room for the grace period", () => {
   assert(
-    installTimeoutMs + testsTimeoutMs + e2eTimeoutMs + e2eGraceMs < unitTimeoutMinutes * 60_000,
+    installTimeoutMs + testsTimeoutMs + testsGraceMs + e2eTimeoutMs + e2eGraceMs <
+      unitTimeoutMinutes * 60_000,
   );
   assert(e2eGraceMs >= 3 * 60_000);
 });
@@ -301,4 +312,69 @@ await test("the lock is taken atomically with its pid, and a stale one is replac
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+await test("tests outcomes are reused for the same head and rerun for a new one", () => {
+  const tests = { sha: "a", success: false, log: "/a.tests.log" };
+  assert.deepEqual(decideTests("a", { testsResult: tests }), { kind: "reuse", tests });
+  assert.deepEqual(decideTests("b", { testsResult: tests }), { kind: "run" });
+  assert.deepEqual(decideTests("a", {}), { kind: "run" });
+});
+
+await test("a tests failure with E2E deferred becomes a tests-only result", () => {
+  const failed = testsFailureResult(
+    { sha: "a".repeat(40), success: false, log: "/a.tests.log" },
+    "2026-01-01T00:00:00Z",
+  );
+  assert.equal(failed.success, false);
+  assert.deepEqual(failed.failedStages, ["tests"]);
+  assert.equal(buildTitle(failed), "Main E2E failing: stage tests");
+  const body = failureBody(failed, "Failing");
+  assert.match(body, /Unit and browser tests log: \/a\.tests\.log/);
+  assert.match(body, /vp run --filter '!cli' --concurrency-limit 1 test/);
+  assert.doesNotMatch(body, /vp run agent test/);
+});
+
+await test("the body names the tests log and the E2E log when both failed", () => {
+  const both = failureBody(
+    result({ failedStages: ["scenarios", "tests"], testsLog: "/t.log" }),
+    "Failing",
+  );
+  assert.match(both, /Unit and browser tests log: \/t\.log/);
+  assert.match(both, /vp run --filter '!cli' --concurrency-limit 1 test/);
+  assert.match(both, /Run log: \/log/);
+  assert.match(both, /vp run agent test/);
+  assert.match(both, /- a-scenario|- b-scenario/);
+  const scenariosOnly = failureBody(result(), "Failing");
+  assert.doesNotMatch(scenariosOnly, /tests log/);
+  assert.match(scenariosOnly, /vp run agent test/);
+});
+
+await test("the tests run is serial and uncached, like CI's full mode", () => {
+  assert.deepEqual(testsCommand, [
+    "run",
+    "--filter",
+    "!cli",
+    "--concurrency-limit",
+    "1",
+    "--no-cache",
+    "test",
+  ]);
+});
+
+await test("an installed unit with another timeout is stale", () => {
+  const current = serviceUnit({
+    checkout: "/home/u/checkout",
+    node: "/usr/bin/node",
+    entry: "/home/u/checkout/tools/agent/entry.ts",
+    path: "/usr/bin",
+  });
+  assert.equal(installedTimeoutMinutes(current), unitTimeoutMinutes);
+  assert.equal(staleUnitWarning(current), null);
+  assert.equal(staleUnitWarning(null), null);
+  assert.match(
+    staleUnitWarning(current.replace(/TimeoutStartSec=\d+min/, "TimeoutStartSec=100min"))!,
+    /100min.*vp run agent main-e2e install/,
+  );
+  assert.match(staleUnitWarning("[Service]\n")!, /unset/);
 });

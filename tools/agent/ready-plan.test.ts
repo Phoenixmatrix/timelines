@@ -647,6 +647,38 @@ await test("CI build selection covers all changes since proven success, not only
   });
 });
 
+await test("CI build selection takes the newest candidate that is an ancestor", async () => {
+  await fixture(async (root, git, put) => {
+    const base = (await git(["rev-parse", "HEAD"])).trim();
+    await put("README.md");
+    await git(["add", "."]);
+    await git(["commit", "-m", "other branch"]);
+    const other = (await git(["rev-parse", "HEAD"])).trim();
+    await git(["checkout", "--detach", base]);
+    const entry = (commit: string, runNumber: number) => ({
+      commit,
+      runNumber,
+      jobId: `build-${runNumber}`,
+    });
+    const env = {
+      GITMATRIX_COMMIT: base,
+      GITMATRIX_VERIFIED_BASE: JSON.stringify([
+        entry("f".repeat(40), 3),
+        entry(other, 2),
+        entry(base, 1),
+      ]),
+    };
+    assert.equal((await ciBuildPlan(root, env)).build, false);
+    // Without an ancestor, or with only malformed entries, everything builds.
+    for (const list of [[entry(other, 2)], [entry(other, 2), { commit: base }]]) {
+      assert.equal(
+        (await ciBuildPlan(root, { ...env, GITMATRIX_VERIFIED_BASE: JSON.stringify(list) })).build,
+        true,
+      );
+    }
+  });
+});
+
 await test("CI build selection cannot use absent, shallow, unrelated or mismatched evidence", async () => {
   await fixture(async (root, git, put) => {
     const base = (await git(["rev-parse", "HEAD"])).trim();
@@ -798,6 +830,17 @@ await test("local ready slims the full fallback to checks and direct tests", asy
       localReasons(plan.reasons).some((reason) => reason.startsWith("Full coverage")),
       false,
     );
+  });
+});
+
+await test("local ready runs the website unit tests a README change reaches", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("apps/website/README.md");
+    const { gates } = await local(root);
+    const website = gates.find((gate) => gate.name === "website-tests");
+    assert.ok(website);
+    assert.ok(website.args.some((arg) => arg.startsWith("--changed=")));
+    assert.equal(localNames(gates).includes("website-browser-tests"), false);
   });
 });
 

@@ -73,7 +73,8 @@ release. Add a tool name to select part of the graph. For example, run
   browser journeys and prerequisites. Server CI skips E2E (too expensive per
   push), so selected live journeys must pass locally before code lands. The
   main-only journeys and the complete suite run on each new main commit through
-  the `vp run agent main-e2e install` watcher, which files failures as P0
+  the `vp run agent main-e2e install` watcher (run it again after the watcher
+  changes), which first runs the full unit and browser suites and files failures as P0
   issues (it retries both environment limits, and a failing run stops at its first
   failing scenario, so the issue title names only that one); `--all` still runs
   everything locally. See

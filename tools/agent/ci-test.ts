@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { verifiedBaseline, type VerifiedBaseline } from "./ci-baseline.ts";
-import { labels, readinessPlan, websiteTestSelection } from "./ready-plan.ts";
+import { labels, readinessPlan, websiteTestSelection, WEBSITE_README } from "./ready-plan.ts";
 
 export interface CiTestPlan {
   full: boolean;
@@ -13,6 +13,34 @@ export interface CiTestPlan {
   workspaces: string[];
   websiteUnit: "all" | "changed" | "none";
   websiteBrowser: boolean;
+}
+
+const WEBSITE_RUNNER = "tools/agent/website-tests.ts";
+
+/**
+ * The files the website's `test` script runs on: website-tests.ts and whatever it imports
+ * relatively (followed statically, so a new import is covered). A change to one of them can
+ * break any website test, so none of Vitest's changed graph applies.
+ */
+export function websiteRunnerFiles(root: string): string[] {
+  const found = new Set<string>([WEBSITE_RUNNER, "tools/agent/heavy.ts"]);
+  const queue = [WEBSITE_RUNNER];
+  for (let path = queue.pop(); path; path = queue.pop()) {
+    let source: string;
+    try {
+      source = readFileSync(join(root, path), "utf8");
+    } catch {
+      continue;
+    }
+    for (const match of source.matchAll(/(?:from|import)\s*\(?\s*["'](\.{1,2}\/[^"']+)["']/g)) {
+      const target = join(dirname(path), match[1]!);
+      if (!found.has(target)) {
+        found.add(target);
+        queue.push(target);
+      }
+    }
+  }
+  return [...found].sort();
 }
 
 /**
@@ -55,7 +83,13 @@ export async function ciTestPlan(
   const reasons: string[] = [];
   let websiteUnit: CiTestPlan["websiteUnit"] = "none";
   let websiteBrowser = false;
-  if (gates.has("website-tests")) {
+  const runner = new Set(websiteRunnerFiles(root));
+  if (plan.changed.some((path) => runner.has(path))) {
+    websiteUnit = "all";
+    websiteBrowser = true;
+    reasons.push("The website's test runner changed: every website test runs.");
+  } else if (gates.has("website-tests") || plan.changed.includes(WEBSITE_README)) {
+    // The README is documentation to the plan, but a unit test reads it (as a `?raw` import).
     const selection = websiteTestSelection(plan.changed);
     websiteUnit = selection.unit;
     websiteBrowser = selection.browser;

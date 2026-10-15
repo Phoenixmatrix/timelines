@@ -12,7 +12,6 @@ import {
   JobCredentialsRevoked,
   jobPayload,
   loadJob,
-  MAX_CHUNK,
   report,
   settleStoppedJob,
   type StoredJob,
@@ -495,19 +494,24 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     let cancelled = false;
     let timedOut = false;
     let flushing: Promise<void> = Promise.resolve();
+    // The flush waiting behind the one in flight. It takes the buffer when it
+    // starts, so every caller meanwhile shares it instead of queueing another.
+    let queued: Promise<void> | null = null;
     let failingSince: number | null = null;
     const flush = () => {
+      if (queued) return queued;
       // One write at a time, taking the buffer when it starts, so text kept for a
       // retry stays ahead of what arrived since. Even a silent process must
       // observe revocation on the next poll.
-      flushing = flushing.then(async () => {
+      const run = (flushing = flushing.then(async () => {
+        queued = null;
         const text = buffer;
         buffer = "";
         let result: { cancelled: boolean };
         try {
           await resolveJobAuthority(this.env, jobId);
           result = await report(this.env, jobId, {
-            logs: chunks(text).map((t) => ({ step, text: t })),
+            logs: [{ step, text }],
           });
         } catch (error) {
           // A transient write failure keeps the text for the next flush instead
@@ -530,8 +534,8 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
           cancelled = true;
           process.kill();
         }
-      });
-      return flushing;
+      }));
+      return (queued = run);
     };
     // Flush until the text is written; flush throws once failures outlast FLUSH_FAILURE_MS.
     const drain = async () => {
@@ -582,18 +586,6 @@ export class CiSandbox extends DurableObject<Env> implements Purgeable {
     if ("error" in outcome) throw outcome.error;
     return outcome.code;
   }
-}
-
-/** Text as pieces a log chunk stores whole, cut after a newline where one fits. */
-export function chunks(text: string, size = MAX_CHUNK): string[] {
-  const out: string[] = [];
-  while (text.length > size) {
-    const cut = text.lastIndexOf("\n", size - 1) + 1 || size;
-    out.push(text.slice(0, cut));
-    text = text.slice(cut);
-  }
-  if (text) out.push(text);
-  return out;
 }
 
 /** The sandbox for one job. */

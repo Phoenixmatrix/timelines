@@ -29,6 +29,18 @@ export const e2eTimeoutMs = 85 * 60_000;
 export const testsTimeoutMs = 30 * 60_000;
 /** After SIGTERM the run gets this long to destroy its environment before SIGKILL. */
 export const e2eGraceMs = 3 * 60_000;
+/** The tests run has no environment to destroy: its process group gets this long, then SIGKILL. */
+export const testsGraceMs = 30_000;
+/** The full-suite command, as CI's full mode runs it: one suite at a time, so they do not share memory. */
+export const testsCommand = [
+  "run",
+  "--filter",
+  "!cli",
+  "--concurrency-limit",
+  "1",
+  "--no-cache",
+  "test",
+];
 export const unitTimeoutMinutes = 150;
 const OPEN_STATUSES = new Set(["backlog", "todo", "in_progress"]);
 
@@ -39,12 +51,25 @@ export interface MainE2EResult {
   failedScenarios: string[];
   evidence: string | null;
   log: string;
+  /** The unit and browser suites' log, recorded when they ran for this commit. */
+  testsLog?: string;
   finishedAt: string;
+}
+
+/** The full unit and browser suites' outcome for one main commit. */
+export interface TestsResult {
+  sha: string;
+  success: boolean;
+  log: string;
+  /** A failure was filed (or commented on) while E2E was deferred; not filed twice. */
+  reported?: boolean;
 }
 
 export interface MainE2EState {
   lastTested?: string;
   lastResult?: MainE2EResult;
+  /** The suites' outcome for the head being tested, so a deferred E2E does not rerun them. */
+  testsResult?: TestsResult;
   /** The run finished but the tracker could not be told yet; retried before the next run. */
   reportPending?: { result: MainE2EResult; previousFailed: boolean };
   /** The checkout could not be brought to origin/main, so the watcher cannot test anything. */
@@ -158,16 +183,28 @@ export function failureBody(result: MainE2EResult, heading: string): string {
   const scenarios = result.failedScenarios.length
     ? result.failedScenarios.map((name) => `- ${name}`).join("\n")
     : "- none recorded";
+  const testsFailed = result.failedStages.includes("tests");
+  // Only the tests failed: the E2E log is of a passing (or deferred) run and says nothing.
+  const e2eFailed =
+    result.failedScenarios.length > 0 || result.failedStages.some((stage) => stage !== "tests");
   return [
     `${heading} at ${result.sha}.`,
     "",
     `Failed stages: ${result.failedStages.join(", ") || "none recorded"}`,
-    "Failed scenarios:",
-    scenarios,
-    `Evidence: ${result.evidence ?? "none retained"}`,
-    `Run log: ${result.log}`,
-    "",
-    `Reproduce: check out ${result.sha} and run \`vp run agent test\` (the complete non-AI suite).`,
+    ...(e2eFailed || !testsFailed ? ["Failed scenarios:", scenarios] : []),
+    ...(testsFailed
+      ? [
+          `Unit and browser tests log: ${result.testsLog ?? "none retained"}`,
+          `Reproduce the tests: check out ${result.sha} and run \`vp run --filter '!cli' --concurrency-limit 1 test\`.`,
+        ]
+      : []),
+    ...(e2eFailed || !testsFailed
+      ? [
+          `Evidence: ${result.evidence ?? "none retained"}`,
+          `Run log: ${result.log}`,
+          `Reproduce the E2E: check out ${result.sha} and run \`vp run agent test\` (the complete non-AI suite).`,
+        ]
+      : []),
     "",
     `Reported by the main E2E watcher (finished ${result.finishedAt}).`,
   ].join("\n");
@@ -176,6 +213,30 @@ export function failureBody(result: MainE2EResult, heading: string): string {
 /** A tick that cannot start because of the environment cap is retried, never reported. */
 export function shouldSkipRetest(head: string, state: MainE2EState): boolean {
   return state.lastTested === head && !state.reportPending;
+}
+
+/** Whether the suites must run for this head, or an earlier tick's outcome is reused. */
+export type TestsDecision = { kind: "run" } | { kind: "reuse"; tests: TestsResult };
+
+/** A deferred E2E (environment cap) retries every tick; the suites run once per head. */
+export function decideTests(head: string, state: MainE2EState): TestsDecision {
+  return state.testsResult?.sha === head
+    ? { kind: "reuse", tests: state.testsResult }
+    : { kind: "run" };
+}
+
+/** The result for a failed suites run whose E2E has not run (yet): reported through the same P0 path. */
+export function testsFailureResult(tests: TestsResult, finishedAt: string): MainE2EResult {
+  return {
+    sha: tests.sha,
+    success: false,
+    failedStages: ["tests"],
+    failedScenarios: [],
+    evidence: null,
+    log: tests.log,
+    testsLog: tests.log,
+    finishedAt,
+  };
 }
 
 /** Why a finished run is not a result: both environment limits mean retry later (CORE-406). */
@@ -209,14 +270,18 @@ export function decideOutcome(input: {
 }
 
 /** A full-suite failure joins the E2E result: the same P0 report, dedupe and recovery apply. */
-export function withTestsOutcome(outcome: RunOutcome, testsPassed: boolean): RunOutcome {
-  if (outcome.kind !== "result" || testsPassed) return outcome;
+export function withTestsOutcome(
+  outcome: RunOutcome,
+  tests: Pick<TestsResult, "success" | "log">,
+): RunOutcome {
+  if (outcome.kind !== "result" || tests.success) return outcome;
   const { result } = outcome;
   return {
     kind: "result",
     result: {
       ...result,
       success: false,
+      testsLog: tests.log,
       failedStages: result.failedStages.includes("tests")
         ? result.failedStages
         : [...result.failedStages, "tests"],
@@ -298,6 +363,28 @@ export function serviceUnit(input: {
   return `[Unit]\nDescription=Run the complete non-AI E2E suite on the newest main commit\n[Service]\nType=oneshot\nWorkingDirectory=${workingDirectory}\nExecStart=${quote(input.node)} ${quote(input.entry)} --execution local main-e2e tick\nEnvironment=${quote(`PATH=${input.path}`)}\nTimeoutStartSec=${unitTimeoutMinutes}min\n`;
 }
 
+/** The TimeoutStartSec minutes an installed service unit carries, or null when it has none. */
+export function installedTimeoutMinutes(unit: string): number | null {
+  const match = /^TimeoutStartSec=(\d+)min$/m.exec(unit);
+  return match ? Number(match[1]) : null;
+}
+
+/** A warning when the installed unit's timeout is not what `serviceUnit` writes now. */
+export function staleUnitWarning(installed: string | null): string | null {
+  if (installed === null) return null;
+  const minutes = installedTimeoutMinutes(installed);
+  if (minutes === unitTimeoutMinutes) return null;
+  return `The installed ${unitName}.service has TimeoutStartSec=${minutes === null ? "unset" : `${minutes}min`}, not ${unitTimeoutMinutes}min: run \`vp run agent main-e2e install\` to update it.`;
+}
+
+async function installedUnit(): Promise<string | null> {
+  try {
+    return await readFile(join(unitDirectory, `${unitName}.service`), "utf8");
+  } catch {
+    return null;
+  }
+}
+
 export function timerUnit(): string {
   return `[Unit]\nDescription=Check for a new main commit to run full E2E on\n[Timer]\nOnBootSec=5min\nOnUnitInactiveSec=5min\nPersistent=false\n[Install]\nWantedBy=timers.target\n`;
 }
@@ -328,6 +415,57 @@ function run(
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
       resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+/**
+ * Runs a command in its own process group, output to `descriptor`. On timeout the whole group
+ * gets SIGTERM, then SIGKILL after `graceMs`; leftovers (Vitest workers, Chromium) are killed
+ * when it exits, so nothing outlives the run.
+ */
+function runGroup(
+  binary: string,
+  args: string[],
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    descriptor: number;
+    timeoutMs: number;
+    graceMs: number;
+  },
+): Promise<{ code: number | null; timedOut: boolean }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(binary, args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ["ignore", options.descriptor, options.descriptor],
+      detached: true,
+    });
+    const signal = (name: NodeJS.Signals) => {
+      try {
+        process.kill(-child.pid!, name);
+      } catch {
+        // The group is already gone.
+      }
+    };
+    let timedOut = false;
+    let killer: NodeJS.Timeout | null = null;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      signal("SIGTERM");
+      killer = setTimeout(() => signal("SIGKILL"), options.graceMs);
+    }, options.timeoutMs);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      if (killer) clearTimeout(killer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (killer) clearTimeout(killer);
+      signal("SIGKILL");
+      resolve({ code, timedOut });
     });
   });
 }
@@ -433,6 +571,7 @@ export async function mainE2EStatus(): Promise<string> {
   const state = await readState();
   return [
     units.stdout || units.stderr,
+    staleUnitWarning(await installedUnit()) ?? "",
     `Last result: ${state.lastResult ? JSON.stringify(state.lastResult, null, 2) : "none yet"}`,
     state.reportPending ? "A tracker report is pending and will be retried." : "",
     `State: ${stateDirectory}`,
@@ -718,30 +857,35 @@ export async function tick(): Promise<void> {
       return;
     }
     log("start", { sha: head });
+    const stale = staleUnitWarning(await installedUnit());
+    if (stale) log("unit-stale", { warning: stale });
     await ok("vp", ["install"], { cwd, timeout: installTimeoutMs });
     await mkdir(join(stateDirectory, "runs"), { recursive: true, mode: 0o700 });
     // The full unit and browser suites, which remote CI no longer runs per push (it tests only
     // what a change affects). A failure is reported with the E2E result; E2E runs regardless.
-    const testsLog = openSync(join(stateDirectory, "runs", `${head}.tests.log`), "w", 0o600);
-    let testsPassed: boolean;
-    try {
-      testsPassed = await new Promise<boolean>((resolve, reject) => {
-        const child = spawn("vp", ["run", "--filter", "!cli", "--no-cache", "test"], {
+    // The outcome is kept per head: a deferred E2E retries every tick without rerunning them.
+    const decision = decideTests(head, state);
+    let tests: TestsResult;
+    if (decision.kind === "reuse") tests = decision.tests;
+    else {
+      const testsLogPath = join(stateDirectory, "runs", `${head}.tests.log`);
+      const testsLog = openSync(testsLogPath, "w", 0o600);
+      try {
+        const ran = await runGroup("vp", testsCommand, {
           cwd,
           env: { ...process.env, NO_COLOR: "1" },
-          stdio: ["ignore", testsLog, testsLog],
+          descriptor: testsLog,
+          timeoutMs: testsTimeoutMs,
+          graceMs: testsGraceMs,
         });
-        const timer = setTimeout(() => child.kill("SIGKILL"), testsTimeoutMs);
-        child.on("error", reject);
-        child.on("close", (exit) => {
-          clearTimeout(timer);
-          resolve(exit === 0);
-        });
-      });
-    } finally {
-      closeSync(testsLog);
+        tests = { sha: head, success: !ran.timedOut && ran.code === 0, log: testsLogPath };
+      } finally {
+        closeSync(testsLog);
+      }
+      state = { ...state, testsResult: tests };
+      await writeState(state);
     }
-    log("tests", { sha: head, passed: testsPassed });
+    log("tests", { sha: head, passed: tests.success, reused: decision.kind === "reuse" });
     const logPath = join(stateDirectory, "runs", `${head}.log`);
     const descriptor = openSync(logPath, "w", 0o600);
     let code: number | null;
@@ -781,10 +925,25 @@ export async function tick(): Promise<void> {
         log: logPath,
         finishedAt: new Date().toISOString(),
       }),
-      testsPassed,
+      tests,
     );
     if (outcome.kind === "retry-later") {
       log("environment-limit", { sha: head, log: logPath });
+      // Report a tests failure now, once: E2E may stay deferred for hours.
+      if (!tests.success && !tests.reported) {
+        const result = testsFailureResult(tests, new Date().toISOString());
+        const previousFailed = state.lastResult ? !state.lastResult.success : false;
+        log("finished", { ...result, e2e: "deferred" });
+        state = {
+          ...state,
+          lastResult: result,
+          testsResult: { ...tests, reported: true },
+          reportPending: { result, previousFailed },
+        };
+        await writeState(state);
+        await report(result, previousFailed, cwd);
+        await writeState({ ...state, reportPending: undefined });
+      }
       return;
     }
     const result = outcome.result;

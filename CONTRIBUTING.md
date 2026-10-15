@@ -717,8 +717,12 @@ vp run agent main-e2e install    # also: status, uninstall
 
 It keeps its own checkout and state in `~/.local/state/gitmatrix-agent/main-e2e/`
 (`gm worktree add` on `origin/main`, never a feature worktree) and every five minutes
-runs `gm sync`; when main moved it runs `vp install` and the same full suite as
-`vp run agent test`, logging to `runs/<sha>.log`. Runs never overlap, and several
+runs `gm sync`; when main moved it runs `vp install`, then the full unit and browser
+suites (`vp run --filter '!cli' --concurrency-limit 1 --no-cache test`, in their own
+process group, logging to `runs/<sha>.tests.log`: remote CI tests only what a push
+affects), then the same full suite as `vp run agent test`, logging to `runs/<sha>.log`.
+The suites run once per commit: a tick whose E2E is deferred by the environment limit
+reuses their outcome, and a failure is filed at once. Runs never overlap, and several
 commits that land during a run are tested together as the newest one.
 
 Failures become P0 bug issues tagged `testing` and `main-e2e` on main (never a
@@ -726,8 +730,10 @@ timeline), titled `Main E2E failing: <scenarios>`, with the commit, failed stage
 scenarios, evidence path, log and reproduction. While an open issue names the same
 failing set, later commits add a comment instead. When main passes again each open
 `main-e2e` issue gets a "Passing again" comment; closing stays a person's decision.
-A run refused for the installation or the machine environment limit files nothing
-and is retried on the next tick. A run stops at its first failing scenario, so the
+A tests failure files the same P0 issue (stage `tests`, with the tests log and its
+reproduction) even when scenarios fail too, in which case the title names only the
+scenarios and the body lists both. A run refused for the installation or the machine
+environment limit files nothing for E2E and is retried on the next tick. A run stops at its first failing scenario, so the
 issue title names that first failure: a second regression can hide behind it until the
 first is fixed. A run that outlasts its budget (85 minutes) is stopped with SIGTERM so
 it can destroy its environment, then SIGKILL after three minutes, and is reported as
@@ -738,6 +744,10 @@ and, failing that, files a P0 `Main E2E watcher stuck: <reason>` issue once and 
 on it when the checkout recovers. A running suite holds one environment slot for its duration (about
 as long as `vp run agent test`). `uninstall` removes the units and keeps the checkout
 and state.
+
+The unit's 150-minute `TimeoutStartSec` (room for the suites and E2E) reaches only a
+fresh install: after updating, run `vp run agent main-e2e install` again. `status` and
+the start of each tick warn when the installed unit's timeout differs.
 
 ### AI capability verification
 

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { ciTestPlan } from "./ci-test.ts";
+import { ciTestPlan, websiteRunnerFiles } from "./ci-test.ts";
 
 const exec = promisify(execFile);
 const repository = resolve(import.meta.dirname, "../..");
@@ -190,5 +190,59 @@ await test("the lockfile, CI configuration and workspace manifests select the fu
       assert.equal(selected.websiteBrowser, true, path);
       await git(["checkout", "--", path]);
     }
+  });
+});
+
+await test("a remote runtime change runs the agent tests that import it", async () => {
+  await fixture(async (plan, put) => {
+    await put("tools/remote/runtime.mjs");
+    const selected = await plan();
+    assert.equal(selected.full, false);
+    assert.ok(selected.workspaces.includes("agent"));
+  });
+});
+
+await test("a change to the website's test runner runs every website test", async () => {
+  await fixture(async (plan, put, git) => {
+    for (const path of ["tools/agent/website-tests.ts", "tools/agent/heavy.ts"]) {
+      await put(path);
+      const selected = await plan();
+      assert.equal(selected.full, false, path);
+      assert.equal(selected.websiteUnit, "all", path);
+      assert.equal(selected.websiteBrowser, true, path);
+      await git(["clean", "-fdq"]);
+    }
+  });
+});
+
+await test("the test runner's files follow its relative imports", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ci-test-runner-"));
+  try {
+    await mkdir(join(root, "tools/agent"), { recursive: true });
+    await writeFile(
+      join(root, "tools/agent/website-tests.ts"),
+      'import { a } from "./a.ts";\nimport { x } from "node:path";\n',
+    );
+    await writeFile(join(root, "tools/agent/a.ts"), 'export { b } from "./b.ts";\n');
+    await writeFile(join(root, "tools/agent/b.ts"), "export const b = 1;\n");
+    assert.deepEqual(websiteRunnerFiles(root), [
+      "tools/agent/a.ts",
+      "tools/agent/b.ts",
+      "tools/agent/heavy.ts",
+      "tools/agent/website-tests.ts",
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+  assert.ok(websiteRunnerFiles(repository).includes("tools/agent/heavy.ts"));
+});
+
+await test("the website README, which a unit test reads, runs the changed unit tests only", async () => {
+  await fixture(async (plan, put) => {
+    await put("apps/website/README.md");
+    const selected = await plan();
+    assert.equal(selected.full, false);
+    assert.equal(selected.websiteUnit, "changed");
+    assert.equal(selected.websiteBrowser, false);
   });
 });
