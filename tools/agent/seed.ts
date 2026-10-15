@@ -204,67 +204,73 @@ export async function seedFixtures(
 
   // Each attempt clones from the real service. Interrupted pushes are recovered by
   // examining the remote contents, not by trusting a local completion marker.
-  for (const repo of repos) {
-    const directory = await mkdtemp(join(ctx.work, "seed-clone-"));
-    const token = repo.space === "sam" ? tokens.sam : tokens.marco;
-    const env = { ...ctx.env };
-    for (const key of Object.keys(env)) {
-      if (
-        key.startsWith("GIT_CONFIG_") ||
-        key.startsWith("GITMATRIX_TOKEN") ||
-        key === "SSH_AUTH_SOCK" ||
-        key === "GM_TOKEN"
-      )
-        delete env[key];
-    }
-    Object.assign(env, {
-      GM_SERVER: ctx.origin,
-      GM_TOKEN: token,
-      XDG_CONFIG_HOME: join(ctx.dir, "config"),
-      XDG_CACHE_HOME: join(ctx.dir, "cache"),
-      XDG_DATA_HOME: join(ctx.dir, "data"),
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_CONFIG_GLOBAL: "/dev/null",
-      GIT_TERMINAL_PROMPT: "0",
-      GIT_AUTHOR_NAME: "Gitmatrix Fixtures",
-      GIT_AUTHOR_EMAIL: "fixtures@gitmatrix.invalid",
-      GIT_COMMITTER_NAME: "Gitmatrix Fixtures",
-      GIT_COMMITTER_EMAIL: "fixtures@gitmatrix.invalid",
-      GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
-      GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
-    });
-    async function gm(args: string[], cwd: string): Promise<void> {
-      try {
-        await exec(ctx.gm, args, { cwd, env, timeout: 120_000, maxBuffer: 1024 * 1024 });
-      } catch {
-        throw new Error(
-          `Seed gm ${args[0]} failed for ${repo.space}/${repo.name}; credentials and child output withheld.`,
-        );
+  // The repositories are independent (own clone directory, own env copy), so they run
+  // concurrently; every settled result is awaited before the first failure is rethrown,
+  // so no clone is still running when the caller tears the environment down.
+  const pushed = await Promise.allSettled(
+    repos.map(async (repo) => {
+      const directory = await mkdtemp(join(ctx.work, "seed-clone-"));
+      const token = repo.space === "sam" ? tokens.sam : tokens.marco;
+      const env = { ...ctx.env };
+      for (const key of Object.keys(env)) {
+        if (
+          key.startsWith("GIT_CONFIG_") ||
+          key.startsWith("GITMATRIX_TOKEN") ||
+          key === "SSH_AUTH_SOCK" ||
+          key === "GM_TOKEN"
+        )
+          delete env[key];
       }
-    }
-    try {
-      const checkout = join(directory, "repo");
-      await gm(["clone", `${repo.space}/${repo.name}`, checkout], directory);
-      const contents = `# ${repo.space}/${repo.name}\n\nDeterministic Gitmatrix agent fixture, version 1.\n`;
-      let existing: string | undefined;
-      try {
-        existing = await readFile(join(checkout, "README.md"), "utf8");
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      }
-      if (existing !== contents) {
-        if (existing !== undefined)
+      Object.assign(env, {
+        GM_SERVER: ctx.origin,
+        GM_TOKEN: token,
+        XDG_CONFIG_HOME: join(ctx.dir, "config"),
+        XDG_CACHE_HOME: join(ctx.dir, "cache"),
+        XDG_DATA_HOME: join(ctx.dir, "data"),
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_AUTHOR_NAME: "Gitmatrix Fixtures",
+        GIT_AUTHOR_EMAIL: "fixtures@gitmatrix.invalid",
+        GIT_COMMITTER_NAME: "Gitmatrix Fixtures",
+        GIT_COMMITTER_EMAIL: "fixtures@gitmatrix.invalid",
+        GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
+        GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
+      });
+      async function gm(args: string[], cwd: string): Promise<void> {
+        try {
+          await exec(ctx.gm, args, { cwd, env, timeout: 120_000, maxBuffer: 1024 * 1024 });
+        } catch {
           throw new Error(
-            `Fixture ${repo.space}/${repo.name} has unexpected contents; refusing to overwrite.`,
+            `Seed gm ${args[0]} failed for ${repo.space}/${repo.name}; credentials and child output withheld.`,
           );
-        await writeFile(join(checkout, "README.md"), contents);
-        await gm(["commit", "-m", "Seed deterministic agent fixture"], checkout);
-        await gm(["push"], checkout);
+        }
       }
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  }
+      try {
+        const checkout = join(directory, "repo");
+        await gm(["clone", `${repo.space}/${repo.name}`, checkout], directory);
+        const contents = `# ${repo.space}/${repo.name}\n\nDeterministic Gitmatrix agent fixture, version 1.\n`;
+        let existing: string | undefined;
+        try {
+          existing = await readFile(join(checkout, "README.md"), "utf8");
+        } catch (error) {
+          if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+        }
+        if (existing !== contents) {
+          if (existing !== undefined)
+            throw new Error(
+              `Fixture ${repo.space}/${repo.name} has unexpected contents; refusing to overwrite.`,
+            );
+          await writeFile(join(checkout, "README.md"), contents);
+          await gm(["commit", "-m", "Seed deterministic agent fixture"], checkout);
+          await gm(["push"], checkout);
+        }
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }),
+  );
+  for (const result of pushed) if (result.status === "rejected") throw result.reason;
   const scope = await request<{ contractVersion: 4; spaceId: string; migrationEpoch: number }>(
     "/tracker/orbit/snapshot",
     tokens.marco,

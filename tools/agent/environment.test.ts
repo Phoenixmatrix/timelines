@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withFileLock } from "./heavy.ts";
 import { spawn } from "node:child_process";
 import { watch } from "node:fs";
 import { once } from "node:events";
@@ -587,6 +588,55 @@ await test("the sweep before a create leaves orphaned namespaces to the janitor"
       `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired().catch(() => {});`,
     );
     assert.match(await readFile(calls, "utf8"), /artifacts/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("a sweep skips an environment another process is destroying, then finishes it", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-destroy-lock-"));
+  try {
+    const root = join(home, "worktree");
+    const directory = join(home, ".local/state/gitmatrix-agent/environments");
+    const bin = join(home, "bin");
+    await mkdir(directory, { recursive: true });
+    await mkdir(root, { recursive: true });
+    await mkdir(bin);
+    const env = owned(root);
+    env.created -= 172_800_000;
+    env.expires -= 172_800_000;
+    env.status = "deleting";
+    const journal = join(directory, `${env.id}.json`);
+    await writeFile(journal, JSON.stringify(env));
+    const calls = join(home, "cf-calls");
+    await writeFile(
+      join(bin, "cf"),
+      `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(' ') + '\\n'); console.log(process.argv.includes('list') ? '[]' : '{}');\n`,
+      { mode: 0o700 },
+    );
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const run = (code: string) =>
+      command(process.execPath, ["--input-type=module", "-e", code], {
+        env: {
+          ...unitTestEnvironment(process.env),
+          HOME: home,
+          PATH: `${bin}:${process.env.PATH}`,
+        },
+      });
+    // A background cleanup holds this environment's destroy lock.
+    const output = await withFileLock(join(directory, `${env.id}.destroy.lock`), 0, () =>
+      run(
+        `import {cleanupExpired} from ${JSON.stringify(module)}; const errors = []; console.error = (...parts) => errors.push(parts.join(" ")); await cleanupExpired(); console.log(JSON.stringify(errors));`,
+      ),
+    );
+    const errors = JSON.parse(output.trim().split("\n").at(-1) ?? "[]") as string[];
+    assert.ok(errors.some((line) => line.includes("cleanup.in-progress") && line.includes(env.id)));
+    assert.equal(await readFile(calls, "utf8").catch(() => ""), "");
+    assert.equal((JSON.parse(await readFile(journal, "utf8")) as Environment).status, "deleting");
+    // Once it lets go, the next sweep destroys it.
+    await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
+    assert.match(await readFile(calls, "utf8"), /artifacts/);
+    assert.equal((JSON.parse(await readFile(journal, "utf8")) as Environment).status, "deleted");
   } finally {
     await rm(home, { recursive: true, force: true });
   }

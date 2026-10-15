@@ -17,6 +17,7 @@ import {
 } from "./quota.ts";
 import type { QuotaReservation } from "./quota.ts";
 import { prunable, sweepReservations } from "./reservations.ts";
+import { e2eWorkers } from "./ready-e2e.ts";
 
 const TTL = 24 * 60 * 60 * 1000;
 const ID = /^gma-[a-z0-9]{8,10}-[a-f0-9]{12}$/;
@@ -623,6 +624,40 @@ export async function destroyEnvironment(env: Environment): Promise<void> {
   console.log(JSON.stringify({ event: `environment.${env.status}`, id: env.id }));
 }
 
+/** The lock one environment's destroy holds, apart from the registry lock. */
+function destroyLockPath(id: string): string {
+  return join(registry, "environments", `${id}.destroy.lock`);
+}
+
+class DestroyInProgress extends Error {}
+
+/**
+ * Destroy under the environment's own lock, without the registry lock: ready's background
+ * cleanup deletes for up to a minute, and must not stall the next setup on this machine.
+ */
+export async function destroyExclusively(env: Environment): Promise<void> {
+  await mkdir(join(registry, "environments"), { recursive: true, mode: 0o700 });
+  await withFileLock(destroyLockPath(env.id), 300, () => destroyEnvironment(env));
+}
+
+/** Destroy unless another process (a background cleanup) is already destroying it. */
+async function destroyUnlessBusy(env: Environment): Promise<boolean> {
+  try {
+    await withFileLock(
+      destroyLockPath(env.id),
+      0,
+      () => destroyEnvironment(env),
+      () => {
+        throw new DestroyInProgress();
+      },
+    );
+    return true;
+  } catch (error) {
+    if (error instanceof DestroyInProgress) return false;
+    throw error;
+  }
+}
+
 /**
  * Destroy expired environments and retry incomplete deletions. `orphans: false`
  * leaves orphaned namespaces to the hourly janitor: retrying each one costs a
@@ -660,7 +695,8 @@ export async function cleanupExpired({ orphans = true } = {}): Promise<void> {
       )
         continue;
       try {
-        await destroyEnvironment(env);
+        if (!(await destroyUnlessBusy(env)))
+          console.error(JSON.stringify({ event: "cleanup.in-progress", id: env.id }));
       } catch (error) {
         failures.push(String(error));
       }
@@ -937,6 +973,7 @@ export async function context(env: Environment): Promise<HarnessContext> {
     { mode: 0o600 },
   );
   const gm = join(env.root, "apps", "cli", "target", "debug", "gm");
+  const workers = e2eWorkers();
   const hosted = process.env.GITMATRIX_REMOTE_HOSTED === "1";
   const preview = hosted && env.dir === join(env.root, ".gitmatrix-agent");
   if (hosted) {
@@ -964,7 +1001,8 @@ export async function context(env: Environment): Promise<HarnessContext> {
     GITMATRIX_AI_GATEWAY: env.id,
     GITMATRIX_GM: gm,
     GITMATRIX_CI_RUNNER: "local",
-    GITMATRIX_CI_RUNNERS: "2",
+    // Scenarios side by side share these slots: a third when they overlap.
+    GITMATRIX_CI_RUNNERS: String(workers > 1 ? Math.max(2, Math.min(3, workers)) : 2),
     // A timeline's full CI and overlays wait for its pushes to pause (CORE-238):
     // seconds here, so scenarios exercise the wait without spending minutes on it.
     GITMATRIX_TIMELINE_QUIET_SECONDS: "3",
