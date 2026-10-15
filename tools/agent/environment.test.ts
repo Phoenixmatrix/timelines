@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withFileLock } from "./heavy.ts";
 import { spawn } from "node:child_process";
 import { watch } from "node:fs";
 import { once } from "node:events";
@@ -19,6 +20,7 @@ import {
 } from "./environment.ts";
 import type { Environment } from "./environment.ts";
 import { parseEnvironmentLimits } from "./quota.ts";
+import { HANDOFF_ENV, awaitHandoff } from "./live-run.ts";
 import { developmentEnvironment } from "../../apps/website/vite/environment.ts";
 
 function owned(root = "/tmp/agent-worktree"): Environment {
@@ -587,6 +589,55 @@ await test("the sweep before a create leaves orphaned namespaces to the janitor"
       `import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired().catch(() => {});`,
     );
     assert.match(await readFile(calls, "utf8"), /artifacts/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("a sweep skips an environment another process is destroying, then finishes it", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gitmatrix-destroy-lock-"));
+  try {
+    const root = join(home, "worktree");
+    const directory = join(home, ".local/state/gitmatrix-agent/environments");
+    const bin = join(home, "bin");
+    await mkdir(directory, { recursive: true });
+    await mkdir(root, { recursive: true });
+    await mkdir(bin);
+    const env = owned(root);
+    env.created -= 172_800_000;
+    env.expires -= 172_800_000;
+    env.status = "deleting";
+    const journal = join(directory, `${env.id}.json`);
+    await writeFile(journal, JSON.stringify(env));
+    const calls = join(home, "cf-calls");
+    await writeFile(
+      join(bin, "cf"),
+      `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(' ') + '\\n'); console.log(process.argv.includes('list') ? '[]' : '{}');\n`,
+      { mode: 0o700 },
+    );
+    const module = fileURLToPath(new URL("./environment.ts", import.meta.url));
+    const run = (code: string) =>
+      command(process.execPath, ["--input-type=module", "-e", code], {
+        env: {
+          ...unitTestEnvironment(process.env),
+          HOME: home,
+          PATH: `${bin}:${process.env.PATH}`,
+        },
+      });
+    // A background cleanup holds this environment's destroy lock.
+    const output = await withFileLock(join(directory, `${env.id}.destroy.lock`), 0, () =>
+      run(
+        `import {cleanupExpired} from ${JSON.stringify(module)}; const errors = []; console.error = (...parts) => errors.push(parts.join(" ")); await cleanupExpired(); console.log(JSON.stringify(errors));`,
+      ),
+    );
+    const errors = JSON.parse(output.trim().split("\n").at(-1) ?? "[]") as string[];
+    assert.ok(errors.some((line) => line.includes("cleanup.in-progress") && line.includes(env.id)));
+    assert.equal(await readFile(calls, "utf8").catch(() => ""), "");
+    assert.equal((JSON.parse(await readFile(journal, "utf8")) as Environment).status, "deleting");
+    // Once it lets go, the next sweep destroys it.
+    await run(`import {cleanupExpired} from ${JSON.stringify(module)}; await cleanupExpired();`);
+    assert.match(await readFile(calls, "utf8"), /artifacts/);
+    assert.equal((JSON.parse(await readFile(journal, "utf8")) as Environment).status, "deleted");
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -1592,6 +1643,8 @@ await test("the sweep releases only released-locally and own-orphan reservations
     assert.deepEqual(Object.keys(await rows()).sort(), Object.keys(initial).sort());
     await readFile(join(local, `${old.id}.json`));
     await rm(join(home, "quota-response.json"));
+    // A background cleanup's lock file goes with its pruned journal.
+    await writeFile(join(local, `${old.id}.destroy.lock`), "");
     await run(sweep);
     assert.deepEqual(
       Object.keys(await rows()).sort(),
@@ -1599,6 +1652,7 @@ await test("the sweep releases only released-locally and own-orphan reservations
       "the sweep never releases expired-foreign rows",
     );
     await assert.rejects(readFile(join(local, `${old.id}.json`)), { code: "ENOENT" });
+    await assert.rejects(readFile(join(local, `${old.id}.destroy.lock`)), { code: "ENOENT" });
     await assert.rejects(readFile(join(local, `${unadmitted.id}.json`)), { code: "ENOENT" });
     // Its authority was not listed, so nothing proves that reservation is gone.
     await readFile(join(local, `${moved.id}.json`));
@@ -1748,6 +1802,174 @@ await test("the reservation host id belongs to one machine and is published atom
     );
     assert.equal(none.trim(), "null");
     await assert.rejects(readFile(path), { code: "ENOENT" });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("setup never adopts a journal a background cleanup is destroying (CORE-368)", async () => {
+  const { home, env, environment, run, rows } = await quotaHome("gitmatrix-adopt-destroying-");
+  try {
+    const calls = join(home, "cf-calls");
+    await writeFile(
+      join(home, "bin/cf"),
+      `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args[0] !== 'auth') require('node:fs').appendFileSync(${JSON.stringify(calls)}, args.join(' ') + '\\n');
+console.log(args[0] === 'auth'
+  ? JSON.stringify({ authenticated: true, tokenValid: true, accounts: [{ id: '${"a".repeat(32)}' }] })
+  : args.includes('list') ? '[]' : '{}');
+`,
+      { mode: 0o700 },
+    );
+    const first = join(home, "first");
+    await mkdir(first);
+    await run(
+      `import {createEnvironment} from ${JSON.stringify(environment)}; await createEnvironment(${JSON.stringify(first)});`,
+    );
+    const created = JSON.parse(
+      await readFile(join(first, ".gitmatrix-agent/environment.json"), "utf8"),
+    ) as Environment;
+    const directory = join(home, ".local/state/gitmatrix-agent/environments");
+    const journal = join(directory, `${created.id}.json`);
+    // Mid-destroy: marked deleting, and its release has reached the authority but not yet
+    // the journal. Adopting it now would reserve the row again.
+    const text = JSON.stringify({ ...created, status: "deleting" });
+    await writeFile(journal, text);
+    await writeFile(join(home, "quota.json"), "{}");
+    await writeFile(calls, "");
+    const second = join(home, "second");
+    await mkdir(second);
+    const create = `import {createEnvironment} from ${JSON.stringify(environment)}; const errors = []; console.error = (...parts) => errors.push(parts.join(" ")); const env = await createEnvironment(${JSON.stringify(second)}, true); console.log(JSON.stringify({id: env.id, errors}));`;
+    const output = await withFileLock(join(directory, `${created.id}.destroy.lock`), 0, () =>
+      command(process.execPath, ["--input-type=module", "-e", create], { env }),
+    );
+    const { id, errors } = JSON.parse(output.trim().split("\n").at(-1)!) as {
+      id: string;
+      errors: string[];
+    };
+    assert.ok(
+      errors.some((line) => line.includes("adoption-skipped") && line.includes(created.id)),
+    );
+    assert.equal(await readFile(journal, "utf8"), text, "the journal being destroyed is untouched");
+    assert.deepEqual(Object.keys(await rows()), [id], "no reservation is resurrected");
+    assert.ok(!(await readFile(calls, "utf8")).includes(created.id), "nor is it destroyed twice");
+    // Once that destroy lets go, the next sweep finishes it and nothing re-reserves it.
+    await run(
+      `import {createEnvironment} from ${JSON.stringify(environment)}; await createEnvironment(${JSON.stringify(second)}, true);`,
+    );
+    const finished = JSON.parse(await readFile(journal, "utf8")) as Environment;
+    assert.equal(finished.status, "deleted");
+    assert.equal(finished.quota?.state, "released");
+    assert.ok(!(created.id in (await rows())));
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("the detached cleanup marks the journal deleting under its lock, then announces", async () => {
+  const { home, env, environment, run, rows } = await quotaHome("gitmatrix-cleanup-handoff-");
+  try {
+    const root = join(home, "worktree");
+    await mkdir(root);
+    await run(
+      `import {createEnvironment} from ${JSON.stringify(environment)}; await createEnvironment(${JSON.stringify(root)});`,
+    );
+    const created = JSON.parse(
+      await readFile(join(root, ".gitmatrix-agent/environment.json"), "utf8"),
+    ) as Environment;
+    const directory = join(home, ".local/state/gitmatrix-agent/environments");
+    const journal = join(directory, `${created.id}.json`);
+    // Remote deletions wait for this file, so the destroy is observed in flight.
+    const release = join(home, "release");
+    await writeFile(
+      join(home, "bin/cf"),
+      `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] !== 'auth') while (!fs.existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+console.log(args[0] === 'auth'
+  ? JSON.stringify({ authenticated: true, tokenValid: true, accounts: [{ id: '${"a".repeat(32)}' }] })
+  : args.includes('list') ? '[]' : '{}');
+`,
+      { mode: 0o700 },
+    );
+    const liveRun = fileURLToPath(new URL("./live-run.ts", import.meta.url));
+    const announced = join(home, "journal-at-announcement.json");
+    // As main.ts's destroy-environment does it, with the pipe and variable ready sets.
+    const child = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        // Records the journal as it stands when the child announces, before destroyEnvironment's
+        // own writes, in a file written before the announcement (two pipes have no common order).
+        `import {copyFileSync} from "node:fs"; import {destroyExclusively} from ${JSON.stringify(environment)}; import {announceHandoff} from ${JSON.stringify(liveRun)}; await destroyExclusively(${JSON.stringify(created)}, () => { copyFileSync(${JSON.stringify(journal)}, ${JSON.stringify(announced)}); announceHandoff(); });`,
+      ],
+      { env: { ...env, [HANDOFF_ENV]: "1" }, stdio: ["ignore", "pipe", "pipe", "pipe"] },
+    );
+    let output = "";
+    child.stdout!.on("data", (chunk: Buffer) => (output += chunk.toString()));
+    child.stderr!.on("data", (chunk: Buffer) => (output += chunk.toString()));
+    const exited = once(child, "exit");
+    try {
+      assert.equal(
+        await awaitHandoff({ channel: child.stdio[3]!, child, timeoutMs: 60_000 }),
+        "locked",
+        output,
+      );
+      const marked = JSON.parse(await readFile(announced, "utf8")) as Environment;
+      assert.equal(marked.status, "deleting");
+      assert.equal(marked.quota?.state, "reserved");
+      // The child still holds the destroy lock: a sweep would skip this journal.
+      let busy = false;
+      await assert.rejects(
+        withFileLock(
+          join(directory, `${created.id}.destroy.lock`),
+          0,
+          async () => {},
+          () => {
+            busy = true;
+            throw new Error("busy");
+          },
+        ),
+        /busy/,
+      );
+      assert.ok(busy);
+    } finally {
+      await writeFile(release, "");
+    }
+    const [code] = await exited;
+    assert.equal(code, 0, output);
+    const finished = JSON.parse(await readFile(journal, "utf8")) as Environment;
+    assert.equal(finished.status, "deleted");
+    assert.deepEqual(await rows(), {});
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+await test("an invalid GITMATRIX_E2E_WORKERS warns once in context() instead of failing", async () => {
+  const { home, env, environment } = await quotaHome("gitmatrix-context-workers-");
+  try {
+    const root = join(home, "worktree");
+    await mkdir(root);
+    const output = await command(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import {context, createEnvironment} from ${JSON.stringify(environment)}; const warnings = []; console.warn = (...parts) => warnings.push(parts.join(" ")); const env = await createEnvironment(${JSON.stringify(root)}); const runners = [(await context(env)).env.GITMATRIX_CI_RUNNERS, (await context(env)).env.GITMATRIX_CI_RUNNERS]; console.log(JSON.stringify({runners, warnings}));`,
+      ],
+      { env: { ...env, GITMATRIX_E2E_WORKERS: "two" } },
+    );
+    const { runners, warnings } = JSON.parse(output.trim().split("\n").at(-1)!) as {
+      runners: string[];
+      warnings: string[];
+    };
+    assert.deepEqual(runners, ["2", "2"]);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /GITMATRIX_E2E_WORKERS must be a positive integer, not two/);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

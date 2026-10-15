@@ -1,3 +1,5 @@
+import type { Browser } from "@playwright/test";
+
 export interface HarnessContext {
   root: string;
   dir: string;
@@ -18,4 +20,13 @@ export interface SeedManifest {
   readToken: string;
   repos: { space: string; name: string; visibility: "public" | "private" }[];
   tracker: { space: string; team: string; ready: string; blocked: string; blocker: string };
+}
+
+/**
+ * A scenario's view of the one browser the E2E run shares: its contexts are its
+ * own, and close() closes them, never the browser.
+ */
+export interface ScenarioBrowser {
+  newContext: Browser["newContext"];
+  close(): Promise<void>;
 }

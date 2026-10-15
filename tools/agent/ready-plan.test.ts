@@ -910,3 +910,32 @@ await test("--all keeps the full gates and failed discovery is not slimmed", asy
     assert.deepEqual(await localGates(root, lost), lost.gates);
   });
 });
+
+await test("--resume fingerprints read each workspace's transitive dependencies", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("apps/website/worker/new.ts");
+    const { dependencies } = await readinessPlan(root, options);
+    assert.ok(dependencies);
+    for (const consumer of ["tools/agent", "tools/preview", "tools/remote"]) {
+      assert.ok(dependencies[consumer]!.includes("apps/website"), consumer);
+      for (const dependency of dependencies["apps/website"]!)
+        assert.ok(dependencies[consumer]!.includes(dependency), `${consumer} ${dependency}`);
+    }
+    assert.ok(dependencies["apps/site"]!.includes("apps/cli"));
+    for (const [workspace, list] of Object.entries(dependencies))
+      assert.ok(!list.includes(workspace), workspace);
+  });
+  // The stylesheet shortcut omits the harness's relative-import edge from selection, not from reads.
+  await fixture(async (root, _git, put) => {
+    await put("apps/website/src/styles/app.css", '@import "./base.css";\n.a { color: blue; }\n');
+    const plan = await readinessPlan(root, options);
+    assert.ok(plan.reasons.some((reason) => reason.startsWith("Content-only audited stylesheets")));
+    assert.ok(plan.dependencies!["tools/agent"]!.includes("apps/website"));
+    assert.ok(plan.dependencies!["tools/preview"]!.includes("apps/website"));
+  });
+  // A full-coverage fallback has no task graph: every gate then reads every change.
+  await fixture(async (root, _git, put) => {
+    await put("unknown.txt");
+    assert.equal((await readinessPlan(root, options)).dependencies, undefined);
+  });
+});

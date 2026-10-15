@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { chromium, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
 import type { Timeline } from "../../apps/website/shared/timelines.ts";
 import type { QueueGm, RepoInventory } from "./queue-e2e.ts";
 import { sourceRetentionFixture } from "./source-retention-e2e.ts";
-import type { HarnessContext, SeedManifest } from "./types.ts";
+import type { HarnessContext, ScenarioBrowser, SeedManifest } from "./types.ts";
 
 /** An actual expired source remains intelligible even after its timeline history is gone. */
 export async function runSourceExpiredE2E(
@@ -15,6 +15,7 @@ export async function runSourceExpiredE2E(
   fixtures: SeedManifest,
   gm: QueueGm,
   record: (value: unknown) => void,
+  sharedBrowser: () => Promise<ScenarioBrowser>,
 ) {
   const { owner, secret, name, repo, api, timelines, root, json, git } =
     await sourceRetentionFixture(ctx, fixtures, record);
@@ -88,7 +89,7 @@ export async function runSourceExpiredE2E(
     assert.equal(retention.run.status, "succeeded");
     assert(retention.run.categories.every((category) => category.error === null));
     await json(`${timelines}/${slug}`, "GET", undefined, [404]);
-    const browser = await chromium.launch({ headless: true });
+    const browser = await sharedBrowser();
     try {
       const context = await browser.newContext({ baseURL: ctx.origin });
       const page = await context.newPage();

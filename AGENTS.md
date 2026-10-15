@@ -63,6 +63,12 @@ release. Add a tool name to select part of the graph. For example, run
   committed, staged, unstaged and untracked work since the merge base with
   local `origin/main`, not just the last edit, and does not fetch.
   Use `--all` only for deliberately required comprehensive verification.
+  After a failure, fix the cause and rerun with `vp run ready --resume`: it
+  reuses only the gates and journeys whose last attempt passed with the same
+  merge base and unchanged inputs, in the last 24 hours, and runs the rest
+  (with their prerequisite scenarios) in a fresh environment. It reuses
+  verdicts, never state; `--dry-run --resume` shows what it would reuse, and
+  `--all` refuses it.
   Use `--base <ref>` only for the actual integration branch, never to hide
   unlanded changes or force a smaller plan. Unknown or global paths automatically
   keep the full code gates, and those and shared harness changes run every E2E journey

@@ -7,6 +7,36 @@ import { command, registry, listEnvironments } from "./environment.ts";
 const unitName = "gitmatrix-agent-cleanup";
 const unitDirectory = join(homedir(), ".config", "systemd", "user");
 
+/**
+ * What the hourly janitor runs, copied out of the worktree that installs it. Every
+ * `setup` reinstalls it, so the runtime imports reachable from environment.ts (which
+ * janitor.ts imports) must stay within this list (maintenance.test.ts checks).
+ */
+export const JANITOR_FILES = [
+  "quota.ts",
+  "reservations.ts",
+  "heavy.ts",
+  "cloudflare-delete.ts",
+  "environment.ts",
+] as const;
+
+/**
+ * What the remote janitor copies besides JANITOR_FILES, relative to tools/agent. Its
+ * entry.ts imports only Node builtins before dispatch; the runtime imports reachable from
+ * it on the cleanup path must stay within both lists (maintenance.test.ts checks).
+ */
+export const REMOTE_JANITOR_ONLY = [
+  "entry.ts",
+  "remote.ts",
+  "remote-build.ts",
+  "remote-environment.ts",
+  "remote-sync.ts",
+  "remote-protocol.ts",
+  "maintenance.ts",
+  "types.ts",
+  "../remote/cloudflare.config.ts",
+] as const;
+
 /** Install outside the worktree: cleanup still runs after a worktree is removed. */
 export async function installMaintenance(): Promise<void> {
   // The hosted container's absolute lifetime is enforced by its owning DO alarm.
@@ -41,13 +71,7 @@ export async function installMaintenance(): Promise<void> {
     if ((await realpath(executable)).startsWith(`${checkout}/`))
       throw new Error("Scheduled cleanup requires Node, cf and gm installed outside the worktree.");
   }
-  for (const name of [
-    "quota.ts",
-    "reservations.ts",
-    "heavy.ts",
-    "cloudflare-delete.ts",
-    "environment.ts",
-  ]) {
+  for (const name of JANITOR_FILES) {
     const temporary = join(registry, `${name}.${process.pid}.tmp`);
     await copyFile(join(source, name), temporary);
     await rename(temporary, join(registry, name));
@@ -114,22 +138,7 @@ export async function installRemoteMaintenance(root: string): Promise<void> {
   await mkdir(destination, { recursive: true, mode: 0o700 });
   // This entry imports only Node builtins before dispatch. Keep its complete
   // dependency closure outside the worktree, including maintenance's imports.
-  for (const name of [
-    "entry.ts",
-    "remote.ts",
-    "remote-build.ts",
-    "remote-environment.ts",
-    "remote-sync.ts",
-    "remote-protocol.ts",
-    "maintenance.ts",
-    "environment.ts",
-    "quota.ts",
-    "reservations.ts",
-    "heavy.ts",
-    "cloudflare-delete.ts",
-    "types.ts",
-    "../remote/cloudflare.config.ts",
-  ]) {
+  for (const name of [...JANITOR_FILES, ...REMOTE_JANITOR_ONLY]) {
     const target = join(destination, name);
     await mkdir(dirname(target), { recursive: true, mode: 0o700 });
     const temporary = `${target}.${process.pid}.tmp`;

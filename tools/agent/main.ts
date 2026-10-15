@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { createWriteStream } from "node:fs";
-import { copyFile, mkdir, readFile, realpath, rename, rm } from "node:fs/promises";
+import { closeSync, createWriteStream, openSync } from "node:fs";
+import { copyFile, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -12,11 +12,13 @@ import {
   context,
   createEnvironment,
   destroyEnvironment,
+  destroyExclusively,
   listEnvironments,
   loadEnvironment,
   markServer,
   privateJson,
   redact,
+  registry,
   registryLock,
   stopEnvironment,
   terminateProcessGroup,
@@ -30,6 +32,17 @@ import { installMainE2E, mainE2EStatus, tick, uninstallMainE2E } from "./main-e2
 import { parseReservationArgs, reconcileReservations } from "./reservations.ts";
 import { pruneBrowsers } from "./browsers.ts";
 import { seed } from "./seed.ts";
+import {
+  HANDOFF_ENV,
+  announceHandoff,
+  awaitHandoff,
+  backgroundCleanupSpawn,
+  cleanupMode,
+  gatesWriteBindingTypes,
+  overlapSetup,
+  seedMayBeAffected,
+  type CleanupMode,
+} from "./live-run.ts";
 import { runE2E } from "./e2e.ts";
 import { runProviderE2E, type AiRun } from "./provider-e2e.ts";
 import { ATLAS_PROVIDER_CONFIG } from "./atlas-provider-e2e.ts";
@@ -40,7 +53,27 @@ import {
   readinessPlan,
   type ReadyOptions,
 } from "./ready-plan.ts";
-import { selectReadyE2E, selectsE2E, type ReadyE2ESelection } from "./ready-e2e.ts";
+import {
+  e2eScenarioNames,
+  e2eWorkers,
+  selectReadyE2E,
+  selectsE2E,
+  type ReadyE2ESelection,
+} from "./ready-e2e.ts";
+import {
+  contentHashes,
+  gateFingerprint,
+  readHistory as readReadyHistory,
+  recordAttempts,
+  resumeDecision,
+  scenarioFingerprints,
+  mirrorFingerprint,
+  mirrorOutcome,
+  scenarioOutcomes,
+  writeHistory,
+  type Attempt,
+  type ResumeDecision,
+} from "./ready-history.ts";
 import {
   AI_STAGES,
   appendHistory,
@@ -73,10 +106,14 @@ const help = `Gitmatrix agent workflow (Linux, Node 24+, cf login, Rust, Vite+)
   vp run agent gm -- <args>       Use this worktree's binary, server, credentials and replica
   vp run agent exec -- <command>  Run another tool with isolated Git/XDG/GM settings
   vp run agent inspect [db|registry] [SQL]  Read local data; defaults to table inventory
-  vp run agent check [--all] [--dry-run] [--base <ref>]
+  vp run agent check [--all] [--resume] [--dry-run] [--base <ref>] [--foreground-cleanup]
                                   Change-aware uncached readiness (also vp run ready): E2E journeys of the
                                   changed areas; --all runs every gate and every non-AI E2E journey,
-                                  --dry-run explains selection without running or provisioning
+                                  --resume reuses this worktree's passed gates and journeys whose inputs
+                                  are unchanged (in a fresh environment), --dry-run explains selection
+                                  without running or provisioning;
+                                  the E2E environment is destroyed in a detached process after the
+                                  result unless --foreground-cleanup
   vp run agent test               Fresh non-AI E2E; no AI resources or inference
   vp run agent test-ai [--stage <id>[,<id>]] [--all] [--resume] [--force] [--dry-run] [--base <ref>]
                                   Paid real-provider verification of the stages your changes (against
@@ -103,7 +140,11 @@ Configure the shared quota authority before setup. Setup installs hourly user-sy
 Canonical source publication uses ordinary gm outside 'agent gm'. Never point test commands at port 5180.
 `;
 
-async function prepare(): Promise<void> {
+async function prepare({
+  skipTypes = false,
+  overlapped = false,
+  signal,
+}: { skipTypes?: boolean; overlapped?: boolean; signal?: AbortSignal } = {}): Promise<void> {
   await installMaintenance();
   console.log(JSON.stringify({ event: "prepare", step: "gm-build" }));
   const target = process.env.CARGO_TARGET_DIR
@@ -114,8 +155,10 @@ async function prepare(): Promise<void> {
     ["build", "--manifest-path", join(root, "apps/cli/Cargo.toml"), "--target-dir", target],
     {
       cwd: root,
-      timeout: 900_000,
+      // Beside the gates, cli-check (clippy) contends for the target-dir lock: wait as long as a gate may.
+      timeout: overlapped ? 1_800_000 : 900_000,
       log: join(root, ".gitmatrix-agent", "artifacts", "cargo-build.log"),
+      signal,
     },
   );
   const scopedTarget = join(root, "apps/cli/target");
@@ -129,13 +172,16 @@ async function prepare(): Promise<void> {
       await rm(temporary, { force: true });
     }
   }
-  await command("cf", ["workers", "types"], { cwd: website });
+  // A gate of the same run (website-types, bindings) regenerates .cloudflare/types; two writers race.
+  if (!skipTypes) await command("cf", ["workers", "types"], { cwd: website, signal });
   // Every scenario launches headless, which Playwright serves from the headless
   // shell; full Chromium (~400 MB a revision) is only for headed or channel launches.
   await command("vp", ["exec", "playwright", "install", "--only-shell", "chromium"], {
     cwd: join(root, "tools/agent"),
     timeout: 300_000,
+    signal,
   });
+  signal?.throwIfAborted();
   // Fail before provisioning if the shell or its system dependencies are unavailable,
   // exercising the emulation the browser scenarios rely on.
   const browser = await chromium.launch({ headless: true });
@@ -159,7 +205,7 @@ async function prepare(): Promise<void> {
   }
 }
 
-async function migrate(env: Environment): Promise<void> {
+async function migrate(env: Environment, signal?: AbortSignal): Promise<void> {
   for (const [id, directory] of [
     ["00000000000000000000000000000000", "migrations"],
     ["00000000000000000000000000000001", "registry/migrations"],
@@ -177,11 +223,11 @@ async function migrate(env: Environment): Promise<void> {
         "--dir",
         directory!,
       ],
-      { cwd: website },
+      { cwd: website, signal },
     );
 }
 
-async function seedDatabase(env: Environment): Promise<void> {
+async function seedDatabase(env: Environment, signal?: AbortSignal): Promise<void> {
   // The authenticated readiness request completes real canonical-v4 bootstrap.
   // Never apply persona SQL to a legacy or not-yet-initialized installation.
   if (!(await identity(env)))
@@ -203,7 +249,7 @@ async function seedDatabase(env: Environment): Promise<void> {
       "--dir",
       "seed",
     ],
-    { cwd: website },
+    { cwd: website, signal },
   );
 }
 
@@ -303,9 +349,11 @@ interface EnvironmentSupervisor {
   close(): Promise<void>;
 }
 
+/** Stops the owned server on SIGINT, SIGTERM, expiry or an abort of `signal`. */
 function superviseEnvironment(
   env: Environment,
   stopOwned: () => Promise<void> = () => stopEnvironment(env),
+  signal?: AbortSignal,
 ): EnvironmentSupervisor {
   let interrupted = false;
   let stopping: Promise<void> | undefined;
@@ -318,6 +366,8 @@ function superviseEnvironment(
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
+  if (signal?.aborted) stop();
+  else signal?.addEventListener("abort", stop, { once: true });
   const expiry = setTimeout(stop, Math.max(1, env.expires - Date.now()));
   return {
     assertRunning() {
@@ -328,6 +378,7 @@ function superviseEnvironment(
       await stopping;
       process.off("SIGINT", stop);
       process.off("SIGTERM", stop);
+      signal?.removeEventListener("abort", stop);
       if (stopFailure) throw stopFailure;
     },
   };
@@ -443,114 +494,307 @@ async function selectAiStages(options: TestAiOptions): Promise<Selection | null>
   return selection;
 }
 
+interface LiveOptions {
+  ai: boolean;
+  run?: AiRun;
+  readyE2E?: ReadyE2ESelection;
+  /** Skip `cf workers types`: a gate of the same run regenerates `.cloudflare/types`. */
+  skipTypes?: boolean;
+  /** Setup runs beside the gates, so the cargo build may wait on a target-dir lock. */
+  overlapped?: boolean;
+  /** Run the seed's idempotency check (always, unless every changed path cannot reach the seed). */
+  repeatSeed: boolean;
+  cleanup: CleanupMode;
+  /** The setup is a repeat after the environment quota refused the overlapped one. */
+  quotaFallback?: boolean;
+  /** Aborted when a gate fails during an overlapped setup: kills the step in flight. */
+  signal?: AbortSignal;
+}
+
+interface LiveState extends LiveOptions {
+  started: number;
+  executionStarted: number;
+  artifacts: string;
+  timings: { stage: string; elapsedMs: number; outcome: string }[];
+  timed: <T>(stage: string, action: () => Promise<T>) => Promise<T>;
+  env?: Environment;
+  ctx?: HarnessContext;
+  fixtures?: Awaited<ReturnType<typeof seed>>;
+  supervisor?: EnvironmentSupervisor;
+  /** Everything that went wrong so far, in order. */
+  failures: unknown[];
+  /** The error that ended setup (prepare through seed), if any; also the first of `failures`. */
+  setupFailure?: unknown;
+  /** `setupFailure` came from a step the abort interrupted, not from the setup itself. */
+  setupAbortCaused?: boolean;
+  /** Set once a detached cleanup process owns the environment's deletion. */
+  cleanupLog?: string;
+}
+
 async function liveTest(
   ai = false,
   options?: TestAiOptions,
   readyE2E?: ReadyE2ESelection,
 ): Promise<void> {
+  // Refuse a malformed worker count before anything is provisioned.
+  e2eWorkers();
   let run: AiRun | undefined;
   if (ai) {
     const selection = await selectAiStages(options ?? parseTestAiOptions([]));
     if (!selection) return;
     run = { selection, outcomes: {} };
   }
-  const started = Date.now();
-  const executionStarted = performance.now();
-  let artifacts = join(
-    root,
-    ".gitmatrix-agent",
-    "artifacts",
-    `test-${ai ? "ai" : "non-ai"}-${started}`,
+  // test, test-ai and the main watcher: sequential, always repeat the seed, wait for cleanup.
+  await finishLive(
+    await startLive({
+      ai,
+      ...(run ? { run } : {}),
+      ...(readyE2E ? { readyE2E } : {}),
+      repeatSeed: true,
+      cleanup: "foreground",
+    }),
   );
-  const timings: { stage: string; elapsedMs: number; outcome: string }[] = [];
-  const timed = async <T>(stage: string, action: () => Promise<T>): Promise<T> => {
-    const began = performance.now();
-    let outcome = "failed";
-    try {
-      const result = await action();
-      outcome = "passed";
-      return result;
-    } finally {
-      timings.push({ stage, elapsedMs: Math.round(performance.now() - began), outcome });
-    }
+}
+
+/**
+ * Prepare, provision, migrate, start and seed. Never rejects: a failure is kept for finishLive.
+ * An abort of `options.signal` kills the step in flight and ends the setup with its reason.
+ */
+async function startLive(options: LiveOptions): Promise<LiveState> {
+  const { ai, signal } = options;
+  const started = Date.now();
+  const timings: LiveState["timings"] = [];
+  const state: LiveState = {
+    ...options,
+    started,
+    executionStarted: performance.now(),
+    artifacts: join(
+      root,
+      ".gitmatrix-agent",
+      "artifacts",
+      `test-${ai ? "ai" : "non-ai"}-${started}`,
+    ),
+    timings,
+    timed: async <T>(stage: string, action: () => Promise<T>): Promise<T> => {
+      const began = performance.now();
+      let outcome = "failed";
+      try {
+        const result = await action();
+        outcome = "passed";
+        return result;
+      } finally {
+        timings.push({ stage, elapsedMs: Math.round(performance.now() - began), outcome });
+      }
+    },
+    failures: [],
   };
-  let env: Environment | undefined;
-  let supervisor: EnvironmentSupervisor | undefined;
-  const failures: unknown[] = [];
+  const { timed } = state;
+  // Whether the step in flight is one an abort interrupts (and so fails because of it).
+  let interruptible = true;
   try {
-    await timed("prepare", prepare);
-    env = await timed("provision", () => createEnvironment(root, true, ai));
-    const ctx = await context(env);
+    await timed("prepare", () =>
+      prepare({ skipTypes: options.skipTypes, overlapped: options.overlapped, signal }),
+    );
+    signal?.throwIfAborted();
+    // Not interruptible: a failed provisioning destroys what it made in the foreground, and the
+    // remote calls take seconds. Whatever it made is torn down with the rest after an abort.
+    interruptible = false;
+    const env = (state.env = await timed("provision", () => createEnvironment(root, true, ai)));
+    interruptible = true;
+    signal?.throwIfAborted();
+    interruptible = false;
+    const ctx = (state.ctx = await context(env));
+    interruptible = true;
     // Atlas settings per owning account: the degraded providers test-ai verifies.
     if (ai) ctx.env.GITMATRIX_ATLAS_CONFIG = JSON.stringify(ATLAS_PROVIDER_CONFIG);
-    artifacts = ctx.artifacts;
-    supervisor = superviseEnvironment(env);
-    await timed("migrate", () => migrate(env!));
-    await timed("start", () => start(env!, ctx));
+    state.artifacts = ctx.artifacts;
+    // An abort stops the server too, so the readiness wait and the seed's requests end at once.
+    const supervisor = (state.supervisor = superviseEnvironment(env, undefined, signal));
+    await timed("migrate", () => migrate(env, signal));
     supervisor.assertRunning();
-    const fixtures = await timed("seed", async () => {
-      await seedDatabase(env!);
-      supervisor!.assertRunning();
+    await timed("start", () =>
+      start(env, ctx, { assertRunning: () => supervisor.assertRunning(), spawned: () => {} }),
+    );
+    supervisor.assertRunning();
+    state.fixtures = await timed("seed", async () => {
+      await seedDatabase(env, signal);
+      supervisor.assertRunning();
       const fixtures = await seed(ctx);
-      if (!ai) await seed(ctx); // Bootstrap remains repeatable against real data.
+      // Bootstrap remains repeatable against real data. The second run only guards the
+      // seed's own idempotency, so ready skips it when no changed path can reach the seed.
+      if (!ai && options.repeatSeed) {
+        supervisor.assertRunning();
+        await seed(ctx);
+      }
       return fixtures;
     });
-    const runtime = env;
-    const restartRuntime = async () => {
-      supervisor!.assertRunning();
-      const before = runtime.server;
-      if (!before) throw new Error("Cold verification requires the owned running server.");
-      await stopEnvironment(runtime);
-      const restarted = await start(runtime, ctx);
-      supervisor!.assertRunning();
-      const after = runtime.server;
-      if (!restarted.owned || !after || (before.pid === after.pid && before.start === after.start))
-        throw new Error("Cold verification did not observe a new owned server process.");
-      return { environmentId: runtime.id, origin: runtime.origin, before, after };
-    };
-    await timed("scenarios", async () => {
-      // Independent repositories and reports; neither failure tears down the other's server.
-      const results = await Promise.allSettled(
-        ai
-          ? [runProviderE2E(ctx, fixtures, "ai", run, restartRuntime)]
-          : [
-              runE2E(ctx, fixtures, readyE2E?.scenarios ?? undefined),
-              ...(readyE2E?.mirror === false ? [] : [runProviderE2E(ctx, fixtures, "mirror")]),
-            ],
-      );
-      const errors = results.flatMap((result) =>
-        result.status === "rejected" ? [result.reason] : [],
-      );
-      if (errors.length) throw new AggregateError(errors, "E2E scenarios failed");
+  } catch (error) {
+    // Kept as it is: a real failure must not be replaced by the abort. It is the abort's doing
+    // only when the abort was signalled before this rejection and could reach the step.
+    state.setupFailure = error;
+    state.setupAbortCaused = interruptible && signal?.aborted === true;
+    state.failures.push(error);
+  }
+  return state;
+}
+
+/** Stops the server and destroys the environment, in the foreground, collecting failures. */
+async function teardownLive(state: LiveState, mode: CleanupMode): Promise<void> {
+  const { env, timed, failures } = state;
+  try {
+    await timed("shutdown", async () => {
+      try {
+        await state.supervisor?.close();
+      } finally {
+        if (env) await stopEnvironment(env);
+      }
     });
-    supervisor.assertRunning();
+  } catch (error) {
+    failures.push(error);
+  }
+  try {
+    await timed("cleanup", async () => {
+      if (!env) return;
+      if (mode === "foreground") return await registryLock(() => destroyEnvironment(env));
+      if (await startBackgroundCleanup(state, env)) return;
+      // The child never held the destroy lock: destroy here under that lock, never the
+      // registry lock, which a contended machine may hold for minutes.
+      const destroyed = await destroyExclusively(env);
+      if (destroyed) Object.assign(env, destroyed);
+    });
+  } catch (error) {
+    failures.push(error);
+  }
+}
+
+/**
+ * Destroys the environment in a detached child so the result is not held for the 11-48 s of
+ * remote deletions. The child owns the destroy: holding the environment's destroy lock, it
+ * marks the journal "deleting" and only then announces "locked" on fd 3, so a child that dies
+ * afterwards leaves the journal to the next sweep (the hourly janitor's, or any setup's on this
+ * machine). Resolves false when no announcement came (the child died first, or did not take
+ * the lock within a minute): the child is killed and the caller destroys in the foreground.
+ * A parent killed before it spawns the child leaves the journal "ready" until it expires, and
+ * the next sweep after that destroys it (as before ready cleaned up in the background); once
+ * spawned, the detached child carries on without its parent.
+ */
+async function startBackgroundCleanup(state: LiveState, env: Environment): Promise<boolean> {
+  const log = join(state.artifacts, "cleanup.log");
+  let child: ChildProcess | undefined;
+  try {
+    const { command: binary, args: spawnArgs } = backgroundCleanupSpawn({
+      execPath: process.execPath,
+      execArgv: process.execArgv,
+      script: fileURLToPath(import.meta.url),
+      id: env.id,
+    });
+    await mkdir(state.artifacts, { recursive: true, mode: 0o700 });
+    const descriptor = openSync(log, "a", 0o600);
+    try {
+      child = spawn(binary, spawnArgs, {
+        cwd: root,
+        env: { ...process.env, [HANDOFF_ENV]: "1" },
+        detached: true,
+        stdio: ["ignore", descriptor, descriptor, "pipe"],
+      });
+    } finally {
+      closeSync(descriptor);
+    }
+    const outcome = await awaitHandoff({
+      channel: child.stdio[3]!,
+      child,
+      timeoutMs: 60_000,
+    });
+    if (outcome === "locked") {
+      state.cleanupLog = log;
+      console.log(JSON.stringify({ event: "cleanup.background", id: env.id, pid: child.pid, log }));
+      return true;
+    }
+    console.error(JSON.stringify({ event: "cleanup.background-failed", id: env.id, outcome, log }));
+  } catch (error) {
+    console.error(
+      redact(`Background cleanup could not start (${String(error)}); cleaning up now.`),
+    );
+  } finally {
+    child?.stdio[3]?.destroy();
+    child?.unref();
+  }
+  // Never two destroys at once: the child (and its lock helper) goes before the foreground one.
+  if (child?.pid !== undefined && child.exitCode === null && child.signalCode === null)
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      /* exited */
+    }
+  return false;
+}
+
+/**
+ * A gate failed while the setup was running: stop it and hand the environment to cleanup (the
+ * detached one, unless this run cleans up in the foreground), writing no verdict.
+ */
+async function abortLive(state: LiveState): Promise<void> {
+  await teardownLive(state, state.cleanup);
+  const teardown = state.failures.slice(state.setupFailure === undefined ? 0 : 1);
+  if (teardown.length) throw new AggregateError(teardown, "Live E2E teardown failed");
+}
+
+/** Scenarios, shutdown, cleanup and the completion record. Throws when anything failed. */
+async function finishLive(state: LiveState, overlapped = false): Promise<void> {
+  const { ai, run, readyE2E, timed, timings, failures, env, supervisor } = state;
+  try {
+    if (state.setupFailure === undefined) {
+      const ctx = state.ctx!;
+      const runtime = env!;
+      const fixtures = state.fixtures!;
+      const restartRuntime = async () => {
+        supervisor!.assertRunning();
+        const before = runtime.server;
+        if (!before) throw new Error("Cold verification requires the owned running server.");
+        await stopEnvironment(runtime);
+        const restarted = await start(runtime, ctx);
+        supervisor!.assertRunning();
+        const after = runtime.server;
+        if (
+          !restarted.owned ||
+          !after ||
+          (before.pid === after.pid && before.start === after.start)
+        )
+          throw new Error("Cold verification did not observe a new owned server process.");
+        return { environmentId: runtime.id, origin: runtime.origin, before, after };
+      };
+      await timed("scenarios", async () => {
+        // Independent repositories and reports; neither failure tears down the other's server.
+        const results = await Promise.allSettled(
+          ai
+            ? [runProviderE2E(ctx, fixtures, "ai", run, restartRuntime)]
+            : [
+                runE2E(ctx, fixtures, readyE2E?.scenarios ?? undefined),
+                ...(readyE2E?.mirror === false ? [] : [runProviderE2E(ctx, fixtures, "mirror")]),
+              ],
+        );
+        const errors = results.flatMap((result) =>
+          result.status === "rejected" ? [result.reason] : [],
+        );
+        if (errors.length) throw new AggregateError(errors, "E2E scenarios failed");
+      });
+      supervisor!.assertRunning();
+    }
   } catch (error) {
     failures.push(error);
   } finally {
-    try {
-      await timed("shutdown", async () => {
-        try {
-          await supervisor?.close();
-        } finally {
-          if (env) await stopEnvironment(env);
-        }
-      });
-    } catch (error) {
-      failures.push(error);
-    }
-    try {
-      await timed("cleanup", async () => {
-        if (env) await registryLock(() => destroyEnvironment(env!));
-      });
-    } catch (error) {
-      failures.push(error);
-    }
+    await teardownLive(state, state.cleanup);
+    const background = state.cleanupLog !== undefined;
     const completion = {
       success: failures.length === 0,
       mode: ai ? "ai" : "non-ai",
       id: env?.id ?? null,
-      elapsedMs: Math.round(performance.now() - executionStarted),
-      cleanup: env?.status ?? "provision-not-completed",
+      // From the start of setup: includes the gates it overlapped.
+      elapsedMs: Math.round(performance.now() - state.executionStarted),
+      cleanup: background ? "background" : (env?.status ?? "provision-not-completed"),
+      ...(background ? { cleanupLog: state.cleanupLog } : {}),
+      setupOverlappedGates: overlapped,
+      ...(state.quotaFallback ? { setupQuotaFallback: true } : {}),
       resources: env ? Object.keys(env.resources).filter((name) => ai || name === "artifacts") : [],
       ...(!ai ? { scenarios: readyE2E?.scenarios ?? "all", mirror: readyE2E?.mirror ?? true } : {}),
       failedStages: timings
@@ -560,18 +804,17 @@ async function liveTest(
         ? {
             aiStages: run.selection.stages,
             aiStageOutcomes: run.outcomes,
-            failedAiStages: Object.keys(run.outcomes).filter(
-              (id) => run!.outcomes[id] === "failed",
-            ),
+            failedAiStages: Object.keys(run.outcomes).filter((id) => run.outcomes[id] === "failed"),
           }
         : {}),
     };
+    const artifacts = state.artifacts;
     await privateJson(join(artifacts, "timings.json"), timings);
     await privateJson(join(artifacts, "completion.json"), completion);
     if (run)
       // For --resume and the failure cooldown (ai-stages.ts).
       await appendHistory(root, {
-        startedAt: new Date(started).toISOString(),
+        startedAt: new Date(state.started).toISOString(),
         finishedAt: new Date().toISOString(),
         success: completion.success,
         base: run.selection.base,
@@ -580,7 +823,7 @@ async function liveTest(
         outcomes: run.outcomes,
         failedStages: [
           ...completion.failedStages,
-          ...Object.keys(run.outcomes).filter((id) => run!.outcomes[id] === "failed"),
+          ...Object.keys(run.outcomes).filter((id) => run.outcomes[id] === "failed"),
         ],
         evidence: artifacts,
       });
@@ -655,7 +898,7 @@ async function retainReports(artifacts: string): Promise<void> {
   }
 }
 
-async function gates(options: ReadyOptions): Promise<void> {
+async function gates(options: ReadyOptions, foregroundCleanup = false): Promise<void> {
   const plan = await readinessPlan(root, options);
   if (!options.all) {
     const slim = await localGates(root, plan);
@@ -668,8 +911,77 @@ async function gates(options: ReadyOptions): Promise<void> {
   // Only explicit --all (or no change list) runs main-only journeys; other full
   // fallbacks still select journeys by path.
   const e2e = plan.e2e ? selectReadyE2E(plan.changed, plan.e2eAll) : null;
-  const selection = { ...plan, e2e };
+  // Every run records its verdicts; --resume reuses those whose inputs are unchanged.
+  let prints:
+    | { gates: Record<string, string>; scenarios: Record<string, string>; mirror: string }
+    | undefined;
+  try {
+    const hashes = await contentHashes(root, plan.changed);
+    prints = {
+      gates: Object.fromEntries(
+        plan.gates.map((gate) => [
+          gate.name,
+          gateFingerprint({
+            base: plan.base,
+            gate,
+            changed: plan.changed,
+            hashes,
+            dependencies: plan.dependencies,
+          }),
+        ]),
+      ),
+      scenarios: scenarioFingerprints({
+        base: plan.base,
+        scenarios: e2e?.scenarios ?? e2eScenarioNames,
+        changed: plan.changed,
+        hashes,
+      }),
+      mirror: mirrorFingerprint({ base: plan.base, changed: plan.changed, hashes }),
+    };
+  } catch (error) {
+    console.error(redact(`Ready history disabled: cannot hash changed paths (${String(error)})`));
+  }
+  const read = options.resume ? await readReadyHistory(root) : undefined;
+  const resume: ResumeDecision | undefined =
+    read &&
+    resumeDecision({
+      history: "history" in read ? read.history : null,
+      problem: prints
+        ? "problem" in read
+          ? read.problem
+          : undefined
+        : "changed paths cannot be hashed",
+      root,
+      base: plan.base,
+      gates: plan.gates.map(({ name }) => ({ name, fingerprint: prints?.gates[name] ?? "" })),
+      scenarios: (e2e?.scenarios ?? []).map((name) => ({
+        name,
+        fingerprint: prints?.scenarios[name] ?? "",
+      })),
+      ...(e2e?.mirror ? { mirror: prints?.mirror ?? "" } : {}),
+    });
+  const gatesToRun = resume
+    ? plan.gates.filter(({ name }) => resume.gates.includes(name))
+    : plan.gates;
+  const liveE2E = resume && e2e ? { scenarios: resume.scenarios, mirror: resume.mirror } : e2e;
+  const selection = { ...plan, e2e, ...(resume ? { resume } : {}) };
   console.log(JSON.stringify({ event: "ready.selection", ...selection }, null, 2));
+  if (resume)
+    console.log(
+      JSON.stringify(
+        {
+          event: "ready.resume",
+          reused: Object.fromEntries(
+            resume.reused.map(({ name, reason, evidence }) => [name, `${reason}: ${evidence}`]),
+          ),
+          rerun: resume.rerun,
+          gates: gatesToRun.map(({ name }) => name),
+          e2e: liveE2E,
+        },
+        null,
+        2,
+      ),
+    );
   if (options.dryRun) return;
   const directory = join(root, ".gitmatrix-agent", "artifacts", `gates-${Date.now()}`);
   await privateJson(join(directory, "selection.json"), selection);
@@ -680,10 +992,8 @@ async function gates(options: ReadyOptions): Promise<void> {
     wallMs: number;
     outcome: "passed" | "failed";
   }[] = [];
-  let success = false;
-  let failure: unknown;
-  try {
-    for (const { name, binary, args: commandArgs, cwd } of plan.gates) {
+  const runGates = async (): Promise<void> => {
+    for (const { name, binary, args: commandArgs, cwd } of gatesToRun) {
       const gateStarted = performance.now();
       let elapsedMs: number | null = null;
       let outcome: "passed" | "failed" = "failed";
@@ -716,19 +1026,75 @@ async function gates(options: ReadyOptions): Promise<void> {
         );
       }
     }
-    // An empty selection provisions no environment.
-    if (e2e && selectsE2E(e2e)) await liveTest(false, undefined, e2e);
+  };
+  let success = false;
+  let failure: unknown;
+  let overlap: { overlapped: boolean; quotaFallback: boolean } | undefined;
+  // The latest live setup: the quota fallback starts a second one.
+  let live: LiveState | undefined;
+  try {
+    // An empty selection, or one --resume reused entirely, provisions no environment.
+    if (liveE2E && selectsE2E(liveE2E)) {
+      // Refuse a malformed worker count before any gate runs or anything is provisioned.
+      e2eWorkers();
+      // The environment's setup (about a minute, several when the machine is loaded) needs
+      // nothing from the gates, so it starts first and the scenarios start when both are done.
+      let attempt = 0;
+      overlap = await overlapSetup<LiveState>({
+        runGates,
+        startLive: async (signal) =>
+          (live = await startLive({
+            ai: false,
+            readyE2E: liveE2E,
+            // Only the first attempt overlaps the gates; the quota fallback runs after them.
+            skipTypes: ++attempt === 1 && gatesWriteBindingTypes(gatesToRun),
+            overlapped: attempt === 1,
+            quotaFallback: attempt > 1,
+            // The repeat seed guards the bootstrap, which most paths reach; an unreliable
+            // change list keeps it.
+            repeatSeed: plan.e2eAll || plan.full || seedMayBeAffected(plan.changed),
+            cleanup: cleanupMode({
+              ready: true,
+              foregroundFlag: foregroundCleanup,
+              hosted: process.env.GITMATRIX_REMOTE_HOSTED === "1",
+            }),
+            ...(signal ? { signal } : {}),
+          })),
+        setupFailure: (state) => (state.setupAbortCaused ? undefined : state.setupFailure),
+        finishLive: (state, overlapped) => finishLive(state, overlapped),
+        abortLive,
+      });
+    } else await runGates();
     success = true;
+    if (resume && !gatesToRun.length && !(liveE2E && selectsE2E(liveE2E)))
+      console.log(
+        JSON.stringify({
+          event: "ready.reused",
+          reason: "Every selected gate and journey passed earlier with unchanged inputs.",
+          evidence: Object.fromEntries(resume.reused.map(({ name, evidence }) => [name, evidence])),
+        }),
+      );
   } catch (error) {
     failure = error;
   }
+  if (prints)
+    try {
+      await recordReadyHistory(plan.base, prints, directory, timings, live);
+    } catch (error) {
+      // History I/O must not replace the original gate or E2E failure, nor fail a passing run.
+      console.error(redact(`Could not record ready history: ${String(error)}`));
+    }
   try {
     await privateJson(join(directory, "completion.json"), {
       success,
-      gates: plan.gates.map(({ name }) => name),
+      gates: gatesToRun.map(({ name }) => name),
+      ...(resume ? { reused: resume.reused } : {}),
       timings,
       elapsedMs: performance.now() - started,
-      e2e,
+      e2e: liveE2E,
+      ...(overlap
+        ? { setupOverlappedGates: overlap.overlapped, setupQuotaFallback: overlap.quotaFallback }
+        : {}),
       completed: new Date().toISOString(),
     });
   } catch (error) {
@@ -739,6 +1105,79 @@ async function gates(options: ReadyOptions): Promise<void> {
   if (!success) throw failure;
 }
 
+/**
+ * Records this run's gate, scenario and mirror attempts (ready-history.ts). A scenario the
+ * run never reached keeps its earlier attempt; e2e.json and mirror-e2e.json are copied beside
+ * the gate logs because the live artifacts directory is reused by the next run.
+ */
+async function recordReadyHistory(
+  base: string | null,
+  prints: { gates: Record<string, string>; scenarios: Record<string, string>; mirror: string },
+  directory: string,
+  timings: { name: string; outcome: "passed" | "failed" }[],
+  live: LiveState | undefined,
+): Promise<void> {
+  const finishedAt = new Date().toISOString();
+  const attempts: Attempt[] = timings.map(({ name, outcome }) => ({
+    kind: "gate",
+    name,
+    fingerprint: prints.gates[name]!,
+    base,
+    outcome,
+    finishedAt,
+    evidence: join(directory, `${name}.log`),
+  }));
+  if (live && live.setupFailure === undefined) {
+    const setup = live;
+    // A report older than this setup is an earlier run's: the live artifacts directory is shared.
+    const report = async (name: string): Promise<{ value: unknown; evidence: string } | null> => {
+      const path = join(setup.artifacts, name);
+      let text: string;
+      try {
+        if ((await stat(path)).mtimeMs < setup.started) return null;
+        text = await readFile(path, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      }
+      const evidence = join(directory, name);
+      await writeFile(evidence, text, { mode: 0o600 });
+      return { value: JSON.parse(text), evidence };
+    };
+    const scenarios = setup.readyE2E?.scenarios;
+    const e2e = scenarios?.length ? await report("e2e.json") : null;
+    if (scenarios && e2e) {
+      const outcomes = scenarioOutcomes(e2e.value);
+      for (const name of scenarios)
+        if (outcomes[name] && prints.scenarios[name])
+          attempts.push({
+            kind: "scenario",
+            name,
+            fingerprint: prints.scenarios[name],
+            base,
+            outcome: outcomes[name],
+            finishedAt,
+            evidence: e2e.evidence,
+          });
+    }
+    const mirror = setup.readyE2E?.mirror ? await report("mirror-e2e.json") : null;
+    const outcome = mirror && mirrorOutcome(mirror.value);
+    if (mirror && outcome)
+      attempts.push({
+        kind: "mirror",
+        name: "mirror",
+        fingerprint: prints.mirror,
+        base,
+        outcome,
+        finishedAt,
+        evidence: mirror.evidence,
+      });
+  }
+  if (!attempts.length) return;
+  const read = await readReadyHistory(root);
+  await writeHistory(root, recordAttempts("history" in read ? read.history : null, root, attempts));
+}
+
 async function destroyCurrent(): Promise<void> {
   const env = JSON.parse(
     await readFile(join(root, ".gitmatrix-agent", "environment.json"), "utf8"),
@@ -747,6 +1186,24 @@ async function destroyCurrent(): Promise<void> {
   if (env.root !== root || env.dir !== join(root, ".gitmatrix-agent"))
     throw new Error("Refusing foreign environment deletion.");
   await registryLock(() => destroyEnvironment(env));
+}
+
+/**
+ * The detached cleanup that `ready` starts after it has its result (see startBackgroundCleanup).
+ * It takes no registry lock: destroyEnvironment is idempotent per resource and its journal
+ * writes merge deleted resources, and holding the lock for the 11-48 s of remote deletions
+ * would stall the next setup on this machine. It announces the handoff on fd 3 once it holds
+ * the environment's destroy lock and has marked the journal "deleting".
+ */
+async function destroyById(id: string | undefined): Promise<void> {
+  if (!id || !/^gma-[a-z0-9]{8,10}-[a-f0-9]{12}$/.test(id))
+    throw new Error("Use destroy-environment <environment id>.");
+  const env = JSON.parse(
+    await readFile(join(registry, "environments", `${id}.json`), "utf8"),
+  ) as Environment;
+  validateEnvironment(env);
+  if (env.id !== id) throw new Error("Mismatched ownership journal.");
+  await destroyExclusively(env, () => announceHandoff());
 }
 
 try {
@@ -792,7 +1249,11 @@ try {
     await setup(options);
   } else if (operation === "test") await liveTest();
   else if (operation === "test-ai") await liveTest(true, parseTestAiOptions(args));
-  else if (operation === "check") await gates(parseReadyOptions(args));
+  else if (operation === "check") {
+    // Cleanup of the ready path's environment is detached unless asked to wait.
+    const foreground = args.filter((argument) => argument !== "--foreground-cleanup");
+    await gates(parseReadyOptions(foreground), foreground.length !== args.length);
+  } else if (operation === "destroy-environment") await destroyById(args[0]);
   else {
     const env = await loadEnvironment(root);
     const ctx = await context(env);
