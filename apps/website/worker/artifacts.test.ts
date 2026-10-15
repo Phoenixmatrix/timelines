@@ -8,6 +8,7 @@ import {
   upstreamToken,
   UpstreamStatusError,
 } from "./artifacts.ts";
+import { Timing } from "./timing.ts";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -81,6 +82,22 @@ describe("lsRefs", () => {
       "ls-refs failed with HTTP 403",
     );
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  test("Server-Timing shows the token mint apart from the listing, then its reuse", async () => {
+    forgetUpstreamTokens("r-timed");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("0000")),
+    );
+    const cold = new Timing();
+    await lsRefs(env, "r-timed", "https://artifacts.example/r-timed", undefined, cold);
+    expect(cold.header()).toMatch(/(^|, )artifacts-token;desc="artifacts-token #1";dur=/);
+    expect(cold.header()).not.toContain("token-memory");
+    const warm = new Timing();
+    await lsRefs(env, "r-timed", "https://artifacts.example/r-timed", undefined, warm);
+    expect(warm.header()).toContain('token-memory;desc="token-memory x1"');
+    expect(warm.header()).not.toContain("artifacts-token");
   });
 });
 

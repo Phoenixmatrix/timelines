@@ -298,7 +298,7 @@ export class RepoReader {
       return this.#sourceRefs(cached.refs);
     }
     const refresh = async () => {
-      const refs = await listRefs(this.env, this.artifactsName, this.remote);
+      const refs = await listRefs(this.env, this.artifactsName, this.remote, this.timing);
       refsCache.set(this.artifactsName, { at: Date.now(), refs });
       return refs;
     };
