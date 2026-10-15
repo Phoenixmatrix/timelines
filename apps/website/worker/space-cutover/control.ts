@@ -562,7 +562,14 @@ export class SpaceCutover extends DurableObject<Env> {
   } {
     return admissionFor(this.status(), this.fresh.status(), contractVersion);
   }
-  /** Admission and where the installation stands, in one read; never the manifest. */
+  /**
+   * Admission and where the installation stands, in one read; never the manifest.
+   *
+   * Added after status()/admission()/freshStatus(), which stay unchanged: for
+   * minutes after a deploy a new Worker can reach this object still running the
+   * previous release (durable/rpc-compat.ts), so every caller keeps a fallback
+   * to those until a later release (expand, then contract).
+   */
   installationState(): InstallationState {
     const run = this.status();
     const fresh = this.fresh.status();

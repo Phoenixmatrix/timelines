@@ -16,6 +16,7 @@ import {
   peekCachedAdmission,
   primeCachedAdmission,
 } from "../durable/cutover-admission.ts";
+import { isMissingRpcMethod } from "../durable/rpc-compat.ts";
 import { readWorkState, writeWorkState } from "./work-state.ts";
 import type { Timing } from "../timing.ts";
 
@@ -325,22 +326,86 @@ export class FreshInstallation {
 export async function initializeFreshSpaceInstallation(env: Env, timing?: Timing): Promise<void> {
   const control = cutoverControl(env);
   // Server-Timing: each round trip to the singleton, by name, when a request is timed.
-  const rpc = <T>(name: string, work: Promise<T>) => (timing ? timing.measure(name, work) : work);
+  const rpc: Rpc = (name, work) => (timing ? timing.measure(name, work) : work);
   const readAt = Date.now();
-  const state = await rpc("install-status", control.installationState());
+  const state = await rpc("install-status", installationState(control));
+  if (state === null) return previousReleaseInstallation(control, rpc, timing);
   if (state.runPhase !== null) {
     if (!state.admission.allowed) throw new Error("space_cutover_requires_reviewed_migration");
     primeCachedAdmission(env, state.admission, readAt);
     return;
   }
-  let status = state.fresh;
+  // Only a read that saw the installation active proves admission open.
+  if (await activateFreshInstallation(control, rpc, state.fresh))
+    primeCachedAdmission(env, state.admission, readAt);
+}
+
+type Control = ReturnType<typeof cutoverControl>;
+type Rpc = <T>(name: string, work: Promise<T>) => Promise<T>;
+
+/**
+ * control.installationState(), or null while the control object still runs a
+ * release without it: Durable Object code rolls out after the Worker's, for
+ * minutes on every deploy (durable/rpc-compat.ts). Any other failure throws.
+ */
+async function installationState(control: Control) {
+  try {
+    return await control.installationState();
+  } catch (error) {
+    if (isMissingRpcMethod(error, "installationState")) return null;
+    throw error;
+  }
+}
+
+/**
+ * The previous release's gate, for a control object that has not yet received
+ * this release's code: status(), then admission() when a run exists, else the
+ * native installation's freshStatus/advance/verify loop. As fail-closed as
+ * before. It never primes the isolate's admission cache: caching a positive
+ * read is sound only because this release's SpaceCutover.save refuses to close
+ * contract-4 admission, which the previous code does not enforce. So until the
+ * object updates, each request checks again, as the previous release did.
+ *
+ * Keep it, and installationState's fallback to it, until a release after the
+ * one that added installationState (expand, then contract).
+ */
+async function previousReleaseInstallation(
+  control: Control,
+  rpc: Rpc,
+  timing: Timing | undefined,
+): Promise<void> {
+  timing?.count("install-rpc-skew");
+  console.warn(
+    "space-cutover: the control object lacks installationState (Durable Object code is still " +
+      "rolling out; this normally heals within ~5 minutes of a deploy). Checking with the " +
+      "previous release's status/admission/freshStatus calls.",
+  );
+  if (await rpc("install-run", control.status())) {
+    if (!(await rpc("install-admission", control.admission())).allowed)
+      throw new Error("space_cutover_requires_reviewed_migration");
+    return;
+  }
+  await activateFreshInstallation(
+    control,
+    rpc,
+    await rpc("install-fresh-status", control.freshStatus()),
+  );
+}
+
+/**
+ * Advance the native installation from `status` until it is active, then
+ * verify it. True when `status` itself was already active.
+ */
+async function activateFreshInstallation(
+  control: Control,
+  rpc: Rpc,
+  status: FreshInstallationStatus | null,
+): Promise<boolean> {
   for (let call = 0; call < 4096; call++) {
     if (call) status = await rpc("install-fresh-status", control.freshStatus());
     if (status?.phase === "active") {
       await rpc("install-fresh-verify", control.verifyFreshInstallation());
-      // Only a read that saw the installation active proves admission open.
-      if (!call) primeCachedAdmission(env, state.admission, readAt);
-      return;
+      return !call;
     }
     try {
       await control.advanceFreshInstallation(status);
