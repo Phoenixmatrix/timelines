@@ -1,3 +1,5 @@
+import assert from "node:assert/strict";
+
 export interface ReadyE2ESelection {
   /** null runs every scenario, main-only ones included (explicit `--all`). */
   scenarios: string[] | null;
@@ -146,6 +148,216 @@ export const prerequisites: Readonly<Record<ScenarioName, readonly ScenarioName[
   // Chronicle seeds its own history but links to an existing pushed CI commit.
   "browser-chronicle-scrub-range-span-and-links": ["ci-push-triggered-local-dag-and-provenance"],
 };
+
+/**
+ * Shared state scenarios read or write, for running them side by side
+ * (GITMATRIX_E2E_WORKERS > 1): two scenarios that touch one resource, one of
+ * them writing it, never overlap. `engine` is orbit/engine (its refs, timelines,
+ * sources, CI and secrets) and clone's checkout; `space:*` a Space's repositories,
+ * tracker, packages and Space-wide retention ("daysAhead" ages the whole Space);
+ * `person:jun` jun's account (avatar, chats, personal retention); `gm-state` the
+ * one gm configuration, tracker replicas and lease store every gm shares
+ * (XDG_DATA_HOME), and with it the seed's tracker issues and marco's agents;
+ * `instance` everything (a write means the scenario needs the environment alone).
+ */
+export const resources = [
+  "engine",
+  "space:orbit",
+  "space:sam",
+  "space:jun",
+  "person:jun",
+  "gm-state",
+  "instance",
+] as const;
+
+export type Resource = (typeof resources)[number];
+export type Access = "read" | "write";
+
+// orbit/engine lives in orbit: whoever uses it reads that Space, so orbit-wide
+// retention (a write) waits for them.
+const engineRead = { engine: "read", "space:orbit": "read" } as const;
+const engineWrite = { engine: "write", "space:orbit": "read" } as const;
+
+/**
+ * What each scenario touches, audited against e2e.ts and its helpers. Fresh
+ * fixtures of its own (a timeline, a tracker team, an `orbit/queue-*` or Atlas
+ * repository) count as reading their Space. When unsure, write: over-serializing
+ * is safe. Not modelled: the CI runner slots (GITMATRIX_CI_RUNNERS) every
+ * repository shares, which the environment widens when scenarios overlap.
+ */
+export const scenarioResources: Readonly<
+  Record<ScenarioName, Readonly<Partial<Record<Resource, Access>>>>
+> = {
+  // Sets and deletes a CI secret on engine.
+  "authorization-and-token-revocation": engineWrite,
+  "gm-clone-commit-push-and-denied-push": engineWrite,
+  "repository-file-history-and-attribution": engineRead,
+  // Claims and completes the seed's ready issue; `tracker use` saves gm's selection.
+  "tracker-claim-sync-complete-and-blocked-transitions": {
+    "space:orbit": "read",
+    "gm-state": "write",
+  },
+  "chronicle-history-and-linked-work-over-api": { "space:orbit": "read", "gm-state": "write" },
+  // Asserts the fork is main's tip and main never moves: nobody may push it meanwhile.
+  "timeline-fork-owned-source-and-abandon-permissions": engineWrite,
+  "gm-timeline-start-push-and-abandon": engineWrite,
+  // `agent configure` keeps a token in the shared gm.json, which gm rewrites in
+  // place while every other gm reads it: alone. It also runs gm in clone's
+  // checkout, claims the seed's blocker issue and creates marco's agents.
+  "agent-capabilities-self-reporting-and-claim-identity": {
+    ...engineWrite,
+    "gm-state": "write",
+    instance: "write",
+  },
+  // Issue commands write the shared replica and its outbox.
+  "tags-one-vocabulary-and-old-spellings": { "space:orbit": "read", "gm-state": "write" },
+  "tightening-requirements-on-a-claimed-issue": { "space:orbit": "read", "gm-state": "write" },
+  // Edits the lease store's files directly.
+  "agent-durable-interventions-and-resume": { "space:orbit": "read", "gm-state": "write" },
+  "tracker-handoff-to-an-agent-created-after-sync": { "space:orbit": "read", "gm-state": "write" },
+  // Grants the package to engine.
+  "package-upload-download-and-write-boundary": engineWrite,
+  "ci-push-triggered-local-dag-and-provenance": engineWrite,
+  "ci-failing-prerequisite-skips-dependent": engineWrite,
+  "ci-job-records-and-updates-a-deployment": engineWrite,
+  "ci-cancellation-and-job-token-lifetime": engineWrite,
+  // Retention runs over orbit's CI logs and runs.
+  "ci-retention-removes-logs-and-runs": { engine: "write", "space:orbit": "write" },
+  // Tracker-activity retention on orbit, 179 days ahead.
+  "timeline-compact-landing-gates-receipt-and-native-source": {
+    engine: "write",
+    "space:orbit": "write",
+  },
+  // `gm hook` reads held leases and records when it last checked in the lease store.
+  "steps-context-hook-live-run-landing-and-access": { ...engineWrite, "gm-state": "write" },
+  "timeline-landing-conflict-asks-for-a-sync": engineWrite,
+  "timeline-nested-admission-and-canonical-revert": engineWrite,
+  // Its own orbit repositories; claims a remediation issue.
+  "queue-concurrency-failure-fencing-and-push-recovery": {
+    "space:orbit": "read",
+    "gm-state": "write",
+  },
+  // Counts marco's agents exactly; its own HOME and XDG_CONFIG_HOME, but the shared XDG_DATA_HOME.
+  "agent-setup-memorable-persistent-identities": { "space:orbit": "read", "gm-state": "write" },
+  // Claims the seed's blocker issue; `gm runs start` on engine's agent-ci-failure.
+  "agent-identity-provisioned-on-first-use": { ...engineWrite, "gm-state": "write" },
+  // jun's picture and orbit's Organization icon, which nothing else reads.
+  "profile-picture-upload-serve-and-remove": { "person:jun": "write", "space:orbit": "read" },
+  // Fresh instances of every class, purged.
+  "durable-objects-register-and-purge": {},
+  // Collects orbit's usage (lower bounds on what the earlier scenarios stored):
+  // never beside push-log retention's collection in jun's Space.
+  "usage-metering-collects-per-account": { ...engineRead, "space:jun": "read" },
+  // Changes the Instance's AI settings.
+  "ai-gateway-log-bodies-site-default-and-account-override": { instance: "write" },
+  // Compares the Instance report's subjects with the page: no Space's usage may be collected meanwhile.
+  "browser-usage-and-costs-account-and-site": {
+    "space:orbit": "read",
+    "space:sam": "read",
+    "space:jun": "read",
+  },
+  // The retention cron and Instance retention, marco's chats and settings.
+  "browser-data-retention-account-and-site": { instance: "write" },
+  // Tracker retention on sam's Space, 400 days ahead; sam's replica.
+  "tracker-retention-removes-closed-issues-and-replicas-converge": {
+    "space:sam": "write",
+    "gm-state": "write",
+  },
+  // Instance registry retention and garbage collection, 400 days ahead.
+  "registry-retention-keeps-installs-working": { instance: "write" },
+  // Its own orbit repository, preview and grant.
+  "repository-deletion-purges-everything-and-resumes": { "space:orbit": "read" },
+  // jun's chats and personal retention, 100 days ahead.
+  "assistant-chats-expire": { "person:jun": "write" },
+  // Instance-wide auth hygiene; asserts nothing is left after its run.
+  "auth-hygiene-keeps-sign-in-and-tokens-working": { instance: "write" },
+  "password-accounts-admin-create-sign-in-and-reset": {},
+  // Push log retention on jun's Space, 400 days ahead, and its usage collection.
+  "push-log-retention-and-unreachable-git": { "space:jun": "write" },
+  // Edits the seed's ready issue, which only its prerequisite also touches.
+  "browser-personas-persisted-product-state": engineRead,
+  "browser-atlas-smoke": { "space:orbit": "read" },
+  "atlas-revocation-reads-like-a-missing-repository": { "space:orbit": "read" },
+  // Asserts the new timeline's source is main's tip.
+  "browser-timeline-scope-round-trip": engineWrite,
+  // Retention on jun's Space and person, 400 days ahead, again and again.
+  "retention-concurrent-with-pushes-builds-and-chats": {
+    "space:jun": "write",
+    "person:jun": "write",
+  },
+  // Repositories and timelines in sam's Space (and marco's).
+  "source-authorization-native-and-canonical-separation": { "space:sam": "read" },
+  "source-multi-repository-landing-and-durable-recovery": { "space:orbit": "read" },
+  "source-push-recovery-fences-late-writes": { "space:orbit": "read" },
+  "source-late-sync-lineage-conflicts-guard-and-expiry": { "space:orbit": "read" },
+  "source-finite-legacy-migration-and-partial-revert": { "space:orbit": "read" },
+  // Source retention on sam's Space and the Instance-wide orphan sweep.
+  "source-retention-expiry-orphan-and-canonical-purge": { instance: "write" },
+  // Tracker-activity retention on sam's Space, 181 days ahead.
+  "browser-expired-source-without-timeline-history": { "space:sam": "write" },
+  // Links a month of seeded orbit history to an engine CI run.
+  "browser-chronicle-scrub-range-span-and-links": engineRead,
+};
+
+function conflicts(
+  a: Readonly<Partial<Record<Resource, Access>>>,
+  b: Readonly<Partial<Record<Resource, Access>>>,
+): boolean {
+  if (a.instance === "write" || b.instance === "write") return true;
+  return resources.some(
+    (name) => a[name] && b[name] && (a[name] === "write" || b[name] === "write"),
+  );
+}
+
+export interface Schedule {
+  /** The serialization order: suite order, independent Instance-wide scenarios last. */
+  order: ScenarioName[];
+  /** For each scenario, the earlier ones in `order` it must wait for. */
+  waitsFor: Map<ScenarioName, Set<ScenarioName>>;
+}
+
+/**
+ * Which selected scenarios each must wait for, so that any overlap is
+ * conflict-serializable in suite order: every earlier one it conflicts with,
+ * its prerequisites, and around an Instance-wide writer everything. Those
+ * writers run last unless a selected scenario needs them.
+ */
+export function schedule(
+  selected: readonly ScenarioName[],
+  declared: Readonly<
+    Record<ScenarioName, Readonly<Partial<Record<Resource, Access>>>>
+  > = scenarioResources,
+  needs: Readonly<Record<ScenarioName, readonly ScenarioName[]>> = prerequisites,
+): Schedule {
+  const inSuite = e2eScenarioNames.filter((name) => selected.includes(name));
+  const needed = new Set(inSuite.flatMap((name) => needs[name]));
+  const last = (name: ScenarioName) => declared[name].instance === "write" && !needed.has(name);
+  const order = [...inSuite.filter((name) => !last(name)), ...inSuite.filter(last)];
+  const waitsFor = new Map<ScenarioName, Set<ScenarioName>>();
+  order.forEach((name, index) => {
+    const before = order.slice(0, index);
+    for (const dependency of needs[name])
+      assert(before.includes(dependency), `${name} needs ${dependency} selected before it`);
+    waitsFor.set(
+      name,
+      new Set(
+        before.filter(
+          (earlier) =>
+            needs[name].includes(earlier) || conflicts(declared[earlier], declared[name]),
+        ),
+      ),
+    );
+  });
+  return { order, waitsFor };
+}
+
+/** GITMATRIX_E2E_WORKERS: scenarios run at once (experimental; 1, the default, is the serial suite). */
+export function e2eWorkers(env: NodeJS.ProcessEnv = process.env): number {
+  const value = env.GITMATRIX_E2E_WORKERS?.trim() || "1";
+  if (!/^[1-9]\d*$/.test(value))
+    throw new Error(`GITMATRIX_E2E_WORKERS must be a positive integer, not ${value}`);
+  return Number(value);
+}
 
 /**
  * The slowest journeys, whose domains other scenarios also cover: agents'
@@ -321,7 +533,8 @@ export const scenarioAreas: Readonly<Record<ScenarioName, readonly E2EArea[]>> =
   "browser-chronicle-scrub-range-span-and-links": ["tracker"],
 };
 
-const browserScenarios: readonly ScenarioName[] = [
+/** The scenarios that open a browser (sharedBrowser in e2e.ts refuses any other). */
+export const browserScenarios: readonly ScenarioName[] = [
   "ci-retention-removes-logs-and-runs",
   "browser-usage-and-costs-account-and-site",
   "browser-data-retention-account-and-site",

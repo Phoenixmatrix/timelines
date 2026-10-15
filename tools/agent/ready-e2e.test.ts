@@ -1,21 +1,29 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { runE2E } from "./e2e.ts";
+import { setTimeout as delay } from "node:timers/promises";
+import { runE2E, runPool } from "./e2e.ts";
 import {
   agentScenarioNames,
   areaOnlyScenarios,
   areaScenarios,
+  browserScenarios,
   e2eAreas,
   e2eScenarioNames,
+  e2eWorkers,
   expandE2EScenarios,
   mainOnlyScenarios,
   prerequisites,
+  resources,
   scenarioAreas,
+  scenarioResources,
+  schedule,
   selectReadyE2E,
   selectsE2E,
+  type Access,
+  type Resource,
   type ScenarioName,
 } from "./ready-e2e.ts";
 import type { HarnessContext, SeedManifest } from "./types.ts";
@@ -527,4 +535,301 @@ await test("an agents-full path adds to the other paths' selection instead of re
   assert(both.scenarios!.includes("queue-concurrency-failure-fencing-and-push-recovery"));
   assert(!both.scenarios!.includes("source-multi-repository-landing-and-durable-recovery"));
   assert.deepEqual(select("tools/agent/e2e.ts"), agentsFull);
+});
+
+await test("every scenario declares the shared resources it reads or writes", () => {
+  assert.deepEqual(Object.keys(scenarioResources).sort(), [...e2eScenarioNames].sort());
+  for (const name of e2eScenarioNames) {
+    const declared = scenarioResources[name];
+    for (const [resource, access] of Object.entries(declared)) {
+      assert((resources as readonly string[]).includes(resource), `${name}: ${resource}`);
+      assert(["read", "write"].includes(access), `${name}: ${resource} ${access}`);
+    }
+    // orbit/engine is in orbit: orbit-wide retention must wait for its users.
+    if (declared.engine) assert(declared["space:orbit"], `${name} uses engine but not orbit`);
+  }
+  // The Instance-wide writers found in e2e.ts and its helpers.
+  assert.deepEqual(
+    e2eScenarioNames.filter((name) => scenarioResources[name].instance === "write"),
+    [
+      "agent-capabilities-self-reporting-and-claim-identity",
+      "ai-gateway-log-bodies-site-default-and-account-override",
+      "browser-data-retention-account-and-site",
+      "registry-retention-keeps-installs-working",
+      "auth-hygiene-keeps-sign-in-and-tokens-working",
+      "source-retention-expiry-orphan-and-canonical-purge",
+    ],
+  );
+  assert.equal(browserScenarios.length, 12);
+});
+
+type Declared = Record<ScenarioName, Partial<Record<Resource, Access>>>;
+const none = Object.fromEntries(e2eScenarioNames.map((name) => [name, {}])) as Declared;
+const independent = Object.fromEntries(
+  e2eScenarioNames.map((name): [ScenarioName, ScenarioName[]] => [name, []]),
+) as Record<ScenarioName, ScenarioName[]>;
+const waits = (selected: ScenarioName[], declared: Declared, needs = independent) =>
+  Object.fromEntries(
+    [...schedule(selected, declared, needs).waitsFor].map(([name, set]) => [name, [...set]]),
+  );
+
+await test("schedule waits for conflicts, prerequisites and Instance-wide writers, in suite order", () => {
+  const [a, b, c, d] = [
+    "authorization-and-token-revocation",
+    "gm-clone-commit-push-and-denied-push",
+    "repository-file-history-and-attribution",
+    "tracker-claim-sync-complete-and-blocked-transitions",
+  ] as const;
+  // Nothing shared and no prerequisites: everything at once.
+  assert.deepEqual(waits([a, b, c, d], none), { [a]: [], [b]: [], [c]: [], [d]: [] });
+  assert(
+    [...schedule(e2eScenarioNames, none, independent).waitsFor.values()].every(
+      (set) => set.size === 0,
+    ),
+  );
+  // Readers share; a writer waits for and is waited for by each other user.
+  const declared: Declared = {
+    ...none,
+    [a]: { engine: "read" },
+    [b]: { engine: "read" },
+    [c]: { engine: "write" },
+    [d]: { engine: "read", "space:sam": "write" },
+  };
+  assert.deepEqual(waits([a, b, c, d], declared), { [a]: [], [b]: [], [c]: [a, b], [d]: [c] });
+  // A prerequisite is waited for even without a shared resource.
+  assert.deepEqual(waits([a, b, c, d], none, { ...independent, [d]: [a] }), {
+    [a]: [],
+    [b]: [],
+    [c]: [],
+    [d]: [a],
+  });
+  // An Instance-wide writer runs alone, last unless something needs it.
+  const alone: Declared = { ...none, [b]: { instance: "write" } };
+  assert.deepEqual(schedule([a, b, c, d], alone, independent).order, [a, c, d, b]);
+  assert.deepEqual(waits([a, b, c, d], alone), { [a]: [], [c]: [], [d]: [], [b]: [a, c, d] });
+  const needed = { ...independent, [c]: [b] };
+  assert.deepEqual(schedule([a, b, c, d], alone, needed).order, [a, b, c, d]);
+  assert.deepEqual(waits([a, b, c, d], alone, needed), {
+    [a]: [],
+    [b]: [a],
+    [c]: [b],
+    [d]: [b],
+  });
+  // The real declarations: engine's writers one after another; queue (its own
+  // repositories) beside them, but after the tracker scenario's gm state.
+  const real = schedule([
+    "gm-clone-commit-push-and-denied-push",
+    "tracker-claim-sync-complete-and-blocked-transitions",
+    "package-upload-download-and-write-boundary",
+    "queue-concurrency-failure-fencing-and-push-recovery",
+  ]);
+  assert.deepEqual(Object.fromEntries([...real.waitsFor].map(([name, set]) => [name, [...set]])), {
+    "gm-clone-commit-push-and-denied-push": [],
+    "tracker-claim-sync-complete-and-blocked-transitions": [],
+    "package-upload-download-and-write-boundary": ["gm-clone-commit-push-and-denied-push"],
+    "queue-concurrency-failure-fencing-and-push-recovery": [
+      "tracker-claim-sync-complete-and-blocked-transitions",
+    ],
+  });
+});
+
+/** List scheduling as runE2E's pool does it, over historical durations (seconds). */
+function makespan(
+  selected: readonly ScenarioName[],
+  workers: number,
+  seconds: Record<ScenarioName, number>,
+  declared: Declared = scenarioResources,
+  needs = prerequisites,
+): number {
+  const { order, waitsFor } = schedule(selected, declared, needs);
+  const left = new Map(order.map((name) => [name, seconds[name]]));
+  const pending = [...order];
+  const running = new Set<ScenarioName>();
+  const done = new Set<ScenarioName>();
+  let now = 0;
+  while (done.size < order.length) {
+    // A copy: starting or blocking a scenario removes it from pending.
+    for (const name of pending.slice()) {
+      if (running.size >= workers) break;
+      if (![...waitsFor.get(name)!].every((need) => done.has(need))) continue;
+      const browsers = [...running].filter((other) => browserScenarios.includes(other)).length;
+      if (browserScenarios.includes(name) && browsers >= 2) continue;
+      pending.splice(pending.indexOf(name), 1);
+      running.add(name);
+    }
+    const step = Math.min(...[...running].map((name) => left.get(name)!));
+    now += step;
+    for (const name of running) {
+      left.set(name, left.get(name)! - step);
+      if (left.get(name)! <= 0) {
+        running.delete(name);
+        done.add(name);
+      }
+    }
+  }
+  return now;
+}
+
+await test("four workers more than halve the suite over its historical scenario medians", async () => {
+  const seconds = JSON.parse(
+    await readFile(new URL("fixtures/e2e-scenario-medians.json", import.meta.url), "utf8"),
+  ) as Record<ScenarioName, number>;
+  assert.deepEqual(Object.keys(seconds), [...e2eScenarioNames]);
+  for (const selected of [e2eScenarioNames, agentScenarioNames]) {
+    const serial = selected.reduce((sum, name) => sum + seconds[name], 0);
+    assert.equal(makespan(selected, 1, seconds), serial, "One worker is the serial suite");
+    const parallel = makespan(selected, 4, seconds);
+    // Measured with these declarations: 1249 → 595 s (full), 405 → 222 s (agents').
+    assert(parallel < serial * 0.6, `${parallel} s of ${serial} s`);
+  }
+  // Nothing shared: the longest scenario bounds the run.
+  assert.equal(
+    makespan(e2eScenarioNames, e2eScenarioNames.length, seconds, none, independent),
+    Math.max(...Object.values(seconds)),
+  );
+});
+
+await test("GITMATRIX_E2E_WORKERS defaults to one and refuses anything but a positive integer", () => {
+  assert.equal(e2eWorkers({}), 1);
+  assert.equal(e2eWorkers({ GITMATRIX_E2E_WORKERS: "" }), 1);
+  assert.equal(e2eWorkers({ GITMATRIX_E2E_WORKERS: "4" }), 4);
+  for (const value of ["0", "-1", "2.5", "two"])
+    assert.throws(() => e2eWorkers({ GITMATRIX_E2E_WORKERS: value }), /positive integer/);
+});
+
+await test("side by side, unselected scenarios are still separate skip events and nothing runs", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ready-e2e-workers-"));
+  const events: unknown[] = [];
+  t.mock.method(console, "log", (line: string) => events.push(JSON.parse(line)));
+  const before = process.env.GITMATRIX_E2E_WORKERS;
+  process.env.GITMATRIX_E2E_WORKERS = "4";
+  try {
+    const { ctx, fixtures } = emptyFixture(directory);
+    await runE2E(ctx, fixtures, []);
+    assert.deepEqual(
+      events,
+      e2eScenarioNames.map((scenario) => ({ event: "e2e-scenario-skipped", scenario })),
+    );
+    assert.deepEqual(await readdir(ctx.artifacts), []);
+  } finally {
+    if (before === undefined) delete process.env.GITMATRIX_E2E_WORKERS;
+    else process.env.GITMATRIX_E2E_WORKERS = before;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// The suite's scenarios with no-op bodies: runPool hands each to its `run`.
+const registry = e2eScenarioNames.map((name) => ({ name, body: async () => {} }));
+
+await test("one worker runs in suite order and stops at the first failure, as before", async (t) => {
+  const events: unknown[] = [];
+  t.mock.method(console, "log", (line: string) => events.push(JSON.parse(line)));
+  const ran: string[] = [];
+  const failure = new Error("gm-clone-commit-push-and-denied-push: boom");
+  const selected = new Set<string>([
+    "authorization-and-token-revocation",
+    "gm-clone-commit-push-and-denied-push",
+    "package-upload-download-and-write-boundary",
+  ]);
+  await assert.rejects(
+    runPool(registry, selected, 1, async (name) => {
+      ran.push(name);
+      if (name === "gm-clone-commit-push-and-denied-push") throw failure;
+    }),
+    (error) => error === failure,
+  );
+  assert.deepEqual(ran, [
+    "authorization-and-token-revocation",
+    "gm-clone-commit-push-and-denied-push",
+  ]);
+  // Skips print as the suite reaches them; nothing after the failure.
+  assert.deepEqual(events, []);
+});
+
+await test("side by side a failure stops only what waits for it; failures are thrown together", async (t) => {
+  const events: { event: string; scenario: string; failed?: string }[] = [];
+  t.mock.method(console, "log", (line: string) => events.push(JSON.parse(line)));
+  const ran: string[] = [];
+  const selected = new Set<string>([
+    "gm-clone-commit-push-and-denied-push",
+    "tracker-claim-sync-complete-and-blocked-transitions",
+    "package-upload-download-and-write-boundary",
+    "ci-push-triggered-local-dag-and-provenance",
+    "queue-concurrency-failure-fencing-and-push-recovery",
+  ]);
+  const failure = new Error("gm-clone-commit-push-and-denied-push: boom");
+  await assert.rejects(
+    runPool(registry, selected, 4, async (name) => {
+      ran.push(name);
+      await delay(5);
+      if (name === "gm-clone-commit-push-and-denied-push") throw failure;
+    }),
+    (error) => error === failure,
+  );
+  assert.deepEqual(ran.toSorted(), [
+    "gm-clone-commit-push-and-denied-push",
+    "queue-concurrency-failure-fencing-and-push-recovery",
+    "tracker-claim-sync-complete-and-blocked-transitions",
+  ]);
+  assert.deepEqual(
+    events.filter((event) => event.event === "e2e-scenario-blocked"),
+    [
+      {
+        event: "e2e-scenario-blocked",
+        scenario: "package-upload-download-and-write-boundary",
+        failed: "gm-clone-commit-push-and-denied-push",
+      },
+      {
+        event: "e2e-scenario-blocked",
+        scenario: "ci-push-triggered-local-dag-and-provenance",
+        failed: "gm-clone-commit-push-and-denied-push",
+      },
+    ],
+  );
+  assert.equal(
+    events.filter((event) => event.event === "e2e-scenario-skipped").length,
+    e2eScenarioNames.length - selected.size,
+  );
+  // Two independent failures: both reported, neither hides the other.
+  const both = new Set<string>([
+    "gm-clone-commit-push-and-denied-push",
+    "tracker-claim-sync-complete-and-blocked-transitions",
+  ]);
+  await assert.rejects(
+    runPool(registry, both, 4, async (name) => {
+      throw new Error(`${name}: boom`);
+    }),
+    (error) =>
+      error instanceof AggregateError &&
+      error.errors.length === 2 &&
+      /gm-clone.*boom; tracker-claim.*boom/.test(error.message),
+  );
+});
+
+await test("side by side at most `workers` scenarios and two browser scenarios run at once", async () => {
+  // Independent of each other: they overlap as far as the limits allow.
+  const browsers = [
+    "browser-timeline-scope-round-trip",
+    "assistant-chats-expire",
+    "password-accounts-admin-create-sign-in-and-reset",
+    "browser-atlas-smoke",
+  ];
+  const others = [
+    "durable-objects-register-and-purge",
+    "source-push-recovery-fences-late-writes",
+    "source-late-sync-lineage-conflicts-guard-and-expiry",
+  ];
+  let most = 0,
+    mostBrowsers = 0;
+  const open = new Set<string>();
+  await runPool(registry, new Set([...browsers, ...others]), 3, async (name) => {
+    open.add(name);
+    most = Math.max(most, open.size);
+    const browsing = [...open].filter((other) => browsers.includes(other)).length;
+    mostBrowsers = Math.max(mostBrowsers, browsing);
+    await delay(5);
+    open.delete(name);
+  });
+  assert.equal(most, 3);
+  assert.equal(mostBrowsers, 2);
 });

@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { chromium, expect as playwrightExpect, type Page } from "@playwright/test";
+import { expect as playwrightExpect, type Page } from "@playwright/test";
 import type { CiRunList } from "../../apps/website/shared/api.ts";
 import {
   stateAt,
@@ -18,7 +18,7 @@ import {
   type ChronicleIssue,
   type LinkedWork,
 } from "../../apps/website/shared/chronicle.ts";
-import type { HarnessContext } from "./types.ts";
+import type { HarnessContext, ScenarioBrowser } from "./types.ts";
 
 export interface ChronicleE2E {
   ctx: HarnessContext;
@@ -33,6 +33,8 @@ export interface ChronicleE2E {
     statuses?: number[],
   ): Promise<T>;
   record(value: unknown): void;
+  /** The run's shared browser, for this scenario's contexts. */
+  browser(): Promise<ScenarioBrowser>;
   /** The fixture's new team key. */
   team?: string;
 }
@@ -128,7 +130,7 @@ export async function chronicleScenario(t: ChronicleE2E): Promise<void> {
   assert.equal(work.releaseNotes.length, 1, "Linked work names the release-note entry");
 
   const expect = playwrightExpect.configure({ timeout: 15_000 });
-  const browser = await chromium.launch({ headless: true });
+  const browser = await t.browser();
   const shots = (name: string) => join(t.ctx.artifacts, `chronicle-${name}.png`);
   const signIn = async (viewport: { width: number; height: number }, dark: boolean) => {
     const context = await browser.newContext({

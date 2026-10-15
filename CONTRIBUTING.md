@@ -580,6 +580,14 @@ CI/CD gate coverage is retained; candidate proof reuse requires explicit pipelin
 opt-in. Update the workspace policy in `tools/agent/ready-plan.ts` when adding
 workspaces or cross-workspace imports, and the scenario inventory, prerequisites,
 areas, path rules and browser coverage in `ready-e2e.ts` when adding E2E journeys.
+Declare each new journey's shared resources there too (`scenarioResources`: the
+engine repository, a Space, jun's account, gm's state or the whole Instance; when
+unsure, a write).
+
+`GITMATRIX_E2E_WORKERS` (experimental, default 1) runs that many scenarios side by
+side, never two that conflict on a declared resource, at most two with a browser;
+1 is the serial suite and its stop at the first failure. With more, a failure
+stops only what waits for it. The plan is to trial it on the main E2E watcher first.
 
 Measured decisions from 2026-10-09 (single local runs, not portable benchmarks):
 

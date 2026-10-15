@@ -8,7 +8,13 @@ import { createServer, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
-import { chromium, expect as playwrightExpect, type BrowserContext } from "@playwright/test";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  chromium,
+  expect as playwrightExpect,
+  type Browser,
+  type BrowserContext,
+} from "@playwright/test";
 import type {
   Agent,
   AgentCapabilities,
@@ -31,7 +37,7 @@ import type { WhyResponse } from "../../apps/website/shared/why.ts";
 import type { StepFeedRecord, StepPage } from "../../apps/website/shared/steps.ts";
 import { atlasRevocationScenario, atlasSmokeScenario } from "./atlas-e2e.ts";
 import { chronicleScenario } from "./chronicle-e2e.ts";
-import type { HarnessContext, Persona, SeedManifest } from "./types.ts";
+import type { HarnessContext, Persona, ScenarioBrowser, SeedManifest } from "./types.ts";
 import { runQueueE2E } from "./queue-e2e.ts";
 import { runSourceMigrationE2E } from "./source-migration-e2e.ts";
 import { runSourceRetentionE2E } from "./source-retention-e2e.ts";
@@ -40,7 +46,13 @@ import { runSourceAuthE2E } from "./source-auth-e2e.ts";
 import { runSourceLandingE2E } from "./source-landing-e2e.ts";
 import { runSourceSyncE2E } from "./source-sync-e2e.ts";
 import { availableMemory, gib } from "./heavy.ts";
-import { expandE2EScenarios, type ScenarioName } from "./ready-e2e.ts";
+import {
+  browserScenarios,
+  e2eWorkers,
+  expandE2EScenarios,
+  schedule,
+  type ScenarioName,
+} from "./ready-e2e.ts";
 import { runSourcePushRecoveryE2E } from "./source-push-recovery-e2e.ts";
 
 type Evidence = {
@@ -51,6 +63,84 @@ type Evidence = {
   error?: string;
   availableMemory?: string;
 };
+
+/**
+ * Runs the registered scenarios: one at a time in suite order, stopping at the
+ * first failure, or `workers` at once honouring schedule(). Side by side, a
+ * failure stops only what waits for it; the others finish, then every failure
+ * is thrown together.
+ */
+export async function runPool(
+  registered: readonly { name: ScenarioName; body: () => Promise<void> }[],
+  selection: ReadonlySet<string> | undefined,
+  workers: number,
+  run: (name: ScenarioName, body: () => Promise<void>) => Promise<void>,
+): Promise<void> {
+  if (workers === 1) {
+    for (const { name, body } of registered) {
+      if (selection && !selection.has(name))
+        console.log(JSON.stringify({ event: "e2e-scenario-skipped", scenario: name }));
+      else await run(name, body);
+    }
+    return;
+  }
+  const bodies = new Map(registered.map(({ name, body }) => [name, body]));
+  const chosen = registered.map(({ name }) => name).filter((name) => selection?.has(name) ?? true);
+  for (const { name } of registered)
+    if (!chosen.includes(name))
+      console.log(JSON.stringify({ event: "e2e-scenario-skipped", scenario: name }));
+  const { order, waitsFor } = schedule(chosen);
+  const pending = [...order];
+  const passed = new Set<ScenarioName>();
+  // Failed, or not started because something it waits for failed.
+  const stopped = new Set<ScenarioName>();
+  const active = new Map<ScenarioName, Promise<void>>();
+  const errors: unknown[] = [];
+  while (pending.length || active.size) {
+    // A copy: starting or blocking a scenario removes it from pending.
+    for (const name of pending.slice()) {
+      const needs = [...waitsFor.get(name)!];
+      const failed = needs.find((need) => stopped.has(need));
+      if (failed) {
+        pending.splice(pending.indexOf(name), 1);
+        stopped.add(name);
+        console.log(JSON.stringify({ event: "e2e-scenario-blocked", scenario: name, failed }));
+        continue;
+      }
+      if (active.size >= workers || !needs.every((need) => passed.has(need))) continue;
+      // At most two browser scenarios at once: Chromium's renderers are the memory (CORE-306).
+      if (
+        browserScenarios.includes(name) &&
+        [...active.keys()].filter((other) => browserScenarios.includes(other)).length >= 2
+      )
+        continue;
+      pending.splice(pending.indexOf(name), 1);
+      active.set(
+        name,
+        run(name, bodies.get(name)!)
+          .then(
+            () => void passed.add(name),
+            (error: unknown) => {
+              stopped.add(name);
+              errors.push(error);
+            },
+          )
+          .finally(() => active.delete(name)),
+      );
+    }
+    if (!active.size) {
+      assert(!pending.length, `No E2E scenario can start: ${pending.join(", ")}`);
+      break;
+    }
+    await Promise.race(active.values());
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length)
+    throw new AggregateError(
+      errors,
+      `E2E scenarios failed: ${errors.map((error) => (error as Error).message).join("; ")}`,
+    );
+}
 
 /** Real clients against the isolated server. A failed scenario always fails the command. */
 export async function runE2E(
@@ -65,6 +155,7 @@ export async function runE2E(
   );
   const selection =
     selected === undefined ? undefined : new Set<string>(expandE2EScenarios(selected));
+  const workers = e2eWorkers();
   assert.equal(fixtures.origin, ctx.origin, "Fixture/server identity mismatch");
   const work = join(ctx.work, `e2e-${randomUUID()}`);
   await mkdir(work, { recursive: true, mode: 0o700 });
@@ -75,40 +166,102 @@ export async function runE2E(
     return text.replace(/gm[xj]_[A-Za-z0-9_-]+/g, "[REDACTED]");
   };
   const report: Evidence[] = [];
-  let observations: unknown[] = [];
-  const record = (value: unknown) => observations.push(JSON.parse(redact(JSON.stringify(value))));
-  async function scenario(name: ScenarioName, body: () => Promise<void>) {
-    if (selection && !selection.has(name)) {
-      console.log(JSON.stringify({ event: "e2e-scenario-skipped", scenario: name }));
-      return;
-    }
+  // Each running scenario's own observations and browser contexts.
+  interface Running {
+    name: ScenarioName;
+    observations: unknown[];
+    contexts: Set<BrowserContext>;
+  }
+  const running = new AsyncLocalStorage<Running>();
+  // A callback outside every scenario's async context records into the latest started.
+  let latest: Running | undefined;
+  const record = (value: unknown) =>
+    (running.getStore() ?? latest)?.observations.push(JSON.parse(redact(JSON.stringify(value))));
+  // Bodies run after registration (runPool below), so setup between them stays declarations.
+  const registered: { name: ScenarioName; body: () => Promise<void> }[] = [];
+  function scenario(name: ScenarioName, body: () => Promise<void>) {
+    registered.push({ name, body });
+  }
+  // Scenarios finish in any order side by side: one e2e.json write at a time.
+  let persisted = Promise.resolve();
+  const persist = () =>
+    (persisted = persisted
+      .catch(() => {})
+      .then(() =>
+        writeFile(join(ctx.artifacts, "e2e.json"), JSON.stringify(report, null, 2), {
+          mode: 0o600,
+        }),
+      ));
+  async function run(name: ScenarioName, body: () => Promise<void>) {
     const started = performance.now();
-    observations = [];
+    const own: Running = { name, observations: [], contexts: new Set() };
+    latest = own;
+    let entry: Evidence | undefined;
     try {
-      await body();
-      report.push({
+      await running.run(own, body);
+      entry = {
         scenario: name,
         status: "passed",
         elapsedMs: Math.round(performance.now() - started),
-        observations,
-      });
+        observations: own.observations,
+      };
+      report.push(entry);
     } catch (error) {
-      report.push({
+      entry = {
         scenario: name,
         status: "failed",
         elapsedMs: Math.round(performance.now() - started),
-        observations,
+        observations: own.observations,
         error: redact(String(error)),
         // A renderer killed for memory fails whatever it was waiting on (CORE-306).
         availableMemory: gib(await availableMemory()),
-      });
+      };
+      report.push(entry);
       throw new Error(`${name}: ${redact(String(error))}`);
     } finally {
-      await writeFile(join(ctx.artifacts, "e2e.json"), JSON.stringify(report, null, 2), {
-        mode: 0o600,
-      });
-      console.log(JSON.stringify(report.at(-1)));
+      for (const context of own.contexts) await context.close().catch(() => {});
+      await persist();
+      console.log(JSON.stringify(entry));
     }
+  }
+  // One browser for the run, launched on first use; each scenario has its own contexts.
+  let launched: Promise<Browser> | undefined;
+  function launch() {
+    const pending = chromium.launch({ headless: true });
+    launched = pending;
+    pending.catch(() => {
+      if (launched === pending) launched = undefined;
+    });
+    return pending;
+  }
+  async function sharedBrowser(): Promise<ScenarioBrowser> {
+    const own = running.getStore();
+    assert(own, "A browser is opened only inside a scenario");
+    assert(
+      browserScenarios.includes(own.name),
+      `${own.name} opens a browser: add it to browserScenarios (ready-e2e.ts)`,
+    );
+    const pending = launched ?? launch();
+    let browser = await pending;
+    // A crashed browser fails only the scenario that was using it.
+    if (!browser.isConnected()) browser = await (launched === pending ? launch() : launched!);
+    return {
+      newContext: async (options) => {
+        const context = await browser.newContext(options);
+        own.contexts.add(context);
+        context.once("close", () => own.contexts.delete(context));
+        return context;
+      },
+      close: async () => {
+        for (const context of own.contexts) await context.close();
+      },
+    };
+  }
+  async function closeBrowser() {
+    const pending = launched;
+    launched = undefined;
+    // Never in place of a scenario's failure.
+    await (await pending?.catch(() => undefined))?.close().catch(() => {});
   }
   async function request(
     path: string,
@@ -284,7 +437,7 @@ export async function runE2E(
     ).stdout.trim();
   }
 
-  await scenario("authorization-and-token-revocation", async () => {
+  scenario("authorization-and-token-revocation", async () => {
     await request(`/api/repos/${publicRepo.space}/${publicRepo.name}`, null);
     await request(api, null, "GET", undefined, [401, 404]);
     await request(api, "gmx_invalid", "GET", undefined, [401, 404]);
@@ -324,7 +477,7 @@ export async function runE2E(
     await spaceBoundaryScenario(ctx, fixtures, json, record);
   });
 
-  await scenario("gm-clone-commit-push-and-denied-push", async () => {
+  scenario("gm-clone-commit-push-and-denied-push", async () => {
     await gm(["clone", fullName, checkout]);
     await writeFile(join(checkout, "agent-e2e.txt"), bytes);
     await gm(
@@ -368,7 +521,7 @@ export async function runE2E(
     record({ ref: branch.shortName, oid: branch.oid, deniedRefUnchanged: true });
   });
 
-  await scenario("repository-file-history-and-attribution", async () => {
+  scenario("repository-file-history-and-attribution", async () => {
     const history = await json<HistoryPage>(`${api}/history?at=agent-e2e&entries=true`, ownerToken);
     assert.equal(history.next, null);
     assert.equal(history.commits.length, 2);
@@ -404,7 +557,7 @@ export async function runE2E(
     });
   });
 
-  await scenario("tracker-claim-sync-complete-and-blocked-transitions", async () => {
+  scenario("tracker-claim-sync-complete-and-blocked-transitions", async () => {
     const owner = fixtures.tracker.space;
     await gm(["tracker", "use", owner]);
     await gm(["tracker", "sync", "--space", owner]);
@@ -471,7 +624,7 @@ export async function runE2E(
     record({ issue: fixtures.tracker.ready, status: completed.issue.status, evidenceSynced: true });
   });
 
-  await scenario("chronicle-history-and-linked-work-over-api", async () => {
+  scenario("chronicle-history-and-linked-work-over-api", async () => {
     // CORE-250: real gm work on a fresh issue, read back by time from the
     // Tracker Durable Object in workerd: its states, its work span and markers.
     const owner = fixtures.tracker.space;
@@ -559,7 +712,7 @@ export async function runE2E(
     record({ key, span: { endedBy: span.endedBy, renewals: span.renewals.length } });
   });
 
-  await scenario("timeline-fork-owned-source-and-abandon-permissions", async () => {
+  scenario("timeline-fork-owned-source-and-abandon-permissions", async () => {
     // Forks allocate a separate source; abandonment archives it without changing main.
     const timelines = `/api/tracker/${fixtures.tracker.space}/timelines`;
     const slug = `e2e-${randomUUID().slice(0, 8)}`;
@@ -623,7 +776,7 @@ export async function runE2E(
     record({ timeline: slug, source, forked, abandoned: true, archiveReadable: true });
   });
 
-  await scenario("gm-timeline-start-push-and-abandon", async () => {
+  scenario("gm-timeline-start-push-and-abandon", async () => {
     // A bound checkout pushes to its owned source, never a canonical timeline branch.
     const owner = fixtures.tracker.space;
     const slug = `gm-e2e-${randomUUID().slice(0, 8)}`;
@@ -732,7 +885,7 @@ export async function runE2E(
     });
   });
 
-  await scenario("agent-capabilities-self-reporting-and-claim-identity", async () => {
+  scenario("agent-capabilities-self-reporting-and-claim-identity", async () => {
     const name = `capabilities-${randomUUID().slice(0, 8)}`;
     const skillDir = join(work, "capability-skills");
     const home = join(work, "capability-home");
@@ -975,7 +1128,7 @@ export async function runE2E(
     });
   });
 
-  await scenario("tags-one-vocabulary-and-old-spellings", async () => {
+  scenario("tags-one-vocabulary-and-old-spellings", async () => {
     // CORE-271: issue tags from the tracker's tag catalog through the real gm and
     // API, with every old spelling kept: --label, `labels` in --data and the API,
     // and label: in search.
@@ -1044,7 +1197,7 @@ export async function runE2E(
     record({ tags: [ux, data], aliases: ["--label", "labels", "tags"] });
   });
 
-  await scenario("tightening-requirements-on-a-claimed-issue", async () => {
+  scenario("tightening-requirements-on-a-claimed-issue", async () => {
     // CORE-272: a real agent claims; a person tightens the requirements. gm says
     // who's affected and keeps the claim (recorded), --release-claim releases it,
     // --require-issue-tags turns tags into requirements, and next names what blocked it.
@@ -1194,7 +1347,7 @@ export async function runE2E(
     record({ agent: agent.name, kept: true, released: true, blocking: next.skipped.blocking });
   });
 
-  await scenario("agent-durable-interventions-and-resume", async () => {
+  scenario("agent-durable-interventions-and-resume", async () => {
     const owner = fixtures.tracker.space;
     const directory = join(work, "autonomous-agent");
     await mkdir(join(directory, ".gitmatrix"), { recursive: true, mode: 0o700 });
@@ -1454,7 +1607,7 @@ export async function runE2E(
     });
   });
 
-  await scenario("tracker-handoff-to-an-agent-created-after-sync", async () => {
+  scenario("tracker-handoff-to-an-agent-created-after-sync", async () => {
     // marco's replica predates this agent: the handoff must still find it by name.
     const owner = fixtures.tracker.space;
     const issue = fixtures.tracker.blocker;
@@ -1517,7 +1670,7 @@ export async function runE2E(
     record({ agent: name, holder: shown.issue.claim.actorId });
   });
 
-  await scenario("package-upload-download-and-write-boundary", async () => {
+  scenario("package-upload-download-and-write-boundary", async () => {
     const file = join(work, "artifact.txt");
     await writeFile(file, bytes);
     await gm(["pkg", "upload", file, `${packageName}/1.0.0/artifact.txt`, "--space", repo.space]);
@@ -1667,7 +1820,7 @@ export async function runE2E(
   const terminal = (run: CiRunDetail) => !["queued", "running"].includes(run.status);
   const publish = `printf 'gitmatrix live regression artifact\\n' > artifact.txt\ncurl --fail --silent --show-error -X PUT -H "Authorization: Bearer $GITMATRIX_TOKEN" --data-binary @artifact.txt "\${GITMATRIX_GENERIC_URL}${packageName}/2.0.0/artifact.txt"`;
 
-  await scenario("ci-push-triggered-local-dag-and-provenance", async () => {
+  scenario("ci-push-triggered-local-dag-and-provenance", async () => {
     const number = await pushPipeline(
       {
         build: {
@@ -1725,7 +1878,7 @@ export async function runE2E(
     record({ publish: row });
   });
 
-  await scenario("ci-failing-prerequisite-skips-dependent", async () => {
+  scenario("ci-failing-prerequisite-skips-dependent", async () => {
     const number = await pushPipeline(
       {
         fail: { steps: [{ run: "printf 'intentional agent failure\\n'; exit 23" }] },
@@ -1742,7 +1895,7 @@ export async function runE2E(
     record({ run });
   });
 
-  await scenario("ci-job-records-and-updates-a-deployment", async () => {
+  scenario("ci-job-records-and-updates-a-deployment", async () => {
     // The job runs this environment's gm, never a globally installed one.
     const number = await pushPipeline(
       {
@@ -1838,7 +1991,7 @@ export async function runE2E(
     await request(`${timelineApi}/${timelineSlug}/abandon`, ownerToken, "POST");
   });
 
-  await scenario("ci-cancellation-and-job-token-lifetime", async () => {
+  scenario("ci-cancellation-and-job-token-lifetime", async () => {
     const capability = randomUUID();
     let liveToken: string | undefined;
     let waiting: ServerResponse | undefined;
@@ -1931,7 +2084,7 @@ export async function runE2E(
     }
   });
 
-  await scenario("ci-retention-removes-logs-and-runs", async () => {
+  scenario("ci-retention-removes-logs-and-runs", async () => {
     // CORE-200, in the real runtime: two finished runs on one branch, moved
     // 40 days back; a manual dry run then run of "ci-logs" removes their log
     // text (the run page, the logs API and `gm runs` say so), then "ci-runs"
@@ -2010,7 +2163,7 @@ export async function runE2E(
 
     const browserTimeout = 15_000;
     const expect = playwrightExpect.configure({ timeout: browserTimeout });
-    const browser = await chromium.launch({ headless: true });
+    const browser = await sharedBrowser();
     const context = await browser.newContext({ baseURL: ctx.origin });
     const page = await context.newPage();
     page.setDefaultTimeout(browserTimeout);
@@ -2107,7 +2260,7 @@ export async function runE2E(
     return checkpoint.checkpoint;
   }
 
-  await scenario("timeline-compact-landing-gates-receipt-and-native-source", async () => {
+  scenario("timeline-compact-landing-gates-receipt-and-native-source", async () => {
     const slug = `land-e2e-${randomUUID().slice(0, 8)}`;
     const marker = `landing-e2e/${slug}.txt`;
     const clone = await landingTimeline(slug);
@@ -2445,7 +2598,7 @@ export async function runE2E(
     return promise;
   }
 
-  await scenario("steps-context-hook-live-run-landing-and-access", async () => {
+  scenario("steps-context-hook-live-run-landing-and-access", async () => {
     // CORE-226 (S01, S02, S04, S06, S07, S09): an agent steps through a
     // timeline: what the person said comes through the hook, the step carries
     // its why and local tests, arrives on the live feed within seconds, gets
@@ -2553,7 +2706,7 @@ export async function runE2E(
     });
   });
 
-  await scenario("timeline-landing-conflict-asks-for-a-sync", async () => {
+  scenario("timeline-landing-conflict-asks-for-a-sync", async () => {
     const slug = `clash-e2e-${randomUUID().slice(0, 8)}`;
     const file = `landing-e2e/${slug}.txt`;
     const clone = await landingTimeline(slug);
@@ -2720,7 +2873,7 @@ export async function runE2E(
     }
   });
 
-  await scenario("timeline-nested-admission-and-canonical-revert", async () => {
+  scenario("timeline-nested-admission-and-canonical-revert", async () => {
     const parent = `parent-${randomUUID().slice(0, 8)}`;
     const child = `child-${randomUUID().slice(0, 8)}`;
     const parentClone = await landingTimeline(parent);
@@ -2855,11 +3008,11 @@ export async function runE2E(
     record({ parent, child, p0, parentCompact, childCompact, revertTip, integrated });
   });
 
-  await scenario("queue-concurrency-failure-fencing-and-push-recovery", async () => {
+  scenario("queue-concurrency-failure-fencing-and-push-recovery", async () => {
     await runQueueE2E(ctx, fixtures, gm, record);
   });
 
-  await scenario("agent-setup-memorable-persistent-identities", async () => {
+  scenario("agent-setup-memorable-persistent-identities", async () => {
     const home = join(work, "setup-names-home");
     const first = join(work, "setup-names-first");
     const second = join(work, "setup-names-second");
@@ -2939,7 +3092,7 @@ export async function runE2E(
     });
   });
 
-  await scenario("agent-identity-provisioned-on-first-use", async () => {
+  scenario("agent-identity-provisioned-on-first-use", async () => {
     // A harness drives gm in a checkout set up for an agent, but this machine
     // holds no token for it: gm must act as the agent, never quietly as its person.
     const name = `harness-${randomUUID().slice(0, 8)}`;
@@ -3015,7 +3168,7 @@ export async function runE2E(
     });
   });
 
-  await scenario("profile-picture-upload-serve-and-remove", async () => {
+  scenario("profile-picture-upload-serve-and-remove", async () => {
     // CORE-116: a person's picture, stored in the AVATARS bucket.
     const token = fixtures.tokens.jun;
     const put = (bytes: Uint8Array, type: string) =>
@@ -3081,7 +3234,7 @@ export async function runE2E(
     record({ avatar: url, removed: true, orgIcon: icon });
   });
 
-  await scenario("durable-objects-register-and-purge", async () => {
+  scenario("durable-objects-register-and-purge", async () => {
     // CORE-197, in the real runtime: every Durable Object class, a fresh
     // instance each, recorded in the registry on use, given storage and an
     // alarm (retire()), then purged: no table, key or alarm left, and the
@@ -3132,7 +3285,7 @@ export async function runE2E(
     });
   });
 
-  await scenario("usage-metering-collects-per-account", async () => {
+  scenario("usage-metering-collects-per-account", async () => {
     // CORE-207, in the real runtime: the cron's collection, run to the end,
     // meters what the earlier scenarios stored for the fixture repository's
     // Space: pushed pack bytes (Artifacts), D1 groups, Durable Objects.
@@ -3175,7 +3328,7 @@ export async function runE2E(
     record({ usage: figures.map((f) => `${f.construct}/${f.item}/${f.metric}=${f.quantity}`) });
   });
 
-  await scenario("ai-gateway-log-bodies-site-default-and-account-override", async () => {
+  scenario("ai-gateway-log-bodies-site-default-and-account-override", async () => {
     // CORE-290: "Keep AI request and response bodies in gateway logs", per
     // component. Agent environments keep them by default; site administrators
     // set the Instance default and a Space's administrators override it for
@@ -3254,7 +3407,7 @@ export async function runE2E(
     assert(reset.logBodies.components.every((e) => e.siteFrom === "environment" && e.effective));
   });
 
-  await scenario("browser-usage-and-costs-account-and-site", async () => {
+  scenario("browser-usage-and-costs-account-and-site", async () => {
     // CORE-209: Space usage requires its explicit admin grant; Instance totals
     // never grant drilldown access. Exercise both widths from the collection
     // above; members and non-admins remain refused.
@@ -3285,7 +3438,7 @@ export async function runE2E(
 
     const browserTimeout = 15_000;
     const expect = playwrightExpect.configure({ timeout: browserTimeout });
-    const browser = await chromium.launch({ headless: true });
+    const browser = await sharedBrowser();
     const signIn = async (persona: Persona, viewport: { width: number; height: number }) => {
       const context = await browser.newContext({ baseURL: ctx.origin, viewport });
       await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
@@ -3426,7 +3579,7 @@ export async function runE2E(
     }
   });
 
-  await scenario("browser-data-retention-account-and-site", async () => {
+  scenario("browser-data-retention-account-and-site", async () => {
     // CORE-210: independent personal, Space-admin and Instance retention,
     // at desktop and phone widths, driven from the keyboard.
     // Marco turns personal assistant chat expiration on, previews it
@@ -3541,7 +3694,7 @@ export async function runE2E(
 
     const browserTimeout = 20_000;
     const expect = playwrightExpect.configure({ timeout: browserTimeout });
-    const browser = await chromium.launch({ headless: true });
+    const browser = await sharedBrowser();
     const signIn = async (persona: Persona, viewport: { width: number; height: number }) => {
       const context = await browser.newContext({ baseURL: ctx.origin, viewport });
       await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
@@ -3786,7 +3939,7 @@ export async function runE2E(
     }
   });
 
-  await scenario("tracker-retention-removes-closed-issues-and-replicas-converge", async () => {
+  scenario("tracker-retention-removes-closed-issues-and-replicas-converge", async () => {
     // CORE-203, in the real runtime: sam's own tracker gets a closed issue,
     // an open one and a gm replica; a retention run 400 days ahead (a dry run
     // first) removes the closed issue and prunes old activity, including an
@@ -3919,7 +4072,7 @@ export async function runE2E(
     await gm(["tracker", "sync", "--space", owner], "sam");
     await gm(["issue", "show", freshKey, "--space", owner, "--offline"], "sam");
 
-    const browser = await chromium.launch({ headless: true });
+    const browser = await sharedBrowser();
     const context = await browser.newContext({ baseURL: ctx.origin });
     const page = await context.newPage();
     try {
@@ -3943,7 +4096,7 @@ export async function runE2E(
     record({ removed: closedKey, kept: openKey, items: removed });
   });
 
-  await scenario("registry-retention-keeps-installs-working", async () => {
+  scenario("registry-retention-keeps-installs-working", async () => {
     // CORE-205, in the real runtime: the registry's site categories run 400
     // days ahead (a dry run first, the same items), then garbage collection
     // at that moment; every version the package scenario published still
@@ -4005,7 +4158,7 @@ export async function runE2E(
     record({ removed: counts, installed: ["1.0.0", "2.0.0"] });
   });
 
-  await scenario("repository-deletion-purges-everything-and-resumes", async () => {
+  scenario("repository-deletion-purges-everything-and-resumes", async () => {
     // CORE-199, in the real runtime with real Artifacts: a repository with a
     // live timeline preview, a registry grant and pushed history is deleted.
     // It's missing at once; the purge Workflow tears the preview down with the
@@ -4231,7 +4384,7 @@ export async function runE2E(
     }
   });
 
-  await scenario("assistant-chats-expire", async () => {
+  scenario("assistant-chats-expire", async () => {
     // CORE-204, in the real runtime: jun turns on assistant chat expiration;
     // the chat list says when each chat expires; a run 100 days ahead (a dry
     // run first) purges the chat nobody used (its Durable Object through the
@@ -4263,7 +4416,7 @@ export async function runE2E(
       "No expiry while the policy is off",
     );
     await json(settings, token, "PATCH", { categories: { "assistant-chats": { enabled: true } } });
-    const browser = await chromium.launch({ headless: true });
+    const browser = await sharedBrowser();
     const context = await browser.newContext({ baseURL: ctx.origin });
     const page = await context.newPage();
     try {
@@ -4357,7 +4510,7 @@ export async function runE2E(
     }
   });
 
-  await scenario("auth-hygiene-keeps-sign-in-and-tokens-working", async () => {
+  scenario("auth-hygiene-keeps-sign-in-and-tokens-working", async () => {
     // CORE-206, in the real runtime: a site administrator's dry run then run
     // of "auth-hygiene" removes sign-in state that ended a month ago; every
     // live token still authenticates, gm still works, and a browser sign-in
@@ -4401,7 +4554,7 @@ export async function runE2E(
     await request(api, fixtures.readToken);
     await gm(["auth", "status"], "jun");
 
-    const browser = await chromium.launch({ headless: true });
+    const browser = await sharedBrowser();
     const context = await browser.newContext({ baseURL: ctx.origin });
     const page = await context.newPage();
     try {
@@ -4418,7 +4571,7 @@ export async function runE2E(
     record({ written: Object.keys(written), dry: dry.items, removed: removed.items });
   });
 
-  await scenario("password-accounts-admin-create-sign-in-and-reset", async () => {
+  scenario("password-accounts-admin-create-sign-in-and-reset", async () => {
     // CORE-404, in the real runtime: a site admin's gm creates an account with
     // a made-up, never-verified email and a generated password; the person
     // signs in with their username in a browser; a new password ends that
@@ -4447,7 +4600,7 @@ export async function runE2E(
     };
     assert(listed.accounts.some((a) => a.username === username && a.hasPassword));
 
-    const browser = await chromium.launch({ headless: true });
+    const browser = await sharedBrowser();
     const context = await browser.newContext({ baseURL: ctx.origin });
     const page = await context.newPage();
     try {
@@ -4487,7 +4640,7 @@ export async function runE2E(
     record({ username, sessionsRevoked: 1 });
   });
 
-  await scenario("push-log-retention-and-unreachable-git", async () => {
+  scenario("push-log-retention-and-unreachable-git", async () => {
     // CORE-202 with real Artifacts, in jun's explicitly granted personal Space
     // (cleanup is per Space): a deleted branch leaves a commit no ref reaches.
     // Artifacts keeps it (it still serves it by id) and can't prune it, so
@@ -4657,11 +4810,11 @@ export async function runE2E(
     record({ unreachable: measured, objects: before.count, cleanup: { dry, real } });
   });
 
-  await scenario("browser-personas-persisted-product-state", async () => {
+  scenario("browser-personas-persisted-product-state", async () => {
     // Hydration on the live dev server needs the same budget as page actions.
     const browserTimeout = 15_000;
     const expect = playwrightExpect.configure({ timeout: browserTimeout });
-    const browser = await chromium.launch({ headless: true });
+    const browser = await sharedBrowser();
     const contexts: BrowserContext[] = [];
     try {
       for (const persona of ["marco", "sam"] as const) {
@@ -5083,7 +5236,7 @@ export async function runE2E(
   // The browser scenarios are a few journeys across the real stack. What a
   // page does with what it reads (the palette, the Atlas, the switcher's
   // scoping) is in apps/website's browser-mode tests: README "Testing".
-  await scenario("browser-atlas-smoke", async () => {
+  scenario("browser-atlas-smoke", async () => {
     // CORE-171: a pushed repository's Atlas, projected by the Worker, read in
     // a real session down to the cited source in git.
     await atlasSmokeScenario({
@@ -5091,12 +5244,13 @@ export async function runE2E(
       work,
       token: ownerToken,
       gm: (args, persona = "marco", cwd = work) => gm(args, persona, cwd),
+      browser: sharedBrowser,
       json,
       record,
     });
   });
 
-  await scenario("atlas-revocation-reads-like-a-missing-repository", async () => {
+  scenario("atlas-revocation-reads-like-a-missing-repository", async () => {
     // CORE-178: a removed collaborator's still-valid Atlas links answer as a
     // repository that never existed.
     await atlasRevocationScenario({
@@ -5110,7 +5264,7 @@ export async function runE2E(
     });
   });
 
-  await scenario("browser-timeline-scope-round-trip", async () => {
+  scenario("browser-timeline-scope-round-trip", async () => {
     // A real session carries the owned source through code links, then explicitly returns to main.
     const timelines = `/api/tracker/${fixtures.tracker.space}/timelines`;
     const slug = `e2e-switch-${randomUUID().slice(0, 8)}`;
@@ -5126,7 +5280,7 @@ export async function runE2E(
     assert(!detail.branches.some((b) => b.shortName === `timeline/${slug}`));
     const browserTimeout = 15_000;
     const expect = playwrightExpect.configure({ timeout: browserTimeout });
-    const browser = await chromium.launch({ headless: true });
+    const browser = await sharedBrowser();
     const context = await browser.newContext({
       baseURL: ctx.origin,
       viewport: { width: 1280, height: 800 },
@@ -5197,7 +5351,7 @@ export async function runE2E(
       await request(`${timelines}/${slug}/abandon`, fixtures.tokens.jun, "POST").catch(() => {});
     }
   });
-  await scenario("retention-concurrent-with-pushes-builds-and-chats", async () => {
+  scenario("retention-concurrent-with-pushes-builds-and-chats", async () => {
     // CORE-211, in the real runtime: real cleanups (dated a year ahead, so
     // nearly everything is old enough) run again and again in jun's Space and personal scope
     // while jun pushes to two branches, a CI build runs, and new chats are
@@ -5424,37 +5578,44 @@ export async function runE2E(
       chats: { fresh: fresh.length, idleRemoved: idle.length },
     });
   });
-  await scenario("source-authorization-native-and-canonical-separation", () =>
+  scenario("source-authorization-native-and-canonical-separation", () =>
     runSourceAuthE2E(ctx, fixtures, gm, record),
   );
-  await scenario("source-multi-repository-landing-and-durable-recovery", () =>
+  scenario("source-multi-repository-landing-and-durable-recovery", () =>
     runSourceLandingE2E(ctx, fixtures, gm, record),
   );
-  await scenario("source-push-recovery-fences-late-writes", () =>
+  scenario("source-push-recovery-fences-late-writes", () =>
     runSourcePushRecoveryE2E(ctx, fixtures, gm, record),
   );
-  await scenario("source-late-sync-lineage-conflicts-guard-and-expiry", () =>
+  scenario("source-late-sync-lineage-conflicts-guard-and-expiry", () =>
     runSourceSyncE2E(ctx, fixtures, gm, record),
   );
-  await scenario("source-finite-legacy-migration-and-partial-revert", () =>
+  scenario("source-finite-legacy-migration-and-partial-revert", () =>
     runSourceMigrationE2E(ctx, fixtures, gm, record),
   );
-  await scenario("source-retention-expiry-orphan-and-canonical-purge", () =>
+  scenario("source-retention-expiry-orphan-and-canonical-purge", () =>
     runSourceRetentionE2E(ctx, fixtures, gm, record),
   );
-  await scenario("browser-expired-source-without-timeline-history", () =>
-    runSourceExpiredE2E(ctx, fixtures, gm, record),
+  scenario("browser-expired-source-without-timeline-history", () =>
+    runSourceExpiredE2E(ctx, fixtures, gm, record, sharedBrowser),
   );
 
-  await scenario("browser-chronicle-scrub-range-span-and-links", async () => {
+  scenario("browser-chronicle-scrub-range-span-and-links", async () => {
     // CORE-251: a month of real tracker history read on a time axis, at
     // desktop and phone widths (tools/agent/chronicle-e2e.ts).
     await chronicleScenario({
       ctx,
       token: ownerToken,
       secret: ctx.env.GITMATRIX_AGENT_SECRET ?? "",
+      browser: sharedBrowser,
       json,
       record,
     });
   });
+
+  try {
+    await runPool(registered, selection, workers, run);
+  } finally {
+    await closeBrowser();
+  }
 }

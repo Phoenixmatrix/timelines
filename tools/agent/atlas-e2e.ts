@@ -11,14 +11,14 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { chromium, expect as playwrightExpect } from "@playwright/test";
+import { expect as playwrightExpect } from "@playwright/test";
 import type { RepoDetail } from "../../apps/website/shared/api.ts";
 import {
   atlasFixtureFiles,
   atlasFixtureSource,
   type AtlasFixtureVariant,
 } from "../../apps/website/shared/atlasFixture.ts";
-import type { HarnessContext, Persona } from "./types.ts";
+import type { HarnessContext, Persona, ScenarioBrowser } from "./types.ts";
 
 export interface AtlasE2E {
   ctx: HarnessContext;
@@ -82,13 +82,13 @@ const ATLAS_ROUTE = /\/atlas\/([a-z]+)$/;
  * source opened from git at the indexed commit. Browsing never reaches
  * search, a model-backed index or the whole graph.
  */
-export async function atlasSmokeScenario(t: AtlasE2E) {
+export async function atlasSmokeScenario(t: AtlasE2E & { browser(): Promise<ScenarioBrowser> }) {
   const browserTimeout = 15_000;
   const expect = playwrightExpect.configure({ timeout: browserTimeout });
   const { owner, name, api, head } = await atlasFixtureRepo(t);
   const base = `/${owner}/${name}/knowledge`;
   const target = "sym:billing/ledger/ledger.ts#post";
-  const browser = await chromium.launch({ headless: true });
+  const browser = await t.browser();
   const context = await browser.newContext({
     baseURL: t.ctx.origin,
     viewport: { width: 1280, height: 900 },
