@@ -122,9 +122,13 @@ function fullGates(): ReadyPlan["gates"] {
 }
 
 function documentation(path: string): boolean {
-  // Only human-facing documents at known roots; assets and nested Markdown can be runtime inputs.
+  // Only human-facing documents at known names (nothing builds from or reads them); an unknown
+  // root file, assets and nested Markdown can be runtime inputs.
   return (
-    /^(?:README|AGENTS|CONTRIBUTING|CHANGELOG)\.md$/.test(path) ||
+    /^(?:README|AGENTS|CONTRIBUTING|CHANGELOG|CLAUDE|DESIGN|PRODUCT|SELF-HOSTING|ATTRIBUTIONS)\.md$/.test(
+      path,
+    ) ||
+    path === "LICENSE" ||
     WORKSPACES.some((workspace) =>
       new RegExp(`^${workspace}/(?:README|AGENTS|CONTRIBUTING|CHANGELOG)\\.md$`).test(path),
     )

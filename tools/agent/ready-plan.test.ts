@@ -114,6 +114,9 @@ await test("docs and coding-agent configuration retain mandatory checks", async 
   await fixture(async (root, _git, put) => {
     assert.deepEqual(names(await readinessPlan(root, options)), ["remote-types", "check"]);
     await put("README.md");
+    await put("DESIGN.md");
+    await put("SELF-HOSTING.md");
+    await put("LICENSE");
     await put("apps/website/README.md");
     await put(".claude/settings.json", "{}\n");
     await put(".claude/agents/runner.md");
@@ -133,6 +136,15 @@ await test("docs and coding-agent configuration retain mandatory checks", async 
       args: ["workers", "types"],
       cwd: "website",
     });
+  });
+});
+
+await test("Markdown below the root and outside known workspace names is not documentation", async () => {
+  await fixture(async (root, _git, put) => {
+    await put("docs/guide.md");
+    const plan = await readinessPlan(root, options);
+    assert.equal(plan.full, true);
+    assert.match(plan.reasons[0]!, /Unclassified or global path: docs\/guide\.md/);
   });
 });
 
