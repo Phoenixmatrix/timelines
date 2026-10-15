@@ -332,6 +332,45 @@ export class RepoReader {
     return this.#json("tree", oid, async () => (await this.#repo()).readTree(oid), true);
   }
 
+  /**
+   * Data derived from immutable objects and keyed by them (CORE-451: what a
+   * commit changed at a path; a directory's last changes from a commit), so as
+   * permanent as they are: memory, then the Cache API; undefined when neither
+   * has it.
+   */
+  peekDerived<T>(kind: string, id: string): Promise<T | undefined> {
+    return this.#fromCache<T>(kind, id, jsonEncode, jsonDecode);
+  }
+
+  /** peekDerived from this isolate's memory only: free, so a walk may ask for every commit. */
+  recallDerived<T>(kind: string, id: string): T | undefined {
+    const hit = recall<T>(`${this.artifactsName}/${kind}/${id}`) ?? undefined;
+    if (hit !== undefined) this.timing.count(`${kind}-memory`);
+    return hit;
+  }
+
+  /** Keep derived data: in memory now, in the Cache API in the background. */
+  storeDerived(kind: string, id: string, value: unknown): void {
+    const key = `${this.artifactsName}/${kind}/${id}`;
+    const { body, size } = jsonEncode(value);
+    remember(key, value, size);
+    const cache = cacheApi();
+    if (!cache) return;
+    this.waitUntil(
+      cache
+        .put(
+          `${CACHE_ORIGIN}/${key}`,
+          new Response(body, {
+            headers: {
+              "cache-control": "public, max-age=31536000, immutable",
+              "x-gitmatrix-object": "present",
+            },
+          }),
+        )
+        .catch((error: unknown) => console.warn("derived cache put failed", key, error)),
+    );
+  }
+
   /** A page of first-parent history counted from a commit: immutable too. */
   async log(oid: string, limit: number, offset: number): Promise<ArtifactsCommitMetadata[]> {
     const commits = await this.#json(`log`, `${oid}-${limit}-${offset}`, async () =>
