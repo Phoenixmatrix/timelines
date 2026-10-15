@@ -265,16 +265,22 @@ commit trailers, not verified account identities.
 
 `GET /api/repos/:space/:name/history` accepts `at=<ref>/<path>` or `ref` and
 `path`, plus `entries=true` for immediate-child metadata. Each request scans at
-most 100 commits. `next` is the next commit to scan; pass it as `cursor` and pin
-`ref` to the returned `head` for subsequent pages. The file list loads this
-separately from files and automatically follows pages until every displayed file
-and folder has its latest change, then stops. One sequential scan serves the
-whole directory, not a request per row; immutable history pages and commit/tree
-objects are reused. Older pages never replace a newer last-change message.
-Pending rows say **Finding last change…**; a failed page preserves resolved rows
-and offers **Retry history**. Leaving the directory stops further pagination.
-Counts remain partial (labelled with `+`) until **Load older history** reaches the
-end. No file contents are read to calculate history.
+most 100 commits, except with `cover=1` (with `entries=true`): then it scans on,
+within 1000 commits and 1.5 s, until every entry and the path itself have their
+latest change, and stops at that commit (from a cursor, after at least 100).
+`next` is the next commit to scan; pass it as `cursor` and pin `ref` to the
+returned `head` for subsequent pages. The file list loads this separately from
+files with `cover=1`, and follows pages until every displayed file and folder has
+its latest change, then stops: usually after the first. One scan serves the whole
+directory, not a request per row. Each commit's changes at a path and a complete
+cover answer from a commit are cached by commit (memory, then the Cache API), so a
+newer head scans back only to the newest commit with a cached answer; immutable
+history pages and commit/tree objects are reused. Older pages never replace a
+newer last-change message. Pending rows say **Finding last change…**; a failed
+page preserves resolved rows and offers **Retry history**. Leaving the directory
+stops further pagination. Until history is complete, the folder's **History** link
+shows no count (file and commit pages label partial counts with `+`); **Load older
+history** reaches further. No file contents are read to calculate history.
 
 ## Sign-in
 

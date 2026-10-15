@@ -7,7 +7,7 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, test, vi } from "vite-plus/test";
 import type { CommitSummary, HistoryPage, RepoDetail, TreeEntry } from "../../../shared/api.ts";
 import { forgetAllRepoData } from "../../lib/repoData.ts";
-import { useHistory, type HistoryState } from "./History.tsx";
+import { folderHistoryLabel, useHistory, type HistoryState } from "./History.tsx";
 
 const HEAD = "a".repeat(40);
 const repo = { space: { slug: "orbit" }, name: "engine", source: null } as unknown as RepoDetail;
@@ -96,4 +96,14 @@ test("a cut-short answer still pages on from next, with cover", async () => {
   expect(reads[1]!.searchParams.get("cover")).toBe("1");
   expect(Object.keys(state().history?.entries ?? {}).sort()).toEqual(["LICENSE", "src"]);
   expect(reads).toHaveLength(2);
+});
+
+test("a folder's history link counts commits only once its history is complete", () => {
+  expect(folderHistoryLabel(null)).toBe("History");
+  expect(folderHistoryLabel(historyPage(["LICENSE", "src"], "b".repeat(40)))).toBe("History");
+  const complete = historyPage(["LICENSE", "src"], null);
+  expect(folderHistoryLabel(complete)).toBe("1 commit");
+  expect(folderHistoryLabel({ ...complete, commits: Array(447).fill(commit("x")) })).toBe(
+    "447 commits",
+  );
 });

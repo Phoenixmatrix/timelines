@@ -35,7 +35,7 @@ import { railClass } from "../../components/Rail.tsx";
 import { useViewer } from "../../lib/session.ts";
 import { LinkedText } from "../../refs/RefLink.tsx";
 import { useRefMarkdown } from "../../refs/remark.tsx";
-import { CommitInfo, HistoryProgress, countLabel, useHistory } from "./History.tsx";
+import { CommitInfo, HistoryProgress, folderHistoryLabel, useHistory } from "./History.tsx";
 import { About } from "./About.tsx";
 import { RefBar } from "./RefPicker.tsx";
 import { useRepo } from "./RepoLayout.tsx";
@@ -310,7 +310,7 @@ function FileList({ repo, tree }: { repo: RepoDetail; tree: TreeResponse }) {
             repo.source?.sourceId,
           )}
         >
-          {history ? countLabel(history.commits.length, !!history.next) : "History"}
+          {folderHistoryLabel(history)}
         </Link>
       </div>
       <ul className="m-0 list-none divide-y divide-line-soft p-0">
