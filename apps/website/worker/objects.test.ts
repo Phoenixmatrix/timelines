@@ -540,11 +540,7 @@ describe("refs shared through the Cache API under a refs generation (CORE-444)",
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     w.sqlite.close();
     await expect(invalidateRefs(w.db, "shared-bump-failed")).resolves.toBeUndefined();
-    expect(error).toHaveBeenCalledWith(
-      "refs generation bump failed",
-      "shared-bump-failed",
-      expect.anything(),
-    );
+    expect(error).toHaveBeenCalledWith("refs generation bump failed", expect.anything());
     error.mockRestore();
   });
 
@@ -567,7 +563,6 @@ describe("refs shared through the Cache API under a refs generation (CORE-444)",
     expect(settled).toBe(true);
     expect(error).toHaveBeenCalledWith(
       "refs generation bump failed",
-      "shared-bump-stalled",
       expect.objectContaining({ name: "TimeoutError" }),
     );
   });

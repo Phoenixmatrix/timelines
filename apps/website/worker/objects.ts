@@ -158,7 +158,8 @@ export async function invalidateRefs(d1: D1Database, artifactsName: string): Pro
       UPSTREAM_TIMEOUT_MS,
     );
   } catch (error) {
-    console.error("refs generation bump failed", artifactsName, error);
+    // Provider names stay out of logs (they are public-output-sensitive, see source-auth-e2e).
+    console.error("refs generation bump failed", error);
   }
 }
 
@@ -628,7 +629,7 @@ export class RepoReader {
       await history;
     } catch (error) {
       warmed.delete(key);
-      console.warn("warm-up failed", this.artifactsName, error);
+      console.warn("warm-up failed", error);
     }
   }
 
