@@ -59,10 +59,11 @@ import { agents } from "../api/agents.ts";
 import { createAuth } from "../better-auth.ts";
 import { Tracker } from "../tracker/object.ts";
 import { fakeProviders, isProviderUrl } from "./ai-providers.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "./d1.ts";
+import { d1 } from "./d1.ts";
 import { fakeDurableObjectId, fakeDurableState } from "./durable-state.ts";
 import { fakeRemotes } from "./remote.ts";
 import { installCutoverTestControl } from "./space-cutover.ts";
+import { freshInstallationDatabases } from "./spaces.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 
 /** Who a world's requests act as: a seeded persona, or nobody (signed out). */
@@ -145,13 +146,14 @@ class BrowserStepFeed extends StepFeed {
 }
 
 async function createWorld(persona: Persona): Promise<string> {
-  const sqlite = migratedDatabase();
+  const fresh = await freshInstallationDatabases();
+  const { sqlite, registry } = fresh;
   const git = fakeRemotes();
   const trackers = new Map<string, Tracker>();
   const feeds = new Map<string, BrowserStepFeed>();
   const env: Env = {
     DB: d1(sqlite),
-    REGISTRY_DB: d1(migratedRegistryDatabase()),
+    REGISTRY_DB: d1(registry),
     DEV_MODE: "true",
     BETTER_AUTH_SECRET: "browser-tests-browser-tests-browser-tests",
     // Password sign-in counts failures here; nothing is ever locked out.
@@ -200,7 +202,7 @@ async function createWorld(persona: Persona): Promise<string> {
     KNOWLEDGE_QUEUE: absent("KNOWLEDGE_QUEUE"),
     KNOWLEDGE_BUILD: absent("KNOWLEDGE_BUILD"),
   } as unknown as Env;
-  const cutover = installCutoverTestControl(env);
+  const cutover = installCutoverTestControl(env, fresh.control);
   await initializeFreshSpaceInstallation(env);
   sqlite.exec("BEGIN");
   try {

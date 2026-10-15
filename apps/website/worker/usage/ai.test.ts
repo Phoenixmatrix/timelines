@@ -2,8 +2,8 @@
 // Recording errors never fail the model call.
 import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import type { DatabaseSync } from "node:sqlite";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
-import { seedSpaceFixture } from "../testing/spaces.ts";
+import { d1 } from "../testing/d1.ts";
+import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import { chatJson, embed } from "../knowledge/models.ts";
@@ -21,10 +21,10 @@ afterEach(() => {
 });
 
 beforeEach(async () => {
-  sqlite = migratedDatabase();
-  registry = migratedRegistryDatabase();
+  const fresh = await freshInstallationDatabases();
+  ({ sqlite, registry } = fresh);
   env = { DB: d1(sqlite), REGISTRY_DB: d1(registry) } as Env;
-  closeControl = installCutoverTestControl(env).close;
+  closeControl = installCutoverTestControl(env, fresh.control).close;
   await initializeFreshSpaceInstallation(env);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES ('acc_o', 'user', 'ann', 'Ann');

@@ -1,7 +1,7 @@
 import { afterEach, expect, test, vi } from "vite-plus/test";
 import { issueToken } from "../api/tokens.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
-import { seedSpaceFixture } from "../testing/spaces.ts";
+import { d1 } from "../testing/d1.ts";
+import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import { claim, jobPayload, loadJob, report } from "./jobs.ts";
 import { mintJobToken } from "./registry.ts";
@@ -23,15 +23,15 @@ afterEach(() => {
 });
 
 async function fixture() {
-  const sqlite = migratedDatabase();
+  const fresh = await freshInstallationDatabases();
+  const { sqlite, registry } = fresh;
   const sendEvent = vi.fn(async () => {});
-  const registry = migratedRegistryDatabase();
   const env = {
     DB: d1(sqlite),
     REGISTRY_DB: d1(registry),
     CI_RUN: { get: async () => ({ sendEvent }) },
   } as unknown as Env;
-  const admission = installCutoverTestControl(env);
+  const admission = installCutoverTestControl(env, fresh.control);
   dispose.push(
     () => sqlite.close(),
     () => registry.close(),

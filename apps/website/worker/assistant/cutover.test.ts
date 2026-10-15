@@ -8,7 +8,7 @@ import { installCutoverTestControl } from "../testing/space-cutover.ts";
 import type { Actor } from "../db.ts";
 import { findRepo, repoSummary, roleFor } from "../db.ts";
 import { apiClient, type CallApi } from "./internal.ts";
-import { seedSpaceFixture } from "../testing/spaces.ts";
+import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 import { releaseNotesFor, viewerTrackers } from "../release-notes/read.ts";
 import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
@@ -56,10 +56,11 @@ afterEach(async () => {
 });
 
 async function fixture(onAbort?: () => void, native = true) {
-  const database = migratedDatabase();
-  const registry = migratedRegistryDatabase();
+  const fresh = native ? await freshInstallationDatabases() : undefined;
+  const database = fresh?.sqlite ?? migratedDatabase();
+  const registry = fresh?.registry ?? migratedRegistryDatabase();
   const env = { DB: d1(database), REGISTRY_DB: d1(registry) } as Env;
-  const journal = installCutoverTestControl(env);
+  const journal = installCutoverTestControl(env, fresh?.control);
   const state = fakeDurableState({ name: "person:chat" });
   resources.push(database, registry, journal, state.db);
   if (native) {

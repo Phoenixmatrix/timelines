@@ -38,11 +38,10 @@ import { resetDerivedKeys } from "../core/secrets.ts";
 import { RepoLogic } from "../do/repo-logic.ts";
 import { cacheNpmArchive } from "../manage/archive.ts";
 import { installCutoverTestControl } from "../../worker/testing/space-cutover.ts";
+import { freshInstallationDatabases } from "../../worker/testing/spaces.ts";
 import { captureWorkAuthority } from "../../worker/ci/admission.ts";
 import { initializeFreshSpaceInstallation } from "../../worker/space-cutover/installation.ts";
 
-const REGISTRY_MIGRATIONS = fileURLToPath(new URL("../migrations/", import.meta.url).href);
-const GITMATRIX_MIGRATIONS = fileURLToPath(new URL("../../migrations/", import.meta.url).href);
 /** Canonical development people/Organizations/Spaces, seeded after native v4 initialization. */
 const GITMATRIX_SEED = fileURLToPath(new URL("../../seed/", import.meta.url).href);
 export const REGISTRY_URL = "https://pkg.test";
@@ -244,10 +243,9 @@ export async function makeHarness(
   resetDerivedKeys();
   purgedRepoObjects.length = 0;
 
-  const db = new FakeD1();
-  migrate(db, REGISTRY_MIGRATIONS);
-  const gitmatrix = new FakeD1();
-  migrate(gitmatrix, GITMATRIX_MIGRATIONS);
+  const fresh = await freshInstallationDatabases();
+  const db = new FakeD1(fresh.registry);
+  const gitmatrix = new FakeD1(fresh.sqlite);
   const ensureSpace = (id: string, slug: string) => {
     gitmatrix.applySql(
       `BEGIN;
@@ -272,7 +270,7 @@ export async function makeHarness(
     REGISTRY_KEK: btoa("k".repeat(32)),
     ...overrides,
   } as unknown as Env;
-  const cutover = installCutoverTestControl(env);
+  const cutover = installCutoverTestControl(env, fresh.control);
   cutoverClosers.push(cutover.close);
   await initializeFreshSpaceInstallation(env);
   gitmatrix.applySql("BEGIN");

@@ -91,8 +91,8 @@ export class FakeStatement {
 export class FakeD1 {
   private readonly sqlite: DatabaseSync;
 
-  constructor() {
-    this.sqlite = new DatabaseSync(":memory:");
+  constructor(sqlite: DatabaseSync = new DatabaseSync(":memory:")) {
+    this.sqlite = sqlite;
     this.sqlite.exec("PRAGMA foreign_keys = ON");
   }
 

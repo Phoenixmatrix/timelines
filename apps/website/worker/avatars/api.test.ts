@@ -3,11 +3,11 @@ import { afterEach, describe, expect, onTestFinished, test, vi } from "vite-plus
 import type { AvatarOptions, SessionResponse } from "../../shared/api.ts";
 import type { AppEnv } from "../auth.ts";
 import type { Actor } from "../db.ts";
-import { d1, migratedDatabase, migratedRegistryDatabase } from "../testing/d1.ts";
+import { d1 } from "../testing/d1.ts";
 import { accounts } from "../api/accounts.ts";
 import { organizations } from "../api/organizations.ts";
 import { issueToken } from "../api/tokens.ts";
-import { seedSpaceFixture } from "../testing/spaces.ts";
+import { freshInstallationDatabases, seedSpaceFixture } from "../testing/spaces.ts";
 import { initializeFreshSpaceInstallation } from "../space-cutover/installation.ts";
 import { durableStorage } from "../testing/durable.ts";
 import { installCutoverTestControl } from "../testing/space-cutover.ts";
@@ -75,8 +75,8 @@ function bucket() {
 async function setup({
   ai = "ok" as "ok" | "none" | "fail" | ((n: number, prompt: string) => boolean),
 } = {}) {
-  const sqlite = migratedDatabase();
-  const registry = migratedRegistryDatabase();
+  const fresh = await freshInstallationDatabases();
+  const { sqlite, registry } = fresh;
   const waits: Promise<unknown>[] = [];
   onTestFinished(async () => {
     await Promise.all(waits);
@@ -109,7 +109,7 @@ async function setup({
       },
     },
   } as unknown as Env;
-  onTestFinished(installCutoverTestControl(env).close);
+  onTestFinished(installCutoverTestControl(env, fresh.control).close);
   await initializeFreshSpaceInstallation(env);
   sqlite.exec(`
     INSERT INTO accounts (id, kind, slug, display_name) VALUES
